@@ -531,6 +531,22 @@ def test_truncated_blob_on_disk_is_detected(tmp_path: Path):
         store.get(digest)
 
 
+def test_put_repairs_a_same_length_corruption(tmp_path: Path):
+    """The nastier torn write: same length, wrong bytes.
+
+    A size-only dedupe check accepts this forever, so put() returns success
+    while holding the correct bytes and the digest stays poisoned. put() must
+    re-verify and repair.
+    """
+    store = BlobStore(tmp_path)
+    digest, _ = store.put(b"a" * 500)
+    store.path_for(digest).write_bytes(b"b" * 500)  # same length, wrong content
+
+    again, length = store.put(b"a" * 500)
+    assert again == digest and length == 500
+    assert store.get(digest) == b"a" * 500, "put() did not repair the blob"
+
+
 def test_large_blob_round_trips(tmp_path: Path):
     store = BlobStore(tmp_path)
     payload = bytes(range(256)) * 8000  # ~2 MB, larger than a Burp response
@@ -585,8 +601,17 @@ class BlobStore:
     def put(self, data: bytes) -> tuple[str, int]:
         digest = hashlib.sha256(data).hexdigest()
         final = self.path_for(digest)
-        if final.exists() and final.stat().st_size == len(data):
-            return digest, len(data)
+        # Trusting st_size here is the bug the design warns about: a torn write
+        # that happens to preserve length (bit rot, a zero-filled tail after a
+        # crash) would be accepted forever, and put() would report success while
+        # holding the correct bytes. Re-hash what is actually on disk; on any
+        # mismatch fall through and repair it via the atomic path below.
+        if final.exists():
+            try:
+                if hashlib.sha256(final.read_bytes()).hexdigest() == digest:
+                    return digest, len(data)
+            except OSError:
+                pass  # unreadable: repair it
 
         final.parent.mkdir(parents=True, exist_ok=True)
         staging = self.tmp / f"{uuid.uuid4().hex}.part"
@@ -621,7 +646,7 @@ class BlobStore:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_blobs.py -v`
-Expected: PASS, 6 passed
+Expected: PASS, 7 passed
 
 - [ ] **Step 5: Commit**
 
