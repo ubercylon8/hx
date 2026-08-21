@@ -9,8 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import uuid
 from pathlib import Path
+
+from hx.store.paths import secure_mkdir
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 class CorruptBlob(Exception):
@@ -21,27 +26,20 @@ class BlobStore:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
         self.tmp = self.root / "tmp"
-        self._secure_dir(self.tmp)
-
-    def _secure_dir(self, path: Path) -> None:
-        """Create `path` and any missing ancestors, chmodding ONLY what we create.
-
-        A directory that already exists belongs to the user, not to this store:
-        re-permissioning it would silently change their filesystem.
-        """
-        missing = []
-        probe = path
-        while not probe.exists():
-            missing.append(probe)
-            if probe.parent == probe:      # reached the filesystem root
-                break
-            probe = probe.parent
-
-        path.mkdir(parents=True, exist_ok=True)
-        for created in reversed(missing):
-            os.chmod(created, 0o700)
+        secure_mkdir(self.tmp)
 
     def path_for(self, digest: str) -> Path:
+        """Resolve a digest to its on-disk path.
+
+        `digest` must be a bare 64-character lowercase hex sha256. Without
+        this check, an absolute or `..`-laden string resets or escapes the
+        join (`path_for("/etc/passwd")` returns `/etc/passwd` outright), and
+        blob refs will arrive over the bridge from the JVM in Plan 2 -- an
+        attacker-controlled string reaching this function is not hypothetical
+        there.
+        """
+        if not _HEX64.fullmatch(digest):
+            raise CorruptBlob(f"not a valid digest: {digest!r}")
         return self.root / digest[:2] / digest[2:4] / digest
 
     def put(self, data: bytes) -> tuple[str, int]:
@@ -55,7 +53,7 @@ class BlobStore:
                 pass  # unreadable: repair it
 
         # Create directories with mode 0o700
-        self._secure_dir(final.parent)
+        secure_mkdir(final.parent)
 
         # Create staging file with mode 0o600
         staging = self.tmp / f"{uuid.uuid4().hex}.part"
@@ -66,10 +64,15 @@ class BlobStore:
                 fh.flush()
                 os.fsync(fh.fileno())
         except Exception:
-            # Clean up the file descriptor if something goes wrong
+            # The `with` block already closed fd via fdopen()'s __exit__ in
+            # the common case (write/fsync failure inside the block); this
+            # only catches fd surviving unclosed if fdopen() itself raised
+            # before the file object existed to close it. Closing an
+            # already-closed fd raises OSError (EBADF), which is the one
+            # error worth swallowing here -- anything else should surface.
             try:
                 os.close(fd)
-            except Exception:
+            except OSError:
                 pass
             staging.unlink(missing_ok=True)
             raise
