@@ -19,6 +19,7 @@ from pathlib import Path
 from hx import config as config_mod
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 
 
 class EngagementError(Exception):
@@ -42,41 +43,42 @@ class Engagement:
     blobs: blobs_mod.BlobStore
 
 
-def _secure_mkdir(path: Path) -> None:
-    """Create `path` and any missing ancestors, chmodding ONLY what we create.
-
-    `path.mkdir(parents=True, mode=0o700)` applies `mode` to the leaf
-    directory alone; any missing ancestor gets created at the process umask
-    default, which can be world-readable -- turning a directory listing of
-    every client under engagement into public information. A directory that
-    already exists belongs to the user, not to this store: re-permissioning
-    it would silently change their filesystem. Mirrors
-    `hx.store.blobs.BlobStore._secure_dir`.
-    """
-    missing = []
-    probe = path
-    while not probe.exists():
-        missing.append(probe)
-        if probe.parent == probe:  # reached the filesystem root
-            break
-        probe = probe.parent
-
-    path.mkdir(parents=True, exist_ok=True)
-    for created in reversed(missing):
-        os.chmod(created, 0o700)
-
-
 def _write_config_secure(path: Path, text: str) -> None:
-    """Write `path` so it never exists at a looser mode than 0o600.
+    """Atomically replace `path` with `text`, never at a looser mode than
+    0o600 and never leaving a half-written file behind.
 
-    `write_text()` followed by `os.chmod(..., 0o600)` leaves the file at the
-    umask default (typically 0o644) between the two calls, world-readable
-    while it holds scope and identity references. Opening with O_EXCL and
-    the final mode up front closes that window entirely.
+    Used for both first creation (`create()`) and every subsequent rewrite
+    (`record_scope_version()`). A bare `write_text()` -- whether creating the
+    file or truncating an existing one -- has no temp file, no fsync, and no
+    atomic rename: a process killed mid-write can leave `config.yaml`
+    truncated, or (worse) leave it as valid YAML with every required key
+    present but a shorter `dangerous_paths` list, since `dumps()` emits that
+    key near the end. The blob store already does temp -> fsync -> verify ->
+    `os.replace` for a response body; the file defining what is contractually
+    permitted to touch gets no less.
+
+    The temp file is created with `O_EXCL` at the final 0o600 mode, so it is
+    never briefly world-readable either.
     """
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    path = Path(path)
+    # Hidden, uuid-qualified, but same trailing name as the target: a
+    # collision-proof temp name in the same directory (so the final
+    # os.replace stays on one filesystem and is atomic).
+    tmp = path.parent / f".{uuid.uuid4().hex}.{path.name}"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def _record_scope(
@@ -122,20 +124,14 @@ def _create_engagement_and_scope(
     record -- exactly the state the design says must be impossible ("what
     was in scope when request X was issued" must always be answerable).
     """
-    conn.execute("BEGIN")
-    try:
+    with db_mod.transaction(conn):
         conn.execute(
             "INSERT INTO engagement(id, name, client, created_us, status, config_path)"
             " VALUES(?,?,?,?,?,?)",
             (eng_id, cfg.name, cfg.client, now_us(), "active", config_path),
         )
         sv_id = _record_scope(conn, eng_id, cfg, author=author, reason=reason)
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
-        return sv_id
+    return sv_id
 
 
 def create(root: Path, cfg: config_mod.Config, *, author: str) -> Engagement:
@@ -146,7 +142,7 @@ def create(root: Path, cfg: config_mod.Config, *, author: str) -> Engagement:
     created_root = False
     conn: sqlite3.Connection | None = None
     try:
-        _secure_mkdir(root)
+        secure_mkdir(root)
         created_root = True
         (root / "exports").mkdir(mode=0o700)
 
@@ -154,7 +150,6 @@ def create(root: Path, cfg: config_mod.Config, *, author: str) -> Engagement:
 
         conn = db_mod.connect(root / "hx.db")
         db_mod.init_schema(conn)
-        os.chmod(root / "hx.db", 0o600)  # redundant: db.connect already does this
 
         eng_id = _new_id("e")
         _create_engagement_and_scope(
@@ -189,10 +184,54 @@ def open_(root: Path) -> Engagement:
         raise EngagementError(f"no engagement at {root}")
     conn = db_mod.connect(root / "hx.db")
     try:
-        row = conn.execute("SELECT id FROM engagement LIMIT 1").fetchone()
-        if row is None:
-            raise EngagementError(f"engagement row missing in {root}")
+        # I6: a store opened by a different (and possibly incompatible)
+        # schema version must fail loudly rather than run queries against
+        # tables/triggers it does not actually have. The migration runner
+        # itself is a later plan's problem; this guard only refuses to
+        # pretend compatibility that was never verified.
+        found_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if found_version != db_mod.SCHEMA_VERSION:
+            raise EngagementError(
+                f"engagement at {root} was created by a different version of "
+                f"hx: on-disk schema version {found_version}, this hx expects "
+                f"{db_mod.SCHEMA_VERSION}"
+            )
+
+        # I5: `engagement` is meant to hold exactly one row -- it is the
+        # unit of isolation, and `quarantine` and every unqualified lookup
+        # here presume a single authoritative id. `LIMIT 1` with no
+        # `ORDER BY` would pick an arbitrary row if a second one ever got
+        # in; fetch all of them and refuse to guess.
+        rows = conn.execute("SELECT id FROM engagement").fetchall()
+        if len(rows) != 1:
+            raise EngagementError(
+                f"expected exactly one engagement row in {root}, found {len(rows)}"
+            )
+        row = rows[0]
+
         config = config_mod.load(root / "config.yaml")
+
+        # I2: config.yaml and the recorded scope of record must never be
+        # allowed to silently diverge -- a hand edit to the file would
+        # otherwise become the live scope while the audit history (and,
+        # later, the recorded `scope_version_id` stamped on every request)
+        # says something else. There is no legitimate hand-edit workflow in
+        # this store: `record_scope_version` is the API, so divergence
+        # raises rather than warns.
+        latest_scope = conn.execute(
+            "SELECT yaml FROM scope_version"
+            " ORDER BY effective_from_us DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if latest_scope is not None:
+            on_disk = (root / "config.yaml").read_text(encoding="utf-8")
+            if on_disk != latest_scope["yaml"]:
+                raise EngagementError(
+                    f"{root / 'config.yaml'} diverges from the recorded scope "
+                    "of record: its contents do not match the latest row in "
+                    "scope_version. Restore config.yaml from that row, or "
+                    "re-record the change through record_scope_version()."
+                )
+
         blobs = blobs_mod.BlobStore(root / "blobs")
     except Exception:
         # Any failure past this point (missing config.yaml, a malformed
@@ -208,7 +247,5 @@ def open_(root: Path) -> Engagement:
 def record_scope_version(eng: Engagement, *, author: str, reason: str) -> str:
     """Append a new scope version. Never updates an existing row."""
     sv_id = _record_scope(eng.db, eng.id, eng.config, author=author, reason=reason)
-    (eng.root / "config.yaml").write_text(
-        config_mod.dumps(eng.config), encoding="utf-8"
-    )
+    _write_config_secure(eng.root / "config.yaml", config_mod.dumps(eng.config))
     return sv_id
