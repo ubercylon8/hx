@@ -866,7 +866,13 @@ def _positive_int(raw: dict, key: str, default: int) -> int:
 
 
 def load(path: Path) -> Config:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    # A YAML syntax error is "nonsense" by this module's own definition of
+    # ConfigError. Wrapping it here means no caller — the CLI, the agent tool
+    # layer, the web app — has to know PyYAML is the parser underneath.
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
 
@@ -1303,6 +1309,7 @@ rather than in the agent-facing tool layer.
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
 import click
@@ -1345,6 +1352,14 @@ def main() -> None:
 def new(name, client, scope, exclude, profile, root, author) -> None:
     """Create a new engagement."""
     base = root or default_root()
+    # Guard before anything touches disk. An empty NAME makes `base / name`
+    # collapse to base itself, so `hx new ""` would turn the engagements root
+    # into an engagement directory -- and it could then never be opened
+    # (config.load rejects an empty name) nor recreated (create refuses an
+    # existing directory).
+    for field, value in (("NAME", name), ("--client", client)):
+        if not value.strip():
+            raise click.ClickException(f"{field} must not be empty")
     cfg = config_mod.Config(
         name=name,
         client=client,
@@ -1368,15 +1383,23 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
 def info(root) -> None:
     """Show an engagement's configuration and current counts."""
     path = root or default_root()
+    # Everything that reads the engagement goes inside one guard: opening it,
+    # loading its config, and querying it. A damaged engagement must produce a
+    # sentence, never a traceback -- and sqlite3.Error is not an OSError.
     try:
         eng = eng_mod.open_(path)
+        counts = {
+            t: eng.db.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            for t in ("run", "surface", "exchange", "finding", "check_run")
+        }
     except eng_mod.EngagementError as exc:
         raise click.ClickException(str(exc)) from exc
-
-    counts = {
-        t: eng.db.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
-        for t in ("run", "surface", "exchange", "finding", "check_run")
-    }
+    except config_mod.ConfigError as exc:
+        raise click.ClickException(f"invalid config at {path}: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot read the database at {path}: {exc}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"cannot access the engagement at {path}: {exc}") from exc
     click.echo(f"engagement {eng.config.name} ({eng.id})")
     click.echo(f"  client   {eng.config.client}")
     click.echo(f"  profile  {eng.config.safety_profile}")
