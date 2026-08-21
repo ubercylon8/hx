@@ -1,5 +1,7 @@
+import shutil
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from hx import cli
@@ -163,3 +165,84 @@ def test_info_damaged_database(tmp_path: Path):
     finally:
         # Restore permissions so pytest can clean up
         os_module.chmod(db_path, 0o600)
+
+
+# --- I3: `hx new` accepts a path, not a name ---
+
+
+@pytest.mark.parametrize("bad_name", [".", "..", "../escaped", "a/b"])
+def test_new_rejects_path_like_names_within_root(tmp_path: Path, bad_name):
+    """`.` breaks the destruction guarantee outright (the engagements root
+    itself becomes an engagement, so `rm -rf` of it destroys every sibling
+    client), and any other traversal walks the created directory outside
+    the engagements root. Nothing must be created at all."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", bad_name, "--client", "Acme", "--scope", "https://a/*", "--root", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert list(tmp_path.iterdir()) == [], f"NAME={bad_name!r} created something under root"
+
+
+def test_new_rejects_an_absolute_path_as_name(tmp_path: Path):
+    """pathlib's `/` operator discards the left operand when the right one
+    is absolute, so NAME='/tmp/hx-i3-abs-escape-test' used to make --root
+    silently ignored and create the engagement at that literal absolute
+    path."""
+    target = Path("/tmp/hx-i3-abs-escape-test")
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+
+    runner = CliRunner()
+    try:
+        result = runner.invoke(
+            cli.main,
+            [
+                "new", str(target), "--client", "Acme",
+                "--scope", "https://a/*", "--root", str(tmp_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert not target.exists(), "NAME as an absolute path escaped --root entirely"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def test_new_accepts_a_normal_name(tmp_path: Path):
+    """The validation must not be so strict it rejects ordinary names."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        [
+            "new", "acme-2026-09.retest_1", "--client", "Acme",
+            "--scope", "https://a/*", "--root", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "acme-2026-09.retest_1" / "hx.db").exists()
+
+
+# --- M3: `hx new` must degrade like `hx info` does, not traceback ---
+
+
+def test_new_reports_a_clean_error_when_root_is_not_a_directory(tmp_path: Path):
+    """`hx new acme --root /etc/hostname` used to dump a NotADirectoryError
+    traceback -- `new` needs the same guard shape `info` already has."""
+    not_a_dir = tmp_path / "im-a-file"
+    not_a_dir.write_text("not a directory")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        [
+            "new", "x", "--client", "Acme",
+            "--scope", "https://a/*", "--root", str(not_a_dir),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output

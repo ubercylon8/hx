@@ -279,3 +279,140 @@ def test_blobstore_construction_failure_still_triggers_cleanup(tmp_path: Path, m
         engagement.create(tmp_path / "acme", _cfg(), author="jimx")
 
     assert not (tmp_path / "acme").exists()
+
+
+# --- I1: record_scope_version's config.yaml rewrite must be atomic and 0o600 ---
+
+
+def test_record_scope_version_recreates_missing_config_yaml_at_0o600(tmp_path: Path):
+    """record_scope_version must route through the same atomic-replace
+    helper as create(): a bare write_text() on a missing file lands at the
+    umask default (e.g. 0o644), not 0o600, and `_write_config_secure` sat
+    unused for exactly this call site."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    (eng.root / "config.yaml").unlink()
+
+    engagement.record_scope_version(eng, author="jimx", reason="rewrite after deletion")
+
+    mode = stat.S_IMODE((eng.root / "config.yaml").stat().st_mode)
+    assert mode == 0o600
+
+
+def test_record_scope_version_writes_exact_dumps_output(tmp_path: Path):
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.config.scope_include.append("https://api.acme.com/*")
+
+    engagement.record_scope_version(eng, author="jimx", reason="client added API host")
+
+    on_disk = (eng.root / "config.yaml").read_text(encoding="utf-8")
+    assert on_disk == config.dumps(eng.config)
+
+
+def test_record_scope_version_leaves_no_tmp_file_behind(tmp_path: Path):
+    """Truncate-then-write with no temp file, no fsync, no rename meant a
+    write interrupted partway left `config.yaml` as valid YAML with a
+    shorter `dangerous_paths` list -- `logout` and `delete` are among the
+    last entries `dumps()` emits. The fix's temp file must not survive a
+    successful write either."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.config.scope_include.append("https://api.acme.com/*")
+
+    engagement.record_scope_version(eng, author="jimx", reason="client added API host")
+
+    hidden = [p.name for p in eng.root.iterdir() if p.name.startswith(".")]
+    assert hidden == [], f"leftover temp file(s): {hidden}"
+
+
+# --- I2: config.yaml and the recorded scope of record must never diverge ---
+
+
+def test_open_raises_on_hand_edited_config_yaml(tmp_path: Path):
+    """A hand edit to config.yaml after create() must not silently become
+    the live scope while the recorded scope_version history says something
+    else. There is no legitimate hand-edit workflow in this store --
+    record_scope_version is the API -- so divergence raises, it does not
+    warn."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.db.close()
+
+    (eng.root / "config.yaml").write_text(
+        "name: acme-2026-09\nclient: Acme Corp\nsafety_profile: production\n"
+        "scope:\n  include: ['https://app.acme.com/*', 'https://evil.example.com/*']\n"
+        "  exclude: []\nrender_allow: []\ndangerous_paths: []\nchecks: {}\n"
+        "rate_limit_rps: 5\nmax_concurrency: 2\nidentities: {}\n"
+        "preserve_segments: []\nslug_threshold: 12\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(engagement.EngagementError, match="diverges"):
+        engagement.open_(tmp_path / "acme")
+
+
+def test_open_succeeds_when_config_yaml_matches_the_recorded_scope(tmp_path: Path):
+    """The normal create() -> open_() round trip must still succeed: both
+    files are written from the same dumps() output at create() time."""
+    created = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    created.db.close()
+
+    reopened = engagement.open_(tmp_path / "acme")
+    assert reopened.id == created.id
+
+
+# --- I5: exactly one engagement row, enforced defensively in open_() too,
+# not only by the schema trigger ---
+
+
+def test_open_raises_when_engagement_table_has_two_rows(tmp_path: Path):
+    """The schema trigger (tested in test_db.py) prevents a second row
+    through normal INSERT; this proves open_() itself does not trust
+    `SELECT ... LIMIT 1` with no ORDER BY, which would pick an arbitrary
+    row if a second one ever got in some other way (e.g. a hand-crafted
+    database, or a future migration bug)."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.db.execute("DROP TRIGGER trg_engagement_singleton")
+    eng.db.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e-rogue','globex','Globex',2,'active')"
+    )
+    eng.db.close()
+
+    with pytest.raises(engagement.EngagementError, match="exactly one"):
+        engagement.open_(tmp_path / "acme")
+
+
+# --- I6: an engagement created by a different schema version must not open ---
+
+
+def test_open_rejects_a_different_schema_version(tmp_path: Path):
+    """There is no migration mechanism, so every schema gap is currently
+    permanent -- silently proceeding on a version mismatch would run
+    queries against tables/triggers the store does not actually have."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.db.execute("PRAGMA user_version=99")
+    eng.db.close()
+
+    with pytest.raises(engagement.EngagementError, match="schema version"):
+        engagement.open_(tmp_path / "acme")
+
+
+# --- Test-suite fix: prove the spec S5 isolation/destruction guarantee ---
+
+
+def test_deleting_one_engagement_does_not_affect_another(tmp_path: Path):
+    """The contractual claim is that `rm -rf` of one engagement directory
+    must not touch another's data. Nothing currently tests this end to
+    end."""
+    import shutil
+
+    a = engagement.create(tmp_path / "acme", _cfg("acme"), author="jimx")
+    b = engagement.create(tmp_path / "globex", _cfg("globex"), author="jimx")
+
+    a.blobs.put(b"acme secret response")
+    b_digest, _ = b.blobs.put(b"globex secret response")
+
+    a.db.close()  # release the connection before nuking a's directory
+    shutil.rmtree(a.root)
+
+    assert not a.root.exists()
+    assert b.blobs.get(b_digest) == b"globex secret response"
+    assert b.db.execute("SELECT COUNT(*) AS n FROM engagement").fetchone()["n"] == 1

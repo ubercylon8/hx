@@ -43,8 +43,12 @@ scope:
     assert cfg.checks["active_mutate"] is False
     assert cfg.checks["active_dos"] is False
     assert cfg.checks["passive"] is True
-    assert cfg.rate_limit_rps <= 10
-    assert "logout" in " ".join(cfg.dangerous_paths)
+    # `<= 10` and a substring of a joined string both pass even if the real
+    # default drifted -- e.g. a join could make an unrelated pair of entries
+    # spell "logout" across a boundary. Assert the actual documented default
+    # value and check membership in the list itself.
+    assert cfg.rate_limit_rps == 5
+    assert "*/logout*" in cfg.dangerous_paths
 
 
 def test_empty_scope_include_is_rejected(tmp_path: Path):
@@ -194,3 +198,73 @@ def test_invalid_yaml_raises_config_error(tmp_path: Path):
     p = _write(tmp_path, "{ invalid yaml: [")
     with pytest.raises(config.ConfigError, match="invalid YAML"):
         config.load(p)
+
+
+# --- M6: name and client are the only unvalidated types in this module ---
+
+
+def test_name_int_is_rejected(tmp_path: Path):
+    """`if not raw.get(required)` is a truthiness test: `name: 123` is
+    truthy and used to load fine, reaching the database and the report as
+    a coerced value."""
+    p = _write(
+        tmp_path,
+        "name: 123\nclient: Acme\nscope:\n  include: ['https://a/*']\n",
+    )
+    with pytest.raises(config.ConfigError, match="name"):
+        config.load(p)
+
+
+def test_client_bool_is_rejected(tmp_path: Path):
+    """`client: true` is truthy and used to load fine for the same reason."""
+    p = _write(
+        tmp_path,
+        "name: acme\nclient: true\nscope:\n  include: ['https://a/*']\n",
+    )
+    with pytest.raises(config.ConfigError, match="client"):
+        config.load(p)
+
+
+def test_name_blank_string_is_rejected(tmp_path: Path):
+    """A whitespace-only name is a string (truthy), but not a real name."""
+    p = _write(
+        tmp_path,
+        "name: '   '\nclient: Acme\nscope:\n  include: ['https://a/*']\n",
+    )
+    with pytest.raises(config.ConfigError, match="name"):
+        config.load(p)
+
+
+# --- Test-suite fix: a direct Config() construction, bypassing load()
+# entirely ---
+
+
+def test_direct_config_construction_has_safe_defaults():
+    """`hx new` builds Config(...) directly and never calls load() -- so
+    every default_factory field must be independently proven safe here,
+    not only when reached through the YAML-parsing path."""
+    cfg = config.Config(
+        name="acme-2026-09",
+        client="Acme Corp",
+        scope_include=["https://app.acme.com/*"],
+    )
+    assert cfg.safety_profile == "production"
+    assert cfg.checks["active_mutate"] is False
+    assert cfg.checks["active_dos"] is False
+    assert cfg.rate_limit_rps == 5
+    assert "*/logout*" in cfg.dangerous_paths
+    assert cfg.scope_exclude == []
+    assert cfg.identities == {}
+
+
+def test_direct_config_construction_round_trips_through_dumps_and_load(tmp_path: Path):
+    """The same direct-construction path `hx new` uses, proven to still
+    dump and reload correctly -- not just to have safe field values."""
+    cfg = config.Config(
+        name="acme-2026-09",
+        client="Acme Corp",
+        scope_include=["https://app.acme.com/*"],
+    )
+    p = tmp_path / "config.yaml"
+    p.write_text(config.dumps(cfg), encoding="utf-8")
+    assert config.load(p) == cfg
