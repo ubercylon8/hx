@@ -1594,6 +1594,7 @@ git commit -m "feat(bridge): unix socket server with peercred check and deny-all
   - `hx.bridge.BridgeClient(Path socketPath, String engagementId, String instanceId, Logger log)`
   - `BridgeClient.connect()` / `BridgeClient.close()`
   - `BridgeClient.isConfigured() -> boolean`
+  - `BridgeClient.maySend() -> boolean` — configured and not halted
   - `BridgeClient.configEpoch() -> long`
   - `BridgeClient.scopeConfig() -> Map<String,List<String>>`
   - `BridgeClient.checkMaySend() -> void` — throws `NotConfigured` unless configured and not halted
@@ -1630,6 +1631,8 @@ package hx.bridge;
 
 import java.io.*;
 import java.net.*;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.nio.file.*;
 import java.util.*;
 
@@ -1996,6 +1999,7 @@ git commit -m "feat(bridge): java client dials in, stays deny-all until configur
 ### Task 5: End-to-end against real headless Burp
 
 **Files:**
+- Create: `tests/__init__.py` — **required**: without it `from tests.integration import ...` fails with `ModuleNotFoundError: No module named 'tests'`, verified
 - Create: `tests/integration/__init__.py`
 - Create: `tests/integration/test_real_burp.py`
 - Create: `tests/integration/burp_fixture.py`
@@ -2186,7 +2190,7 @@ Expected: PASS, 144 passed, under 2 seconds — the integration tests excluded b
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/integration pyproject.toml
+git add tests/__init__.py tests/integration pyproject.toml
 git commit -m "test(bridge): real headless Burp completes the handshake end to end"
 ```
 
