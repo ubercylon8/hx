@@ -1,0 +1,137 @@
+package hx.bridge;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.io.ByteArrayInputStream;
+import java.util.*;
+
+/** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
+public class CodecTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    static void expectThrows(String what, Class<?> type, Runnable body) {
+        try {
+            body.run();
+            check(what + " (expected " + type.getSimpleName() + ")", false);
+        } catch (Throwable t) {
+            check(what, type.isInstance(t));
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        headerRoundTrip();
+        bodyIsVerbatim();
+        bodyNewlinesDoNotConfuseTheHeaderSplit();
+        incompleteIsDistinctFromCorrupt();
+        oversizedLengthIsRefused();
+        readReassemblesAcrossChunks();
+        configBody();
+        goldenVectors();
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    static void headerRoundTrip() {
+        Map<String, Object> h = new LinkedHashMap<>();
+        h.put("v", 1L); h.put("t", "hello"); h.put("pid", 4171L);
+        Frame.Decoded d = Frame.decode(Frame.encode(h, new byte[0]));
+        check("header round trip", d.header.equals(h) && d.body.length == 0);
+    }
+
+    static void bodyIsVerbatim() {
+        byte[] payload = "GET / HTTP/1.1\r\nHost: a\r\n\r\n".getBytes(StandardCharsets.UTF_8);
+        Map<String, Object> h = Map.of("v", 1L, "t", "send", "id", 1L);
+        Frame.Decoded d = Frame.decode(Frame.encode(h, payload));
+        check("body survives verbatim", Arrays.equals(d.body, payload));
+    }
+
+    static void bodyNewlinesDoNotConfuseTheHeaderSplit() {
+        byte[] payload = "\n\n{\"not\":\"a header\"}\n".getBytes(StandardCharsets.UTF_8);
+        Map<String, Object> h = Map.of("v", 1L, "t", "send", "id", 2L);
+        Frame.Decoded d = Frame.decode(Frame.encode(h, payload));
+        check("header ends at the FIRST newline",
+              "send".equals(d.header.get("t")) && Arrays.equals(d.body, payload));
+    }
+
+    static void incompleteIsDistinctFromCorrupt() {
+        byte[] raw = Frame.encode(Map.of("v", 1L, "t", "hello"), "abcdef".getBytes());
+        for (int cut : new int[]{0, 1, 3, 4, raw.length - 1}) {
+            byte[] part = Arrays.copyOf(raw, cut);
+            expectThrows("partial buffer of " + cut + " raises Incomplete",
+                         Frame.Incomplete.class, () -> Frame.decode(part));
+        }
+    }
+
+    static void oversizedLengthIsRefused() {
+        byte[] evil = new byte[6];
+        long tooBig = Frame.MAX_FRAME + 1L;
+        evil[0] = (byte) (tooBig >>> 24); evil[1] = (byte) (tooBig >>> 16);
+        evil[2] = (byte) (tooBig >>> 8);  evil[3] = (byte) tooBig;
+        expectThrows("oversized length prefix refused before allocating",
+                     Frame.FrameError.class, () -> Frame.decode(evil));
+    }
+
+    static void readReassemblesAcrossChunks() throws Exception {
+        byte[] payload = new byte[100_000];
+        new Random(42).nextBytes(payload);
+        byte[] raw = Frame.encode(Map.of("v", 1L, "t", "result", "id", 5L), payload);
+        Frame.Decoded d = Frame.read(new ByteArrayInputStream(raw));
+        check("read() reassembles a large frame", Arrays.equals(d.body, payload));
+    }
+
+    static void configBody() {
+        byte[] body = ("scope.include\thttps://a/*\nscope.include\thttps://b/*\n"
+                     + "limit.rate_rps\t5\n").getBytes(StandardCharsets.UTF_8);
+        Map<String, List<String>> got = ConfigBody.parse(body);
+        check("config repeated keys accumulate in order",
+              got.get("scope.include").equals(List.of("https://a/*", "https://b/*")));
+        check("config single value", got.get("limit.rate_rps").equals(List.of("5")));
+        expectThrows("unrecognised config key is an error", Frame.FrameError.class,
+                     () -> ConfigBody.parse("scope.includ\tx\n".getBytes(StandardCharsets.UTF_8)));
+        expectThrows("config line without a tab is an error", Frame.FrameError.class,
+                     () -> ConfigBody.parse("scope.include x\n".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /** The vectors Python recorded. If these disagree, the two codecs have drifted. */
+    static void goldenVectors() throws Exception {
+        Path p = Path.of("..", "tests", "vectors", "frames.json");
+        String text = Files.readString(p, StandardCharsets.UTF_8);
+        List<Map<String, Object>> frames = MiniVectorReader.frames(text);
+        check("vectors file has frames", !frames.isEmpty());
+        for (Map<String, Object> v : frames) {
+            String name = (String) v.get("name");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> header = (Map<String, Object>) v.get("header");
+            byte[] body = ((String) v.get("body_utf8")).getBytes(StandardCharsets.UTF_8);
+            String wantHex = (String) v.get("hex");
+
+            String gotHex = hex(Frame.encode(header, body));
+            check("vector " + name + " encodes to the recorded bytes", gotHex.equals(wantHex));
+
+            Frame.Decoded d = Frame.decode(unhex(wantHex));
+            check("vector " + name + " decodes to the recorded header", d.header.equals(header));
+            check("vector " + name + " decodes to the recorded body", Arrays.equals(d.body, body));
+        }
+    }
+
+    static String hex(byte[] b) {
+        StringBuilder s = new StringBuilder();
+        for (byte x : b) s.append(String.format("%02x", x));
+        return s.toString();
+    }
+
+    static byte[] unhex(String s) {
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++)
+            out[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
+        return out;
+    }
+}
