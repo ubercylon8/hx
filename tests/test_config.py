@@ -187,3 +187,10 @@ def test_explicit_empty_dangerous_paths_is_honoured(tmp_path: Path):
     )
     cfg = config.load(p)
     assert cfg.dangerous_paths == []
+
+
+def test_invalid_yaml_raises_config_error(tmp_path: Path):
+    """Malformed YAML must raise ConfigError, not yaml.YAMLError."""
+    p = _write(tmp_path, "{ invalid yaml: [")
+    with pytest.raises(config.ConfigError, match="invalid YAML"):
+        config.load(p)

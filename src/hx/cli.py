@@ -6,10 +6,10 @@ rather than in the agent-facing tool layer.
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
 import click
-import yaml
 
 from hx import config as config_mod
 from hx import engagement as eng_mod
@@ -48,6 +48,9 @@ def main() -> None:
 @click.option("--author", default=lambda: os.environ.get("USER", "unknown"))
 def new(name, client, scope, exclude, profile, root, author) -> None:
     """Create a new engagement."""
+    for field, value in (("NAME", name), ("--client", client)):
+        if not value.strip():
+            raise click.ClickException(f"{field} must not be empty")
     base = root or default_root()
     cfg = config_mod.Config(
         name=name,
@@ -74,19 +77,19 @@ def info(root) -> None:
     path = root or default_root()
     try:
         eng = eng_mod.open_(path)
+        counts = {
+            t: eng.db.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            for t in ("run", "surface", "exchange", "finding", "check_run")
+        }
     except eng_mod.EngagementError as exc:
         raise click.ClickException(str(exc)) from exc
     except config_mod.ConfigError as exc:
-        raise click.ClickException(f"error loading config at {path}: {exc}") from exc
-    except yaml.YAMLError as exc:
-        raise click.ClickException(f"error parsing config at {path}: {exc}") from exc
+        raise click.ClickException(f"invalid config at {path}: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot read the database at {path}: {exc}") from exc
     except OSError as exc:
-        raise click.ClickException(f"error accessing engagement at {path}: {exc}") from exc
+        raise click.ClickException(f"cannot access the engagement at {path}: {exc}") from exc
 
-    counts = {
-        t: eng.db.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
-        for t in ("run", "surface", "exchange", "finding", "check_run")
-    }
     click.echo(f"engagement {eng.config.name} ({eng.id})")
     click.echo(f"  client   {eng.config.client}")
     click.echo(f"  profile  {eng.config.safety_profile}")

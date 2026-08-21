@@ -94,7 +94,13 @@ def _positive_int(raw: dict, key: str, default: int) -> int:
 
 
 def load(path: Path) -> Config:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    # A YAML syntax error is "nonsense" by this module's own definition of
+    # ConfigError. Wrapping it here means no caller has to know PyYAML is
+    # the parser underneath.
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
 

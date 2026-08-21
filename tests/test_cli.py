@@ -64,6 +64,30 @@ def test_default_root_honours_env(tmp_path: Path, monkeypatch):
     assert cli.default_root() == tmp_path / "custom"
 
 
+def test_new_rejects_empty_name(tmp_path: Path):
+    """Test that hx new rejects empty NAME and creates no directory."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", "", "--client", "Acme", "--scope", "https://a/*", "--root", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    # Ensure no directory was created at all
+    assert len(list(tmp_path.iterdir())) == 0
+
+
+def test_new_rejects_empty_client(tmp_path: Path):
+    """Test that hx new rejects empty --client and creates no directory."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", "acme", "--client", "", "--scope", "https://a/*", "--root", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    # Ensure no directory was created at all
+    assert len(list(tmp_path.iterdir())) == 0
+
+
 def test_info_missing_config_yaml(tmp_path: Path):
     """Test that info handles missing config.yaml gracefully."""
     runner = CliRunner()
@@ -85,7 +109,7 @@ def test_info_missing_config_yaml(tmp_path: Path):
     result = runner.invoke(cli.main, ["info", "--root", str(tmp_path / "acme")])
     assert result.exit_code != 0
     assert "Traceback" not in result.output
-    assert str(tmp_path / "acme") in result.output or "config" in result.output.lower()
+    assert str(tmp_path / "acme") in result.output
 
 
 def test_info_malformed_config_yaml(tmp_path: Path):
@@ -109,4 +133,33 @@ def test_info_malformed_config_yaml(tmp_path: Path):
     result = runner.invoke(cli.main, ["info", "--root", str(tmp_path / "acme")])
     assert result.exit_code != 0
     assert "Traceback" not in result.output
-    assert str(tmp_path / "acme") in result.output or "config" in result.output.lower()
+    assert str(tmp_path / "acme") in result.output
+
+
+def test_info_damaged_database(tmp_path: Path):
+    """Test that info handles inaccessible database gracefully."""
+    import os as os_module
+
+    runner = CliRunner()
+    # Create an engagement
+    result = runner.invoke(
+        cli.main,
+        [
+            "new", "acme", "--client", "Acme Corp",
+            "--scope", "https://app.acme.com/*", "--root", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0
+
+    # Make the database inaccessible
+    db_path = tmp_path / "acme" / "hx.db"
+    os_module.chmod(db_path, 0o000)
+
+    try:
+        # Try to run info - should show an error, not a traceback
+        result = runner.invoke(cli.main, ["info", "--root", str(tmp_path / "acme")])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+    finally:
+        # Restore permissions so pytest can clean up
+        os_module.chmod(db_path, 0o600)
