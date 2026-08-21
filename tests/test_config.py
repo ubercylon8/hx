@@ -77,3 +77,113 @@ def test_dumps_round_trips(tmp_path: Path):
     p2 = tmp_path / "again.yaml"
     p2.write_text(config.dumps(cfg), encoding="utf-8")
     assert config.load(p2) == cfg
+
+
+def test_checks_string_false_is_rejected(tmp_path: Path):
+    """String 'false' must not coerce to bool True; must be rejected."""
+    p = _write(
+        tmp_path,
+        'name: a\nclient: b\nscope:\n  include: ["https://a/*"]\nchecks:\n  active_mutate: "false"\n',
+    )
+    with pytest.raises(config.ConfigError, match="active_mutate.*boolean"):
+        config.load(p)
+
+
+def test_checks_true_bool_is_honoured(tmp_path: Path):
+    """A real bool true in checks must be accepted."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nchecks:\n  active_mutate: true\n",
+    )
+    cfg = config.load(p)
+    assert cfg.checks["active_mutate"] is True
+
+
+def test_checks_unknown_class_is_rejected(tmp_path: Path):
+    """An unknown check class must be rejected, with a message naming valid classes."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nchecks:\n  no_such_class: true\n",
+    )
+    with pytest.raises(config.ConfigError, match="no_such_class.*valid check class.*passive.*active_mutate"):
+        config.load(p)
+
+
+def test_dangerous_paths_string_is_rejected(tmp_path: Path):
+    """A string dangerous_paths must not be iterated into chars; must be rejected."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\ndangerous_paths: custom\n",
+    )
+    with pytest.raises(config.ConfigError, match="dangerous_paths.*list"):
+        config.load(p)
+
+
+def test_scope_include_string_is_rejected(tmp_path: Path):
+    """A string scope.include must not be iterated into chars; must be rejected."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: 'https://a/*'\n",
+    )
+    with pytest.raises(config.ConfigError, match="include.*list"):
+        config.load(p)
+
+
+def test_rate_limit_rps_zero_is_rejected(tmp_path: Path):
+    """rate_limit_rps must be >= 1, not 0."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nrate_limit_rps: 0\n",
+    )
+    with pytest.raises(config.ConfigError, match="rate_limit_rps.*integer >= 1"):
+        config.load(p)
+
+
+def test_rate_limit_rps_negative_is_rejected(tmp_path: Path):
+    """rate_limit_rps must be >= 1, not negative."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nrate_limit_rps: -5\n",
+    )
+    with pytest.raises(config.ConfigError, match="rate_limit_rps.*integer >= 1"):
+        config.load(p)
+
+
+def test_rate_limit_rps_bool_is_rejected(tmp_path: Path):
+    """bool is an int subclass; rate_limit_rps: true must be rejected."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nrate_limit_rps: true\n",
+    )
+    with pytest.raises(config.ConfigError, match="rate_limit_rps.*integer >= 1"):
+        config.load(p)
+
+
+def test_scope_string_raises_config_error(tmp_path: Path):
+    """scope: 'oops' must raise ConfigError, not AttributeError."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope: oops\n",
+    )
+    with pytest.raises(config.ConfigError, match="scope.*mapping"):
+        config.load(p)
+
+
+def test_checks_string_raises_config_error(tmp_path: Path):
+    """checks: 'yes' must raise ConfigError, not ValueError."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nchecks: yes\n",
+    )
+    with pytest.raises(config.ConfigError, match="checks.*mapping"):
+        config.load(p)
+
+
+def test_explicit_empty_dangerous_paths_is_honoured(tmp_path: Path):
+    """An explicit empty dangerous_paths: [] must NOT be replaced by defaults."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\ndangerous_paths: []\n",
+    )
+    cfg = config.load(p)
+    assert cfg.dangerous_paths == []
