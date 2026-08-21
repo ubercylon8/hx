@@ -188,16 +188,21 @@ def open_(root: Path) -> Engagement:
     if not (root / "hx.db").exists():
         raise EngagementError(f"no engagement at {root}")
     conn = db_mod.connect(root / "hx.db")
-    row = conn.execute("SELECT id FROM engagement LIMIT 1").fetchone()
-    if row is None:
-        raise EngagementError(f"engagement row missing in {root}")
-    return Engagement(
-        id=row["id"],
-        root=root,
-        config=config_mod.load(root / "config.yaml"),
-        db=conn,
-        blobs=blobs_mod.BlobStore(root / "blobs"),
-    )
+    try:
+        row = conn.execute("SELECT id FROM engagement LIMIT 1").fetchone()
+        if row is None:
+            raise EngagementError(f"engagement row missing in {root}")
+        config = config_mod.load(root / "config.yaml")
+        blobs = blobs_mod.BlobStore(root / "blobs")
+    except Exception:
+        # Any failure past this point (missing config.yaml, a malformed
+        # config, BlobStore init) must not leak the connection -- relying on
+        # refcounting to eventually close it is not acceptable for a public
+        # API, since a caller holding the exception (a CLI logging the
+        # traceback, pytest) keeps the handle open indefinitely.
+        conn.close()
+        raise
+    return Engagement(id=row["id"], root=root, config=config, db=conn, blobs=blobs)
 
 
 def record_scope_version(eng: Engagement, *, author: str, reason: str) -> str:

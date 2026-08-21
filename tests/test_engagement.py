@@ -223,3 +223,59 @@ def test_failed_create_does_not_remove_a_preexisting_directory(tmp_path: Path):
         engagement.create(target, _cfg(), author="jimx")
 
     assert marker.exists()
+
+
+# --- Fix round 1: open_() must not leak its connection on error paths ---
+
+
+def test_open_closes_connection_on_failure_after_connect(tmp_path: Path, monkeypatch):
+    """A failure after db.connect() succeeds (e.g. config.yaml missing) must
+    not leak the connection. Relying on refcounting to eventually close it
+    is not acceptable for a public API: a caller holding the exception (a
+    CLI logging the traceback, pytest) keeps the handle open indefinitely.
+    """
+    import sqlite3
+
+    from hx.store import db as db_mod
+
+    engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    (tmp_path / "acme" / "config.yaml").unlink()
+
+    captured = {}
+    real_connect = db_mod.connect
+
+    def spying_connect(path, **kwargs):
+        conn = real_connect(path, **kwargs)
+        captured["conn"] = conn
+        return conn
+
+    monkeypatch.setattr(db_mod, "connect", spying_connect)
+
+    with pytest.raises(FileNotFoundError):
+        engagement.open_(tmp_path / "acme")
+
+    assert "conn" in captured, "open_() never reached db.connect()"
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured["conn"].execute("SELECT 1")
+
+
+# --- Regression test for the self-review fix: BlobStore inside create()'s try ---
+
+
+def test_blobstore_construction_failure_still_triggers_cleanup(tmp_path: Path, monkeypatch):
+    """Every other failure-injection test stubs `_record_scope`, which runs
+    before `BlobStore(root/'blobs')` is constructed, so none of them ever
+    reach that line. Without this test, a future edit that moved the
+    BlobStore construction back outside create()'s try/except would leave
+    fix (d) enforced there only by discipline, and the suite would stay
+    green."""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated BlobStore construction failure")
+
+    monkeypatch.setattr(engagement.blobs_mod, "BlobStore", boom)
+
+    with pytest.raises(RuntimeError):
+        engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+
+    assert not (tmp_path / "acme").exists()
