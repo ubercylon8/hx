@@ -6,6 +6,7 @@ rather than in the agent-facing tool layer.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -13,6 +14,8 @@ import click
 
 from hx import config as config_mod
 from hx import engagement as eng_mod
+
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def default_root() -> Path:
@@ -51,6 +54,19 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
     for field, value in (("NAME", name), ("--client", client)):
         if not value.strip():
             raise click.ClickException(f"{field} must not be empty")
+    # NAME becomes a path segment under the engagements root (`base / name`).
+    # Without this check, "." makes the engagements root ITSELF an
+    # engagement (so `rm -rf` of it destroys every client), ".." or
+    # "../escaped" walk outside the root, and an absolute NAME like
+    # "/tmp/anywhere" makes pathlib's `/` operator discard `base` entirely
+    # -- `--root` silently ignored. User-controlled NAME also reaches
+    # `shutil.rmtree` on create()'s failure path, so this has to hold before
+    # any directory is touched.
+    if not _NAME_RE.fullmatch(name) or name in (".", ".."):
+        raise click.ClickException(
+            "NAME must be 1-64 characters of letters, digits, dot, underscore "
+            "or hyphen, and must start with a letter or digit"
+        )
     base = root or default_root()
     cfg = config_mod.Config(
         name=name,
@@ -63,6 +79,12 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
         eng = eng_mod.create(base / name, cfg, author=author)
     except eng_mod.EngagementError as exc:
         raise click.ClickException(str(exc)) from exc
+    except config_mod.ConfigError as exc:
+        raise click.ClickException(f"invalid config for {base / name}: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot create the database at {base / name}: {exc}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"cannot create the engagement at {base / name}: {exc}") from exc
 
     click.echo(f"created engagement {name} ({eng.id})")
     click.echo(f"  root    {eng.root}")
