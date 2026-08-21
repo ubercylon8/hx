@@ -19,14 +19,26 @@ class CorruptBlob(Exception):
 
 class BlobStore:
     def __init__(self, root: Path):
-        self.root = Path(root)
+        self.root = Path(root).resolve()
         self.tmp = self.root / "tmp"
-        self.tmp.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.tmp, 0o700)
-        # Ensure all parent directories are also 0o700
-        for parent in self.tmp.parents:
-            if parent == self.root:
-                os.chmod(parent, 0o700)
+        self._secure_dir(self.tmp)
+
+    def _secure_dir(self, path: Path) -> None:
+        """Create directory and parents with mode 0o700, securing all levels."""
+        path.mkdir(parents=True, exist_ok=True)
+        current = path.resolve()
+        # Chmod the path and all its parents
+        while True:
+            try:
+                os.chmod(current, 0o700)
+            except PermissionError:
+                # Stop if we don't have permission to chmod this directory
+                break
+            next_parent = current.parent
+            if next_parent == current:
+                # Reached filesystem root
+                break
+            current = next_parent
 
     def path_for(self, digest: str) -> Path:
         return self.root / digest[:2] / digest[2:4] / digest
@@ -34,18 +46,15 @@ class BlobStore:
     def put(self, data: bytes) -> tuple[str, int]:
         digest = hashlib.sha256(data).hexdigest()
         final = self.path_for(digest)
-        if final.exists() and final.stat().st_size == len(data):
-            return digest, len(data)
+        if final.exists():
+            try:
+                if hashlib.sha256(final.read_bytes()).hexdigest() == digest:
+                    return digest, len(data)
+            except OSError:
+                pass  # unreadable: repair it
 
         # Create directories with mode 0o700
-        final.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(final.parent, 0o700)
-        # Ensure all parent directories are also 0o700
-        for parent in final.parent.parents:
-            if parent == self.root:
-                os.chmod(parent, 0o700)
-                break
-            os.chmod(parent, 0o700)
+        self._secure_dir(final.parent)
 
         # Create staging file with mode 0o600
         staging = self.tmp / f"{uuid.uuid4().hex}.part"
