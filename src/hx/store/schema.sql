@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS authorization (
   doc_blob      TEXT,
   doc_sha256    TEXT,
   signatory     TEXT,
-  valid_from    INTEGER,
-  valid_to      INTEGER,
+  valid_from_us INTEGER,
+  valid_to_us   INTEGER,
   scope_sha256  TEXT
 );
 
@@ -64,9 +64,9 @@ CREATE TABLE IF NOT EXISTS surface (
   discovered_by       TEXT NOT NULL DEFAULT 'proxy'
                       CHECK (discovered_by IN ('proxy','crawl','import','agent')),
   normaliser_version  INTEGER NOT NULL DEFAULT 1,
-  first_seen_run      TEXT,
-  last_seen_run       TEXT,
-  exemplar_exchange_id TEXT,
+  first_seen_run      TEXT REFERENCES run(id),
+  last_seen_run       TEXT REFERENCES run(id),
+  exemplar_exchange_id TEXT REFERENCES exchange(id),
   UNIQUE (engagement_id, method, scheme, host, port, path_template, query_key_set)
 );
 
@@ -144,8 +144,8 @@ CREATE TABLE IF NOT EXISTS finding (
                      CHECK (scope_level IN ('engagement','host','surface','insertion')),
   payload            TEXT,
   normaliser_version INTEGER NOT NULL DEFAULT 1,
-  first_seen_run     TEXT,
-  last_seen_run      TEXT,
+  first_seen_run     TEXT REFERENCES run(id),
+  last_seen_run      TEXT REFERENCES run(id),
   UNIQUE (engagement_id, dedupe_key)
 );
 
@@ -166,7 +166,8 @@ CREATE TABLE IF NOT EXISTS finding_status_event (
   id          TEXT PRIMARY KEY,
   finding_id  TEXT NOT NULL REFERENCES finding(id),
   from_status TEXT,
-  to_status   TEXT NOT NULL,
+  to_status   TEXT NOT NULL
+               CHECK (to_status IN ('new','triaged','confirmed','false_positive','reported')),
   actor       TEXT NOT NULL CHECK (actor IN ('agent','human','check')),
   note        TEXT,
   ts_us       INTEGER NOT NULL
@@ -179,6 +180,19 @@ BEFORE INSERT ON finding_status_event
 WHEN NEW.actor = 'agent' AND NEW.to_status IN ('confirmed','reported')
 BEGIN
   SELECT RAISE(ABORT, 'agent may not set status confirmed or reported');
+END;
+
+-- scope_version is append-only: tamper-evidence for contract disputes.
+CREATE TRIGGER IF NOT EXISTS trg_scope_version_no_update
+BEFORE UPDATE ON scope_version
+BEGIN
+  SELECT RAISE(ABORT, 'scope_version is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_scope_version_no_delete
+BEFORE DELETE ON scope_version
+BEGIN
+  SELECT RAISE(ABORT, 'scope_version is append-only');
 END;
 
 CREATE TABLE IF NOT EXISTS evidence (

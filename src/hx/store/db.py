@@ -34,8 +34,10 @@ def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     if readonly:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     else:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         conn = sqlite3.connect(path, isolation_level=None)
+        # Ensure database file has restricted permissions
+        path.chmod(0o600)
     conn.row_factory = sqlite3.Row
     if not readonly:
         # journal_mode is a write to the database header, so it raises
