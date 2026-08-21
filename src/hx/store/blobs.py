@@ -24,21 +24,22 @@ class BlobStore:
         self._secure_dir(self.tmp)
 
     def _secure_dir(self, path: Path) -> None:
-        """Create directory and parents with mode 0o700, securing all levels."""
+        """Create `path` and any missing ancestors, chmodding ONLY what we create.
+
+        A directory that already exists belongs to the user, not to this store:
+        re-permissioning it would silently change their filesystem.
+        """
+        missing = []
+        probe = path
+        while not probe.exists():
+            missing.append(probe)
+            if probe.parent == probe:      # reached the filesystem root
+                break
+            probe = probe.parent
+
         path.mkdir(parents=True, exist_ok=True)
-        current = path.resolve()
-        # Chmod the path and all its parents
-        while True:
-            try:
-                os.chmod(current, 0o700)
-            except PermissionError:
-                # Stop if we don't have permission to chmod this directory
-                break
-            next_parent = current.parent
-            if next_parent == current:
-                # Reached filesystem root
-                break
-            current = next_parent
+        for created in reversed(missing):
+            os.chmod(created, 0o700)
 
     def path_for(self, digest: str) -> Path:
         return self.root / digest[:2] / digest[2:4] / digest

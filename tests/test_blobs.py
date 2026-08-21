@@ -88,15 +88,30 @@ def test_put_repairs_a_same_length_corruption(tmp_path: Path):
 
 
 def test_nested_directory_creation_secures_all_levels(tmp_path: Path):
-    """All directories created by BlobStore should be 0o700, even if parent doesn't exist."""
-    # Create BlobStore at a path where parent doesn't exist
+    """All directories created by BlobStore should be 0o700, even if parents don't exist."""
+    # Create BlobStore at a path where parents don't exist
     nested_root = tmp_path / "nonexistent" / "nested" / "root"
     store = BlobStore(nested_root)
     digest, _ = store.put(b"test data")
 
-    # Check that tmp directory and all parents up to nested_root are 0o700
+    # Check that directories created by BlobStore are 0o700
     tmp_dir = nested_root / "tmp"
     for path in [tmp_dir, nested_root, tmp_path / "nonexistent" / "nested"]:
-        if path.is_dir():
-            mode = path.stat().st_mode & 0o777
-            assert mode == 0o700, f"Directory {path} has mode {oct(mode)}, expected 0o700"
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o700, f"Created directory {path} has mode {oct(mode)}, expected 0o700"
+
+
+def test_preexisting_directories_left_alone(tmp_path: Path):
+    """Regression test: BlobStore must not chmod pre-existing directories."""
+    # Create a pre-existing directory with mode 0o755
+    preexisting = tmp_path / "preexisting"
+    preexisting.mkdir(mode=0o755)
+
+    # Create BlobStore in a subdirectory beneath it
+    store_root = preexisting / "store" / "root"
+    store = BlobStore(store_root)
+    store.put(b"test data")
+
+    # Assert the pre-existing directory was NOT modified
+    mode = preexisting.stat().st_mode & 0o777
+    assert mode == 0o755, f"Pre-existing directory was modified to {oct(mode)}, expected 0o755"
