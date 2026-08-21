@@ -43,7 +43,8 @@
   - `hx.bridge.codec.MAX_FRAME: int` — `64 * 1024 * 1024`
   - `hx.bridge.codec.encode(header: dict, body: bytes = b"") -> bytes`
   - `hx.bridge.codec.decode(buf: bytes) -> tuple[dict, bytes, int]` — returns `(header, body, bytes_consumed)`; raises `Incomplete` when `buf` holds less than one whole frame
-  - `hx.bridge.codec.read_frame(sock) -> tuple[dict, bytes]` — blocking read of exactly one frame
+  - `hx.bridge.codec.FrameReader(sock)` with `.read() -> tuple[dict, bytes]` — owns the buffer across calls
+  - `hx.bridge.codec.PeerClosed(Exception)`
   - `hx.bridge.codec.Incomplete(Exception)`, `hx.bridge.codec.FrameError(Exception)`
   - `hx.bridge.codec.parse_config_body(body: bytes) -> dict[str, list[str]]`
   - `hx.bridge.codec.build_config_body(pairs: dict[str, list[str]]) -> bytes`
@@ -78,6 +79,21 @@ Every frame:
 Request/response frames (`send`, `result`, `error`, `configure`, `configured`):
   id         integer  monotonic, set by the sender of the request
   deadline_us integer absolute microseconds; the receiver abandons work past it
+
+## Two things a second implementation must match
+
+**Key order is preserved on the wire.** The header is written in insertion
+order, and the golden vectors compare exact bytes. A writer using an unordered
+map produces a semantically identical header with different bytes and fails the
+vector comparison. Parsing is order-independent; only the byte comparison cares.
+
+**Header integers are 64-bit signed.** `deadline_us` is absolute microseconds
+since epoch -- about 1.79e15 today, which overflows a 32-bit integer by roughly
+six orders of magnitude. Parse header numbers into a 64-bit type. Floats and
+exponents are not valid header numbers.
+
+**Non-ASCII header values are raw UTF-8, not `\uXXXX` escapes.** Only the
+characters JSON requires are escaped: `"` `\\` and the control characters.
 
 ## Frame types
 
@@ -157,6 +173,36 @@ Both the Python and the Java codec are tested against this same file. It is the 
     {
       "name": "empty_header_values",
       "header": {"v": 1, "t": "error", "id": 3, "class": "scope_denied", "detail": ""},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "header_value_needing_json_escapes",
+      "header": {"v": 1, "t": "error", "id": 4, "detail": "quote\" back\\ tab\t nl\n ctrl\u0001"},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "header_value_non_ascii",
+      "header": {"v": 1, "t": "error", "id": 5, "detail": "éü中 \u00e9"},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "header_integer_beyond_int32",
+      "header": {"v": 1, "t": "send", "id": 6, "deadline_us": 1787355131378277},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "header_negative_integer",
+      "header": {"v": 1, "t": "result", "id": 7, "ms": -1},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "empty_body_is_zero_bytes_not_absent",
+      "header": {"v": 1, "t": "hello", "id": 8},
       "body_utf8": "",
       "hex": ""
     }
@@ -395,6 +441,11 @@ class FrameError(Exception):
     """The bytes are not a valid frame, or the header is not encodable."""
 
 
+class PeerClosed(Exception):
+    """The far end went away. Distinct from Incomplete, which means "call
+    again"; conflating them makes a caller busy-loop against a dead socket."""
+
+
 def _check_header(header: dict) -> None:
     for required in ("v", "t"):
         if required not in header:
@@ -434,27 +485,54 @@ def decode(buf: bytes) -> tuple[dict, bytes, int]:
         raise FrameError("header has no newline terminator")
     try:
         header = json.loads(payload[:nl].decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
+    except ValueError as exc:          # UnicodeDecodeError is a ValueError
         raise FrameError(f"header is not valid JSON: {exc}") from exc
     if not isinstance(header, dict):
         raise FrameError("header must be a JSON object")
+    # Validate on receipt too, not only on send. The flat restriction exists to
+    # bound what the far side may produce, so this is the one place that can
+    # actually defend it against a peer that ignores the contract.
+    _check_header(header)
     return header, payload[nl + 1 : end], end
 
 
-def read_frame(sock: socket.socket) -> tuple[dict, bytes]:
-    """Read exactly one frame, reassembling across however many chunks the
-    kernel decides to give us."""
-    buf = bytearray()
-    while True:
-        try:
-            header, body, _ = decode(bytes(buf))
-            return header, body
-        except Incomplete:
-            pass
-        chunk = sock.recv(65536)
-        if not chunk:
-            raise Incomplete("peer closed mid-frame")
-        buf.extend(chunk)
+class FrameReader:
+    """Reads frames from a socket, owning the buffer across calls.
+
+    A bare ``read_frame(sock)`` function cannot be correct here. ``decode``
+    reports ``bytes_consumed`` precisely because one ``recv`` may deliver more
+    than one frame, and a function that returns after the first frame has
+    nowhere to put the remainder -- so it drops it, and the loss surfaces later
+    as a misleading "peer closed mid-frame". Owning the buffer is that
+    somewhere.
+
+    It also reads the length prefix before attempting a decode, so draining a
+    large frame is linear rather than re-parsing a growing buffer per chunk.
+    """
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._buf = bytearray()
+
+    def read(self) -> tuple[dict, bytes]:
+        while True:
+            if len(self._buf) >= _LEN.size:
+                (length,) = _LEN.unpack_from(self._buf, 0)
+                if length > MAX_FRAME:
+                    raise FrameError(
+                        f"declared frame of {length} bytes exceeds MAX_FRAME {MAX_FRAME}"
+                    )
+                end = _LEN.size + length
+                if len(self._buf) >= end:
+                    header, body, consumed = decode(bytes(self._buf[:end]))
+                    del self._buf[:consumed]
+                    return header, body
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise PeerClosed(
+                    "peer closed mid-frame" if self._buf else "peer closed"
+                )
+            self._buf.extend(chunk)
 
 
 def build_config_body(pairs: dict[str, list[str]]) -> bytes:
@@ -1457,11 +1535,12 @@ class BridgeServer:
                 return
             self.peer_pid, self.peer_uid = pid, uid
 
+            reader = codec.FrameReader(conn)
             while not self._stopping.is_set():
-                header, body = codec.read_frame(conn)
+                header, body = reader.read()
                 if not self._handle(header, body):
                     return
-        except (codec.Incomplete, codec.FrameError, OSError):
+        except (codec.PeerClosed, codec.Incomplete, codec.FrameError, OSError):
             return
         finally:
             self._reset()
