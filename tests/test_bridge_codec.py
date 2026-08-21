@@ -68,6 +68,22 @@ def test_oversized_length_prefix_is_refused_before_allocating():
         codec.decode(evil)
 
 
+def test_frame_of_exactly_max_frame_bytes_succeeds():
+    """A frame at the boundary should succeed; only MAX_FRAME+1 should fail."""
+    # Create a frame that is exactly MAX_FRAME bytes (header + body, not including length prefix)
+    header = {"v": 1, "t": "send"}
+    # Calculate body size to reach exactly MAX_FRAME
+    header_json = b'{"v":1,"t":"send"}'
+    header_with_newline = header_json + b"\n"
+    payload_size = codec.MAX_FRAME - len(header_with_newline)
+    body = b"x" * payload_size
+    raw = codec.encode(header, body)
+    # Verify it succeeds
+    decoded_header, decoded_body, _ = codec.decode(raw)
+    assert decoded_header == header
+    assert decoded_body == body
+
+
 def test_header_without_a_newline_terminator_is_a_frame_error():
     body = b'{"v":1,"t":"hello"}'          # no trailing newline
     raw = len(body).to_bytes(4, "big") + body
@@ -91,6 +107,35 @@ def test_nested_header_values_are_refused_on_encode():
         codec.encode({"v": 1, "t": "send", "methods": ["GET"]})
 
 
+def test_flat_header_validated_on_decode():
+    """The flat restriction is validated on receipt too, not only on send.
+    This defends against a peer that ignores the contract."""
+    # Nested object
+    bad = b'{"v":1,"t":"send","scope":{"include":["x"]}}\n'
+    raw = len(bad).to_bytes(4, "big") + bad
+    with pytest.raises(codec.FrameError, match="flat"):
+        codec.decode(raw)
+    # Array
+    bad = b'{"v":1,"t":"send","methods":["GET"]}\n'
+    raw = len(bad).to_bytes(4, "big") + bad
+    with pytest.raises(codec.FrameError, match="flat"):
+        codec.decode(raw)
+
+
+def test_missing_required_header_fields_on_decode():
+    """Missing v or t is an error on decode, defending against malformed peers."""
+    # Missing v
+    bad = b'{"t":"send"}\n'
+    raw = len(bad).to_bytes(4, "big") + bad
+    with pytest.raises(codec.FrameError, match="v"):
+        codec.decode(raw)
+    # Missing t
+    bad = b'{"v":1}\n'
+    raw = len(bad).to_bytes(4, "big") + bad
+    with pytest.raises(codec.FrameError, match="t"):
+        codec.decode(raw)
+
+
 def test_missing_required_header_fields_are_refused_on_encode():
     with pytest.raises(codec.FrameError, match="v"):
         codec.encode({"t": "hello"})
@@ -98,7 +143,7 @@ def test_missing_required_header_fields_are_refused_on_encode():
         codec.encode({"v": 1})
 
 
-def test_read_frame_reassembles_across_socket_chunks():
+def test_frame_reader_reassembles_across_socket_chunks():
     """Stream sockets split writes wherever they like."""
     payload = b"x" * 100_000
     raw = codec.encode({"v": 1, "t": "result", "id": 5}, payload)
@@ -106,9 +151,31 @@ def test_read_frame_reassembles_across_socket_chunks():
     try:
         for i in range(0, len(raw), 4096):
             a.sendall(raw[i : i + 4096])
-        header, body = codec.read_frame(b)
+        reader = codec.FrameReader(b)
+        header, body = reader.read()
         assert header["id"] == 5
         assert body == payload
+    finally:
+        a.close()
+        b.close()
+
+
+def test_frame_reader_handles_coalesced_frames():
+    """Regression guard: two frames written in one sendall must be read separately.
+    The kernel may coalesce them; the reader must buffer and return them one at a time."""
+    f1 = codec.encode({"v": 1, "t": "hello", "id": 1})
+    f2 = codec.encode({"v": 1, "t": "hello", "id": 2})
+    f3 = codec.encode({"v": 1, "t": "hello", "id": 3})
+    a, b = socket.socketpair()
+    try:
+        a.sendall(f1 + f2 + f3)  # all three in one write
+        reader = codec.FrameReader(b)
+        header1, _ = reader.read()
+        assert header1["id"] == 1
+        header2, _ = reader.read()
+        assert header2["id"] == 2
+        header3, _ = reader.read()
+        assert header3["id"] == 3
     finally:
         a.close()
         b.close()

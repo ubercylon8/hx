@@ -40,6 +40,11 @@ class FrameError(Exception):
     """The bytes are not a valid frame, or the header is not encodable."""
 
 
+class PeerClosed(Exception):
+    """The far end went away. Distinct from Incomplete, which means "call
+    again"; conflating them makes a caller busy-loop against a dead socket."""
+
+
 def _check_header(header: dict) -> None:
     for required in ("v", "t"):
         if required not in header:
@@ -79,27 +84,54 @@ def decode(buf: bytes) -> tuple[dict, bytes, int]:
         raise FrameError("header has no newline terminator")
     try:
         header = json.loads(payload[:nl].decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
+    except ValueError as exc:  # UnicodeDecodeError is a ValueError
         raise FrameError(f"header is not valid JSON: {exc}") from exc
     if not isinstance(header, dict):
         raise FrameError("header must be a JSON object")
+    # Validate on receipt too, not only on send. The flat restriction exists to
+    # bound what the far side may produce, so this is the one place that can
+    # actually defend it against a peer that ignores the contract.
+    _check_header(header)
     return header, payload[nl + 1 : end], end
 
 
-def read_frame(sock: socket.socket) -> tuple[dict, bytes]:
-    """Read exactly one frame, reassembling across however many chunks the
-    kernel decides to give us."""
-    buf = bytearray()
-    while True:
-        try:
-            header, body, _ = decode(bytes(buf))
-            return header, body
-        except Incomplete:
-            pass
-        chunk = sock.recv(65536)
-        if not chunk:
-            raise Incomplete("peer closed mid-frame")
-        buf.extend(chunk)
+class FrameReader:
+    """Reads frames from a socket, owning the buffer across calls.
+
+    A bare ``read_frame(sock)`` function cannot be correct here. ``decode``
+    reports ``bytes_consumed`` precisely because one ``recv`` may deliver more
+    than one frame, and a function that returns after the first frame has
+    nowhere to put the remainder -- so it drops it, and the loss surfaces later
+    as a misleading "peer closed mid-frame". Owning the buffer is that
+    somewhere.
+
+    It also reads the length prefix before attempting a decode, so draining a
+    large frame is linear rather than re-parsing a growing buffer per chunk.
+    """
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._buf = bytearray()
+
+    def read(self) -> tuple[dict, bytes]:
+        while True:
+            if len(self._buf) >= _LEN.size:
+                (length,) = _LEN.unpack_from(self._buf, 0)
+                if length > MAX_FRAME:
+                    raise FrameError(
+                        f"declared frame of {length} bytes exceeds MAX_FRAME {MAX_FRAME}"
+                    )
+                end = _LEN.size + length
+                if len(self._buf) >= end:
+                    header, body, consumed = decode(bytes(self._buf[:end]))
+                    del self._buf[:consumed]
+                    return header, body
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise PeerClosed(
+                    "peer closed mid-frame" if self._buf else "peer closed"
+                )
+            self._buf.extend(chunk)
 
 
 def build_config_body(pairs: dict[str, list[str]]) -> bytes:

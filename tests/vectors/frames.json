@@ -54,6 +54,60 @@
       },
       "body_utf8": "",
       "hex": "0000003e7b2276223a312c2274223a226572726f72222c226964223a332c22636c617373223a2273636f70655f64656e696564222c2264657461696c223a22227d0a"
+    },
+    {
+      "name": "header_value_needing_json_escapes",
+      "header": {
+        "v": 1,
+        "t": "error",
+        "id": 4,
+        "detail": "quote\" back\\ tab\t nl\n ctrl\u0001"
+      },
+      "body_utf8": "",
+      "hex": "0000004b7b2276223a312c2274223a226572726f72222c226964223a342c2264657461696c223a2271756f74655c22206261636b5c5c207461625c74206e6c5c6e206374726c5c7530303031227d0a"
+    },
+    {
+      "name": "header_value_non_ascii",
+      "header": {
+        "v": 1,
+        "t": "error",
+        "id": 5,
+        "detail": "éü中 é"
+      },
+      "body_utf8": "",
+      "hex": "000000317b2276223a312c2274223a226572726f72222c226964223a352c2264657461696c223a22c3a9c3bce4b8ad20c3a9227d0a"
+    },
+    {
+      "name": "header_integer_beyond_int32",
+      "header": {
+        "v": 1,
+        "t": "send",
+        "id": 6,
+        "deadline_us": 1787355131378277
+      },
+      "body_utf8": "",
+      "hex": "000000397b2276223a312c2274223a2273656e64222c226964223a362c22646561646c696e655f7573223a313738373335353133313337383237377d0a"
+    },
+    {
+      "name": "header_negative_integer",
+      "header": {
+        "v": 1,
+        "t": "result",
+        "id": 7,
+        "ms": -1
+      },
+      "body_utf8": "",
+      "hex": "000000247b2276223a312c2274223a22726573756c74222c226964223a372c226d73223a2d317d0a"
+    },
+    {
+      "name": "empty_body_is_zero_bytes_not_absent",
+      "header": {
+        "v": 1,
+        "t": "hello",
+        "id": 8
+      },
+      "body_utf8": "",
+      "hex": "0000001b7b2276223a312c2274223a2268656c6c6f222c226964223a387d0a"
     }
   ]
 }

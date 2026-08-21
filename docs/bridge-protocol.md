@@ -24,6 +24,21 @@ Request/response frames (`send`, `result`, `error`, `configure`, `configured`):
   id         integer  monotonic, set by the sender of the request
   deadline_us integer absolute microseconds; the receiver abandons work past it
 
+## Two things a second implementation must match
+
+**Key order is preserved on the wire.** The header is written in insertion
+order, and the golden vectors compare exact bytes. A writer using an unordered
+map produces a semantically identical header with different bytes and fails the
+vector comparison. Parsing is order-independent; only the byte comparison cares.
+
+**Header integers are 64-bit signed.** `deadline_us` is absolute microseconds
+since epoch -- about 1.79e15 today, which overflows a 32-bit integer by roughly
+six orders of magnitude. Parse header numbers into a 64-bit type. Floats and
+exponents are not valid header numbers.
+
+**Non-ASCII header values are raw UTF-8, not `\uXXXX` escapes.** Only the
+characters JSON requires are escaped: `"` `\\` and the control characters.
+
 ## Frame types
 
   burp -> py   hello       {v,t,ext_version,pid,burp_version,instance_id,engagement_id}
