@@ -104,9 +104,17 @@ def load(path: Path) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
 
+    # `if not raw.get(required)` is a truthiness test: `name: 123` and
+    # `name: true` pass it (both truthy) and reach the database and the
+    # report as coerced values. Every other field in this module rejects
+    # rather than coerces; name/client must not be the exception.
     for required in ("name", "client"):
-        if not raw.get(required):
-            raise ConfigError(f"config is missing required key: {required}")
+        value = raw.get(required)
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"config key {required!r} must be a non-empty string, "
+                f"got {value!r} ({type(value).__name__})"
+            )
 
     profile = raw.get("safety_profile", "production")
     if profile not in VALID_PROFILES:
