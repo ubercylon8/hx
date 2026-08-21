@@ -826,6 +826,45 @@ class Config:
     slug_threshold: int = 12
 
 
+def _mapping(raw: dict, key: str) -> dict:
+    """A YAML block that must be a mapping, or absent."""
+    v = raw.get(key)
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        raise ConfigError(f"{key} must be a mapping, got {type(v).__name__}")
+    return v
+
+
+def _string_list(raw: dict, key: str, default: list[str]) -> list[str]:
+    """A list of strings.
+
+    Absent means "use the default". An explicitly written empty list means
+    empty -- the operator said so in the file, which is what the spec's
+    "written down explicitly, where it is recorded and reviewable" requires.
+
+    A non-list is REJECTED rather than coerced. `list("custom")` yields
+    ['c','u','s','t','o','m'], which for dangerous_paths is a denylist that
+    looks populated and matches nothing.
+    """
+    if key not in raw or raw[key] is None:
+        return list(default)
+    v = raw[key]
+    if not isinstance(v, list):
+        raise ConfigError(f"{key} must be a list, got {type(v).__name__}")
+    if not all(isinstance(x, str) for x in v):
+        raise ConfigError(f"every entry in {key} must be a string")
+    return list(v)
+
+
+def _positive_int(raw: dict, key: str, default: int) -> int:
+    v = raw.get(key, default)
+    # bool is a subclass of int; `rate_limit_rps: true` must not become 1.
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ConfigError(f"{key} must be an integer >= 1, got {v!r}")
+    return v
+
+
 def load(path: Path) -> Config:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
@@ -841,28 +880,38 @@ def load(path: Path) -> Config:
             f"safety_profile must be one of {VALID_PROFILES}, got {profile!r}"
         )
 
-    scope = raw.get("scope") or {}
-    include = scope.get("include") or []
+    scope = _mapping(raw, "scope")
+    include = _string_list(scope, "include", [])
     if not include:
         raise ConfigError("scope.include must list at least one target pattern")
 
+    # Every check flag must be a real bool. A quoted "false" is a truthy
+    # string, so an operator writing `active_mutate: "false"` to DISABLE
+    # state-changing checks would silently ENABLE them.
     checks = dict(DEFAULT_CHECKS)
-    checks.update(raw.get("checks") or {})
+    for name, value in _mapping(raw, "checks").items():
+        if name not in DEFAULT_CHECKS:
+            raise ConfigError(
+                f"unknown check class {name!r}; valid: {sorted(DEFAULT_CHECKS)}"
+            )
+        if not isinstance(value, bool):
+            raise ConfigError(f"checks.{name} must be true or false, got {value!r}")
+        checks[name] = value
 
     return Config(
         name=raw["name"],
         client=raw["client"],
         safety_profile=profile,
-        scope_include=list(include),
-        scope_exclude=list(scope.get("exclude") or []),
-        render_allow=list(raw.get("render_allow") or []),
-        dangerous_paths=list(raw.get("dangerous_paths") or DEFAULT_DANGEROUS_PATHS),
+        scope_include=include,
+        scope_exclude=_string_list(scope, "exclude", []),
+        render_allow=_string_list(raw, "render_allow", []),
+        dangerous_paths=_string_list(raw, "dangerous_paths", DEFAULT_DANGEROUS_PATHS),
         checks=checks,
-        rate_limit_rps=int(raw.get("rate_limit_rps", 5)),
-        max_concurrency=int(raw.get("max_concurrency", 2)),
-        identities=dict(raw.get("identities") or {}),
-        preserve_segments=list(raw.get("preserve_segments") or ["api", "v1", "v2", "v3"]),
-        slug_threshold=int(raw.get("slug_threshold", 12)),
+        rate_limit_rps=_positive_int(raw, "rate_limit_rps", 5),
+        max_concurrency=_positive_int(raw, "max_concurrency", 2),
+        identities=_mapping(raw, "identities"),
+        preserve_segments=_string_list(raw, "preserve_segments", ["api", "v1", "v2", "v3"]),
+        slug_threshold=_positive_int(raw, "slug_threshold", 12),
     )
 
 
