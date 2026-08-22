@@ -25,10 +25,22 @@ public final class BridgeClient {
         public NotConfigured(String m) { super(m); }
     }
 
+    /**
+     * The two logging calls the bridge makes. Montoya's Logging satisfies it
+     * through an adapter and the test fake implements it directly. Declaring
+     * it here is what keeps BridgeClient free of a compile-time Montoya
+     * dependency -- and unlike the `Object log` it replaces, it can actually
+     * be called.
+     */
+    public interface Log {
+        void info(String s);
+        void error(String s);
+    }
+
     private final Path socketPath;
     private final String engagementId;
     private final String instanceId;
-    private final Object log;
+    private final Log log;
 
     private SocketChannel channel;
     private InputStream in;
@@ -41,7 +53,7 @@ public final class BridgeClient {
     private volatile String haltReason = null;
     private long epochCounter = 0;
 
-    public BridgeClient(Path socketPath, String engagementId, String instanceId, Object log) {
+    public BridgeClient(Path socketPath, String engagementId, String instanceId, Log log) {
         this.socketPath = socketPath;
         this.engagementId = engagementId;
         this.instanceId = instanceId;
@@ -89,13 +101,27 @@ public final class BridgeClient {
                 Frame.Decoded f = reader.read();
                 if (!handle(f)) return;
             }
-        } catch (Frame.PeerClosed | IOException e) {
-            // Peer closed. DENY-ALL is also the terminal state.
-            configured.set(false);
+        } catch (Frame.PeerClosed | Frame.FrameError | IOException e) {
+            // The expected ways a connection ends. Nothing to do here: the
+            // finally block is what enforces the terminal state.
+        } finally {
+            // DENY-ALL on EVERY exit path, not just the ones named above. The
+            // `return` out of the loop -- a protocol mismatch -- skips the
+            // catch blocks entirely, and used to leave maySend() true with a
+            // dead read loop and no control channel: the extension would keep
+            // issuing requests that nothing could halt. This is the same shape
+            // as the Python side's _reset() in _serve()'s finally, and for the
+            // same reason.
+            boolean wasConfigured = configured.getAndSet(false);
             configEpoch = 0;
-        } catch (Frame.FrameError e) {
-            configured.set(false);
+            scopeConfig = Map.of();
+            closeChannel();
+            if (wasConfigured) log.info("hx: control channel gone, deny-all");
         }
+    }
+
+    private void closeChannel() {
+        try { if (channel != null) channel.close(); } catch (IOException ignored) { }
     }
 
     private boolean handle(Frame.Decoded f) throws IOException {
@@ -166,6 +192,8 @@ public final class BridgeClient {
 
     public void close() {
         configured.set(false);
-        try { if (channel != null) channel.close(); } catch (IOException ignored) { }
+        configEpoch = 0;
+        scopeConfig = Map.of();
+        closeChannel();
     }
 }

@@ -98,6 +98,32 @@ public class BridgeClientTest {
                       "error".equals(err.header.get("t")));
                 check("error class names the mismatch",
                       String.valueOf(err.header.get("class")).contains("engagement"));
+
+                // 6. a protocol-mismatch frame while configured must trip
+                // DENY-ALL through readLoop's OTHER exit path. handle()
+                // returns false here, and the bare `return` that used to
+                // follow skipped both catch blocks entirely: configured
+                // stayed true, configEpoch kept its value, and maySend()
+                // would answer true forever with a dead read loop and no
+                // control channel behind it. This is the exact leak the
+                // finally block in readLoop() exists to close.
+                check("configured before the protocol-mismatch frame", client.maySend());
+                Map<String, Object> badVersion = new LinkedHashMap<>();
+                badVersion.put("v", 2L); badVersion.put("t", "halt"); badVersion.put("reason", "operator");
+                out.write(Frame.encode(badVersion, new byte[0])); out.flush();
+                Frame.Decoded mismatch = reader.read();
+                check("protocol mismatch answered with error",
+                      "error".equals(mismatch.header.get("t")));
+                check("error class names the protocol mismatch",
+                      "protocol_mismatch".equals(mismatch.header.get("class")));
+                waitUntil(() -> !client.maySend());
+                check("protocol mismatch trips DENY-ALL via readLoop's return path",
+                      !client.maySend());
+                boolean deniedAfterMismatch = false;
+                try { client.checkMaySend(); }
+                catch (BridgeClient.NotConfigured e) { deniedAfterMismatch = true; }
+                check("checkMaySend throws after the protocol-mismatch DENY-ALL",
+                      deniedAfterMismatch);
             }
             client.close();
         } finally {

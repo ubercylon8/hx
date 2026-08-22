@@ -550,3 +550,31 @@ def test_configure_never_leaves_a_lying_state_under_stress(srv, monkeypatch):
                 c.close()
             except OSError:
                 pass
+
+
+def test_an_error_reply_to_configure_reports_what_the_peer_said(srv):
+    c = _connected(srv)
+    try:
+        out = {}
+
+        def go():
+            try:
+                srv.configure({"scope.include": ["https://a/*"]},
+                              scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out["err"] = str(exc)
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = codec.FrameReader(c).read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "engagement_mismatch",
+                                "detail": "e-1 != SOMEONE-ELSE"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+        assert "engagement_mismatch" in out["err"], out
+        assert "SOMEONE-ELSE" in out["err"], out
+        assert "without a config_epoch" not in out["err"], out
+    finally:
+        c.close()

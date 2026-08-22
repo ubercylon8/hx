@@ -271,6 +271,15 @@ class BridgeServer:
             },
             codec.build_config_body(pairs),
         )
+        if reply.get("t") == "error":
+            # Surface what the peer actually said. Falling through to the
+            # generic message below turns "engagement_mismatch: e-1 != e-2"
+            # into "acknowledged configure without a config_epoch", which
+            # sends the next debugger looking in the wrong place entirely.
+            raise BridgeError(
+                "peer refused configure: "
+                f"{reply.get('class', 'unspecified')}: {reply.get('detail', '')}".rstrip(": ")
+            )
         if "config_epoch" not in reply:
             raise BridgeError("peer acknowledged configure without a config_epoch")
         with self._lock:

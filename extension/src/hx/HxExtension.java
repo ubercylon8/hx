@@ -30,7 +30,10 @@ public class HxExtension implements BurpExtension {
         }
         System.setProperty("hx.burp.version", api.burpSuite().version().toString());
 
-        client = new BridgeClient(Path.of(sock), engagement, instance, api.logging());
+        client = new BridgeClient(Path.of(sock), engagement, instance, new BridgeClient.Log() {
+            public void info(String s)  { api.logging().logToOutput(s); }
+            public void error(String s) { api.logging().logToError(s); }
+        });
         Thread t = new Thread(() -> {
             try {
                 client.connect();

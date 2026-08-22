@@ -7,7 +7,7 @@ package hx.bridge;
  */
 public final class FakeMontoya {
 
-    public static final class Logger {
+    public static final class Logger implements BridgeClient.Log {
         public final StringBuilder out = new StringBuilder();
         public final StringBuilder err = new StringBuilder();
         public void info(String s) { out.append(s).append('\n'); }
