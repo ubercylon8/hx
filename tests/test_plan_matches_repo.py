@@ -13,6 +13,12 @@ guarantee belongs in the suite, not in a habit.
 Blocks are matched by their first line -- a `// path` or `# path` marker naming
 the file. A block for a file that does not exist yet is skipped, since the plan
 legitimately describes work not yet done.
+
+Deliberately NOT covered: bash blocks (`extension/build.sh`, `extension/test.sh`).
+`test.sh` is legitimately staged across tasks -- Task 2 shows it running one
+test class and Task 4 adds the second -- so a straight byte-compare would be
+wrong there, and a staging exception is a different design than this file. If
+bash blocks are ever added here, they need that exception first.
 """
 from __future__ import annotations
 
