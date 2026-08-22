@@ -42,9 +42,21 @@ public final class BridgeClient {
     private final String instanceId;
     private final Log log;
 
-    private SocketChannel channel;
-    private InputStream in;
-    private OutputStream out;
+    private volatile SocketChannel channel;
+    private volatile InputStream in;
+    private volatile OutputStream out;
+
+    // F1: close() must be STICKY. Without it a client that was closed before
+    // its dial completed goes on to hello, configure and live sending -- an
+    // unloaded extension holding a control channel on a daemon thread.
+    private volatile boolean closed = false;
+
+    // close() and the read loop's configure commit both mutate the permission
+    // state from different threads. Re-checking `closed` after the commit only
+    // makes the window narrow (~ns); this monitor makes it not exist. In a
+    // component whose whole job is refusing to send, "too small to observe" is
+    // not the same as "cannot happen".
+    private final Object commitLock = new Object();
 
     private final AtomicBoolean configured = new AtomicBoolean(false);
     private final AtomicBoolean halted = new AtomicBoolean(false);
@@ -65,6 +77,16 @@ public final class BridgeClient {
     public Map<String, List<String>> scopeConfig() { return scopeConfig; }
     public boolean maySend() { return configured.get() && !halted.get(); }
 
+    /** Drop to DENY-ALL. Returns whether the client had been configured.
+     *  `configured` is cleared FIRST: maySend() reads only that and `halted`,
+     *  so no observer sees permission outlive the scope behind it. */
+    private boolean denyAll() {
+        boolean was = configured.getAndSet(false);
+        configEpoch = 0;
+        scopeConfig = Map.of();
+        return was;
+    }
+
     /** Throws unless the extension is configured and not halted. */
     public void checkMaySend() {
         if (!configured.get())
@@ -74,6 +96,7 @@ public final class BridgeClient {
     }
 
     public void connect() throws IOException {
+        if (closed) throw new IOException("this client is closed; make a new one");
         channel = SocketChannel.open(UnixDomainSocketAddress.of(socketPath));
         in = Channels.newInputStream(channel);
         out = Channels.newOutputStream(channel);
@@ -86,7 +109,15 @@ public final class BridgeClient {
         hello.put("burp_version", System.getProperty("hx.burp.version", "unknown"));
         hello.put("instance_id", instanceId);
         hello.put("engagement_id", engagementId);
-        send(hello, new byte[0]);
+        try {
+            send(hello, new byte[0]);
+        } catch (IOException | RuntimeException e) {
+            closeChannel();          // F6: a dialled channel must not outlive a failed hello
+            throw e;
+        }
+        // close() may have run while we were dialling: it had no channel to
+        // shut and nothing configured to clear, so it left no trace here.
+        if (closed) { closeChannel(); return; }
 
         readLoop();
     }
@@ -112,9 +143,7 @@ public final class BridgeClient {
             // issuing requests that nothing could halt. This is the same shape
             // as the Python side's _reset() in _serve()'s finally, and for the
             // same reason.
-            boolean wasConfigured = configured.getAndSet(false);
-            configEpoch = 0;
-            scopeConfig = Map.of();
+            boolean wasConfigured = denyAll();
             closeChannel();
             if (wasConfigured) log.info("hx: control channel gone, deny-all");
         }
@@ -125,6 +154,7 @@ public final class BridgeClient {
     }
 
     private boolean handle(Frame.Decoded f) throws IOException {
+        if (closed) return false;
         Object v = f.header.get("v");
         if (!Long.valueOf(PROTOCOL_VERSION).equals(v)) {
             error(f, "protocol_mismatch", "expected v=" + PROTOCOL_VERSION + " got " + v);
@@ -149,12 +179,26 @@ public final class BridgeClient {
                 try {
                     scopeConfig = ConfigBody.parse(f.body);
                 } catch (Frame.FrameError e) {
+                    // Unknown intent means DENY, not "carry on under the last
+                    // intent". The likeliest trigger is an operator NARROWING
+                    // scope with a key this jar predates: keeping the old,
+                    // wider scope would then send exactly where they just said
+                    // not to. Unlike engagement_mismatch and bad_frame above --
+                    // neither of which is our peer trying to configure us --
+                    // this one is, and it failed.
+                    denyAll();
                     error(f, "bad_config", e.getMessage());
                     return true;
                 }
-                configEpoch = ++epochCounter;
-                configured.set(true);
-                halted.set(false);
+                synchronized (commitLock) {
+                    // Either close() got here first -- and we must not undo it
+                    // -- or it cannot arrive until this commit is complete and
+                    // will then clear it. No ordering in between exists.
+                    if (closed) return false;
+                    configEpoch = ++epochCounter;
+                    configured.set(true);
+                    halted.set(false);
+                }
 
                 Map<String, Object> ack = new LinkedHashMap<>();
                 ack.put("v", PROTOCOL_VERSION);
@@ -191,9 +235,10 @@ public final class BridgeClient {
     }
 
     public void close() {
-        configured.set(false);
-        configEpoch = 0;
-        scopeConfig = Map.of();
-        closeChannel();
+        synchronized (commitLock) {
+            closed = true;           // sticky: checked by connect() and handle()
+            denyAll();
+        }
+        closeChannel();              // I/O outside the monitor
     }
 }

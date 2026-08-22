@@ -4,6 +4,7 @@ import java.io.*;
 import java.net.*;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 
@@ -86,8 +87,9 @@ public class BridgeClientTest {
 
                 out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0])); out.flush();
                 waitUntil(() -> client.maySend());
-                client.checkMaySend();
-                check("resume unblocks sending", true);
+                boolean resumed = client.maySend();
+                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { resumed = false; }
+                check("resume unblocks sending", resumed);
 
                 // 5. an engagement_id mismatch on configure is refused
                 Map<String, Object> wrong = new LinkedHashMap<>(cfg);
@@ -126,6 +128,12 @@ public class BridgeClientTest {
                       deniedAfterMismatch);
             }
             client.close();
+
+            closedIsSticky(sock);
+            aClosedClientDoesNotGoLive(sock);
+            aRefusedConfigureDropsToDenyAll(sock);
+            closeIsTerminalAgainstTheReadLoop();
+            losingThePeerDropsToDenyAll(sock);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -134,6 +142,215 @@ public class BridgeClientTest {
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
     }
+
+    /** Drive a fresh client to "configured" and hand back the pieces. */
+    static final class Live implements AutoCloseable {
+        final BridgeClient client; final SocketChannel peer;
+        final OutputStream out; final Frame.Reader reader; final FakeMontoya.Logger log;
+        final ServerSocketChannel server;
+        Live(ServerSocketChannel server, BridgeClient c, SocketChannel p,
+             OutputStream o, Frame.Reader r, FakeMontoya.Logger l) {
+            this.server = server; this.client = c; this.peer = p;
+            this.out = o; this.reader = r; this.log = l;
+        }
+        public void close() throws Exception {
+            client.close(); peer.close(); server.close();
+        }
+    }
+
+    static Map<String, Object> configureFrame(String engagement, long id) {
+        Map<String, Object> cfg = new LinkedHashMap<>();
+        cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", id);
+        cfg.put("engagement_id", engagement); cfg.put("scope_sha256", "abc");
+        cfg.put("profile", "production");
+        cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
+        return cfg;
+    }
+
+    static Live live(Path dir, String name) throws Exception {
+        Path sock = dir.resolve(name);
+        ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
+        server.bind(UnixDomainSocketAddress.of(sock));
+        FakeMontoya.Logger log = new FakeMontoya.Logger();
+        BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
+        new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } }).start();
+        SocketChannel peer = server.accept();
+        OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+        Frame.Reader reader = new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
+        reader.read();                                   // the hello
+        out.write(Frame.encode(configureFrame("e-1", 1L),
+                  "scope.include\thttps://WIDE/*\n".getBytes(StandardCharsets.UTF_8)));
+        out.flush();
+        reader.read();                                   // the ack
+        waitUntil(client::isConfigured);
+        return new Live(server, client, peer, out, reader, log);
+    }
+
+    /** close() must be sticky: a client closed before its dial completes must
+     *  never go on to hello, configure and live sending. Reproduced by the
+     *  review as an UNLOADED extension holding a control channel. */
+    static void closedIsSticky(Path base) throws Exception {
+        Path dir = Files.createTempDirectory("hxsticky");
+        Path sock = dir.resolve("s.sock");
+        try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+            server.bind(UnixDomainSocketAddress.of(sock));
+            BridgeClient client = new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+            client.close();
+
+            // On a thread with a join timeout: an unfixed client's connect()
+            // dials, sends hello and blocks in readLoop forever, so a direct
+            // call would hang the suite instead of failing it.
+            final boolean[] refused = {false};
+            Thread dial = new Thread(() -> {
+                try { client.connect(); }
+                catch (IOException e) { refused[0] = true; }
+                catch (Exception ignored) { }
+            });
+            dial.setDaemon(true);
+            dial.start();
+            dial.join(3000);
+
+            check("connect() on a closed client returns instead of dialling", !dial.isAlive());
+            check("connect() on a closed client is refused", refused[0]);
+            check("a closed client never reports maySend", !client.maySend());
+        } finally {
+            Files.deleteIfExists(sock); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A configure arriving after close() must not resurrect the client. */
+    static void aClosedClientDoesNotGoLive(Path base) throws Exception {
+        Path dir = Files.createTempDirectory("hxresurrect");
+        try (Live l = live(dir, "r.sock")) {
+            check("live before close", l.client.maySend());
+            l.client.close();
+            check("closed client denies immediately", !l.client.maySend());
+
+            // A second configure lands after close(): the read loop must not
+            // act on it.
+            try {
+                l.out.write(Frame.encode(configureFrame("e-1", 2L),
+                        "scope.include\thttps://SNEAKY/*\n".getBytes(StandardCharsets.UTF_8)));
+                l.out.flush();
+            } catch (IOException ignored) { /* channel already shut: also fine */ }
+            Thread.sleep(150);
+            check("a configure after close() does not resurrect the client", !l.client.maySend());
+            check("and leaves no epoch behind", l.client.configEpoch() == 0);
+            check("and leaves no scope behind", l.client.scopeConfig().isEmpty());
+        } finally {
+            Files.deleteIfExists(dir.resolve("r.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A configure we cannot parse means the operator's intent is unknown.
+     *  Keeping the PREVIOUS, wider scope would send exactly where a narrowing
+     *  operator just said not to. */
+    static void aRefusedConfigureDropsToDenyAll(Path base) throws Exception {
+        Path dir = Files.createTempDirectory("hxbadcfg");
+        try (Live l = live(dir, "b.sock")) {
+            check("wide scope is in force first",
+                  l.client.scopeConfig().toString().contains("WIDE"));
+
+            l.out.write(Frame.encode(configureFrame("e-1", 3L),
+                    "this-is-not-a-config-body\n".getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded err = l.reader.read();
+            check("unparseable configure is answered with an error",
+                  "error".equals(err.header.get("t")));
+            check("error class names the config",
+                  String.valueOf(err.header.get("class")).contains("config"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a refused configure drops to DENY-ALL", !l.client.maySend());
+            check("the superseded wider scope is dropped", l.client.scopeConfig().isEmpty());
+            check("and its epoch with it", l.client.configEpoch() == 0);
+        } finally {
+            Files.deleteIfExists(dir.resolve("b.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** The most common terminal path of all, and previously untested. */
+    static void losingThePeerDropsToDenyAll(Path base) throws Exception {
+        Path dir = Files.createTempDirectory("hxpeergone");
+        try (Live l = live(dir, "p.sock")) {
+            check("configured while the peer is up", l.client.maySend());
+            l.peer.close();
+
+            waitUntil(() -> !l.client.maySend());
+            check("losing the peer drops to DENY-ALL", !l.client.maySend());
+            check("epoch zeroed on peer loss", l.client.configEpoch() == 0);
+            check("scope dropped on peer loss", l.client.scopeConfig().isEmpty());
+            check("and the transition is logged",
+                  l.log.sawInfo("deny-all"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("p.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * close() must be terminal the instant it returns. The read loop runs on
+     * its own thread and may be part-way through a `configure` that was
+     * already sitting in the Reader's buffer when close() ran; if the commit
+     * is not exclusive with close(), the loop sets configured back to true
+     * behind close()'s back and maySend() answers true for as long as it takes
+     * to write the ack -- microseconds in which Plan 3 will send.
+     *
+     * Two details are load-bearing, both learned the hard way. TWO coalesced
+     * configure frames, because with one there is no backlog for close() to
+     * race. And a BUSY POLL, because the window opens a few us AFTER close()
+     * returns: a sample at t=0 lands before it, a sample at t=2ms lands after
+     * it, and both report all-clear. Point samples measured 0/40 on code that
+     * a poll catches 39/40.
+     */
+    static void closeIsTerminalAgainstTheReadLoop() throws Exception {
+        Path dir = Files.createTempDirectory("hxclose");
+        int resurrections = 0, attempts = 20;
+        try {
+            for (int i = 0; i < attempts; i++) {
+                Path sock = dir.resolve("c" + i + ".sock");
+                try (ServerSocketChannel server =
+                             ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+                    server.bind(UnixDomainSocketAddress.of(sock));
+                    BridgeClient client =
+                            new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+                    Thread t = new Thread(() -> {
+                        try { client.connect(); } catch (Exception ignored) { } });
+                    t.setDaemon(true);
+                    t.start();
+                    try (SocketChannel peer = server.accept()) {
+                        OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+                        Frame.Reader reader =
+                                new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
+                        reader.read();                                   // hello
+
+                        out.write(Frame.encode(configureFrame("e-1", 0L), CFG));
+                        out.flush();
+                        reader.read();                                   // the ack
+                        waitUntil(client::isConfigured);
+
+                        ByteArrayOutputStream both = new ByteArrayOutputStream();
+                        both.write(Frame.encode(configureFrame("e-1", 1L), CFG));
+                        both.write(Frame.encode(configureFrame("e-1", 2L), CFG));
+                        out.write(both.toByteArray()); out.flush();
+
+                        client.close();
+
+                        long end = System.nanoTime() + 5_000_000L;       // 5 ms
+                        while (System.nanoTime() < end)
+                            if (client.maySend()) { resurrections++; break; }
+                    }
+                }
+                Files.deleteIfExists(sock);
+            }
+        } finally {
+            Files.deleteIfExists(dir);
+        }
+        check("close() is terminal: the read loop cannot re-enable sending behind it ("
+              + resurrections + "/" + attempts + " resurrections)", resurrections == 0);
+    }
+
+    static final byte[] CFG =
+            "scope.include\thttps://RACE/*\n".getBytes(StandardCharsets.UTF_8);
 
     interface Cond { boolean ok(); }
 

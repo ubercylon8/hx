@@ -104,8 +104,9 @@ public final class Frame {
 
         public Reader(InputStream in) { this.in = in; }
 
+        private final byte[] chunk = new byte[65536];   // one per Reader, not per call
+
         public Decoded read() throws IOException {
-            byte[] chunk = new byte[65536];
             while (true) {
                 if (len >= 4) {
                     long length = ((long) (buf[0] & 0xff) << 24) | ((buf[1] & 0xff) << 16)
@@ -119,6 +120,10 @@ public final class Frame {
                         Decoded d = decode(Arrays.copyOfRange(buf, 0, end));
                         System.arraycopy(buf, d.consumed, buf, 0, len - d.consumed);
                         len -= d.consumed;
+                        // One 64 MB frame must not pin 64 MB for the life of
+                        // the connection.
+                        if (buf.length > (1 << 20) && len < (buf.length >>> 2))
+                            buf = Arrays.copyOf(buf, Math.max(len, 65536));
                         return d;
                     }
                 }
