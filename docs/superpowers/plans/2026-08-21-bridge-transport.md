@@ -1984,7 +1984,10 @@ anyone adds a reconnect path that reuses the slot. The comment in
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_bridge_server.py -v`
-Expected: PASS, 18 passed
+Expected: PASS, at least 18 passed — 13 from Steps 1-3 plus Step 3b's 5. The
+file will hold more than that if a fix round added tests of its own (it did:
+the real count at the end of Task 3 is 22). Treat 18 as a floor, never as a
+target to trim tests down to.
 
 - [ ] **Step 5: Commit**
 
