@@ -314,6 +314,7 @@ ordering block is unambiguous about which rule moved.
 
 ```java
 // extension/test/hx/policy/PolicyTest.java
+// extension/test/hx/policy/PolicyTest.java
 package hx.policy;
 
 import hx.bridge.BridgeClient;
@@ -365,6 +366,8 @@ public class PolicyTest {
         aDenyRuleSeesEveryReadingOfThePath();
         anIncludeMustMatchBothReadingsOfThePath();
         aLegitimatelyEncodedPathIsStillAllowed();
+        aTrailingSlashIsNotNewlyRefused();
+        aPathOfOnlySlashesDoesNotThrow();
         theRefusalOrderIsPinned();
         aBrokenGateIsNeverAnAllow();
         policyNamesNoBurpType();
@@ -838,10 +841,27 @@ public class PolicyTest {
         // Case.
         canon("/ADMIN/Users", "/admin/users");
 
-        // Empty segments are NOT merged -- see canonical()'s comment, which
-        // says so and says why. Pinned so that changing it is a decision
-        // somebody makes on purpose.
-        canon("/app//admin", "/app//admin");
+        // Empty segments ARE merged -- see canonical()'s comment for the
+        // order this is done in and why. A single trailing slash is not a
+        // repeat and survives untouched.
+        canon("/app//admin", "/app/admin");
+        canon("//admin/users", "/admin/users");
+        canon("/admin//users", "/admin/users");
+        canon("/admin/", "/admin/");
+        canon("////", "/");
+
+        // The interaction with dot segments: collapsing the empty segment
+        // FIRST means ".." pops the segment before it, same as a server that
+        // merges "//" before resolving ".." would -- so "/a//../admin" reads
+        // as "/a/../admin" and then as "/admin", not as "/a/admin" (which is
+        // what treating the merged slash as a real, poppable segment would
+        // give). See canonical()'s comment.
+        canon("/a//../admin/users", "/admin/users");
+
+        // The same gap through one more layer of percent-encoding: %2f
+        // decodes to the separator that then gets merged with the literal one
+        // beside it.
+        canon("/%2fadmin/users", "/admin/users");
 
         // Idempotence, which is what "until stable" has to mean.
         for (String p : List.of("/api/%252e%252e/admin", "/a%2525b", "/ADMIN/%2e%2e/x"))
@@ -922,7 +942,11 @@ public class PolicyTest {
                                    "/api/../admin/users",     // was ALLOW
                                    "/api/%2e%2e/admin/users", // was ALLOW
                                    "/ADMIN/users",            // was ALLOW
-                                   "/%41dmin/users"))
+                                   "/%41dmin/users",
+                                   "//admin/users",           // empty segment
+                                   "/admin//users",           // empty segment
+                                   "/a//../admin/users",      // empty segment + dot segment
+                                   "/%2fadmin/users"))        // encoded empty segment
             denies("an encoded excluded path is still excluded: " + path, p,
                    req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
                    cfg, "scope_denied");
@@ -1030,6 +1054,55 @@ public class PolicyTest {
         p.decide(r, files);
         check("the request decided about still carries its raw bytes",
               spaced.equals(r.path()) && spaced.equals(r.target()));
+    }
+
+    /**
+     * The direction empty-segment collapsing can fail in. Under scope.exclude
+     * (deny-OR) a broader canonical form only denies more, which is safe; under
+     * scope.include (allow-AND) the SAME canonical form denying one reading
+     * refuses a request the operator authorised. A single trailing slash is
+     * not a repeated separator and collapseEmptySegments() must leave it
+     * alone, or these go from allowed to scope_denied mid-engagement.
+     */
+    static void aTrailingSlashIsNotNewlyRefused() {
+        Policy p = allowingPolicy();
+
+        // The include pattern itself ends in "/", with no wildcard after it,
+        // so raw and canonical must both still be exactly "/reports/" for the
+        // request to be allowed at all.
+        allows("a path matching an include that itself ends in /", p,
+               req("GET", "https://app.example.test/reports/",
+                   "app.example.test", "/reports/", ""),
+               authorised("scope.include", "https://app.example.test/reports/"));
+
+        // An ordinary wildcard prefix, with the request's own trailing slash
+        // the only thing distinguishing it from every other check above.
+        allows("a request with its own trailing slash under a wildcard include", p,
+               req("GET", "https://app.example.test/app/orders/",
+                   "app.example.test", "/app/orders/", ""),
+               authorised("scope.include", "https://app.example.test/app/*"));
+    }
+
+    /**
+     * Constraint: nothing decide() does may throw. A path that is nothing but
+     * slashes exercises collapseEmptySegments() and collapseDotSegments() at
+     * their edges -- no character survives either pass -- and the fail-closed
+     * requirement is that decide() still returns a Decision instead of
+     * unwinding, whatever that Decision says.
+     */
+    static void aPathOfOnlySlashesDoesNotThrow() {
+        Policy p = allowingPolicy();
+        HxRequest r = req("GET", "https://app.example.test////",
+                          "app.example.test", "////", "");
+        Decision d;
+        try {
+            d = p.decide(r, APP);
+        } catch (Throwable t) {
+            check("a path of only slashes does not throw (threw " + t + ")", false);
+            return;
+        }
+        check("a path of only slashes returns a decision (" +
+              (d.allowed() ? "allow" : d.errorClass()) + ") instead of throwing", true);
     }
 
     // ---- the order -------------------------------------------------------
@@ -1315,6 +1388,7 @@ blamed on the ruleset.
 - [ ] **Step 6: Write `Policy`**
 
 ```java
+// extension/src/hx/policy/Policy.java
 // extension/src/hx/policy/Policy.java
 package hx.policy;
 
@@ -1813,17 +1887,60 @@ public final class Policy {
      * already a separator when the path is split into them. Lowercasing comes
      * LAST, on decoded text, so `%4C` and `%6c` both arrive at `l`.
      *
-     * What this deliberately does NOT do is merge empty segments: `/app//admin`
-     * keeps its double slash. RFC 3986 normalisation does not remove one, and
-     * whether `//admin` and `/admin` are the same resource is a question only
-     * the target server answers. That leaves a prefix exclude for `/admin/*`
-     * evadable as `//admin/users` on servers that do collapse it. It is a real
-     * gap in the deny direction, it is written down here rather than papered
-     * over, and closing it needs a decision about empty segments rather than
-     * one more line.
+     * Empty segments ARE merged: a run of two or more `/` collapses to one,
+     * so `//admin/users`, `/admin//users` and `/admin/users` all canonicalise
+     * alike. RFC 3986 normalisation does not do this -- remove_dot_segments
+     * treats a doubled slash as a real, empty path segment -- but plenty of
+     * servers merge `//` before routing, and a prefix exclude for `/admin/*`
+     * was evadable as `//admin/users` against every one of them. Whether
+     * `//admin` and `/admin` are the same resource is still a question only
+     * the target server answers; this makes canonical() answer it the way a
+     * merging server does, which is the fail-closed reading for the deny
+     * rules this function feeds.
+     *
+     * The merge runs BEFORE dot-segment collapsing, not after, and the order
+     * is load-bearing wherever the two interact: `/a//../admin` decodes to
+     * itself, merges to `/a/../admin`, and `..` then pops `a`, landing on
+     * `/admin`. Collapsing dot segments first would read the doubled slash's
+     * empty segment as a real one for `..` to pop instead -- `/a/` then
+     * `admin` appended, landing on `/a/admin` -- which is the RFC 3986
+     * reading, not a merging server's. A merging server merges `//` as a
+     * lexical step on the raw path; it does not first hand `..` an empty
+     * segment to consume in `a`'s place. Merging first is also the direction
+     * that keeps canonical() honest as a DENY tool: it is the reading that
+     * throws more of the path away, so it can only make a deny rule match
+     * more, never less.
+     *
+     * A single `/` is not a repeat and is never touched, so a genuine
+     * trailing slash survives: `/admin/` stays `/admin/`. That matters for
+     * scope.include, which needs BOTH readings to match -- collapsing a
+     * trailing slash away would make the canonical arm stop matching an
+     * include pattern that itself ends in `/`, turning a request that was
+     * rightly in scope into a scope_denied for a byte nothing sent ever
+     * carried.
      */
     static String canonical(String path) {
-        return lower(collapseDotSegments(decodeToFixedPoint(path)));
+        return lower(collapseDotSegments(collapseEmptySegments(decodeToFixedPoint(path))));
+    }
+
+    /**
+     * Runs of two or more `/` collapsed to one; a lone `/` is left alone.
+     * Never throws: a path of nothing but slashes collapses to `/` like any
+     * other run, which is what the "path that is only slashes" check in
+     * PolicyTest pins -- decide() must answer that with a Decision, not an
+     * exception a careless caller could read as an allow.
+     */
+    static String collapseEmptySegments(String path) {
+        StringBuilder out = new StringBuilder(path.length());
+        boolean prevSlash = false;
+        for (int i = 0; i < path.length(); i++) {
+            char c = path.charAt(i);
+            boolean slash = c == '/';
+            if (slash && prevSlash) continue;
+            out.append(c);
+            prevSlash = slash;
+        }
+        return out.toString();
     }
 
     /** Percent-decoding repeated until a round changes nothing. */

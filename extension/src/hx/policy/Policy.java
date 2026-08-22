@@ -496,17 +496,60 @@ public final class Policy {
      * already a separator when the path is split into them. Lowercasing comes
      * LAST, on decoded text, so `%4C` and `%6c` both arrive at `l`.
      *
-     * What this deliberately does NOT do is merge empty segments: `/app//admin`
-     * keeps its double slash. RFC 3986 normalisation does not remove one, and
-     * whether `//admin` and `/admin` are the same resource is a question only
-     * the target server answers. That leaves a prefix exclude for `/admin/*`
-     * evadable as `//admin/users` on servers that do collapse it. It is a real
-     * gap in the deny direction, it is written down here rather than papered
-     * over, and closing it needs a decision about empty segments rather than
-     * one more line.
+     * Empty segments ARE merged: a run of two or more `/` collapses to one,
+     * so `//admin/users`, `/admin//users` and `/admin/users` all canonicalise
+     * alike. RFC 3986 normalisation does not do this -- remove_dot_segments
+     * treats a doubled slash as a real, empty path segment -- but plenty of
+     * servers merge `//` before routing, and a prefix exclude for `/admin/*`
+     * was evadable as `//admin/users` against every one of them. Whether
+     * `//admin` and `/admin` are the same resource is still a question only
+     * the target server answers; this makes canonical() answer it the way a
+     * merging server does, which is the fail-closed reading for the deny
+     * rules this function feeds.
+     *
+     * The merge runs BEFORE dot-segment collapsing, not after, and the order
+     * is load-bearing wherever the two interact: `/a//../admin` decodes to
+     * itself, merges to `/a/../admin`, and `..` then pops `a`, landing on
+     * `/admin`. Collapsing dot segments first would read the doubled slash's
+     * empty segment as a real one for `..` to pop instead -- `/a/` then
+     * `admin` appended, landing on `/a/admin` -- which is the RFC 3986
+     * reading, not a merging server's. A merging server merges `//` as a
+     * lexical step on the raw path; it does not first hand `..` an empty
+     * segment to consume in `a`'s place. Merging first is also the direction
+     * that keeps canonical() honest as a DENY tool: it is the reading that
+     * throws more of the path away, so it can only make a deny rule match
+     * more, never less.
+     *
+     * A single `/` is not a repeat and is never touched, so a genuine
+     * trailing slash survives: `/admin/` stays `/admin/`. That matters for
+     * scope.include, which needs BOTH readings to match -- collapsing a
+     * trailing slash away would make the canonical arm stop matching an
+     * include pattern that itself ends in `/`, turning a request that was
+     * rightly in scope into a scope_denied for a byte nothing sent ever
+     * carried.
      */
     static String canonical(String path) {
-        return lower(collapseDotSegments(decodeToFixedPoint(path)));
+        return lower(collapseDotSegments(collapseEmptySegments(decodeToFixedPoint(path))));
+    }
+
+    /**
+     * Runs of two or more `/` collapsed to one; a lone `/` is left alone.
+     * Never throws: a path of nothing but slashes collapses to `/` like any
+     * other run, which is what the "path that is only slashes" check in
+     * PolicyTest pins -- decide() must answer that with a Decision, not an
+     * exception a careless caller could read as an allow.
+     */
+    static String collapseEmptySegments(String path) {
+        StringBuilder out = new StringBuilder(path.length());
+        boolean prevSlash = false;
+        for (int i = 0; i < path.length(); i++) {
+            char c = path.charAt(i);
+            boolean slash = c == '/';
+            if (slash && prevSlash) continue;
+            out.append(c);
+            prevSlash = slash;
+        }
+        return out.toString();
     }
 
     /** Percent-decoding repeated until a round changes nothing. */
