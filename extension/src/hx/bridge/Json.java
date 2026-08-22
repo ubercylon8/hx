@@ -145,12 +145,33 @@ public final class Json {
                             if (!isHex) throw new JsonError("bad hex in \\u escape: " + hex);
                         }
                         char u = (char) Integer.parseInt(hex, 16);
-                        // A lone surrogate survives parsing and is then silently written
-                        // as '?' by Java's UTF-8 encoder, where Python raises. Reject it.
-                        if (Character.isSurrogate(u))
-                            throw new JsonError("lone surrogate in \\u escape: " + hex);
-                        b.append(u);
                         i += 4;
+                        // A supplementary character is legally encoded as a PAIR of
+                        // \\u escapes, and json.dumps emits exactly that by default
+                        // (ensure_ascii=True). Rejecting a high surrogate outright
+                        // would refuse spec-legal frames. Only an UNPAIRED surrogate
+                        // is invalid -- it survives parsing and Java's UTF-8 encoder
+                        // then silently writes it as '?', where Python raises.
+                        if (Character.isHighSurrogate(u)) {
+                            if (i + 6 > s.length() || s.charAt(i) != '\\' || s.charAt(i + 1) != 'u')
+                                throw new JsonError("unpaired high surrogate: " + hex);
+                            String lowHex = s.substring(i + 2, i + 6);
+                            for (int k = 0; k < 4; k++) {
+                                char hc = lowHex.charAt(k);
+                                if (!((hc >= '0' && hc <= '9') || (hc >= 'a' && hc <= 'f')
+                                        || (hc >= 'A' && hc <= 'F')))
+                                    throw new JsonError("bad hex in low surrogate: " + lowHex);
+                            }
+                            char low = (char) Integer.parseInt(lowHex, 16);
+                            if (!Character.isLowSurrogate(low))
+                                throw new JsonError("high surrogate not followed by a low one: " + lowHex);
+                            b.append(u).append(low);
+                            i += 6;
+                        } else if (Character.isLowSurrogate(u)) {
+                            throw new JsonError("unpaired low surrogate: " + hex);
+                        } else {
+                            b.append(u);
+                        }
                     }
                     default -> throw new JsonError("bad escape \\" + esc);
                 }

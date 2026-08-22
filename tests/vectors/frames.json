@@ -108,6 +108,17 @@
       },
       "body_utf8": "",
       "hex": "0000001b7b2276223a312c2274223a2268656c6c6f222c226964223a387d0a"
+    },
+    {
+      "name": "header_value_supplementary_emoji",
+      "header": {
+        "v": 1,
+        "t": "error",
+        "id": 10,
+        "detail": "😀"
+      },
+      "body_utf8": "",
+      "hex": "0000002c7b2276223a312c2274223a226572726f72222c226964223a31302c2264657461696c223a22f09f9880227d0a"
     }
   ]
 }

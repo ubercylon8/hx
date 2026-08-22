@@ -60,6 +60,16 @@
       "name": "nested_object",
       "header_text": "{\"a\":{\"b\":1}}",
       "why": "a nested object; the header schema is flat by design and must reject this, not half-parse it"
+    },
+    {
+      "name": "unpaired_low_surrogate",
+      "header_text": "{\"a\":\"\\ude00\"}",
+      "why": "a low surrogate with no preceding high surrogate; only valid as the second half of a pair"
+    },
+    {
+      "name": "high_surrogate_not_followed_by_escape",
+      "header_text": "{\"a\":\"\\ud83dX\"}",
+      "why": "a high surrogate followed by a plain character instead of a \\u low-surrogate escape; a supplementary character must be a PAIR of escapes"
     }
   ]
 }

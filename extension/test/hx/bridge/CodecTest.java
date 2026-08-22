@@ -36,6 +36,7 @@ public class CodecTest {
         goldenVectors();
         malformedInputsAreRejected();
         invalidUtf8HeaderIsRejected();
+        pairedSurrogateEqualsRawSupplementaryCharacter();
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -160,6 +161,28 @@ public class CodecTest {
         byte[] raw = rawFrame(bad);
         expectThrows("invalid UTF-8 header (0xC3 0x28) raises FrameError, not U+FFFD",
                      Frame.FrameError.class, () -> Frame.decode(raw));
+    }
+
+    /**
+     * A supplementary character is legally encoded in JSON as a PAIR of \\u
+     * escapes -- exactly what json.dumps emits by default (ensure_ascii=True)
+     * -- and separately as a raw UTF-8 character, which is what our own
+     * codec emits (ensure_ascii=False). Both must parse to the identical
+     * Java string, or a peer that switches encoding style produces a frame
+     * this side reads differently -- or not at all.
+     */
+    static void pairedSurrogateEqualsRawSupplementaryCharacter() {
+        // Escaped form: a literal \\u83d\\ude00 pair IN THE JSON TEXT, for
+        // Json.parse's own escape handling to combine at runtime. (Double
+        // backslashes here so javac leaves the backslash in the string --
+        // a single \\u escape would be consumed by the COMPILER instead.)
+        Map<String, Object> escaped = Json.parse("{\"v\":1,\"t\":\"x\",\"a\":\"\\ud83d\\ude00\"}");
+        // Unescaped form: javac's OWN \\u processing embeds the actual
+        // surrogate pair directly into this Java string literal at compile
+        // time -- equivalent to typing the raw emoji glyph in UTF-8 source.
+        Map<String, Object> raw = Json.parse("{\"v\":1,\"t\":\"x\",\"a\":\"😀\"}");
+        check("escaped surrogate pair equals the raw supplementary character",
+              escaped.equals(raw) && "😀".equals(escaped.get("a")));
     }
 
     /** [4-byte BE length][headerBytes]\n -- built by hand so a header that is
