@@ -3,7 +3,10 @@ package hx.policy;
 
 import hx.bridge.BridgeClient;
 
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -40,6 +43,10 @@ import java.util.Set;
  *   /app/..\other      is /other on IIS and .NET, which read a backslash
  *                      as a path separator
  *   /admin./users      is /admin/users on Windows, which trims trailing dots
+ *   /.../admin/users   is /admin/users on Windows too: `...` is a name, and a
+ *                      name of nothing but trailing dots trims to nothing
+ *   /x/..%ef%bc%8flogout  is /x/../logout wherever a wide string reaches an
+ *                      ANSI API, because U+FF0F best-fits to `/`
  *
  * Worse, mainstream libraries disagree about the SAME path with no attacker
  * involved. For `/a//../admin/users`:
@@ -80,15 +87,22 @@ import java.util.Set;
  * works if the matcher's idea of "the same path" also covers the target
  * server's, which is what the reading set adds.
  *
- * PATTERNS ARE READ THE SAME WAY. An operator's pattern is a string a human
- * typed and it has the same several readings a path does, so Rule.parse builds
- * the same set from it. Matching raw patterns against readings of the path
- * alone fails SILENTLY in both directions: `scope.exclude .../%61dmin/*` is a
- * DEAD RULE that stops nothing while reading as if it named /admin/*, and
- * `scope.include .../files/my%20docs/*` authorises NOTHING -- neither
- * `/files/my%20docs/a.pdf` nor `/files/my docs/a.pdf` -- while the operator is
- * told only that their request "matches no scope.include pattern", which sends
- * them to rewrite a pattern that was right.
+ * PATTERNS ARE READ THE SAME WAY, AND ONE WAY MORE. An operator's pattern is a
+ * string a human typed and it has the same several readings a path does, so
+ * Rule.parse builds the same set from it. Matching raw patterns against
+ * readings of the path alone fails SILENTLY in both directions:
+ * `scope.exclude .../%61dmin/*` is a DEAD RULE that stops nothing while reading
+ * as if it named /admin/*, and `scope.include .../files/my%20docs/*` authorises
+ * NOTHING -- neither `/files/my%20docs/a.pdf` nor `/files/my docs/a.pdf` --
+ * while the operator is told only that their request "matches no scope.include
+ * pattern", which sends them to rewrite a pattern that was right.
+ *
+ * The one way more is ENCODING, and it exists because readings() only ever
+ * decodes. A pattern naming a directory with a non-ASCII character in it --
+ * an accent, a CJK name -- is typed as characters and arrives as
+ * percent-escapes, and no decoding of the pattern reaches the escaped spelling
+ * the request's raw reading carries. patternReadings() adds it. It is a
+ * pattern-only reading, and its comment says why it cannot be a path's.
  *
  * decide() IS TOTAL: every input returns a Decision. A null Authorisation, one
  * carrying a null scope map, a null list under a key, a null element inside a
@@ -207,7 +221,7 @@ public final class Policy {
         // is what the operator's frame said and what they will search for.
         Set<String> targets = targetReadings(req);
         for (String pattern : dangerousPatterns(scope))
-            for (String p : readings(pattern))
+            for (String p : patternReadings(pattern))
                 for (String target : targets)
                     if (glob(lower(p), lower(target)))
                         return Decision.deny("dangerous_denied",
@@ -343,25 +357,62 @@ public final class Policy {
      * of percent-escapes it will unwrap.
      *
      * Both are bounds on work done on the ENFORCEMENT thread, per request.
-     * decodeToFixedPoint is quadratic in the length of its input -- each round
-     * is a full pass and a deeply nested escape needs one round per layer --
-     * and Frame.MAX_FRAME is 64 MB, so nothing upstream stops a send frame from
-     * carrying a path that long. Measured on the shipped code: a 20 KB nested
-     * path took decide() 370 ms, 100 KB took 8.9 s, 400 KB took 143 s. That is
-     * a denial-of-service on our own ruleset, from a frame we accepted.
+     * decodeToFixedPoint is quadratic in the length of its input WITHOUT the
+     * round bound -- each round is a full pass and a deeply nested escape needs
+     * one round per layer -- and Frame.MAX_FRAME is 64 MB, so nothing upstream
+     * stops a send frame from carrying a path that long. Measured before either
+     * bound existed: a 20 KB nested path took decide() 370 ms, 100 KB took
+     * 8.9 s, 400 KB took 143 s, and every one of them ended in ALLOW. That is a
+     * denial-of-service on our own ruleset, from a frame we accepted.
      *
-     * 4096 characters is what IIS accepts in a URL and roughly what nginx and
-     * Tomcat accept in a whole request line, so a target over it is one no
-     * target server was going to answer anyway. 16 rounds is eight more than
-     * any real double-encoding: legitimate traffic needs one, an attack needs
-     * two, and nothing benign needs sixteen.
+     * 8192 characters is the number every mainstream server picked for the same
+     * question. Apache's default LimitRequestLine is 8190, nginx's
+     * large_client_header_buffers line is 8k, Tomcat's maxHttpRequestHeaderSize
+     * is 8192. A target over that is one no target server was going to answer,
+     * so refusing it costs an operator nothing they had.
+     *
+     * It was 4096 for one round, and 4096 refuses traffic that is ordinary
+     * rather than exotic: a SAML HTTP-Redirect binding puts a deflated,
+     * base64'd, signed SAMLRequest in the query; an OIDC `request` parameter is
+     * a whole JWT; a Kibana or Grafana share link is a rison blob; an
+     * Elasticsearch `?source={...}` GET is the query body. Every one of those
+     * is a legitimate request an engagement might need, and every one can pass
+     * 4096. A bound below what the target itself accepts is not a safety
+     * margin, it is a tool that cannot reach part of the application.
+     *
+     * The cost argument that justified the lower number no longer holds. It was
+     * written when decode was unbounded and quadratic; with the round bound in
+     * place decode is linear. Measured at the new bound, in the commit that
+     * raised it: decide() costs 200 us on 8192 benign characters, 3.4 ms on
+     * 8192 characters of `/a;b(backslash)c. ` -- every transform firing in
+     * every segment -- and 406 ms on the worst input a 600,000-sample search
+     * could find, an 8192-character path whose reading set is 425 members. The
+     * ordinary path stays at ~2 us.
+     *
+     * That last number is the honest ceiling and it is worth stating plainly:
+     * this bound is what makes it a ceiling at all. The cost is quadratic-ish
+     * in the length -- more characters mean both longer readings and more of
+     * them -- so the length bound is the only thing standing between a send
+     * frame and an arbitrarily long decision. 406 ms of one thread, against a
+     * rate limiter measured in single-digit requests per second, degrades hx
+     * rather than bypassing it; it is not the 143 seconds this bound was
+     * introduced for. Truncating the reading set instead would be worse than
+     * the cost: fewer readings means fewer deny matches AND easier include
+     * coverage, so it fails open in both directions.
+     *
+     * Hardcoded, not a config key: a key means a ConfigBody.KEYS change, which
+     * is a change to the wire protocol between the agent and the extension --
+     * the same reason the distress thresholds are not keys either.
+     *
+     * 16 rounds is eight more than any real double-encoding: legitimate traffic
+     * needs one, an attack needs two, and nothing benign needs sixteen.
      *
      * Hitting either bound is a DENIAL, never a shrug. "I could not finish
      * reasoning about this request" and "this request is fine" are different
      * answers, and only one of them may be given to a request aimed at a
      * production estate.
      */
-    static final int MAX_TARGET_CHARS = 4096;
+    static final int MAX_TARGET_CHARS = 8192;
     static final int MAX_DECODE_ROUNDS = 16;
 
     /**
@@ -527,7 +578,7 @@ public final class Policy {
                 checkHostChars(host, pattern);
             }
             return new Rule(pattern, scheme, host, suffix, port, pathGlob,
-                            readings(pathGlob));
+                            patternReadings(pathGlob));
         }
 
         /** Everything but the path. Shared, because scheme, port and host
@@ -558,16 +609,21 @@ public final class Policy {
          * lower() on an already-lowered reading returns the same instance, so
          * the derived readings -- which readings() lowercases by construction
          * -- cost nothing to fold again. Only the RAW reading of each side is
-         * really being folded here, and only the path side of that is
-         * falsifiable: readings() already contributes lower(decode(pattern)),
-         * which equals lower(pattern) whenever the pattern has no escape to
-         * decode, so no realistic input can be built that needs the pattern
-         * side's lower() and nothing else. It is kept for symmetry and because
-         * losing it would couple this method to readings() lowercasing, but it
-         * is defence in depth and is recorded as such rather than left for a
-         * later reader to discover it cannot be made to fail.
+         * really being folded here, and BOTH sides are falsifiable.
          *
-         * The path side IS falsifiable and PolicyTest pins it: a pattern with a
+         * A round-3 note here said the pattern side was not, on the ground
+         * that readings() already contributes lower(decode(pattern)), which
+         * equals lower(pattern) whenever the pattern has no escape to decode.
+         * The shape that disproves it is a pattern whose escape is written in
+         * UPPERCASE hex against a path whose escape is lowercase, where the
+         * two decode to DIFFERENT strings: `exclude=.../%2E*` against `/%2e`.
+         * The pattern's decoded reading is `/.*`, the path's is `/`, and those
+         * do not match; the raw readings differ in exactly the two characters
+         * this lower() folds. Without it that request is ALLOWED. PolicyTest
+         * pins it, and the note it replaces is a reminder that "no realistic
+         * input can falsify this" is a claim, not an argument.
+         *
+         * The path side is pinned by the mirror shape: a pattern with a
          * truncated escape decodes to itself while the request's escape decodes
          * to a separator, so neither derived reading matches and the raw ones
          * differ only in case.
@@ -705,13 +761,35 @@ public final class Policy {
      *   - when the decoded bytes are not all ASCII, the same again over the
      *     UTF-8 reading of those bytes, which is what folds the overlong
      *     `%c0%ae%c0%ae` -- the classic IIS traversal -- back to `..`.
+     *   - and the same again with the Windows ANSI best-fit mapping applied,
+     *     which turns U+FF0F into `/`, U+FF0E into `.` and U+FF3C into a
+     *     backslash. See foldBestFit.
      *
      * Identical readings collapse, so an ordinary path like `/api/orders`
      * produces exactly ONE member and costs one glob per rule. The set only
      * grows for a path that carries the characters the transforms act on,
      * which is to say for an attack.
      *
-     * ORDER WITHIN A READING is load-bearing. Decoding comes FIRST, so `%2e%2e`
+     * THE SET IS CLOSED, and it is closed by CONSTRUCTION rather than by
+     * argument. Every member is fed back through derive() until a pass adds
+     * nothing, so readings(m) is a subset of readings(p) for every member m --
+     * which is the property the idempotence check in PolicyTest asserts and,
+     * for two rounds, was never given an input that could falsify. It could
+     * not be had for free: `applicable` is computed on a base, the transforms
+     * COMPOSE, and a composition creates trigger characters the base did not
+     * carry. See addReadings for the two-character path that walked past an
+     * exclusion because of it.
+     *
+     * The loop terminates because every transform in it either shortens its
+     * input or preserves its length -- decoding replaces three characters with
+     * one, stripping and trimming and collapsing delete, folding and
+     * lowercasing substitute -- so the members are drawn from a shrinking
+     * pool. Encoding, which lengthens, is deliberately NOT in the loop; see
+     * patternReadings.
+     *
+     * ORDER WITHIN ONE PASS is load-bearing, though the fixed point covers the
+     * other orders too, as later passes over the members one pass produced.
+     * Decoding comes FIRST, so `%2e%2e`
      * is already `..` when dot segments are resolved and `%2f` is already a
      * separator when the path is split into them. Backslash folding comes
      * before parameter stripping, because folding decides where the SEGMENTS
@@ -720,38 +798,120 @@ public final class Policy {
      * reading `/a/c` would never be built. Lowercasing comes LAST, on decoded
      * text, so `%4C` and `%6c` both arrive at `l`.
      *
+     * Re-decoding on every pass is not wasted work but it is nearly free, and
+     * it is what lets foldBestFit produce a `%`: the loop finds the escape that
+     * character creates. It is also the only way a transform could ever produce
+     * a new escape, and none of them can -- every deletion these transforms
+     * make runs to the end of a segment, so the character after a deleted run
+     * is a `/` or nothing, and a `%` can never acquire two hex digits it did
+     * not already have. The brute-force closure check in PolicyTest is what
+     * says so empirically.
+     *
      * KNOWN LIMIT, stated rather than left to be discovered: `%uXXXX`, the
      * non-standard UTF-16 escape old IIS accepted (`%u002e%u002e/` for `../`),
      * is NOT decoded. It is not in the set because it is not percent-encoding
      * -- decodeOnce reads two hex digits after a `%`, and `%u0` is not two hex
      * digits -- and because IIS has not accepted it by default for many years.
-     * If it ever needs to be, it belongs in decodeOnce, not here.
+     * If it ever needs to be, it belongs in decodeOnce, not here. (The
+     * character it names in the traversal that made it famous, U+FF0E, IS
+     * folded now -- by foldBestFit, from its percent-encoded UTF-8 spelling.)
      */
     static Set<String> readings(String path) {
         Set<String> out = new LinkedHashSet<>();
         out.add(path);
-        String decoded = decodeToFixedPoint(path);
-        addReadings(out, decoded);
+        Deque<String> pending = new ArrayDeque<>();
+        pending.add(path);
+        while (!pending.isEmpty()) derive(out, pending, pending.poll());
+        return out;
+    }
+
+    /**
+     * Every reading of one member, added to the set and queued if it is new.
+     *
+     * Decoding comes first, then the two byte-level re-readings, then the
+     * segment transforms over each of the three bases. Each base is a
+     * different answer to "what characters does the target server think it
+     * got", and the transforms are what it does with them.
+     */
+    private static void derive(Set<String> out, Deque<String> pending, String member) {
+        String decoded = decodeToFixedPoint(member);
+        addReadings(out, pending, decoded);
         String utf8 = foldOverlongUtf8(decoded);
-        if (!utf8.equals(decoded)) addReadings(out, utf8);
+        if (!utf8.equals(decoded)) addReadings(out, pending, utf8);
+        String bestFit = foldBestFit(utf8);
+        if (!bestFit.equals(utf8)) addReadings(out, pending, bestFit);
+    }
+
+    /**
+     * Every reading of a PATTERN: readings(), plus the pattern spelt as the
+     * percent-encoded UTF-8 a request carries it in.
+     *
+     * readings() only ever DECODES, which is right for a path -- the wire
+     * carries the escaped form and the server unescapes it. A pattern is the
+     * other way round. An operator who writes `scope.include
+     * .../files/cafe-with-an-acute/*` has typed the characters; the request
+     * arrives as `/files/caf%c3%a9/a.pdf`, whose RAW reading is percent-encoded
+     * and which no decoding of the pattern can ever produce. Under allow-AND
+     * one uncovered reading refuses the request, so that include authorised
+     * NOTHING and told the operator only that their request "matches no
+     * scope.include pattern" -- which sends them to rewrite a pattern that was
+     * right.
+     *
+     * BOTH hex cases, because the raw reading of a path is verbatim and
+     * unfolded (see Rule.allows) and the encoding a request arrives in is not
+     * the operator's choice: `%c3%a9` and `%C3%A9` are the same two bytes and
+     * only one of them is a string match.
+     *
+     * This is NOT done inside readings(), and the reason is termination.
+     * Encoding LENGTHENS -- one character becomes six -- so a set closed under
+     * both encoding and decoding has no fixed point to reach: the encoded form
+     * decodes to bytes, which encode to a longer form, forever. Every
+     * transform readings() iterates shortens or preserves length, which is what
+     * bounds that loop. Encoding is applied ONCE, to the pattern as the
+     * operator typed it, and the result is fed through readings() like any
+     * other string.
+     */
+    static Set<String> patternReadings(String pattern) {
+        Set<String> out = readings(pattern);
+        String encoded = percentEncodeUtf8(pattern, false);
+        if (!encoded.equals(pattern)) {
+            out.addAll(readings(encoded));
+            out.addAll(readings(percentEncodeUtf8(pattern, true)));
+        }
         return out;
     }
 
     private static final int STRIP_PARAMS = 1, FOLD_BACKSLASH = 2, TRIM_TAILS = 4;
 
     /**
-     * The transform combinations over one decoded base, in both dot-segment
-     * orders.
+     * The transform combinations over one base, in both dot-segment orders,
+     * with every new member queued for re-derivation.
      *
      * Only combinations of the transforms this base can actually be CHANGED by
-     * are built, which is an optimisation and nothing more: each of the three
-     * is the identity on a string without its trigger character, so a skipped
-     * combination would have produced a member the set already holds. That
-     * matters because it runs per request per pattern -- 12 shipped
-     * dangerous.path globs plus the operator's scope -- and an ordinary path
-     * has none of the three triggers, so the loop runs once.
+     * are built. Each of the three is the identity on a string without its
+     * trigger character, so the skipped combinations produce nothing this base
+     * has not already produced -- an early-out, and it is what keeps an
+     * ordinary path at one member and one glob per rule.
+     *
+     * It is also where the closure defect lived, and the reason readings()
+     * iterates. `applicable` is computed on the BASE, and an earlier version
+     * stopped there under a comment claiming the set was closed because "a
+     * skipped combination would have produced a member the set already holds".
+     * The first clause is true of the base; the conclusion does not follow,
+     * because THE TRANSFORMS COMPOSE. Stripping a `;param` or folding a
+     * backslash CREATES a segment tail the base did not have:
+     * `/admin%20;x/users` decodes to `/admin ;x/users`, whose only trimmable
+     * character is hidden behind the parameter, so TRIM_TAILS never switched on
+     * and the reading `/admin /users` -- which Windows trims to `/admin/users`
+     * -- was never built. `exclude=/admin/*` was walked past by appending two
+     * characters to a path it already caught. Feeding every member back through
+     * derive() until nothing new appears is what makes the closure claim true
+     * rather than plausible. It also widens the claim: one pass applies the
+     * three transforms in one fixed order, and re-deriving every member makes
+     * the set closed under any SEQUENCE of them, which is what "every reading a
+     * server might resolve this to" actually asks for.
      */
-    private static void addReadings(Set<String> out, String base) {
+    private static void addReadings(Set<String> out, Deque<String> pending, String base) {
         int applicable = 0;
         if (base.indexOf(';') >= 0) applicable |= STRIP_PARAMS;
         if (base.indexOf('\\') >= 0) applicable |= FOLD_BACKSLASH;
@@ -762,13 +922,17 @@ public final class Policy {
             if ((flags & FOLD_BACKSLASH) != 0) s = foldBackslashes(s);
             if ((flags & STRIP_PARAMS) != 0) s = stripPathParameters(s);
             if ((flags & TRIM_TAILS) != 0) s = trimSegmentTails(s);
-            out.add(lower(collapseDotSegments(collapseEmptySegments(s))));
-            out.add(lower(collapseEmptySegments(collapseDotSegments(s))));
+            add(out, pending, lower(collapseDotSegments(collapseEmptySegments(s))));
+            add(out, pending, lower(collapseEmptySegments(collapseDotSegments(s))));
         }
     }
 
+    private static void add(Set<String> out, Deque<String> pending, String reading) {
+        if (out.add(reading)) pending.add(reading);
+    }
+
     /** Whether trimSegmentTails() would change this path -- exactly the
-     *  condition under which it is not the identity, including the all-dots
+     *  condition under which it is not the identity, including the dot
      *  segments it deliberately leaves alone. */
     private static boolean hasTrimmableTail(String path) {
         int start = 0;
@@ -777,7 +941,7 @@ public final class Policy {
                 if (i > start) {
                     char last = path.charAt(i - 1);
                     if (last == ' ' || last == '\0'
-                            || (last == '.' && !allDots(path, start, i)))
+                            || (last == '.' && !isDotSegment(path, start, i)))
                         return true;
                 }
                 start = i + 1;
@@ -821,11 +985,18 @@ public final class Policy {
      * where a C string ends, so anything that passes the path to a C API sees
      * `/admin%00foo` as `/admin`.
      *
-     * A segment of nothing but dots is left ALONE. `.` and `..` are dot
-     * SEGMENTS, resolved a step later; trimming their dots would delete the
-     * step rather than normalise a name, and `/app/.. /other` -- whose whole
-     * point is that the trimmed segment must still be a `..` -- would come out
-     * as `/app//other` instead of `/other`.
+     * `.` and `..` are left ALONE, and NOTHING ELSE IS. They are dot SEGMENTS,
+     * resolved a step later; trimming their dots would delete the step rather
+     * than normalise a name, and `/app/.. /other` -- whose whole point is that
+     * the trimmed segment must still be a `..` -- would come out as
+     * `/app//other` instead of `/other`.
+     *
+     * The exemption used to be "a segment of nothing but dots", which is wider
+     * than the argument for it. `...` and `....` are not dot segments, they are
+     * ordinary names, and Windows trims them to NOTHING -- so `/.../admin/users`
+     * is `//admin/users` is `/admin/users` on the server, while the exemption
+     * left it as a segment called `...` that `exclude=/admin/*` never matched.
+     * Three characters bought a walk past an exclusion.
      */
     static String trimSegmentTails(String path) {
         StringBuilder out = new StringBuilder(path.length());
@@ -846,7 +1017,7 @@ public final class Policy {
             if (c != ' ' && c != '\0') break;
             cut--;
         }
-        if (!allDots(path, start, cut))
+        if (!isDotSegment(path, start, cut))
             while (cut > start) {
                 char c = path.charAt(cut - 1);
                 if (c != '.' && c != ' ' && c != '\0') break;
@@ -855,8 +1026,11 @@ public final class Policy {
         return path.substring(start, cut);
     }
 
-    private static boolean allDots(String path, int start, int end) {
-        if (end <= start) return false;
+    /** Whether this segment is `.` or `..` -- the two dot SEGMENTS, and not
+     *  the longer runs of dots, which are names. */
+    private static boolean isDotSegment(String path, int start, int end) {
+        int length = end - start;
+        if (length != 1 && length != 2) return false;
         for (int i = start; i < end; i++) if (path.charAt(i) != '.') return false;
         return true;
     }
@@ -905,6 +1079,103 @@ public final class Policy {
             if (!wellFormed || cp > 0xffff) { out.append(c); i++; continue; }
             out.append((char) cp);
             i += extra + 1;
+        }
+        return out.toString();
+    }
+
+    /**
+     * The Windows ANSI best-fit mapping, over the characters that can become a
+     * path separator.
+     *
+     * When a Windows program hands a wide string to an ANSI ("A") API --
+     * which the whole compatibility layer under a great deal of shipped
+     * software still does -- WideCharToMultiByte does not fail on a character
+     * the code page cannot represent. It substitutes a VISUALLY SIMILAR one
+     * from a per-code-page "best fit" table. U+FF0F FULLWIDTH SOLIDUS becomes
+     * an ordinary `/`. U+FF0E becomes `.`, U+FF3C becomes a backslash, U+FF1B
+     * becomes `;`. The path that reaches the filesystem is not the path that
+     * was routed.
+     *
+     * So `/x/..` followed by U+FF0F followed by `logout` -- three
+     * percent-escapes on the wire, `%ef%bc%8f` -- is served as `/x/../logout`,
+     * which is a real logout, and every reading this class had before this
+     * method saw a segment called `..(something)logout` that no glob names.
+     * Named "WorstFit" at Black Hat EU 2024; the same mapping is what made the
+     * historic `%uff0e%uff0e/` IIS traversal work.
+     *
+     * CLOSED rather than documented, on the reviewer's argument: the payload is
+     * in every modern traversal wordlist, and the party generating targets for
+     * this tool is an agent working a pentest, which is exactly the party that
+     * pastes a wordlist entry.
+     *
+     * The map is the separator-producing entries only. The real tables map
+     * hundreds of characters -- quotes, dashes, currency signs -- and none of
+     * the rest changes how a path is READ. U+FF05 (fullwidth percent) is here
+     * because it can create an escape, and readings() re-derives every member,
+     * so the escape it creates is decoded on the next pass.
+     */
+    static String foldBestFit(String s) {
+        int i = 0;
+        while (i < s.length() && s.charAt(i) < 0x80) i++;
+        if (i == s.length()) return s;                  // pure ASCII: nothing to fit
+        StringBuilder out = null;
+        for (; i < s.length(); i++) {
+            char c = s.charAt(i);
+            char fit = bestFit(c);
+            if (fit == c) continue;
+            if (out == null) out = new StringBuilder(s);
+            out.setCharAt(i, fit);
+        }
+        return out == null ? s : out.toString();
+    }
+
+    /** Hex rather than character literals on purpose: these code points are
+     *  homoglyphs of the separators, and a reader has no way to tell them apart
+     *  in a source file. */
+    private static char bestFit(char c) {
+        switch (c) {
+            case 0xff0f:            // FULLWIDTH SOLIDUS
+            case 0x2215:            // DIVISION SLASH
+            case 0x2044:            // FRACTION SLASH
+            case 0x29f8: return '/';// BIG SOLIDUS
+            case 0xff3c:            // FULLWIDTH REVERSE SOLIDUS
+            case 0xfe68: return '\\';// SMALL REVERSE SOLIDUS
+            case 0xff0e:            // FULLWIDTH FULL STOP
+            case 0xfe52:            // SMALL FULL STOP
+            case 0xff61:            // HALFWIDTH IDEOGRAPHIC FULL STOP
+            case 0x2024: return '.';// ONE DOT LEADER
+            case 0xff1b:            // FULLWIDTH SEMICOLON
+            case 0xfe54: return ';';// SMALL SEMICOLON
+            case 0xff05: return '%';// FULLWIDTH PERCENT SIGN
+            default:     return c;
+        }
+    }
+
+    /**
+     * The string spelt as the percent-encoded UTF-8 a request would carry it
+     * in. Only patternReadings() calls this; see its comment for why it is not
+     * a reading of a path.
+     *
+     * Surrogate pairs are encoded as the one code point they are, not as two
+     * unpaired halves, which is what String.getBytes does for a substring that
+     * holds the whole pair.
+     */
+    static String percentEncodeUtf8(String s, boolean upperHex) {
+        int i = 0;
+        while (i < s.length() && s.charAt(i) < 0x80) i++;
+        if (i == s.length()) return s;                  // pure ASCII: already encoded
+        StringBuilder out = new StringBuilder(s.length() + 16);
+        out.append(s, 0, i);
+        String digits = upperHex ? "0123456789ABCDEF" : "0123456789abcdef";
+        while (i < s.length()) {
+            char c = s.charAt(i);
+            if (c < 0x80) { out.append(c); i++; continue; }
+            int end = i + (Character.isHighSurrogate(c) && i + 1 < s.length()
+                           && Character.isLowSurrogate(s.charAt(i + 1)) ? 2 : 1);
+            for (byte b : s.substring(i, end).getBytes(StandardCharsets.UTF_8))
+                out.append('%').append(digits.charAt((b >> 4) & 0xf))
+                   .append(digits.charAt(b & 0xf));
+            i = end;
         }
         return out.toString();
     }
