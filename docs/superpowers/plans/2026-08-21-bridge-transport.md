@@ -2005,6 +2005,8 @@ git commit -m "feat(bridge): unix socket server with peercred check and deny-all
 - Create: `extension/src/hx/HxExtension.java`
 - Create: `extension/test/hx/bridge/BridgeClientTest.java`
 - Create: `extension/test/hx/bridge/FakeMontoya.java`
+- Modify: `extension/src/hx/bridge/Frame.java` — add `PeerClosed` and `Reader`, delete `read(InputStream)` (Step 0)
+- Modify: `extension/test/hx/bridge/CodecTest.java` — the one call to the deleted method, plus the Reader's own tests (Step 0)
 - Modify: `extension/test.sh` — run both test classes
 
 **Interfaces:**
@@ -2019,6 +2021,176 @@ git commit -m "feat(bridge): unix socket server with peercred check and deny-all
   - `BridgeClient.checkMaySend() -> void` — throws `NotConfigured` unless configured and not halted
   - `hx.bridge.BridgeClient.NotConfigured extends RuntimeException`
   - `hx.HxExtension implements BurpExtension`
+
+- [ ] **Step 0: `Frame.Reader` — a bare `read(InputStream)` cannot be correct in a loop**
+
+`Frame.read(InputStream)` buffers into a **call-local** `ByteArrayOutputStream`.
+When one delivery carries two frames it returns the first and drops the rest of
+the buffer on the floor. Task 3's `readLoop()` calls it in a `while (true)`, so
+every control frame that arrives coalesced with its predecessor is lost, and the
+loss surfaces later as a misleading "peer closed mid-frame". Proven before this
+step was written:
+
+```
+frame 1: t=configure
+frame 2: LOST -> Incomplete("peer closed mid-frame")
+```
+
+This is the same defect the Python codec already fixed in Task 1, for the same
+reason — `codec.FrameReader` exists because "a bare `read_frame(sock)` function
+cannot be correct here". The Java side never got the equivalent. Add it, and
+delete the trap rather than documenting it: a method that is correct exactly
+once per stream and silently lossy on every later call is not worth keeping.
+
+**Delete** `public static Decoded read(InputStream in)` from
+`extension/src/hx/bridge/Frame.java` entirely, and append this in its place,
+inside the `Frame` class:
+
+```java
+
+    /** Peer closed the connection. Distinct from Incomplete, which means
+     *  "call again with more bytes". */
+    public static class PeerClosed extends RuntimeException {
+        public PeerClosed(String m) { super(m); }
+    }
+
+    /**
+     * Reads frames from a stream, owning the buffer across calls.
+     *
+     * A bare read(InputStream) cannot be correct in a loop. decode() reports
+     * `consumed` precisely because one read may deliver more than one frame,
+     * and a method that returns after the first frame has nowhere to put the
+     * remainder -- so it drops it, and the loss surfaces later as a misleading
+     * "peer closed mid-frame". Owning the buffer is that somewhere. This
+     * mirrors codec.FrameReader on the Python side, including reading the
+     * length prefix first so draining a large frame is linear rather than
+     * re-parsing a growing buffer once per chunk.
+     */
+    public static final class Reader {
+        private final InputStream in;
+        private byte[] buf = new byte[0];
+        private int len = 0;                       // bytes of buf actually in use
+
+        public Reader(InputStream in) { this.in = in; }
+
+        public Decoded read() throws IOException {
+            byte[] chunk = new byte[65536];
+            while (true) {
+                if (len >= 4) {
+                    long length = ((long) (buf[0] & 0xff) << 24) | ((buf[1] & 0xff) << 16)
+                                | ((buf[2] & 0xff) << 8) | (buf[3] & 0xff);
+                    // Checked before allocation: the prefix is attacker-influenced.
+                    if (length > MAX_FRAME)
+                        throw new FrameError("declared frame of " + length
+                                             + " exceeds MAX_FRAME " + MAX_FRAME);
+                    int end = (int) (4 + length);
+                    if (len >= end) {
+                        Decoded d = decode(Arrays.copyOfRange(buf, 0, end));
+                        System.arraycopy(buf, d.consumed, buf, 0, len - d.consumed);
+                        len -= d.consumed;
+                        return d;
+                    }
+                }
+                int n = in.read(chunk);
+                if (n < 0) throw new PeerClosed(len > 0 ? "peer closed mid-frame" : "peer closed");
+                if (len + n > buf.length)
+                    buf = Arrays.copyOf(buf, Math.max(len + n, Math.max(1024, buf.length * 2)));
+                System.arraycopy(chunk, 0, buf, len, n);
+                len += n;
+            }
+        }
+    }
+```
+
+`PeerClosed` is new, and deliberately distinct from `Incomplete`: `Incomplete`
+means "call again with more bytes", which the Reader now handles internally and
+never surfaces. It mirrors the Python `PeerClosed`, including both messages —
+`"peer closed"` at a frame boundary is an orderly shutdown, `"peer closed
+mid-frame"` is a truncated frame.
+
+**Update the one existing caller** in `extension/test/hx/bridge/CodecTest.java`
+(`readReassemblesAcrossChunks`):
+
+```java
+        Frame.Decoded d = new Frame.Reader(new ByteArrayInputStream(raw)).read();
+```
+
+**Add these to `CodecTest`**, using its existing `check(...)` helper, and call
+them from `main` alongside the others:
+
+```java
+    static void readerKeepsCoalescedFrames() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+        byte[] f2 = Frame.encode(Map.of("v", 1L, "t", "halt"), "body".getBytes(StandardCharsets.UTF_8));
+        ByteArrayOutputStream both = new ByteArrayOutputStream();
+        both.write(f1); both.write(f2);
+
+        Frame.Reader r = new Frame.Reader(new ByteArrayInputStream(both.toByteArray()));
+        check("coalesced frame 1", "configure".equals(r.read().header.get("t")));
+        Frame.Decoded second = r.read();
+        // The whole point: a call-local buffer loses this one.
+        check("coalesced frame 2 survives", "halt".equals(second.header.get("t")));
+        check("coalesced frame 2 body intact",
+              "body".equals(new String(second.body, StandardCharsets.UTF_8)));
+    }
+
+    static void readerSurvivesArbitraryChunkBoundaries() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+        byte[] f2 = Frame.encode(Map.of("v", 1L, "t", "halt"), "body".getBytes(StandardCharsets.UTF_8));
+        ByteArrayOutputStream three = new ByteArrayOutputStream();
+        three.write(f1); three.write(f2); three.write(f1);
+        final byte[] all = three.toByteArray();
+
+        InputStream sevenAtATime = new InputStream() {
+            int i = 0;
+            public int read() { return i < all.length ? (all[i++] & 0xff) : -1; }
+            public int read(byte[] b, int off, int l) {
+                if (i >= all.length) return -1;
+                int n = Math.min(7, Math.min(l, all.length - i));
+                System.arraycopy(all, i, b, off, n); i += n; return n;
+            }
+        };
+        Frame.Reader r = new Frame.Reader(sevenAtATime);
+        check("7-byte chunks: frame 1", "configure".equals(r.read().header.get("t")));
+        check("7-byte chunks: frame 2", "halt".equals(r.read().header.get("t")));
+        check("7-byte chunks: frame 3", "configure".equals(r.read().header.get("t")));
+    }
+
+    static void readerDistinguishesCleanCloseFromTruncation() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+
+        Frame.Reader clean = new Frame.Reader(new ByteArrayInputStream(f1));
+        clean.read();
+        boolean ok = false;
+        try { clean.read(); } catch (Frame.PeerClosed e) { ok = "peer closed".equals(e.getMessage()); }
+        check("clean close at a frame boundary is not an error condition", ok);
+
+        byte[] truncated = Arrays.copyOfRange(f1, 0, f1.length - 3);
+        ok = false;
+        try { new Frame.Reader(new ByteArrayInputStream(truncated)).read(); }
+        catch (Frame.PeerClosed e) { ok = "peer closed mid-frame".equals(e.getMessage()); }
+        check("a truncated frame is reported as mid-frame", ok);
+    }
+
+    static void readerRejectsAnOversizedPrefixBeforeAllocating() throws Exception {
+        byte[] huge = new byte[] {(byte) 0x7f, (byte) 0xff, (byte) 0xff, (byte) 0xff, 'x'};
+        boolean ok = false;
+        try { new Frame.Reader(new ByteArrayInputStream(huge)).read(); }
+        catch (Frame.FrameError e) { ok = e.getMessage().contains("exceeds MAX_FRAME"); }
+        check("oversized length prefix rejected before allocation", ok);
+    }
+```
+
+Run `extension/test.sh`. All of `CodecTest` must pass, including the four new
+methods. Every one of these was run against the real `Frame` class before being
+written here.
+
+Commit this step on its own — it is a codec fix, not extension work:
+
+```bash
+git add extension/src/hx/bridge/Frame.java extension/test/hx/bridge/CodecTest.java
+git commit -m "fix(codec): a call-local buffer drops frames that arrive coalesced"
+```
 
 - [ ] **Step 1: Write the fake and the failing test**
 
@@ -2081,9 +2253,13 @@ public class BridgeClientTest {
             try (SocketChannel peer = server.accept()) {
                 InputStream in = java.nio.channels.Channels.newInputStream(peer);
                 OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+                // One Reader for the whole connection: frames coalesce, and a
+                // fresh reader per call would drop whatever followed the one
+                // it returned.
+                Frame.Reader reader = new Frame.Reader(in);
 
                 // 1. hello arrives with the right identity
-                Frame.Decoded hello = Frame.read(in);
+                Frame.Decoded hello = reader.read();
                 check("sends hello", "hello".equals(hello.header.get("t")));
                 check("hello carries engagement_id", "e-1".equals(hello.header.get("engagement_id")));
                 check("hello carries instance_id", "i-1".equals(hello.header.get("instance_id")));
@@ -2104,7 +2280,7 @@ public class BridgeClientTest {
                         .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
                 out.flush();
 
-                Frame.Decoded ack = Frame.read(in);
+                Frame.Decoded ack = reader.read();
                 check("acks with configured", "configured".equals(ack.header.get("t")));
                 check("ack echoes the request id", Long.valueOf(1L).equals(ack.header.get("id")));
                 check("ack carries a non-zero epoch",
@@ -2133,7 +2309,7 @@ public class BridgeClientTest {
                 Map<String, Object> wrong = new LinkedHashMap<>(cfg);
                 wrong.put("id", 2L); wrong.put("engagement_id", "SOMEONE-ELSE");
                 out.write(Frame.encode(wrong, new byte[0])); out.flush();
-                Frame.Decoded err = Frame.read(in);
+                Frame.Decoded err = reader.read();
                 check("engagement mismatch answered with error",
                       "error".equals(err.header.get("t")));
                 check("error class names the mismatch",
@@ -2259,12 +2435,16 @@ public final class BridgeClient {
     }
 
     private void readLoop() {
+        // The Reader is created once, outside the loop, and owns its buffer
+        // across iterations. Constructing one per iteration would lose every
+        // frame that arrived in the same delivery as its predecessor.
+        Frame.Reader reader = new Frame.Reader(in);
         try {
             while (true) {
-                Frame.Decoded f = Frame.read(in);
+                Frame.Decoded f = reader.read();
                 if (!handle(f)) return;
             }
-        } catch (Frame.Incomplete | IOException e) {
+        } catch (Frame.PeerClosed | IOException e) {
             // Peer closed. DENY-ALL is also the terminal state.
             configured.set(false);
             configEpoch = 0;
