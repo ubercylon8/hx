@@ -314,7 +314,6 @@ ordering block is unambiguous about which rule moved.
 
 ```java
 // extension/test/hx/policy/PolicyTest.java
-// extension/test/hx/policy/PolicyTest.java
 package hx.policy;
 
 import hx.bridge.BridgeClient;
@@ -361,13 +360,22 @@ public class PolicyTest {
         methodsAreCaseSensitive();
         theDangerousDenylistShipsWithDefaults();
         operatorDangerousPatternsAddToTheDefaults();
-        canonicalIsSpelledOutCharacterByCharacter();
+        theReadingSetIsSpelledOutCharacterByCharacter();
+        bothDotSegmentOrdersAreInTheSet();
         aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation();
         aDenyRuleSeesEveryReadingOfThePath();
-        anIncludeMustMatchBothReadingsOfThePath();
+        anIncludeMustMatchEveryReadingOfThePath();
+        aPathParameterIsStrippedBeforeTheServerNormalises();
+        aBackslashIsReadAsASeparator();
+        aTrailingDotSpaceOrNulIsTrimmed();
+        overlongUtf8IsReadAsTheAsciiItDecodesTo();
+        theRawPathIsAReadingInItsOwnRight();
+        aPatternIsReadEveryWayAPathIs();
+        aTargetTooBigToDecideAboutIsRefused();
         aLegitimatelyEncodedPathIsStillAllowed();
         aTrailingSlashIsNotNewlyRefused();
         aPathOfOnlySlashesDoesNotThrow();
+        aMalformedAuthorisationIsADecisionNotACrash();
         theRefusalOrderIsPinned();
         aBrokenGateIsNeverAnAllow();
         policyNamesNoBurpType();
@@ -785,88 +793,126 @@ public class PolicyTest {
                cfg, "dangerous_denied");
     }
 
-    // ---- canonical paths --------------------------------------------------
+    // ---- the reading set --------------------------------------------------
 
-    /** canonical() is a pure function, so it is tested as one. Catches
-     *  Throwable: a canonicaliser that throws inside decide() is an implicit
-     *  allow the moment a caller mishandles it, so "it did not throw" is part
-     *  of every one of these checks, not a separate suite. */
-    static void canon(String in, String want) {
-        String got;
+    /** readings() is a pure function, so it is tested as one. Catches
+     *  Throwable: a reader that throws inside decide() is an implicit allow the
+     *  moment a caller mishandles it, so "it did not throw" is part of every one
+     *  of these checks, not a separate suite. */
+    static Set<String> readingsOf(String in) {
         try {
-            got = Policy.canonical(in);
+            return Policy.readings(in);
         } catch (Throwable t) {
-            check("canonical(" + in + ") threw " + t.getClass().getSimpleName(), false);
-            return;
+            check("readings(" + in + ") threw " + t.getClass().getSimpleName(), false);
+            return Set.of();
         }
-        check("canonical(" + in + ") is \"" + want + "\" (got \"" + got + "\")",
-              want.equals(got));
     }
 
-    static void canonicalIsSpelledOutCharacterByCharacter() {
-        // The identity cases first: a canonicaliser that mangles ordinary
-        // paths would be caught by the scope tests above, but not clearly.
-        canon("/api/orders", "/api/orders");
-        canon("/", "/");
-        canon("", "");
+    /** `want` is one of the ways this path can be read. */
+    static void reads(String in, String want) {
+        Set<String> got = readingsOf(in);
+        check("readings(" + in + ") includes \"" + want + "\" (got " + got + ")",
+              got.contains(want));
+    }
+
+    /**
+     * The set is EXACTLY these, which is the half of the contract membership
+     * checks cannot see. readings() returning every string in the universe
+     * would satisfy every reads() below and refuse every request on earth,
+     * because an include has to cover the whole set.
+     */
+    static void readsExactly(String in, String... want) {
+        Set<String> got = readingsOf(in);
+        check("readings(" + in + ") is exactly " + Arrays.asList(want) + " (got " + got + ")",
+              got.equals(new LinkedHashSet<>(Arrays.asList(want))));
+    }
+
+    static void theReadingSetIsSpelledOutCharacterByCharacter() {
+        // The identity cases first: a reader that mangles ordinary paths would
+        // be caught by the scope tests above, but not clearly. These are
+        // readsExactly, because "an ordinary path has ONE reading" is also the
+        // statement that this costs one glob per rule on the hot path.
+        readsExactly("/api/orders", "/api/orders");
+        readsExactly("/", "/");
+        readsExactly("", "");
 
         // Percent-decoding. %6f is the one that shipped: it decodes to `o` on
         // essentially every server, so /account/log%6fut IS a logout.
-        canon("/account/log%6fut", "/account/logout");
-        canon("/adm%69n/users", "/admin/users");
-        canon("/x/%41", "/x/a");                       // uppercase hex, then lowercased
-        canon("/files/annual%20report.pdf", "/files/annual report.pdf");
+        reads("/account/log%6fut", "/account/logout");
+        reads("/adm%69n/users", "/admin/users");
+        reads("/x/%41", "/x/a");                       // uppercase hex, then lowercased
+        reads("/files/annual%20report.pdf", "/files/annual report.pdf");
 
         // %2f decodes to a separator, and it does so BEFORE the path is split
         // into segments -- otherwise /admin%2fusers is one opaque segment that
         // no /admin/* pattern can reach.
-        canon("/admin%2fusers", "/admin/users");
-        canon("/admin%2Fusers", "/admin/users");
+        reads("/admin%2fusers", "/admin/users");
+        reads("/admin%2Fusers", "/admin/users");
 
         // To a FIXED POINT, not once: %2570 is `%70` is `p`.
-        canon("/account/%2570assword/change", "/account/password/change");
-        canon("/api/%252e%252e/admin", "/admin");
+        reads("/account/%2570assword/change", "/account/password/change");
+        reads("/api/%252e%252e/admin", "/admin");
 
         // Dot segments, encoded and not. Decoding first is what makes the
         // second of these behave like the first.
-        canon("/api/../admin/users", "/admin/users");
-        canon("/api/%2e%2e/admin/users", "/admin/users");
-        canon("/a/./b", "/a/b");
-        canon("/a/b/..", "/a/");                       // trailing slash survives
-        canon("/a/b/.", "/a/b/");
-        canon("/a/", "/a/");
-        canon("/..", "/");
-        canon("/../../etc/passwd", "/etc/passwd");     // .. at the root is discarded
+        reads("/api/../admin/users", "/admin/users");
+        reads("/api/%2e%2e/admin/users", "/admin/users");
+        reads("/a/./b", "/a/b");
+        reads("/a/b/..", "/a/");                       // trailing slash survives
+        reads("/a/b/.", "/a/b/");
+        reads("/a/", "/a/");
+        reads("/..", "/");
+        reads("/../../etc/passwd", "/etc/passwd");     // .. at the root is discarded
 
         // Case.
-        canon("/ADMIN/Users", "/admin/users");
+        reads("/ADMIN/Users", "/admin/users");
 
-        // Empty segments ARE merged -- see canonical()'s comment for the
-        // order this is done in and why. A single trailing slash is not a
-        // repeat and survives untouched.
-        canon("/app//admin", "/app/admin");
-        canon("//admin/users", "/admin/users");
-        canon("/admin//users", "/admin/users");
-        canon("/admin/", "/admin/");
-        canon("////", "/");
+        // Empty segments merged, which is what a slash-merging server does.
+        reads("/app//admin", "/app/admin");
+        reads("//admin/users", "/admin/users");
+        reads("/admin//users", "/admin/users");
+        reads("/admin/", "/admin/");
+        reads("////", "/");
+        reads("/%2fadmin/users", "/admin/users");
 
-        // The interaction with dot segments: collapsing the empty segment
-        // FIRST means ".." pops the segment before it, same as a server that
-        // merges "//" before resolving ".." would -- so "/a//../admin" reads
-        // as "/a/../admin" and then as "/admin", not as "/a/admin" (which is
-        // what treating the merged slash as a real, poppable segment would
-        // give). See canonical()'s comment.
-        canon("/a//../admin/users", "/admin/users");
-
-        // The same gap through one more layer of percent-encoding: %2f
-        // decodes to the separator that then gets merged with the literal one
-        // beside it.
-        canon("/%2fadmin/users", "/admin/users");
-
-        // Idempotence, which is what "until stable" has to mean.
+        // Idempotence, which is what "until stable" has to mean: reading a
+        // reading adds nothing.
         for (String p : List.of("/api/%252e%252e/admin", "/a%2525b", "/ADMIN/%2e%2e/x"))
-            check("canonical is idempotent on " + p,
-                  Policy.canonical(Policy.canonical(p)).equals(Policy.canonical(p)));
+            for (String r : readingsOf(p))
+                check("readings is idempotent on " + p + " -> " + r,
+                      readingsOf(p).containsAll(readingsOf(r)));
+    }
+
+    /**
+     * The defect the whole set model exists for.
+     *
+     * canonical() used to return ONE string, so it had to pick a rule for
+     * `/a//../admin/users`, and there is no rule to pick: python's urljoin and
+     * node's URL both answer /a/admin/users, java's URI.normalize answers
+     * /admin/users. This class picked merge-then-resolve and the reviewer walked
+     * straight past an exclude of /a/admin/* -- merging first does not SHORTEN
+     * the path, it RELOCATES it out from under a glob anchored at the prefix the
+     * merge deleted.
+     *
+     * Both readings are in the set, so there is nothing left to pick.
+     */
+    static void bothDotSegmentOrdersAreInTheSet() {
+        readsExactly("/a//../admin/users",
+                     "/a//../admin/users",   // the bytes on the wire
+                     "/admin/users",         // merge the empty segment, then pop `a`
+                     "/a/admin/users");      // RFC 3986: `..` pops the empty segment
+
+        // And the deny rule that was evaded now catches it under EITHER
+        // spelling of the exclude, which is the point of holding both.
+        Policy p = allowingPolicy();
+        for (String pattern : List.of("https://app.example.test/a/admin/*",
+                                      "https://app.example.test/admin/*"))
+            denies("neither reading of /a//../admin/users escapes " + pattern, p,
+                   req("GET", "https://app.example.test/a//../admin/users",
+                       "app.example.test", "/a//../admin/users", ""),
+                   authorised("scope.include", "https://app.example.test/*",
+                              "scope.exclude", pattern),
+                   "scope_denied");
     }
 
     /**
@@ -876,15 +922,15 @@ public class PolicyTest {
      * by appending a single `%`.
      */
     static void aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation() {
-        canon("%", "%");
-        canon("/a%", "/a%");
-        canon("/a%z", "/a%z");
-        canon("/a%4", "/a%4");
-        canon("%%%", "%%%");
-        canon("/a%zz/b", "/a%zz/b");
+        readsExactly("%", "%");
+        readsExactly("/a%", "/a%");
+        readsExactly("/a%z", "/a%z");
+        readsExactly("/a%4", "/a%4");
+        readsExactly("%%%", "%%%");
+        readsExactly("/a%zz/b", "/a%zz/b");
         // The escape is bad; the ones around it are not, and they still decode.
-        canon("/a%%41", "/a%a");
-        canon("/adm%69n/%/users", "/admin/%/users");
+        reads("/a%%41", "/a%a");
+        reads("/adm%69n/%/users", "/admin/%/users");
 
         // The whole point, at the level that matters: a trailing `%` does not
         // buy a logout.
@@ -985,6 +1031,20 @@ public class PolicyTest {
                           "scope.exclude", "https://app.example.test/REPORTS/Q1%20FINAL*"),
                "scope_denied");
 
+        // Folding the RAW readings is a separate guard from the derived ones,
+        // and this is the shape that proves it. `/reports/q1%2*` is a truncated
+        // escape -- an operator's typo, or a deliberately byte-exact pattern --
+        // so it decodes to itself, while the request's `%2F` decodes to a
+        // separator and takes the path somewhere else entirely. Neither
+        // derived reading matches, and the raw ones differ only in case: fold
+        // them and the exclusion holds, do not and the request is ALLOWED.
+        denies("the raw readings are folded on the path side too", p,
+               req("GET", "https://app.example.test/Reports/Q1%2Final.pdf",
+                   "app.example.test", "/Reports/Q1%2Final.pdf", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "https://app.example.test/reports/q1%2*"),
+               "scope_denied");
+
         // And the ordinary path under the same config is still allowed: a
         // canonicaliser that refused everything would pass every check above.
         allows("an ordinary path under the same exclude is untouched", p, orders(), cfg);
@@ -993,10 +1053,10 @@ public class PolicyTest {
     /**
      * The half that is NOT symmetric decoration. Nothing is excluded here:
      * `/app/%2e%2e/other` matches the include as bytes, and the server serves
-     * `/other`, which no include names. An allow rule must match the raw path
-     * AND its canonical form, so both interpretations have to be in scope.
+     * `/other`, which no include names. An allow rule must have EVERY reading
+     * of the path in scope, not a favourite one.
      */
-    static void anIncludeMustMatchBothReadingsOfThePath() {
+    static void anIncludeMustMatchEveryReadingOfThePath() {
         Policy p = allowingPolicy();
         BridgeClient.Authorisation app =
                 authorised("scope.include", "https://app.example.test/app/*");
@@ -1025,6 +1085,340 @@ public class PolicyTest {
         denies("an include is not widened by folding case", p,
                req("GET", "https://app.example.test/APP/orders",
                    "app.example.test", "/APP/orders", ""), app, "scope_denied");
+    }
+
+    /**
+     * F1. `..;/` is the most weaponised URL-normalisation trick in the field,
+     * and it was ALLOWED past an include.
+     *
+     * Every servlet container -- Tomcat, Jetty, Undertow, WebSphere, so every
+     * Spring Boot application -- strips `;params` from a segment BEFORE it
+     * normalises the path. The segment `..;` therefore becomes `..`, and
+     * `/app/..;/other` is served as `/other`, which no include here names.
+     */
+    static void aPathParameterIsStrippedBeforeTheServerNormalises() {
+        Policy p = allowingPolicy();
+
+        reads("/app/..;/other", "/other");
+        reads("/app/..;a=b/other", "/other");
+        reads("/admin;x=1/users", "/admin/users");
+        // The parameter is dropped and the separator that ends the segment is
+        // kept: a reader that ate the `/` too would land on `/adminusers` and
+        // match nothing.
+        reads("/admin;/users", "/admin/users");
+
+        BridgeClient.Authorisation app =
+                authorised("scope.include", "https://app.example.test/app/*");
+        for (String path : List.of("/app/..;/other", "/app/..;a=b/other",
+                                   "/app/..%3b/other", "/app/%2e%2e;/other"))
+            denies("a path parameter cannot walk out of an include: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   app, "scope_denied");
+
+        BridgeClient.Authorisation cfg =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/admin/*");
+        for (String path : List.of("/public/..;/admin/users", "/admin;x=1/users",
+                                   "/admin;/users", "/admin%3b/users"))
+            denies("nor into an exclusion: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   cfg, "scope_denied");
+
+        // A `;` that is not an evasion must not cost an operator their scope:
+        // the include covers the directory, so it covers the file.
+        allows("a jsessionid on an in-scope path is still in scope", p,
+               req("GET", "https://app.example.test/app/orders;jsessionid=ABC",
+                   "app.example.test", "/app/orders;jsessionid=ABC", ""), app);
+    }
+
+    /**
+     * F2. IIS and .NET read a backslash as a path separator, so a backslash
+     * between `/admin` and `users` reaches `/admin/users`, and `/x/..%5clogout`
+     * is a real logout -- which is the one that matters, because that request
+     * gets ISSUED and ends the session.
+     *
+     * (Written out rather than shown: a backslash followed by a `u` is a
+     * unicode escape in Java source, and the compiler reads it inside comments
+     * too. The string literals below are correctly escaped and are the actual
+     * payloads.)
+     */
+    static void aBackslashIsReadAsASeparator() {
+        Policy p = allowingPolicy();
+
+        reads("/admin\\users", "/admin/users");
+        reads("/admin%5cusers", "/admin/users");
+        reads("/app/..\\other", "/other");
+
+        BridgeClient.Authorisation cfg =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/admin/*");
+        for (String path : List.of("/admin\\users", "/admin%5cusers", "/admin%5Cusers"))
+            denies("a backslash does not evade an exclusion: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   cfg, "scope_denied");
+
+        BridgeClient.Authorisation app =
+                authorised("scope.include", "https://app.example.test/app/*");
+        for (String path : List.of("/app/..\\other", "/app/..%5cother"))
+            denies("nor walk out of an include: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   app, "scope_denied");
+
+        // The expensive one. Nothing is excluded here and the include covers
+        // everything: it is the DENYLIST that has to see the logout, and it
+        // only sees it through the backslash reading.
+        denies("a backslash does not hide a logout from the denylist", p,
+               req("GET", "https://app.example.test/x/..%5clogout",
+                   "app.example.test", "/x/..%5clogout", ""),
+               APP, "dangerous_denied");
+    }
+
+    /**
+     * F8. Windows trims trailing dots and spaces from a name before opening it
+     * and IIS serves what Windows opens, so `/admin./users` and `/admin%20/users`
+     * reach `/admin/users`. A NUL is where a C string ends.
+     */
+    static void aTrailingDotSpaceOrNulIsTrimmed() {
+        Policy p = allowingPolicy();
+
+        reads("/admin./users", "/admin/users");
+        reads("/admin%20/users", "/admin/users");
+        reads("/admin%00/users", "/admin/users");
+        reads("/app/..%00/other", "/other");
+        reads("/app/.. /other", "/other");
+
+        // `..` and `.` are dot SEGMENTS and must survive the trim as segments,
+        // or `/app/.. /other` would read as `/app//other` and the escape would
+        // still be in scope.
+        readsExactly("/a/../b", "/a/../b", "/b");
+
+        BridgeClient.Authorisation cfg =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/admin/*");
+        for (String path : List.of("/admin./users", "/admin%20/users", "/admin%00/users"))
+            denies("a trimmed tail does not evade an exclusion: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   cfg, "scope_denied");
+
+        BridgeClient.Authorisation app =
+                authorised("scope.include", "https://app.example.test/app/*");
+        for (String path : List.of("/app/..%00/other", "/app/.. /other"))
+            denies("nor walk out of an include: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   app, "scope_denied");
+
+        // A dot inside a name is a name, not a tail. An include that covers the
+        // directory has to keep covering the file.
+        allows("an ordinary filename with a dot in it is untouched", p,
+               req("GET", "https://app.example.test/app/report.pdf",
+                   "app.example.test", "/app/report.pdf", ""), app);
+    }
+
+    /**
+     * F9. `%c0%ae%c0%ae/` is the overlong UTF-8 `../` that walked past IIS for
+     * years. decodeOnce maps a percent-escape to one char with no transcoding,
+     * so nothing else in the class would ever see the `..`: it is two chars
+     * 0xC0 0xAE 0xC0 0xAE until something reads them as UTF-8.
+     */
+    static void overlongUtf8IsReadAsTheAsciiItDecodesTo() {
+        Policy p = allowingPolicy();
+
+        reads("/x/%c0%ae%c0%ae/admin/users", "/admin/users");
+        reads("/admin%c0%afusers", "/admin/users");     // overlong `/`
+        reads("/x/%e0%80%ae%e0%80%ae/admin", "/admin"); // three-byte overlong
+
+        denies("an overlong UTF-8 traversal does not evade an exclusion", p,
+               req("GET", "https://app.example.test/x/%c0%ae%c0%ae/admin/users",
+                   "app.example.test", "/x/%c0%ae%c0%ae/admin/users", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "https://app.example.test/admin/*"),
+               "scope_denied");
+        denies("nor walk out of an include", p,
+               req("GET", "https://app.example.test/app/%c0%ae%c0%ae/other",
+                   "app.example.test", "/app/%c0%ae%c0%ae/other", ""),
+               authorised("scope.include", "https://app.example.test/app/*"),
+               "scope_denied");
+
+        // A lead byte with nothing valid after it is copied through and
+        // reading carries on past it, for the same reason a malformed escape
+        // does not stop decoding: one stray byte must not be a switch that
+        // turns a reading off for the whole path.
+        denies("a stray UTF-8 lead byte does not disable the reading after it", p,
+               req("GET", "https://app.example.test/account/%c0/log%6fut",
+                   "app.example.test", "/account/%c0/log%6fut", ""),
+               APP, "dangerous_denied");
+    }
+
+    /**
+     * F5, and it is a TEST-INTEGRITY finding as much as a behavioural one.
+     *
+     * Deleting the raw arm of the dangerous-path check left all 163 checks in
+     * this file green while flipping live verdicts: `/account/logout/../profile`
+     * went dangerous_denied -> ALLOW. Every other reading of that path resolves
+     * the `..` and pops the logout off, so the shipped logout glob matches the
+     * RAW bytes and nothing else -- and a server that routes before it
+     * normalises serves the logout. The whole raw half of the denylist was
+     * unguarded. (The glob is not quoted here: a pattern beginning with a star
+     * and a slash ends a block comment, which is why DEFAULT_DANGEROUS is
+     * commented with line comments.)
+     */
+    static void theRawPathIsAReadingInItsOwnRight() {
+        Policy p = allowingPolicy();
+
+        // The reading itself: the raw path is in the set even when every
+        // normalisation of it says something else.
+        reads("/account/logout/../profile", "/account/logout/../profile");
+        reads("/ADMIN/Users", "/ADMIN/Users");
+        reads("/files/my%20docs/a.pdf", "/files/my%20docs/a.pdf");
+
+        // dangerous.path, through decide(), which is where it counts.
+        for (String path : List.of("/account/logout/../profile",
+                                   "/account/password/../profile",
+                                   "/api/users/7/delete/../list"))
+            denies("a normalisation that pops the dangerous segment off does not "
+                   + "make it safe: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   APP, "dangerous_denied");
+
+        // The query half of the same finding. The denylist reads path AND
+        // query, and the query has a raw reading for the same reason the path
+        // does: an operator's pattern written against the BYTES matches the
+        // bytes and nothing else. `*=arch%6*` is one character short of the
+        // whole escape, so it matches `x=arch%69ve` and matches nothing once
+        // the query is decoded to `x=archive` -- the raw reading is the only
+        // one that sees it.
+        //
+        // Deliberately not spelt with `log%6`: `*=logout*` is a shipped
+        // default and would catch the decoded query on its own, which would
+        // make this check pass with the raw reading deleted. It did, and the
+        // sabotage run is what said so.
+        denies("a dangerous.path written against the query bytes still matches", p,
+               req("GET", "https://app.example.test/index.php?x=arch%69ve",
+                   "app.example.test", "/index.php", "x=arch%69ve"),
+               authorised("scope.include", "https://app.example.test/*",
+                          "dangerous.path", "*=arch%6*"),
+               "dangerous_denied");
+
+        // And the same shape against scope.exclude.
+        denies("nor does it get past an exclusion", p,
+               req("GET", "https://app.example.test/admin/users/../../public/x",
+                   "app.example.test", "/admin/users/../../public/x", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "https://app.example.test/admin/*"),
+               "scope_denied");
+    }
+
+    /**
+     * F6 and F10. Patterns were never read any way but literally, and both
+     * failure directions are SILENT.
+     *
+     * An exclude written with an escape is a DEAD RULE that fails open: it
+     * reads as if it named /admin/* and stops nothing. An include written with
+     * one authorises NOTHING, in either spelling, and the operator is told only
+     * that their request "matches no scope.include pattern" -- which sends them
+     * to rewrite a pattern that was right.
+     */
+    static void aPatternIsReadEveryWayAPathIs() {
+        Policy p = allowingPolicy();
+
+        // F6: the dead exclude.
+        for (String pattern : List.of("https://app.example.test/%61dmin/*",
+                                      "https://app.example.test/ADMIN/*",
+                                      "https://app.example.test/admin%2f*"))
+            denies("an exclude written as " + pattern + " still excludes /admin/x", p,
+                   req("GET", "https://app.example.test/admin/x",
+                       "app.example.test", "/admin/x", ""),
+                   authorised("scope.include", "https://app.example.test/*",
+                              "scope.exclude", pattern),
+                   "scope_denied");
+
+        // F10: the include that authorises nothing. BOTH spellings of the
+        // request have to work -- the operator wrote one pattern, and the
+        // encoding a request arrives in is not their choice.
+        BridgeClient.Authorisation files =
+                authorised("scope.include", "https://app.example.test/files/my%20docs/*");
+        for (String path : List.of("/files/my%20docs/a.pdf", "/files/my docs/a.pdf"))
+            allows("an include written with an escape authorises " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   files);
+
+        // ...and still authorises nothing else. A pattern read every way is not
+        // a pattern read as `*`.
+        denies("and nothing outside it", p,
+               req("GET", "https://app.example.test/files/other/a.pdf",
+                   "app.example.test", "/files/other/a.pdf", ""),
+               files, "scope_denied");
+
+        // The same for a dangerous.path line an operator wrote with an escape.
+        denies("an operator's dangerous.path written with an escape is not a dead rule", p,
+               req("GET", "https://app.example.test/admin/jobs/run",
+                   "app.example.test", "/admin/jobs/run", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "dangerous.path", "*/%61dmin/jobs/*"),
+               "dangerous_denied");
+    }
+
+    /**
+     * F7. decodeToFixedPoint is quadratic -- each round is a full pass and a
+     * nested escape needs one round per layer -- and it ran on the enforcement
+     * thread with nothing capping the path length. Measured on the shipped
+     * code: a 20 KB path took decide() 370 ms, 100 KB took 8.9 s, 400 KB took
+     * 143 s, and every one of them ended in ALLOW.
+     *
+     * Both bounds are DENIALS. "I could not finish reasoning about this
+     * request" and "this request is fine" are different answers, and a decider
+     * that conflates them has stopped being a decider.
+     */
+    static void aTargetTooBigToDecideAboutIsRefused() {
+        Policy p = allowingPolicy();
+
+        String atTheBound = "/a" + "b".repeat(Policy.MAX_TARGET_CHARS - 2);
+        check("the fixture is exactly at the bound",
+              atTheBound.length() == Policy.MAX_TARGET_CHARS);
+        allows("a target exactly at the bound is decided normally", p,
+               req("GET", "https://app.example.test" + atTheBound,
+                   "app.example.test", atTheBound, ""), APP);
+
+        String overTheBound = atTheBound + "c";
+        denies("one character over it is refused rather than decided slowly", p,
+               req("GET", "https://app.example.test" + overTheBound,
+                   "app.example.test", overTheBound, ""), APP, "scope_denied");
+
+        // The query counts toward the same budget: the denylist reads it, so
+        // it costs the same decoding.
+        denies("a long query counts toward the same bound", p,
+               req("GET", "https://app.example.test/a?" + "b".repeat(Policy.MAX_TARGET_CHARS),
+                   "app.example.test", "/a", "b".repeat(Policy.MAX_TARGET_CHARS)),
+               APP, "scope_denied");
+
+        // The round cap, which is the other half: a short path can still be
+        // nested deeply enough to cost a round per layer.
+        String nested = "/a/%" + "25".repeat(40) + "2e";
+        check("the nested fixture is well inside the length bound",
+              nested.length() < Policy.MAX_TARGET_CHARS);
+        denies("a path still encoded after the round cap is refused", p,
+               req("GET", "https://app.example.test" + nested,
+                   "app.example.test", nested, ""), APP, "scope_denied");
+
+        // And an ordinary double-encoding is nowhere near the cap: the bound
+        // must not turn into a denial of the traffic it was meant to survive.
+        allows("an ordinary double-encoded path still decodes", p,
+               req("GET", "https://app.example.test/files/a%2520b.pdf",
+                   "app.example.test", "/files/a%2520b.pdf", ""),
+               authorised("scope.include", "https://app.example.test/files/*"));
+        check("decodesFully agrees with the bound",
+              Policy.decodesFully("/files/a%2520b.pdf") && !Policy.decodesFully(nested));
+
+        // The one that pays for the whole check: the 20 KB path that took 370 ms
+        // and was ALLOWED. It is refused now, and refused without decoding it.
+        String huge = "/a/%" + "25".repeat(10_000) + "2e";
+        long start = System.nanoTime();
+        Decision d = p.decide(req("GET", "https://app.example.test" + huge,
+                                  "app.example.test", huge, ""), APP);
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        check("a 20 KB nested path is refused (" + (d.allowed() ? "ALLOWED" : d.errorClass())
+              + ") in " + ms + " ms",
+              !d.allowed() && "scope_denied".equals(d.errorClass()) && ms < 100);
     }
 
     /**
@@ -1103,6 +1497,74 @@ public class PolicyTest {
         }
         check("a path of only slashes returns a decision (" +
               (d.allowed() ? "allow" : d.errorClass()) + ") instead of throwing", true);
+    }
+
+    /**
+     * F12. decide() says it is total, and it was not: `Authorisation(7, null)`,
+     * a null list under a key, and a null element inside one each reached a
+     * NullPointerException three frames down.
+     *
+     * None of these is reachable from the wire today -- ConfigBody.parse
+     * freezes every list with List.copyOf, which rejects nulls -- but Sender is
+     * the caller, it treats a Decision as the whole answer, and an exception
+     * unwinding out of the send arm is an implicit allow the moment anyone
+     * mishandles it. A guarantee stated in this class has to be enforced in
+     * this class, not in a different one.
+     */
+    static void aMalformedAuthorisationIsADecisionNotACrash() {
+        CountingGate gate = new CountingGate();
+        Policy p = new Policy(gate);
+
+        Map<String, List<String>> nullList = new LinkedHashMap<>();
+        nullList.put("scope.include", null);
+        Map<String, List<String>> nullElement = new LinkedHashMap<>();
+        nullElement.put("scope.include", Collections.singletonList(null));
+        Map<String, List<String>> nullDangerous = new LinkedHashMap<>();
+        nullDangerous.put("scope.include", List.of("https://app.example.test/*"));
+        nullDangerous.put("dangerous.path", Collections.singletonList(null));
+        Map<String, List<String>> nullMethod = new LinkedHashMap<>();
+        nullMethod.put("scope.include", List.of("https://app.example.test/*"));
+        nullMethod.put("method.allow", Collections.singletonList(null));
+
+        // A LinkedHashMap and not Map.of: Map.of rejects a null value, which is
+        // the first case here. That the JDK's own immutable map will not hold
+        // one is exactly why ConfigBody.parse cannot produce one -- and exactly
+        // why this class must still answer if a caller hands one over.
+        Map<String, Map<String, List<String>>> cases = new LinkedHashMap<>();
+        cases.put("a null scope map", null);
+        cases.put("a null scope.include list", nullList);
+        cases.put("a null inside scope.include", nullElement);
+        cases.put("a null inside dangerous.path", nullDangerous);
+        cases.put("a null inside method.allow", nullMethod);
+        for (Map.Entry<String, Map<String, List<String>>> e : cases.entrySet()) {
+            BridgeClient.Authorisation auth = new BridgeClient.Authorisation(EPOCH, e.getValue());
+            Decision d;
+            try {
+                d = p.decide(orders(), auth);
+            } catch (Throwable t) {
+                check(e.getKey() + " is a Decision, not a " + t.getClass().getSimpleName(), false);
+                continue;
+            }
+            check(e.getKey() + " denies as not_configured (got "
+                  + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
+                  !d.allowed() && "not_configured".equals(d.errorClass()));
+            check("...and says which key is wrong: " + d.detail(),
+                  d.detail() != null && !d.detail().isEmpty());
+        }
+
+        check("no malformed snapshot reached the gate (" + gate.calls + " call(s))",
+              gate.calls == 0);
+
+        // The whole-map shapes that are legitimate must not be caught by the
+        // same guard: an empty map is "configured with nothing", which is a
+        // scope question, and an empty LIST under a key is an operator writing
+        // no patterns.
+        Map<String, List<String>> emptyList = new LinkedHashMap<>();
+        emptyList.put("scope.include", List.of());
+        denies("an empty scope map is still a scope answer", p, orders(),
+               new BridgeClient.Authorisation(EPOCH, Map.of()), "scope_denied");
+        denies("and an empty scope.include list is too", p, orders(),
+               new BridgeClient.Authorisation(EPOCH, emptyList), "scope_denied");
     }
 
     // ---- the order -------------------------------------------------------
@@ -1389,15 +1851,16 @@ blamed on the ruleset.
 
 ```java
 // extension/src/hx/policy/Policy.java
-// extension/src/hx/policy/Policy.java
 package hx.policy;
 
 import hx.bridge.BridgeClient;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The decision, as a pure function of a request and one Authorisation
@@ -1420,28 +1883,75 @@ import java.util.Map;
  * checks it, in that position, between not_configured and this method.
  *
  * WHAT THE RULES MATCH AGAINST: the request that goes on the wire is
- * unchanged -- canonicalisation here decides, it never rewrites. But "the
- * path" is two things at once: the bytes we send, and the resource the target
- * server resolves them to. `/account/log%6fut` is a real logout on essentially
- * every server that has ever shipped, and matching the literal bytes alone let
- * it through. So the two kinds of rule see different things, each in its
- * fail-closed direction:
+ * unchanged -- readings() decides, it never rewrites. But "the path" is not
+ * one string. It is the bytes we send AND every resource a target server might
+ * resolve them to, and those differ by more than encoding:
  *
- *   - a DENY rule (scope.exclude, dangerous.path) matches the raw path OR its
- *     canonical form, case-folded. Either match refuses: a denylist has to see
- *     every reading of the request, not a favourite one.
- *   - an ALLOW rule (scope.include) must match BOTH.
+ *   /account/log%6fut  is a real logout on every server that has shipped
+ *   /app/..;/other     is /other on every servlet container, so every Spring app
+ *   /app/..\other      is /other on IIS and .NET, which read a backslash
+ *                      as a path separator
+ *   /admin./users      is /admin/users on Windows, which trims trailing dots
+ *
+ * Worse, mainstream libraries disagree about the SAME path with no attacker
+ * involved. For `/a//../admin/users`:
+ *
+ *   python  urljoin()             -> /a/admin/users
+ *   node    new URL().pathname    -> /a/admin/users
+ *   java    URI.normalize()       -> /admin/users
+ *
+ * An earlier round of this class picked ONE reading (merge empty segments,
+ * then resolve dot segments) and matched against it. Picking one is picking
+ * which half of the internet to be wrong about, and it opened a live bypass:
+ * with exclude=/a/admin/*, `/a//../admin/users` was ALLOWED, because merging
+ * first does not shorten the path, it RELOCATES it -- out from under a glob
+ * anchored at the prefix the merge had just deleted.
+ *
+ * So readings() returns a SET: the raw path plus every normalisation a
+ * mainstream server or library plausibly applies, deduplicated. Both kinds of
+ * rule read the WHOLE set, each in its fail-closed direction:
+ *
+ *   - a DENY rule (scope.exclude, dangerous.path) refuses if ANY reading of
+ *     the path matches ANY reading of the pattern, case folded. A denylist has
+ *     to see every reading of the request, not a favourite one.
+ *   - an ALLOW rule (scope.include) authorises only if EVERY reading of the
+ *     path is matched by some reading of the pattern.
  *
  * The second half is not decoration, and it is not symmetric with the first.
  * With include=/app/* a request for `/app/%2e%2e/other` matches the include as
  * bytes while the server serves `/other`, which no include names. Requiring
- * the canonical form to match as well is what closes that.
+ * every reading to be included is what closes that.
+ *
+ * Cost of the set model when it is wrong: a deny rule matches a path some
+ * exotic server would route elsewhere, or an include refuses one. Both are
+ * denials, which is the direction a tool aimed at production has to err in.
  *
  * Matching a decoded COPY while sending raw bytes -- the obvious fix -- would
  * reintroduce exactly the decision-versus-wire mismatch the authority checks
  * below exist to prevent. Deciding about the bytes we send is right; it only
  * works if the matcher's idea of "the same path" also covers the target
- * server's, which is what canonical() adds.
+ * server's, which is what the reading set adds.
+ *
+ * PATTERNS ARE READ THE SAME WAY. An operator's pattern is a string a human
+ * typed and it has the same several readings a path does, so Rule.parse builds
+ * the same set from it. Matching raw patterns against readings of the path
+ * alone fails SILENTLY in both directions: `scope.exclude .../%61dmin/*` is a
+ * DEAD RULE that stops nothing while reading as if it named /admin/*, and
+ * `scope.include .../files/my%20docs/*` authorises NOTHING -- neither
+ * `/files/my%20docs/a.pdf` nor `/files/my docs/a.pdf` -- while the operator is
+ * told only that their request "matches no scope.include pattern", which sends
+ * them to rewrite a pattern that was right.
+ *
+ * decide() IS TOTAL: every input returns a Decision. A null Authorisation, one
+ * carrying a null scope map, a null list under a key, a null element inside a
+ * list, a path of nothing but slashes, a 4 KB path of nested escapes -- all
+ * answered, none thrown. That is a guarantee this class owes its caller rather
+ * than a tidiness: Sender treats a Decision as the whole answer, so anything
+ * thrown out of here is an implicit allow the moment a caller mishandles it.
+ * The malformed shapes are unreachable from the wire today because
+ * ConfigBody.parse builds every list with List.copyOf, which rejects nulls --
+ * but that is a property of a DIFFERENT class, and a guarantee stated here has
+ * to be enforced here.
  *
  * The Authorisation is a PARAMETER. It is read once per send, by
  * BridgeClient's send arm, and carried down -- epoch and scope from the one
@@ -1519,6 +2029,11 @@ public final class Policy {
             return Decision.deny("not_configured", "no configure frame acknowledged yet");
 
         Map<String, List<String>> scope = auth.scope();
+        // An Authorisation that cannot be read is answered the same way as one
+        // that was never committed. See malformation().
+        String malformed = malformation(scope);
+        if (malformed != null)
+            return Decision.deny("not_configured", malformed);
 
         Decision scoped = checkScope(req, scope);
         if (!scoped.allowed()) return scoped;
@@ -1532,19 +2047,23 @@ public final class Policy {
             return Decision.deny("method_denied",
                     req.method() + " is not in method.allow " + allowed);
 
-        // Both readings, and either one refuses. The raw form catches a
-        // pattern written against the bytes; the canonical form catches
-        // `/account/log%6fut`, `/account/%2570assword` (decoded twice) and
+        // Every reading of the target against every reading of the pattern,
+        // and any one match refuses. The RAW reading is not a formality: it is
+        // the only one that catches `/account/logout/../profile`, whose other
+        // readings resolve to `/account/profile` with the logout popped off --
+        // a request that reaches a logout URL on any server that does not
+        // normalise before routing. The encoded readings catch
+        // `/account/log%6fut`, `/account/%2570assword` (decoded twice),
+        // `/x/..%5clogout` (IIS reads the backslash as a separator) and
         // `/ADMIN/purge`. The detail line quotes the RAW target, because that
         // is what the operator's frame said and what they will search for.
-        String rawTarget = lower(req.target());
-        String canonicalTarget = canonicalTarget(req);
-        for (String pattern : dangerousPatterns(scope)) {
-            String p = lower(pattern);
-            if (glob(p, rawTarget) || glob(p, canonicalTarget))
-                return Decision.deny("dangerous_denied",
-                        req.target() + " matches dangerous.path " + pattern);
-        }
+        Set<String> targets = targetReadings(req);
+        for (String pattern : dangerousPatterns(scope))
+            for (String p : readings(pattern))
+                for (String target : targets)
+                    if (glob(lower(p), lower(target)))
+                        return Decision.deny("dangerous_denied",
+                                req.target() + " matches dangerous.path " + pattern);
 
         // The Gate LAST, because it is the only check with a side effect:
         // Limiter.check() spends a rate token and a budget slot, and spending
@@ -1566,6 +2085,33 @@ public final class Policy {
         return gated;
     }
 
+    /**
+     * Why an Authorisation cannot be decided under, or null when it can.
+     *
+     * decide() is documented as total, and totality is not something a caller
+     * can be trusted to supply: `new Authorisation(7, null)`, a null list under
+     * `scope.include`, or a null element inside one all reached a
+     * NullPointerException three frames down, and an exception unwinding out of
+     * decide() is an implicit allow the moment any caller mishandles it.
+     *
+     * The class is `not_configured`, not `scope_denied`: a snapshot this
+     * malformed did not come from ConfigBody.parse -- which freezes every list
+     * with List.copyOf, and List.copyOf rejects nulls -- so it is a caller bug,
+     * and "no usable configuration" is the honest thing to tell an operator
+     * about one. The detail names the key so the bug is findable.
+     */
+    private static String malformation(Map<String, List<String>> scope) {
+        if (scope == null) return "the authorisation carries no scope";
+        for (Map.Entry<String, List<String>> e : scope.entrySet()) {
+            if (e.getValue() == null)
+                return "the authorisation's " + e.getKey() + " is null";
+            for (String v : e.getValue())
+                if (v == null)
+                    return "the authorisation's " + e.getKey() + " carries a null value";
+        }
+        return null;
+    }
+
     // ---- scope ---------------------------------------------------------
 
     /**
@@ -1576,6 +2122,9 @@ public final class Policy {
      * request depending on which line the operator typed first.
      */
     private static Decision checkScope(HxRequest req, Map<String, List<String>> scope) {
+        Decision undecidable = undecidable(req);
+        if (undecidable != null) return undecidable;
+
         Target t;
         try {
             t = Target.parse(req.url());
@@ -1622,23 +2171,70 @@ public final class Policy {
             return Decision.deny("scope_denied", "unusable scope pattern: " + e.getMessage());
         }
 
-        // Computed once, and handed to both kinds of rule: they read it
-        // differently, but neither should pay for it per pattern. The host
-        // half needs nothing of the sort -- checkHostChars refuses '%'
+        // Computed once, and handed to both kinds of rule: they read the set
+        // differently, but neither should pay for building it per pattern. The
+        // host half needs nothing of the sort -- checkHostChars refuses '%'
         // outright, so an encoded authority never reaches a comparison.
-        String canonicalPath = canonical(t.path());
+        Set<String> pathReadings = readings(t.path());
 
         // Exclude first: an exclusion is the operator naming something they
         // know they must not touch, and it beats every include it overlaps.
         for (Rule r : excludes)
-            if (r.denies(t, canonicalPath))
+            if (r.denies(t, pathReadings))
                 return Decision.deny("scope_denied",
                         req.url() + " matches scope.exclude " + r.source());
 
         for (Rule r : includes)
-            if (r.allows(t, canonicalPath)) return Decision.allow();
+            if (r.allows(t, pathReadings)) return Decision.allow();
 
         return Decision.deny("scope_denied", req.url() + " matches no scope.include pattern");
+    }
+
+    /**
+     * The longest request target this can decide about, and the deepest nesting
+     * of percent-escapes it will unwrap.
+     *
+     * Both are bounds on work done on the ENFORCEMENT thread, per request.
+     * decodeToFixedPoint is quadratic in the length of its input -- each round
+     * is a full pass and a deeply nested escape needs one round per layer --
+     * and Frame.MAX_FRAME is 64 MB, so nothing upstream stops a send frame from
+     * carrying a path that long. Measured on the shipped code: a 20 KB nested
+     * path took decide() 370 ms, 100 KB took 8.9 s, 400 KB took 143 s. That is
+     * a denial-of-service on our own ruleset, from a frame we accepted.
+     *
+     * 4096 characters is what IIS accepts in a URL and roughly what nginx and
+     * Tomcat accept in a whole request line, so a target over it is one no
+     * target server was going to answer anyway. 16 rounds is eight more than
+     * any real double-encoding: legitimate traffic needs one, an attack needs
+     * two, and nothing benign needs sixteen.
+     *
+     * Hitting either bound is a DENIAL, never a shrug. "I could not finish
+     * reasoning about this request" and "this request is fine" are different
+     * answers, and only one of them may be given to a request aimed at a
+     * production estate.
+     */
+    static final int MAX_TARGET_CHARS = 4096;
+    static final int MAX_DECODE_ROUNDS = 16;
+
+    /**
+     * The denial for a request too long or too deeply encoded to decide about,
+     * or null when there is none.
+     *
+     * `scope_denied` because scope is the first rule about the request itself,
+     * so this keeps the pinned order intact, and because it is true: a request
+     * whose readings cannot be computed has not been shown to be in scope.
+     */
+    private static Decision undecidable(HxRequest req) {
+        int size = req.path().length() + req.query().length();
+        if (size > MAX_TARGET_CHARS)
+            return Decision.deny("scope_denied", "request target is " + size
+                    + " characters, over the " + MAX_TARGET_CHARS
+                    + " this can decide about");
+        if (!decodesFully(req.path()) || !decodesFully(req.query()))
+            return Decision.deny("scope_denied",
+                    "request target is still percent-encoded after "
+                    + MAX_DECODE_ROUNDS + " rounds of decoding");
+        return null;
     }
 
     /** scheme, host, port and path of a request URL, with no ambiguity left in
@@ -1718,9 +2314,19 @@ public final class Policy {
         }
     }
 
-    /** One scope.include / scope.exclude pattern, pre-parsed. */
+    /**
+     * One scope.include / scope.exclude pattern, pre-parsed -- including its
+     * path half read every way readings() reads a path.
+     *
+     * The pattern gets the same treatment as the request for the reason given
+     * in the class comment: an operator's pattern is a typed string with the
+     * same several readings, and reading it only one way fails silently in
+     * both directions -- a dead exclude that stops nothing, an include that
+     * authorises nothing.
+     */
     private record Rule(String source, String scheme, String hostPattern,
-                        boolean hostSuffix, int port, String pathGlob) {
+                        boolean hostSuffix, int port, String pathGlob,
+                        Set<String> globReadings) {
 
         static Rule parse(String pattern) {
             int sep = pattern.indexOf("://");
@@ -1772,7 +2378,8 @@ public final class Policy {
             } else {
                 checkHostChars(host, pattern);
             }
-            return new Rule(pattern, scheme, host, suffix, port, pathGlob);
+            return new Rule(pattern, scheme, host, suffix, port, pathGlob,
+                            readings(pathGlob));
         }
 
         /** Everything but the path. Shared, because scheme, port and host
@@ -1790,7 +2397,8 @@ public final class Policy {
         }
 
         /**
-         * scope.exclude: EITHER reading matches, and case is folded doing it.
+         * scope.exclude: ANY reading of the path against ANY reading of the
+         * pattern, and case is folded doing it.
          *
          * Case-folded because `dangerous.path` already was and scope.exclude
          * was not, and the difference was live: an operator excluding
@@ -1798,29 +2406,62 @@ public final class Policy {
          * case-insensitive routing, which is most of them. Two denylists in
          * one file disagreeing about what "the same path" means is the finding,
          * not the typo.
+         *
+         * lower() on an already-lowered reading returns the same instance, so
+         * the derived readings -- which readings() lowercases by construction
+         * -- cost nothing to fold again. Only the RAW reading of each side is
+         * really being folded here, and only the path side of that is
+         * falsifiable: readings() already contributes lower(decode(pattern)),
+         * which equals lower(pattern) whenever the pattern has no escape to
+         * decode, so no realistic input can be built that needs the pattern
+         * side's lower() and nothing else. It is kept for symmetry and because
+         * losing it would couple this method to readings() lowercasing, but it
+         * is defence in depth and is recorded as such rather than left for a
+         * later reader to discover it cannot be made to fail.
+         *
+         * The path side IS falsifiable and PolicyTest pins it: a pattern with a
+         * truncated escape decodes to itself while the request's escape decodes
+         * to a separator, so neither derived reading matches and the raw ones
+         * differ only in case.
          */
-        boolean denies(Target t, String canonicalPath) {
+        boolean denies(Target t, Set<String> pathReadings) {
             if (!authorityMatches(t)) return false;
-            String p = lower(pathGlob);
-            return glob(p, lower(t.path())) || glob(p, canonicalPath);
+            for (String pattern : globReadings)
+                for (String reading : pathReadings)
+                    if (glob(lower(pattern), lower(reading))) return true;
+            return false;
         }
 
         /**
-         * scope.include: BOTH readings must match, or the request is out of
-         * scope.
+         * scope.include: EVERY reading of the path must be matched by SOME
+         * reading of the pattern, or the request is out of scope.
          *
-         * The raw half stays case-SENSITIVE. Folding case on an allow rule
-         * WIDENS it, which is the wrong direction for the one rule that
-         * authorises anything, and `/Admin` has never been authorised by a
-         * pattern naming `/admin`. The canonical half compares a lowercased
-         * pattern against a canonical path, which is lowercased by
-         * construction: an operator who wrote `/API/*` would otherwise have
-         * every request under it refused, which is fail-closed but is also
-         * just broken.
+         * Note which side quantifies which way. "Every reading of the path" is
+         * what closes the escapes -- `/app/%2e%2e/other` and `/app/..;/other`
+         * each have a reading that lands on `/other`, which the include does
+         * not name. "Some reading of the pattern" is what keeps an operator's
+         * own escapes usable: `/files/my%20docs/*` has to authorise the request
+         * whether it arrives encoded or not, and only the pattern's decoded
+         * reading matches the decoded arrival.
+         *
+         * The raw reading of the path stays case-SENSITIVE, because readings()
+         * lowercases only the derived readings and glob() folds nothing.
+         * Folding case on an allow rule WIDENS it, which is the wrong direction
+         * for the one rule that authorises anything, and `/Admin` has never
+         * been authorised by a pattern naming `/admin`. The derived readings
+         * are lowercased on both sides, so an operator who wrote `/API/*` does
+         * not have every request under it refused -- which would be fail-closed
+         * but would also be just broken.
          */
-        boolean allows(Target t, String canonicalPath) {
+        boolean allows(Target t, Set<String> pathReadings) {
             if (!authorityMatches(t)) return false;
-            return glob(pathGlob, t.path()) && glob(lower(pathGlob), canonicalPath);
+            for (String reading : pathReadings) {
+                boolean covered = false;
+                for (String pattern : globReadings)
+                    if (glob(pattern, reading)) { covered = true; break; }
+                if (!covered) return false;
+            }
+            return true;
         }
     }
 
@@ -1866,61 +2507,258 @@ public final class Policy {
         return p == pattern.length();
     }
 
-    // ---- canonical paths -------------------------------------------------
+    // ---- readings --------------------------------------------------------
 
     /**
-     * The path as the target server will read it: percent-decoded until
-     * stable, dot segments collapsed, lowercased. Pure, and it changes no byte
-     * of the request -- see the class comment for which rules take it and in
-     * which direction.
+     * Every reading of a path this tool is willing to be wrong about, as a set.
      *
-     * Decoding runs to a FIXED POINT, not once. `%2570assword` decodes to
-     * `%70assword` and only then to `password`, and a denylist that stopped
-     * after one round would be reading the middle spelling while the server,
-     * or any proxy in front of it, reads the last. Termination is not an
-     * assumption: a round that changes anything replaces three characters with
-     * one, so the string strictly shortens and the loop is bounded by its
-     * length.
+     * This replaced a canonical() that returned ONE string, because there is no
+     * one string to return -- see the class comment for the three mainstream
+     * libraries that disagree about `/a//../admin/users`, and for the bypass
+     * that picking one of them opened. A set removes the guess: a deny rule
+     * refuses if any member matches, an allow rule authorises only if every
+     * member is covered, and neither has to know which normaliser the target
+     * server runs.
      *
-     * The order of the three steps is load-bearing. Decoding comes FIRST, so
-     * `%2e%2e` is already `..` when dot segments are collapsed and `%2f` is
-     * already a separator when the path is split into them. Lowercasing comes
-     * LAST, on decoded text, so `%4C` and `%6c` both arrive at `l`.
+     * WHAT IS IN THE SET.
      *
-     * Empty segments ARE merged: a run of two or more `/` collapses to one,
-     * so `//admin/users`, `/admin//users` and `/admin/users` all canonicalise
-     * alike. RFC 3986 normalisation does not do this -- remove_dot_segments
-     * treats a doubled slash as a real, empty path segment -- but plenty of
-     * servers merge `//` before routing, and a prefix exclude for `/admin/*`
-     * was evadable as `//admin/users` against every one of them. Whether
-     * `//admin` and `/admin` are the same resource is still a question only
-     * the target server answers; this makes canonical() answer it the way a
-     * merging server does, which is the fail-closed reading for the deny
-     * rules this function feeds.
+     *   - the RAW path, verbatim and unfolded. It is the only reading that is
+     *     certainly real -- it is what goes on the wire -- and it is the only
+     *     one that catches a pattern written against the bytes
+     *     (`/reports/q1%20final*`) or a dangerous URL that other readings
+     *     normalise away (`/account/logout/../profile`).
+     *   - the decoded path with dot segments resolved, in BOTH orders relative
+     *     to merging empty segments, because that is exactly where the
+     *     mainstream libraries part company. Merge-then-resolve is what a
+     *     slash-merging server does (`/a//../admin` is `/admin`);
+     *     resolve-then-merge is RFC 3986's remove_dot_segments, which treats
+     *     the doubled slash as a real empty segment for `..` to pop
+     *     (`/a/admin`). Both ship. Both are here.
+     *   - the same, with `;params` stripped from each segment. Every servlet
+     *     container -- Tomcat, Jetty, Undertow, WebSphere, so every Spring Boot
+     *     application -- strips them BEFORE normalising, which turns the
+     *     segment `..;` into `..`. `/app/..;/other` is served as `/other`, and
+     *     `..;/` is the most weaponised URL-normalisation trick in the field.
+     *   - the same, with `\` folded to `/`. IIS and .NET read a backslash as a
+     *     path separator, so a backslash before `users` reaches `/admin/users`
+     *     and `/x/..%5clogout` is a real logout. (Spelt out rather than shown:
+     *     a backslash followed by a `u` is a unicode escape in Java source and
+     *     the compiler reads it even inside a comment.)
+     *   - the same, with trailing dots, spaces and NULs trimmed from each
+     *     segment. Windows trims trailing dots and spaces from a name before
+     *     opening it, so `/admin./users` and `/admin%20/users` reach `/admin`;
+     *     a NUL is where a C string ends, so `/admin%00foo` reaches `/admin`
+     *     on anything that hands the path to a C API.
+     *   - all combinations of those three, because servers implement different
+     *     SUBSETS of them: Tomcat strips parameters and rejects backslashes,
+     *     IIS folds backslashes and trims dots but keeps parameters. A
+     *     combination nobody implements only adds a reading, and an extra
+     *     reading can only deny more.
+     *   - when the decoded bytes are not all ASCII, the same again over the
+     *     UTF-8 reading of those bytes, which is what folds the overlong
+     *     `%c0%ae%c0%ae` -- the classic IIS traversal -- back to `..`.
      *
-     * The merge runs BEFORE dot-segment collapsing, not after, and the order
-     * is load-bearing wherever the two interact: `/a//../admin` decodes to
-     * itself, merges to `/a/../admin`, and `..` then pops `a`, landing on
-     * `/admin`. Collapsing dot segments first would read the doubled slash's
-     * empty segment as a real one for `..` to pop instead -- `/a/` then
-     * `admin` appended, landing on `/a/admin` -- which is the RFC 3986
-     * reading, not a merging server's. A merging server merges `//` as a
-     * lexical step on the raw path; it does not first hand `..` an empty
-     * segment to consume in `a`'s place. Merging first is also the direction
-     * that keeps canonical() honest as a DENY tool: it is the reading that
-     * throws more of the path away, so it can only make a deny rule match
-     * more, never less.
+     * Identical readings collapse, so an ordinary path like `/api/orders`
+     * produces exactly ONE member and costs one glob per rule. The set only
+     * grows for a path that carries the characters the transforms act on,
+     * which is to say for an attack.
      *
-     * A single `/` is not a repeat and is never touched, so a genuine
-     * trailing slash survives: `/admin/` stays `/admin/`. That matters for
-     * scope.include, which needs BOTH readings to match -- collapsing a
-     * trailing slash away would make the canonical arm stop matching an
-     * include pattern that itself ends in `/`, turning a request that was
-     * rightly in scope into a scope_denied for a byte nothing sent ever
-     * carried.
+     * ORDER WITHIN A READING is load-bearing. Decoding comes FIRST, so `%2e%2e`
+     * is already `..` when dot segments are resolved and `%2f` is already a
+     * separator when the path is split into them. Backslash folding comes
+     * before parameter stripping, because folding decides where the SEGMENTS
+     * are and stripping is per segment: `/a;b\c` folds to `/a;b/c` and then
+     * strips to `/a/c`, whereas stripping first would reach `/a` and the
+     * reading `/a/c` would never be built. Lowercasing comes LAST, on decoded
+     * text, so `%4C` and `%6c` both arrive at `l`.
+     *
+     * KNOWN LIMIT, stated rather than left to be discovered: `%uXXXX`, the
+     * non-standard UTF-16 escape old IIS accepted (`%u002e%u002e/` for `../`),
+     * is NOT decoded. It is not in the set because it is not percent-encoding
+     * -- decodeOnce reads two hex digits after a `%`, and `%u0` is not two hex
+     * digits -- and because IIS has not accepted it by default for many years.
+     * If it ever needs to be, it belongs in decodeOnce, not here.
      */
-    static String canonical(String path) {
-        return lower(collapseDotSegments(collapseEmptySegments(decodeToFixedPoint(path))));
+    static Set<String> readings(String path) {
+        Set<String> out = new LinkedHashSet<>();
+        out.add(path);
+        String decoded = decodeToFixedPoint(path);
+        addReadings(out, decoded);
+        String utf8 = foldOverlongUtf8(decoded);
+        if (!utf8.equals(decoded)) addReadings(out, utf8);
+        return out;
+    }
+
+    private static final int STRIP_PARAMS = 1, FOLD_BACKSLASH = 2, TRIM_TAILS = 4;
+
+    /**
+     * The transform combinations over one decoded base, in both dot-segment
+     * orders.
+     *
+     * Only combinations of the transforms this base can actually be CHANGED by
+     * are built, which is an optimisation and nothing more: each of the three
+     * is the identity on a string without its trigger character, so a skipped
+     * combination would have produced a member the set already holds. That
+     * matters because it runs per request per pattern -- 12 shipped
+     * dangerous.path globs plus the operator's scope -- and an ordinary path
+     * has none of the three triggers, so the loop runs once.
+     */
+    private static void addReadings(Set<String> out, String base) {
+        int applicable = 0;
+        if (base.indexOf(';') >= 0) applicable |= STRIP_PARAMS;
+        if (base.indexOf('\\') >= 0) applicable |= FOLD_BACKSLASH;
+        if (hasTrimmableTail(base)) applicable |= TRIM_TAILS;
+        for (int flags = 0; flags <= applicable; flags++) {
+            if ((flags & ~applicable) != 0) continue;
+            String s = base;
+            if ((flags & FOLD_BACKSLASH) != 0) s = foldBackslashes(s);
+            if ((flags & STRIP_PARAMS) != 0) s = stripPathParameters(s);
+            if ((flags & TRIM_TAILS) != 0) s = trimSegmentTails(s);
+            out.add(lower(collapseDotSegments(collapseEmptySegments(s))));
+            out.add(lower(collapseEmptySegments(collapseDotSegments(s))));
+        }
+    }
+
+    /** Whether trimSegmentTails() would change this path -- exactly the
+     *  condition under which it is not the identity, including the all-dots
+     *  segments it deliberately leaves alone. */
+    private static boolean hasTrimmableTail(String path) {
+        int start = 0;
+        for (int i = 0; i <= path.length(); i++)
+            if (i == path.length() || path.charAt(i) == '/') {
+                if (i > start) {
+                    char last = path.charAt(i - 1);
+                    if (last == ' ' || last == '\0'
+                            || (last == '.' && !allDots(path, start, i)))
+                        return true;
+                }
+                start = i + 1;
+            }
+        return false;
+    }
+
+    /** `\` read as the separator IIS and .NET read it as. */
+    static String foldBackslashes(String path) {
+        return path.indexOf('\\') < 0 ? path : path.replace('\\', '/');
+    }
+
+    /**
+     * Everything from the first `;` of a segment to the end of that segment,
+     * removed -- what a servlet container does to `/app/orders;jsessionid=X`
+     * before it looks at the path at all.
+     *
+     * The `;` and what follows are dropped, the `/` that ends the segment is
+     * kept. That is what makes `/app/..;/other` read as `/app/../other` and
+     * then as `/other`.
+     */
+    static String stripPathParameters(String path) {
+        if (path.indexOf(';') < 0) return path;
+        StringBuilder out = new StringBuilder(path.length());
+        boolean dropping = false;
+        for (int i = 0; i < path.length(); i++) {
+            char c = path.charAt(i);
+            if (c == '/') { dropping = false; out.append(c); continue; }
+            if (c == ';') dropping = true;
+            if (!dropping) out.append(c);
+        }
+        return out.toString();
+    }
+
+    /**
+     * Trailing dots, spaces and NULs trimmed from each segment.
+     *
+     * Windows trims trailing dots and spaces from a filename before opening
+     * it, and IIS serves what Windows opens, so `/admin./users` and
+     * `/admin%20/users` reach the same resource `/admin/users` does. A NUL is
+     * where a C string ends, so anything that passes the path to a C API sees
+     * `/admin%00foo` as `/admin`.
+     *
+     * A segment of nothing but dots is left ALONE. `.` and `..` are dot
+     * SEGMENTS, resolved a step later; trimming their dots would delete the
+     * step rather than normalise a name, and `/app/.. /other` -- whose whole
+     * point is that the trimmed segment must still be a `..` -- would come out
+     * as `/app//other` instead of `/other`.
+     */
+    static String trimSegmentTails(String path) {
+        StringBuilder out = new StringBuilder(path.length());
+        int start = 0;
+        for (int i = 0; i <= path.length(); i++)
+            if (i == path.length() || path.charAt(i) == '/') {
+                out.append(trimSegmentTail(path, start, i));
+                if (i < path.length()) out.append('/');
+                start = i + 1;
+            }
+        return out.toString();
+    }
+
+    private static String trimSegmentTail(String path, int start, int end) {
+        int cut = end;
+        while (cut > start) {
+            char c = path.charAt(cut - 1);
+            if (c != ' ' && c != '\0') break;
+            cut--;
+        }
+        if (!allDots(path, start, cut))
+            while (cut > start) {
+                char c = path.charAt(cut - 1);
+                if (c != '.' && c != ' ' && c != '\0') break;
+                cut--;
+            }
+        return path.substring(start, cut);
+    }
+
+    private static boolean allDots(String path, int start, int end) {
+        if (end <= start) return false;
+        for (int i = start; i < end; i++) if (path.charAt(i) != '.') return false;
+        return true;
+    }
+
+    /**
+     * The decoded bytes read as UTF-8, when they are not already ASCII.
+     *
+     * decodeOnce maps a percent-escape to one char with no transcoding, so
+     * after decoding a string of `%c0%ae` is the two chars 0xC0 0xAE. Read as
+     * UTF-8 that is an OVERLONG encoding of `.`, and `%c0%ae%c0%ae%c0%af` is
+     * the `../` that walked past IIS for years. Nothing else in this class
+     * would ever see it: a dot-segment resolver looking for the two-character
+     * string ".." does not find it there.
+     *
+     * Overlong forms are folded on purpose -- they are the attack, and a
+     * decoder that rejects them (as a correct UTF-8 decoder must) is exactly
+     * the decoder that would not produce this reading. Well-formed sequences
+     * are folded too, which is just correct: `%c3%a9` becomes the one char
+     * `e-acute` rather than two bytes, so an operator's pattern and the request
+     * agree about a filename with an accent in it.
+     *
+     * A sequence that is not well formed at all -- a lead byte with no
+     * continuation after it -- is copied through and reading carries on, for
+     * the same reason decodeOnce does not abandon a string on one bad escape:
+     * a single stray byte must not be a switch that turns this reading off.
+     */
+    static String foldOverlongUtf8(String s) {
+        int i = 0;
+        while (i < s.length() && s.charAt(i) < 0x80) i++;
+        if (i == s.length()) return s;
+        StringBuilder out = new StringBuilder(s.length());
+        out.append(s, 0, i);
+        while (i < s.length()) {
+            char c = s.charAt(i);
+            int extra = c >= 0xf0 && c <= 0xf7 ? 3
+                      : c >= 0xe0 && c <= 0xef ? 2
+                      : c >= 0xc0 && c <= 0xdf ? 1 : 0;
+            if (extra == 0 || i + extra >= s.length()) { out.append(c); i++; continue; }
+            int cp = c & (0x3f >> extra);
+            boolean wellFormed = true;
+            for (int k = 1; k <= extra && wellFormed; k++) {
+                char b = s.charAt(i + k);
+                if (b < 0x80 || b > 0xbf) wellFormed = false;
+                else cp = (cp << 6) | (b & 0x3f);
+            }
+            if (!wellFormed || cp > 0xffff) { out.append(c); i++; continue; }
+            out.append((char) cp);
+            i += extra + 1;
+        }
+        return out.toString();
     }
 
     /**
@@ -1931,6 +2769,7 @@ public final class Policy {
      * exception a careless caller could read as an allow.
      */
     static String collapseEmptySegments(String path) {
+        if (path.indexOf("//") < 0) return path;    // nothing to collapse
         StringBuilder out = new StringBuilder(path.length());
         boolean prevSlash = false;
         for (int i = 0; i < path.length(); i++) {
@@ -1943,13 +2782,46 @@ public final class Policy {
         return out.toString();
     }
 
-    /** Percent-decoding repeated until a round changes nothing. */
+    /**
+     * Percent-decoding repeated until a round changes nothing, or until
+     * MAX_DECODE_ROUNDS rounds have run.
+     *
+     * Decoding runs to a FIXED POINT, not once. `%2570assword` decodes to
+     * `%70assword` and only then to `password`, and a denylist that stopped
+     * after one round would be reading the middle spelling while the server,
+     * or any proxy in front of it, reads the last.
+     *
+     * The cap is not about termination -- a round that changes anything
+     * replaces three characters with one, so the string strictly shortens and
+     * the loop was already bounded by its length. It is about COST: each round
+     * is a full pass, so a path of one escape nested n deep costs O(n^2), and
+     * that ran on the enforcement thread with nothing capping the path length.
+     * See MAX_TARGET_CHARS. A string still changing after 16 rounds is not a
+     * request anyone is legitimately making, and decodesFully() is what turns
+     * it into a denial rather than a partially-decoded reading nobody checked.
+     */
     static String decodeToFixedPoint(String s) {
-        for (;;) {
+        for (int round = 0; round < MAX_DECODE_ROUNDS; round++) {
             String next = decodeOnce(s);
             if (next.equals(s)) return s;
             s = next;
         }
+        return s;
+    }
+
+    /**
+     * Whether decodeToFixedPoint actually reached a fixed point rather than
+     * running out of rounds. One extra decodeOnce, so it costs one pass.
+     *
+     * Kept separate from decodeToFixedPoint rather than folded into it because
+     * the answer belongs to decide(), which owes the caller a Decision:
+     * "still encoded after 16 rounds" has to become a denial, and a decoder
+     * that threw or returned null to say so would be a decoder that could take
+     * decide() down with it.
+     */
+    static boolean decodesFully(String s) {
+        String decoded = decodeToFixedPoint(s);
+        return decodeOnce(decoded).equals(decoded);
     }
 
     /**
@@ -2001,6 +2873,11 @@ public final class Policy {
      * and not `/a`.
      */
     static String collapseDotSegments(String path) {
+        // With no '.' anywhere there is no dot segment, and the split-and-
+        // rejoin below reproduces its input character for character. Returning
+        // early is the same answer without the ArrayList: this runs per
+        // request per pattern, and almost every pattern is dot-free.
+        if (path.indexOf('.') < 0) return path;
         boolean absolute = path.startsWith("/");
         List<String> segments = new ArrayList<>();
         int start = 0;
@@ -2037,20 +2914,37 @@ public final class Policy {
     }
 
     /**
-     * The canonical form of the origin-form target, for the dangerous-path
-     * denylist, which reads path AND query.
+     * Every reading of the origin-form target, for the dangerous-path denylist,
+     * which reads path AND query: every reading of the path against every
+     * reading of the query.
      *
-     * The two halves are canonicalised separately and dot segments are
-     * collapsed in the path ONLY: a `..` in a query value is a value, and a
-     * `%2f` in one is not a path separator the server will ever see. Decoding
-     * the query still matters -- on a legacy application the logout is
-     * `?action=log%6fut` at least as often as it is a path.
+     * The query has TWO readings, raw and decoded, and both earn their place.
+     * The decoded one is the obvious half -- on a legacy application the logout
+     * is `?action=log%6fut` at least as often as it is a path. The raw one is
+     * the half that is easy to drop and hard to miss the loss of: a
+     * dangerous.path an operator wrote against the bytes, `*=log%6*`, matches
+     * `action=log%6fut` and matches nothing at all once the query is decoded,
+     * because `%6f` is gone by then and `%6` was never a whole escape.
+     *
+     * The two halves are read separately, and the path transforms are applied
+     * to the path ONLY: a `..` in a query value is a value, a `;` in one is a
+     * separator some frameworks still use, and a `%2f` in one is not a path
+     * separator the server will ever see.
+     *
+     * With no query the target IS the path, so the path's readings are the
+     * target's -- built once rather than copied.
      */
-    private static String canonicalTarget(HxRequest req) {
-        String path = canonical(req.path());
-        return req.query().isEmpty()
-                ? path
-                : path + "?" + lower(decodeToFixedPoint(req.query()));
+    private static Set<String> targetReadings(HxRequest req) {
+        Set<String> paths = readings(req.path());
+        if (req.query().isEmpty()) return paths;
+        Set<String> queries = new LinkedHashSet<>();
+        queries.add(req.query());
+        queries.add(lower(decodeToFixedPoint(req.query())));
+        Set<String> out = new LinkedHashSet<>();
+        for (String path : paths)
+            for (String query : queries)
+                out.add(path + "?" + query);
+        return out;
     }
 
     // Locale.ROOT, not the default locale: in a Turkish locale "I" lowercases
