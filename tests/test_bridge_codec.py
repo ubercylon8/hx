@@ -7,6 +7,7 @@ import pytest
 from hx.bridge import codec
 
 VECTORS = Path(__file__).parent / "vectors" / "frames.json"
+MALFORMED = Path(__file__).parent / "vectors" / "malformed.json"
 
 
 def test_round_trip_simple():
@@ -237,3 +238,37 @@ def test_vectors_match_their_recorded_hex():
         assert v["hex"], f"vector {v['name']} has no recorded hex"
         raw = codec.encode(v["header"], v["body_utf8"].encode("utf-8"))
         assert raw.hex() == v["hex"], v["name"]
+
+
+# ---- malformed input parity --------------------------------------------
+#
+# The golden vectors above are all well-formed, which is exactly why probing
+# found the Java and Python codecs disagreeing on five of six hostile inputs
+# (plan fix f8d8229) with none of these tests noticing. Well-formed vectors
+# pin agreement on what is valid; they say nothing about whether both sides
+# reject the same invalid input the same way. This suite pins rejection too,
+# against the SAME cases the Java CodecTest runs.
+
+def test_every_malformed_case_is_rejected_by_decode():
+    data = json.loads(MALFORMED.read_text())
+    assert data["cases"], "malformed vectors file has no cases"
+    for c in data["cases"]:
+        head = c["header_text"].encode("utf-8")
+        raw = len(head + b"\n").to_bytes(4, "big") + head + b"\n"
+        with pytest.raises(codec.FrameError):
+            codec.decode(raw)
+
+
+def test_encode_refuses_an_integer_outside_signed_64_bit_range():
+    """This diverges the other way from most findings in f8d8229: Python's
+    ints are unbounded, so nothing stopped it from emitting a header the Java
+    side cannot represent -- a frame valid here and a hard error there."""
+    too_big = 2 ** 63
+    too_small = -(2 ** 63) - 1
+    with pytest.raises(codec.FrameError, match="64-bit"):
+        codec.encode({"v": 1, "t": "send", "deadline_us": too_big})
+    with pytest.raises(codec.FrameError, match="64-bit"):
+        codec.encode({"v": 1, "t": "send", "deadline_us": too_small})
+    # The boundary values themselves must still be accepted.
+    codec.encode({"v": 1, "t": "send", "deadline_us": 2 ** 63 - 1})
+    codec.encode({"v": 1, "t": "send", "deadline_us": -(2 ** 63)})

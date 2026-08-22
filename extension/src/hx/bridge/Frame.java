@@ -59,9 +59,21 @@ public final class Frame {
         for (int i = 4; i < end; i++) if (buf[i] == '\n') { nl = i; break; }
         if (nl < 0) throw new FrameError("header has no newline terminator");
 
+        String headerText;
+        try {
+            // Java's default decoder REPLACES malformed bytes with U+FFFD, silently
+            // accepting a frame Python rejects outright. Decode strictly instead.
+            headerText = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(buf, 4, nl - 4))
+                    .toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            throw new FrameError("header bytes are not valid UTF-8: " + e.getMessage());
+        }
         Map<String, Object> header;
         try {
-            header = Json.parse(new String(buf, 4, nl - 4, StandardCharsets.UTF_8));
+            header = Json.parse(headerText);
         } catch (Json.JsonError e) {
             throw new FrameError("header is not valid JSON: " + e.getMessage());
         }

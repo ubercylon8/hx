@@ -68,6 +68,16 @@ public final class Json {
 
     public static Map<String, Object> parse(String text) {
         P p = new P(text);
+        Map<String, Object> out = parseObject(p);
+        p.ws();
+        // Python's json.loads raises "Extra data" here. Accepting it would let a
+        // crafted frame be valid on one side of the bridge and not the other.
+        if (p.i != text.length())
+            throw new JsonError("trailing data after the header object at " + p.i);
+        return out;
+    }
+
+    private static Map<String, Object> parseObject(P p) {
         p.ws();
         p.expect('{');
         Map<String, Object> out = new LinkedHashMap<>();
@@ -125,7 +135,21 @@ public final class Json {
                     case 'f'  -> b.append('\f');
                     case 'u'  -> {
                         if (i + 4 > s.length()) throw new JsonError("truncated \\u escape");
-                        b.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
+                        String hex = s.substring(i, i + 4);
+                        for (int k = 0; k < 4; k++) {
+                            char hc = hex.charAt(k);
+                            boolean isHex = (hc >= '0' && hc <= '9')
+                                         || (hc >= 'a' && hc <= 'f') || (hc >= 'A' && hc <= 'F');
+                            // Integer.parseInt would throw NumberFormatException, which
+                            // escapes Frame.decode's catch of JsonError entirely.
+                            if (!isHex) throw new JsonError("bad hex in \\u escape: " + hex);
+                        }
+                        char u = (char) Integer.parseInt(hex, 16);
+                        // A lone surrogate survives parsing and is then silently written
+                        // as '?' by Java's UTF-8 encoder, where Python raises. Reject it.
+                        if (Character.isSurrogate(u))
+                            throw new JsonError("lone surrogate in \\u escape: " + hex);
+                        b.append(u);
                         i += 4;
                     }
                     default -> throw new JsonError("bad escape \\" + esc);
@@ -143,11 +167,24 @@ public final class Json {
             if (s.startsWith("null", i))  { i += 4; return null; }
             int start = i;
             if (c == '-') i++;
+            int digits = i;
             while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
-            if (i == start) throw new JsonError("unparseable value at " + i);
+            if (i == digits) throw new JsonError("no digits in number at " + start);
             if (i < s.length() && (s.charAt(i) == '.' || s.charAt(i) == 'e' || s.charAt(i) == 'E'))
                 throw new JsonError("header numbers must be integers");
-            return Long.parseLong(s.substring(start, i));
+            String lit = s.substring(start, i);
+            // Python rejects leading zeros; accepting them here would let the two
+            // sides disagree on whether a frame is valid.
+            if (lit.length() > (lit.startsWith("-") ? 2 : 1)
+                    && lit.charAt(lit.startsWith("-") ? 1 : 0) == '0')
+                throw new JsonError("leading zeros are not valid JSON: " + lit);
+            try {
+                // Long.parseLong throws NumberFormatException, which is NOT a
+                // JsonError and would escape Frame.decode's catch clause.
+                return Long.parseLong(lit);
+            } catch (NumberFormatException e) {
+                throw new JsonError("integer out of 64-bit range: " + lit);
+            }
         }
     }
 }

@@ -57,6 +57,23 @@ def _check_header(header: dict) -> None:
                 f"header must be flat: {key!r} is {type(value).__name__}, and the "
                 "Java parser reads only string/int/bool/null"
             )
+        # A lone UTF-16 surrogate from a \u escape parses fine here -- json.loads
+        # accepts it -- but corrupts silently later: this side raises
+        # UnicodeEncodeError on re-encode, the Java side silently writes '?'.
+        # Reject it at the same place the flat-type check lives, so decode()
+        # and encode() both refuse it rather than letting only one side notice.
+        if isinstance(value, str) and any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            raise FrameError(
+                f"header string {key!r} contains an unpaired UTF-16 surrogate"
+            )
+        # Python integers are unbounded; the far side reads them into a signed
+        # 64-bit long. Emitting a value it cannot represent would produce a frame
+        # that is valid here and a hard error there.
+        if isinstance(value, int) and not isinstance(value, bool):
+            if not (-(2 ** 63) <= value <= 2 ** 63 - 1):
+                raise FrameError(
+                    f"header integer {key!r}={value} is outside signed 64-bit range"
+                )
 
 
 def encode(header: dict, body: bytes = b"") -> bytes:

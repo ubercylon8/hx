@@ -34,6 +34,8 @@ public class CodecTest {
         readReassemblesAcrossChunks();
         configBody();
         goldenVectors();
+        malformedInputsAreRejected();
+        invalidUtf8HeaderIsRejected();
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -120,6 +122,59 @@ public class CodecTest {
             check("vector " + name + " decodes to the recorded header", d.header.equals(header));
             check("vector " + name + " decodes to the recorded body", Arrays.equals(d.body, body));
         }
+    }
+
+    /**
+     * Well-formed vectors can only pin agreement on what is VALID. They say
+     * nothing about whether both sides reject the same hostile input the same
+     * way -- which is exactly how a NumberFormatException escaped Frame.decode
+     * in the first place. This pins rejection too, on both Json.parse directly
+     * and on Frame.decode once the same text is wrapped in a real frame.
+     */
+    static void malformedInputsAreRejected() throws Exception {
+        Path p = Path.of("..", "tests", "vectors", "malformed.json");
+        String text = Files.readString(p, StandardCharsets.UTF_8);
+        List<Map<String, Object>> cases = MalformedVectorReader.cases(text);
+        check("malformed vectors file has cases", !cases.isEmpty());
+        for (Map<String, Object> c : cases) {
+            String name = (String) c.get("name");
+            String headerText = (String) c.get("header_text");
+
+            expectThrows("malformed " + name + ": Json.parse rejects it",
+                         Json.JsonError.class, () -> Json.parse(headerText));
+
+            byte[] raw = rawFrame(headerText.getBytes(StandardCharsets.UTF_8));
+            expectThrows("malformed " + name + ": Frame.decode rejects it wrapped in a frame",
+                         Frame.FrameError.class, () -> Frame.decode(raw));
+        }
+    }
+
+    /**
+     * 0xC3 0x28 is not valid UTF-8: 0xC3 starts a 2-byte sequence that must be
+     * followed by a continuation byte (0x80-0xBF), and 0x28 '(' is not one.
+     * Java's default decoder REPLACES malformed bytes with U+FFFD instead of
+     * raising, which would silently accept a frame Python rejects outright.
+     */
+    static void invalidUtf8HeaderIsRejected() {
+        byte[] bad = new byte[] { (byte) 0xC3, 0x28 };
+        byte[] raw = rawFrame(bad);
+        expectThrows("invalid UTF-8 header (0xC3 0x28) raises FrameError, not U+FFFD",
+                     Frame.FrameError.class, () -> Frame.decode(raw));
+    }
+
+    /** [4-byte BE length][headerBytes]\n -- built by hand so a header that is
+     * not valid JSON (most of malformed.json isn't) can still be wrapped in a
+     * real frame; Frame.encode itself would refuse to write such a header. */
+    static byte[] rawFrame(byte[] headerBytes) {
+        byte[] payload = new byte[headerBytes.length + 1];
+        System.arraycopy(headerBytes, 0, payload, 0, headerBytes.length);
+        payload[headerBytes.length] = '\n';
+        int len = payload.length;
+        byte[] raw = new byte[4 + len];
+        raw[0] = (byte) (len >>> 24); raw[1] = (byte) (len >>> 16);
+        raw[2] = (byte) (len >>> 8);  raw[3] = (byte) len;
+        System.arraycopy(payload, 0, raw, 4, len);
+        return raw;
     }
 
     static String hex(byte[] b) {
