@@ -1775,6 +1775,15 @@ class BridgeServer:
             },
             codec.build_config_body(pairs),
         )
+        if reply.get("t") == "error":
+            # Surface what the peer actually said. Falling through to the
+            # generic message below turns "engagement_mismatch: e-1 != e-2"
+            # into "acknowledged configure without a config_epoch", which
+            # sends the next debugger looking in the wrong place entirely.
+            raise BridgeError(
+                "peer refused configure: "
+                f"{reply.get('class', 'unspecified')}: {reply.get('detail', '')}".rstrip(": ")
+            )
         if "config_epoch" not in reply:
             raise BridgeError("peer acknowledged configure without a config_epoch")
         with self._lock:
@@ -2205,7 +2214,7 @@ package hx.bridge;
  */
 public final class FakeMontoya {
 
-    public static final class Logger {
+    public static final class Logger implements BridgeClient.Log {
         public final StringBuilder out = new StringBuilder();
         public final StringBuilder err = new StringBuilder();
         public void info(String s) { out.append(s).append('\n'); }
@@ -2276,6 +2285,11 @@ public class BridgeClientTest {
                 cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", 1L);
                 cfg.put("engagement_id", "e-1"); cfg.put("scope_sha256", "abc");
                 cfg.put("profile", "production");
+                // The real peer stamps id AND deadline_us on every frame it
+                // sends through _request(), and configure() is its only caller.
+                // Omit it and the client correctly rejects the frame as
+                // bad_frame -- the fake would be misrepresenting the peer.
+                cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
                 out.write(Frame.encode(cfg, "scope.include\thttps://a/*\nlimit.rate_rps\t5\n"
                         .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
                 out.flush();
@@ -2380,10 +2394,22 @@ public final class BridgeClient {
         public NotConfigured(String m) { super(m); }
     }
 
+    /**
+     * The two logging calls the bridge makes. Montoya's Logging satisfies it
+     * through an adapter and the test fake implements it directly. Declaring
+     * it here is what keeps BridgeClient free of a compile-time Montoya
+     * dependency -- and unlike the `Object log` it replaces, it can actually
+     * be called.
+     */
+    public interface Log {
+        void info(String s);
+        void error(String s);
+    }
+
     private final Path socketPath;
     private final String engagementId;
     private final String instanceId;
-    private final Object log;
+    private final Log log;
 
     private SocketChannel channel;
     private InputStream in;
@@ -2396,7 +2422,7 @@ public final class BridgeClient {
     private volatile String haltReason = null;
     private long epochCounter = 0;
 
-    public BridgeClient(Path socketPath, String engagementId, String instanceId, Object log) {
+    public BridgeClient(Path socketPath, String engagementId, String instanceId, Log log) {
         this.socketPath = socketPath;
         this.engagementId = engagementId;
         this.instanceId = instanceId;
@@ -2444,13 +2470,27 @@ public final class BridgeClient {
                 Frame.Decoded f = reader.read();
                 if (!handle(f)) return;
             }
-        } catch (Frame.PeerClosed | IOException e) {
-            // Peer closed. DENY-ALL is also the terminal state.
-            configured.set(false);
+        } catch (Frame.PeerClosed | Frame.FrameError | IOException e) {
+            // The expected ways a connection ends. Nothing to do here: the
+            // finally block is what enforces the terminal state.
+        } finally {
+            // DENY-ALL on EVERY exit path, not just the ones named above. The
+            // `return` out of the loop -- a protocol mismatch -- skips the
+            // catch blocks entirely, and used to leave maySend() true with a
+            // dead read loop and no control channel: the extension would keep
+            // issuing requests that nothing could halt. This is the same shape
+            // as the Python side's _reset() in _serve()'s finally, and for the
+            // same reason.
+            boolean wasConfigured = configured.getAndSet(false);
             configEpoch = 0;
-        } catch (Frame.FrameError e) {
-            configured.set(false);
+            scopeConfig = Map.of();
+            closeChannel();
+            if (wasConfigured) log.info("hx: control channel gone, deny-all");
         }
+    }
+
+    private void closeChannel() {
+        try { if (channel != null) channel.close(); } catch (IOException ignored) { }
     }
 
     private boolean handle(Frame.Decoded f) throws IOException {
@@ -2521,7 +2561,9 @@ public final class BridgeClient {
 
     public void close() {
         configured.set(false);
-        try { if (channel != null) channel.close(); } catch (IOException ignored) { }
+        configEpoch = 0;
+        scopeConfig = Map.of();
+        closeChannel();
     }
 }
 ```
@@ -2562,7 +2604,10 @@ public class HxExtension implements BurpExtension {
         }
         System.setProperty("hx.burp.version", api.burpSuite().version().toString());
 
-        client = new BridgeClient(Path.of(sock), engagement, instance, api.logging());
+        client = new BridgeClient(Path.of(sock), engagement, instance, new BridgeClient.Log() {
+            public void info(String s)  { api.logging().logToOutput(s); }
+            public void error(String s) { api.logging().logToError(s); }
+        });
         Thread t = new Thread(() -> {
             try {
                 client.connect();
@@ -2591,6 +2636,91 @@ Expected: both classes print `ALL PASS`, exit 0
 ```bash
 git add extension
 git commit -m "feat(bridge): java client dials in, stays deny-all until configured"
+```
+
+---
+
+- [ ] **Step 6: fixes from the task review**
+
+The code blocks in Steps 0-5 above have been corrected in place, so a fresh
+implementer reading this plan top-to-bottom writes the right thing. If Steps
+0-5 are already implemented, this step is the diff — five changes, the first
+load-bearing.
+
+**1. `readLoop()` leaked DENY-ALL through its one `return` path.** `handle()`
+returns `false` on a protocol mismatch; the bare `return` skipped both catch
+blocks, so `configured` stayed `true` and `configEpoch` kept its value with a
+dead read loop and no control channel behind them. `maySend()` would answer
+`true` forever, and the halt that is supposed to stop an assessment would have
+nothing to arrive on. Replace the catch blocks with the caught set plus a
+`finally`, and add `closeChannel()` — both shown in Step 3's corrected block.
+
+The invariant, stated once: **leaving `readLoop()` by any path means DENY-ALL.**
+Not "by the paths we thought of".
+
+**2. `close()` zeroed `configured` but not `configEpoch` or `scopeConfig`,**
+leaving a closed client reporting a live epoch and a stale scope. Corrected in
+Step 3's block.
+
+**3. The fake's `configure` frame omitted `deadline_us`,** which the client
+correctly rejects as `bad_frame` — the real peer stamps `id` and `deadline_us`
+on every frame `_request()` sends, and `configure()` is its only caller. The
+fake was wrong, not the client. Corrected in Step 1's block. Do not "fix" this
+by relaxing the client's validation.
+
+**4. `private final Object log` was stored and never used,** typed `Object`
+only to dodge a compile-time Montoya dependency in tests. Replaced by the
+`BridgeClient.Log` interface, an adapter in `HxExtension`, and
+`FakeMontoya.Logger implements BridgeClient.Log` — all shown above. The
+`finally` block now logs the transition into DENY-ALL, which is the one event
+Task 5 will most want in Burp's output when a handshake misbehaves.
+
+**5. On the Python side, an `error` reply to `configure` was reported as
+"peer acknowledged configure without a config_epoch"** — technically true and
+actively misleading, since the peer said exactly what was wrong and the message
+threw it away. `configure()` now surfaces the reply's `class` and `detail`;
+corrected in Task 3's `configure()` above. Add this test to
+`tests/test_bridge_server.py`:
+
+```python
+def test_an_error_reply_to_configure_reports_what_the_peer_said(srv):
+    c = _connected(srv)
+    try:
+        out = {}
+
+        def go():
+            try:
+                srv.configure({"scope.include": ["https://a/*"]},
+                              scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out["err"] = str(exc)
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = codec.FrameReader(c).read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "engagement_mismatch",
+                                "detail": "e-1 != SOMEONE-ELSE"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+        assert "engagement_mismatch" in out["err"], out
+        assert "SOMEONE-ELSE" in out["err"], out
+        assert "without a config_epoch" not in out["err"], out
+    finally:
+        c.close()
+```
+
+Verified against the real server before it was written here: passes, and the
+Python suite stays green at 160.
+
+- [ ] **Step 7: Run everything and commit**
+
+```bash
+extension/test.sh && extension/build.sh
+.venv/bin/python -m pytest tests/ -q      # 160 passed
+git add extension src/hx/bridge/server.py tests/test_bridge_server.py
+git commit -m "fix(bridge): deny-all on every exit from the read loop"
 ```
 
 ---
