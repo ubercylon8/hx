@@ -531,6 +531,22 @@ def test_truncated_blob_on_disk_is_detected(tmp_path: Path):
         store.get(digest)
 
 
+def test_put_repairs_a_same_length_corruption(tmp_path: Path):
+    """The nastier torn write: same length, wrong bytes.
+
+    A size-only dedupe check accepts this forever, so put() returns success
+    while holding the correct bytes and the digest stays poisoned. put() must
+    re-verify and repair.
+    """
+    store = BlobStore(tmp_path)
+    digest, _ = store.put(b"a" * 500)
+    store.path_for(digest).write_bytes(b"b" * 500)  # same length, wrong content
+
+    again, length = store.put(b"a" * 500)
+    assert again == digest and length == 500
+    assert store.get(digest) == b"a" * 500, "put() did not repair the blob"
+
+
 def test_large_blob_round_trips(tmp_path: Path):
     store = BlobStore(tmp_path)
     payload = bytes(range(256)) * 8000  # ~2 MB, larger than a Burp response
@@ -585,8 +601,17 @@ class BlobStore:
     def put(self, data: bytes) -> tuple[str, int]:
         digest = hashlib.sha256(data).hexdigest()
         final = self.path_for(digest)
-        if final.exists() and final.stat().st_size == len(data):
-            return digest, len(data)
+        # Trusting st_size here is the bug the design warns about: a torn write
+        # that happens to preserve length (bit rot, a zero-filled tail after a
+        # crash) would be accepted forever, and put() would report success while
+        # holding the correct bytes. Re-hash what is actually on disk; on any
+        # mismatch fall through and repair it via the atomic path below.
+        if final.exists():
+            try:
+                if hashlib.sha256(final.read_bytes()).hexdigest() == digest:
+                    return digest, len(data)
+            except OSError:
+                pass  # unreadable: repair it
 
         final.parent.mkdir(parents=True, exist_ok=True)
         staging = self.tmp / f"{uuid.uuid4().hex}.part"
@@ -621,7 +646,7 @@ class BlobStore:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_blobs.py -v`
-Expected: PASS, 6 passed
+Expected: PASS, 7 passed
 
 - [ ] **Step 5: Commit**
 
@@ -801,8 +826,53 @@ class Config:
     slug_threshold: int = 12
 
 
+def _mapping(raw: dict, key: str) -> dict:
+    """A YAML block that must be a mapping, or absent."""
+    v = raw.get(key)
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        raise ConfigError(f"{key} must be a mapping, got {type(v).__name__}")
+    return v
+
+
+def _string_list(raw: dict, key: str, default: list[str]) -> list[str]:
+    """A list of strings.
+
+    Absent means "use the default". An explicitly written empty list means
+    empty -- the operator said so in the file, which is what the spec's
+    "written down explicitly, where it is recorded and reviewable" requires.
+
+    A non-list is REJECTED rather than coerced. `list("custom")` yields
+    ['c','u','s','t','o','m'], which for dangerous_paths is a denylist that
+    looks populated and matches nothing.
+    """
+    if key not in raw or raw[key] is None:
+        return list(default)
+    v = raw[key]
+    if not isinstance(v, list):
+        raise ConfigError(f"{key} must be a list, got {type(v).__name__}")
+    if not all(isinstance(x, str) for x in v):
+        raise ConfigError(f"every entry in {key} must be a string")
+    return list(v)
+
+
+def _positive_int(raw: dict, key: str, default: int) -> int:
+    v = raw.get(key, default)
+    # bool is a subclass of int; `rate_limit_rps: true` must not become 1.
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ConfigError(f"{key} must be an integer >= 1, got {v!r}")
+    return v
+
+
 def load(path: Path) -> Config:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    # A YAML syntax error is "nonsense" by this module's own definition of
+    # ConfigError. Wrapping it here means no caller — the CLI, the agent tool
+    # layer, the web app — has to know PyYAML is the parser underneath.
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
 
@@ -816,28 +886,38 @@ def load(path: Path) -> Config:
             f"safety_profile must be one of {VALID_PROFILES}, got {profile!r}"
         )
 
-    scope = raw.get("scope") or {}
-    include = scope.get("include") or []
+    scope = _mapping(raw, "scope")
+    include = _string_list(scope, "include", [])
     if not include:
         raise ConfigError("scope.include must list at least one target pattern")
 
+    # Every check flag must be a real bool. A quoted "false" is a truthy
+    # string, so an operator writing `active_mutate: "false"` to DISABLE
+    # state-changing checks would silently ENABLE them.
     checks = dict(DEFAULT_CHECKS)
-    checks.update(raw.get("checks") or {})
+    for name, value in _mapping(raw, "checks").items():
+        if name not in DEFAULT_CHECKS:
+            raise ConfigError(
+                f"unknown check class {name!r}; valid: {sorted(DEFAULT_CHECKS)}"
+            )
+        if not isinstance(value, bool):
+            raise ConfigError(f"checks.{name} must be true or false, got {value!r}")
+        checks[name] = value
 
     return Config(
         name=raw["name"],
         client=raw["client"],
         safety_profile=profile,
-        scope_include=list(include),
-        scope_exclude=list(scope.get("exclude") or []),
-        render_allow=list(raw.get("render_allow") or []),
-        dangerous_paths=list(raw.get("dangerous_paths") or DEFAULT_DANGEROUS_PATHS),
+        scope_include=include,
+        scope_exclude=_string_list(scope, "exclude", []),
+        render_allow=_string_list(raw, "render_allow", []),
+        dangerous_paths=_string_list(raw, "dangerous_paths", DEFAULT_DANGEROUS_PATHS),
         checks=checks,
-        rate_limit_rps=int(raw.get("rate_limit_rps", 5)),
-        max_concurrency=int(raw.get("max_concurrency", 2)),
-        identities=dict(raw.get("identities") or {}),
-        preserve_segments=list(raw.get("preserve_segments") or ["api", "v1", "v2", "v3"]),
-        slug_threshold=int(raw.get("slug_threshold", 12)),
+        rate_limit_rps=_positive_int(raw, "rate_limit_rps", 5),
+        max_concurrency=_positive_int(raw, "max_concurrency", 2),
+        identities=_mapping(raw, "identities"),
+        preserve_segments=_string_list(raw, "preserve_segments", ["api", "v1", "v2", "v3"]),
+        slug_threshold=_positive_int(raw, "slug_threshold", 12),
     )
 
 
@@ -1229,6 +1309,7 @@ rather than in the agent-facing tool layer.
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
 import click
@@ -1271,6 +1352,14 @@ def main() -> None:
 def new(name, client, scope, exclude, profile, root, author) -> None:
     """Create a new engagement."""
     base = root or default_root()
+    # Guard before anything touches disk. An empty NAME makes `base / name`
+    # collapse to base itself, so `hx new ""` would turn the engagements root
+    # into an engagement directory -- and it could then never be opened
+    # (config.load rejects an empty name) nor recreated (create refuses an
+    # existing directory).
+    for field, value in (("NAME", name), ("--client", client)):
+        if not value.strip():
+            raise click.ClickException(f"{field} must not be empty")
     cfg = config_mod.Config(
         name=name,
         client=client,
@@ -1294,15 +1383,23 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
 def info(root) -> None:
     """Show an engagement's configuration and current counts."""
     path = root or default_root()
+    # Everything that reads the engagement goes inside one guard: opening it,
+    # loading its config, and querying it. A damaged engagement must produce a
+    # sentence, never a traceback -- and sqlite3.Error is not an OSError.
     try:
         eng = eng_mod.open_(path)
+        counts = {
+            t: eng.db.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            for t in ("run", "surface", "exchange", "finding", "check_run")
+        }
     except eng_mod.EngagementError as exc:
         raise click.ClickException(str(exc)) from exc
-
-    counts = {
-        t: eng.db.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
-        for t in ("run", "surface", "exchange", "finding", "check_run")
-    }
+    except config_mod.ConfigError as exc:
+        raise click.ClickException(f"invalid config at {path}: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot read the database at {path}: {exc}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"cannot access the engagement at {path}: {exc}") from exc
     click.echo(f"engagement {eng.config.name} ({eng.id})")
     click.echo(f"  client   {eng.config.client}")
     click.echo(f"  profile  {eng.config.safety_profile}")
