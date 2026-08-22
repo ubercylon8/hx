@@ -1,5 +1,11 @@
 # Enforcement and the Send Path Implementation Plan
 
+<!-- plan-drift: pending -->
+<!-- Remove that marker in the commit that finishes this plan. Until then
+     tests/test_plan_matches_repo.py skips this plan's blocks: it modifies
+     extension/src/hx/HxExtension.java, so its block describes the state
+     AFTER Task 6 while the repo still holds the state before it. -->
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the issuance gate — the single point inside the JVM through which every request `hx` sends must pass, enforcing scope, method, dangerous paths, rate and budget, with auto-halt, a durable kill switch, and credential redaction.
@@ -206,3 +212,11392 @@ with a reason, even though they produce no `denial` row.
 `budget_exhausted`. When a request violates several rules, the earliest wins.
 
 ---
+
+### Task 1: The policy core — `HxRequest`, `Decision`, `Gate`, `Clock`, `Policy`
+
+**Files:**
+- Create: `extension/src/hx/policy/HxRequest.java`
+- Create: `extension/src/hx/policy/Decision.java`
+- Create: `extension/src/hx/policy/Gate.java`
+- Create: `extension/src/hx/policy/Clock.java`
+- Create: `extension/src/hx/policy/Policy.java`
+- Modify: `extension/test.sh` — one line, to run the new test class
+- Test: `extension/test/hx/policy/PolicyTest.java`
+
+**Interfaces:**
+- Consumes:
+  - `hx.bridge.BridgeClient.Authorisation(long epoch, Map<String, List<String>> scope)` — the
+    Plan 2 record. Epoch and scope in ONE reference; `configEpoch()` and `scopeConfig()` are
+    `@Deprecated` and nothing here calls either.
+  - `hx.bridge.ConfigBody.KEYS` — the key names this task reads out of `auth.scope()`:
+    `scope.include`, `scope.exclude`, `method.allow`, `dangerous.path`. Repeated keys
+    accumulate in order and both levels of the map are frozen; `PolicyTest` builds its
+    fixtures in exactly that shape.
+- Produces:
+  - `public record HxRequest(String method, String url, String host, String path, String query,
+    Map<String, List<String>> headers, byte[] body)` — plus `String target()`, the origin-form
+    path-and-query that the dangerous-path denylist matches against.
+  - `public record Decision(boolean allowed, String errorClass, String detail, long retryAfterUs)`
+    with `Decision.allow()`, `Decision.deny(String, String)`, `Decision.rateLimited(long, String)`.
+  - `public interface Gate { Decision check(HxRequest req); }`
+  - `public interface Clock { long nowUs(); }`
+  - `public final class Policy` — `Policy(Gate gate)`, `Decision decide(HxRequest req,
+    BridgeClient.Authorisation auth)`.
+
+`Policy.decide` is the whole ruleset as a pure function: no sockets, no clock, no
+filesystem, nothing from Montoya. Everything that owns state or time sits behind `Gate`
+(Task 2's `Limiter`) or outside it entirely (`HaltSwitch`, `Distress`). That is what makes
+the ordering testable at all — 87 checks, no Burp, no sleep.
+
+**On `halted`.** The Interface Contract's order is `not_configured` → `halted` →
+`scope_denied` → `method_denied` → `dangerous_denied` → `rate_limited` →
+`budget_exhausted`. `Policy` enforces all of it except `halted`, which it cannot see: a
+halt is live state — a `halt` frame, the sentinel file, or auto-halt on target distress —
+not a property of a request and an authorisation. `Sender` holds that position, between
+its own `not_configured` check and this call, and `SenderTest.theRefusalOrderIsPinned`
+pins the composite. This task pins the five verdicts `Policy` owns.
+
+---
+
+- [ ] **Step 1: Put the new test class in the runner**
+
+Do this first. A hand-rolled runner has no discovery: a test class nobody added to
+`test.sh` is a file that compiles, never runs, and reads in review exactly like a test
+that passes.
+
+Append one line to `extension/test.sh`, after the `BridgeClientTest` line:
+
+```bash
+java -cp "build/test-classes:$MONTOYA" hx.policy.PolicyTest
+```
+
+Nothing else in `test.sh` or `build.sh` changes: both compile
+`$(find src test -name '*.java')`, so a new package is picked up with no edit.
+
+- [ ] **Step 2: Write the failing test**
+
+Eighty-seven checks, in the project's hand-rolled runner — `check(String, boolean)` and
+`expectThrows`, no JUnit, because this jar has no dependencies. The ordering block near the
+bottom is the reason this task exists; everything above it exists so that a failure in the
+ordering block is unambiguous about which rule moved.
+
+```java
+// extension/test/hx/policy/PolicyTest.java
+package hx.policy;
+
+import hx.bridge.BridgeClient;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.stream.Stream;
+
+/** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
+public class PolicyTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    static void expectThrows(String what, Class<?> type, Runnable body) {
+        try {
+            body.run();
+            check(what + " (expected " + type.getSimpleName() + ")", false);
+        } catch (Throwable t) {
+            check(what, type.isInstance(t));
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        theVerdictTypeCarriesItsClassAndItsHint();
+        aRequestFieldThatIsNullIsARejectedFrameNotANullPointer();
+        epochZeroIsNotConfigured();
+        anInScopeRequestIsAllowed();
+        scopeMatchesSchemeHostPortAndPath();
+        aWildcardSubdomainDoesNotMatchTheApex();
+        excludeBeatsInclude();
+        anUnusableScopePatternDeniesEverything();
+        userinfoInTheAuthorityCannotSatisfyScope();
+        aPortSmuggledIntoTheHostCannotSatisfyScope();
+        aUrlThatDisagreesWithItsOwnPathIsRefused();
+        theMethodAllowlistDefaultsToTheProductionProfile();
+        anExplicitMethodAllowReplacesTheDefault();
+        methodsAreCaseSensitive();
+        theDangerousDenylistShipsWithDefaults();
+        operatorDangerousPatternsAddToTheDefaults();
+        theRefusalOrderIsPinned();
+        aBrokenGateIsNeverAnAllow();
+        policyNamesNoBurpType();
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    // ---- fixtures -------------------------------------------------------
+
+    static final long EPOCH = 7L;
+
+    /** A request in the shape Sender.parse produces: the url built from the
+     *  frame's target_host and the origin-form target, the parts split out. */
+    static HxRequest req(String method, String url, String host, String path, String query) {
+        Map<String, List<String>> headers = new LinkedHashMap<>();
+        headers.put("Host", List.of(host));
+        headers.put("User-Agent", List.of("hx/0.1"));
+        headers.put("Accept", List.of("*/*"));
+        return new HxRequest(method, url, host, path, query,
+                             Collections.unmodifiableMap(headers), new byte[0]);
+    }
+
+    static HxRequest orders() {
+        return req("GET", "https://app.example.test/api/orders",
+                   "app.example.test", "/api/orders", "");
+    }
+
+    /** An Authorisation at a real epoch, carrying config in exactly the shape
+     *  ConfigBody.parse hands to BridgeClient: repeated keys accumulate in
+     *  order, and both levels are frozen. */
+    static BridgeClient.Authorisation authorised(String... keyThenValue) {
+        Map<String, List<String>> scope = new LinkedHashMap<>();
+        for (int i = 0; i < keyThenValue.length; i += 2)
+            scope.computeIfAbsent(keyThenValue[i], k -> new ArrayList<>()).add(keyThenValue[i + 1]);
+        Map<String, List<String>> frozen = new LinkedHashMap<>();
+        scope.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
+        return new BridgeClient.Authorisation(EPOCH, Collections.unmodifiableMap(frozen));
+    }
+
+    /** The DENY-ALL snapshot BridgeClient publishes before any configure and
+     *  after every disconnect. Epoch 0 is what "not configured" IS. */
+    static BridgeClient.Authorisation denyAll() {
+        return new BridgeClient.Authorisation(0L, Map.of());
+    }
+
+    static final BridgeClient.Authorisation APP =
+            authorised("scope.include", "https://app.example.test/*");
+
+    /** Counts, because a request refused by an earlier rule must cost no rate
+     *  token and no budget slot: Limiter.check() has a side effect. */
+    static final class CountingGate implements Gate {
+        int calls = 0;
+        Decision verdict = Decision.allow();
+        public Decision check(HxRequest req) { calls++; return verdict; }
+    }
+
+    static Policy allowingPolicy() { return new Policy(new CountingGate()); }
+
+    static void allows(String label, Policy p, HxRequest r, BridgeClient.Authorisation a) {
+        Decision d = p.decide(r, a);
+        check(label + " -> allowed (got "
+              + (d.allowed() ? "allow" : d.errorClass() + ": " + d.detail()) + ")",
+              d.allowed());
+    }
+
+    static void denies(String label, Policy p, HxRequest r, BridgeClient.Authorisation a,
+                       String expectedClass) {
+        Decision d = p.decide(r, a);
+        check(label + " -> " + expectedClass + " (got "
+              + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
+              !d.allowed() && expectedClass.equals(d.errorClass()));
+    }
+
+    // ---- the verdict type ------------------------------------------------
+
+    static void theVerdictTypeCarriesItsClassAndItsHint() {
+        Decision allow = Decision.allow();
+        check("allow() is allowed, with no class and no hint",
+              allow.allowed() && allow.errorClass() == null && allow.retryAfterUs() == 0L);
+
+        Decision denied = Decision.deny("scope_denied", "https://evil.example.test/ is not in scope");
+        check("deny() carries the class it was given",
+              !denied.allowed() && "scope_denied".equals(denied.errorClass()));
+        // s6: retry_after_us belongs to rate_limited alone. A *_denied verdict
+        // carrying one would tell the agent to come back and try a request
+        // whose answer will never change.
+        check("deny() leaves retryAfterUs at 0", denied.retryAfterUs() == 0L);
+
+        Decision limited = Decision.rateLimited(200_000L, "5 rps, 5 issued this second");
+        check("rateLimited() sets the class itself",
+              !limited.allowed() && "rate_limited".equals(limited.errorClass()));
+        check("rateLimited() carries the hint", limited.retryAfterUs() == 200_000L);
+    }
+
+    static void aRequestFieldThatIsNullIsARejectedFrameNotANullPointer() {
+        // Sender.parse's caller catches IllegalArgumentException and answers
+        // bad_frame. A NullPointerException from three frames later would
+        // unwind out of the send arm instead.
+        expectThrows("a null path is an IllegalArgumentException at construction",
+                     IllegalArgumentException.class,
+                     () -> new HxRequest("GET", "https://app.example.test/", "app.example.test",
+                                         null, "", Map.of(), new byte[0]));
+        expectThrows("a null body is an IllegalArgumentException at construction",
+                     IllegalArgumentException.class,
+                     () -> new HxRequest("GET", "https://app.example.test/", "app.example.test",
+                                         "/", "", Map.of(), null));
+        HxRequest withQuery = req("GET", "https://app.example.test/search?q=1",
+                                  "app.example.test", "/search", "q=1");
+        check("target() is the origin-form target the wire would carry",
+              "/search?q=1".equals(withQuery.target()));
+        check("target() of an empty query is the bare path", "/api/orders".equals(orders().target()));
+    }
+
+    // ---- not_configured --------------------------------------------------
+
+    static void epochZeroIsNotConfigured() {
+        CountingGate gate = new CountingGate();
+        Policy p = new Policy(gate);
+        denies("epoch 0 refuses a request that breaks nothing else",
+               p, orders(), denyAll(), "not_configured");
+        // Not merely "an error came back": a request refused before the Gate
+        // must not spend a budget slot the operator paid for.
+        check("not_configured never reached the gate (" + gate.calls + " call(s))", gate.calls == 0);
+
+        // Epoch 0 is not a scope question: a snapshot with a perfectly good
+        // scope but no epoch is still DENY-ALL, because it is the epoch that
+        // says a configure was acknowledged.
+        denies("epoch 0 with a populated scope map is still not_configured", p, orders(),
+               new BridgeClient.Authorisation(0L, Map.of(
+                       "scope.include", List.of("https://app.example.test/*"))),
+               "not_configured");
+        denies("a null Authorisation is not_configured, not a crash",
+               p, orders(), null, "not_configured");
+    }
+
+    // ---- scope -----------------------------------------------------------
+
+    static void anInScopeRequestIsAllowed() {
+        CountingGate gate = new CountingGate();
+        allows("a GET on an in-scope host", new Policy(gate), orders(), APP);
+        check("the gate is consulted for a request that passes every rule", gate.calls == 1);
+    }
+
+    static void scopeMatchesSchemeHostPortAndPath() {
+        Policy p = allowingPolicy();
+
+        denies("another host is out of scope", p,
+               req("GET", "https://other.example.test/api/orders",
+                   "other.example.test", "/api/orders", ""),
+               APP, "scope_denied");
+
+        // Exact, not "contains" and not "endsWith": both of those are the
+        // matcher someone writes in a hurry, and both hand an attacker who can
+        // register a domain a way into an authorised scope.
+        denies("a host with the pattern appended to another domain is out of scope", p,
+               req("GET", "https://app.example.test.evil.test/api/orders",
+                   "app.example.test.evil.test", "/api/orders", ""),
+               APP, "scope_denied");
+        denies("nor a host that merely ends with the pattern", p,
+               req("GET", "https://notapp.example.test/api/orders",
+                   "notapp.example.test", "/api/orders", ""),
+               APP, "scope_denied");
+
+        // http:// and https:// are different origins and the pattern named one.
+        denies("http is out of scope when the pattern says https", p,
+               req("GET", "http://app.example.test/api/orders",
+                   "app.example.test", "/api/orders", ""),
+               APP, "scope_denied");
+
+        // A pattern with no port means the scheme's default port. 8443 on the
+        // same host is a different service, and frequently a different team's.
+        denies("a non-default port is out of scope under a default-port pattern", p,
+               req("GET", "https://app.example.test:8443/api/orders",
+                   "app.example.test", "/api/orders", ""),
+               APP, "scope_denied");
+        allows("the same request is allowed when the pattern names the port", p,
+               req("GET", "https://app.example.test:8443/api/orders",
+                   "app.example.test", "/api/orders", ""),
+               authorised("scope.include", "https://app.example.test:8443/*"));
+
+        // Path globs.
+        allows("a path glob matches below its prefix", p,
+               req("GET", "https://app.example.test/api/v2/orders",
+                   "app.example.test", "/api/v2/orders", ""),
+               authorised("scope.include", "https://app.example.test/api/*"));
+        denies("and refuses everything outside it", p,
+               req("GET", "https://app.example.test/admin", "app.example.test", "/admin", ""),
+               authorised("scope.include", "https://app.example.test/api/*"), "scope_denied");
+
+        // The query is not part of the scope decision, and a pattern is
+        // matched against the path alone.
+        allows("a query string does not take a request out of scope", p,
+               req("GET", "https://app.example.test/api/orders?status=open",
+                   "app.example.test", "/api/orders", "status=open"),
+               authorised("scope.include", "https://app.example.test/api/*"));
+
+        // Hostnames are case-insensitive; nothing upstream lowercases them.
+        allows("an uppercase host still matches a lowercase pattern", p,
+               req("GET", "https://APP.EXAMPLE.TEST/api/orders",
+                   "APP.EXAMPLE.TEST", "/api/orders", ""),
+               APP);
+
+        // An epoch with limits but no scope.include authorises nothing.
+        denies("an Authorisation with no scope.include authorises nothing", p, orders(),
+               authorised("limit.rate_rps", "5"), "scope_denied");
+
+        // Two includes: the second one is reached.
+        allows("a later scope.include is reached", p, orders(),
+               authorised("scope.include", "https://other.example.test/*",
+                          "scope.include", "https://app.example.test/*"));
+    }
+
+    static void aWildcardSubdomainDoesNotMatchTheApex() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation subs =
+                authorised("scope.include", "https://*.example.test/*");
+
+        allows("a wildcard subdomain matches one label", p,
+               req("GET", "https://api.example.test/orders", "api.example.test", "/orders", ""),
+               subs);
+        allows("and several", p,
+               req("GET", "https://a.b.example.test/orders", "a.b.example.test", "/orders", ""),
+               subs);
+        // The apex is a different service run by different people often
+        // enough that scoping the subdomains must not silently scope it.
+        denies("but not the apex itself", p,
+               req("GET", "https://example.test/orders", "example.test", "/orders", ""),
+               subs, "scope_denied");
+        // The prize for a general glob in the host half.
+        denies("and not a host that merely ends in the same letters", p,
+               req("GET", "https://notexample.test/orders", "notexample.test", "/orders", ""),
+               subs, "scope_denied");
+    }
+
+    static void excludeBeatsInclude() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation cfg =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/admin/*");
+        allows("an included path outside the exclusion", p, orders(), cfg);
+        denies("an excluded path, though it is also included", p,
+               req("GET", "https://app.example.test/admin/users",
+                   "app.example.test", "/admin/users", ""),
+               cfg, "scope_denied");
+    }
+
+    static void anUnusableScopePatternDeniesEverything() {
+        Policy p = allowingPolicy();
+
+        // Every pattern is parsed before any is matched, so a matching first
+        // include does not hide a garbage second one. Order-dependent scope is
+        // scope nobody can review.
+        denies("a matching include does not excuse an unusable one after it", p, orders(),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.include", "app.example.test"),
+               "scope_denied");
+        denies("a pattern with no path is refused rather than guessed at", p, orders(),
+               authorised("scope.include", "https://app.example.test"), "scope_denied");
+        denies("a pattern with a wildcard host is refused", p, orders(),
+               authorised("scope.include", "https://*/*"), "scope_denied");
+        // The dangerous direction: an unusable EXCLUDE that was ignored would
+        // widen the effective scope, silently.
+        denies("an unusable scope.exclude denies rather than being ignored", p, orders(),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "ftp://app.example.test/files/*"),
+               "scope_denied");
+    }
+
+    static void userinfoInTheAuthorityCannotSatisfyScope() {
+        Policy p = allowingPolicy();
+        // What a send frame with target_host
+        // "app.example.test@evil.example.test" produces. A URL parser reads
+        // the host as evil.example.test and discards everything before the @;
+        // a human, and a prefix match, read it as app.example.test. Burp would
+        // connect to neither -- it connects to the whole string -- so there is
+        // no reading under which this is authorised.
+        denies("userinfo cannot smuggle an out-of-scope host past an in-scope prefix", p,
+               req("GET", "https://app.example.test@evil.example.test/api/orders",
+                   "app.example.test@evil.example.test", "/api/orders", ""),
+               APP, "scope_denied");
+        denies("nor past a pattern for the host after the @", p,
+               req("GET", "https://app.example.test@evil.example.test/api/orders",
+                   "app.example.test@evil.example.test", "/api/orders", ""),
+               authorised("scope.include", "https://evil.example.test/*"), "scope_denied");
+        // And the same trick written into a pattern is not usable either.
+        denies("a scope pattern carrying userinfo is unusable", p, orders(),
+               authorised("scope.include", "https://app.example.test@evil.example.test/*"),
+               "scope_denied");
+    }
+
+    static void aPortSmuggledIntoTheHostCannotSatisfyScope() {
+        Policy p = allowingPolicy();
+        // target_host "app.example.test:443" builds the url
+        // https://app.example.test:443/api/orders, whose authority parses to
+        // the in-scope host on the in-scope port -- while Burp connects to a
+        // HOSTNAME with a colon in it. The url and the connection disagree, so
+        // the decision is about a request nobody is going to issue.
+        denies("a port inside target_host is not a port", p,
+               req("GET", "https://app.example.test:443/api/orders",
+                   "app.example.test:443", "/api/orders", ""),
+               APP, "scope_denied");
+        denies("nor when the pattern names that port explicitly", p,
+               req("GET", "https://app.example.test:8443/api/orders",
+                   "app.example.test:8443", "/api/orders", ""),
+               authorised("scope.include", "https://app.example.test:8443/*"), "scope_denied");
+        // The same shape one level out: a host that is not a hostname.
+        denies("a host with a slash in it is refused", p,
+               req("GET", "https://app.example.test/evil.example.test/x",
+                   "app.example.test/evil.example.test", "/x", ""),
+               APP, "scope_denied");
+        denies("a host with a non-ASCII lookalike character is refused", p,
+               req("GET", "https://аpp.example.test/api/orders",
+                   "аpp.example.test", "/api/orders", ""),
+               APP, "scope_denied");
+    }
+
+    static void aUrlThatDisagreesWithItsOwnPathIsRefused() {
+        // Sender builds the url from the same target it splits into path and
+        // query, so these cannot disagree today. The check is here so that the
+        // day one of them is built differently, the answer is a denial rather
+        // than a decision about the wrong path.
+        denies("a url whose path is not the request path is refused", allowingPolicy(),
+               req("GET", "https://app.example.test/api/orders",
+                   "app.example.test", "/admin/users", ""),
+               APP, "scope_denied");
+    }
+
+    // ---- method ----------------------------------------------------------
+
+    static void theMethodAllowlistDefaultsToTheProductionProfile() {
+        Policy p = allowingPolicy();
+        for (String m : List.of("GET", "HEAD", "OPTIONS"))
+            allows(m + " is allowed with no method.allow configured", p,
+                   req(m, "https://app.example.test/api/orders",
+                       "app.example.test", "/api/orders", ""), APP);
+        for (String m : List.of("POST", "PUT", "PATCH", "DELETE", "TRACE"))
+            denies(m + " is refused with no method.allow configured", p,
+                   req(m, "https://app.example.test/api/orders",
+                       "app.example.test", "/api/orders", ""), APP, "method_denied");
+    }
+
+    static void anExplicitMethodAllowReplacesTheDefault() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation postOnly =
+                authorised("scope.include", "https://app.example.test/*",
+                           "method.allow", "POST");
+        allows("an explicitly allowed POST", p,
+               req("POST", "https://app.example.test/api/orders",
+                   "app.example.test", "/api/orders", ""), postOnly);
+        // Replaces, does not union: an allowlist that can only grow is not an
+        // allowlist, and an operator who says HEAD-only on a fragile
+        // application has to be able to mean it.
+        denies("GET is gone once method.allow names something else", p, orders(),
+               postOnly, "method_denied");
+    }
+
+    static void methodsAreCaseSensitive() {
+        // RFC 9110 s9.1, and Sender.parse keeps the frame's spelling verbatim:
+        // `get` is what would go on the wire, and a server that does not
+        // recognise it may do something other than a GET.
+        denies("a lowercase get does not satisfy an allowlist of GET", allowingPolicy(),
+               req("get", "https://app.example.test/api/orders",
+                   "app.example.test", "/api/orders", ""),
+               APP, "method_denied");
+    }
+
+    // ---- dangerous paths -------------------------------------------------
+
+    static void theDangerousDenylistShipsWithDefaults() {
+        Policy p = allowingPolicy();
+        // In scope, an allowed method, and still refused: s4 is explicit that
+        // "in scope" and "safe to touch automatically" are different questions.
+        for (String path : List.of("/account/logout", "/signout", "/sign-out",
+                                   "/account/password/change", "/api/users/7/delete",
+                                   "/admin/cache/purge"))
+            denies("a shipped default refuses " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   APP, "dangerous_denied");
+
+        // Case-folded: /Account/Logout is the same button.
+        denies("the denylist is case-insensitive", p,
+               req("GET", "https://app.example.test/Account/Logout",
+                   "app.example.test", "/Account/Logout", ""),
+               APP, "dangerous_denied");
+
+        // A logout is as often a query parameter as a path.
+        denies("the denylist reads the query too", p,
+               req("GET", "https://app.example.test/index.php?action=logout",
+                   "app.example.test", "/index.php", "action=logout"),
+               APP, "dangerous_denied");
+
+        // The false-positive direction matters just as much: a denylist that
+        // refuses ordinary traffic gets turned off.
+        for (String path : List.of("/api/orders", "/products/1", "/static/app.js", "/login"))
+            allows("an ordinary path is not refused: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   APP);
+    }
+
+    static void operatorDangerousPatternsAddToTheDefaults() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation cfg =
+                authorised("scope.include", "https://app.example.test/*",
+                           "dangerous.path", "*/admin/jobs/*");
+        denies("an operator's own pattern is refused", p,
+               req("GET", "https://app.example.test/admin/jobs/run",
+                   "app.example.test", "/admin/jobs/run", ""),
+               cfg, "dangerous_denied");
+        // ConfigBody.KEYS has no key that means "drop a default", so a
+        // dangerous.path line can only be read as ADDING one.
+        denies("and the shipped defaults survive alongside it", p,
+               req("GET", "https://app.example.test/account/logout",
+                   "app.example.test", "/account/logout", ""),
+               cfg, "dangerous_denied");
+    }
+
+    // ---- the order -------------------------------------------------------
+
+    /**
+     * The pinned order: not_configured -> scope_denied -> method_denied ->
+     * dangerous_denied -> the Gate's answer. Each case violates its own rule
+     * AND every rule after it, so a reordering cannot pass by accident: the
+     * operator reading a denial acts on the reason it gives, and "rate
+     * limited" for a request that was never in scope sends them to tune a
+     * limit instead of fixing their scope file.
+     *
+     * `halted` sits between not_configured and scope_denied in the full
+     * order and is not decidable here -- it is live state, not a property of
+     * the request. Sender holds that position, and SenderTest pins it.
+     */
+    static void theRefusalOrderIsPinned() {
+        // Wrong host, wrong method, dangerous path, and a gate that has
+        // already ended the run.
+        HxRequest worst = req("POST", "https://app.example.test/account/logout",
+                              "app.example.test", "/account/logout", "");
+        CountingGate gate = new CountingGate();
+        gate.verdict = Decision.deny("budget_exhausted", "2000 of 2000 requests issued");
+        Policy p = new Policy(gate);
+
+        denies("epoch 0 beats scope, method, dangerous and budget",
+               p, worst, denyAll(), "not_configured");
+        denies("scope beats method, dangerous and budget", p, worst,
+               authorised("scope.include", "https://other.example.test/*",
+                          "method.allow", "GET",
+                          "dangerous.path", "*/logout*"),
+               "scope_denied");
+        denies("method beats dangerous and budget", p, worst,
+               authorised("scope.include", "https://app.example.test/*",
+                          "method.allow", "GET",
+                          "dangerous.path", "*/logout*"),
+               "method_denied");
+        denies("dangerous beats budget", p, worst,
+               authorised("scope.include", "https://app.example.test/*",
+                          "method.allow", "POST",
+                          "dangerous.path", "*/logout*"),
+               "dangerous_denied");
+
+        check("nothing refused above spent a budget slot (" + gate.calls + " gate call(s))",
+              gate.calls == 0);
+
+        denies("the gate answers last", p,
+               req("POST", "https://app.example.test/api/orders",
+                   "app.example.test", "/api/orders", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "method.allow", "POST"),
+               "budget_exhausted");
+        check("and it was consulted exactly once, by the one request that reached it",
+              gate.calls == 1);
+
+        CountingGate slow = new CountingGate();
+        slow.verdict = Decision.rateLimited(200_000L, "5 rps, 5 issued this second");
+        Decision d = new Policy(slow).decide(orders(), APP);
+        check("the Gate's verdict passes through Policy verbatim, retry hint and all",
+              "rate_limited".equals(d.errorClass()) && d.retryAfterUs() == 200_000L
+              && "5 rps, 5 issued this second".equals(d.detail()));
+    }
+
+    // ---- a gate that does not answer -------------------------------------
+
+    static void aBrokenGateIsNeverAnAllow() {
+        // s4: an exception is never an implicit allow. budget_exhausted is the
+        // class that means "this run is over", which is the honest answer when
+        // the thing that tracks what is left of the run has stopped answering.
+        Policy throwing = new Policy(r -> { throw new IllegalStateException("clock went backwards"); });
+        Decision d = throwing.decide(orders(), APP);
+        check("a gate that throws denies (got " + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
+              !d.allowed() && "budget_exhausted".equals(d.errorClass()));
+        check("and the denial says what happened",
+              d.detail() != null && d.detail().contains("clock went backwards"));
+
+        Policy nullish = new Policy(r -> null);
+        Decision n = nullish.decide(orders(), APP);
+        check("a gate that returns nothing denies (got "
+              + (n.allowed() ? "ALLOWED" : n.errorClass()) + ")",
+              !n.allowed() && "budget_exhausted".equals(n.errorClass()));
+    }
+
+    // ---- structural ------------------------------------------------------
+
+    /**
+     * The policy core decides what a production estate may receive, and it
+     * must be exercisable without Burp running: a ruleset that needs the whole
+     * JVM stood up gets exercised by hand, once, and then trusted. Relative
+     * path because test.sh runs from extension/, the same idiom CodecTest uses
+     * for the golden vectors.
+     */
+    static void policyNamesNoBurpType() throws Exception {
+        Path dir = Path.of("src", "hx", "policy");
+        List<Path> sources;
+        try (Stream<Path> s = Files.list(dir)) {
+            sources = s.filter(f -> f.toString().endsWith(".java")).sorted().toList();
+        }
+        // A scan that silently found nothing would make every check below
+        // vacuous -- the failure mode that put this project's seven deleted
+        // guards through green tests.
+        check("the scan found the policy sources (" + sources.size() + " file(s))",
+              sources.size() >= 5);
+        for (Path f : sources) {
+            String text = Files.readString(f, StandardCharsets.UTF_8);
+            check(f.getFileName() + " names no burp.* type", !text.contains("burp."));
+        }
+    }
+}
+```
+
+- [ ] **Step 3: Run it and watch it fail**
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL at compile time — `javac` never gets as far as running anything:
+
+```
+test/hx/policy/PolicyTest.java:61: error: cannot find symbol
+    static HxRequest req(String method, String url, String host, String path, String query) {
+           ^
+  symbol:   class HxRequest
+  location: class PolicyTest
+```
+
+with the same `cannot find symbol` for `Policy`, `Decision` and `Gate`. `CodecTest` and
+`BridgeClientTest` do not run either — the compile is one unit. That is expected here and
+only here; from Step 5 on, a failure must be a check going red, not a compile error.
+
+- [ ] **Step 4: The four value types**
+
+None of these makes a decision. They exist so that `Policy` and its tests are talking
+about the same thing, and so that `Limiter`, `Distress` and `HaltSwitch` (Tasks 2, 3 and 5)
+take their clock from one interface rather than three.
+
+```java
+// extension/src/hx/policy/HxRequest.java
+package hx.policy;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * One request, already split into the parts the rules ask about. This is what
+ * Policy decides about and what Sender puts on the wire, so the two are never
+ * reasoning about different requests.
+ *
+ * `url` is the whole thing -- scheme, authority, path and query -- and `host`
+ * is the name Burp actually connects to. They are both here because they can
+ * disagree: `host` comes from the send frame's `target_host` and `url` is
+ * built from it, so a `target_host` of "app.example.test:8443" or
+ * "app.example.test@evil.example.test" produces a url whose authority is not
+ * the host at all. Policy checks that they agree before it matches anything;
+ * see Policy.scopeOf.
+ *
+ * `body` is a byte[], so the record's generated equals() and hashCode()
+ * compare it by IDENTITY. Nothing in this project compares HxRequests or uses
+ * one as a map key, and nothing should start: a value-looking type that is not
+ * a value is worth knowing about before you rely on it.
+ */
+public record HxRequest(String method, String url, String host, String path,
+                        String query, Map<String, List<String>> headers, byte[] body) {
+
+    /**
+     * IllegalArgumentException rather than a late NullPointerException: the one
+     * caller in production is Sender.parse, whose try/catch turns exactly this
+     * type into error class `bad_frame`. A field that arrives null there is a
+     * malformed send frame, and it should be answered as one rather than
+     * unwinding out of the send arm as an unhandled exception.
+     */
+    public HxRequest {
+        if (method == null) throw new IllegalArgumentException("method is null");
+        if (url == null) throw new IllegalArgumentException("url is null");
+        if (host == null) throw new IllegalArgumentException("host is null");
+        if (path == null) throw new IllegalArgumentException("path is null");
+        if (query == null) throw new IllegalArgumentException("query is null");
+        if (headers == null) throw new IllegalArgumentException("headers is null");
+        if (body == null) throw new IllegalArgumentException("body is null");
+    }
+
+    /**
+     * The origin-form request target: the path, plus "?" and the query when
+     * there is one. What the dangerous-path denylist matches against, because
+     * a logout is as often `/index.php?action=logout` as it is `/logout`.
+     */
+    public String target() {
+        return query.isEmpty() ? path : path + "?" + query;
+    }
+}
+```
+
+```java
+// extension/src/hx/policy/Decision.java
+package hx.policy;
+
+/**
+ * A verdict. `errorClass` is one of the classes in spec s6 -- the agent
+ * switches on it, and the distinction is load-bearing: `rate_limited` means
+ * slow down and retry, the three `*_denied` classes mean the answer will not
+ * change, and `budget_exhausted` means this run is over.
+ *
+ * `retryAfterUs` is meaningful only for `rate_limited`; every other verdict
+ * leaves it 0, and LimiterTest pins that.
+ */
+public record Decision(boolean allowed, String errorClass, String detail, long retryAfterUs) {
+
+    private static final Decision ALLOW = new Decision(true, null, null, 0L);
+
+    /** Shared: an allow carries no state, and the send path makes one per
+     *  request on the hot path. */
+    public static Decision allow() { return ALLOW; }
+
+    public static Decision deny(String errorClass, String detail) {
+        return new Decision(false, errorClass, detail, 0L);
+    }
+
+    /** The one verdict that carries a retry hint. The class is set here rather
+     *  than by the caller so a typo cannot produce a denial the agent does not
+     *  recognise and therefore does not back off from. */
+    public static Decision rateLimited(long retryAfterUs, String detail) {
+        return new Decision(false, "rate_limited", detail, retryAfterUs);
+    }
+}
+```
+
+```java
+// extension/src/hx/policy/Gate.java
+package hx.policy;
+
+/**
+ * The rate/budget half of the decision, behind one method.
+ *
+ * Policy consults a Gate rather than owning a Limiter so that the ordering of
+ * the rules can be tested with a double that answers on command, and so that
+ * Policy stays a pure function of its arguments. The real implementation is
+ * hx.policy.Limiter.
+ *
+ * check() has a SIDE EFFECT -- Limiter spends a rate token and a budget slot
+ * -- which is why Policy calls it last, and why nothing may call it on a
+ * request an earlier rule has already refused.
+ */
+public interface Gate {
+    Decision check(HxRequest req);
+}
+```
+
+```java
+// extension/src/hx/policy/Clock.java
+package hx.policy;
+
+/**
+ * Microseconds since the epoch, injected everywhere time matters.
+ *
+ * Nothing in this package reads System.currentTimeMillis() directly. Limiter's
+ * window, Distress's rolling baseline and HaltSwitch's poll interval all take
+ * one of these, so their boundaries are hit exactly in tests instead of being
+ * approached with a sleep -- a test that sleeps 1100ms to cross a 1s window is
+ * both slow and, on a loaded machine, occasionally wrong.
+ */
+public interface Clock {
+    long nowUs();
+}
+```
+
+- [ ] **Step 5: Run it again and watch the failure move**
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL, still at compile time, but now on one symbol only:
+
+```
+test/hx/policy/PolicyTest.java:104: error: cannot find symbol
+    static Policy allowingPolicy() { return new Policy(new CountingGate()); }
+           ^
+  symbol:   class Policy
+  location: class PolicyTest
+```
+
+`HxRequest`, `Decision`, `Gate` and `Clock` are gone from the error list. Confirm that
+before writing `Policy`: if a value type had a typo, the next step's failure would be
+blamed on the ruleset.
+
+- [ ] **Step 6: Write `Policy`**
+
+```java
+// extension/src/hx/policy/Policy.java
+package hx.policy;
+
+import hx.bridge.BridgeClient;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+/**
+ * The decision, as a pure function of a request and one Authorisation
+ * snapshot. No sockets, no clock, no filesystem, and nothing from Burp's
+ * Montoya API -- PolicyTest scans every source file in this package and fails
+ * if one names a Montoya type, because a ruleset that needs Burp running to be
+ * exercised is a ruleset that will be exercised by hand, once, and then
+ * trusted.
+ *
+ * THE ORDER IS THE CONTRACT: not_configured -> [halted] -> scope_denied ->
+ * method_denied -> dangerous_denied -> rate_limited -> budget_exhausted. When
+ * a request violates several rules the earliest wins, because the denial an
+ * operator reads is the reason they will act on. "Rate limited" for a request
+ * that was never in scope sends them to tune a limit instead of fixing their
+ * scope file.
+ *
+ * `halted` is in brackets because it is not decidable here: a halt is a piece
+ * of live state (a halt frame, the sentinel file, or auto-halt on target
+ * distress), not a property of the request and the authorisation. Sender
+ * checks it, in that position, between not_configured and this method.
+ *
+ * The Authorisation is a PARAMETER. It is read once per send, by
+ * BridgeClient's send arm, and carried down -- epoch and scope from the one
+ * reference, so the scope a request was decided under and the epoch stamped on
+ * its evidence line are the same commit. configEpoch() and scopeConfig() are
+ * two reads of that one record and a commit lands between them: measured wrong
+ * in 393/400 trials, in the unsafe direction.
+ */
+public final class Policy {
+
+    /**
+     * Spec s4: "Defaults on a production profile are single-digit req/s and
+     * GET/HEAD/OPTIONS only."
+     *
+     * This applies whenever `method.allow` is ABSENT, whatever profile the
+     * configure frame named -- Authorisation carries the config body, and the
+     * profile is a header field that never reaches this class. That is
+     * deliberate: the body is what was hashed and committed at this epoch, and
+     * the strictest profile's allowlist is the only safe reading of "the
+     * operator did not say".
+     */
+    static final List<String> DEFAULT_METHODS = List.of("GET", "HEAD", "OPTIONS");
+
+    // Spec s4: the denylist "ships with sensible defaults (logout, password
+    // change, delete, purge) and is separate from scope -- 'in scope' and
+    // 'safe to touch automatically' are different questions."
+    //
+    // Same glob syntax as an operator's own `dangerous.path` lines, matched
+    // case-insensitively against the request target -- path AND query, because
+    // on a legacy application a logout is `/index.php?action=logout` at least
+    // as often as it is `/logout`. Each verb therefore appears twice, once
+    // after a `/` and once after a `=`: those are the two separators it can
+    // follow, and requiring one is what keeps `/api/blogouts` out of the
+    // denylist. The two spellings of sign-out are both here because real
+    // applications use both, and password covers change-password,
+    // password/change and reset-password without guessing which shape a given
+    // app chose.
+    //
+    // The false-positive direction is accepted deliberately: `?sort=deleted_at`
+    // matches and will be refused. A visible dangerous_denied on a listing
+    // endpoint costs an operator one config line; an automated logout costs
+    // them the session, and possibly the evidence of everything issued under
+    // it.
+    //
+    // These are ADDED to whatever the operator configured, never replaced by
+    // it: ConfigBody.KEYS has no key meaning "drop a default", so a
+    // `dangerous.path` line can only be read as one more thing to refuse. The
+    // cost is real and accepted -- there is no way to authorise hx to issue a
+    // logout, and an operator who needs one issues it by hand in Repeater,
+    // which is where s1 says manual manipulation belongs.
+    //
+    // (Line comments, not javadoc: a pattern beginning `*/` ends a block
+    // comment.)
+    static final List<String> DEFAULT_DANGEROUS = List.of(
+            "*/logout*",   "*=logout*",
+            "*/signout*",  "*=signout*",
+            "*/sign-out*", "*=sign-out*",
+            "*/password*", "*=password*",
+            "*/delete*",   "*=delete*",
+            "*/purge*",    "*=purge*");
+
+    private final Gate gate;
+
+    public Policy(Gate gate) {
+        this.gate = gate;
+    }
+
+    public Decision decide(HxRequest req, BridgeClient.Authorisation auth) {
+        // Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before
+        // any configure and after every disconnect; epochCounter is
+        // pre-incremented, so a real commit is >= 1 and there is no other way
+        // to observe a 0. A null snapshot is a caller bug, and the fail-closed
+        // reading of a caller bug is the same one.
+        if (auth == null || auth.epoch() == 0)
+            return Decision.deny("not_configured", "no configure frame acknowledged yet");
+
+        Map<String, List<String>> scope = auth.scope();
+
+        Decision scoped = checkScope(req, scope);
+        if (!scoped.allowed()) return scoped;
+
+        // NOT uppercased on either side. HTTP methods are case-sensitive (RFC
+        // 9110 s9.1) and Sender.parse keeps whatever the frame said, so `get`
+        // is what would go on the wire; folding case here would let it satisfy
+        // a method.allow of GET while the server sees something else.
+        List<String> allowed = scope.getOrDefault("method.allow", DEFAULT_METHODS);
+        if (!allowed.contains(req.method()))
+            return Decision.deny("method_denied",
+                    req.method() + " is not in method.allow " + allowed);
+
+        String target = lower(req.target());
+        for (String pattern : dangerousPatterns(scope))
+            if (glob(lower(pattern), target))
+                return Decision.deny("dangerous_denied",
+                        req.target() + " matches dangerous.path " + pattern);
+
+        // The Gate LAST, because it is the only check with a side effect:
+        // Limiter.check() spends a rate token and a budget slot, and spending
+        // either on a request three earlier rules would have refused shortens
+        // the run for no evidence.
+        Decision gated;
+        try {
+            gated = gate.check(req);
+        } catch (RuntimeException e) {
+            // s4: an exception is never an implicit allow. budget_exhausted is
+            // the honest class -- it is the one that means "this run is over",
+            // and a gate that cannot say what is left of the budget has ended
+            // the run whether or not it meant to.
+            return Decision.deny("budget_exhausted",
+                    "gate failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        if (gated == null)
+            return Decision.deny("budget_exhausted", "gate returned no decision");
+        return gated;
+    }
+
+    // ---- scope ---------------------------------------------------------
+
+    /**
+     * Scope is decided about the URL, and every pattern is parsed BEFORE any
+     * of them is matched. Parsing lazily would make the verdict depend on the
+     * order of the include list: a garbage pattern after a matching one would
+     * never be reached, and the same config would authorise or refuse the same
+     * request depending on which line the operator typed first.
+     */
+    private static Decision checkScope(HxRequest req, Map<String, List<String>> scope) {
+        Target t;
+        try {
+            t = Target.parse(req.url());
+        } catch (IllegalArgumentException e) {
+            return Decision.deny("scope_denied", e.getMessage());
+        }
+
+        // Policy decides about req.url(); Burp connects to req.host() on the
+        // port in that url. If the url's authority is not exactly that host,
+        // the decision and the connection are about different destinations --
+        // which is precisely what a `target_host` of
+        // "app.example.test@evil.example.test" (userinfo: everything before
+        // the @ is discarded by a URL parser, and by nobody else) or
+        // "app.example.test:8443" (a port smuggled into the host field) buys
+        // an attacker who can influence a send frame. Neither can be matched
+        // safely, so neither is matched at all.
+        if (!t.host().equals(lower(req.host())))
+            return Decision.deny("scope_denied", "url authority host " + t.host()
+                    + " is not the connection host " + req.host());
+        // Same argument one field down: the url's path is what the patterns
+        // are matched against and req.path() is what the wire gets. The query
+        // is deliberately NOT compared -- HxRequest cannot tell "/x" from
+        // "/x?", both of which parse to an empty query -- and no scope pattern
+        // matches against it.
+        if (!t.path().equals(req.path()))
+            return Decision.deny("scope_denied", "url path " + t.path()
+                    + " is not the request path " + req.path());
+
+        List<String> include = scope.getOrDefault("scope.include", List.of());
+        if (include.isEmpty())
+            // An engagement with no scope.include authorises nothing. This is
+            // reachable with a non-zero epoch: a configure frame carrying only
+            // limits commits fine.
+            return Decision.deny("scope_denied", "no scope.include pattern is configured");
+
+        List<Rule> excludes = new ArrayList<>();
+        List<Rule> includes = new ArrayList<>();
+        try {
+            for (String p : scope.getOrDefault("scope.exclude", List.of()))
+                excludes.add(Rule.parse(p));
+            for (String p : include)
+                includes.add(Rule.parse(p));
+        } catch (IllegalArgumentException e) {
+            return Decision.deny("scope_denied", "unusable scope pattern: " + e.getMessage());
+        }
+
+        // Exclude first: an exclusion is the operator naming something they
+        // know they must not touch, and it beats every include it overlaps.
+        for (Rule r : excludes)
+            if (r.matches(t))
+                return Decision.deny("scope_denied",
+                        req.url() + " matches scope.exclude " + r.source());
+
+        for (Rule r : includes)
+            if (r.matches(t)) return Decision.allow();
+
+        return Decision.deny("scope_denied", req.url() + " matches no scope.include pattern");
+    }
+
+    /** scheme, host, port and path of a request URL, with no ambiguity left in
+     *  any of them. */
+    private record Target(String scheme, String host, int port, String path) {
+
+        static Target parse(String url) {
+            int sep = url.indexOf("://");
+            if (sep <= 0) throw new IllegalArgumentException("url has no scheme: " + url);
+            String scheme = lower(url.substring(0, sep));
+            if (!scheme.equals("http") && !scheme.equals("https"))
+                throw new IllegalArgumentException("url scheme is not http(s): " + url);
+
+            String rest = url.substring(sep + 3);
+            int slash = rest.indexOf('/');
+            if (slash < 0)
+                // Sender only ever builds a url from an origin-form target, so
+                // this is a caller that built one some other way.
+                throw new IllegalArgumentException("url has no path: " + url);
+
+            String authority = rest.substring(0, slash);
+            String pathAndQuery = rest.substring(slash);
+            int q = pathAndQuery.indexOf('?');
+            String path = q < 0 ? pathAndQuery : pathAndQuery.substring(0, q);
+
+            if (authority.indexOf('@') >= 0)
+                throw new IllegalArgumentException("url authority carries userinfo: " + url);
+
+            int port = scheme.equals("https") ? 443 : 80;
+            String host = authority;
+            int colon = authority.indexOf(':');
+            if (colon >= 0) {
+                host = authority.substring(0, colon);
+                String portText = authority.substring(colon + 1);
+                if (portText.isEmpty())
+                    throw new IllegalArgumentException("url authority has an empty port: " + url);
+                for (int i = 0; i < portText.length(); i++)
+                    if (portText.charAt(i) < '0' || portText.charAt(i) > '9')
+                        // Catches the second colon of an unbracketed IPv6
+                        // literal as well as junk. An IPv6 target needs
+                        // brackets before it can be reasoned about, and
+                        // nothing produces one yet.
+                        throw new IllegalArgumentException("url port is not a number: " + url);
+                if (portText.length() > 5)
+                    throw new IllegalArgumentException("url port is out of range: " + url);
+                port = Integer.parseInt(portText);
+                if (port < 1 || port > 65535)
+                    throw new IllegalArgumentException("url port is out of range: " + url);
+            }
+            host = lower(host);
+            checkHostChars(host, url);
+            return new Target(scheme, host, port, path);
+        }
+    }
+
+    /**
+     * A hostname we are willing to match against a pattern.
+     *
+     * The refused characters are the ones that create a SECOND reading of
+     * where a request is going: '@' (userinfo), ':' (port), '/' and '\'
+     * (authority ends), whitespace, and anything non-ASCII (a Cyrillic 'a' in
+     * a hostname is a different host that renders identically). '_' is allowed
+     * although RFC 1123 does not: internal names use it, and it cannot make an
+     * authority ambiguous.
+     */
+    private static void checkHostChars(String host, String url) {
+        if (host.isEmpty())
+            throw new IllegalArgumentException("url has an empty host: " + url);
+        if (host.startsWith(".") || host.endsWith(".") || host.contains(".."))
+            throw new IllegalArgumentException("url host has an empty label: " + url);
+        for (int i = 0; i < host.length(); i++) {
+            char c = host.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                      || c == '-' || c == '.' || c == '_';
+            if (!ok) throw new IllegalArgumentException(
+                    "url host has a character that cannot appear in a hostname: " + url);
+        }
+    }
+
+    /** One scope.include / scope.exclude pattern, pre-parsed. */
+    private record Rule(String source, String scheme, String hostPattern,
+                        boolean hostSuffix, int port, String pathGlob) {
+
+        static Rule parse(String pattern) {
+            int sep = pattern.indexOf("://");
+            if (sep <= 0) throw new IllegalArgumentException(pattern + " has no scheme");
+            String scheme = lower(pattern.substring(0, sep));
+            if (!scheme.equals("http") && !scheme.equals("https"))
+                throw new IllegalArgumentException(pattern + " has a scheme that is not http(s)");
+
+            String rest = pattern.substring(sep + 3);
+            int slash = rest.indexOf('/');
+            if (slash < 0)
+                // "https://app.example.test" has two readings -- the root
+                // only, or everything under it -- and they differ by the whole
+                // application. Make the operator write which one.
+                throw new IllegalArgumentException(pattern + " has no path; write /* if you mean everything");
+
+            String authority = rest.substring(0, slash);
+            String pathGlob = rest.substring(slash);
+            if (authority.indexOf('@') >= 0)
+                throw new IllegalArgumentException(pattern + " carries userinfo");
+
+            int port = scheme.equals("https") ? 443 : 80;
+            String host = authority;
+            int colon = authority.indexOf(':');
+            if (colon >= 0) {
+                host = authority.substring(0, colon);
+                String portText = authority.substring(colon + 1);
+                if (portText.isEmpty() || portText.length() > 5)
+                    throw new IllegalArgumentException(pattern + " has a bad port");
+                for (int i = 0; i < portText.length(); i++)
+                    if (portText.charAt(i) < '0' || portText.charAt(i) > '9')
+                        throw new IllegalArgumentException(pattern + " has a bad port");
+                port = Integer.parseInt(portText);
+                if (port < 1 || port > 65535)
+                    throw new IllegalArgumentException(pattern + " has a bad port");
+            }
+            host = lower(host);
+
+            // The host half accepts exactly one wildcard shape: a leading
+            // "*." matching one or more labels underneath a suffix. A general
+            // glob here would let "*.example.test" be written as
+            // "*example.test", which also matches "notexample.test", and would
+            // let a bare "*" authorise the entire internet from one typo.
+            boolean suffix = false;
+            if (host.startsWith("*.")) {
+                suffix = true;
+                host = host.substring(1);           // ".example.test"
+                checkHostChars(host.substring(1), pattern);
+            } else {
+                checkHostChars(host, pattern);
+            }
+            return new Rule(pattern, scheme, host, suffix, port, pathGlob);
+        }
+
+        boolean matches(Target t) {
+            if (!scheme.equals(t.scheme())) return false;
+            if (port != t.port()) return false;
+            if (hostSuffix) {
+                // ".example.test" matches api.example.test but NOT
+                // example.test: an operator scoping the subdomains has not
+                // scoped the apex, which is frequently a different service run
+                // by a different team.
+                if (!t.host().endsWith(hostPattern)) return false;
+            } else if (!hostPattern.equals(t.host())) {
+                return false;
+            }
+            return glob(pathGlob, t.path());
+        }
+    }
+
+    // ---- dangerous paths ------------------------------------------------
+
+    private static List<String> dangerousPatterns(Map<String, List<String>> scope) {
+        List<String> configured = scope.getOrDefault("dangerous.path", List.of());
+        if (configured.isEmpty()) return DEFAULT_DANGEROUS;
+        List<String> all = new ArrayList<>(DEFAULT_DANGEROUS);
+        all.addAll(configured);
+        return all;
+    }
+
+    // ---- helpers --------------------------------------------------------
+
+    /**
+     * `*` matches any run of characters, including none. There is no other
+     * metacharacter: a scope pattern is read by an operator under time
+     * pressure, and a regex is a language in which it is easy to write
+     * something wider than you meant -- and in which a pattern from a config
+     * file is a denial-of-service on our own JVM.
+     *
+     * Iterative with one backtrack point, so a pattern of many stars against a
+     * long path cannot go exponential.
+     */
+    static boolean glob(String pattern, String text) {
+        int p = 0, t = 0, star = -1, mark = 0;
+        while (t < text.length()) {
+            if (p < pattern.length() && pattern.charAt(p) == '*') {
+                star = p++;
+                mark = t;
+            } else if (p < pattern.length() && pattern.charAt(p) == text.charAt(t)) {
+                p++;
+                t++;
+            } else if (star >= 0) {
+                p = star + 1;
+                t = ++mark;
+            } else {
+                return false;
+            }
+        }
+        while (p < pattern.length() && pattern.charAt(p) == '*') p++;
+        return p == pattern.length();
+    }
+
+    // Locale.ROOT, not the default locale: in a Turkish locale "I" lowercases
+    // to a dotless i, so an operator who wrote a dangerous.path in capitals
+    // would have it stop matching "/delete" on their laptop and nowhere else.
+    private static String lower(String s) {
+        return s.toLowerCase(Locale.ROOT);
+    }
+}
+```
+
+- [ ] **Step 7: Run it and watch it pass**
+
+Run: `cd extension && ./test.sh`
+
+Expected: `CodecTest` and `BridgeClientTest` unchanged, then `PolicyTest` printing 87
+`ok` lines and `ALL PASS`. Count them:
+
+```bash
+cd extension && java -cp "build/test-classes:$MONTOYA" hx.policy.PolicyTest | grep -c '^  ok'
+```
+
+87. If it is fewer, a check was lost in transcription — find which one before moving on.
+
+One check in this suite has already earned its place. The scan in `policyNamesNoBurpType`
+first went red on `Policy.java` itself: the class comment explaining the scan named the
+token the scan looks for. A guard that catches the text of its own justification is better
+evidence that it is not vacuous than any assertion about it would be.
+
+- [ ] **Step 8: Sabotage — the order is the contract**
+
+In `Policy.decide`, move the `method.allow` block ABOVE the `checkScope` call, so the
+method check runs first. Rebuild and run.
+
+Exactly one check must go red, and it must be this one:
+
+```
+  FAIL scope beats method, dangerous and budget -> scope_denied (got method_denied)
+```
+
+Measured. Note what does NOT go red: every single-rule test still passes, because a
+request that breaks one rule cannot tell you which rule was consulted first. That is the
+whole argument for `theRefusalOrderIsPinned` building requests that break several rules at
+once — and for it being the check that fails here.
+
+Restore the original order and re-run: `ALL PASS`.
+
+- [ ] **Step 9: Sabotage — the host is matched exactly**
+
+In `Policy.Rule.matches`, replace the exact host comparison
+
+```java
+            } else if (!hostPattern.equals(t.host())) {
+```
+
+with the matcher someone writes when they are tired:
+
+```java
+            } else if (!t.host().endsWith(hostPattern)) {
+```
+
+Rebuild and run. This must go red:
+
+```
+  FAIL nor a host that merely ends with the pattern -> scope_denied (got ALLOWED)
+```
+
+`ALLOWED`, not a different error class: `notapp.example.test` is a domain anyone can
+register, and under `endsWith` a scope of `https://app.example.test/*` authorises `hx` to
+send to it. The `contains` spelling of the same mistake is caught by the check above it,
+`a host with the pattern appended to another domain is out of scope`.
+
+Restore and re-run: `ALL PASS`.
+
+- [ ] **Step 10: Sabotage — the url and the connection must be one destination**
+
+Delete these three lines from `Policy.checkScope`:
+
+```java
+        if (!t.host().equals(lower(req.host())))
+            return Decision.deny("scope_denied", "url authority host " + t.host()
+                    + " is not the connection host " + req.host());
+```
+
+Rebuild and run. Two checks must go red, both `ALLOWED`:
+
+```
+  FAIL a port inside target_host is not a port -> scope_denied (got ALLOWED)
+  FAIL nor when the pattern names that port explicitly -> scope_denied (got ALLOWED)
+```
+
+That is a `send` frame whose `target_host` is `app.example.test:443` being authorised
+against a scope for `app.example.test`, while Burp is handed a hostname with a colon in
+it. The decision and the connection are about different destinations.
+
+Two more things were measured here, and are worth knowing before anyone "simplifies" this
+class. Deleting the userinfo rejection in `Target.parse` **on its own** turns nothing red —
+`checkHostChars` refuses the `@` a few lines later. Deleting both still turns nothing red —
+the pattern is then compared against the whole string `app.example.test@evil.example.test`,
+which matches no pattern. So the userinfo checks pass because of three independent guards,
+and only the third (exact comparison, Step 9) is load-bearing on its own. Keep all three:
+the first two are what produce a legible denial instead of an accidental one.
+
+Restore and re-run: `ALL PASS`.
+
+- [ ] **Step 11: Sabotage — a `dangerous.path` line cannot delete a default**
+
+In `Policy.dangerousPatterns`, replace the union
+
+```java
+        List<String> all = new ArrayList<>(DEFAULT_DANGEROUS);
+        all.addAll(configured);
+        return all;
+```
+
+with `return configured;` — the reading in which an operator's list replaces the shipped
+one. Rebuild and run:
+
+```
+  FAIL and the shipped defaults survive alongside it -> dangerous_denied (got ALLOWED)
+```
+
+An operator who adds one `dangerous.path` line for their own admin endpoint has, under
+that reading, silently re-authorised `hx` to issue a logout. `ConfigBody.KEYS` has no key
+meaning "drop a default", so there is no way to ask for the replacing behaviour on
+purpose — which is why the additive reading is the only safe one.
+
+Restore and re-run: `ALL PASS`.
+
+- [ ] **Step 12: Sabotage — a gate that fails is not an allow**
+
+In `Policy.decide`, replace the body of the `catch (RuntimeException e)` block with
+`return Decision.allow();`. Rebuild and run:
+
+```
+  FAIL a gate that throws denies (got ALLOWED)
+  FAIL and the denial says what happened
+```
+
+Global constraint, and §4: an exception is never an implicit allow. A `Limiter` that
+throws — a clock that went backwards, an overflow in a window — must end the run, not
+open it.
+
+Restore and re-run: `ALL PASS`.
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add extension/src/hx/policy extension/test/hx/policy extension/test.sh
+git commit -m "feat(policy): the decision core, five rules in one pinned order"
+```
+
+---
+
+### Task 2: Limiter — rate limit and per-run budget
+
+**Files:**
+- Create: `extension/src/hx/policy/Limiter.java`
+- Create: `extension/test/hx/policy/LimiterTest.java`
+- Create: `extension/test/hx/policy/TickClock.java`
+- Modify: `extension/test.sh` — one line, to run the new class
+- Test: `extension/test/hx/policy/LimiterTest.java`
+
+**Interfaces:**
+- Consumes (all from Task 1, and this task pins three of them at the seam):
+  - `hx.policy.Clock` — `long nowUs()`
+  - `hx.policy.Gate` — `Decision check(HxRequest req)`
+  - `hx.policy.HxRequest(String method, String url, String host, String path, String query, Map<String, List<String>> headers, byte[] body)`
+  - `hx.policy.Decision(boolean allowed, String errorClass, String detail, long retryAfterUs)` with
+    `Decision.allow()`, `Decision.deny(String errorClass, String detail)`,
+    `Decision.rateLimited(long retryAfterUs, String detail)`. The test asserts that
+    `rateLimited(...)` sets `errorClass` to exactly `"rate_limited"` and that
+    `deny(...)` leaves `retryAfterUs` at `0` — both are contract, and if Task 1
+    ships them otherwise this test is the thing that says so.
+- Produces:
+  - `hx.policy.Limiter implements Gate` — `Limiter(Clock clock, long ratePerSecond, long maxRequests)`,
+    `Decision check(HxRequest req)`, `long issued()`
+  - `hx.policy.TickClock implements Clock` (test tree) — `TickClock(long us)`, `set(long)`,
+    `advance(long)`. Task 3 (`Distress`) and the `HaltSwitch` task take the same
+    injected clock and should use this one rather than each rolling their own.
+
+`Limiter` is what `Policy` consults as its `Gate`: `rate_limited` and
+`budget_exhausted` are the last two rules in the decision order, so this class
+answers both. Its two numbers come from `limit.rate_rps` and
+`limit.max_requests` in the `configure` body (`ConfigBody.KEYS` already carries
+both); parsing them and constructing the `Limiter` belongs to the wiring task,
+not this one.
+
+- [ ] **Step 1: Add the hand-moved clock, and put the new class in the runner**
+
+Every guard in this plan that owns time takes an injected `Clock` so its
+boundaries can be hit exactly. This is that clock.
+
+```java
+// extension/test/hx/policy/TickClock.java
+package hx.policy;
+
+/**
+ * A clock the test moves by hand. Every time-dependent guard in hx takes an
+ * injected Clock precisely so its boundaries can be hit exactly -- the
+ * microsecond before a window rolls, and the microsecond it rolls -- which no
+ * amount of Thread.sleep can do.
+ *
+ * `us` is volatile because the concurrency check reads it from eight threads
+ * while they hammer one Limiter. `advance` is a read-modify-write and is NOT
+ * atomic: move the clock only from the thread that is driving the test, never
+ * from inside a racing worker.
+ */
+public final class TickClock implements Clock {
+
+    private volatile long us;
+
+    public TickClock(long us) { this.us = us; }
+
+    @Override
+    public long nowUs() { return us; }
+
+    public void set(long us) { this.us = us; }
+
+    public void advance(long deltaUs) { this.us += deltaUs; }
+}
+```
+
+Then add one line to `extension/test.sh`, after the `java` lines already there
+(Task 1 will have added its own above it):
+
+```bash
+java -cp "build/test-classes:$MONTOYA" hx.policy.LimiterTest
+```
+
+Nothing else in the script changes: its `javac` line already sweeps
+`$(find src test -name '*.java')`, which picks up the new `hx/policy`
+directories on its own.
+
+- [ ] **Step 2: Write the failing test**
+
+Ten test methods, and the three boundaries the task turns on are hit exactly:
+the request **at** the limit, the microsecond **before** the window rolls, and
+the microsecond it **rolls**. No sleeps anywhere.
+
+```java
+// extension/test/hx/policy/LimiterTest.java
+package hx.policy;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
+public class LimiterTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    static void expectThrows(String what, Class<?> type, Runnable body) {
+        try {
+            body.run();
+            check(what + " (expected " + type.getSimpleName() + ")", false);
+        } catch (Throwable t) {
+            check(what, type.isInstance(t));
+        }
+    }
+
+    /** 2026-08-22T00:00:00Z in microseconds. A real point on a real clock:
+     *  every boundary below is an offset from it, so an off-by-one in the
+     *  window arithmetic shows up as a wrong number rather than as a
+     *  coincidence around zero.
+     *
+     *  Every expected duration below is written out as a literal microsecond
+     *  count rather than derived from Limiter's own WINDOW_US -- which is why
+     *  that constant is private. A test that computes its expectation from the
+     *  constant it is checking agrees with itself whatever the constant says. */
+    static final long T0 = 1_787_356_800_000_000L;
+
+    static final HxRequest ACCOUNT = get("app.example.test", "/account");
+    static final HxRequest API_ORDERS = get("api.example.test", "/v2/orders");
+
+    public static void main(String[] args) throws Exception {
+        theWindowIsExactAtItsBoundaries();
+        retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore();
+        rateIsAnsweredBeforeBudget();
+        theBudgetIsMonotonicAndTimeDoesNotRefillIt();
+        nothingOnThisClassCanRefillASpentBudget();
+        aZeroBudgetIssuesNothing();
+        theConstructorRefusesLimitsItCannotEnforce();
+        theLimitIsWholeRunNotPerHost();
+        aBackwardsClockCanOnlyOverRestrict();
+        concurrentCallersCannotExceedEitherLimit();
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    /**
+     * The three boundaries that matter, hit exactly: the request at the limit,
+     * the microsecond before the window rolls, and the microsecond it rolls.
+     */
+    static void theWindowIsExactAtItsBoundaries() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 5, 1000);
+
+        for (int i = 1; i <= 5; i++)
+            check("rate 5/s: request " + i + " of 5 in the same microsecond is allowed",
+                  l.check(ACCOUNT).allowed());
+
+        Decision sixth = l.check(ACCOUNT);
+        check("the 6th request in the same microsecond is refused", !sixth.allowed());
+        check("...as rate_limited", "rate_limited".equals(sixth.errorClass()));
+        check("...retrying after the whole second, 1000000us", sixth.retryAfterUs() == 1_000_000L);
+        // String.valueOf, not sixth.detail(): a broken limiter returns an
+        // ALLOW here, whose detail is null, and an NPE would abort the run --
+        // hiding the verdict of every check after this line, which is most of
+        // them.
+        check("...with a detail that names the limit",
+              String.valueOf(sixth.detail()).contains("5/s"));
+
+        clock.set(T0 + 999_999L);
+        Decision oneEarly = l.check(ACCOUNT);
+        check("one microsecond before the window rolls it is still refused", !oneEarly.allowed());
+        check("...and the wait has shrunk to exactly 1us", oneEarly.retryAfterUs() == 1L);
+
+        clock.set(T0 + 1_000_000L);
+        check("at exactly one second the oldest issuance has left the window",
+              l.check(ACCOUNT).allowed());
+        // All five original issuances shared T0, so the window empties in one
+        // step rather than freeing a slot at a time.
+        boolean fourMore = true;
+        for (int i = 2; i <= 5; i++) fourMore &= l.check(ACCOUNT).allowed();
+        check("...and so do the other four, all issued at the same instant", fourMore);
+
+        Decision full = l.check(ACCOUNT);
+        check("the 6th of the rolled window is refused again", !full.allowed());
+        check("...for a full second measured from the new window's oldest issuance",
+              full.retryAfterUs() == 1_000_000L);
+        check("issued() counted the 10 issuances and none of the 3 refusals",
+              l.issued() == 10L);
+    }
+
+    /**
+     * retryAfterUs is a promise to the agent: wait this long and the gate will
+     * let you in. Arithmetic, not a guess -- so the wait is asserted from the
+     * value the Decision carried, AND against the number that value must be.
+     */
+    static void retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 3, 1000);
+
+        check("issuance 1 of 3, at T0", l.check(ACCOUNT).allowed());
+        clock.set(T0 + 200_000L);
+        check("issuance 2 of 3, 200ms later", l.check(ACCOUNT).allowed());
+        clock.set(T0 + 350_000L);
+        check("issuance 3 of 3, 350ms in", l.check(ACCOUNT).allowed());
+
+        clock.set(T0 + 400_000L);
+        Decision d = l.check(ACCOUNT);
+        check("a 4th inside the same second is refused", !d.allowed());
+        // The oldest of the last three is issuance 1 at T0. It leaves the
+        // window at T0+1000000, which is 600000us after now -- NOT a full
+        // second, and not the gap since the most recent issuance either.
+        check("retryAfterUs is the wait for the OLDEST issuance to leave: 600000us",
+              d.retryAfterUs() == 600_000L);
+
+        long wait = d.retryAfterUs();
+        clock.set(T0 + 400_000L + wait - 1);
+        Decision early = l.check(ACCOUNT);
+        check("a caller that waits retryAfterUs minus one microsecond is still refused",
+              !early.allowed());
+        check("...and is told the remaining 1us", early.retryAfterUs() == 1L);
+
+        clock.advance(1);
+        check("a caller that waits exactly retryAfterUs is allowed", l.check(ACCOUNT).allowed());
+        check("none of the refusals spent an issuance", l.issued() == 4L);
+    }
+
+    /** When a request breaks both limits the earlier rule in the published
+     *  order wins: ... dangerous -> rate_limited -> budget_exhausted. */
+    static void rateIsAnsweredBeforeBudget() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 1, 1);
+
+        check("the single permitted request is allowed", l.check(ACCOUNT).allowed());
+
+        Decision both = l.check(ACCOUNT);
+        check("a request that breaks BOTH limits is refused", !both.allowed());
+        check("...as rate_limited, the earlier rule in the published order",
+              "rate_limited".equals(both.errorClass()));
+
+        clock.set(T0 + 1_000_000L);
+        Decision after = l.check(ACCOUNT);
+        check("once the window rolls the same request is budget_exhausted",
+              !after.allowed() && "budget_exhausted".equals(after.errorClass()));
+        check("and budget_exhausted carries no retry, because the answer will not change",
+              after.retryAfterUs() == 0L);
+    }
+
+    /** A budget is per RUN. Nothing -- not the clock, not a later configure --
+     *  gives a spent run more requests. */
+    static void theBudgetIsMonotonicAndTimeDoesNotRefillIt() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 100, 3);
+
+        boolean three = true;
+        for (int i = 1; i <= 3; i++) three &= l.check(ACCOUNT).allowed();
+        check("a budget of 3 issues 3", three);
+
+        Decision spent = l.check(ACCOUNT);
+        check("the 4th is refused", !spent.allowed());
+        check("...as budget_exhausted", "budget_exhausted".equals(spent.errorClass()));
+        check("...with a detail that names the budget",
+              String.valueOf(spent.detail()).contains("3 of 3"));
+
+        clock.advance(3_600_000_000L);   // one hour
+        Decision anHourLater = l.check(ACCOUNT);
+        check("an hour later, with every rate window long gone, it is still refused",
+              !anHourLater.allowed() && "budget_exhausted".equals(anHourLater.errorClass()));
+
+        boolean allRefused = true;
+        for (int i = 0; i < 100; i++) allRefused &= !l.check(ACCOUNT).allowed();
+        check("a hundred further calls are all refused", allRefused);
+        check("and issued() is pinned at the budget, not counting the refusals",
+              l.issued() == 3L);
+    }
+
+    /**
+     * The other half of "monotonic". A `configure` frame re-authorises SCOPE,
+     * not ISSUANCE -- BridgeClient already refuses to lift a halt on configure
+     * for the same reason -- so a scope push must not hand the run a fresh
+     * budget. The way that would happen is a later edit adding a setter, a
+     * reset, or a reconfigure to this class, so the public surface is pinned
+     * here. The other way it could happen is the wiring building a NEW Limiter
+     * when a configure lands; that lives in HxExtension and is pinned there.
+     */
+    static void nothingOnThisClassCanRefillASpentBudget() {
+        Set<String> want = Set.of("check", "issued");
+        Set<String> found = new TreeSet<>();
+        for (Method m : Limiter.class.getDeclaredMethods())
+            if (Modifier.isPublic(m.getModifiers()) && !m.isSynthetic()) found.add(m.getName());
+        check("Limiter's public surface is exactly check() and issued(), so no caller can "
+              + "reset, raise or re-push a spent budget (found " + found + ")",
+              found.equals(want));
+
+        boolean noPublicState = true;
+        for (Field f : Limiter.class.getDeclaredFields())
+            if (Modifier.isPublic(f.getModifiers())) noPublicState = false;
+        check("...and no public field to reach round the methods", noPublicState);
+
+        Constructor<?>[] ctors = Limiter.class.getDeclaredConstructors();
+        check("...and exactly one constructor, so the limits are set once, at construction",
+              ctors.length == 1 && ctors[0].getParameterCount() == 3);
+    }
+
+    /** A budget of zero means zero. The dangerous reading is "unset, so
+     *  unlimited", which is how a dry run becomes a live one. */
+    static void aZeroBudgetIssuesNothing() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 5, 0);
+
+        Decision d = l.check(ACCOUNT);
+        check("a budget of 0 refuses the very first request", !d.allowed());
+        check("...as budget_exhausted", "budget_exhausted".equals(d.errorClass()));
+        check("...and nothing was issued", l.issued() == 0L);
+    }
+
+    static void theConstructorRefusesLimitsItCannotEnforce() {
+        TickClock clock = new TickClock(T0);
+
+        // Not clamped to 1: clamping widens the limit the operator wrote, and
+        // a safety limit may not move that way on its own. A throw here
+        // surfaces as bad_config, which is DENY-ALL.
+        expectThrows("a rate of 0 is refused, not clamped up to 1",
+                     IllegalArgumentException.class, () -> new Limiter(clock, 0, 100));
+        expectThrows("a negative rate is refused",
+                     IllegalArgumentException.class, () -> new Limiter(clock, -1, 100));
+        expectThrows("a negative budget is refused",
+                     IllegalArgumentException.class, () -> new Limiter(clock, 5, -1));
+        expectThrows("a limiter with no clock is refused",
+                     IllegalArgumentException.class, () -> new Limiter(null, 5, 100));
+        // The sliding log is one long per permitted request per second, so the
+        // rate is also an allocation. 10000 is the ceiling and is allowed;
+        // above it is a config typo, refused before it allocates.
+        expectThrows("a rate above the 10000 ceiling is refused before allocating",
+                     IllegalArgumentException.class, () -> new Limiter(clock, 10_001, 100));
+        Limiter atCeiling = new Limiter(clock, 10_000, 1);
+        check("a rate of exactly 10000 is accepted, so the ceiling is inclusive",
+              atCeiling.check(ACCOUNT).allowed());
+    }
+
+    /** Whole-run, not per-host: 2/s against two hosts is 4/s into one estate. */
+    static void theLimitIsWholeRunNotPerHost() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 2, 1000);
+
+        check("one to app.example.test", l.check(ACCOUNT).allowed());
+        check("one to api.example.test", l.check(API_ORDERS).allowed());
+        Decision third = l.check(API_ORDERS);
+        check("a third to a different host is still refused: the limit is whole-run",
+              !third.allowed() && "rate_limited".equals(third.errorClass()));
+    }
+
+    /**
+     * The Clock is injected, and the real one will be a wall clock that NTP
+     * can step backwards. The window arithmetic must not open when that
+     * happens: a backwards `now` makes past issuances look more recent, which
+     * can only refuse more and never less.
+     */
+    static void aBackwardsClockCanOnlyOverRestrict() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 2, 1000);
+
+        check("two issuances at T0", l.check(ACCOUNT).allowed() && l.check(ACCOUNT).allowed());
+
+        clock.set(T0 - 5_000_000L);          // the clock steps five seconds back
+        Decision d = l.check(ACCOUNT);
+        check("a backwards clock step does not open the gate", !d.allowed());
+        check("...and the wait grows rather than shrinking: 6000000us",
+              d.retryAfterUs() == 6_000_000L);
+    }
+
+    /**
+     * Deterministic despite being concurrent: the clock does not move, so the
+     * window never rolls and the answer is exactly `rate`, whatever order the
+     * threads run in. An unsynchronised check() reads `issued`, decides, and
+     * writes it back, so two threads inside that gap both find room -- and the
+     * excess is requests that reached a client's estate.
+     */
+    static void concurrentCallersCannotExceedEitherLimit() throws Exception {
+        check("8 threads x 200 calls against a rate of 5 issue exactly 5",
+              5 == raceAgainst(new Limiter(new TickClock(T0), 5, 1000)));
+        // A rate of 10000 cannot bind on 1600 calls, so this one is the budget
+        // alone, with the same eight threads racing on it.
+        check("8 threads x 200 calls against a budget of 3 issue exactly 3",
+              3 == raceAgainst(new Limiter(new TickClock(T0), 10_000, 3)));
+    }
+
+    static int raceAgainst(Limiter l) throws Exception {
+        int threads = 8, callsEach = 200;
+        AtomicInteger allowed = new AtomicInteger();
+        CountDownLatch go = new CountDownLatch(1);
+        List<Thread> workers = new ArrayList<>();
+        for (int t = 0; t < threads; t++) {
+            Thread w = new Thread(() -> {
+                try { go.await(); } catch (InterruptedException e) { return; }
+                for (int i = 0; i < callsEach; i++)
+                    if (l.check(ACCOUNT).allowed()) allowed.incrementAndGet();
+            });
+            workers.add(w);
+            w.start();
+        }
+        go.countDown();
+        for (Thread w : workers) w.join();
+        // issued() is the limiter's own count; allowed is the callers'. They
+        // must agree, or one of the two is not counting what it claims to.
+        if (l.issued() != allowed.get())
+            check("issued() disagrees with the callers: " + l.issued() + " vs " + allowed.get(), false);
+        return allowed.get();
+    }
+
+    /** A real request against a loopback-only test target. The limiter reads
+     *  nothing out of it -- the limit is whole-run -- but a Gate takes one,
+     *  and a null here would be testing a shape the send path never produces. */
+    static HxRequest get(String host, String path) {
+        Map<String, List<String>> headers = new LinkedHashMap<>();
+        headers.put("Host", List.of(host));
+        headers.put("User-Agent", List.of("hx/0.1"));
+        headers.put("Accept", List.of("*/*"));
+        return new HxRequest("GET", "https://" + host + path, host, path, "",
+                             Collections.unmodifiableMap(headers), new byte[0]);
+    }
+}
+```
+
+- [ ] **Step 3: Run it and watch it fail**
+
+Run: `./extension/test.sh`
+
+Expected: FAIL — `javac` never gets as far as running anything.
+
+```
+test/hx/policy/LimiterTest.java:301: error: cannot find symbol
+    static int raceAgainst(Limiter l) throws Exception {
+                           ^
+  symbol:   class Limiter
+  location: class LimiterTest
+test/hx/policy/LimiterTest.java:66: error: cannot find symbol
+        Limiter l = new Limiter(clock, 5, 1000);
+        ^
+  symbol:   class Limiter
+  location: class LimiterTest
+```
+
+`27 errors` in total, one pair per `new Limiter(...)` in the file.
+
+- [ ] **Step 4: Make it compile with a limiter that limits nothing, and watch 37 checks go red**
+
+A missing symbol proves the test mentions a class. It does not prove a single
+assertion can fail — which is the failure mode this project has already been
+bitten by: seven guards on the previous branch passed with the thing they
+guarded deleted. So compile it against a `Limiter` that allows everything, and
+read the output.
+
+Write this to `extension/src/hx/policy/Limiter.java`. **Do not give this block a
+`// path` marker when transcribing it into the plan** — `tests/test_plan_matches_repo.py`
+byte-compares every marked block against the file it names, and this one is
+deliberately wrong.
+
+```java
+package hx.policy;
+
+/** Deliberately wrong: it compiles, and it limits nothing. Step 5 replaces it. */
+public final class Limiter implements Gate {
+    public Limiter(Clock clock, long ratePerSecond, long maxRequests) { }
+    @Override public Decision check(HxRequest req) { return Decision.allow(); }
+    public long issued() { return 0L; }
+}
+```
+
+Run: `./extension/test.sh`
+
+Expected: `37 FAILURE(S)`, and every check that asserts a **refusal** is among
+them:
+
+```
+  FAIL the 6th request in the same microsecond is refused
+  FAIL ...as rate_limited
+  FAIL ...retrying after the whole second, 1000000us
+  FAIL one microsecond before the window rolls it is still refused
+  FAIL ...and the wait has shrunk to exactly 1us
+  FAIL a 4th inside the same second is refused
+  FAIL retryAfterUs is the wait for the OLDEST issuance to leave: 600000us
+  FAIL a caller that waits retryAfterUs minus one microsecond is still refused
+  FAIL the 4th is refused
+  FAIL ...as budget_exhausted
+  FAIL an hour later, with every rate window long gone, it is still refused
+  FAIL a hundred further calls are all refused
+  FAIL and issued() is pinned at the budget, not counting the refusals
+  FAIL a budget of 0 refuses the very first request
+  FAIL a rate of 0 is refused, not clamped up to 1 (expected IllegalArgumentException)
+  FAIL a backwards clock step does not open the gate
+  FAIL issued() disagrees with the callers: 0 vs 1600
+  FAIL 8 threads x 200 calls against a rate of 5 issue exactly 5
+  FAIL 8 threads x 200 calls against a budget of 3 issue exactly 3
+```
+
+Twenty-two checks stay green, and it is worth knowing which, because they are
+the ones this step does **not** vouch for: the five "request N of 5 is allowed"
+lines, "at exactly one second the oldest issuance has left the window", "a
+caller that waits exactly retryAfterUs is allowed" and the rest of the
+allow-side assertions all pass against a gate that allows everything. They earn
+their keep in Step 7(c), where the sabotage that closes the window a microsecond
+late turns them red.
+
+- [ ] **Step 5: Implement the limiter**
+
+```java
+// extension/src/hx/policy/Limiter.java
+package hx.policy;
+
+/**
+ * Rate limit and per-run budget -- the two checks that stand between a looping
+ * check and the 320 req/s the probe measured Montoya's single-request egress
+ * call sustaining (spec section 2). Burp Community imposes no request-rate
+ * throttle of its own, so this class is the throttle.
+ *
+ * Both limits are WHOLE-RUN, not per-host: five requests a second spread over
+ * ten hosts is fifty requests a second into one client's estate, and the estate
+ * is what the limit exists to protect. `check` therefore ignores everything
+ * about the request it is handed.
+ *
+ * Time comes from an injected {@link Clock} so the window can be tested at its
+ * exact boundaries instead of approached with sleeps. The rate window is a
+ * sliding log of the last `ratePerSecond` issue times, which is exact: at no
+ * instant can more than `ratePerSecond` issuances lie within any one-second
+ * window. A token bucket would be cheaper and would let 2*rate through a window
+ * that straddles a refill, and this limit is the one a client's operations team
+ * would be reading off a graph.
+ */
+public final class Limiter implements Gate {
+
+    /** One second, in the microseconds every clock in hx measures. */
+    private static final long WINDOW_US = 1_000_000L;
+
+    /**
+     * Ceiling on `ratePerSecond`, because the sliding log allocates one long
+     * per permitted request per second. Ten thousand is 80 KB and is already
+     * absurd for this tool -- spec section 4 puts a production profile in the
+     * single digits -- so a value above it is a typo in the engagement config,
+     * and a typo should not get to allocate an array inside Burp's JVM.
+     */
+    private static final long MAX_RATE = 10_000L;
+
+    private final Clock clock;
+    private final long ratePerSecond;
+    private final long maxRequests;
+
+    /**
+     * Issue times of the last `ratePerSecond` issuances. The slot at
+     * `issued % ratePerSecond` holds the OLDEST of them, because it is the one
+     * the next issuance overwrites. Never read before `issued` reaches
+     * `ratePerSecond`, so the zeroes it starts life with are never mistaken for
+     * issue times.
+     */
+    private final long[] recent;
+
+    private long issued = 0;
+
+    public Limiter(Clock clock, long ratePerSecond, long maxRequests) {
+        if (clock == null)
+            throw new IllegalArgumentException("a limiter without a clock cannot limit anything");
+        // A rate of zero is refused rather than clamped to one. Clamping widens
+        // the limit the operator actually wrote, which is the one direction a
+        // safety limit may never move on its own; refusing surfaces as a
+        // bad_config error and DENY-ALL, which is the direction it may.
+        if (ratePerSecond < 1)
+            throw new IllegalArgumentException("limit.rate_rps must be at least 1, got " + ratePerSecond);
+        if (ratePerSecond > MAX_RATE)
+            throw new IllegalArgumentException(
+                "limit.rate_rps above the " + MAX_RATE + " ceiling: " + ratePerSecond);
+        if (maxRequests < 0)
+            throw new IllegalArgumentException("limit.max_requests must not be negative, got " + maxRequests);
+        this.clock = clock;
+        this.ratePerSecond = ratePerSecond;
+        this.maxRequests = maxRequests;
+        this.recent = new long[(int) ratePerSecond];
+    }
+
+    /**
+     * Consult the gate and, when it allows, SPEND the slot. This is not a pure
+     * predicate: an allow is recorded as an issuance, so calling `check` twice
+     * for one request costs two slots and one budget unit.
+     *
+     * That is safe here because the gate is the last thing consulted on the
+     * decision path -- the published order is not_configured, halted, scope,
+     * method, dangerous, rate, budget -- so nothing downstream of an allow can
+     * turn round and deny. Anything that grows a new refusal AFTER the gate
+     * must run before it instead, or it burns budget on requests that never
+     * left the JVM.
+     *
+     * `synchronized` because a rate limit that races is not a rate limit: two
+     * threads reading `issued` before either writes it both see room and both
+     * issue. Burp calls extension code from more than one thread and the send
+     * path is explicitly allowed to be concurrent (limit.concurrency).
+     */
+    @Override
+    public synchronized Decision check(HxRequest req) {
+        long now = clock.nowUs();
+
+        // Rate is answered before budget: the published decision order is
+        // ... dangerous -> rate_limited -> budget_exhausted and the earliest
+        // matching rule wins. A run that is both over rate and out of budget
+        // therefore answers "retry in N" once before answering "this run is
+        // over" -- one wasted wait, in exchange for one order that every layer
+        // and every test agrees on.
+        if (issued >= ratePerSecond) {
+            long oldest = recent[(int) (issued % ratePerSecond)];
+            // An issuance is inside the window while now - oldest < WINDOW_US,
+            // so it leaves at exactly oldest + WINDOW_US. Strictly less-than is
+            // what makes retryAfterUs positive whenever this branch is taken:
+            // if oldest + WINDOW_US - now were zero, the issuance would already
+            // be outside the window and we would not be here.
+            long leavesWindowAt = oldest + WINDOW_US;
+            if (now < leavesWindowAt) {
+                return Decision.rateLimited(leavesWindowAt - now,
+                    "rate limit " + ratePerSecond + "/s: " + ratePerSecond
+                    + " requests issued in the last second");
+            }
+        }
+
+        // Monotonic by construction: `issued` only ever increases and
+        // `maxRequests` is final, so a budget that is spent stays spent. There
+        // is deliberately no way to refill it -- see LimiterTest's reflection
+        // check. A `configure` frame re-authorises SCOPE, not ISSUANCE, and a
+        // scope push that silently handed the run another thousand requests
+        // would be a budget reset with no operator behind it.
+        if (issued >= maxRequests) {
+            return Decision.deny("budget_exhausted",
+                "run budget spent: " + issued + " of " + maxRequests + " requests issued");
+        }
+
+        recent[(int) (issued % ratePerSecond)] = now;
+        issued++;
+        return Decision.allow();
+    }
+
+    /** How many requests this run has actually issued. Refusals are not
+     *  issuances and do not appear here. */
+    public synchronized long issued() { return issued; }
+}
+```
+
+- [ ] **Step 6: Run it and watch every check go green**
+
+Run: `./extension/test.sh`
+
+Expected: `ALL PASS` from `hx.policy.LimiterTest` — 57 checks, all `ok` — with `CodecTest`
+and `BridgeClientTest` still `ALL PASS` above it.
+
+- [ ] **Step 7: Sabotage the rate window three ways**
+
+This gate is the only thing between a looping check and the 320 req/s Burp
+Community will happily sustain. Break it on purpose, three times, and confirm
+the named check goes red each time. Restore the file after each one. Every count
+below was measured, not predicted.
+
+**(a) Off-by-one on the window, in the unsafe direction.** In `check`, change
+
+```java
+        if (issued >= ratePerSecond) {
+```
+
+to `if (issued > ratePerSecond) {`. Run `./extension/test.sh`.
+
+Expected: `14 FAILURE(S)`, headed by
+
+```
+  FAIL the 6th request in the same microsecond is refused
+```
+
+Note what this one does **not** break: "one microsecond before the window rolls
+it is still refused" stays green, because by then a seventh request has pushed
+`issued` past the mutated bound. One boundary check would not have caught this;
+the 6th-request check is the one that bites. Restore.
+
+**(b) The issue time is never recorded.** Delete the line
+
+```java
+        recent[(int) (issued % ratePerSecond)] = now;
+```
+
+leaving `issued++` in place. Run `./extension/test.sh`.
+
+Expected: `19 FAILURE(S)` — the window is now measured against slots that are
+still zero, which is 1970, so nothing is ever inside it:
+
+```
+  FAIL the 6th request in the same microsecond is refused
+  FAIL none of the refusals spent an issuance
+  FAIL 8 threads x 200 calls against a rate of 5 issue exactly 5
+```
+
+Restore.
+
+**(c) The window boundary closes a microsecond late.** Change
+
+```java
+            if (now < leavesWindowAt) {
+```
+
+to `if (now <= leavesWindowAt) {`. This is the *safe* direction — it refuses
+more — and it still has to go red, because it makes `retryAfterUs` a lie: the
+caller waits exactly as long as it was told to and is refused anyway. Run
+`./extension/test.sh`.
+
+Expected: `7 FAILURE(S)`, including
+
+```
+  FAIL at exactly one second the oldest issuance has left the window
+  FAIL a caller that waits exactly retryAfterUs is allowed
+```
+
+Restore, and re-run `./extension/test.sh` to confirm `ALL PASS` before moving on.
+
+- [ ] **Step 8: Sabotage the budget, the no-refill guard, and the lock**
+
+**(d) Off-by-one on the budget.** Change
+
+```java
+        if (issued >= maxRequests) {
+```
+
+to `if (issued > maxRequests) {`. Run `./extension/test.sh`.
+
+Expected: `9 FAILURE(S)`, including
+
+```
+  FAIL the 4th is refused
+  FAIL a budget of 0 refuses the very first request
+  FAIL ...and nothing was issued
+```
+
+A budget of zero issuing one request is the whole reason
+`aZeroBudgetIssuesNothing` exists. Restore.
+
+**(e) A way to refill the budget appears.** Add, after `issued()`:
+
+```java
+    public synchronized void reset() { issued = 0; }
+```
+
+Run `./extension/test.sh`.
+
+Expected: exactly `1 FAILURE(S)` —
+
+```
+  FAIL Limiter's public surface is exactly check() and issued(), so no caller can reset, raise or re-push a spent budget (found [check, issued, reset])
+```
+
+Every behavioural check stays green: nothing calls `reset`, so only the
+reflection check can catch this. That is precisely why it is there. The day
+someone wires a `configure` frame to a fresh budget, a method like this one is
+the first thing they will reach for, and the suite has to argue with them.
+Restore.
+
+**(f) The lock comes off.** Change
+
+```java
+    public synchronized Decision check(HxRequest req) {
+```
+
+to `public Decision check(HxRequest req) {`. This sabotage is **probabilistic**
+and must be run in a loop; a single green run proves nothing:
+
+```bash
+for i in $(seq 1 20); do java -cp extension/build/test-classes hx.policy.LimiterTest | grep -c FAIL; done
+```
+
+Measured on a 24-thread machine: **9 of 20 runs went red**, with
+
+```
+  FAIL 8 threads x 200 calls against a rate of 5 issue exactly 5
+  FAIL issued() disagrees with the callers: 5 vs 6
+```
+
+— six requests issued against a limit of five. Restore, run `./extension/test.sh`
+once more, and confirm `ALL PASS`.
+
+- [ ] **Step 9: Confirm nothing else moved**
+
+Run: `./extension/build.sh && ./extension/test.sh && python -m pytest tests/ -q`
+
+Expected: the jar builds (`hx.policy` adds no Montoya dependency — `Limiter.java`
+carries no `import` line at all), every Java test class prints `ALL PASS`, and
+the Python suite is green including `tests/test_plan_matches_repo.py`, which
+byte-compares this task's three marked blocks against the files they name.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add extension/src/hx/policy/Limiter.java \
+        extension/test/hx/policy/LimiterTest.java \
+        extension/test/hx/policy/TickClock.java \
+        extension/test.sh
+git commit -m "feat(policy): rate limit and a per-run budget that never refills
+
+The rate window is a sliding log of the last ratePerSecond issue times, so no
+one-second window can contain more than that many issuances, and retryAfterUs
+is the exact wait for the oldest of them to leave it. Tested at the boundaries
+with an injected clock: the request at the limit, the microsecond before the
+window rolls, and the microsecond it rolls.
+
+The budget is monotonic. A configure frame re-authorises scope, not issuance,
+so a scope push must not hand a spent run another thousand requests; there is
+no way to refill it, and a reflection check pins that there never is one."
+```
+
+---
+
+### Task 3: Distress — the rolling auto-halt window
+
+**Files:**
+- Create: `extension/src/hx/policy/Distress.java`
+- Modify: `extension/test.sh` — add the runner line for the new test class
+- Test: `extension/test/hx/policy/DistressTest.java`
+- Reuse (do not create): `extension/test/hx/policy/TickClock.java`, which the
+  `Limiter` task adds. This task's test will not compile until that file exists.
+
+**Interfaces:**
+- Consumes:
+  - `hx.policy.Clock` — `public interface Clock { long nowUs(); }` (Task 1). Nothing here reads a wall clock of its own; every boundary below is hit exactly rather than approached with a sleep.
+  - `hx.policy.TickClock` (test tree, from the `Limiter` task) — `TickClock(long us)`,
+    `long nowUs()`, `set(long us)`, `advance(long deltaUs)`. `DistressTest` drives this
+    rather than defining a second hand-moved clock; both are in `hx.policy`, so it needs
+    no import. **`advance` takes microseconds**, so every millisecond gap in the test is
+    multiplied out at the call site.
+- Produces:
+  - `public Distress(Clock clock, double max5xxRate, double latencyMultiple, int maxConsecutiveErrors)` — the Interface Contract's constructor. Spec §4's window (50 requests / 60 s) and baseline (first 10 requests) are the defaults it supplies.
+  - `public Distress(Clock clock, double max5xxRate, double latencyMultiple, int maxConsecutiveErrors, int windowRequests, long windowMs, int baselineRequests, long latencyFloorMs)` — the same thing with every engagement-config knob exposed. §14 says these numbers need tuning against a real client app, so none of them is a constant.
+  - `public void record(String host, int status, long ms, boolean connectionError)`
+  - `public String stopReason()` — null while healthy, a human-readable reason once tripped
+  - `public String stopHost()` — null while healthy, the host that tripped it
+  - `public String window()` — the third field of §6's `halted` frame, `{reason, host, window}`; nothing else on the send path knows what window produced the stop
+  - `long baselineMs(String host)` / `int windowSize(String host)` — package-private test seams, in the same shape as `BridgeClient.channelIsOpen()`
+- Consumed by: the `Sender` task, which calls `record(...)` after every issuance, checks `stopReason()` before the next one, and builds the `halted` frame from the three accessors.
+
+`Distress` imports no `burp.*` type, opens no file and reads no clock but the injected one. It answers one question — *is this host in trouble* — and it answers it stickily: §4 says one distressed host aborts the **whole run**, so there is no per-host recovery to model and the first reason is the one that becomes `run.stop_reason`.
+
+- [ ] **Step 1: Write the failing test**
+
+Nineteen cases. The four the task exists for — 20% exactly versus one over, the tenth request establishing a baseline versus the eleventh being measured against it, four errors then a success then four more, and the window rolling by count and by time *independently* — are pinned at the exact boundary, and two more exist purely to hold the false-positive direction shut, because a false auto-halt aborts a client's authorised test just as surely as a real one does.
+
+```java
+// extension/test/hx/policy/DistressTest.java
+package hx.policy;
+
+/**
+ * Hand-rolled runner: JUnit would be a dependency, and this jar has none.
+ *
+ * The clock is hand-driven -- hx.policy.TickClock, the one the Limiter task puts
+ * in the test tree. Same package, so no import. Every boundary below is hit
+ * exactly and nothing here sleeps: a 60-second window tested by waiting is a
+ * test nobody runs twice. TickClock.advance takes MICROSECONDS, so the
+ * millisecond gaps below are multiplied out at the call site.
+ */
+public class DistressTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    static void expectThrows(String what, Class<?> type, Runnable body) {
+        try {
+            body.run();
+            check(what + " (expected " + type.getSimpleName() + ")", false);
+        } catch (Throwable t) {
+            check(what, type.isInstance(t));
+        }
+    }
+
+    // Real host names. `.test` is reserved by RFC 6761 and resolves nowhere;
+    // nothing in this file opens a socket in any case.
+    static final String APP = "app.example.test";
+    static final String API = "api.example.test";
+
+    /** 2026-08-22, in microseconds. A real epoch, so an accidental int
+     *  somewhere in the arithmetic overflows visibly instead of passing. */
+    static final long T0 = 1_787_000_000_000_000L;
+
+    /** §4's defaults: 5xx above 20%, p50 above 5x baseline, 5 consecutive
+     *  connection errors. Built through the Interface Contract's four-argument
+     *  constructor, so that constructor is exercised by every case below. */
+    static Distress fresh(TickClock clock) { return new Distress(clock, 0.20, 5.0, 5); }
+
+    public static void main(String[] args) {
+        healthyTrafficNeverTrips();
+        aSlowButConsistentHostIsNotADistressedOne();
+        fiveXxRateAtExactlyTheThresholdDoesNotTrip();
+        oneMoreFiveXxOverTheThresholdTrips();
+        aRateNeedsEnoughSamplesToBeARate();
+        connectionErrorsAreNotCountedAgainstTheFiveXxRate();
+        fourErrorsThenASuccessThenFourMoreDoesNotTrip();
+        aFiveHundredThreeIsAResponseNotAConnectionError();
+        theTenthRequestEstablishesTheBaselineTheEleventhIsMeasured();
+        latencyAtExactlyFiveTimesBaselineDoesNotTrip();
+        oneMillisecondOverFiveTimesBaselineTrips();
+        aSubMillisecondBaselineDoesNotMakeJitterDistress();
+        theLatencyFloorDelaysTheRuleItDoesNotDisableIt();
+        theWindowRollsByCount();
+        theWindowRollsByTime();
+        hostsAreCountedSeparately();
+        aTrippedDistressStaysTripped();
+        aWindowThatCannotHoldASampleIsRefused();
+        theHaltedFrameCanNameTheWindow();
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    static void healthyTrafficNeverTrips() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        // 3xx and 4xx are in here deliberately: a 404 sweep is what a lot of
+        // discovery looks like, and reading one as a server error would abort
+        // a run for doing its job.
+        int[] statuses = {200, 200, 301, 200, 404, 200, 302, 200, 401, 200};
+        for (int i = 0; i < 50; i++) {
+            d.record(APP, statuses[i % statuses.length], 120, false);
+            clock.advance(120_000L);
+        }
+        check("50 healthy requests do not trip", d.stopReason() == null);
+        check("a healthy run names no host", d.stopHost() == null);
+    }
+
+    static void aSlowButConsistentHostIsNotADistressedOne() {
+        // The false-positive direction, and the one that costs a client
+        // engagement rather than a client system: a slow site is not a
+        // distressed one. Everything here is roughly a second per request --
+        // miserable, entirely normal for an internal app behind three
+        // middleboxes -- and steady.
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 10; i++) { d.record(APP, 200, 900, false); clock.advance(900_000L); }
+        check("a 900 ms baseline is 900 ms", d.baselineMs(APP) == 900);
+        long[] jitter = {850, 875, 900, 925, 950};
+        for (int i = 0; i < 40; i++) {
+            d.record(APP, 200, jitter[i % jitter.length], false);
+            clock.advance(jitter[i % jitter.length] * 1000L);
+        }
+        check("consistently slow is not distress", d.stopReason() == null);
+    }
+
+    static void fiveXxRateAtExactlyTheThresholdDoesNotTrip() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 8; i++) d.record(APP, 200, 120, false);
+        d.record(APP, 503, 120, false);
+        d.record(APP, 503, 120, false);
+        // 2 of 10 is 20.0%, and §4 says "above 20%". Exactly at the threshold
+        // is not above it.
+        check("a 5xx rate of exactly 20% does not trip", d.stopReason() == null);
+    }
+
+    static void oneMoreFiveXxOverTheThresholdTrips() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 8; i++) d.record(APP, 200, 120, false);
+        d.record(APP, 503, 120, false);
+        d.record(APP, 503, 120, false);
+        d.record(APP, 500, 120, false);          // 3 of 11 = 27.3%
+        check("one 5xx over the threshold trips",
+              "5xx rate 27.3% over the last 11 requests exceeds 20.0%".equals(d.stopReason()));
+        check("the stop names the host", APP.equals(d.stopHost()));
+    }
+
+    static void aRateNeedsEnoughSamplesToBeARate() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        d.record(APP, 502, 120, false);
+        // 1 of 1 is 100%, and it is also one transient bad gateway on the
+        // first request of the run.
+        check("a single 502 does not abort the run", d.stopReason() == null);
+        for (int i = 0; i < 8; i++) d.record(APP, 502, 120, false);
+        check("nine consecutive 502s still hold the gate", d.stopReason() == null);
+        d.record(APP, 502, 120, false);
+        check("the tenth 502 trips: the gate delays the rule, it does not disable it",
+              d.stopReason() != null && d.stopReason().startsWith("5xx rate 100.0%"));
+    }
+
+    static void connectionErrorsAreNotCountedAgainstTheFiveXxRate() {
+        // A 5xx RATE is the rate at which the application ANSWERS 5xx, so the
+        // denominator is answered requests. Counting refused connections in it
+        // would let two rules borrow each other's evidence, and the
+        // consecutive-error rule already owns transport failure.
+        //
+        // The documented cost is here in the assertions rather than hidden: a
+        // host alternating a 503 and a refusal needs twice as many requests
+        // before a rate exists, and the interleaving is exactly what keeps the
+        // streak from reaching five. Ten requests, not five, is the price.
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 5; i++) { d.record(APP, 503, 100, false); d.record(APP, 0, 30, true); }
+        check("five answers is not ten, whatever the ten samples beside them are",
+              d.stopReason() == null);
+        check("the window still holds all ten samples", d.windowSize(APP) == 10);
+        for (int i = 0; i < 5; i++) { d.record(APP, 503, 100, false); d.record(APP, 0, 30, true); }
+        check("the tenth answered 5xx trips",
+              d.stopReason() != null && d.stopReason().startsWith("5xx rate 100.0%"));
+    }
+
+    static void fourErrorsThenASuccessThenFourMoreDoesNotTrip() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 4; i++) d.record(APP, 0, 30, true);
+        check("four consecutive connection errors do not trip", d.stopReason() == null);
+        d.record(APP, 200, 120, false);          // the streak is broken here
+        for (int i = 0; i < 4; i++) d.record(APP, 0, 30, true);
+        check("four, a success, then four more is not five in a row", d.stopReason() == null);
+        d.record(APP, 0, 30, true);
+        check("the fifth in a row trips",
+              "5 consecutive connection errors".equals(d.stopReason()));
+        check("the connection-error stop names the host", APP.equals(d.stopHost()));
+    }
+
+    static void aFiveHundredThreeIsAResponseNotAConnectionError() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 4; i++) d.record(APP, 0, 30, true);
+        // Something answered, so the transport is up. That is a different
+        // failure from a refused connection and it breaks the streak, even
+        // though the same sample counts against the 5xx rate.
+        d.record(APP, 503, 120, false);
+        for (int i = 0; i < 4; i++) d.record(APP, 0, 30, true);
+        check("a 503 breaks the connection-error streak", d.stopReason() == null);
+    }
+
+    static void theTenthRequestEstablishesTheBaselineTheEleventhIsMeasured() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 9; i++) d.record(APP, 200, 100, false);
+        check("no baseline after nine requests", d.baselineMs(APP) == -1);
+        check("and nothing to measure against, so nothing trips", d.stopReason() == null);
+
+        // The tenth arrives 61 seconds later, so the nine before it have aged
+        // out of the WINDOW while the baseline is still taken from all ten.
+        // That gap is what makes the guard observable: the window now holds a
+        // single 60-second sample, so if the tenth request were measured
+        // against a baseline it is still helping to establish, this is where
+        // it would trip.
+        clock.advance(61_000_000L);
+        d.record(APP, 200, 60_000, false);
+        check("the tenth request establishes the baseline", d.baselineMs(APP) == 100);
+        check("the tenth request is not itself measured against it", d.stopReason() == null);
+
+        d.record(APP, 200, 60_000, false);
+        check("the eleventh is",
+              d.stopReason() != null && d.stopReason().startsWith("p50 latency 60000 ms"));
+    }
+
+    static void latencyAtExactlyFiveTimesBaselineDoesNotTrip() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 10; i++) d.record(APP, 200, 100, false);
+        check("the baseline is the p50 of the first ten", d.baselineMs(APP) == 100);
+        // 5 x 100 ms is 500 ms. Twenty samples at exactly 500 ms move the
+        // median of the window onto a slow sample and still do not trip,
+        // because §4 says "above 5x".
+        for (int i = 0; i < 20; i++) d.record(APP, 200, 500, false);
+        check("p50 at exactly 5x the baseline does not trip", d.stopReason() == null);
+    }
+
+    static void oneMillisecondOverFiveTimesBaselineTrips() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 10; i++) d.record(APP, 200, 100, false);
+        for (int i = 0; i < 10; i++) d.record(APP, 200, 501, false);
+        // Ten slow samples against ten fast ones leave the median fast. That
+        // is the whole point of a p50 rule: one slow request, or ten, is not
+        // yet a trend, and a mean would have tripped on the first.
+        check("ten slow samples still leave the median fast", d.stopReason() == null);
+        d.record(APP, 200, 501, false);
+        check("the eleventh makes the median slow, and 501 ms is above 500 ms",
+              "p50 latency 501 ms over the last 21 requests exceeds 5.0x the 100 ms baseline"
+                  .equals(d.stopReason()));
+    }
+
+    static void aSubMillisecondBaselineDoesNotMakeJitterDistress() {
+        // A loopback target answers in about a millisecond, and every
+        // integration test in this repo runs against loopback. With no floor,
+        // 5x a 1 ms baseline is 5 ms, ordinary scheduler jitter clears it, and
+        // the harness aborts its own test suite.
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 10; i++) d.record(APP, 200, 1, false);
+        check("a 1 ms baseline", d.baselineMs(APP) == 1);
+        for (int i = 0; i < 15; i++) d.record(APP, 200, 20, false);
+        check("20 ms against a 1 ms baseline is jitter, not distress", d.stopReason() == null);
+    }
+
+    static void theLatencyFloorDelaysTheRuleItDoesNotDisableIt() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 10; i++) d.record(APP, 200, 1, false);
+        for (int i = 0; i < 11; i++) d.record(APP, 200, 300, false);
+        check("300 ms against a 1 ms baseline is above the floor and trips",
+              d.stopReason() != null && d.stopReason().startsWith("p50 latency 300 ms"));
+    }
+
+    static void theWindowRollsByCount() {
+        // Nothing advances the clock in this case, so the 60-second bound
+        // cannot be what does the work. This is the count bound alone.
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 200; i++) d.record(APP, 200, 100, false);
+        check("the window holds at most 50 samples", d.windowSize(APP) == 50);
+        for (int i = 0; i < 10; i++) d.record(APP, 503, 100, false);
+        check("40 healthy and 10 failing is exactly 20% and does not trip",
+              d.stopReason() == null);
+        // The eleventh evicts one more healthy sample instead of diluting
+        // itself against two hundred of them. A long healthy history must not
+        // mask a host that has just started failing: unbounded, this reads
+        // 11/211 = 5.2% and the run walks on into a host now failing one
+        // request in five.
+        d.record(APP, 503, 100, false);
+        check("the eleventh trips at 22.0% of a 50-sample window",
+              "5xx rate 22.0% over the last 50 requests exceeds 20.0%".equals(d.stopReason()));
+    }
+
+    static void theWindowRollsByTime() {
+        // Ten samples at most, so the 50-request bound cannot be what does the
+        // work. This is the 60-second bound alone, at the exact microsecond on
+        // both sides of the edge.
+        TickClock atTheEdge = new TickClock(T0);
+        Distress d1 = fresh(atTheEdge);
+        for (int i = 0; i < 9; i++) d1.record(APP, 503, 100, false);
+        check("nine 5xx are below the ten-sample gate", d1.stopReason() == null);
+        atTheEdge.advance(60_000_000L);                  // exactly 60 s later
+        d1.record(APP, 503, 100, false);
+        check("a sample exactly 60 s old is still in the window", d1.windowSize(APP) == 10);
+        check("so the tenth 5xx trips",
+              d1.stopReason() != null && d1.stopReason().startsWith("5xx rate 100.0%"));
+
+        TickClock pastTheEdge = new TickClock(T0);
+        Distress d2 = fresh(pastTheEdge);
+        for (int i = 0; i < 9; i++) d2.record(APP, 503, 100, false);
+        pastTheEdge.advance(60_000_001L);                // one microsecond older
+        d2.record(APP, 503, 100, false);
+        check("one microsecond past the edge and the nine are gone", d2.windowSize(APP) == 1);
+        check("with one sample in the window there is no rate to trip on",
+              d2.stopReason() == null);
+    }
+
+    static void hostsAreCountedSeparately() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 9; i++) d.record(APP, 503, 100, false);
+        for (int i = 0; i < 9; i++) d.record(API, 503, 100, false);
+        // Eighteen 5xx and no trip. One window per host, or two hosts each
+        // below the gate add up to one that is not -- and the host named in
+        // the stop would then be whichever one happened to be last.
+        check("windows do not pool across hosts", d.stopReason() == null);
+        check("each host has its own window",
+              d.windowSize(APP) == 9 && d.windowSize(API) == 9);
+        d.record(APP, 503, 100, false);
+        check("the tenth on one host trips the whole run", d.stopReason() != null);
+        check("and names that host", APP.equals(d.stopHost()));
+    }
+
+    static void aTrippedDistressStaysTripped() {
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 10; i++) d.record(APP, 503, 100, false);
+        String reason = d.stopReason();
+        check("tripped", reason != null && APP.equals(d.stopHost()));
+
+        // §4: one distressed host aborts the WHOLE run. There is no per-host
+        // recovery to model, so a healthy second host cannot talk the first one
+        // down, and the first reason is the one that becomes run.stop_reason.
+        for (int i = 0; i < 200; i++) { d.record(API, 200, 20, false); clock.advance(20_000L); }
+        check("a healthy host does not clear a trip", reason.equals(d.stopReason()));
+        check("and does not steal the stop from the host that caused it",
+              APP.equals(d.stopHost()));
+        check("a tripped Distress stops recording altogether", d.windowSize(API) == 0);
+    }
+
+    static void aWindowThatCannotHoldASampleIsRefused() {
+        // The dangerous direction of a config typo is the one that DISABLES a
+        // rule: a zero-length window makes the 5xx and latency rules
+        // unfireable and a distressed host then reads as a healthy one. A
+        // threshold set too tight only ever costs an early stop, which is the
+        // cheap failure. So the constructor refuses the disarming values.
+        TickClock clock = new TickClock(T0);
+        expectThrows("a zero-request window is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 0, 60_000L, 10, 250L));
+        expectThrows("a zero-millisecond window is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 0L, 10, 250L));
+        expectThrows("a 5xx rate above 1.0 is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 1.5, 5.0, 5));
+        expectThrows("a latency multiple below 1.0 is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 0.5, 5));
+        expectThrows("a zero-length error streak is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 0));
+        expectThrows("a zero-sample baseline is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 0, 250L));
+    }
+
+    static void theHaltedFrameCanNameTheWindow() {
+        // §6's halted frame is {reason, host, window}. Reason and host come
+        // from the stop; the window is the configuration that produced it, and
+        // nothing else on the send path knows what that configuration was.
+        Distress d = fresh(new TickClock(T0));
+        check("the window describes both bounds",
+              "last 50 requests or 60000 ms".equals(d.window()));
+    }
+}
+```
+
+- [ ] **Step 2: Add the runner line**
+
+`test.sh` gains one class per test-carrying task, appended in task order. It is
+a bash block, so `tests/test_plan_matches_repo.py` does not byte-compare it —
+but a class that is never invoked is a file full of tests nobody runs, which is
+the failure mode this project has already been bitten by.
+
+```bash
+cd extension
+printf 'java -cp "build/test-classes:$MONTOYA" hx.policy.DistressTest\n' >> test.sh
+tail -3 test.sh
+```
+
+- [ ] **Step 3: Run it and watch it fail**
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL — `javac` never gets as far as running anything:
+
+```
+test/hx/policy/DistressTest.java:42: error: cannot find symbol
+    static Distress fresh(TickClock clock) { return new Distress(clock, 0.20, 5.0, 5); }
+           ^
+  symbol:   class Distress
+  location: class DistressTest
+```
+
+- [ ] **Step 4: Write `Distress.java`**
+
+```java
+// extension/src/hx/policy/Distress.java
+package hx.policy;
+
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+
+/**
+ * Auto-halt on target distress (spec §4).
+ *
+ * Every issued request is reported here with its outcome, and three rules run
+ * over a rolling per-host window -- the last {@code windowRequests} requests or
+ * {@code windowMs} milliseconds, whichever is shorter:
+ *
+ *   1. consecutive connection errors   the transport is gone
+ *   2. 5xx rate                        we are breaking the application
+ *   3. p50 latency against a baseline  we are exhausting the application
+ *
+ * A trip is STICKY. §4 says one distressed host aborts the WHOLE run, so there
+ * is no per-host recovery to model: the only thing left to do with this object
+ * is read the first reason out of it. {@link #record} returns immediately once
+ * tripped, which is also what makes {@link #stopReason()} and {@link #stopHost()}
+ * safe to read as two separate calls -- there is exactly one write, so the pair
+ * cannot tear the way BridgeClient's epoch and scope did before they were
+ * published through a single reference.
+ *
+ * The thresholds are engagement-config DEFAULTS, not constants. §14 flags that
+ * they need tuning against a real client app, and a threshold you cannot change
+ * mid-engagement is one you will fight, so every one of them -- including the
+ * window and the baseline size -- is a constructor argument.
+ *
+ * Two deliberate consequences of the rules below, stated here because both look
+ * like bugs from the outside:
+ *
+ *   - A connection error is excluded from BOTH the 5xx rate and the latency
+ *     figures. Its {@code ms} is time-to-failure, not service latency, and a
+ *     refused connection returns in about a millisecond; feeding those into a
+ *     latency baseline drags it toward zero, which makes the 5x rule fire on
+ *     healthy traffic. The cost is that a host alternating a 503 and a refusal
+ *     needs twice as many requests before a rate exists. That is bounded, and
+ *     DistressTest pins it.
+ *   - The 5xx rate needs {@code baselineRequests} answered samples before it is
+ *     computed at all. A rate over one sample is not a rate, and a single
+ *     transient 502 on a run's first request would otherwise abort the
+ *     engagement. It delays the rule; it does not disable it.
+ *
+ * No Montoya import, no I/O, and no clock of its own: the {@link Clock} is
+ * injected so the boundaries are exercised exactly rather than approached with
+ * sleeps.
+ */
+public final class Distress {
+
+    /** §4: "the last 50 requests or 60 seconds, whichever is shorter". */
+    public static final int  DEFAULT_WINDOW_REQUESTS   = 50;
+    public static final long DEFAULT_WINDOW_MS         = 60_000L;
+
+    /** §4: "a baseline taken from that host's first 10 requests". The same
+     *  count gates the 5xx rate -- one knob rather than two for the same
+     *  question, "have we seen enough of this host to have an opinion". */
+    public static final int  DEFAULT_BASELINE_REQUESTS = 10;
+
+    /**
+     * A host answering in under a quarter of a second is not in distress,
+     * whatever its baseline was. Without this floor a loopback target with a
+     * 1 ms baseline trips at 6 ms -- ordinary scheduler jitter -- and a false
+     * auto-halt aborts a client's authorised test. §4 does not name a floor;
+     * this is the smallest addition that keeps rule 3 off noise, and it only
+     * ever suppresses a stop while the host is still answering faster than
+     * 250 ms.
+     */
+    public static final long DEFAULT_LATENCY_FLOOR_MS  = 250L;
+
+    private record Sample(long atUs, int status, long ms, boolean connectionError) { }
+
+    /** Reason and host as one value, written once. See the class comment. */
+    private record Stop(String reason, String host) { }
+
+    /** One host's rolling window and its baseline. */
+    private static final class Host {
+        final Deque<Sample> window = new ArrayDeque<>();
+        final long[] firstLatencies;
+        int latencyCount = 0;
+        boolean baselineReady = false;
+        long baselineMs = 0;
+        int consecutiveErrors = 0;
+
+        Host(int baselineRequests) { this.firstLatencies = new long[baselineRequests]; }
+    }
+
+    private final Clock clock;
+    private final double max5xxRate;
+    private final double latencyMultiple;
+    private final int maxConsecutiveErrors;
+    private final int windowRequests;
+    private final long windowMs;
+    private final int baselineRequests;
+    private final long latencyFloorMs;
+
+    /** One entry per host. Scope bounds how many hosts a run may touch and the
+     *  window bounds each entry, so this cannot grow without a scope that
+     *  permits it. */
+    private final Map<String, Host> hosts = new HashMap<>();
+
+    private volatile Stop stop = null;
+
+    /** The Interface Contract's constructor: §4's window and baseline, with the
+     *  three thresholds supplied by the engagement config. */
+    public Distress(Clock clock, double max5xxRate, double latencyMultiple,
+                    int maxConsecutiveErrors) {
+        this(clock, max5xxRate, latencyMultiple, maxConsecutiveErrors,
+             DEFAULT_WINDOW_REQUESTS, DEFAULT_WINDOW_MS,
+             DEFAULT_BASELINE_REQUESTS, DEFAULT_LATENCY_FLOOR_MS);
+    }
+
+    /**
+     * Every knob. The validation is not defensive tidiness: the dangerous
+     * direction of a mistyped engagement config is the one that DISABLES a
+     * rule, and a zero-length window or a rate above 1.0 does exactly that
+     * while leaving an object that looks configured and never trips. A value
+     * set too tight only costs an early stop, which is the cheap failure.
+     */
+    public Distress(Clock clock, double max5xxRate, double latencyMultiple,
+                    int maxConsecutiveErrors, int windowRequests, long windowMs,
+                    int baselineRequests, long latencyFloorMs) {
+        if (clock == null) throw new IllegalArgumentException("clock is required");
+        if (!(max5xxRate >= 0.0 && max5xxRate <= 1.0))
+            throw new IllegalArgumentException("max5xxRate must be within 0.0..1.0, got " + max5xxRate);
+        if (!(latencyMultiple >= 1.0))
+            throw new IllegalArgumentException("latencyMultiple must be >= 1.0, got " + latencyMultiple);
+        if (maxConsecutiveErrors < 1)
+            throw new IllegalArgumentException("maxConsecutiveErrors must be >= 1, got " + maxConsecutiveErrors);
+        if (windowRequests < 1)
+            throw new IllegalArgumentException("windowRequests must be >= 1, got " + windowRequests);
+        if (windowMs < 1)
+            throw new IllegalArgumentException("windowMs must be >= 1, got " + windowMs);
+        if (baselineRequests < 1)
+            throw new IllegalArgumentException("baselineRequests must be >= 1, got " + baselineRequests);
+        if (latencyFloorMs < 0)
+            throw new IllegalArgumentException("latencyFloorMs must be >= 0, got " + latencyFloorMs);
+
+        this.clock = clock;
+        this.max5xxRate = max5xxRate;
+        this.latencyMultiple = latencyMultiple;
+        this.maxConsecutiveErrors = maxConsecutiveErrors;
+        this.windowRequests = windowRequests;
+        this.windowMs = windowMs;
+        this.baselineRequests = baselineRequests;
+        this.latencyFloorMs = latencyFloorMs;
+    }
+
+    /**
+     * Report one issued request.
+     *
+     * {@code status} is the HTTP status, or 0 when {@code connectionError} is
+     * true -- a refused, reset or timed-out connection has no status, and
+     * {@code ms} is then time-to-failure rather than service latency.
+     *
+     * Synchronised because the send path can be driven from more than one Burp
+     * thread. These are microsecond operations over a 50-element deque, and an
+     * auto-halt computed from a torn window is worse than a slow one.
+     */
+    public synchronized void record(String host, int status, long ms, boolean connectionError) {
+        if (stop != null) return;                 // sticky: see the class comment
+        long nowUs = clock.nowUs();
+        Host h = hosts.computeIfAbsent(host, unused -> new Host(baselineRequests));
+
+        h.window.addLast(new Sample(nowUs, status, ms, connectionError));
+        evict(h, nowUs);
+
+        // Captured BEFORE this sample can complete the baseline. §4 takes the
+        // baseline from "that host's first 10 requests", so the tenth request
+        // establishes it and the eleventh is the first measured against it.
+        boolean baselineWasReady = h.baselineReady;
+
+        if (connectionError) {
+            h.consecutiveErrors++;
+            if (h.consecutiveErrors >= maxConsecutiveErrors) {
+                trip(host, h.consecutiveErrors + " consecutive connection errors");
+                return;
+            }
+        } else {
+            // A 503 is a RESPONSE: something answered, so the transport is up
+            // and the streak is broken. It still counts against the rate below.
+            h.consecutiveErrors = 0;
+            if (!h.baselineReady) {
+                h.firstLatencies[h.latencyCount++] = ms;
+                if (h.latencyCount == baselineRequests) {
+                    h.baselineMs = p50(Arrays.copyOf(h.firstLatencies, h.latencyCount));
+                    h.baselineReady = true;
+                }
+            }
+        }
+
+        // Fixed order, so the recorded reason is stable when more than one rule
+        // fires on the same request: transport first, then errors we are
+        // causing, then exhaustion we are causing.
+        if (tripOn5xxRate(host, h)) return;
+        if (baselineWasReady) tripOnLatency(host, h);
+    }
+
+    /**
+     * Both bounds, so the effective window is whichever is shorter. A sample
+     * exactly {@code windowMs} old is still inside it; one microsecond older is
+     * not, and DistressTest pins both sides of that edge.
+     *
+     * Eviction runs on record, so the window a rule sees is the window as of
+     * the request that provoked it -- which is the one the stop reason quotes.
+     */
+    private void evict(Host h, long nowUs) {
+        while (h.window.size() > windowRequests) h.window.removeFirst();
+        long cutoffUs = nowUs - windowMs * 1000L;
+        while (!h.window.isEmpty() && h.window.peekFirst().atUs() < cutoffUs) h.window.removeFirst();
+    }
+
+    /** @return true if this tripped the run. */
+    private boolean tripOn5xxRate(String host, Host h) {
+        int answered = 0, fivexx = 0;
+        for (Sample s : h.window) {
+            if (s.connectionError()) continue;     // no status: not this rule's evidence
+            answered++;
+            if (s.status() >= 500 && s.status() <= 599) fivexx++;
+        }
+        if (answered < baselineRequests) return false;
+        double rate = (double) fivexx / answered;
+        // "above 20%": exactly at the threshold is not above it.
+        if (rate <= max5xxRate) return false;
+        // Locale.ROOT: this string is written into run.stop_reason and read in
+        // a report. A JVM started under a comma-decimal locale would otherwise
+        // record "27,3%".
+        trip(host, String.format(Locale.ROOT,
+                "5xx rate %.1f%% over the last %d requests exceeds %.1f%%",
+                rate * 100.0, answered, max5xxRate * 100.0));
+        return true;
+    }
+
+    private void tripOnLatency(String host, Host h) {
+        long[] latencies = new long[h.window.size()];
+        int n = 0;
+        for (Sample s : h.window) if (!s.connectionError()) latencies[n++] = s.ms();
+        if (n == 0) return;
+        long p50 = p50(Arrays.copyOf(latencies, n));
+        // max(baselineMs, 1) keeps the arithmetic honest for a sub-millisecond
+        // baseline; the floor keeps the VERDICT honest for one. Both are needed:
+        // without the clamp a 0 ms baseline makes every threshold 0, and without
+        // the floor a 1 ms baseline makes 6 ms a distress signal.
+        double threshold = Math.max(h.baselineMs, 1L) * latencyMultiple;
+        if (p50 <= threshold || p50 < latencyFloorMs) return;
+        trip(host, String.format(Locale.ROOT,
+                "p50 latency %d ms over the last %d requests exceeds %.1fx the %d ms baseline",
+                p50, n, latencyMultiple, h.baselineMs));
+    }
+
+    /**
+     * Nearest-rank p50: the lower of the two middles for an even count, so the
+     * figure quoted in the stop reason is a latency that was actually observed
+     * and not an interpolation between two that were not.
+     */
+    private static long p50(long[] xs) {
+        long[] sorted = xs.clone();
+        Arrays.sort(sorted);
+        return sorted[(sorted.length - 1) / 2];
+    }
+
+    /**
+     * Written once and never overwritten. Nothing is logged and nothing is
+     * called out to: this object decides, and the Sender is what emits §6's
+     * unsolicited {@code halted} frame and marks the run aborted. Giving the
+     * policy core an I/O dependency is exactly what the split in §3 forbids.
+     */
+    private void trip(String host, String reason) {
+        stop = new Stop(reason, host);
+    }
+
+    /** Null while healthy; once tripped, why. One volatile read. */
+    public String stopReason() {
+        Stop s = stop;
+        return s == null ? null : s.reason();
+    }
+
+    /** Null while healthy; once tripped, the host that caused it. */
+    public String stopHost() {
+        Stop s = stop;
+        return s == null ? null : s.host();
+    }
+
+    /** The {@code window} field of §6's {@code halted} frame. */
+    public String window() {
+        return "last " + windowRequests + " requests or " + windowMs + " ms";
+    }
+
+    /** Test seam: the baseline p50 in milliseconds for {@code host}, or -1
+     *  while the first {@code baselineRequests} answered requests are still
+     *  being collected. -1 rather than 0 because 0 ms is a real baseline on
+     *  loopback. Package-private, and Distress is final, so it cannot escape
+     *  hx.policy; the boundary between "establishing" and "measured against"
+     *  has no other observable. */
+    synchronized long baselineMs(String host) {
+        Host h = hosts.get(host);
+        return (h == null || !h.baselineReady) ? -1 : h.baselineMs;
+    }
+
+    /** Test seam: how many samples the window holds for {@code host} after the
+     *  last record evicted by count and by age. */
+    synchronized int windowSize(String host) {
+        Host h = hosts.get(host);
+        return h == null ? 0 : h.window.size();
+    }
+}
+```
+
+- [ ] **Step 5: Run it and watch it pass**
+
+Run: `cd extension && ./test.sh`
+
+Expected: PASS. The `DistressTest` block ends `ALL PASS`, and these lines must
+be present — if `hx.policy.DistressTest` never made it into `test.sh`, the run
+is green having executed none of them:
+
+```
+  ok   the eleventh trips at 22.0% of a 50-sample window
+  ok   a sample exactly 60 s old is still in the window
+  ok   one microsecond past the edge and the nine are gone
+  ok   consistently slow is not distress
+```
+
+- [ ] **Step 6: Sabotage — prove each guard is guarded**
+
+This is the step that matters. Seven guards on the previous branch passed with
+the thing they guarded deleted, and a distress detector that never trips is
+indistinguishable from a healthy target right up until a client's application
+falls over. Apply each sabotage to `extension/src/hx/policy/Distress.java`, run
+`cd extension && ./test.sh`, confirm the named checks print `FAIL`, then
+`git checkout -- extension/src/hx/policy/Distress.java` before the next one.
+
+Each row below was measured, not predicted — the list is what actually printed
+`FAIL`, so a sabotage that produces a different set is itself a finding.
+
+| Sabotage | Must fail |
+|---|---|
+| `stopReason()` → `return null;` unconditionally | all eleven trip checks: `one 5xx over the threshold trips`, `the tenth 502 trips…`, `the tenth answered 5xx trips`, `the fifth in a row trips`, `the eleventh is`, `the eleventh makes the median slow…`, `300 ms against a 1 ms baseline…`, `the eleventh trips at 22.0%…`, `so the tenth 5xx trips`, `the tenth on one host trips the whole run`, `tripped` |
+| `if (rate <= max5xxRate)` → `if (rate < max5xxRate)` | `a 5xx rate of exactly 20% does not trip`, `40 healthy and 10 failing is exactly 20% and does not trip`, and — because tripping early changes which message is recorded — `one 5xx over the threshold trips`, `the eleventh trips at 22.0% of a 50-sample window` |
+| `if (p50 <= threshold …)` → `if (p50 < threshold …)` | `p50 at exactly 5x the baseline does not trip` |
+| delete `while (h.window.size() > windowRequests) …` from `evict` | `the window holds at most 50 samples`, `the eleventh trips at 22.0% of a 50-sample window` |
+| delete the `cutoffUs` loop from `evict` | `the eleventh is`, `one microsecond past the edge and the nine are gone`, `with one sample in the window there is no rate to trip on` |
+| `peekFirst().atUs() < cutoffUs` → `<= cutoffUs` | `a sample exactly 60 s old is still in the window`, `so the tenth 5xx trips` |
+| delete `h.consecutiveErrors = 0;` | `five answers is not ten…`, `the tenth answered 5xx trips`, `four, a success, then four more is not five in a row`, `a 503 breaks the connection-error streak` |
+| move `h.consecutiveErrors = 0;` into the `connectionError` branch | `the fifth in a row trips`, `the connection-error stop names the host` |
+| delete `if (stop != null) return;` from `record` | `a tripped Distress stops recording altogether` |
+| delete `boolean baselineWasReady` and call `tripOnLatency` unconditionally | `a 900 ms baseline is 900 ms`, `consistently slow is not distress`, `the tenth request is not itself measured against it` — the first two because an unready baseline is 0, so the clamped threshold is 5 ms and the very first 900 ms request trips |
+| delete `if (answered < baselineRequests) return false;` | thirteen checks, from `a single 502 does not abort the run` and `nine consecutive 502s still hold the gate` outward through most of the file: with no gate a single 5xx is a 100% rate, so nearly every case trips on its first failing sample |
+| delete `\|\| p50 < latencyFloorMs` | `20 ms against a 1 ms baseline is jitter, not distress` |
+| move `answered++` above the `continue` in `tripOn5xxRate` | `five answers is not ten, whatever the ten samples beside them are`, `the tenth answered 5xx trips` |
+| `p50` → `sorted[sorted.length / 2]` (upper median) | `ten slow samples still leave the median fast`, `the eleventh makes the median slow, and 501 ms is above 500 ms` |
+| delete every `throw new IllegalArgumentException` from the eight-argument constructor | all six checks in `aWindowThatCannotHoldASampleIsRefused` |
+
+The first row is the important one and it is worth running even if the rest are
+taken on trust: it is the shape of the failure this project has actually had —
+a green suite over a guard that no longer exists.
+
+- [ ] **Step 7: Run the whole suite**
+
+The plan's code blocks are byte-compared against the files they name, so a
+hand-edited block is a test failure rather than a note in a review.
+
+Run:
+```bash
+cd extension && ./test.sh && cd .. && .venv/bin/pytest tests/test_plan_matches_repo.py -q
+```
+Expected: `ALL PASS` from each Java class, then pytest green. If the
+`Distress.java` case fails, sync the plan block **from the file** — never the
+other way round.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add extension/src/hx/policy/Distress.java extension/test/hx/policy/DistressTest.java extension/test.sh
+git commit -m "feat(policy): auto-halt on target distress over a rolling per-host window"
+```
+
+---
+
+### Task 4: The Redactor — credentials never reach the blob store raw
+
+**Files:**
+- Create: `extension/src/hx/send/Redactor.java`
+- Create: `extension/test/hx/send/RedactorTest.java`
+- Modify: `extension/test.sh` — run the new test class
+
+**Interfaces:**
+- Consumes:
+  - `public record HxRequest(String method, String url, String host, String path, String query, Map<String, List<String>> headers, byte[] body)` — `hx.policy.HxRequest` from Task 1. Only `headers()` is read here; the redactor never looks at the URL or the body.
+- Produces:
+  - `hx.send.Redactor()` — no-arg. One instance per `Sender`.
+  - `void register(String identityId, int start, int end)` — records a half-open byte range `[start, end)` that the extension injected into the serialised request. Throws `RangeError` on a degenerate range or one overlapping a range already registered. **Nothing in this plan calls it**; the first caller is Plan 5's identity injection. See *What this task deliberately does not do* below before filing it as dead code.
+  - `String unmanagedCredential(HxRequest req)` — the header name **as the harness wrote it** for the first of `Authorization`, `Cookie`, `Proxy-Authorization` present, in that fixed order; `null` when none is. The `Sender` turns a non-null answer into error class `unmanaged_credential`, refuses issuance, and persists nothing.
+  - `byte[] redactRequest(byte[] raw)` — a new array with every registered range replaced by `{{identity:<id>:authz}}`. `raw` is never modified. Throws `RangeError` if a registered range runs past the end of `raw`. **Nothing in this plan calls it either**: Task 6's `Sender` redacts the response only, and no request bytes pass through it until Plan 5 has a range to substitute.
+  - `byte[] redactResponse(byte[] raw)` — a new array with every `Set-Cookie` **value** replaced by `{{observed:set-cookie}}`, cookie name and attributes kept. `raw` is never modified.
+  - `void clear()` — drops the registry. **Task 6 must call it from a `finally` in `Sender.issue`**, wrapping the whole decide-issue-redact body, so the registry cannot outlive the request on the deny paths or when something throws. In this plan that `finally` drops a registry that is always empty; it is written now so that Plan 5's first `register` call does not also have to remember to add it. Of `register`, `redactRequest` and `clear`, it is the only one with a caller in this plan — and that caller has nothing to drop.
+  - `public static final class Redactor.RangeError extends RuntimeException` — **not in the Interface Contract**, which lists methods, not exception types. **Task 6 must catch `Redactor.RangeError` in `Sender.issue` and answer with error class `bad_frame`** — the class the corrected contract gives a `send` frame whose content cannot be read, and a range that will not fit the bytes in hand says exactly that about the request it describes. Not `transport_error`: nothing was issued. §4, an exception is never an implicit allow, so the catch denies and the denial is reported like any other. Nothing on the send path can make it throw in this plan, because nothing there registers a range — only `RedactorTest` does, on purpose. The catch is written for Plan 5, and Plan 5's first registered range is the wrong moment to find out the send path has no answer for a bad one.
+
+**What this task deliberately does not do.** Two of this class's five methods have no
+caller anywhere in this plan: nothing calls `register`, and nothing calls
+`redactRequest`. Plan 5's identity injection is the first thing that registers a byte
+range, and until it does the registry is always empty, `redactRequest` would return a
+verbatim copy of every request, and no `RangeError` can reach the send path — only
+`RedactorTest` provokes one, deliberately. `clear()` does get a caller — Task 6's
+`Sender` clears in a `finally` — and it has an empty registry to drop. Only
+`unmanagedCredential` and `redactResponse` do live work on the send path this plan
+builds.
+
+That is the expected state rather than an oversight, and the test
+`anEmptyRegistryLeavesTheRequestVerbatim` pins it. The machinery ships now because §7
+calls it the one item that cannot be retrofitted: once raw credentials are
+content-addressed into the blob store they are in every backup taken since, so the
+class that keeps them out has to be right before the first exchange is stored, not when
+the first range is injected. Read the unreached methods that way, and read the
+`Sender`'s `finally` and its `RangeError` catch as the seams Plan 5 needs already in
+place, so that plan's change to the chokepoint is the injection and nothing else.
+Wiring the refusal into the send path belongs to the `Sender` task; this task produces
+the answer it acts on.
+
+- [ ] **Step 1: Write the failing test**
+
+Forty-eight checks, in the project's hand-rolled runner — `check(String, boolean)` and
+`expectThrows`, no JUnit, because this jar has no dependencies.
+
+```java
+// extension/test/hx/send/RedactorTest.java
+package hx.send;
+
+import hx.policy.HxRequest;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.*;
+
+/** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
+public class RedactorTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    static void expectThrows(String what, Class<?> type, Runnable body) {
+        try {
+            body.run();
+            check(what + " (expected " + type.getSimpleName() + ")", false);
+        } catch (Throwable t) {
+            check(what, type.isInstance(t));
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        anEmptyRegistryLeavesTheRequestVerbatim();
+        aRegisteredRangeBecomesTheIdentityPlaceholder();
+        theBytesOnTheWireAreNeverTouched();
+        twoRangesAreBothReplacedWhateverOrderTheyWereRegisteredIn();
+        overlappingRangesAreRefusedAndAbuttingOnesAreNot();
+        aRangePastTheEndIsRefusedNotTruncated();
+        degenerateRangesAreRefused();
+        clearDropsTheRegistry();
+        rangesAreNotSharedAcrossThreads();
+
+        anUnmanagedAuthorizationIsNamed();
+        credentialHeaderMatchingIsCaseInsensitive();
+        credentialDetectionSurvivesATurkishLocale();
+        theNamedHeaderDoesNotDependOnMapOrder();
+        aWholeNameMustMatchNotAPrefix();
+        aRequestWithoutACredentialHeaderIsNull();
+
+        setCookieValuesAreReplacedAndAttributesKept();
+        everySetCookieHeaderIsRedacted();
+        setCookieMatchingIsCaseInsensitive();
+        aDeletionCookieKeepsItsEmptyValue();
+        aCookiePairWithNoEqualsIsRedactedWhole();
+        aFoldedContinuationOfASetCookieIsRedacted();
+        theResponseBodyIsNeverRewritten();
+
+        redactionHappensBeforeHashing();
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    // ---- the injected-range registry ------------------------------------
+
+    static final String TOKEN = "eyJhbGciOiJIUzI1NiJ9.cHJvZC1zZXNzaW9u.9f2c";
+
+    static byte[] authRequest() {
+        return bytes("GET /orders?status=open HTTP/1.1\r\n"
+                   + "Host: app.example.test\r\n"
+                   + "Accept: application/json\r\n"
+                   + "Authorization: Bearer " + TOKEN + "\r\n"
+                   + "\r\n");
+    }
+
+    /** The range the extension would register for the request above: the
+     *  credential value only, so the header name and the structure around it
+     *  stay verbatim in the evidence. */
+    static int tokenStart(byte[] raw) { return find(raw, "Bearer " + TOKEN); }
+    static int tokenEnd(byte[] raw)   { return tokenStart(raw) + ("Bearer " + TOKEN).length(); }
+
+    static void anEmptyRegistryLeavesTheRequestVerbatim() {
+        // Nothing registers a range until identity injection ships. Until then
+        // this is the only path that runs, and it must be a no-op.
+        Redactor r = new Redactor();
+        byte[] raw = authRequest();
+        byte[] out = r.redactRequest(raw);
+        check("an empty registry returns the same bytes", Arrays.equals(out, raw));
+        check("an empty registry still returns a copy, not the wire array", out != raw);
+    }
+
+    static void aRegisteredRangeBecomesTheIdentityPlaceholder() {
+        Redactor r = new Redactor();
+        byte[] raw = authRequest();
+        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        String out = text(r.redactRequest(raw));
+        check("the injected range is replaced by the identity placeholder",
+              out.contains("Authorization: {{identity:ident-admin:authz}}\r\n"));
+        check("the credential is gone from the copy that crosses the bridge",
+              !out.contains(TOKEN));
+        check("everything around it is verbatim",
+              out.startsWith("GET /orders?status=open HTTP/1.1\r\nHost: app.example.test\r\n")
+              && out.endsWith("\r\n\r\n"));
+    }
+
+    static void theBytesOnTheWireAreNeverTouched() {
+        // §4: the request Burp issues is verbatim; only the copy crossing the
+        // bridge is substituted. An in-place edit would corrupt the exchange
+        // it exists to evidence -- and would do it AFTER the decision.
+        Redactor r = new Redactor();
+        byte[] raw = authRequest();
+        byte[] wire = raw.clone();
+        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        r.redactRequest(raw);
+        check("redactRequest does not modify its argument", Arrays.equals(raw, wire));
+    }
+
+    static void twoRangesAreBothReplacedWhateverOrderTheyWereRegisteredIn() {
+        Redactor r = new Redactor();
+        byte[] raw = bytes("POST /account HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Cookie: JSESSIONID=9C4A1F0E27B84D5FA3\r\n"
+                         + "Authorization: Bearer " + TOKEN + "\r\n"
+                         + "\r\nname=x");
+        // Registered LAST-first on purpose: the registry sorts, the caller
+        // does not have to.
+        int aStart = find(raw, "Bearer " + TOKEN);
+        r.register("ident-admin", aStart, aStart + ("Bearer " + TOKEN).length());
+        int cStart = find(raw, "JSESSIONID=9C4A1F0E27B84D5FA3");
+        r.register("ident-admin", cStart, cStart + "JSESSIONID=9C4A1F0E27B84D5FA3".length());
+        String out = text(r.redactRequest(raw));
+        check("both ranges are replaced",
+              out.contains("Cookie: {{identity:ident-admin:authz}}\r\n")
+              && out.contains("Authorization: {{identity:ident-admin:authz}}\r\n"));
+        check("the body after the last range survives", out.endsWith("\r\n\r\nname=x"));
+    }
+
+    static void overlappingRangesAreRefusedAndAbuttingOnesAreNot() {
+        // Overlap means the two ranges disagree about what those bytes are.
+        // Truncating or double-substituting either one produces bytes that
+        // were never sent, so the answer is a refusal.
+        Redactor r = new Redactor();
+        r.register("ident-admin", 10, 20);
+        expectThrows("a range overlapping an earlier one is refused",
+                     Redactor.RangeError.class, () -> r.register("ident-admin", 15, 25));
+        expectThrows("a range containing an earlier one is refused",
+                     Redactor.RangeError.class, () -> r.register("ident-b", 5, 30));
+        // [10,20) and [20,30) are two adjacent injected headers, not an overlap.
+        r.register("ident-b", 20, 30);
+        check("abutting ranges are accepted", true);
+    }
+
+    static void aRangePastTheEndIsRefusedNotTruncated() {
+        // Silently clamping would hand the bridge a request shorter than the
+        // one that was sent, and the evidence would be of a request nobody
+        // made.
+        Redactor r = new Redactor();
+        byte[] raw = authRequest();
+        r.register("ident-admin", raw.length - 4, raw.length + 40);
+        expectThrows("a range running past the end of the request is refused",
+                     Redactor.RangeError.class, () -> r.redactRequest(raw));
+    }
+
+    static void degenerateRangesAreRefused() {
+        Redactor r = new Redactor();
+        expectThrows("a negative start is refused",
+                     Redactor.RangeError.class, () -> r.register("ident-admin", -1, 5));
+        expectThrows("an empty range is refused",
+                     Redactor.RangeError.class, () -> r.register("ident-admin", 7, 7));
+        expectThrows("a reversed range is refused",
+                     Redactor.RangeError.class, () -> r.register("ident-admin", 9, 4));
+        expectThrows("a range with no identity is refused",
+                     Redactor.RangeError.class, () -> r.register("", 0, 5));
+    }
+
+    static void clearDropsTheRegistry() {
+        // The Sender clears in a finally. One request's offsets applied to the
+        // next request's bytes would blank out a span of somebody else's body.
+        Redactor r = new Redactor();
+        byte[] raw = authRequest();
+        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        r.clear();
+        check("after clear() the next request is verbatim",
+              Arrays.equals(r.redactRequest(raw), raw));
+    }
+
+    static void rangesAreNotSharedAcrossThreads() throws Exception {
+        Redactor r = new Redactor();
+        byte[] raw = authRequest();
+        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        byte[][] other = new byte[1][];
+        Thread t = new Thread(() -> other[0] = r.redactRequest(raw));
+        t.start();
+        t.join();
+        check("a range registered on one thread does not rewrite another thread's request",
+              Arrays.equals(other[0], raw));
+    }
+
+    // ---- fail closed on what we did not inject --------------------------
+
+    static HxRequest req(Map<String, List<String>> headers) {
+        return new HxRequest("GET", "https://app.example.test/orders", "app.example.test",
+                             "/orders", "status=open", headers, new byte[0]);
+    }
+
+    static void anUnmanagedAuthorizationIsNamed() {
+        Redactor r = new Redactor();
+        Map<String, List<String>> h = new LinkedHashMap<>();
+        h.put("Accept", List.of("application/json"));
+        h.put("Authorization", List.of("Bearer " + TOKEN));
+        check("an Authorization the extension did not inject is named",
+              "Authorization".equals(r.unmanagedCredential(req(h))));
+    }
+
+    static void credentialHeaderMatchingIsCaseInsensitive() {
+        Redactor r = new Redactor();
+        check("lower-case authorization is caught",
+              "authorization".equals(r.unmanagedCredential(
+                  req(Map.of("authorization", List.of("Bearer " + TOKEN))))));
+        check("mixed-case Cookie is caught",
+              "cOoKiE".equals(r.unmanagedCredential(
+                  req(Map.of("cOoKiE", List.of("JSESSIONID=9C4A1F0E27B84D5FA3"))))));
+        check("upper-case PROXY-AUTHORIZATION is caught",
+              "PROXY-AUTHORIZATION".equals(r.unmanagedCredential(
+                  req(Map.of("PROXY-AUTHORIZATION", List.of("Basic YWRtaW46aHVudGVyMg=="))))));
+    }
+
+    static void credentialDetectionSurvivesATurkishLocale() {
+        Redactor r = new Redactor();
+        Locale saved = Locale.getDefault();
+        try {
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"));
+            // Measured, not assumed: this is the fold that would break a
+            // toLowerCase()-based match, and it is why the matcher is ASCII.
+            check("tr_TR really does fold 'I' away from 'i'",
+                  !"AUTHORIZATION".toLowerCase().equals("authorization"));
+            check("credential detection survives a Turkish locale",
+                  "AUTHORIZATION".equals(r.unmanagedCredential(
+                      req(Map.of("AUTHORIZATION", List.of("Bearer " + TOKEN))))));
+        } finally {
+            Locale.setDefault(saved);
+        }
+    }
+
+    static void theNamedHeaderDoesNotDependOnMapOrder() {
+        // Same request, two iteration orders, one answer: the refusal detail
+        // is evidence and must read the same twice.
+        Redactor r = new Redactor();
+        Map<String, List<String>> cookieFirst = new LinkedHashMap<>();
+        cookieFirst.put("Cookie", List.of("JSESSIONID=9C4A1F0E27B84D5FA3"));
+        cookieFirst.put("Authorization", List.of("Bearer " + TOKEN));
+        Map<String, List<String>> authFirst = new LinkedHashMap<>();
+        authFirst.put("Authorization", List.of("Bearer " + TOKEN));
+        authFirst.put("Cookie", List.of("JSESSIONID=9C4A1F0E27B84D5FA3"));
+        check("Authorization wins whichever way the map iterates",
+              "Authorization".equals(r.unmanagedCredential(req(cookieFirst)))
+              && "Authorization".equals(r.unmanagedCredential(req(authFirst))));
+    }
+
+    static void aWholeNameMustMatchNotAPrefix() {
+        Redactor r = new Redactor();
+        Map<String, List<String>> h = new LinkedHashMap<>();
+        h.put("X-Cookie-Consent", List.of("all"));
+        h.put("Authorization-Info", List.of("nextnonce=42"));
+        check("a header merely containing a credential name is not one",
+              r.unmanagedCredential(req(h)) == null);
+    }
+
+    static void aRequestWithoutACredentialHeaderIsNull() {
+        Redactor r = new Redactor();
+        check("an ordinary request is not refused",
+              r.unmanagedCredential(req(Map.of("Accept", List.of("*/*")))) == null);
+        check("a request with no headers at all is not refused",
+              r.unmanagedCredential(req(Map.of())) == null);
+    }
+
+    // ---- response Set-Cookie --------------------------------------------
+
+    static final String SESSION = "9C4A1F0E27B84D5FA3";
+
+    static byte[] loginResponse() {
+        // A body whose second line is EXACTLY a Set-Cookie field, because that
+        // is what a page documenting cookies looks like -- and because a body
+        // that could never be mistaken for a header would not guard anything.
+        String body = "Cookies this app sets:\r\nSet-Cookie: sid=not-a-real-header\r\n";
+        return bytes("HTTP/1.1 302 Found\r\n"
+                   + "Date: Sat, 22 Aug 2026 09:14:03 GMT\r\n"
+                   + "Content-Type: text/html; charset=utf-8\r\n"
+                   + "Set-Cookie: JSESSIONID=" + SESSION
+                   + "; Path=/; HttpOnly; Secure; SameSite=Lax\r\n"
+                   + "Set-Cookie: csrf=8f14e45fceea167a5a36dedd4bea2543; Path=/; Secure\r\n"
+                   + "Location: https://app.example.test/dashboard\r\n"
+                   + "Content-Length: " + body.length() + "\r\n"
+                   + "\r\n" + body);
+    }
+
+    static void setCookieValuesAreReplacedAndAttributesKept() {
+        Redactor r = new Redactor();
+        byte[] raw = loginResponse();
+        byte[] wire = raw.clone();
+        String out = text(r.redactResponse(raw));
+        check("the cookie value is replaced",
+              out.contains("Set-Cookie: JSESSIONID={{observed:set-cookie}}; "
+                           + "Path=/; HttpOnly; Secure; SameSite=Lax\r\n"));
+        check("the live session cookie is gone", !out.contains(SESSION));
+        check("attributes survive, so cookie-flag checks still read",
+              out.contains("HttpOnly") && out.contains("Secure") && out.contains("SameSite=Lax"));
+        check("other headers are verbatim",
+              out.contains("Location: https://app.example.test/dashboard\r\n")
+              && out.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        check("redactResponse does not modify its argument", Arrays.equals(raw, wire));
+    }
+
+    static void everySetCookieHeaderIsRedacted() {
+        // A response sets several cookies at once, and the second one is as
+        // live as the first.
+        Redactor r = new Redactor();
+        String out = text(r.redactResponse(loginResponse()));
+        check("the second Set-Cookie is redacted too",
+              out.contains("Set-Cookie: csrf={{observed:set-cookie}}; Path=/; Secure\r\n"));
+        check("no cookie value survives anywhere in the head",
+              !out.contains("8f14e45fceea167a5a36dedd4bea2543"));
+    }
+
+    static void setCookieMatchingIsCaseInsensitive() {
+        Redactor r = new Redactor();
+        String out = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "set-cookie: sid=" + SESSION + "; Path=/\r\n"
+            + "SET-COOKIE: pref=dark\r\n"
+            + "\r\n")));
+        check("a lower-case set-cookie is redacted",
+              out.contains("set-cookie: sid={{observed:set-cookie}}; Path=/\r\n"));
+        check("an upper-case SET-COOKIE is redacted",
+              out.contains("SET-COOKIE: pref={{observed:set-cookie}}\r\n"));
+    }
+
+    static void aDeletionCookieKeepsItsEmptyValue() {
+        // A logout clears the cookie, and that is how a logout is DETECTED.
+        // An empty value cannot be a credential, and a placeholder here would
+        // read as an issuance.
+        Redactor r = new Redactor();
+        String out = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie: JSESSIONID=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/\r\n"
+            + "\r\n")));
+        check("a deletion cookie is left alone",
+              out.contains("Set-Cookie: JSESSIONID=; "
+                           + "Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/\r\n"));
+    }
+
+    static void aCookiePairWithNoEqualsIsRedactedWhole() {
+        // No name=value split to make, so every byte of the pair could be the
+        // value. Unknown means redact.
+        Redactor r = new Redactor();
+        String out = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie: " + SESSION + "; Path=/\r\n"
+            + "\r\n")));
+        check("a malformed cookie pair is redacted whole",
+              out.contains("Set-Cookie: {{observed:set-cookie}}; Path=/\r\n"));
+        check("its bytes do not survive", !out.contains(SESSION));
+    }
+
+    static void aFoldedContinuationOfASetCookieIsRedacted() {
+        // obs-fold is dead in RFC 9110 and no real server emits it, but if one
+        // does, the value can sit entirely on the folded line -- where a
+        // per-line matcher never looks, because the continuation has no name.
+        Redactor r = new Redactor();
+        String out = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie: sid=\r\n"
+            + "\t" + SESSION + "; Path=/\r\n"
+            + "Content-Length: 0\r\n"
+            + "\r\n")));
+        check("a value hidden on a folded continuation line does not survive",
+              !out.contains(SESSION));
+        check("the fold itself is preserved so the head still parses",
+              out.contains("\r\n\t{{observed:set-cookie}}\r\n"));
+        check("the header after the fold is untouched",
+              out.contains("Content-Length: 0\r\n"));
+    }
+
+    static void theResponseBodyIsNeverRewritten() {
+        // A body may legitimately contain the text "Set-Cookie:" -- API error
+        // dumps and documentation pages do -- and rewriting it corrupts the
+        // evidence a check reads.
+        Redactor r = new Redactor();
+        String out = text(r.redactResponse(loginResponse()));
+        check("a Set-Cookie inside the body is left verbatim",
+              out.endsWith("\r\n\r\nCookies this app sets:\r\n"
+                           + "Set-Cookie: sid=not-a-real-header\r\n"));
+    }
+
+    // ---- the ordering the blob store depends on -------------------------
+
+    /**
+     * The blob store is content-addressed: put() hashes the bytes it is given
+     * and stores them under that digest. So the bytes handed to it are the
+     * bytes kept, and redaction has to have happened already. Hash first and
+     * the digest names the raw bytes -- which is what a content-addressed
+     * store then keeps, in every backup taken since.
+     */
+    static void redactionHappensBeforeHashing() throws Exception {
+        Redactor r = new Redactor();
+        byte[] raw = authRequest();
+        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        byte[] crossingTheBridge = r.redactRequest(raw);
+
+        // A content-addressed store, in three lines, standing in for
+        // hx.store.blobs.BlobStore.put() -- same sha256 hex digest.
+        Map<String, byte[]> store = new HashMap<>();
+        store.put(sha256(crossingTheBridge), crossingTheBridge);
+
+        check("the raw bytes are not addressable in the store at all",
+              store.get(sha256(raw)) == null);
+        check("nothing under the digest a caller computes can be turned back "
+              + "into the credential",
+              !text(store.get(sha256(crossingTheBridge))).contains(TOKEN));
+        check("redacting changes the digest, so the raw bytes are not addressable",
+              !sha256(crossingTheBridge).equals(sha256(raw)));
+
+        // The other order, demonstrated rather than left as a claim: this is
+        // what the store holds if the send path hashes what it was given and
+        // redacts afterwards.
+        Map<String, byte[]> hashedFirst = new HashMap<>();
+        hashedFirst.put(sha256(raw), raw);
+        check("hashing first leaves the credential recoverable from the store",
+              text(hashedFirst.get(sha256(raw))).contains(TOKEN));
+    }
+
+    // ---- helpers ---------------------------------------------------------
+
+    static byte[] bytes(String s) { return s.getBytes(StandardCharsets.UTF_8); }
+    static String text(byte[] b)  { return new String(b, StandardCharsets.UTF_8); }
+
+    /** Char offset == byte offset only because every fixture above is ASCII;
+     *  a non-ASCII fixture would need a byte search instead. */
+    static int find(byte[] hay, String needle) {
+        int i = text(hay).indexOf(needle);
+        if (i < 0) throw new IllegalArgumentException("test data has no " + needle);
+        return i;
+    }
+
+    static String sha256(byte[] b) throws Exception {
+        StringBuilder s = new StringBuilder();
+        for (byte x : MessageDigest.getInstance("SHA-256").digest(b))
+            s.append(String.format("%02x", x));
+        return s.toString();
+    }
+}
+```
+
+Then add the class to the runner. **Append the line; do not paste a whole `test.sh`** —
+earlier tasks in this plan added their own `java -cp` lines and a pasted copy would
+delete them:
+
+```bash
+printf 'java -cp "build/test-classes:$MONTOYA" hx.send.RedactorTest\n' >> extension/test.sh
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL — javac stops with **53 errors**, all of them the same missing class:
+
+```
+test/hx/send/RedactorTest.java:81: error: cannot find symbol
+        Redactor r = new Redactor();
+        ^
+  symbol:   class Redactor
+  location: class RedactorTest
+```
+
+A compile failure is a weak red: it says nothing about whether any individual check
+would notice a broken guard. Step 5 is what establishes that, and it is not optional.
+
+- [ ] **Step 3: Write `Redactor.java`**
+
+```java
+// extension/src/hx/send/Redactor.java
+package hx.send;
+
+import hx.policy.HxRequest;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Credential redaction for the copy of an exchange that crosses the bridge.
+ *
+ * Three jobs, and they are three because a credential reaches disk by three
+ * different routes (§7):
+ *
+ *  1. What WE injected. The extension knows the exact byte range it wrote, so
+ *     it replaces that range with {@code {{identity:<id>:authz}}}. Byte ranges,
+ *     not header names: the range is known exactly, and a name match is a
+ *     guess. Nothing registers a range until identity injection ships; until
+ *     then the registry is empty and every request passes through unchanged.
+ *     It is built now anyway because §7 calls this the one item that cannot be
+ *     retrofitted -- once raw credentials are content-addressed into the blob
+ *     store they are in every backup taken since.
+ *
+ *  2. What we did NOT inject. {@link #unmanagedCredential} names an
+ *     Authorization, Cookie or Proxy-Authorization header the harness supplied
+ *     itself. The Sender refuses such a request with {@code
+ *     unmanaged_credential} and never persists it, which is what closes the
+ *     window before job 1 has anything to redact.
+ *
+ *  3. What the application handed BACK. A response Set-Cookie is a live
+ *     production session cookie the extension never injected, so job 1 cannot
+ *     key on it and job 2 cannot refuse it -- the request already went out.
+ *     Header-name matching is all there is, so cookie VALUES are replaced with
+ *     {@code {{observed:set-cookie}}} and the cookie name and its attributes
+ *     are kept, so session-fixation and cookie-flag checks still read.
+ *
+ * Redaction runs BEFORE hashing. The blob store is content-addressed: the
+ * digest names the bytes it was computed over, so hashing raw bytes and
+ * redacting afterwards stores the raw ones under their own digest.
+ *
+ * The bytes on the wire are never touched. redactRequest() and redactResponse()
+ * return a new array and leave their argument byte-for-byte as it was: the
+ * request Burp issues is verbatim, only the copy crossing the bridge carries
+ * placeholders. An in-place edit would corrupt the very exchange it is meant to
+ * evidence.
+ *
+ * No burp.* import, no I/O, no clock: this class is decided by its arguments
+ * alone and its tests need nothing running.
+ */
+public final class Redactor {
+
+    /**
+     * A registered range that cannot be applied to these bytes. Refusing is
+     * the only safe answer: a range that runs off the end, or over another,
+     * describes a request other than the one in hand, and applying it anyway
+     * would either truncate the request or blank out a span of somebody
+     * else's body.
+     *
+     * The send path catches this and answers with the error class
+     * {@code bad_frame} -- nothing has been issued at that point, and §4 says
+     * an exception is never an implicit allow.
+     */
+    public static final class RangeError extends RuntimeException {
+        public RangeError(String m) { super(m); }
+    }
+
+    /**
+     * The three credential headers §6 names, lower-cased for the ASCII match
+     * below, in the FIXED precedence order the refusal reports. A request may
+     * carry more than one; which one is named must not depend on the harness's
+     * map iteration order, or the same refusal reads differently twice.
+     */
+    private static final String[] CREDENTIAL_HEADERS = {
+        "authorization", "cookie", "proxy-authorization"
+    };
+
+    private static final byte[] OBSERVED_COOKIE =
+        "{{observed:set-cookie}}".getBytes(StandardCharsets.US_ASCII);
+
+    private record Range(String identityId, int start, int end) { }
+
+    /**
+     * Thread-confined, not shared. A range is a byte offset into ONE request;
+     * applied to another it does not merely leak, it substitutes a placeholder
+     * over whatever happens to sit at those offsets in the other request's
+     * body. Today the send path runs on the bridge's single read-loop thread,
+     * so a plain field would be correct -- but `limit.concurrency` is already
+     * in the configure body (§6), and the day it is honoured a shared registry
+     * corrupts evidence silently. clear() calls remove(), so a pooled thread
+     * carries nothing into its next task.
+     */
+    private final ThreadLocal<List<Range>> ranges = ThreadLocal.withInitial(ArrayList::new);
+
+    /**
+     * Record a half-open byte range [start, end) that this extension injected
+     * into the request bytes on behalf of {@code identityId}.
+     *
+     * Overlaps are rejected here, where the caller that made the mistake is
+     * still on the stack. Abutting ranges -- [10,20) and [20,30) -- are two
+     * adjacent injected headers and are fine.
+     */
+    public void register(String identityId, int start, int end) {
+        if (identityId == null || identityId.isEmpty())
+            throw new RangeError("a registered range must name an identity");
+        if (start < 0 || end <= start)
+            throw new RangeError("not a range: [" + start + "," + end + ")");
+        List<Range> mine = ranges.get();
+        for (Range r : mine)
+            if (start < r.end() && r.start() < end)
+                throw new RangeError("range [" + start + "," + end + ") overlaps ["
+                    + r.start() + "," + r.end() + ") registered for " + r.identityId());
+        mine.add(new Range(identityId, start, end));
+    }
+
+    /** Drop every registered range. The Sender calls this in a finally, so one
+     *  request's offsets can never be applied to the next one's bytes. */
+    public void clear() {
+        ranges.remove();
+    }
+
+    /**
+     * The name of a credential header this extension did not inject, or null.
+     *
+     * It answers about the request the HARNESS sent us, which is why no
+     * registered range is consulted: {@link HxRequest} is the frozen content
+     * of a `send` frame, injection happens downstream on the serialised bytes,
+     * and that is precisely why registered ranges are byte offsets rather than
+     * header names. So a credential header present HERE is by construction one
+     * we did not put there. The Sender's order is fixed by that: refuse on
+     * this answer first, then inject, then register, then redact.
+     *
+     * The value is not inspected. A header we did not inject is unmanaged
+     * whether or not this particular value looks like a credential, and a
+     * value-sniffing rule is the kind that gets fooled.
+     */
+    public String unmanagedCredential(HxRequest req) {
+        Map<String, List<String>> headers = req.headers();
+        if (headers == null) return null;
+        for (String wanted : CREDENTIAL_HEADERS)
+            for (Map.Entry<String, List<String>> e : headers.entrySet())
+                // The name as the harness wrote it, not the one we matched on:
+                // the refusal should quote what was actually sent.
+                if (asciiEqualsIgnoreCase(wanted, e.getKey())) return e.getKey();
+        return null;
+    }
+
+    /**
+     * The request bytes with every registered range replaced by that
+     * identity's placeholder. The argument is not modified.
+     */
+    public byte[] redactRequest(byte[] raw) {
+        List<Range> mine = new ArrayList<>(ranges.get());
+        // A copy even when there is nothing to do: the returned array must
+        // never alias the array that goes on the wire, or a later in-place
+        // fix-up to one silently edits the other.
+        if (mine.isEmpty()) return raw.clone();
+
+        mine.sort(Comparator.comparingInt(Range::start));
+        for (Range r : mine)
+            if (r.end() > raw.length)
+                throw new RangeError("range [" + r.start() + "," + r.end() + ") registered for "
+                    + r.identityId() + " runs past the " + raw.length + "-byte request");
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int at = 0;
+        for (Range r : mine) {
+            out.write(raw, at, r.start() - at);
+            out.writeBytes(("{{identity:" + r.identityId() + ":authz}}")
+                           .getBytes(StandardCharsets.UTF_8));
+            at = r.end();
+        }
+        out.write(raw, at, raw.length - at);
+        return out.toByteArray();
+    }
+
+    /**
+     * The response bytes with every Set-Cookie VALUE replaced, name and
+     * attributes kept. The argument is not modified.
+     *
+     * Only the head is scanned. A body may legitimately contain the text
+     * "Set-Cookie: sid=..." -- documentation pages and API error dumps do --
+     * and rewriting it would corrupt the evidence a check reads.
+     */
+    public byte[] redactResponse(byte[] raw) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int i = 0;
+        boolean first = true;
+        boolean inSetCookie = false;
+        while (i < raw.length) {
+            int next = lineStartAfter(raw, i);      // start of the following line
+            int content = contentEnd(raw, i, next); // this line without its CR/LF
+
+            if (content == i) {                     // the blank line: head is over
+                out.write(raw, i, raw.length - i);
+                return out.toByteArray();
+            }
+            if (first) {                            // the status line is not a field
+                first = false;
+                inSetCookie = false;
+                out.write(raw, i, next - i);
+                i = next;
+                continue;
+            }
+            if (raw[i] == ' ' || raw[i] == '\t') {
+                // obs-fold. RFC 9110 says a recipient must reject it and no
+                // real server emits it, but if one does, the folded remainder
+                // of a Set-Cookie is cookie bytes we cannot parse -- so the
+                // whole continuation goes, attributes included. Losing a
+                // folded attribute beats storing a folded session cookie.
+                if (inSetCookie) {
+                    int ws = i;
+                    while (ws < content && (raw[ws] == ' ' || raw[ws] == '\t')) ws++;
+                    out.write(raw, i, ws - i);
+                    out.writeBytes(OBSERVED_COOKIE);
+                    out.write(raw, content, next - content);
+                } else {
+                    out.write(raw, i, next - i);
+                }
+                i = next;
+                continue;
+            }
+            int colon = indexOf(raw, i, content, (byte) ':');
+            inSetCookie = colon > i && asciiEqualsIgnoreCase("set-cookie", raw, i, colon);
+            if (!inSetCookie) {
+                out.write(raw, i, next - i);
+                i = next;
+                continue;
+            }
+            out.write(raw, i, colon + 1 - i);       // "Set-Cookie:" as written
+            int v = colon + 1;
+            while (v < content && (raw[v] == ' ' || raw[v] == '\t')) v++;
+            out.write(raw, colon + 1, v - (colon + 1));   // the OWS, verbatim
+
+            int semi = indexOf(raw, v, content, (byte) ';');
+            int pairEnd = semi < 0 ? content : semi;
+            int eq = indexOf(raw, v, pairEnd, (byte) '=');
+            if (eq < 0) {
+                // No name=value split to make, so every byte of the pair is a
+                // candidate value. Unknown means redact.
+                out.writeBytes(OBSERVED_COOKIE);
+            } else if (eq + 1 == pairEnd) {
+                // "sid=" with nothing after it is a DELETION, and that is how
+                // a logout is detected. An empty value cannot be a credential,
+                // and a placeholder here would read as an issuance.
+                out.write(raw, v, pairEnd - v);
+            } else {
+                out.write(raw, v, eq + 1 - v);      // the cookie name and '='
+                out.writeBytes(OBSERVED_COOKIE);
+            }
+            out.write(raw, pairEnd, next - pairEnd); // attributes and the CRLF
+            i = next;
+        }
+        return out.toByteArray();
+    }
+
+    // ---- bytes ----------------------------------------------------------
+
+    /** Index just past this line's terminator, or raw.length. */
+    private static int lineStartAfter(byte[] raw, int from) {
+        for (int i = from; i < raw.length; i++) if (raw[i] == '\n') return i + 1;
+        return raw.length;
+    }
+
+    /** Index of the line's last content byte + 1: the terminator stripped,
+     *  whether it is CRLF or a bare LF, and neither is rewritten as the other. */
+    private static int contentEnd(byte[] raw, int from, int next) {
+        int e = next;
+        if (e > from && raw[e - 1] == '\n') e--;
+        if (e > from && raw[e - 1] == '\r') e--;
+        return e;
+    }
+
+    private static int indexOf(byte[] raw, int from, int to, byte b) {
+        for (int i = from; i < to; i++) if (raw[i] == b) return i;
+        return -1;
+    }
+
+    /**
+     * ASCII case folding, deliberately hand-rolled.
+     *
+     * Not {@code toLowerCase()}: that folds per the DEFAULT locale, and in
+     * tr_TR 'I' folds to 'ı' (U+0131), so "AUTHORIZATION" stops matching
+     * "authorization" -- a credential header missed because of the operator's
+     * locale. Burp runs in that locale, and RedactorTest pins the case.
+     *
+     * Not {@code equalsIgnoreCase} either, though that one IS locale-
+     * independent and would pass every test here: it folds the whole of
+     * Unicode, so "COOKIE" spelled with U+212A KELVIN SIGN equals "cookie"
+     * -- measured true on JDK 26. Inventing matches errs safe, but RFC 9110
+     * field names are ASCII, and a matcher that answers about bytes the wire
+     * cannot carry is one nobody can reason about.
+     */
+    private static boolean asciiEqualsIgnoreCase(String lower, String actual) {
+        if (actual == null || actual.length() != lower.length()) return false;
+        for (int i = 0; i < lower.length(); i++)
+            if (asciiLower(actual.charAt(i)) != lower.charAt(i)) return false;
+        return true;
+    }
+
+    private static boolean asciiEqualsIgnoreCase(String lower, byte[] raw, int from, int to) {
+        if (to - from != lower.length()) return false;
+        for (int i = 0; i < lower.length(); i++)
+            if (asciiLower((char) (raw[from + i] & 0xff)) != lower.charAt(i)) return false;
+        return true;
+    }
+
+    private static char asciiLower(char c) {
+        return (c >= 'A' && c <= 'Z') ? (char) (c + 32) : c;
+    }
+}
+```
+
+- [ ] **Step 4: Run it and watch it pass**
+
+Run: `cd extension && ./test.sh`
+
+Expected: PASS — every earlier test class still prints `ALL PASS`, and
+`hx.send.RedactorTest` prints 48 `ok` lines ending:
+
+```
+  ok   the raw bytes are not addressable in the store at all
+  ok   nothing under the digest a caller computes can be turned back into the credential
+  ok   redacting changes the digest, so the raw bytes are not addressable
+  ok   hashing first leaves the credential recoverable from the store
+ALL PASS
+```
+
+- [ ] **Step 5: Sabotage every guard, one at a time**
+
+Seven guards on the previous branch passed with the thing they guarded deleted, so a
+green suite is evidence about the suite until each guard has been watched to fail. Each
+row below is a single edit to `extension/src/hx/send/Redactor.java`. For each one: make
+the edit, run `cd extension && ./test.sh`, confirm **exactly** the named checks print
+`FAIL`, then `git checkout -- extension/src/hx/send/Redactor.java` before the next row.
+
+Every sabotage here compiles. A compile error would turn the whole run red and prove
+nothing about which check was watching.
+
+| # | The edit | Checks that must go red |
+|---|---|---|
+| A | `redactRequest`: insert `if (true) return raw.clone();` as its first line | the injected range is replaced by the identity placeholder · the credential is gone from the copy that crosses the bridge · both ranges are replaced · a range running past the end of the request is refused · the raw bytes are not addressable in the store at all · nothing under the digest a caller computes can be turned back into the credential · redacting changes the digest, so the raw bytes are not addressable |
+| B | `redactRequest`: `if (mine.isEmpty()) return raw.clone();` → `return raw;` | an empty registry still returns a copy, not the wire array |
+| C | `unmanagedCredential`: insert `if (true) return null;` as its first line | an Authorization the extension did not inject is named · lower-case authorization is caught · mixed-case Cookie is caught · upper-case PROXY-AUTHORIZATION is caught · credential detection survives a Turkish locale · Authorization wins whichever way the map iterates |
+| D | `asciiEqualsIgnoreCase(String, String)`: replace the body with `return actual != null && lower.equals(actual.toLowerCase());` | credential detection survives a Turkish locale |
+| E | `unmanagedCredential`: match with `e.getKey().toLowerCase(Locale.ROOT).contains(wanted)` | a header merely containing a credential name is not one |
+| F | `unmanagedCredential`: swap the two `for` lines so the header map is the outer loop | Authorization wins whichever way the map iterates |
+| G | `register`: delete the overlap loop and its `throw` | a range overlapping an earlier one is refused · a range containing an earlier one is refused |
+| H | `redactRequest`: replace the out-of-bounds `throw` with clamping `end` to `raw.length` | a range running past the end of the request is refused |
+| I | `clear`: delete `ranges.remove();` | after clear() the next request is verbatim |
+| J | `redactResponse`: insert `if (true) return raw.clone();` as its first line | the cookie value is replaced · the live session cookie is gone · the second Set-Cookie is redacted too · no cookie value survives anywhere in the head · a lower-case set-cookie is redacted · an upper-case SET-COOKIE is redacted · a malformed cookie pair is redacted whole · its bytes do not survive · a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
+| K | `redactResponse`: match the field name with `new String(raw, i, colon - i, US_ASCII).equals("Set-Cookie")` | a lower-case set-cookie is redacted · an upper-case SET-COOKIE is redacted |
+| L | `redactResponse`: after the first redacted line, write the remainder and return | the second Set-Cookie is redacted too · no cookie value survives anywhere in the head · an upper-case SET-COOKIE is redacted · a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
+| M | `redactResponse`: make the blank-line branch `continue` instead of writing the rest and returning | a Set-Cookie inside the body is left verbatim |
+| N | `redactResponse`: `} else if (eq + 1 == pairEnd) {` → `} else if (false) {` | a deletion cookie is left alone |
+| O | `redactResponse`: in the `eq < 0` branch, write `raw, v, pairEnd - v` instead of the placeholder | a malformed cookie pair is redacted whole · its bytes do not survive |
+| P | `redactResponse`: `if (inSetCookie) {` in the fold branch → `if (false) {` | a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
+| Q | `redactResponse`: last write of the loop → `out.write(raw, content, next - content);` | the cookie value is replaced · attributes survive, so cookie-flag checks still read · the second Set-Cookie is redacted too · a lower-case set-cookie is redacted · a deletion cookie is left alone · a malformed cookie pair is redacted whole |
+| R | the registry: replace the `ThreadLocal` with a plain `List<Range>` field (and `sharedRanges.clear()` in `clear()`) | a range registered on one thread does not rewrite another thread's request |
+
+Rows A and C are the two that matter most and they are the two to run first. A is the
+redaction itself: with it broken, the bytes a caller hands the blob store are the raw
+credential, and three separate checks say so. C is the fail-closed gate: with it broken,
+`unmanagedCredential` answers `null` for a request carrying a live production session
+cookie, and the `Sender` — once the `Sender` task wires it up — issues that request and
+persists it. The `Sender`'s own refusal is sabotaged in that task; here the requirement
+is that breaking the answer it depends on cannot pass this suite.
+
+- [ ] **Step 6: Run everything**
+
+```bash
+cd extension && ./test.sh
+cd .. && .venv/bin/pytest -q
+.venv/bin/pytest tests/test_plan_matches_repo.py -v
+```
+
+Expected: an `ALL PASS` line from every extension test class, `hx.send.RedactorTest`
+last among them, and a clean pytest run. The last command is run separately because
+`-q` hides the ids: `tests/test_plan_matches_repo.py` now byte-compares two more blocks
+instead of skipping them, and those two ids have to be seen to have stopped skipping:
+
+```
+tests/test_plan_matches_repo.py::test_plan_block_matches_the_file_it_names[2026-08-22-enforcement-send-path.md::extension/src/hx/send/Redactor.java] PASSED
+tests/test_plan_matches_repo.py::test_plan_block_matches_the_file_it_names[2026-08-22-enforcement-send-path.md::extension/test/hx/send/RedactorTest.java] PASSED
+```
+
+If either fails, sync the block in this plan **from** the file. Never the other way
+round.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add extension/src/hx/send/Redactor.java extension/test/hx/send/RedactorTest.java extension/test.sh
+git commit -m "feat(send): redact credentials before anything can hash them"
+```
+
+---
+
+### Task 5: `HaltSwitch` — the kill switch that works when the bridge does not
+
+**Files:**
+- Create: `extension/src/hx/send/HaltSwitch.java`
+- Create: `extension/test/hx/send/HaltSwitchTest.java`
+- Modify: `extension/src/hx/bridge/BridgeClient.java` — route `halt`/`resume` frames to a `HaltSink`
+- Modify: `extension/test/hx/bridge/BridgeClientTest.java` — two methods, called from `main`
+- Modify: `extension/test.sh` — run the new test class
+- Modify: `docs/superpowers/plans/2026-08-21-bridge-transport.md` — re-sync the two
+  full-file blocks this task's edits make stale (Step 12)
+- Test: `extension/test/hx/send/HaltSwitchTest.java`
+
+**Interfaces:**
+- Consumes:
+  - `hx.policy.Clock` — `long nowUs()` (Task 1). The only thing this class uses it for is
+    measuring how long ago the poller last answered; see `STALE_INTERVALS` below.
+  - `hx.policy.TickClock` — `TickClock(long us)`, `set(long)`, `advance(long)` (Task 2, test
+    tree). The staleness horizon is hit exactly on this clock rather than waited out.
+  - `hx.bridge.BridgeClient` (Plan 2) — its `handle()` switch, its `Log`, and `denyAll()`.
+    This task adds an arm's worth of code to two existing `case`s and nothing else.
+- Produces:
+  - `hx.send.HaltSwitch(Clock clock, Path sentinel, long pollIntervalMs)` — `start()`,
+    `stop()`, `haltedByFrame(String)`, `resumedByFrame()`, `halted()`, `reason()`,
+    exactly as the Interface Contract has them.
+  - `public static final long HaltSwitch.DEFAULT_POLL_MS = 500L` — **not in the Interface
+    Contract**, which lists methods, not constants. It is the §4 number the wiring task
+    should pass rather than inventing one.
+  - Package-private test seams, all inside `hx.send` and therefore invisible to the jar's
+    callers: `STALE_INTERVALS`, `pollOnce()`, `pollerAlive()`, `polls()`.
+  - `hx.bridge.BridgeClient.HaltSink` — `void halted(String reason)` / `void resumed()` —
+    and `BridgeClient.setHaltSink(HaltSink)`. Also not in the Interface Contract; it is
+    how the File Structure's "expose halt to `HaltSwitch`" is spelled.
+
+Two inputs, one flag. Both must be clear before issuance re-arms: a `resume` frame does
+not lift a sentinel file, and deleting the file does not lift a `halt` frame. The
+sentinel is the path that works when the bridge does not — an operator with a dead
+socket runs `touch` and issuance stops — so **presence of the name is the whole signal**,
+and **anything that stops the poller answering the question counts as halted**.
+Permissions, a vanished directory, a provider that closed underneath us: §4 as amended
+says unknown state is stop, and this is the class that has to mean it.
+
+**What this task deliberately leaves to Task 6.** `HxExtension` is Task 6's file and its
+code block there is byte-compared against the repo, so this task does not touch it. Task
+6 must install the sink next to the send handler it already installs, or `halt` frames
+reach `BridgeClient`'s own flag — which `Sender` never reads — and nothing stops:
+
+```java
+        c.setHaltSink(new BridgeClient.HaltSink() {
+            public void halted(String reason) { haltSwitch.haltedByFrame(reason); }
+            public void resumed()             { haltSwitch.resumedByFrame(); }
+        });
+```
+
+and it should construct the switch with `HaltSwitch.DEFAULT_POLL_MS`, not the `1000L`
+its draft currently passes.
+
+- [ ] **Step 1: Write the failing test**
+
+Sixty-three checks in the project's hand-rolled runner — `check(String, boolean)` and
+`expectThrows`, no JUnit, because this jar has no dependencies. A real file, a real
+poller, and every wait bounded at five seconds: a suite that hangs tells you nothing
+about which check was watching.
+
+```java
+// extension/test/hx/send/HaltSwitchTest.java
+package hx.send;
+
+import hx.policy.TickClock;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+/** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
+public class HaltSwitchTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    static void expectThrows(String what, Class<?> type, Runnable body) {
+        try {
+            body.run();
+            check(what + " (expected " + type.getSimpleName() + ")", false);
+        } catch (Throwable t) {
+            check(what, type.isInstance(t));
+        }
+    }
+
+    /** A precondition this uid cannot satisfy is not a pass. It prints on its
+     *  own line so a suite that skipped something cannot read as a clean one. */
+    static void skip(String what, String why) {
+        System.out.println("  SKIP " + what + " -- " + why);
+    }
+
+    /** An arbitrary but fixed wall time, in microseconds: every clock here is
+     *  moved by hand, so the absolute value only has to be plausible. */
+    static final long T0 = 1_787_355_131_378_277L;
+
+    public static void main(String[] args) throws Exception {
+        aFreshSwitchIsNotHalted();
+        aHaltFrameHaltsAndAResumeLiftsIt();
+        aHaltFrameWithNoReasonStillReportsOne();
+        anUnstartedSwitchDoesNotConsultTheSentinel();
+
+        aSentinelThatAlreadyExistsIsInForceBeforeStartReturns();
+        theSentinelIsPolledInBothDirections();
+        presenceIsTheSignalNotContent();
+
+        theTwoInputsAreIndependent();
+
+        anUnreadableSentinelIsHalted();
+        aSentinelOnAClosedFileSystemIsHaltedNotAnEscapedException();
+        thePollerSurvivesAFailedPollAndKeepsPolling();
+        aStalledPollerIsHalted();
+
+        thePollerIsADaemonAndDoesNotOutliveStop();
+        nothingPollsAfterStop();
+        startIsIdempotent();
+        stopIsSafeWhenNeverStartedAndNeverClearsAHalt();
+        stopThenStartPollsAgain();
+        aNonPositivePollIntervalIsRefused();
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    // ---- the frame input -------------------------------------------------
+
+    static void aFreshSwitchIsNotHalted() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltfresh");
+        try {
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), dir.resolve("halt"), 10L);
+            check("a fresh switch is not halted", !hs.halted());
+            check("and has no reason", hs.reason() == null);
+        } finally { rmTree(dir); }
+    }
+
+    static void aHaltFrameHaltsAndAResumeLiftsIt() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltframe");
+        try {
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), dir.resolve("halt"), 10L);
+            hs.haltedByFrame("operator pressed stop");
+            check("a halt frame halts issuance", hs.halted());
+            check("and the operator's words are the reason",
+                  "operator pressed stop".equals(hs.reason()));
+
+            hs.resumedByFrame();
+            check("a resume frame lifts a frame halt", !hs.halted());
+            check("and clears the reason with it", hs.reason() == null);
+        } finally { rmTree(dir); }
+    }
+
+    /** Sender prints reason() into the error frame. A null there costs the
+     *  operator the one line that says which of three kill paths fired. */
+    static void aHaltFrameWithNoReasonStillReportsOne() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltnoreason");
+        try {
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), dir.resolve("halt"), 10L);
+            hs.haltedByFrame(null);
+            check("a halt frame with no reason still halts", hs.halted());
+            check("and still reports a reason", hs.reason() != null && !hs.reason().isBlank());
+        } finally { rmTree(dir); }
+    }
+
+    /**
+     * start() is what arms the sentinel path, and HxExtension calls it before
+     * the bridge dials. A switch that polled from its constructor would be a
+     * thread started by a `new`, which no Sender unit test could avoid; a
+     * switch that answered "halted" merely because nobody had started it would
+     * make every one of those tests a false red. The seam is start(), and this
+     * pins which side of it the sentinel lives on.
+     */
+    static void anUnstartedSwitchDoesNotConsultTheSentinel() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltunstarted");
+        Path sentinel = dir.resolve("halt");
+        try {
+            Files.writeString(sentinel, "");
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 10L);
+            check("an unstarted switch has not looked at the sentinel", !hs.halted());
+            check("and has not started a poller", !hs.pollerAlive());
+            hs.start();
+            try {
+                check("start() is the seam that arms it", hs.halted());
+            } finally { hs.stop(); }
+        } finally { rmTree(dir); }
+    }
+
+    // ---- the sentinel input ----------------------------------------------
+
+    /**
+     * The operator halted the last run, then Burp restarted. The file is
+     * already there, and it must be in force before start() returns -- not one
+     * poll interval later, which is a window in which a standing halt reads as
+     * "issue away".
+     */
+    static void aSentinelThatAlreadyExistsIsInForceBeforeStartReturns() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltexisting");
+        Path sentinel = dir.resolve("halt");
+        try {
+            Files.writeString(sentinel, "");
+            // A one-minute interval: if this only passed because a background
+            // poll happened to land first, it would have to wait a minute for
+            // it, and the check runs immediately.
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 60_000L);
+            hs.start();
+            try {
+                check("a sentinel that already existed is in force when start() returns",
+                      hs.halted());
+                check("and the reason names the file",
+                      hs.reason() != null && hs.reason().contains(sentinel.toString()));
+            } finally { hs.stop(); }
+        } finally { rmTree(dir); }
+    }
+
+    /** The whole point of the file: an operator with a dead socket creates it
+     *  from a shell, and issuance stops without anything on the bridge. */
+    static void theSentinelIsPolledInBothDirections() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltpoll");
+        Path sentinel = dir.resolve("halt");
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 10L);
+        try {
+            hs.start();
+            check("not halted while the file is absent", !hs.halted());
+
+            Files.writeString(sentinel, "");
+            check("creating the file from outside the JVM halts issuance",
+                  awaitTrue(hs::halted));
+            check("and the reason says the sentinel is present",
+                  hs.reason() != null && hs.reason().contains("present"));
+
+            Files.delete(sentinel);
+            check("removing it lifts the sentinel halt", awaitTrue(() -> !hs.halted()));
+            check("and the reason goes with it", hs.reason() == null);
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    /**
+     * Presence of the NAME is the signal; the contents are never read. A
+     * dangling symlink is the case that separates the two readings -- with
+     * symlinks followed it resolves to an absent target and reads as "no
+     * halt", which is the wrong answer for something an operator put there
+     * deliberately. Measured: Files.exists() on that link is false.
+     */
+    static void presenceIsTheSignalNotContent() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltpresence");
+        try {
+            Path empty = dir.resolve("empty");
+            Files.writeString(empty, "");
+            check("an empty file is presence", haltedNow(empty));
+
+            Path asDir = Files.createDirectory(dir.resolve("asdir"));
+            check("a directory at the sentinel path is presence", haltedNow(asDir));
+
+            Path dangling = dir.resolve("dangling");
+            Files.createSymbolicLink(dangling, dir.resolve("nothing-here"));
+            check("a dangling symlink is presence, not absence", haltedNow(dangling));
+
+            check("and an absent path is still absence", !haltedNow(dir.resolve("nope")));
+        } finally { rmTree(dir); }
+    }
+
+    // ---- the two inputs are independent ----------------------------------
+
+    /**
+     * Both must be clear. A resume frame that re-armed issuance while the file
+     * was still there would let an agent lift a halt an operator placed by
+     * hand -- and the operator would have no way to know, since the file they
+     * are looking at is still on disk.
+     */
+    static void theTwoInputsAreIndependent() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltboth");
+        Path sentinel = dir.resolve("halt");
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 10L);
+        try {
+            Files.writeString(sentinel, "");
+            hs.start();
+            check("the sentinel alone halts", hs.halted());
+
+            hs.haltedByFrame("agent noticed a 500 storm");
+            check("both inputs in force", hs.halted());
+            check("the frame reason is the one reported while both hold",
+                  "agent noticed a 500 storm".equals(hs.reason()));
+
+            hs.resumedByFrame();
+            check("a resume does NOT re-arm while the sentinel file exists", hs.halted());
+            check("and the reason falls back to the sentinel",
+                  hs.reason() != null && hs.reason().contains("present"));
+
+            hs.haltedByFrame("still stopped");
+            Files.delete(sentinel);
+            // Wait for the poller to have SEEN the deletion. Asserting the
+            // moment after delete() passes before the poll that would break
+            // it has run -- measured: the first version of this check passed
+            // against a poller that cleared the frame halt on every absent
+            // sentinel.
+            long seen = hs.polls();
+            check("the poller observed the deletion", awaitTrue(() -> hs.polls() > seen + 1));
+            check("removing the file does NOT re-arm while a halt frame stands",
+                  hs.halted() && "still stopped".equals(hs.reason()));
+
+            hs.resumedByFrame();
+            check("only both together re-arm issuance", awaitTrue(() -> !hs.halted()));
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    // ---- unknown state is stop -------------------------------------------
+
+    /**
+     * A sentinel the poller is not allowed to stat. Files.exists() answers
+     * `false` here -- measured, on a 0000 directory: exists()==false AND
+     * notExists()==false, the API's way of saying it does not know -- and
+     * `false` means issue away. readAttributes throws instead, and every
+     * throw that is not NoSuchFileException means halted.
+     */
+    static void anUnreadableSentinelIsHalted() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltunreadable");
+        Path box = Files.createDirectory(dir.resolve("box"));
+        Path sentinel = box.resolve("halt");
+        try {
+            Files.writeString(sentinel, "");
+            Files.setPosixFilePermissions(box, PosixFilePermissions.fromString("---------"));
+            if (canStillRead(sentinel)) {
+                // root ignores the mode bits, and so would this check.
+                skip("an unreadable sentinel is halted",
+                     "this uid can stat a file inside a 0000 directory");
+                return;
+            }
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 60_000L);
+            hs.start();
+            try {
+                check("an unreadable sentinel is halted", hs.halted());
+                check("and the reason says so rather than guessing",
+                      hs.reason() != null && hs.reason().contains("unreadable"));
+            } finally { hs.stop(); }
+        } finally {
+            Files.setPosixFilePermissions(box, PosixFilePermissions.fromString("rwx------"));
+            rmTree(dir);
+        }
+    }
+
+    /**
+     * The failure that a narrowed catch would let through. ClosedFileSystem-
+     * Exception extends IllegalStateException -- a RuntimeException, NOT an
+     * IOException -- so `catch (IOException)` around the sentinel read lets it
+     * escape the poller entirely. The permissions case above cannot show that:
+     * AccessDeniedException IS an IOException, so it stays caught either way.
+     * Measured, both of them.
+     *
+     * A zip filesystem is the cheapest way to get a provider that closes under
+     * a live Path; the engagement directory is an ordinary one. What is being
+     * pinned is the CLASS of failure -- a filesystem call throwing something
+     * this file does not name -- which has opened three guards on this project
+     * already.
+     */
+    static void aSentinelOnAClosedFileSystemIsHaltedNotAnEscapedException() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltclosedfs");
+        Path zip = dir.resolve("engagement.zip");
+        try {
+            try (ZipOutputStream z = new ZipOutputStream(Files.newOutputStream(zip))) {
+                z.putNextEntry(new ZipEntry("halt"));
+                z.write("stop".getBytes(StandardCharsets.UTF_8));
+                z.closeEntry();
+            }
+            Path inside;
+            try (FileSystem fs = FileSystems.newFileSystem(zip, Map.of())) {
+                inside = fs.getPath("/halt");
+            }                                        // provider closed here
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), inside, 60_000L);
+            boolean threw = false;
+            try { hs.start(); } catch (Throwable t) { threw = true; }
+            try {
+                check("a sentinel on a closed filesystem does not throw out of start()", !threw);
+                check("a sentinel on a closed filesystem is halted", hs.halted());
+                check("and the sentinel read is what names it, not the outer net",
+                      hs.reason() != null && hs.reason().contains("unreadable"));
+            } finally { hs.stop(); }
+        } finally { rmTree(dir); }
+    }
+
+    /** A poll that failed must not kill the thread: the next one is how the
+     *  halt would ever lift. */
+    static void thePollerSurvivesAFailedPollAndKeepsPolling() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltrecover");
+        Path box = Files.createDirectory(dir.resolve("box"));
+        Path sentinel = box.resolve("halt");
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 10L);
+        try {
+            Files.setPosixFilePermissions(box, PosixFilePermissions.fromString("---------"));
+            if (canStillRead(sentinel)) {
+                skip("the poller survives a failed poll",
+                     "this uid can stat a file inside a 0000 directory");
+                return;
+            }
+            hs.start();
+            check("halted while the directory is unreadable", hs.halted());
+            check("and the poller is still alive after a failing poll", hs.pollerAlive());
+
+            long before = hs.polls();
+            check("and it keeps polling", awaitTrue(() -> hs.polls() > before + 1));
+
+            Files.setPosixFilePermissions(box, PosixFilePermissions.fromString("rwx------"));
+            check("and it recovers once the answer is readable again",
+                  awaitTrue(() -> !hs.halted()));
+        } finally {
+            hs.stop();
+            Files.setPosixFilePermissions(box, PosixFilePermissions.fromString("rwx------"));
+            rmTree(dir);
+        }
+    }
+
+    /**
+     * A poller that stopped answering is not a poller that answered "no". The
+     * thread can die on an Error, or block for good in a filesystem call on a
+     * hung mount; either way the last answer goes stale, and a stale answer to
+     * "is the operator holding the stop button" is not one. Driven on the
+     * injected clock, so the horizon is hit exactly rather than waited out.
+     */
+    static void aStalledPollerIsHalted() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltstale");
+        Path sentinel = dir.resolve("halt");
+        TickClock clock = new TickClock(T0);
+        // One minute between polls, so the background thread cannot refresh
+        // the poll clock underneath the assertions below.
+        HaltSwitch hs = new HaltSwitch(clock, sentinel, 60_000L);
+        try {
+            hs.start();
+            check("fresh after start(), with no file", !hs.halted());
+
+            clock.advance(60_000L * 1000L * HaltSwitch.STALE_INTERVALS);
+            check("exactly at the staleness horizon it is still trusted", !hs.halted());
+
+            clock.advance(1L);
+            check("one microsecond past it, a stalled poller is halted", hs.halted());
+            check("and says which of the three paths it is",
+                  hs.reason() != null && hs.reason().contains("stalled"));
+
+            hs.pollOnce();
+            check("a fresh answer clears the stall", !hs.halted());
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    // ---- the thread ------------------------------------------------------
+
+    /**
+     * A polling thread that outlives stop() keeps stat()ing a client's
+     * engagement directory after Burp thinks hx is gone.
+     *
+     * The interval is a full minute deliberately: a stop() that only worked
+     * because the thread was about to wake anyway would pass at 10ms and hang
+     * Burp's unload for a minute in production.
+     */
+    static void thePollerIsADaemonAndDoesNotOutliveStop() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltthread");
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), dir.resolve("halt"), 60_000L);
+        try {
+            hs.start();
+            Thread t = namedPoller();
+            check("start() runs a poller", t != null && hs.pollerAlive());
+            check("the poller is a daemon", t != null && t.isDaemon());
+
+            long t0 = System.nanoTime();
+            hs.stop();
+            long ms = (System.nanoTime() - t0) / 1_000_000L;
+            check("stop() ends the poller", !hs.pollerAlive());
+            check("and the thread itself is gone", t == null || !t.isAlive());
+            check("no hx-halt-sentinel thread is left behind", namedPoller() == null);
+            check("and stop() does not wait out the poll interval (" + ms + "ms)", ms < 1_000L);
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    /** The other half of "does not outlive stop()": not merely a dead Thread
+     *  object, but no more filesystem calls. */
+    static void nothingPollsAfterStop() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltquiet");
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), dir.resolve("halt"), 10L);
+        try {
+            hs.start();
+            long start = hs.polls();
+            check("the poller is polling before stop()", awaitTrue(() -> hs.polls() > start + 1));
+            hs.stop();
+            long after = hs.polls();
+            Thread.sleep(50);                        // five poll intervals
+            check("nothing polls after stop()", hs.polls() == after);
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    /**
+     * Two pollers answer correctly and leak a thread, which is the kind of
+     * defect that survives review.
+     *
+     * A minute between polls again: at 10ms an orphaned poller notices it has
+     * been replaced and exits before the count is taken, so the check passes
+     * against a switch that really did start two. Measured.
+     */
+    static void startIsIdempotent() throws Exception {
+        Path dir = Files.createTempDirectory("hxhalttwice");
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), dir.resolve("halt"), 60_000L);
+        try {
+            hs.start();
+            Thread first = namedPoller();
+            // Wait until the first poller is actually asleep between polls. A
+            // thread that has not run its first loop check yet retires itself
+            // the moment a second start() replaces it, which makes a switch
+            // that really did start two look like one. Measured.
+            check("the first poller is asleep between polls",
+                  awaitTrue(() -> first != null && first.getState() == Thread.State.TIMED_WAITING));
+            hs.start();
+            check("start() twice leaves exactly one poller", pollerCount() == 1);
+            hs.stop();
+            check("and one stop() ends it", pollerCount() == 0);
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    static void stopIsSafeWhenNeverStartedAndNeverClearsAHalt() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltstop");
+        Path sentinel = dir.resolve("halt");
+        try {
+            HaltSwitch never = new HaltSwitch(new TickClock(T0), sentinel, 10L);
+            never.stop();                            // must not throw
+            check("stop() on a switch that never started is a no-op", !never.halted());
+
+            Files.writeString(sentinel, "");
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 10L);
+            hs.start();
+            check("halted by the sentinel", hs.halted());
+            hs.stop();
+            check("stop() never clears a halt", hs.halted());
+            check("and the reason survives it too",
+                  hs.reason() != null && hs.reason().contains("present"));
+        } finally { rmTree(dir); }
+    }
+
+    static void stopThenStartPollsAgain() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltrestart");
+        Path sentinel = dir.resolve("halt");
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 10L);
+        try {
+            hs.start();
+            hs.stop();
+            Files.writeString(sentinel, "");
+            hs.start();
+            check("a stopped switch can be started again", hs.halted() && hs.pollerAlive());
+            check("and there is still only one poller", pollerCount() == 1);
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    /** Thread.sleep(0) does not sleep: it spins a core and stats the sentinel
+     *  millions of times a second. */
+    static void aNonPositivePollIntervalIsRefused() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltinterval");
+        try {
+            Path sentinel = dir.resolve("halt");
+            expectThrows("a zero poll interval is refused", IllegalArgumentException.class,
+                         () -> new HaltSwitch(new TickClock(T0), sentinel, 0L));
+            expectThrows("a negative poll interval is refused", IllegalArgumentException.class,
+                         () -> new HaltSwitch(new TickClock(T0), sentinel, -1L));
+        } finally { rmTree(dir); }
+    }
+
+    // ---- helpers ---------------------------------------------------------
+
+    interface Cond { boolean ok(); }
+
+    /** Bounded: five seconds, polled every millisecond. A test that waits for
+     *  a real poller must never wait forever -- a hung suite tells you nothing
+     *  about which check was watching. */
+    static boolean awaitTrue(Cond c) throws Exception {
+        long end = System.currentTimeMillis() + 5_000L;
+        while (System.currentTimeMillis() < end) {
+            if (c.ok()) return true;
+            Thread.sleep(1);
+        }
+        return c.ok();
+    }
+
+    /** One poll, on this thread, with no poller running: the sentinel's answer
+     *  for a path, isolated from timing entirely. */
+    static boolean haltedNow(Path sentinel) {
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 60_000L);
+        hs.pollOnce();
+        return hs.halted();
+    }
+
+    static boolean canStillRead(Path p) {
+        try {
+            Files.readAttributes(p, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    static Thread namedPoller() {
+        for (Thread t : Thread.getAllStackTraces().keySet())
+            if ("hx-halt-sentinel".equals(t.getName()) && t.isAlive()) return t;
+        return null;
+    }
+
+    static int pollerCount() {
+        int n = 0;
+        for (Thread t : Thread.getAllStackTraces().keySet())
+            if ("hx-halt-sentinel".equals(t.getName()) && t.isAlive()) n++;
+        return n;
+    }
+
+    static void rmTree(Path p) throws Exception {
+        if (Files.isDirectory(p, LinkOption.NOFOLLOW_LINKS))
+            try (var kids = Files.newDirectoryStream(p)) {
+                for (Path kid : kids) rmTree(kid);
+            }
+        Files.deleteIfExists(p);
+    }
+}
+```
+
+- [ ] **Step 2: Add the runner line**
+
+One line in `extension/test.sh`, after the `java` lines already there (Task 4 will have
+added `hx.send.RedactorTest` above it):
+
+```bash
+java -cp "build/test-classes:$MONTOYA" hx.send.HaltSwitchTest
+```
+
+The script's `javac` line already sweeps `$(find src test -name '*.java')`, so nothing
+else in it changes.
+
+- [ ] **Step 3: Run it and watch it fail**
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL — javac stops with **39 errors**, all of them the same missing class:
+
+```
+test/hx/send/HaltSwitchTest.java:79: error: cannot find symbol
+            HaltSwitch hs = new HaltSwitch(new TickClock(T0), dir.resolve("halt"), 10L);
+            ^
+  symbol:   class HaltSwitch
+  location: class HaltSwitchTest
+```
+
+A compile failure is a weak red: it says nothing about whether any individual check would
+notice a broken guard. Step 6 is what establishes that, and it is not optional.
+
+- [ ] **Step 4: Write `HaltSwitch.java`**
+
+```java
+// extension/src/hx/send/HaltSwitch.java
+package hx.send;
+
+import hx.policy.Clock;
+
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * The halted flag, fed by two independent inputs: `halt`/`resume` frames off
+ * the bridge, and a sentinel file polled on a background thread.
+ *
+ * The sentinel exists to work when the bridge does not (§4). An operator with
+ * a dead socket, a wedged harness, or an agent that has stopped answering can
+ * `touch` one path from a shell and stop issuance; nothing in Python, and
+ * nothing on the control channel, has to be alive for that to take effect.
+ * Its PRESENCE is the whole signal -- the file's contents are never read, so
+ * `touch`, `install`, a redirect, or an empty directory all work.
+ *
+ * The two inputs are independent and BOTH must be clear before issuance
+ * re-arms. A `resume` frame lifts the frame half only: the operator who
+ * created the sentinel by hand is not necessarily the agent that sent the
+ * resume, and re-arming on one of them is how a halt gets lifted by someone
+ * who never knew it was in force. Symmetrically, deleting the file does not
+ * lift a `halt` frame.
+ *
+ * **Unknown state is stop.** Every filesystem call here is treated as able to
+ * throw something this file does not name -- a permission error, a vanished
+ * mount, a provider whose FileSystem was closed underneath us -- and every one
+ * of those answers "halted". Only one specific outcome, NoSuchFileException,
+ * means "not halted", because it is the only one that actually answers the
+ * question. Three separate guards on this project have been opened by an
+ * exception from outside the repo escaping a catch clause that named the
+ * wrong type.
+ *
+ * No Montoya, no bridge types, no sockets: this class must keep working when
+ * everything around it has stopped.
+ */
+public final class HaltSwitch {
+
+    /**
+     * §4's kill switch is a path an operator uses during an incident, so the
+     * budget for "I created the file" to become "nothing is issuing" is human
+     * -- half a second, not a minute. At the production profile's single-digit
+     * req/s this bounds the requests issued after the file appears to a
+     * handful.
+     */
+    public static final long DEFAULT_POLL_MS = 500L;
+
+    /**
+     * A poller that has not answered in this many intervals is treated as
+     * halted: a thread that died, or is blocked in a filesystem call on a
+     * hung mount, leaves the last answer stale, and a stale answer to "is the
+     * operator holding the stop button" is not an answer. Five intervals
+     * (2.5s at the default) is long enough that an ordinary JVM pause inside
+     * Burp does not trip it and short enough that a dead poller cannot cover a
+     * whole run. It clears itself on the next successful poll, because the
+     * condition is "we do not know right now", not "something happened once".
+     */
+    static final long STALE_INTERVALS = 5L;
+
+    /**
+     * stop() runs on Burp's extension-unloading thread. A poller wedged in a
+     * filesystem call cannot be killed from inside the JVM, so the join is
+     * bounded: unloading the extension must not hang Burp. The state stays
+     * whatever it last was, which -- for a wedged poller -- is halted.
+     */
+    private static final long STOP_JOIN_MS = 2_000L;
+
+    private final Clock clock;
+    private final Path sentinel;
+    private final long pollIntervalMs;
+    private final long staleAfterUs;
+
+    /** A private monitor, not `this`: nothing outside can take it, so nothing
+     *  outside can deadlock the poller against stop(). */
+    private final Object lock = new Object();
+
+    /**
+     * Both inputs, and the poll clock, published through ONE reference.
+     *
+     * halted() and reason() are two calls and a change can land between them
+     * -- the bridge measured that straddle for epoch/scope and it is real here
+     * too. What one reference buys is that each ANSWER is coherent: reason()
+     * can never report a frame reason from a halt that has already been
+     * resumed, or a sentinel reason with sentinelHalted false. The one
+     * straddle left is halted()==true followed by reason()==null, which needs
+     * a resume to land in between -- and Sender answers it with an explicit
+     * fallback string rather than believing it was never halted.
+     */
+    private record State(boolean frameHalted, String frameReason,
+                         boolean sentinelHalted, String sentinelReason,
+                         boolean armed, long lastPollUs) { }
+
+    private volatile State state = new State(false, null, false, null, false, 0L);
+
+    /** The live poller, or null. Also the loop's own "am I still wanted"
+     *  token: a thread that is no longer this reference returns. */
+    private volatile Thread poller;
+
+    /** Completed polls. A test seam, not state: nothing here reads it. */
+    private final AtomicLong polls = new AtomicLong();
+
+    public HaltSwitch(Clock clock, Path sentinel, long pollIntervalMs) {
+        if (clock == null) throw new IllegalArgumentException("clock is required");
+        if (sentinel == null) throw new IllegalArgumentException("sentinel path is required");
+        if (pollIntervalMs <= 0)
+            // Thread.sleep(0) spins a core at 100% and polls the filesystem
+            // millions of times a second; a negative one throws from inside
+            // the loop, which would kill the poller outright.
+            throw new IllegalArgumentException("poll interval must be positive, got " + pollIntervalMs);
+        this.clock = clock;
+        this.sentinel = sentinel;
+        this.pollIntervalMs = pollIntervalMs;
+        this.staleAfterUs = pollIntervalMs * 1_000L * STALE_INTERVALS;
+    }
+
+    /**
+     * Look at the sentinel now, then keep looking on a daemon thread.
+     *
+     * The first poll runs on the CALLER's thread and completes before this
+     * returns, so a sentinel that already existed -- an operator halted the
+     * last run and Burp has just restarted -- is in force before anything can
+     * ask. A first poll left to the background thread would leave one poll
+     * interval in which a standing halt reads as "not halted".
+     *
+     * Idempotent: a second call while a poller is alive is a no-op rather than
+     * a second thread. Two pollers is a leak that answers correctly, which is
+     * the kind that survives review.
+     */
+    public void start() {
+        synchronized (lock) {
+            Thread live = poller;
+            if (live != null && live.isAlive()) return;
+            pollNow();
+            State s = state;
+            state = new State(s.frameHalted(), s.frameReason(),
+                              s.sentinelHalted(), s.sentinelReason(),
+                              true, s.lastPollUs());
+            Thread t = new Thread(this::pollLoop, "hx-halt-sentinel");
+            // Daemon: a polling thread that outlives the extension keeps a
+            // JVM alive and keeps stat()ing a client's engagement directory
+            // after Burp thinks hx is gone.
+            t.setDaemon(true);
+            poller = t;
+            t.start();
+        }
+    }
+
+    /**
+     * Stop polling. Never clears a halt: the last thing the poller learned
+     * stays in force, so unloading the extension cannot re-arm issuance.
+     */
+    public void stop() {
+        Thread t;
+        synchronized (lock) {
+            t = poller;
+            poller = null;                     // the loop's exit condition
+            State s = state;
+            // armed=false retires the staleness rule with the thread that fed
+            // it: a stopped switch is not a stalled one, and reporting a
+            // stopped extension as "poller stalled" would be a false reason on
+            // a true halt.
+            state = new State(s.frameHalted(), s.frameReason(),
+                              s.sentinelHalted(), s.sentinelReason(),
+                              false, s.lastPollUs());
+        }
+        if (t == null) return;
+        // Outside the monitor. The poller takes `lock` to publish, so a
+        // stop() that held it across the join would wait out STOP_JOIN_MS
+        // whenever the poller happened to be mid-publish -- and would then
+        // return with the thread still running. That is a narrow window rather
+        // than a certain deadlock (the poller is nearly always asleep, where
+        // the interrupt reaches it), which is exactly why no test would catch
+        // it and why the join goes here rather than two lines up.
+        t.interrupt();
+        try {
+            t.join(STOP_JOIN_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** A `halt` frame arrived. */
+    public void haltedByFrame(String reason) {
+        synchronized (lock) {
+            State s = state;
+            state = new State(true,
+                              reason == null || reason.isBlank()
+                                  ? "halted by frame, no reason given" : reason,
+                              s.sentinelHalted(), s.sentinelReason(),
+                              s.armed(), s.lastPollUs());
+        }
+    }
+
+    /**
+     * A `resume` frame arrived. Clears the frame half ONLY -- if the sentinel
+     * file is still there, this switch stays halted, and the operator who
+     * created it is the only one who can clear it.
+     */
+    public void resumedByFrame() {
+        synchronized (lock) {
+            State s = state;
+            state = new State(false, null,
+                              s.sentinelHalted(), s.sentinelReason(),
+                              s.armed(), s.lastPollUs());
+        }
+    }
+
+    /** True if EITHER input is in force, or if the poller has stopped
+     *  answering while armed. */
+    public boolean halted() {
+        State s = state;
+        return s.frameHalted() || s.sentinelHalted() || stale(s);
+    }
+
+    /** Why, or null when nothing is holding issuance. */
+    public String reason() {
+        State s = state;
+        if (s.frameHalted()) return s.frameReason();
+        if (s.sentinelHalted()) return s.sentinelReason();
+        if (stale(s))
+            // Deliberately does not read the clock again to print an age: a
+            // reason() that can throw turns a halt into an exception on the
+            // send path.
+            return "halt sentinel poller stalled: no answer in the last "
+                   + (staleAfterUs / 1000L) + "ms (poll interval " + pollIntervalMs + "ms)";
+        return null;
+    }
+
+    private boolean stale(State s) {
+        if (!s.armed()) return false;
+        try {
+            return clock.nowUs() - s.lastPollUs() > staleAfterUs;
+        } catch (Throwable t) {
+            // The clock is injected, so it is someone else's code. A clock we
+            // cannot read is a poll age we cannot compute, which is an unknown
+            // state, which is stop.
+            return true;
+        }
+    }
+
+    /** One look at the sentinel, publishing whatever it learned. Package-
+     *  private: HaltSwitchTest drives a single poll without a thread. */
+    void pollOnce() {
+        boolean present;
+        String why;
+        try {
+            // NOT Files.exists(). It answers `false` for a path it was not
+            // ALLOWED to look at -- measured: a sentinel inside a 0000
+            // directory gives Files.exists()==false, Files.notExists()==false
+            // -- and false here means "issue away". readAttributes throws
+            // instead, which is the only way to tell "no file" from "no
+            // answer".
+            //
+            // NOFOLLOW_LINKS because presence of the NAME is the signal: a
+            // dangling symlink is something an operator put there, and
+            // following it would report the absent TARGET as "no halt".
+            Files.readAttributes(sentinel, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            present = true;
+            why = "halt sentinel present: " + sentinel;
+        } catch (NoSuchFileException absent) {
+            // The one outcome that answers the question with "no".
+            present = false;
+            why = null;
+        } catch (Throwable t) {
+            // Everything else: AccessDeniedException, a vanished mount, a
+            // ClosedFileSystemException from a provider we do not control.
+            // We did not learn the state, so the state is halted.
+            present = true;
+            why = "halt sentinel unreadable, treating as halted: " + sentinel + ": " + t;
+        }
+        publishAnswer(present, why);
+    }
+
+    /** pollOnce() plus the outer net. The net is separate because pollOnce()
+     *  also reads an injected Clock and publishes, and neither of those is a
+     *  filesystem call its own catch clause covers. */
+    private void pollNow() {
+        try {
+            pollOnce();
+        } catch (Throwable t) {
+            publishFailure("halt sentinel poll failed, treating as halted: " + t);
+        }
+    }
+
+    /** Publish what a completed poll learned, and stamp the poll clock. */
+    private void publishAnswer(boolean present, String why) {
+        // Read the clock BEFORE taking the monitor: an injected clock that
+        // blocks must not hold up a halt frame arriving on another thread.
+        long now = clock.nowUs();
+        synchronized (lock) {
+            State s = state;
+            state = new State(s.frameHalted(), s.frameReason(), present, why, s.armed(), now);
+        }
+        polls.incrementAndGet();
+    }
+
+    /**
+     * Publish a poll that did not complete. Reads no clock: the injected Clock
+     * is one of the things that can have thrown to get here, and a reason
+     * string is worth more than a timestamp we could not take. The poll stamp
+     * is left where the last completed poll put it, so the staleness rule goes
+     * on measuring time since the last real ANSWER.
+     */
+    private void publishFailure(String why) {
+        synchronized (lock) {
+            State s = state;
+            state = new State(s.frameHalted(), s.frameReason(), true, why,
+                              s.armed(), s.lastPollUs());
+        }
+    }
+
+    private void pollLoop() {
+        // The condition is the exit that does not depend on an interrupt
+        // arriving. stop()'s interrupt is what ends the sleep in practice --
+        // measured: `while (true)` still passes the whole suite -- but a
+        // poller whose interrupt was consumed somewhere else still has to be
+        // able to leave.
+        while (poller == Thread.currentThread()) {
+            try {
+                Thread.sleep(pollIntervalMs);
+            } catch (InterruptedException e) {
+                // stop() interrupts to cut the sleep short. Restore the flag
+                // and leave; the state stop() published stands.
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (poller != Thread.currentThread()) return;
+            pollNow();
+        }
+    }
+
+    /** Test seam: is the poller thread still running? */
+    boolean pollerAlive() {
+        Thread t = poller;
+        return t != null && t.isAlive();
+    }
+
+    /** Test seam: completed polls, so a test can wait for one to have
+     *  happened rather than sleeping for an interval and hoping. */
+    long polls() { return polls.get(); }
+}
+```
+
+- [ ] **Step 5: Run it and watch it pass**
+
+Run: `cd extension && ./test.sh`
+
+Expected: PASS — every earlier test class still prints `ALL PASS`, and
+`hx.send.HaltSwitchTest` prints 63 `ok` lines. The whole class runs in about 0.2s: there
+is one 50ms sleep in it and nothing else waits unless something is broken.
+
+```
+  ok   a fresh switch is not halted
+  ok   and has no reason
+  ok   a halt frame halts issuance
+  ok   and the operator's words are the reason
+  ok   a resume frame lifts a frame halt
+  ok   and clears the reason with it
+  ok   a halt frame with no reason still halts
+  ok   and still reports a reason
+  ok   an unstarted switch has not looked at the sentinel
+  ok   and has not started a poller
+  ok   start() is the seam that arms it
+  ok   a sentinel that already existed is in force when start() returns
+  ok   and the reason names the file
+  ok   not halted while the file is absent
+  ok   creating the file from outside the JVM halts issuance
+  ok   and the reason says the sentinel is present
+  ok   removing it lifts the sentinel halt
+  ok   and the reason goes with it
+  ok   an empty file is presence
+  ok   a directory at the sentinel path is presence
+  ok   a dangling symlink is presence, not absence
+  ok   and an absent path is still absence
+  ok   the sentinel alone halts
+  ok   both inputs in force
+  ok   the frame reason is the one reported while both hold
+  ok   a resume does NOT re-arm while the sentinel file exists
+  ok   and the reason falls back to the sentinel
+  ok   the poller observed the deletion
+  ok   removing the file does NOT re-arm while a halt frame stands
+  ok   only both together re-arm issuance
+  ok   an unreadable sentinel is halted
+  ok   and the reason says so rather than guessing
+  ok   a sentinel on a closed filesystem does not throw out of start()
+  ok   a sentinel on a closed filesystem is halted
+  ok   and the sentinel read is what names it, not the outer net
+  ok   halted while the directory is unreadable
+  ok   and the poller is still alive after a failing poll
+  ok   and it keeps polling
+  ok   and it recovers once the answer is readable again
+  ok   fresh after start(), with no file
+  ok   exactly at the staleness horizon it is still trusted
+  ok   one microsecond past it, a stalled poller is halted
+  ok   and says which of the three paths it is
+  ok   a fresh answer clears the stall
+  ok   start() runs a poller
+  ok   the poller is a daemon
+  ok   stop() ends the poller
+  ok   and the thread itself is gone
+  ok   no hx-halt-sentinel thread is left behind
+  ok   and stop() does not wait out the poll interval (0ms)
+  ok   the poller is polling before stop()
+  ok   nothing polls after stop()
+  ok   the first poller is asleep between polls
+  ok   start() twice leaves exactly one poller
+  ok   and one stop() ends it
+  ok   stop() on a switch that never started is a no-op
+  ok   halted by the sentinel
+  ok   stop() never clears a halt
+  ok   and the reason survives it too
+  ok   a stopped switch can be started again
+  ok   and there is still only one poller
+  ok   a zero poll interval is refused
+  ok   a negative poll interval is refused
+ALL PASS
+```
+
+- [ ] **Step 6: Sabotage every guard, one at a time**
+
+Seven guards on the previous branch passed with the thing they guarded deleted, so a
+green suite is evidence about the suite until each guard has been watched to fail. Each
+row below is a single edit to `extension/src/hx/send/HaltSwitch.java`. For each one: make
+the edit, run `cd extension && ./test.sh`, confirm **exactly** the named checks print
+`FAIL`, then `git checkout -- extension/src/hx/send/HaltSwitch.java` before the next row.
+
+Every sabotage here compiles. A compile error would turn the whole run red and prove
+nothing about which check was watching.
+
+| # | The edit | Checks that must go red |
+|---|---|---|
+| A | `pollOnce`: replace the `Files.readAttributes(...)` line with `if (!Files.exists(sentinel, LinkOption.NOFOLLOW_LINKS)) throw new NoSuchFileException(sentinel.toString());` | an unreadable sentinel is halted · and the reason says so rather than guessing · halted while the directory is unreadable |
+| B | `pollOnce`: the last `catch (Throwable t)` → `catch (java.io.IOException t)` | and the sentinel read is what names it, not the outer net |
+| C | row B, **and** reduce `pollNow` to a bare `pollOnce();` with no catch | a sentinel on a closed filesystem does not throw out of start() · a sentinel on a closed filesystem is halted · and the sentinel read is what names it, not the outer net |
+| D | `pollOnce`: `catch (NoSuchFileException absent)` → `catch (java.io.IOException absent)` | an unreadable sentinel is halted · and the reason says so rather than guessing · halted while the directory is unreadable |
+| E | `resumedByFrame`: publish `new State(false, null, false, null, s.armed(), s.lastPollUs())` | a resume does NOT re-arm while the sentinel file exists · and the reason falls back to the sentinel |
+| F | `publishAnswer`: publish `new State(present && s.frameHalted(), present ? s.frameReason() : null, present, why, s.armed(), now)` | removing the file does NOT re-arm while a halt frame stands |
+| G | `start()`: delete the `pollNow();` line | and the reason names the file · not halted while the file is absent · and the reason says the sentinel is present · and the reason falls back to the sentinel · and the reason says so rather than guessing · and the sentinel read is what names it, not the outer net · fresh after start(), with no file · exactly at the staleness horizon it is still trusted · stop() never clears a halt · and the reason survives it too |
+| H | `stop()`: delete `t.interrupt();` | and the thread itself is gone · no hx-halt-sentinel thread is left behind · and stop() does not wait out the poll interval (2000ms) · start() twice leaves exactly one poller · and one stop() ends it · and there is still only one poller |
+| I | `start()`: delete `t.setDaemon(true);` | the poller is a daemon |
+| J | `start()`: delete `if (live != null && live.isAlive()) return;` | start() twice leaves exactly one poller · and one stop() ends it · and there is still only one poller |
+| K | `stale()`: `return clock.nowUs() - s.lastPollUs() > staleAfterUs;` → `return false;` | one microsecond past it, a stalled poller is halted · and says which of the three paths it is |
+| L | `pollOnce`: drop the `LinkOption.NOFOLLOW_LINKS` argument | a dangling symlink is presence, not absence |
+
+Rows A, C and D are the fail-closed rule and they are the three to run first. A is the
+trap the class exists to avoid: `Files.exists()` answers `false` for a sentinel it was
+not allowed to stat — measured, on a 0000 directory, `exists()` and `notExists()` are
+**both** false — and `false` means issue away. D is the same hole from the other side: an
+operator's `chmod` read as "no file". C is what a narrowed `catch` costs.
+
+Narrowing the catch is worth a paragraph, because the obvious experiment does not show
+it. `AccessDeniedException` **is** an `IOException`, so on the permissions case row B
+changes nothing an assertion can see: the outer net in `pollNow` still catches it, the
+switch is still halted, and only the wording of `reason()` moves. It takes a filesystem
+call that throws something outside `IOException` to show the difference, which is what
+the closed-filesystem check is for — `ClosedFileSystemException` extends
+`IllegalStateException`. With both layers narrowed (row C) it escapes `start()`
+altogether and the switch answers `halted() == false` for a sentinel it never managed to
+read. Both facts were measured, not assumed.
+
+Two edits do **not** show up in this suite, and it is better to know which than to
+believe the coverage is total:
+
+- `pollLoop`'s `while (poller == Thread.currentThread())` → `while (true)` still prints
+  `ALL PASS`. `stop()`'s interrupt is what ends the sleep in practice; the loop condition
+  is the exit that does not depend on an interrupt arriving, and row H is what happens
+  when one does not.
+- Moving `stop()`'s `t.interrupt(); t.join(...)` inside `synchronized (lock)` also still
+  passes. It only wedges when the poller is mid-publish, which no test can arrange
+  reliably; the comment in the file says exactly that rather than claiming a deadlock it
+  cannot demonstrate.
+
+- [ ] **Step 7: Write the failing test for the routing**
+
+The switch is only a switch if something flips it. `BridgeClient`'s own `halted` flag
+guards `maySend()` and `checkMaySend()`, and `Sender` calls neither — it asks
+`HaltSwitch` — so a `halt` frame that reaches only that flag stops nothing while both
+consoles read "halted".
+
+Add these two methods to `extension/test/hx/bridge/BridgeClientTest.java`, using its
+existing `check`, `live`, `waitUntil` and `Live` helpers:
+
+```java
+// added to extension/test/hx/bridge/BridgeClientTest.java, called from main()
+
+    /**
+     * A `halt` frame has to reach the switch the SEND PATH asks.
+     *
+     * BridgeClient's own `halted` flag guards maySend() and checkMaySend(),
+     * and Sender calls neither: it asks HaltSwitch. Wired up wrongly -- or not
+     * at all -- a halt frame would flip a flag nothing on the send path reads,
+     * both consoles would say "halted", and requests would keep going out. The
+     * failure has no other observable: maySend() answers false either way.
+     */
+    static void haltFramesReachTheSwitchTheSendPathAsks() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsink");
+        // Unstarted, so this test runs no poller thread: the sentinel half is
+        // HaltSwitchTest's business, and the frame half needs no clock -- an
+        // unarmed switch never reads one.
+        HaltSwitch hs = new HaltSwitch(() -> 0L, dir.resolve("halt"), 500L);
+        try (Live l = live(dir, "hs.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { hs.haltedByFrame(reason); }
+                public void resumed()             { hs.resumedByFrame(); }
+            });
+            check("the send path is not halted before the frame", !hs.halted());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "operator pressed stop"), new byte[0]));
+            l.out.flush();
+            waitUntil(hs::halted);
+            check("a halt frame halts the switch the send path asks", hs.halted());
+            check("and the operator's words arrive with it",
+                  "operator pressed stop".equals(hs.reason()));
+            check("and the client's own flag agrees", !l.client.maySend());
+
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !hs.halted());
+            check("a resume frame lifts it on the send path too", !hs.halted());
+            check("and the client is sending again", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("hs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A halt that could not be delivered is an unknown state, and unknown is
+     *  stop. Not "log it and carry on": the frame that was meant to stop
+     *  issuance went nowhere. */
+    static void aHaltSinkThatThrowsDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsinkthrows");
+        try (Live l = live(dir, "ht.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { throw new IllegalStateException("switch is gone"); }
+                public void resumed()             { }
+            });
+            check("configured before the undeliverable halt", l.client.maySend());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "operator pressed stop"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !l.client.isConfigured());
+            // isConfigured(), not maySend(): the local halt flag would answer
+            // maySend() false on its own, so a client that had merely logged
+            // the failure and carried on under the standing scope would pass a
+            // maySend() check. DENY-ALL means the scope went too.
+            check("a halt that could not be delivered drops to DENY-ALL",
+                  !l.client.isConfigured());
+            check("and the transition is logged", l.log.sawError("halt sink threw, deny-all"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("ht.sock")); Files.deleteIfExists(dir);
+        }
+    }
+```
+
+Add the import at the top of the file, above the `java.*` block:
+
+```java
+import hx.send.HaltSwitch;
+```
+
+and call both from `main`, after `aConfigureDoesNotLiftAHalt();`:
+
+```java
+            haltFramesReachTheSwitchTheSendPathAsks();
+            aHaltSinkThatThrowsDropsToDenyAll();
+```
+
+- [ ] **Step 8: Run it and watch it fail**
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL — javac stops with **2 errors**, one per anonymous sink:
+
+```
+test/hx/bridge/BridgeClientTest.java:578: error: cannot find symbol
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                                                 ^
+  symbol:   class HaltSink
+  location: class BridgeClient
+```
+
+- [ ] **Step 9: Route `halt` and `resume` through `BridgeClient`**
+
+Add these members to `extension/src/hx/bridge/BridgeClient.java`, immediately after the
+`Log` interface and before `private final Path socketPath;`:
+
+```java
+// extension/src/hx/bridge/BridgeClient.java -- new members, after the Log interface
+
+    /**
+     * Where `halt` and `resume` frames land: the switch the SEND PATH asks.
+     *
+     * HaltSwitch has the matching pair of methods but does not implement this
+     * interface -- hx.send must not take a compile-time dependency on the
+     * bridge for a two-method callback -- so HxExtension installs a delegating
+     * instance, in one place, before it dials.
+     */
+    public interface HaltSink {
+        void halted(String reason);
+        void resumed();
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile HaltSink haltSink;
+
+    /** Install the halt switch. Called before connect(): a client that goes
+     *  live with no sink routes halt frames to its own flag alone, and that
+     *  flag is not what Sender asks. */
+    public void setHaltSink(HaltSink s) { this.haltSink = s; }
+```
+
+Replace the `halt` and `resume` arms of `handle()` with these. The `resume` arm was a
+one-liner and is now a block:
+
+```java
+// extension/src/hx/bridge/BridgeClient.java -- the halt and resume arms of handle()
+
+            case "halt" -> {
+                String why = String.valueOf(f.header.get("reason"));
+                // The switch FIRST, this flag second. `halted` here governs
+                // maySend()/checkMaySend(); the send path asks HaltSwitch, and
+                // on the way DOWN the stricter authority is told first.
+                if (!notifyHalt(true, why)) return false;
+                halted.set(true);
+                haltReason = why;
+            }
+            case "resume" -> {
+                halted.set(false);
+                // ...and on the way back UP it is told last, so no window
+                // exists in which issuance is armed and the flag behind it is
+                // not. Only a `resume` frame reaches here: a `configure` does
+                // not lift a halt.
+                if (!notifyHalt(false, null)) return false;
+            }
+```
+
+And add `notifyHalt` just above `error(...)`:
+
+```java
+// extension/src/hx/bridge/BridgeClient.java -- new method, above error(...)
+
+    /**
+     * Hand a halt or a resume to the switch. Returns false when the read loop
+     * must drop to DENY-ALL and close.
+     *
+     * A sink that throws is the one case that cannot be shrugged off: the
+     * frame that was supposed to stop issuance did not arrive anywhere, and an
+     * exception is never an implicit allow. With no sink installed at all --
+     * the state before HxExtension wires one up -- the local flag is the whole
+     * answer, and nothing can be issued through a client that has no
+     * SendHandler either.
+     */
+    private boolean notifyHalt(boolean halt, String reason) {
+        HaltSink s = haltSink;
+        if (s == null) return true;
+        try {
+            if (halt) s.halted(reason); else s.resumed();
+            return true;
+        } catch (Throwable t) {
+            log.error("hx: halt sink threw, deny-all: " + t);
+            denyAll();
+            return false;
+        }
+    }
+```
+
+- [ ] **Step 10: Run it and watch it pass**
+
+Run: `cd extension && ./test.sh`
+
+Expected: PASS — `hx.bridge.BridgeClientTest` prints 68 `ok` lines now, ending:
+
+```
+  ok   the send path is not halted before the frame
+  ok   a halt frame halts the switch the send path asks
+  ok   and the operator's words arrive with it
+  ok   and the client's own flag agrees
+  ok   a resume frame lifts it on the send path too
+  ok   and the client is sending again
+  ok   configured before the undeliverable halt
+  ok   a halt that could not be delivered drops to DENY-ALL
+  ok   and the transition is logged
+ALL PASS
+```
+
+- [ ] **Step 11: Sabotage the routing**
+
+Three edits to `extension/src/hx/bridge/BridgeClient.java`, same procedure: edit, run
+`cd extension && ./test.sh`, confirm exactly the named checks go red, `git checkout --`
+the file.
+
+| # | The edit | Checks that must go red |
+|---|---|---|
+| M | `case "halt"`: delete the `if (!notifyHalt(true, why)) return false;` line | a halt frame halts the switch the send path asks · and the operator's words arrive with it · a halt that could not be delivered drops to DENY-ALL · and the transition is logged |
+| N | `case "resume"`: delete the `if (!notifyHalt(false, null)) return false;` line | a resume frame lifts it on the send path too |
+| O | `notifyHalt`: replace the catch body with `log.error("hx: halt sink threw: " + t); return true;` | a halt that could not be delivered drops to DENY-ALL · and the transition is logged |
+
+Row M is the whole point of the task: with it applied, the `halt` frame still flips
+`BridgeClient`'s own flag, `maySend()` still answers false, and the four checks that go
+red are the only thing distinguishing that from a send path that actually stopped. Row O
+is why the deny-all check asserts on `isConfigured()` rather than `maySend()` — the local
+flag would satisfy `maySend()` on its own, and a client that logged the failure and
+carried on under the standing scope would have passed.
+
+- [ ] **Step 12: Re-sync Plan 2's blocks for the two files this task changed**
+
+`tests/test_plan_matches_repo.py` walks **every** plan in `docs/superpowers/plans/`, not
+only this one, and matches a block by its first line — a `// path` marker naming a file.
+Plan 2, `2026-08-21-bridge-transport.md`, carries full-file blocks for
+`extension/src/hx/bridge/BridgeClient.java` and
+`extension/test/hx/bridge/BridgeClientTest.java`. Step 7 changed the test, Step 9 changed
+the client, so Plan 2 has been stale since Step 7 and pytest has been red since Step 7 —
+two failures naming `2026-08-21-bridge-transport.md`, each ending
+`Sync the plan from the file`. They are failures in the *previous* plan, which is exactly
+how they get waved through as somebody else's problem. They are this task's: this task
+wrote the drift, and nothing between here and Step 13 runs pytest, so this is the step
+that has to notice.
+
+Sync mechanically, from the file into the plan — never the other way round, and never by
+hand. Hand-editing a block is how a defect already fixed in the file gets transcribed
+back in from the plan, which is the history that put this test in the suite. Run from the
+repository root:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+
+# (plan, file) pairs this task made stale. The two Plan 2 blocks are the point
+# of the step; this plan's own two are here so that one command leaves every
+# block naming a file this task wrote in agreement with that file.
+PAIRS = [
+    ("docs/superpowers/plans/2026-08-21-bridge-transport.md",
+     "extension/src/hx/bridge/BridgeClient.java"),
+    ("docs/superpowers/plans/2026-08-21-bridge-transport.md",
+     "extension/test/hx/bridge/BridgeClientTest.java"),
+    ("docs/superpowers/plans/2026-08-22-enforcement-send-path.md",
+     "extension/src/hx/send/HaltSwitch.java"),
+    ("docs/superpowers/plans/2026-08-22-enforcement-send-path.md",
+     "extension/test/hx/send/HaltSwitchTest.java"),
+]
+
+for plan, path in PAIRS:
+    p = Path(plan)
+    text = p.read_text()
+    head = "```java\n// " + path + "\n"      # the marker line the test matches on
+    n = text.count(head)
+    assert n == 1, f"{plan}: {n} blocks marked {path}, expected 1"
+    start = text.index(head) + len(head)
+    end = text.index("\n```\n", start) + 1   # the newline before the closing fence
+    p.write_text(text[:start] + Path(path).read_text() + text[end:])
+    print("synced", plan, path)
+PY
+```
+
+The marker line stays; only the body under it is replaced. The `assert` is not
+decoration: without it, a marker matching zero blocks would make this a silent no-op and
+leave the suite red for a reason the next step's output would not explain, and a marker
+matching two would mean a block had been duplicated and only one copy would get fixed. Those two
+escape sequences inside the Python strings are backslash-n, not line breaks, so nothing
+in this block is itself a fence the matcher can see.
+
+Then `git diff --stat docs/`. Expect `2026-08-21-bridge-transport.md` in the diff, with
+both `BridgeClient` blocks changed. This plan's own file should *not* appear: Step 1 and
+Step 4 printed `HaltSwitchTest.java` and `HaltSwitch.java` verbatim, so syncing them is a
+no-op. If it does appear, the file on disk is the authority and the diff is the
+correction — read it, though, because it is also the diff that shows what got transcribed
+differently from what this plan says.
+
+- [ ] **Step 13: Run everything**
+
+```bash
+cd extension && ./test.sh
+cd .. && .venv/bin/pytest -q
+.venv/bin/pytest tests/test_plan_matches_repo.py -v
+cd extension && ./build.sh
+```
+
+Expected: an `ALL PASS` line from every extension test class, `hx.send.HaltSwitchTest`
+among them; a clean pytest run; and `built .../extension/build/hx-bridge.jar`. The
+plan-matching test is run separately because `-q` hides the ids, and **four** of them
+belong to this task — the two blocks this task added, which stop skipping now that the
+files exist, and the two Plan 2 blocks Step 12 re-synced, which were passing before this
+task and would be red without it:
+
+```
+tests/test_plan_matches_repo.py::test_plan_block_matches_the_file_it_names[2026-08-21-bridge-transport.md::extension/test/hx/bridge/BridgeClientTest.java] PASSED
+tests/test_plan_matches_repo.py::test_plan_block_matches_the_file_it_names[2026-08-21-bridge-transport.md::extension/src/hx/bridge/BridgeClient.java] PASSED
+tests/test_plan_matches_repo.py::test_plan_block_matches_the_file_it_names[2026-08-22-enforcement-send-path.md::extension/test/hx/send/HaltSwitchTest.java] PASSED
+tests/test_plan_matches_repo.py::test_plan_block_matches_the_file_it_names[2026-08-22-enforcement-send-path.md::extension/src/hx/send/HaltSwitch.java] PASSED
+```
+
+None of those four may read `SKIPPED`: a skip means the path in the marker names no file
+on disk — a typo in the marker, most likely — and a skipped case proves nothing. No total
+is quoted for the run, because the collected count moves with the tasks either side of
+this one: every block in the plan whose file does not exist yet skips, and Tasks 6 to 8
+own most of those.
+
+If one of the four fails, sync the block **from** the file with Step 12's script. Never
+the other way round, and never by hand. The three `BridgeClient` snippets in Step 9 are
+partial and their first lines deliberately do not end in `.java`, so `_blocks()` never
+yields them: no case is collected for them at all — not a `SKIPPED` one, none. The file
+is the authority for those, and Step 12 syncs the whole-file block that *is* collected.
+
+`build.sh` is run as well because `test.sh` only ever compiles into
+`build/test-classes`: building is the step that proves the manifest and the jar still
+assemble with the new class in them.
+
+- [ ] **Step 14: Commit**
+
+```bash
+git add extension/src/hx/send/HaltSwitch.java extension/test/hx/send/HaltSwitchTest.java \
+        extension/src/hx/bridge/BridgeClient.java \
+        extension/test/hx/bridge/BridgeClientTest.java extension/test.sh \
+        docs/superpowers/plans/2026-08-21-bridge-transport.md \
+        docs/superpowers/plans/2026-08-22-enforcement-send-path.md
+git commit -m "feat(send): HaltSwitch, the kill path that works when the bridge does not
+
+Two independent inputs, one flag: halt/resume frames off the bridge, and a
+sentinel file polled by a daemon thread (DEFAULT_POLL_MS is 500ms; the wiring
+task chooses). Both must be clear before
+issuance re-arms -- a resume does not lift a file an operator created by hand,
+and deleting the file does not lift a halt frame.
+
+Unreadable means halted. Files.exists() answers false for a sentinel inside a
+0000 directory (measured: exists() and notExists() are both false), so the
+poller reads attributes and treats every outcome except NoSuchFileException as
+halted, including the ones that are not IOException at all. A poller that stops
+answering for five intervals is halted too: unknown state is stop, and a stale
+answer is not an answer.
+
+halt frames now reach the switch the send path asks. They previously flipped
+only BridgeClient's own flag, which Sender does not read.
+
+Plan 2's blocks for BridgeClient and BridgeClientTest are re-synced from the
+two files in this same commit. tests/test_plan_matches_repo.py walks every plan
+in docs/superpowers/plans/, so the previous plan's copy of a file goes stale the
+moment a later plan edits that file, and a commit that changed the file without
+the block would leave the suite red for the next task to inherit."
+```
+
+The two plan files are in the same commit as the code they quote, not a tidy-up
+afterwards. A commit that edits `BridgeClient.java` and leaves Plan 2's block behind is a
+commit whose own test suite is red, and the next task starts by inheriting a failure it
+did not cause.
+
+---
+
+### Task 6: `Sender` — the chokepoint, and the structural test that keeps it one
+
+**Files:**
+- Create: `extension/src/hx/send/Http.java`
+- Create: `extension/src/hx/send/HttpReply.java`
+- Create: `extension/src/hx/send/Limits.java`
+- Create: `extension/src/hx/send/Sender.java`
+- Modify: `extension/src/hx/bridge/BridgeClient.java` — route `send` frames to a `SendHandler`, and expose the unsolicited `halted` frame
+- Modify: `extension/src/hx/HxExtension.java` — construct the pieces and the real Montoya `Http`
+- Modify: `extension/test.sh` — run the two new test classes
+- Modify: `docs/bridge-protocol.md` — the `send` frame's `engagement_id`, and the `result` frame's `config_epoch`
+- Modify: `docs/superpowers/plans/2026-08-21-bridge-transport.md` — re-sync the Plan 2 blocks this task edits
+- Test: `extension/test/hx/send/SenderTest.java`
+- Test: `extension/test/hx/ChokepointTest.java`
+- Test: `extension/test/hx/bridge/BridgeClientTest.java` (additions)
+
+**Interfaces:**
+- Consumes:
+  - `hx.policy.HxRequest(String method, String url, String host, String path, String query, Map<String,List<String>> headers, byte[] body)`
+  - `hx.policy.Decision(boolean allowed, String errorClass, String detail, long retryAfterUs)` with `allow()`, `deny(String,String)`, `rateLimited(long,String)`
+  - `hx.policy.Gate` — `Decision check(HxRequest req)`
+  - `hx.policy.Clock` — `long nowUs()`
+  - `hx.policy.TickClock(long us)` — `set(long)`, `advance(long)` (Task 2, test tree). Every time-dependent guard in this plan takes an injected clock so its boundaries can be hit exactly; this is the one the tests move by hand, and `SenderTest` uses it rather than rolling a third one.
+  - `hx.policy.Policy(Gate gate)` — `Decision decide(HxRequest req, BridgeClient.Authorisation auth)`
+  - `hx.policy.Limiter(Clock clock, long ratePerSecond, long maxRequests) implements Gate` — `check(HxRequest)`, `issued()`
+  - `hx.policy.Distress(Clock clock, double max5xxRate, double latencyMultiple, int maxConsecutiveErrors)` — `record(String,int,long,boolean)`, `stopReason()`, `stopHost()`, `window()`
+  - `hx.send.Redactor` — `unmanagedCredential(HxRequest)`, `redactResponse(byte[])`, `register`, `redactRequest`, `clear`, and `Redactor.RangeError`
+  - `hx.send.HaltSwitch(Clock clock, Path sentinel, long pollIntervalMs)` — `start()`, `stop()`, `halted()`, `reason()`, `haltedByFrame(String)`, `resumedByFrame()`, and `HaltSwitch.DEFAULT_POLL_MS` (500 ms), which is the interval this task passes rather than inventing one
+  - `hx.bridge.BridgeClient.Authorisation(long epoch, Map<String,List<String>> scope)`, `BridgeClient.authorisation()`, `BridgeClient.PROTOCOL_VERSION`
+  - `hx.bridge.BridgeClient.HaltSink` and `BridgeClient.setHaltSink(HaltSink)` (Task 5) — this task installs the sink, which is the only thing that connects a `halt` frame to the switch `Sender` asks
+  - `hx.bridge.ConfigBody.KEYS` — carries `limit.rate_rps` and `limit.max_requests`, which is why `Limits` can read them out of the scope map
+  - `hx.bridge.Frame`, `hx.bridge.Json` (the codec, for the reserved-key failsafe test)
+- Produces:
+  - `hx.send.Http` — `HttpReply send(HxRequest req, long deadlineUs) throws IOException`
+  - `hx.send.HttpReply(int status, byte[] raw, long ms, boolean connectionError)`
+  - `hx.send.Limits(Clock clock, long defaultRatePerSecond, long defaultMaxRequests) implements Gate` — `arm(BridgeClient.Authorisation)`, `check(HxRequest)`. The `Gate` `Policy` consults, built once from the engagement's configured `limit.rate_rps` / `limit.max_requests`.
+  - `hx.send.Sender(Policy policy, Redactor redactor, HaltSwitch halt, Distress distress, Http http, Clock clock)`
+  - `hx.send.Sender.issue(Map<String,Object> header, byte[] body, BridgeClient.Authorisation auth) -> Map<String,Object>`
+  - `hx.send.Sender.setHaltNotifier(BridgeClient.HaltNotifier)` — where the unsolicited `halted` frame is pushed from
+  - `hx.send.Sender.wireBytes(HxRequest) -> byte[]`, `Sender.portOf(HxRequest) -> int`, `Sender.secureOf(HxRequest) -> boolean` — the frame↔wire mapping, public and static so the Montoya adapter in `HxExtension` is three lines and the mapping itself is testable without Burp
+  - `hx.bridge.BridgeClient.SendHandler` — `Map<String,Object> handle(Map<String,Object> header, byte[] body, Authorisation auth)`; a `@FunctionalInterface`, so `HxExtension` installs it as a two-line lambda that arms the limits and delegates to `sender.issue`
+  - `hx.bridge.BridgeClient.setSendHandler(SendHandler)`
+  - `hx.bridge.BridgeClient.HaltNotifier` — `void halted(String reason, String host, String window)` — and `BridgeClient.haltNotifier()`, which frames `{v, t:"halted", reason, host, window}` and writes it down the socket. §6: auto-halt is extension-initiated, so there is no outstanding `id` to answer and without this frame an auto-halt is invisible until the next `send` fails.
+  - `hx.bridge.BridgeClient.BODY_KEY` — `"@body"`, the reserved map key under which a redacted response body rides from `Sender` to the framer
+
+**Error classes this task's send path emits.** Ten are §6's, and `halted` is the
+eleventh that the pinned decision order requires. Two more are emitted by this
+task for malformed input rather than by `Policy`, and they are refusals like any
+other — §4 says a denial is never silent — so Task 7's `SEND_PATH_ERROR_CLASSES`
+must carry them and `records.UNRECORDABLE` must give each a reason, even though
+neither produces a `denial` row:
+
+- `bad_frame` — a `send` with no `deadline_us`, a body with no request line, a
+  malformed request line or header line, a target that is not origin-form, or a
+  redaction range that does not fit the bytes it was registered against.
+- `engagement_mismatch` — a `send` naming an engagement this extension does not
+  serve. Refused in `BridgeClient` before the handler is called at all.
+
+---
+
+- [ ] **Step 1: Write the network seam — `Http` and `HttpReply`**
+
+Two tiny files, and the reason they exist is the whole task. `Sender` must be
+testable against something that **counts its calls**: "an error came back" and
+"the request never left the JVM" are different claims, and only the second one
+is §4's invariant.
+
+```java
+// extension/src/hx/send/Http.java
+package hx.send;
+
+import hx.policy.HxRequest;
+
+import java.io.IOException;
+
+/**
+ * The extension's entire reach to the network, in one method.
+ *
+ * It is an interface so that Sender can be driven by a fake that RECORDS ITS
+ * CALLS. Every denial in this package is asserted as "the fake Http was called
+ * zero times", not as "an error map came back" -- a Sender that called Montoya
+ * directly could only ever be tested for the second, and spec s4 is about the
+ * first.
+ *
+ * The single implementation that touches Burp is built in HxExtension, which
+ * is also the only file in extension/src allowed to name burp.* at all.
+ * ChokepointTest counts both facts.
+ */
+public interface Http {
+
+    /**
+     * Issue {@code req} and return what came back.
+     *
+     * @param deadlineUs absolute microseconds since epoch, straight from the
+     *   send frame. An implementation should cap its own wait at the time
+     *   remaining, but that is an optimisation: Sender re-reads the clock after
+     *   this returns and answers `timeout` on its own account, so the deadline
+     *   holds even if the transport ignores it.
+     * @throws IOException the request could not be issued at all. Sender turns
+     *   this into `transport_error` and feeds it to Distress as a connection
+     *   error, which is one of the three auto-halt conditions in spec s4.
+     */
+    HttpReply send(HxRequest req, long deadlineUs) throws IOException;
+}
+```
+
+```java
+// extension/src/hx/send/HttpReply.java
+package hx.send;
+
+/**
+ * What one issuance produced.
+ *
+ * `connectionError` is not derivable from `status`, which is why it is a field
+ * rather than a convention. Montoya answers a request that never got a
+ * response with a response-less HttpRequestResponse rather than throwing, so
+ * without this flag a dead host arrives as status 0 -- and Distress would count
+ * status 0 as a perfectly good non-5xx reply. Spec s4 stops a run on FIVE
+ * CONSECUTIVE connection errors; five status-0 replies are nothing at all.
+ *
+ * `raw` is the response exactly as it came off the wire, before redaction.
+ * Sender redacts it; nothing else may hold onto it.
+ */
+public record HttpReply(int status, byte[] raw, long ms, boolean connectionError) { }
+```
+
+- [ ] **Step 2: Write the failing test — `SenderTest`**
+
+The two assertions that matter are in `denied(...)`: every denial class must
+produce an error map **and** leave `FakeHttp.calls` at zero.
+
+```java
+// extension/test/hx/send/SenderTest.java
+package hx.send;
+
+import hx.bridge.BridgeClient;
+import hx.bridge.Json;
+import hx.policy.Decision;
+import hx.policy.Distress;
+import hx.policy.Gate;
+import hx.policy.HxRequest;
+import hx.policy.Policy;
+import hx.policy.TickClock;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
+public class SenderTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    /** A fixed wall-clock instant in microseconds. Real value, not a round
+     *  number: deadline arithmetic that only works on round numbers is a bug
+     *  waiting for a Tuesday. */
+    static final long NOW = 1_787_355_131_378_277L;
+    static final long THIRTY_SECONDS = 30_000_000L;
+
+    public static void main(String[] args) throws Exception {
+        Path dir = Files.createTempDirectory("hxsend");
+        Path sentinel = dir.resolve("halt");          // deliberately absent
+        try {
+            anAllowedRequestIsIssuedOnceAndFramedAsAResult(sentinel);
+            everyDenialClassLeavesTheWireUntouched(sentinel);
+            theRefusalOrderIsPinned(sentinel);
+            rateLimitedCarriesRetryAfterUs(sentinel);
+            anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget(sentinel);
+            aDeadlineThatExpiresMidFlightIsReportedAsTimeout(sentinel);
+            aTransportFailureFeedsDistressAndHaltsTheNextSend(sentinel);
+            distressPushesOneUnsolicitedHaltedFrame(sentinel);
+            oneRequestsInjectedRangesNeverSurviveIntoTheNext(sentinel);
+            theResultIsStampedWithTheEpochThatAuthorisedIt(sentinel);
+            theResponseBodyRidesUnderAKeyJsonRefusesToWrite(sentinel);
+            theWireMappingRoundTripsWhatItParsed();
+            theConfiguredLimitsArmTheGateOnceFromTheAuthorisation();
+        } finally {
+            Files.deleteIfExists(sentinel);
+            Files.deleteIfExists(dir);
+        }
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    // ---- doubles -------------------------------------------------------
+
+    // The clock is hx.policy.TickClock, the one Task 2 put in the test tree
+    // for exactly this: every guard in this plan that owns time takes an
+    // injected Clock so its boundaries can be hit AT the microsecond instead
+    // of approached with a sleep, and one such clock for the whole suite means
+    // one set of semantics for `advance`.
+
+    /** The point of the whole task: it counts. */
+    static final class FakeHttp implements Http {
+        int calls = 0;
+        HxRequest last;
+        HttpReply reply = new HttpReply(200, RESPONSE, 12L, false);
+        IOException boom = null;
+        long advanceUsPerCall = 0;
+        TickClock clock;
+
+        public HttpReply send(HxRequest req, long deadlineUs) throws IOException {
+            calls++;
+            last = req;
+            if (clock != null) clock.advance(advanceUsPerCall);
+            if (boom != null) throw boom;
+            return reply;
+        }
+    }
+
+    /** Records the unsolicited `halted` frames Sender pushes. Auto-halt has no
+     *  outstanding id to answer, so this is the only evidence that it told
+     *  anyone -- and how many times it told them. */
+    static final class RecordingNotifier implements BridgeClient.HaltNotifier {
+        final List<String[]> frames = new ArrayList<>();
+        public void halted(String reason, String host, String window) {
+            frames.add(new String[] { reason, host, window });
+        }
+    }
+
+    /** Counts too. A request refused before the Gate must cost no rate token
+     *  and no budget slot -- the Limiter's check() has a side effect. */
+    static final class CountingGate implements Gate {
+        int calls = 0;
+        Decision verdict = Decision.allow();
+        public Decision check(HxRequest req) { calls++; return verdict; }
+    }
+
+    /** One Sender and every double it was built from. */
+    static final class Rig {
+        final TickClock clock = new TickClock(NOW);
+        final CountingGate gate = new CountingGate();
+        final FakeHttp http = new FakeHttp();
+        final Redactor redactor = new Redactor();
+        final RecordingNotifier notifier = new RecordingNotifier();
+        final HaltSwitch halt;
+        final Distress distress;
+        final Sender sender;
+
+        Rig(Path sentinel, int maxConsecutiveErrors) {
+            http.clock = clock;
+            // start() is deliberately NOT called: the sentinel poller is
+            // HaltSwitch's own test's business, and a background thread in
+            // here would make these assertions time-dependent.
+            halt = new HaltSwitch(clock, sentinel, HaltSwitch.DEFAULT_POLL_MS);
+            // The spec s4 production defaults: 20% 5xx, 5x baseline latency.
+            distress = new Distress(clock, 0.20, 5.0, maxConsecutiveErrors);
+            sender = new Sender(new Policy(gate), redactor, halt, distress, http, clock);
+            sender.setHaltNotifier(notifier);
+        }
+
+        Rig(Path sentinel) { this(sentinel, 5); }
+    }
+
+    // ---- fixtures ------------------------------------------------------
+
+    static final byte[] RESPONSE = ("HTTP/1.1 200 OK\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Set-Cookie: session=9f1c4a2e7b; Path=/; HttpOnly; Secure\r\n"
+            + "Content-Length: 15\r\n"
+            + "\r\n"
+            + "{\"orders\":[42]}").getBytes(StandardCharsets.ISO_8859_1);
+
+    static Map<String, Object> sendHeader(long deadlineUs) {
+        Map<String, Object> h = new LinkedHashMap<>();
+        h.put("v", 1L);
+        h.put("t", "send");
+        h.put("id", 41L);
+        h.put("deadline_us", deadlineUs);
+        h.put("engagement_id", "e-1");
+        h.put("identity_id", null);
+        h.put("target_host", "app.example.test");
+        h.put("target_port", 443L);
+        h.put("tls", true);
+        return h;
+    }
+
+    static byte[] request(String method, String target, String... nameThenValue) {
+        StringBuilder s = new StringBuilder();
+        s.append(method).append(' ').append(target).append(" HTTP/1.1\r\n");
+        s.append("Host: app.example.test\r\n");
+        s.append("User-Agent: hx/0.1\r\n");
+        for (int i = 0; i < nameThenValue.length; i += 2)
+            s.append(nameThenValue[i]).append(": ").append(nameThenValue[i + 1]).append("\r\n");
+        s.append("\r\n");
+        return s.toString().getBytes(StandardCharsets.ISO_8859_1);
+    }
+
+    /** A decided request, for the Gate cases that never go near a Sender.
+     *  Limiter reads nothing off it -- a token is a token -- so the smallest
+     *  well-formed value is the honest one to pass. */
+    static final HxRequest REQ = new HxRequest("GET",
+            "https://app.example.test/api/orders", "app.example.test",
+            "/api/orders", "", Map.of(), new byte[0]);
+
+    /** The scope an operator actually configured, at a real epoch. */
+    static BridgeClient.Authorisation authorised() {
+        Map<String, List<String>> scope = new LinkedHashMap<>();
+        scope.put("scope.include", List.of("https://app.example.test/*"));
+        scope.put("method.allow", List.of("GET", "HEAD", "OPTIONS"));
+        scope.put("dangerous.path", List.of("*/logout*", "*/password*"));
+        scope.put("limit.rate_rps", List.of("5"));
+        return new BridgeClient.Authorisation(7L, Collections.unmodifiableMap(scope));
+    }
+
+    /** The DENY-ALL snapshot BridgeClient publishes before any configure and
+     *  after every disconnect. Epoch 0 is what "not configured" IS. */
+    static BridgeClient.Authorisation denyAll() {
+        return new BridgeClient.Authorisation(0L, Map.of());
+    }
+
+    // ---- the assertion this task exists for ----------------------------
+
+    static void denied(String label, Rig rig, Map<String, Object> header, byte[] body,
+                       BridgeClient.Authorisation auth, String expectedClass) {
+        Map<String, Object> reply = rig.sender.issue(header, body, auth);
+        check(label + " -> t=error (got " + reply.get("t") + ")",
+              "error".equals(reply.get("t")));
+        check(label + " -> class=" + expectedClass + " (got " + reply.get("class") + ")",
+              expectedClass.equals(reply.get("class")));
+        // Not "an error was returned". Nothing was sent.
+        check(label + " NEVER REACHED THE WIRE (fake Http saw " + rig.http.calls + " call(s))",
+              rig.http.calls == 0);
+        check(label + " carries no response body",
+              !reply.containsKey(BridgeClient.BODY_KEY));
+        check(label + " echoes the frame id", Long.valueOf(41L).equals(reply.get("id")));
+    }
+
+    // ---- tests ---------------------------------------------------------
+
+    static void anAllowedRequestIsIssuedOnceAndFramedAsAResult(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders?page=2"),
+                authorised());
+
+        check("an allowed request is framed as a result", "result".equals(reply.get("t")));
+        check("issued exactly once (" + r.http.calls + ")", r.http.calls == 1);
+        check("status is carried", Long.valueOf(200L).equals(reply.get("status")));
+        check("outcome is ok", "ok".equals(reply.get("outcome")));
+        check("elapsed ms is carried", Long.valueOf(12L).equals(reply.get("ms")));
+        check("the url Policy saw is the one we asked for",
+              "https://app.example.test/api/orders?page=2".equals(r.http.last.url()));
+        check("path and query are split for Policy",
+              "/api/orders".equals(r.http.last.path()) && "page=2".equals(r.http.last.query()));
+        check("the destination comes from the frame header, not the Host line",
+              "app.example.test".equals(r.http.last.host()));
+        byte[] body = (byte[]) reply.get(BridgeClient.BODY_KEY);
+        check("the response body rides under the reserved key", body != null);
+        check("`bytes` counts the REDACTED body, which is what crosses the bridge",
+              Long.valueOf((long) body.length).equals(reply.get("bytes")));
+        // s7: a response Set-Cookie is a live production session cookie the
+        // extension never injected, so the injected-range mechanism cannot key
+        // it. The value goes; the name and attributes stay, so cookie-flag and
+        // session-fixation checks still work.
+        String text = new String(body, StandardCharsets.ISO_8859_1);
+        check("the response session cookie value is gone", !text.contains("9f1c4a2e7b"));
+        check("its name and attributes survive redaction",
+              text.contains("Set-Cookie: session=") && text.contains("HttpOnly"));
+        check("the payload is untouched", text.contains("{\"orders\":[42]}"));
+    }
+
+    static void everyDenialClassLeavesTheWireUntouched(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+
+        denied("not_configured", new Rig(sentinel), header,
+               request("GET", "/api/orders"), denyAll(), "not_configured");
+
+        Rig halted = new Rig(sentinel);
+        halted.halt.haltedByFrame("operator pressed stop");
+        denied("halted", halted, header, request("GET", "/api/orders"),
+               authorised(), "halted");
+
+        denied("scope_denied", new Rig(sentinel), header,
+               request("GET", "/api/orders"),
+               new BridgeClient.Authorisation(7L, Map.of(
+                       "scope.include", List.of("https://other.example.test/*"),
+                       "method.allow", List.of("GET"))),
+               "scope_denied");
+
+        denied("method_denied", new Rig(sentinel), header,
+               request("POST", "/api/orders"), authorised(), "method_denied");
+
+        denied("dangerous_denied", new Rig(sentinel), header,
+               request("GET", "/account/logout"), authorised(), "dangerous_denied");
+
+        Rig limited = new Rig(sentinel);
+        limited.gate.verdict = Decision.rateLimited(200_000L, "5 rps, 5 issued this second");
+        denied("rate_limited", limited, header, request("GET", "/api/orders"),
+               authorised(), "rate_limited");
+
+        Rig spent = new Rig(sentinel);
+        spent.gate.verdict = Decision.deny("budget_exhausted", "2000 of 2000 requests issued");
+        denied("budget_exhausted", spent, header, request("GET", "/api/orders"),
+               authorised(), "budget_exhausted");
+
+        // s7: refused and NEVER PERSISTED. Until identity injection exists,
+        // this is the only thing keeping a live client session cookie out of a
+        // content-addressed blob store, where it would be in every backup.
+        Rig cred = new Rig(sentinel);
+        denied("unmanaged_credential", cred, header,
+               request("GET", "/api/orders", "Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"),
+               authorised(), "unmanaged_credential");
+
+        denied("bad_frame (no request line)", new Rig(sentinel), header,
+               new byte[0], authorised(), "bad_frame");
+
+        Map<String, Object> noDeadline = sendHeader(NOW + THIRTY_SECONDS);
+        noDeadline.remove("deadline_us");
+        denied("bad_frame (no deadline_us)", new Rig(sentinel), noDeadline,
+               request("GET", "/api/orders"), authorised(), "bad_frame");
+    }
+
+    /**
+     * The pinned order: not_configured -> halted -> scope_denied ->
+     * method_denied -> dangerous_denied -> rate_limited -> budget_exhausted.
+     * Each case violates its rule AND every rule after it; the earliest must
+     * win, or an operator reading a denial row is told the wrong reason for a
+     * stop they need to understand.
+     */
+    static void theRefusalOrderIsPinned(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        byte[] worst = request("POST", "/account/logout");   // wrong method AND dangerous
+
+        Rig a = new Rig(sentinel);
+        a.halt.haltedByFrame("operator pressed stop");
+        a.gate.verdict = Decision.deny("budget_exhausted", "spent");
+        denied("epoch 0 beats halted, scope, method, dangerous and budget",
+               a, header, worst, denyAll(), "not_configured");
+
+        Rig b = new Rig(sentinel);
+        b.halt.haltedByFrame("operator pressed stop");
+        b.gate.verdict = Decision.deny("budget_exhausted", "spent");
+        denied("halted beats scope, method, dangerous and budget",
+               b, header, worst,
+               new BridgeClient.Authorisation(7L, Map.of(
+                       "scope.include", List.of("https://other.example.test/*"))),
+               "halted");
+
+        Rig c = new Rig(sentinel);
+        c.gate.verdict = Decision.deny("budget_exhausted", "spent");
+        denied("scope beats method, dangerous and budget", c, header, worst,
+               new BridgeClient.Authorisation(7L, Map.of(
+                       "scope.include", List.of("https://other.example.test/*"),
+                       "method.allow", List.of("GET"),
+                       "dangerous.path", List.of("*/logout*"))),
+               "scope_denied");
+
+        Rig d = new Rig(sentinel);
+        d.gate.verdict = Decision.deny("budget_exhausted", "spent");
+        denied("method beats dangerous and budget", d, header, worst,
+               authorised(), "method_denied");
+    }
+
+    static void rateLimitedCarriesRetryAfterUs(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        r.gate.verdict = Decision.rateLimited(200_000L, "5 rps, 5 issued this second");
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        // s6: this is the one class that carries a retry hint, and the
+        // distinction is load-bearing for the agent. rate_limited means slow
+        // down; the three *_denied classes mean the answer will not change.
+        check("rate_limited carries retry_after_us",
+              Long.valueOf(200_000L).equals(reply.get("retry_after_us")));
+        check("a *_denied class carries no retry hint",
+              !new Rig(sentinel).sender.issue(
+                      sendHeader(NOW + THIRTY_SECONDS), request("POST", "/api/orders"),
+                      authorised()).containsKey("retry_after_us"));
+    }
+
+    /**
+     * Plan 2 carried deadline_us on every request frame and validated its
+     * presence without ever comparing it to a clock. This is where it starts
+     * meaning something.
+     */
+    static void anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        // The caller gave up 1.5 s ago: its _request() has already popped this
+        // id and a reply would be dropped by _deliver() on the far side.
+        Map<String, Object> header = sendHeader(NOW - 1_500_000L);
+        Map<String, Object> reply = r.sender.issue(header, request("GET", "/api/orders"),
+                                                   authorised());
+        check("an expired deadline -> t=error (got " + reply.get("t") + ")",
+              "error".equals(reply.get("t")));
+        check("an expired deadline -> class=timeout (got " + reply.get("class") + ")",
+              "timeout".equals(reply.get("class")));
+        check("an expired deadline NEVER REACHED THE WIRE (fake Http saw "
+              + r.http.calls + " call(s))", r.http.calls == 0);
+        // Why the deadline is checked FIRST. Limiter.check() has a side
+        // effect; spending a rate token and a budget slot on a request nothing
+        // is waiting for makes a run shorter for no evidence at all.
+        check("an expired deadline costs no rate token or budget slot (gate consulted "
+              + r.gate.calls + " time(s))", r.gate.calls == 0);
+    }
+
+    static void aDeadlineThatExpiresMidFlightIsReportedAsTimeout(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        r.http.advanceUsPerCall = 31_000_000L;      // 31 s against a 30 s budget
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("a response after the deadline is reported as timeout",
+              "error".equals(reply.get("t")) && "timeout".equals(reply.get("class")));
+        // It DID go out. This is not a refusal, and the difference matters:
+        // the request exists on the client's estate whatever we report.
+        check("the request was in fact issued", r.http.calls == 1);
+        check("but no evidence is framed for a caller that stopped waiting",
+              !reply.containsKey(BridgeClient.BODY_KEY));
+    }
+
+    static void aTransportFailureFeedsDistressAndHaltsTheNextSend(Path sentinel) {
+        // maxConsecutiveErrors = 1 so ONE failure trips the stop condition and
+        // the test needs no loop. The threshold is a constructor argument for
+        // exactly this reason; spec s14 flags 5 as needing tuning anyway.
+        Rig r = new Rig(sentinel, 1);
+        r.http.boom = new IOException("Connection refused");
+
+        Map<String, Object> first = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("a transport failure is reported as transport_error",
+              "error".equals(first.get("t")) && "transport_error".equals(first.get("class")));
+        check("the failure reached Distress", r.distress.stopReason() != null);
+        check("and Distress names the host", "app.example.test".equals(r.distress.stopHost()));
+
+        // Auto-halt is extension-initiated: nothing sent a halt frame, and the
+        // sentinel file does not exist. Issuance still has to stop.
+        Rig unused = null;
+        Map<String, Object> second = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("the next send is halted by target distress",
+              "error".equals(second.get("t")) && "halted".equals(second.get("class")));
+        check("and it names the reason", String.valueOf(second.get("detail")).contains("distress"));
+        check("the wire saw only the first request (" + r.http.calls + ")", r.http.calls == 1);
+        check("unused stays null so javac keeps this honest", unused == null);
+    }
+
+    /**
+     * s6: auto-halt is extension-initiated, so there is no outstanding id to
+     * answer. Without an unsolicited `halted` frame the stop is invisible
+     * until the next send fails, and `run.status = 'aborted'` has no
+     * stop_reason to record -- the harness cannot invent one it was never
+     * told.
+     *
+     * ONCE. Distress has no reset, so every send after the first would push an
+     * identical frame, and the second one would be a second abort attempt
+     * against a run that is already aborted for the same reason.
+     */
+    static void distressPushesOneUnsolicitedHaltedFrame(Path sentinel) {
+        Rig r = new Rig(sentinel, 1);
+        r.http.boom = new IOException("Connection refused");
+        check("nothing is announced before anything goes wrong", r.notifier.frames.isEmpty());
+
+        r.sender.issue(sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"),
+                       authorised());
+        check("the trip is announced (" + r.notifier.frames.size() + " frame(s))",
+              r.notifier.frames.size() == 1);
+        String[] frame = r.notifier.frames.get(0);
+        check("the frame carries the reason Distress gave",
+              frame[0] != null && frame[0].equals(r.distress.stopReason()));
+        check("and the host it gave", "app.example.test".equals(frame[1]));
+        // The third field is why the operator is being told: "5xx rate 0.40"
+        // means nothing without the window it was measured over.
+        check("and the window it measured", frame[2] != null && !frame[2].isEmpty());
+
+        r.sender.issue(sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"),
+                       authorised());
+        check("a second refused send announces nothing further ("
+              + r.notifier.frames.size() + ")", r.notifier.frames.size() == 1);
+    }
+
+    /**
+     * s7: the registry holds BYTE OFFSETS into one request. Applied to another
+     * request they do not merely leak, they write a placeholder over whatever
+     * happens to sit at those offsets -- so Sender clears the registry in a
+     * finally, on every path out of issue().
+     *
+     * Nothing registers a range until identity injection ships in Plan 5, so
+     * this test registers one by hand. That is the point: the clear() has to
+     * be in place BEFORE anything depends on it, because the failure it
+     * prevents is silently corrupted evidence rather than an exception.
+     */
+    static void oneRequestsInjectedRangesNeverSurviveIntoTheNext(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        r.redactor.register("ident-admin", 0, 4);
+        r.sender.issue(sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"),
+                       authorised());
+        byte[] next = "0123456789".getBytes(StandardCharsets.ISO_8859_1);
+        check("the registry is empty once issue() has returned",
+              "0123456789".equals(new String(r.redactor.redactRequest(next),
+                                             StandardCharsets.ISO_8859_1)));
+    }
+
+    /**
+     * The Plan 2 debt, paid. Epoch and scope arrive as ONE record and the
+     * result is stamped with the epoch that authorised the scope it was
+     * decided under -- not with whatever configEpoch() would answer now.
+     */
+    static void theResultIsStampedWithTheEpochThatAuthorisedIt(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("the result carries the epoch from the snapshot it decided under",
+              Long.valueOf(7L).equals(reply.get("config_epoch")));
+
+        // The same Sender, the same everything, a different snapshot. Nothing
+        // else can change the answer, because nothing else is read.
+        Rig fresh = new Rig(sentinel);
+        Map<String, Object> denied = fresh.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), denyAll());
+        check("the snapshot is the only input: epoch 0 is not_configured",
+              "not_configured".equals(denied.get("class")));
+        check("and nothing was issued under it", fresh.http.calls == 0);
+    }
+
+    /**
+     * The response body cannot travel in a flat JSON header, so it rides in
+     * the result map under a reserved key that BridgeClient removes and hands
+     * to Frame.encode as the frame body.
+     *
+     * Json.write refuses a byte[] value. That is the failsafe: a framer that
+     * forgets to strip the key throws JsonError instead of quietly writing a
+     * result frame with the evidence missing.
+     */
+    static void theResponseBodyRidesUnderAKeyJsonRefusesToWrite(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        boolean threw = false;
+        try { Json.write(reply); } catch (Json.JsonError e) { threw = true; }
+        check("Json.write refuses a result that still carries the body key", threw);
+
+        reply.remove(BridgeClient.BODY_KEY);
+        String header = Json.write(reply);
+        check("once stripped, the header writes", header.startsWith("{\"v\":1,\"t\":\"result\""));
+        check("and the body key is not on the wire", !header.contains(BridgeClient.BODY_KEY));
+    }
+
+    /**
+     * HxRequest is what Policy decides about; Sender.wireBytes is what Burp
+     * issues. They have to agree, or the request that was authorised and the
+     * request that goes out are two different requests.
+     */
+    static void theWireMappingRoundTripsWhatItParsed() {
+        byte[] raw = ("POST /api/orders?page=2 HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "User-Agent: hx/0.1\r\n"
+                + "Content-Type: application/json\r\n"
+                + "Content-Length: 13\r\n"
+                + "\r\n"
+                + "{\"qty\":7}\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1);
+
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        header.put("target_port", 8443L);
+        Rig r = new Rig(Path.of("/nonexistent/hx-halt"));
+        r.gate.verdict = Decision.allow();
+        r.sender.issue(header, raw, new BridgeClient.Authorisation(7L, Map.of(
+                "scope.include", List.of("https://app.example.test:8443/*"),
+                "method.allow", List.of("POST"))));
+        HxRequest req = r.http.last;
+        check("the request reached Http", req != null);
+        check("a non-default port is in the url",
+              "https://app.example.test:8443/api/orders?page=2".equals(req.url()));
+        check("Sender.secureOf reads the scheme back", Sender.secureOf(req));
+        check("Sender.portOf reads the port back (" + Sender.portOf(req) + ")",
+              Sender.portOf(req) == 8443);
+        check("the body after the header block is preserved verbatim, CRLFs and all",
+              "{\"qty\":7}\r\n\r\n".equals(new String(req.body(), StandardCharsets.ISO_8859_1)));
+        check("wireBytes reproduces the request it parsed",
+              new String(Sender.wireBytes(req), StandardCharsets.ISO_8859_1)
+                      .equals(new String(raw, StandardCharsets.ISO_8859_1)));
+    }
+
+    /**
+     * s4 calls the rate and the budget engagement-config defaults, not
+     * constants, and `limit.rate_rps` and `limit.max_requests` are two of the
+     * keys ConfigBody already accepts. An operator who configures 1 rps must
+     * get 1 rps rather than the number this jar was built with.
+     *
+     * They arrive inside the same Authorisation snapshot the decision is made
+     * under, which is the only place they can be read from coherently -- and
+     * they are read ONCE, because Limiter's budget deliberately has no refill.
+     */
+    static void theConfiguredLimitsArmTheGateOnceFromTheAuthorisation() {
+        TickClock clock = new TickClock(NOW);
+        Limits limits = new Limits(clock, 5L, 2000L);
+
+        limits.arm(denyAll());
+        check("a DENY-ALL snapshot arms nothing: epoch 0 carries no config at all",
+              limits.ratePerSecond() == 0L);
+
+        // authorised() configures limit.rate_rps=5 and says nothing about
+        // limit.max_requests.
+        limits.arm(authorised());
+        check("the configured rate is what the gate uses (" + limits.ratePerSecond() + ")",
+              limits.ratePerSecond() == 5L);
+        check("an absent key leaves the built-in default (" + limits.maxRequests() + ")",
+              limits.maxRequests() == 2000L);
+
+        check("the armed gate answers", limits.check(REQ).allowed());
+        check("and spending is counted (" + limits.issued() + ")", limits.issued() == 1L);
+
+        // A configure re-authorises SCOPE, not issuance. Rebuilding the
+        // Limiter here would hand a spent run a fresh budget -- exactly what
+        // Limiter's missing refill exists to prevent.
+        limits.arm(new BridgeClient.Authorisation(8L, Map.of(
+                "limit.rate_rps", List.of("99"),
+                "limit.max_requests", List.of("1000000"))));
+        check("a later configure does not re-arm the limits (" + limits.ratePerSecond() + ")",
+              limits.ratePerSecond() == 5L);
+        check("and does not refill the budget (" + limits.issued() + ")",
+              limits.issued() == 1L);
+
+        // Unreadable is not "use the default". An operator who asked for a
+        // limit we cannot parse has not been given the limit they asked for,
+        // and BridgeClient's send arm turns this throw into an error frame and
+        // DENY-ALL.
+        boolean threw = false;
+        try {
+            new Limits(clock, 5L, 2000L).arm(new BridgeClient.Authorisation(2L,
+                    Map.of("limit.rate_rps", List.of("as fast as possible"))));
+        } catch (IllegalArgumentException e) {
+            threw = true;
+        }
+        check("a limit that is not a positive integer is refused, not defaulted", threw);
+
+        check("an unarmed gate denies rather than allowing",
+              !new Limits(clock, 5L, 2000L).check(REQ).allowed());
+    }
+}
+```
+
+- [ ] **Step 3: Run it and watch it fail**
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL at compile time, on two symbols:
+
+```
+test/hx/send/SenderTest.java:... error: cannot find symbol
+        final Sender sender;
+              ^
+  symbol:   class Sender
+  location: package hx.send
+test/hx/send/SenderTest.java:... error: cannot find symbol
+        Limits limits = new Limits(clock, 5L, 2000L);
+        ^
+  symbol:   class Limits
+  location: package hx.send
+```
+
+That is the whole of the failure. `Http` and `HttpReply` exist; the two classes
+the test drives do not.
+
+- [ ] **Step 4: Write `Limits` — the gate the operator's numbers arm**
+
+`Limiter` takes its rate and its budget in its constructor, and its budget is
+monotonic on purpose: there is no refill, because a `configure` re-authorises
+scope and must never hand a spent run another thousand requests. But the two
+numbers arrive in the `configure` body, after the extension has loaded and
+built its `Policy`. Something has to stand between a `Gate` built at load time
+and numbers that arrive later, and this is that something — armed once, from
+the first `Authorisation` that carries an epoch.
+
+```java
+// extension/src/hx/send/Limits.java
+package hx.send;
+
+import hx.bridge.BridgeClient;
+import hx.policy.Clock;
+import hx.policy.Decision;
+import hx.policy.Gate;
+import hx.policy.HxRequest;
+import hx.policy.Limiter;
+
+import java.util.List;
+
+/**
+ * The Gate Policy consults, holding the rate and budget an operator
+ * configured.
+ *
+ * `limit.rate_rps` and `limit.max_requests` are two of the keys ConfigBody
+ * already accepts, so they arrive in the Authorisation snapshot beside the
+ * scope they were configured with -- which is the only place they can be read
+ * from coherently, and the same read the decision is made under.
+ *
+ * ARMED ONCE. Spec s4's rate and budget are engagement-config defaults rather
+ * than constants, but the budget is also monotonic: Limiter has no refill,
+ * because a scope push must not resupply a run that has spent its requests. So
+ * the numbers are taken from the first authorisation that has an epoch and
+ * held for the run; every later configure re-authorises scope, which is what a
+ * configure is for.
+ *
+ * The defaults in the constructor are what a configure body that omits a key
+ * gets. They are not a policy of their own -- an omitted key means the
+ * operator expressed no opinion, and this jar's built-in number is the only
+ * answer left.
+ */
+public final class Limits implements Gate {
+
+    private final Clock clock;
+    private final long defaultRatePerSecond;
+    private final long defaultMaxRequests;
+
+    // Written on the read-loop thread inside arm(), read by check() on the
+    // same thread today -- but `limit.concurrency` is already in the configure
+    // body, and the day it is honoured these are cross-thread reads.
+    private volatile Limiter limiter;
+    private volatile long ratePerSecond;
+    private volatile long maxRequests;
+
+    public Limits(Clock clock, long defaultRatePerSecond, long defaultMaxRequests) {
+        this.clock = clock;
+        this.defaultRatePerSecond = defaultRatePerSecond;
+        this.defaultMaxRequests = defaultMaxRequests;
+    }
+
+    /**
+     * Build the Limiter from this snapshot's limit keys, once.
+     *
+     * Called before every decision and does nothing after the first. Epoch 0
+     * is skipped rather than defaulted: it is the DENY-ALL snapshot, it
+     * carries no configuration at all, and arming from it would fix the run's
+     * numbers at this jar's built-ins before the operator's configure ever
+     * arrived.
+     *
+     * A key that is present but is not a positive integer throws. Falling back
+     * to the built-in default there is the one answer that is wrong in both
+     * directions -- an operator who asked for 1 rps would silently get 5, and
+     * one who asked for 500 would silently get 5 as well. BridgeClient's send
+     * arm turns the throw into an error frame and DENY-ALL.
+     */
+    public synchronized void arm(BridgeClient.Authorisation auth) {
+        if (limiter != null || auth.epoch() == 0) return;
+        long rps = positive(auth, "limit.rate_rps", defaultRatePerSecond);
+        long max = positive(auth, "limit.max_requests", defaultMaxRequests);
+        ratePerSecond = rps;
+        maxRequests = max;
+        limiter = new Limiter(clock, rps, max);
+    }
+
+    @Override
+    public Decision check(HxRequest req) {
+        Limiter l = limiter;
+        if (l == null)
+            // Unreachable through HxExtension, which arms this from the same
+            // snapshot before it calls issue() -- and Sender refuses epoch 0
+            // as not_configured before Policy consults a Gate at all. A gate
+            // that does not know its budget still has to answer no.
+            return Decision.deny("not_configured", "the rate and budget are not armed");
+        return l.check(req);
+    }
+
+    // Test seams, package-private, in the same shape as Distress's.
+    long ratePerSecond() { return limiter == null ? 0L : ratePerSecond; }
+
+    long maxRequests() { return limiter == null ? 0L : maxRequests; }
+
+    long issued() {
+        Limiter l = limiter;
+        return l == null ? 0L : l.issued();
+    }
+
+    private static long positive(BridgeClient.Authorisation auth, String key, long fallback) {
+        List<String> values = auth.scope().get(key);
+        if (values == null || values.isEmpty()) return fallback;
+        if (values.size() != 1)
+            // The protocol document says "integer, once". ConfigBody
+            // accumulates repeated keys in order and does not enforce that,
+            // so it is enforced where the value is used: two answers to "how
+            // fast" is not a limit.
+            throw new IllegalArgumentException(key + " was set " + values.size()
+                + " times; it is an integer, once");
+        String raw = values.get(0).strip();
+        long n;
+        try {
+            n = Long.parseLong(raw);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(key + " is not an integer: " + raw, e);
+        }
+        if (n <= 0)
+            throw new IllegalArgumentException(key + " must be positive, not " + n);
+        return n;
+    }
+}
+```
+
+- [ ] **Step 5: Write `Sender`**
+
+```java
+// extension/src/hx/send/Sender.java
+package hx.send;
+
+import hx.bridge.BridgeClient;
+import hx.policy.Clock;
+import hx.policy.Decision;
+import hx.policy.Distress;
+import hx.policy.HxRequest;
+import hx.policy.Policy;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * The chokepoint. Every request hx issues passes through issue(), and issue()
+ * is the only thing in the extension that reaches anything capable of touching
+ * a network -- through the injected Http, whose one implementation is built in
+ * HxExtension. ChokepointTest asserts that structurally. Spec s4: "never add a
+ * third egress path."
+ *
+ * Nothing in this file imports burp.*, and that is not tidiness. It is what
+ * lets every refusal below be tested against a fake Http that counts its
+ * calls, so the assertion can be "the request never left the JVM" rather than
+ * the much weaker "an error came back".
+ *
+ * ORDER OF REFUSAL, and why it is this one:
+ *
+ *   0. bad_frame             you cannot decide about a request you cannot read.
+ *   1. timeout               the caller has already given up. FIRST, because it
+ *                            is the only check that costs nothing: Policy's
+ *                            Gate is Limits, whose check() spends a rate token
+ *                            and a budget slot, and spending either on a
+ *                            request nothing is waiting for shortens the run
+ *                            for no evidence.
+ *   2. not_configured        DENY-ALL, read from the Authorisation snapshot.
+ *   3. halted                halt frame, sentinel file, or auto-halt on target
+ *                            distress.
+ *   4. unmanaged_credential  before the Gate, for the same reason as 1.
+ *   5. Policy                scope -> method -> dangerous -> rate -> budget.
+ *
+ * Steps 2-5 hold the pinned order -- not_configured, halted, scope_denied,
+ * method_denied, dangerous_denied, rate_limited, budget_exhausted. Policy
+ * checks not_configured too, and the duplication is deliberate: it is the
+ * single most important check in the system, and repeating it here is what
+ * lets the two halt checks run BEFORE the budget-consuming Gate without moving
+ * any verdict out of its pinned position.
+ */
+public final class Sender {
+
+    private final Policy policy;
+    private final Redactor redactor;
+    private final HaltSwitch halt;
+    private final Distress distress;
+    private final Http http;
+    private final Clock clock;
+
+    // Installed by HxExtension after construction, because it comes from the
+    // BridgeClient and the Sender is what the BridgeClient is given. Volatile
+    // for that cross-thread edge: written on Burp's initialize thread, read on
+    // the read loop's.
+    private volatile BridgeClient.HaltNotifier haltNotifier;
+
+    // Auto-halt is announced once. Distress has no reset -- one distressed
+    // host aborts the whole run and a human decides when it restarts -- so
+    // every later send would push an identical frame at a run that is already
+    // aborted for that same reason.
+    private final AtomicBoolean announced = new AtomicBoolean(false);
+
+    public Sender(Policy policy, Redactor redactor, HaltSwitch halt,
+                  Distress distress, Http http, Clock clock) {
+        this.policy = policy;
+        this.redactor = redactor;
+        this.halt = halt;
+        this.distress = distress;
+        this.http = http;
+        this.clock = clock;
+    }
+
+    /**
+     * Where the unsolicited `halted` frame goes.
+     *
+     * Spec s6: auto-halt is extension-initiated, so there is no outstanding id
+     * to answer. Without this the stop is invisible until the next send fails,
+     * and `run.status = 'aborted'` has no stop_reason to record -- the harness
+     * cannot write down a reason nobody told it.
+     */
+    public void setHaltNotifier(BridgeClient.HaltNotifier n) { this.haltNotifier = n; }
+
+    /**
+     * Decide, issue, time, redact, answer.
+     *
+     * The Authorisation is a PARAMETER, not something read in here. It is read
+     * exactly once per send, by BridgeClient's send arm, and carried down --
+     * epoch and scope from one reference, so the scope a request was decided
+     * under and the epoch stamped on its evidence line are the same commit.
+     * configEpoch() and scopeConfig() are two reads of that one record and a
+     * commit lands between them (393/400 trials, in the unsafe direction);
+     * ChokepointTest asserts neither is called anywhere in extension/src.
+     *
+     * Returns a map ready to be framed as `result` or `error`. A result also
+     * carries the redacted response bytes under BridgeClient.BODY_KEY, which
+     * the framer removes and passes to Frame.encode as the body -- a flat JSON
+     * header cannot carry them.
+     *
+     * The registry is cleared on EVERY path out, including the refusals: a
+     * registered range is a byte offset into one request, and applied to the
+     * next one it does not leak so much as write a placeholder over whatever
+     * happens to sit at those offsets. A RangeError is a denial, never an
+     * allow (s4): nothing registers a range until identity injection ships in
+     * Plan 5, so it cannot be raised today -- but injection lands ON THIS
+     * METHOD, between the credential refusal and the issue, and the two
+     * failure modes it brings are exactly the two handled here.
+     */
+    public Map<String, Object> issue(Map<String, Object> header, byte[] body,
+                                     BridgeClient.Authorisation auth) {
+        try {
+            return decideAndIssue(header, body, auth);
+        } catch (Redactor.RangeError e) {
+            return error(header.get("id"), "bad_frame",
+                         "redaction range does not fit these bytes: " + e.getMessage());
+        } finally {
+            redactor.clear();
+        }
+    }
+
+    private Map<String, Object> decideAndIssue(Map<String, Object> header, byte[] body,
+                                               BridgeClient.Authorisation auth) {
+        Object id = header.get("id");
+
+        // JSON numbers arrive as Long on this side; the pattern is the null
+        // check as well as the type check.
+        if (!(header.get("deadline_us") instanceof Long deadlineUs))
+            return error(id, "bad_frame", "send frame has no deadline_us");
+
+        HxRequest req;
+        try {
+            req = parse(header, body);
+        } catch (IllegalArgumentException e) {
+            return error(id, "bad_frame", e.getMessage());
+        }
+
+        long before = clock.nowUs();
+        if (before >= deadlineUs)
+            return error(id, "timeout", "deadline passed " + (before - deadlineUs)
+                         + "us before this frame was decided; not issued");
+
+        // Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before
+        // any configure and after every disconnect. There is no other way to
+        // get one: epochCounter is pre-incremented, so a real commit is >= 1.
+        if (auth.epoch() == 0)
+            return error(id, "not_configured", "no configure frame acknowledged yet");
+
+        if (halt.halted()) {
+            String why = halt.reason();
+            return error(id, "halted", why == null ? "halted, no reason recorded" : why);
+        }
+
+        // Auto-halt. Distress is extension-initiated and has no reset: one
+        // distressed host aborts the whole run (spec s4), and a human decides
+        // when it restarts.
+        String stop = distress.stopReason();
+        if (stop != null)
+            return error(id, "halted",
+                         "target distress: " + stop + " on " + distress.stopHost());
+
+        // s7: refused AND NEVER PERSISTED. Until identity injection registers
+        // byte ranges, this is the only thing keeping a live client session
+        // cookie out of a content-addressed blob store -- where, once written,
+        // it is in every backup. This is the one item that cannot be
+        // retrofitted.
+        String credential = redactor.unmanagedCredential(req);
+        if (credential != null)
+            return error(id, "unmanaged_credential", "request carries a " + credential
+                         + " header this extension did not inject");
+
+        Decision d = policy.decide(req, auth);
+        if (!d.allowed()) return error(id, d);
+
+        HttpReply reply;
+        try {
+            reply = http.send(req, deadlineUs);
+        } catch (IOException e) {
+            // It tried. Distress has to see it: five consecutive connection
+            // errors are one of the three auto-halt conditions in spec s4, and
+            // a failure that never reaches the window is a failure that never
+            // counts.
+            distress.record(req.host(), 0, (clock.nowUs() - before) / 1000L, true);
+            announceDistress();
+            return error(id, "transport_error",
+                         e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+
+        distress.record(req.host(), reply.status(), reply.ms(), reply.connectionError());
+        announceDistress();
+
+        if (reply.connectionError())
+            return error(id, "transport_error", "no response from " + req.host());
+
+        long after = clock.nowUs();
+        if (after >= deadlineUs)
+            // The bytes exist, but the harness's _request() has already popped
+            // this id and _deliver() drops a reply nobody is waiting for. Say
+            // timeout rather than frame evidence the far side will discard.
+            // Distress was fed above regardless: a host that answers slowly is
+            // precisely what auto-halt watches for.
+            return error(id, "timeout",
+                         "response arrived " + (after - deadlineUs) + "us after the deadline");
+
+        // Redaction runs BEFORE the bytes cross the bridge, because the blob
+        // store on the far side is content-addressed: hashing raw bytes and
+        // redacting afterwards means the raw bytes are already on disk.
+        byte[] redacted = redactor.redactResponse(reply.raw());
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("v", BridgeClient.PROTOCOL_VERSION);
+        result.put("t", "result");
+        result.put("id", id);
+        result.put("status", (long) reply.status());
+        result.put("bytes", (long) redacted.length);
+        result.put("ms", reply.ms());
+        result.put("outcome", "ok");
+        // The epoch that authorised the scope this was decided under, from the
+        // same reference. An evidence line claiming authorisation from an
+        // epoch that never granted it is worse than no evidence line.
+        result.put("config_epoch", auth.epoch());
+        result.put(BridgeClient.BODY_KEY, redacted);
+        return result;
+    }
+
+    /**
+     * Push the stop frame, the first time Distress has one to push.
+     *
+     * Called immediately after each record(), which is the only thing that can
+     * turn stopReason() non-null, so "the first time" and "once" are the same
+     * statement. The notifier is checked before the flag is spent: an
+     * announcement nobody was listening for is not an announcement, and
+     * burning the flag on it would lose the frame for good.
+     */
+    private void announceDistress() {
+        String reason = distress.stopReason();
+        if (reason == null) return;
+        BridgeClient.HaltNotifier n = haltNotifier;
+        if (n == null) return;
+        if (!announced.compareAndSet(false, true)) return;
+        n.halted(reason, distress.stopHost(), distress.window());
+    }
+
+    // ---- frame <-> wire ------------------------------------------------
+
+    /**
+     * Frame header plus raw request bytes -> the value Policy decides about.
+     *
+     * The destination is taken from the FRAME HEADER (target_host,
+     * target_port, tls) and never from the request's own Host line. Burp
+     * connects to the service we name, so the scope decision has to be about
+     * that service; deciding on a Host header would let a request authorised
+     * for app.example.test open a connection somewhere else entirely.
+     *
+     * Bytes are read as ISO-8859-1. Two reasons, both load-bearing: HTTP field
+     * values are opaque octets rather than text, so UTF-8 would mangle a
+     * Latin-1 cookie value and strict UTF-8 would refuse a request that is
+     * perfectly legal on the wire; and ISO-8859-1 maps one octet to exactly
+     * one char, so the string offsets below are byte offsets and the body
+     * slice needs no re-encoding.
+     */
+    static HxRequest parse(Map<String, Object> header, byte[] body) {
+        if (!(header.get("target_host") instanceof String host) || host.isEmpty())
+            throw new IllegalArgumentException("send frame has no target_host");
+        boolean tls = Boolean.TRUE.equals(header.get("tls"));
+        long port = header.get("target_port") instanceof Long p ? p : (tls ? 443L : 80L);
+        if (port < 1 || port > 65535)
+            throw new IllegalArgumentException("target_port " + port + " is not a port");
+
+        String text = new String(body, StandardCharsets.ISO_8859_1);
+        int crlf = text.indexOf("\r\n\r\n");
+        int lf = text.indexOf("\n\n");
+        int headEnd, bodyStart;
+        if (crlf >= 0 && (lf < 0 || crlf <= lf)) { headEnd = crlf; bodyStart = crlf + 4; }
+        else if (lf >= 0) { headEnd = lf; bodyStart = lf + 2; }
+        else { headEnd = text.length(); bodyStart = text.length(); }
+
+        String[] lines = text.substring(0, headEnd).split("\r\n|\n", -1);
+        if (lines.length == 0 || lines[0].isEmpty())
+            throw new IllegalArgumentException("send body has no request line");
+        String[] parts = lines[0].split(" ");
+        if (parts.length < 2)
+            throw new IllegalArgumentException("malformed request line: " + lines[0]);
+
+        // NOT uppercased. HTTP methods are case-sensitive (RFC 9110 s9.1), and
+        // `get` is what would go on the wire; normalising it here would let it
+        // satisfy a method.allow of GET while the server sees something else.
+        // Verbatim is the fail-closed direction.
+        String method = parts[0];
+        String target = parts[1];
+        if (!target.startsWith("/"))
+            // Absolute-form and authority-form both make the destination
+            // ambiguous -- two answers to "where is this going" and only one of
+            // them was authorised. OPTIONS * is not supported either; when it
+            // is needed it needs its own scope answer, not this one.
+            throw new IllegalArgumentException("request target must be origin-form: " + target);
+
+        Map<String, List<String>> headers = new LinkedHashMap<>();
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            if (line.isEmpty()) continue;
+            int colon = line.indexOf(':');
+            if (colon <= 0)
+                throw new IllegalArgumentException("malformed header line: " + line);
+            String name = line.substring(0, colon);
+            if (!name.equals(name.strip()))
+                // Whitespace between a field name and its colon is a request-
+                // smuggling primitive: RFC 9112 s5.1 requires a recipient to
+                // reject it, and recipients disagree about that in practice.
+                // We refuse to reason about a header whose name we would have
+                // to guess.
+                throw new IllegalArgumentException("whitespace in header name: " + name);
+            headers.computeIfAbsent(name, k -> new ArrayList<>()).add(line.substring(colon + 1).strip());
+        }
+
+        String path = target;
+        String query = "";
+        int q = target.indexOf('?');
+        if (q >= 0) { path = target.substring(0, q); query = target.substring(q + 1); }
+
+        boolean defaultPort = (tls && port == 443) || (!tls && port == 80);
+        String url = (tls ? "https://" : "http://") + host
+                   + (defaultPort ? "" : ":" + port) + target;
+
+        // Frozen at both levels, like ConfigBody.parse, and here the ORDER is
+        // load-bearing rather than a courtesy: wireBytes() emits headers in
+        // iteration order, so an unordered copy would issue a different
+        // request from the one Policy decided about.
+        Map<String, List<String>> frozen = new LinkedHashMap<>();
+        headers.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
+        return new HxRequest(method, url, host, path, query,
+                             Collections.unmodifiableMap(frozen),
+                             Arrays.copyOfRange(body, bodyStart, body.length));
+    }
+
+    /**
+     * The request bytes to put on the wire.
+     *
+     * Public and static so HxExtension's Montoya adapter is three lines and
+     * this mapping is testable without Burp. It reproduces exactly what
+     * parse() accepted; what it does NOT reproduce is anything parse() refuses
+     * (whitespace before a colon, absolute-form targets), the exact run of
+     * spaces after a colon, an empty `?` with no query, and the interleaving of
+     * headers with DIFFERENT names -- HxRequest groups by name, so
+     * `A / B / A` is re-emitted as `A / A / B`. RFC 9110 s5.3 makes that
+     * semantically identical, but a smuggling check that cares about field
+     * order will not see the request it wrote. The fix is to hand Http the raw
+     * frame body rather than reconstructing it; see the note in the plan.
+     */
+    public static byte[] wireBytes(HxRequest req) {
+        StringBuilder s = new StringBuilder();
+        s.append(req.method()).append(' ').append(req.path());
+        if (!req.query().isEmpty()) s.append('?').append(req.query());
+        s.append(" HTTP/1.1\r\n");
+        req.headers().forEach((name, values) -> {
+            for (String v : values) s.append(name).append(": ").append(v).append("\r\n");
+        });
+        s.append("\r\n");
+        byte[] head = s.toString().getBytes(StandardCharsets.ISO_8859_1);
+        byte[] out = new byte[head.length + req.body().length];
+        System.arraycopy(head, 0, out, 0, head.length);
+        System.arraycopy(req.body(), 0, out, head.length, req.body().length);
+        return out;
+    }
+
+    /** True when the url this request was authorised under is https. */
+    public static boolean secureOf(HxRequest req) {
+        return req.url().startsWith("https://");
+    }
+
+    /** The port the url encodes, or the scheme default. */
+    public static int portOf(HxRequest req) {
+        boolean tls = secureOf(req);
+        String rest = req.url().substring(tls ? 8 : 7);
+        int slash = rest.indexOf('/');
+        String authority = slash < 0 ? rest : rest.substring(0, slash);
+        // An IPv6 literal is full of colons; only one after the closing
+        // bracket is a port.
+        int colon = authority.lastIndexOf(':');
+        if (colon < 0 || colon < authority.lastIndexOf(']')) return tls ? 443 : 80;
+        try {
+            return Integer.parseInt(authority.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("no port in " + req.url(), e);
+        }
+    }
+
+    // ---- replies -------------------------------------------------------
+
+    private static Map<String, Object> error(Object id, String cls, String detail) {
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("v", BridgeClient.PROTOCOL_VERSION);
+        e.put("t", "error");
+        e.put("id", id);
+        e.put("class", cls);
+        e.put("detail", detail);
+        return e;
+    }
+
+    private static Map<String, Object> error(Object id, Decision d) {
+        Map<String, Object> e = error(id, d.errorClass(), d.detail());
+        if ("rate_limited".equals(d.errorClass()))
+            // s6: the one class that carries a retry hint. rate_limited means
+            // slow down and try again; the three *_denied classes mean the
+            // answer will not change however long you wait.
+            e.put("retry_after_us", d.retryAfterUs());
+        return e;
+    }
+}
+```
+
+- [ ] **Step 6: Run `SenderTest` and watch it pass**
+
+Add the new class to the runner. Append after the lines the earlier tasks
+added, before `hx.ChokepointTest` (which does not exist yet):
+
+```bash
+java -cp "build/test-classes:$MONTOYA" hx.send.SenderTest
+```
+
+Run: `cd extension && ./test.sh`
+Expected: PASS — `ALL PASS` from `hx.send.SenderTest`, and every earlier class
+still green.
+
+- [ ] **Step 7: Sabotage — issue before deciding**
+
+In `Sender.decideAndIssue`, move the issuance above the checks: cut the
+`HttpReply reply; try { reply = http.send(req, deadlineUs); } ... ` block and
+paste it immediately after `long before = clock.nowUs();` — above the deadline
+check, and below that line rather than above it, because the `IOException`
+branch inside the block reads `before`.
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL, seventeen reds. Eight of them are the point, and their wording
+is the point of the wording — they are about the wire, not about the return
+value:
+
+```
+  FAIL not_configured NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+  FAIL halted NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+  FAIL scope_denied NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+  FAIL method_denied NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+  FAIL dangerous_denied NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+  FAIL rate_limited NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+  FAIL budget_exhausted NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+  FAIL unmanaged_credential NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+```
+
+Restore: `git checkout -- extension/src/hx/send/Sender.java`
+
+- [ ] **Step 8: Sabotage — delete the deadline check**
+
+Delete these two lines from `Sender.decideAndIssue`:
+
+```java
+        if (before >= deadlineUs)
+            return error(id, "timeout", "deadline passed " + (before - deadlineUs)
+                         + "us before this frame was decided; not issued");
+```
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL, exactly these two:
+
+```
+  FAIL an expired deadline NEVER REACHED THE WIRE (fake Http saw 1 call(s))
+  FAIL an expired deadline costs no rate token or budget slot (gate consulted 1 time(s))
+```
+
+Two, not four — and which two is the whole lesson. The same test's
+`-> t=error` and `-> class=timeout` assertions stay **green**, because the
+second deadline check, the one after the reply comes back, still catches an
+already-expired deadline and answers `timeout`. A suite that only asserted the
+returned class would call this sabotage a pass: the caller is told the same
+thing either way, and the difference is that a request nobody is waiting for
+was issued against a client's production system and paid for out of the run's
+budget. These two assertions are the only ones that can tell those apart.
+
+Restore: `git checkout -- extension/src/hx/send/Sender.java`
+
+- [ ] **Step 9: Write the failing structural test — `ChokepointTest`**
+
+```java
+// extension/test/hx/ChokepointTest.java
+package hx;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Stream;
+
+/**
+ * The enforcement invariant, asserted structurally rather than behaviourally.
+ *
+ * Spec s4: "Every byte that leaves this machine crosses exactly one of two
+ * enforcement points... State it, test it, and never add a third egress path."
+ * A behavioural test can only show that the paths it knows about are enforced.
+ * This one counts, over the whole of extension/src, so a path nobody thought
+ * to test cannot exist quietly.
+ *
+ * It reads RAW TEXT, comments included. That is the fail-safe direction: a
+ * comment that spells the egress call makes the count 2 and this test go RED.
+ * If that happens, rewrite the comment -- do not loosen the needle.
+ */
+public class ChokepointTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    static final String ENTRY_POINT = Path.of("src", "hx", "HxExtension.java").toString();
+
+    public static void main(String[] args) throws Exception {
+        List<Path> sources = sources();
+        // A walk that matched nothing would make every count below zero, and
+        // "zero occurrences" is what most of these assertions want. The suite
+        // has to prove it looked at something first.
+        check("found the extension sources (" + sources.size() + " files)",
+              sources.size() >= 8);
+
+        oneEgressPath(sources);
+        noBatchEgressPath(sources);
+        redirectsAreNotFollowed(sources);
+        montoyaIsConfinedToTheEntryPoint(sources);
+        theDeprecatedAccessorsAreUnusedEverywhere(sources);
+        theAuthorisationSnapshotIsReadInExactlyOnePlace(sources);
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    /** test.sh runs from extension/, the same cwd CodecTest reads its golden
+     *  vectors from. */
+    static List<Path> sources() throws IOException {
+        try (Stream<Path> s = Files.walk(Path.of("src"))) {
+            return s.filter(p -> p.toString().endsWith(".java")).sorted().toList();
+        }
+    }
+
+    static void oneEgressPath(List<Path> sources) throws IOException {
+        int total = 0;
+        List<String> hits = new ArrayList<>();
+        for (Path p : sources) {
+            int n = count(text(p), "http().sendRequest");
+            total += n;
+            if (n > 0) hits.add(p + " x" + n);
+        }
+        check("the egress call appears exactly once in extension/src, not " + total
+              + " times " + hits, total == 1);
+        check("and it is in " + ENTRY_POINT + ", not " + hits,
+              hits.size() == 1 && hits.get(0).startsWith(ENTRY_POINT));
+    }
+
+    static void noBatchEgressPath(List<Path> sources) throws IOException {
+        int total = 0;
+        for (Path p : sources) total += count(text(p), "sendRequests(");
+        // Montoya's batch call is a second egress path wearing the first one's
+        // name. It was measured working on Community (spec s2), which is
+        // exactly why it needs saying no to in writing: one request per
+        // decision, or Policy is deciding about a list.
+        check("the batch egress call appears nowhere in extension/src (" + total + ")",
+              total == 0);
+    }
+
+    static void redirectsAreNotFollowed(List<Path> sources) throws IOException {
+        int total = 0;
+        for (Path p : sources) total += count(text(p), "RedirectionMode.NEVER");
+        // Spec s4: each hop is a distinct issuance with its own scope decision
+        // and its own exchange row. A redirect followed inside Burp is a
+        // request that never crossed Policy -- a third egress path that looks
+        // exactly like the first.
+        check("the egress call disables redirect following (" + total + ")", total == 1);
+    }
+
+    static void montoyaIsConfinedToTheEntryPoint(List<Path> sources) throws IOException {
+        List<String> importers = new ArrayList<>();
+        for (Path p : sources)
+            if (count(text(p), "import burp.") > 0) importers.add(p.toString());
+        // Stronger than the plan's global constraint, and deliberately so.
+        // With Http as an interface, hx.send.Sender needs no burp.* type at
+        // all -- which is what makes the refusal tests able to count calls.
+        check("burp.* is imported only by " + ENTRY_POINT + ", not by " + importers,
+              importers.equals(List.of(ENTRY_POINT)));
+    }
+
+    /**
+     * Counted WITH the leading dot, so a declaration (`public long
+     * configEpoch()`) and a javadoc cross-reference (`{@link #configEpoch()}`)
+     * do not match. A javadoc that writes `BridgeClient.configEpoch()` with a
+     * dot instead of a `#` will trip this, and that is the correct outcome:
+     * fix the javadoc, do not widen the needle.
+     */
+    static void theDeprecatedAccessorsAreUnusedEverywhere(List<Path> sources) throws IOException {
+        int epoch = 0, scope = 0;
+        for (Path p : sources) {
+            String t = text(p);
+            epoch += count(t, ".configEpoch()");
+            scope += count(t, ".scopeConfig()");
+        }
+        // Two reads of one record, with a commit landing between them:
+        // measured wrong in 393/400 trials, and wrong in the unsafe direction
+        // -- decide under the superseded wider scope, stamp it with the epoch
+        // that narrowed it.
+        check("nothing in extension/src calls the deprecated configEpoch() (" + epoch + ")",
+              epoch == 0);
+        check("nothing in extension/src calls the deprecated scopeConfig() (" + scope + ")",
+              scope == 0);
+    }
+
+    /**
+     * BridgeClient's send arm writes `this.authorisation()` with an explicit
+     * receiver precisely so this count can be taken. A bare `authorisation()`
+     * there reads as zero here and turns this check red -- which is the
+     * correct failure, not a false alarm to be quietened by loosening the
+     * needle.
+     */
+    static void theAuthorisationSnapshotIsReadInExactlyOnePlace(List<Path> sources)
+            throws IOException {
+        int total = 0;
+        for (Path p : sources) total += count(text(p), ".authorisation()");
+        check("the whole extension reads the Authorisation snapshot in exactly one "
+              + "place, not " + total, total == 1);
+    }
+
+    static int count(String haystack, String needle) {
+        int n = 0, i = 0;
+        while ((i = haystack.indexOf(needle, i)) >= 0) { n++; i += needle.length(); }
+        return n;
+    }
+
+    static String text(Path p) throws IOException {
+        return Files.readString(p, StandardCharsets.UTF_8);
+    }
+}
+```
+
+- [ ] **Step 10: Run it and watch it fail**
+
+Add to `extension/test.sh`, after the `SenderTest` line:
+
+```bash
+java -cp "build/test-classes:$MONTOYA" hx.ChokepointTest
+```
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL —
+
+```
+  FAIL the egress call appears exactly once in extension/src, not 0 times []
+  FAIL and it is in src/hx/HxExtension.java, not []
+  FAIL the egress call disables redirect following (0)
+  FAIL the whole extension reads the Authorisation snapshot in exactly one place, not 0
+```
+
+Four reds, and all four are honest: there is no egress path yet, and no send
+arm reading the snapshot. `montoyaIsConfinedToTheEntryPoint` and the two
+deprecated-accessor checks are already green, because `HxExtension` is
+currently the only importer of `burp.*` and nothing calls the deprecated pair.
+
+- [ ] **Step 11: Route `send` frames through `BridgeClient`**
+
+Add these members to `extension/src/hx/bridge/BridgeClient.java`, next to the
+`Log` interface near the top of the class:
+
+```java
+// extension/src/hx/bridge/BridgeClient.java -- new members, beside the Log interface
+
+    /** The reserved key a SendHandler puts the redacted response body under.
+     *  It cannot travel in a flat JSON header, and Json.write refuses a byte[]
+     *  -- so a framer that forgets the remove() below throws JsonError rather
+     *  than quietly writing a result frame with the evidence missing. */
+    public static final String BODY_KEY = "@body";
+
+    /**
+     * What answers a `send` frame. Sender.issue has this shape; it is a
+     * functional interface so HxExtension can install it as a lambda, which
+     * keeps hx.send.Sender free of any declared dependency on this class
+     * beyond the Authorisation record it is handed.
+     */
+    @FunctionalInterface
+    public interface SendHandler {
+        Map<String, Object> handle(Map<String, Object> header, byte[] body, Authorisation auth);
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile SendHandler sendHandler;
+
+    /** Install the send path. Called before connect(): a client that is live
+     *  with no handler answers every send `not_configured`, which is correct
+     *  but useless. */
+    public void setSendHandler(SendHandler h) { this.sendHandler = h; }
+
+    /**
+     * The unsolicited stop frame, burp -> py.
+     *
+     * Spec s6: auto-halt is extension-initiated, so there is no outstanding id
+     * to answer. This is a push, not a reply, and it is the only way the
+     * harness learns of a stop before the next send fails -- which matters
+     * because `run.status = 'aborted'` needs a stop_reason, and the only place
+     * that reason exists is the extension that decided to stop.
+     */
+    public interface HaltNotifier {
+        void halted(String reason, String host, String window);
+    }
+
+    /**
+     * A notifier that frames {v, t:"halted", reason, host, window} and writes
+     * it down the socket.
+     *
+     * The three fields are what the harness needs to write one row: the
+     * reason, the host that produced it, and the window it was measured over
+     * -- "5xx rate 0.40" is not an explanation without the last of those.
+     */
+    public HaltNotifier haltNotifier() {
+        return (reason, host, window) -> {
+            Map<String, Object> f = new LinkedHashMap<>();
+            f.put("v", PROTOCOL_VERSION);
+            f.put("t", "halted");
+            f.put("reason", reason);
+            f.put("host", host);
+            f.put("window", window);
+            try {
+                send(f, new byte[0]);
+            } catch (IOException e) {
+                // The stop could not be delivered, so nothing on the far side
+                // will record it. A peer that cannot be told we stopped is a
+                // peer we have no authorisation from either: DENY-ALL is where
+                // an undelivered stop lands.
+                log.error("hx: halted frame undeliverable, deny-all: " + e);
+                denyAll();
+            }
+        };
+    }
+```
+
+And add this arm to `handle()`, between `case "configure"` and `case "halt"`:
+
+```java
+// extension/src/hx/bridge/BridgeClient.java -- new arm in handle()
+
+            case "send" -> {
+                if (!engagementId.equals(f.header.get("engagement_id"))) {
+                    // s6: every send carries it and the extension refuses a
+                    // mismatch. Client A's bytes must never reach client B's
+                    // report, and this is the cheapest place to say so.
+                    error(f, "engagement_mismatch",
+                          "send names engagement " + f.header.get("engagement_id")
+                          + " but this extension serves " + engagementId);
+                    return true;
+                }
+                SendHandler h = sendHandler;
+                if (h == null) {
+                    // "Nothing is wired up yet" is a state, not an exemption.
+                    error(f, "not_configured", "no send handler is installed");
+                    return true;
+                }
+                Map<String, Object> reply;
+                try {
+                    // ONE read of the snapshot per decision, carried down as a
+                    // parameter. The explicit receiver below is load-bearing:
+                    // ChokepointTest counts the snapshot read across
+                    // extension/src and expects exactly one, and it counts the
+                    // dotted form -- a bare call here reads as zero. Write it
+                    // with `this.` and leave it that way.
+                    reply = h.handle(f.header, f.body, this.authorisation());
+                } catch (Throwable ex) {
+                    // An exception is never an implicit allow. Answer the
+                    // caller so it gets an error class instead of a silent
+                    // bridge_lost, then drop to DENY-ALL and close: a send path
+                    // that threw is a send path we no longer understand, and
+                    // the terminal state is the only honest place to be.
+                    //
+                    // `ex`, not `t`: handle() already has a String t, the
+                    // frame type it switched on.
+                    log.error("hx: send handler threw, deny-all: " + ex);
+                    error(f, "not_configured", "send path failed internally: " + ex);
+                    denyAll();
+                    return false;
+                }
+                Object raw = reply.remove(BODY_KEY);
+                send(reply, raw instanceof byte[] b ? b : new byte[0]);
+            }
+```
+
+- [ ] **Step 12: Construct everything, and the one real Montoya call**
+
+```java
+// extension/src/hx/HxExtension.java
+package hx;
+
+import burp.api.montoya.BurpExtension;
+import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.core.ByteArray;
+import burp.api.montoya.http.HttpService;
+import burp.api.montoya.http.RedirectionMode;
+import burp.api.montoya.http.RequestOptions;
+import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.requests.HttpRequest;
+import hx.bridge.BridgeClient;
+import hx.policy.Clock;
+import hx.policy.Distress;
+import hx.policy.Policy;
+import hx.send.HaltSwitch;
+import hx.send.Http;
+import hx.send.HttpReply;
+import hx.send.Limits;
+import hx.send.Redactor;
+import hx.send.Sender;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.time.Instant;
+
+/**
+ * Burp entry point, and the only file in extension/src that names burp.* at
+ * all. It reads its socket path, engagement id, instance id and halt sentinel
+ * from system properties so the harness controls them at launch, builds the
+ * send path, then dials in on a background thread and stays in DENY-ALL until
+ * configured.
+ */
+public class HxExtension implements BurpExtension {
+
+    // Written on Burp's initialize thread, read by the unloading handler on
+    // another -- the same cross-thread edge the bridge's own fields were fixed
+    // for. Read it ONCE into a local there too: `if (client != null)
+    // client.close()` races itself, NPEs inside the handler, and skips the
+    // close() that was the point of the handler.
+    private volatile BridgeClient client;
+    private volatile HaltSwitch halt;
+
+    /** Single-digit req/s, per spec s4's production profile. Used only when a
+     *  configure body omits limit.rate_rps. */
+    static final long DEFAULT_RATE_RPS = 5L;
+
+    /** The per-run budget when a configure body omits limit.max_requests. */
+    static final long DEFAULT_MAX_REQUESTS = 2000L;
+
+    @Override
+    public void initialize(MontoyaApi api) {
+        api.extension().setName("hx bridge");
+
+        String sock = System.getProperty("hx.socket");
+        String engagement = System.getProperty("hx.engagement");
+        String instance = System.getProperty("hx.instance", "unknown");
+        String sentinel = System.getProperty("hx.halt_sentinel");
+
+        if (sock == null || engagement == null || sentinel == null) {
+            // The sentinel is required, not optional. It is the kill path that
+            // works when the bridge does not -- an operator creating a file
+            // from a shell while the socket is dead -- and an extension that
+            // went live without one would have two of the three paths spec s4
+            // promises, silently.
+            api.logging().logToError("hx: -Dhx.socket, -Dhx.engagement and "
+                + "-Dhx.halt_sentinel are required; extension idle");
+            return;
+        }
+        System.setProperty("hx.burp.version", api.burpSuite().version().toString());
+
+        // Wall clock, not System.nanoTime(). deadline_us is absolute
+        // microseconds since epoch, set by the harness on the other side of
+        // the socket; a monotonic clock answers a different question and
+        // cannot be compared with the peer's deadline at all.
+        Clock clock = () -> {
+            Instant t = Instant.now();
+            return t.getEpochSecond() * 1_000_000L + t.getNano() / 1_000L;
+        };
+
+        Redactor redactor = new Redactor();
+        HaltSwitch haltSwitch = new HaltSwitch(clock, Path.of(sentinel),
+                                               HaltSwitch.DEFAULT_POLL_MS);
+        // Spec s4's auto-halt thresholds: stop above a 20% 5xx rate, above 5x
+        // the baseline p50 latency, or after 5 consecutive connection errors.
+        // s4 calls these engagement-config defaults and s14 flags them for
+        // tuning, which is why Distress takes all three as constructor
+        // arguments rather than owning them -- but the configure body cannot
+        // carry them yet: ConfigBody.KEYS has no distress key and an
+        // unrecognised key is a hard error, so routing them through the wire
+        // is a protocol change (the parser, the protocol document, and the
+        // harness that writes the body) rather than a wiring change here.
+        Distress distress = new Distress(clock, 0.20, 5.0, 5);
+        // The rate and the budget DO arrive in the configure body, so these
+        // two numbers are only what an omitted key falls back to. Limits reads
+        // them out of the Authorisation snapshot -- see below, and see why it
+        // reads them exactly once.
+        Limits limits = new Limits(clock, DEFAULT_RATE_RPS, DEFAULT_MAX_REQUESTS);
+
+        BridgeClient c = new BridgeClient(Path.of(sock), engagement, instance,
+                new BridgeClient.Log() {
+                    public void info(String s)  { api.logging().logToOutput(s); }
+                    public void error(String s) { api.logging().logToError(s); }
+                });
+
+        Sender sender = new Sender(new Policy(limits), redactor, haltSwitch,
+                                   distress, montoyaHttp(api, clock), clock);
+        // Auto-halt is extension-initiated: there is no outstanding id to
+        // answer, so this frame is the only way the harness hears about a stop
+        // before the next send fails -- and run.status = 'aborted' needs a
+        // stop_reason that exists nowhere else.
+        sender.setHaltNotifier(c.haltNotifier());
+
+        // Handler, halt sink and sentinel poller all installed BEFORE the
+        // dial: a window in which the client is live with one of the three
+        // kill paths missing is a window in which spec s4's promise is not
+        // true.
+        c.setSendHandler((header, body, auth) -> {
+            // The limits the operator configured, taken from the same snapshot
+            // this request is about to be decided under. Armed once; a later
+            // configure re-authorises scope, not issuance.
+            limits.arm(auth);
+            return sender.issue(header, body, auth);
+        });
+        // Without this, a halt frame reaches BridgeClient's own flag and
+        // stops nothing: that flag governs maySend(), and the send path asks
+        // HaltSwitch.
+        c.setHaltSink(new BridgeClient.HaltSink() {
+            public void halted(String reason) { haltSwitch.haltedByFrame(reason); }
+            public void resumed()             { haltSwitch.resumedByFrame(); }
+        });
+        haltSwitch.start();
+        this.halt = haltSwitch;
+        this.client = c;
+
+        Thread t = new Thread(() -> {
+            try {
+                c.connect();
+            } catch (Exception e) {
+                api.logging().logToError("hx: bridge connect failed: " + e);
+            }
+        }, "hx-bridge");
+        t.setDaemon(true);
+        t.start();
+
+        api.extension().registerUnloadingHandler(() -> {
+            BridgeClient live = client;
+            if (live != null) live.close();
+            HaltSwitch h = halt;
+            if (h != null) h.stop();
+        });
+        api.logging().logToOutput("hx: bridge dialling " + sock);
+    }
+
+    /**
+     * The extension's only route to the network.
+     *
+     * Everything above this line is testable without Burp; nothing below it
+     * is. Keeping it to one lambda is what makes ChokepointTest's count mean
+     * something.
+     */
+    private static Http montoyaHttp(MontoyaApi api, Clock clock) {
+        return (req, deadlineUs) -> {
+            HttpService service = HttpService.httpService(
+                    req.host(), Sender.portOf(req), Sender.secureOf(req));
+            HttpRequest request = HttpRequest.httpRequest(
+                    service, ByteArray.byteArray(Sender.wireBytes(req)));
+
+            // Burp's own timeout is an optimisation; ours is the enforcement.
+            // Sender re-reads the clock after this returns and answers
+            // `timeout` on its own account, so an overshoot here -- or a unit
+            // that is not what we think it is -- cannot turn into a result
+            // frame for a caller that stopped waiting.
+            long remainingMs = Math.max(1L, (deadlineUs - clock.nowUs()) / 1000L);
+            RequestOptions options = RequestOptions.requestOptions()
+                    // Spec s4: redirects are not auto-followed. Each hop is a
+                    // distinct issuance with its own scope decision. Burp does
+                    // not follow them on sendRequest today; saying so
+                    // explicitly means a future default cannot create an
+                    // egress path that never crossed Policy.
+                    .withRedirectionMode(RedirectionMode.NEVER)
+                    .withResponseTimeout(remainingMs);
+
+            // Monotonic, because this one IS a duration. Instant.now() would
+            // measure an NTP step as latency and feed it to Distress, whose
+            // latency rule stops the whole run at 5x baseline.
+            long t0 = System.nanoTime();
+            HttpRequestResponse rr;
+            try {
+                rr = api.http().sendRequest(request, options);
+            } catch (RuntimeException e) {
+                // Montoya answers most transport failures with a response-less
+                // HttpRequestResponse rather than throwing, but "most" is not
+                // "all", and a RuntimeException escaping here would reach
+                // BridgeClient's catch-all and close the connection. Sender
+                // handles IOException and feeds it to Distress; give it one.
+                throw new IOException("sendRequest failed for " + req.url(), e);
+            }
+            long ms = (System.nanoTime() - t0) / 1_000_000L;
+
+            if (!rr.hasResponse())
+                // A refused connection, a DNS failure and a TLS failure all
+                // arrive here rather than as an exception. The flag is what
+                // lets Distress count them toward its consecutive-error stop;
+                // a status of 0 would count as an ordinary non-5xx reply.
+                return new HttpReply(0, new byte[0], ms, true);
+
+            return new HttpReply(rr.response().statusCode(),
+                                 rr.response().toByteArray().getBytes(), ms, false);
+        };
+    }
+}
+```
+
+- [ ] **Step 13: Run `ChokepointTest` and watch it pass**
+
+Run: `cd extension && ./test.sh`
+Expected: PASS — `ALL PASS` from `hx.ChokepointTest`, with
+
+```
+  ok   the egress call appears exactly once in extension/src, not 1 times [src/hx/HxExtension.java x1]
+  ok   burp.* is imported only by src/hx/HxExtension.java, not by [src/hx/HxExtension.java]
+  ok   the whole extension reads the Authorisation snapshot in exactly one place, not 1
+```
+
+- [ ] **Step 14: Sabotage — add a second egress path**
+
+In `HxExtension.montoyaHttp`, duplicate the call:
+
+```java
+                rr = api.http().sendRequest(request, options);
+                api.http().sendRequest(request, options);
+```
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL —
+
+```
+  FAIL the egress call appears exactly once in extension/src, not 2 times [src/hx/HxExtension.java x2]
+```
+
+Then try the subtler version, which is the one that would actually happen: add
+a helper elsewhere. Put this method in `extension/src/hx/send/Sender.java`:
+
+```java
+    /** SABOTAGE: a "convenience" retry helper. */
+    public static void retry(MontoyaApi api, HttpRequest r) {
+        api.http().sendRequest(r);
+    }
+```
+
+and the two imports it needs at the top of that file:
+
+```java
+import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.http.message.requests.HttpRequest;
+```
+
+Expected: FAIL, three reds, and the third is the one that catches the shape
+rather than the string:
+
+```
+  FAIL the egress call appears exactly once in extension/src, not 2 times [src/hx/HxExtension.java x1, src/hx/send/Sender.java x1]
+  FAIL and it is in src/hx/HxExtension.java, not [src/hx/HxExtension.java x1, src/hx/send/Sender.java x1]
+  FAIL burp.* is imported only by src/hx/HxExtension.java, not by [src/hx/HxExtension.java, src/hx/send/Sender.java]
+```
+
+Restore both:
+`git checkout -- extension/src/hx/HxExtension.java extension/src/hx/send/Sender.java`
+
+- [ ] **Step 15: Sabotage — straddle the commit**
+
+In `BridgeClient`'s new `send` arm, replace the coherent read with the pair
+that Plan 2 deprecated:
+
+```java
+                    reply = h.handle(f.header, f.body,
+                            new Authorisation(this.configEpoch(), this.scopeConfig()));
+```
+
+Run: `cd extension && ./test.sh`
+
+Expected: FAIL —
+
+```
+  FAIL nothing in extension/src calls the deprecated configEpoch() (1)
+  FAIL nothing in extension/src calls the deprecated scopeConfig() (1)
+  FAIL the whole extension reads the Authorisation snapshot in exactly one place, not 0
+```
+
+This is the sabotage that matters most and the one no behavioural test can
+catch: the code above compiles, passes every `SenderTest` assertion, and works
+perfectly except in the window where a `configure` commits between the two
+reads — measured 393/400 in the unsafe direction, decide under the superseded
+wider scope and stamp it with the epoch that narrowed it.
+
+Restore: `git checkout -- extension/src/hx/bridge/BridgeClient.java`
+
+- [ ] **Step 16: Test the send arm itself**
+
+Add these to `extension/test/hx/bridge/BridgeClientTest.java`, using its
+existing `check`, `live`, `waitUntil` and `Live` helpers:
+
+```java
+// added to extension/test/hx/bridge/BridgeClientTest.java, called from main()
+
+    static Map<String, Object> sendFrame(String engagement, long id) {
+        Map<String, Object> s = new LinkedHashMap<>();
+        s.put("v", 1L); s.put("t", "send"); s.put("id", id);
+        s.put("deadline_us", System.currentTimeMillis() * 1000L + 30_000_000L);
+        s.put("engagement_id", engagement);
+        s.put("identity_id", null);
+        s.put("target_host", "app.example.test");
+        s.put("target_port", 443L);
+        s.put("tls", true);
+        return s;
+    }
+
+    static final byte[] GET = ("GET /api/orders HTTP/1.1\r\nHost: app.example.test\r\n\r\n")
+            .getBytes(StandardCharsets.UTF_8);
+
+    /** The send arm reads the Authorisation ONCE and hands the whole snapshot
+     *  down. This is the only place in the extension that reads it at all. */
+    static void theSendArmHandsTheHandlerOneCoherentAuthorisation() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendarm");
+        try (Live l = live(dir, "s.sock")) {
+            final List<BridgeClient.Authorisation> seen = new ArrayList<>();
+            l.client.setSendHandler((h, b, auth) -> {
+                seen.add(auth);
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("v", 1L); r.put("t", "result"); r.put("id", h.get("id"));
+                r.put("status", 200L); r.put("outcome", "ok");
+                r.put(BridgeClient.BODY_KEY,
+                      "HTTP/1.1 200 OK\r\n\r\nhi".getBytes(StandardCharsets.UTF_8));
+                return r;
+            });
+
+            l.out.write(Frame.encode(sendFrame("e-1", 11L), GET));
+            l.out.flush();
+            Frame.Decoded result = l.reader.read();
+
+            check("the send arm answers with the handler's frame",
+                  "result".equals(result.header.get("t")));
+            check("the handler saw the request body",
+                  Long.valueOf(11L).equals(result.header.get("id")));
+            check("the reserved body key never reaches the wire",
+                  !result.header.containsKey(BridgeClient.BODY_KEY));
+            check("and its bytes became the frame body",
+                  "HTTP/1.1 200 OK\r\n\r\nhi".equals(
+                          new String(result.body, StandardCharsets.UTF_8)));
+            check("the handler was given exactly one Authorisation", seen.size() == 1);
+            check("with the acked epoch", seen.get(0).epoch() == 1L);
+            check("and the scope that epoch authorised",
+                  seen.get(0).scope().toString().contains("WIDE"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("s.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** s6: every send carries engagement_id and the extension refuses a
+     *  mismatch -- before the handler, which would otherwise decide about a
+     *  request belonging to somebody else's engagement. */
+    static void aSendForAnotherEngagementNeverReachesTheHandler() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendmismatch");
+        try (Live l = live(dir, "m.sock")) {
+            final int[] calls = {0};
+            l.client.setSendHandler((h, b, auth) -> { calls[0]++; return new LinkedHashMap<>(); });
+
+            l.out.write(Frame.encode(sendFrame("SOMEONE-ELSE", 12L), GET));
+            l.out.flush();
+            Frame.Decoded err = l.reader.read();
+
+            check("a send for another engagement is answered with an error",
+                  "error".equals(err.header.get("t")));
+            check("the class names the mismatch",
+                  "engagement_mismatch".equals(err.header.get("class")));
+            check("and the handler was never called (" + calls[0] + ")", calls[0] == 0);
+            check("the connection survives a mismatched send", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("m.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** An exception is never an implicit allow. A handler that throws is
+     *  answered, then the client drops to DENY-ALL and closes. */
+    static void aSendHandlerThatThrowsDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendthrow");
+        try (Live l = live(dir, "t.sock")) {
+            check("live before the throw", l.client.maySend());
+            l.client.setSendHandler((h, b, auth) -> {
+                throw new IllegalStateException("policy table was null");
+            });
+
+            l.out.write(Frame.encode(sendFrame("e-1", 13L), GET));
+            l.out.flush();
+            Frame.Decoded err = l.reader.read();
+
+            check("a throwing handler still answers the caller",
+                  "error".equals(err.header.get("t")));
+            check("with a class rather than a silent bridge_lost",
+                  "not_configured".equals(err.header.get("class")));
+            check("and the detail names the failure",
+                  String.valueOf(err.header.get("detail")).contains("policy table was null"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a send path that threw drops to DENY-ALL", !l.client.maySend());
+            check("and the transition is logged",
+                  l.log.sawError("send handler threw"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("t.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** No handler is a state, not an exemption. */
+    static void aSendWithNoHandlerInstalledIsRefused() throws Exception {
+        Path dir = Files.createTempDirectory("hxnohandler");
+        try (Live l = live(dir, "n.sock")) {
+            l.out.write(Frame.encode(sendFrame("e-1", 14L), GET));
+            l.out.flush();
+            Frame.Decoded err = l.reader.read();
+            check("a send with no handler is refused",
+                  "error".equals(err.header.get("t"))
+                  && "not_configured".equals(err.header.get("class")));
+        } finally {
+            Files.deleteIfExists(dir.resolve("n.sock")); Files.deleteIfExists(dir);
+        }
+    }
+```
+
+Then call all four from `main`, on the four lines immediately after the two
+Task 5 added — so the block ends:
+
+```java
+            aConfigureDoesNotLiftAHalt();
+            haltFramesReachTheSwitchTheSendPathAsks();
+            aHaltSinkThatThrowsDropsToDenyAll();
+            theSendArmHandsTheHandlerOneCoherentAuthorisation();
+            aSendForAnotherEngagementNeverReachesTheHandler();
+            aSendHandlerThatThrowsDropsToDenyAll();
+            aSendWithNoHandlerInstalledIsRefused();
+```
+
+`BridgeClientTest` needs `java.util.ArrayList` and `java.util.List` imports if
+its `java.util.*` wildcard was ever narrowed; it currently imports `java.util.*`,
+so nothing to add. `java.nio.charset.StandardCharsets` and `java.nio.file.*` are
+already imported too, which is what `GET` and `Files.createTempDirectory` need.
+
+- [ ] **Step 17: Record `engagement_id` and `config_epoch` in the wire protocol document**
+
+Two rows of the frame table in `docs/bridge-protocol.md` are now wrong. The
+`send` row omits `engagement_id`, which the send arm written in Step 11
+requires and refuses a mismatch on; the `result` row still carries
+`exchange_id`, which the extension has never had, and not the epoch that
+authorised the request. Replace both rows:
+
+```
+  py -> burp   send        {v,t,id,deadline_us,engagement_id,identity_id,target_host,target_port,tls}
+                           body: raw HTTP request bytes
+  burp -> py   result      {v,t,id,status,bytes,ms,outcome,config_epoch}
+                           body: redacted raw HTTP response bytes
+```
+
+and add, under "Frame types":
+
+```
+`send.engagement_id` is required. The extension serves exactly one engagement
+and refuses a send that names another with class `engagement_mismatch`, before
+the request is decided about at all: one client's bytes must never reach
+another client's report, and two harnesses sharing a Burp is the way that
+happens.
+
+`result.config_epoch` is the epoch of the Authorisation the request was
+decided under, read in one shot with the scope that epoch granted. It is the
+answer to "what was in scope when request X was issued", and it has to come
+from the same read as the decision or it is not an answer at all.
+
+`exchange_id` is NOT on this frame. It is a store row id, assigned by
+`record_exchange()` on the Python side; the extension has none to give.
+```
+
+- [ ] **Step 18: Re-sync the Plan 2 blocks this task made stale**
+
+`tests/test_plan_matches_repo.py` byte-compares **every** plan's code blocks
+against the files they name, not just this plan's. Three of the files edited
+above are carried as full-file blocks by
+`docs/superpowers/plans/2026-08-21-bridge-transport.md`, so that suite is red
+until they agree again. Sync the block from the file, never the file from the
+block:
+
+```bash
+.venv/bin/pytest tests/test_plan_matches_repo.py -q
+```
+
+Expected before this step: FAIL, with ids naming
+`2026-08-21-bridge-transport.md::extension/src/hx/bridge/BridgeClient.java`
+and `...::extension/test/hx/bridge/BridgeClientTest.java` — the send arm, the
+`BODY_KEY`/`SendHandler`/`HaltNotifier` members and the four new test methods
+are in the files and not in Plan 2's blocks. (Task 5's halt arms are in the
+same two files; if Task 5 has already run, its edits come along in the same
+re-sync.)
+
+Replace the body of each of those two blocks with the current contents of the
+file it names, verbatim, keeping the `// path` first line.
+
+The third file, `extension/src/hx/HxExtension.java`, is a **duplicate block,
+not a stale one**. Step 12 above is now the plan block for that file, and two
+blocks naming one file would have to be kept byte-identical forever — the
+older one describing code nobody can read from it any more, and both of them
+going red the next time either is edited. Delete Plan 2's copy: in
+`docs/superpowers/plans/2026-08-21-bridge-transport.md`, replace the whole of
+its `Step 4: Write HxExtension.java` — the heading line, the java block and
+nothing else — with:
+
+```markdown
+- [ ] **Step 4: Write `HxExtension.java`**
+
+The Burp entry point: read `-Dhx.socket`, `-Dhx.engagement` and
+`-Dhx.instance` from system properties, build a `BridgeClient`, dial on a
+daemon thread, and close it from an unloading handler.
+
+The file itself is not reproduced here. Task 6 of
+`2026-08-22-enforcement-send-path.md` rewrites it to construct the send path,
+and that plan carries the full file; `tests/test_plan_matches_repo.py`
+byte-compares every block against the file it names, so a second copy here
+could only ever be a duplicate to keep in step or a lie about what the file
+now contains.
+```
+
+Run: `.venv/bin/pytest tests/test_plan_matches_repo.py -q`
+Expected: PASS, and the id list no longer contains an `HxExtension.java` case
+for Plan 2 — one case for it, from this plan.
+
+- [ ] **Step 19: Run everything**
+
+Run: `cd extension && ./test.sh`
+Expected: PASS — `ALL PASS` from every class, `hx.send.SenderTest` and
+`hx.ChokepointTest` included.
+
+Run: `.venv/bin/pytest -q`
+Expected: PASS. `tests/test_plan_matches_repo.py` now byte-compares this task's
+seven full-file blocks (`Http.java`, `HttpReply.java`, `Limits.java`,
+`Sender.java`, `SenderTest.java`, `ChokepointTest.java`, `HxExtension.java`)
+against the files, and Plan 2's two remaining Java blocks after Step 18. If any
+differ, **sync the block from the file** — never the other way.
+
+Run: `cd extension && ./build.sh`
+Expected: `built .../extension/build/hx-bridge.jar`. The jar has to compile
+against the real `montoya-api.jar`; `test.sh` compiles the same sources, but
+building is the step that proves the manifest and the jar still assemble.
+
+- [ ] **Step 20: Commit**
+
+```bash
+git add extension/src/hx/send/Http.java extension/src/hx/send/HttpReply.java \
+        extension/src/hx/send/Limits.java extension/src/hx/send/Sender.java \
+        extension/src/hx/HxExtension.java \
+        extension/src/hx/bridge/BridgeClient.java \
+        extension/test/hx/send/SenderTest.java extension/test/hx/ChokepointTest.java \
+        extension/test/hx/bridge/BridgeClientTest.java extension/test.sh \
+        docs/bridge-protocol.md \
+        docs/superpowers/plans/2026-08-21-bridge-transport.md
+git commit -m "feat(send): Sender chokepoint, deadline enforcement, structural egress test
+
+Every request hx issues passes through Sender.issue, which is the only caller
+of anything that can reach a network. ChokepointTest asserts that by counting
+over extension/src: one egress call, no batch egress call, burp.* imported by
+HxExtension alone, and exactly one read of the Authorisation snapshot.
+
+deadline_us stops being decoration: a send whose deadline has passed is
+refused with timeout before the gate is consulted, and one that expires
+mid-flight is reported as timeout rather than framed as evidence for a caller
+that stopped waiting.
+
+An auto-halt now announces itself. Distress is extension-initiated and has no
+outstanding id to answer, so Sender pushes one unsolicited halted frame the
+first time a host trips it -- reason, host and window, which is what
+run.stop_reason is written from.
+
+The rate and the budget come from the configure body rather than from this
+jar: limit.rate_rps and limit.max_requests are read out of the same
+Authorisation snapshot the request is decided under, once per run, because a
+scope push must not resupply a run that has spent its requests.
+
+Every denial class is tested as zero calls to a fake Http, not as an error
+map: 'the request was denied' and 'the request never left the JVM' are
+different claims, and only the second is the invariant."
+```
+
+---
+
+### Task 7: The Python side — `send()`, the durable halt, and the records
+
+**Files:**
+- Create: `src/hx/store/records.py`
+- Create: `src/hx/halt.py`
+- Create: `tests/test_records.py`
+- Create: `tests/test_halt.py`
+- Modify: `src/hx/bridge/server.py` — `send()`, the `halted` frame, halt durability
+- Modify: `tests/test_bridge_server.py` — four imports and thirteen appended tests
+- Modify: `docs/bridge-protocol.md` — the `halted` frame, `error`'s `retry_after_us`, and what `halt`/`resume` actually carry
+- Modify: `docs/superpowers/plans/2026-08-21-bridge-transport.md` — re-sync its full-file blocks for `server.py` and `test_bridge_server.py`, which this task edits
+- Test: `tests/test_records.py`, `tests/test_halt.py`, `tests/test_bridge_server.py`
+
+**Interfaces:**
+- Consumes:
+  - `hx.bridge.codec` — `PROTOCOL_VERSION`, `encode(header, body) -> bytes`, `FrameReader(sock).read() -> (dict, bytes)`, `parse_config_body(bytes)` (Plan 2)
+  - `hx.bridge.server.BridgeServer(socket_path, engagement_id, on_hello=None)` with `state`, `config_epoch`, `configure()`, `halt()`, `resume()`, `_request()`, `_send()`, `_reset()` (Plan 2)
+  - `hx.store.db.connect(path)` / `init_schema(conn)`, and Plan 1's `schema.sql` — the `denial`, `exchange`, `run` and `agent_action` tables, with their CHECK vocabularies
+  - `hx.store.paths.secure_mkdir(path)` (Plan 1)
+  - Frames produced by the extension: `result {v,t,id,status,bytes,ms,outcome,config_epoch}` + body, `error {v,t,id,class,detail[,retry_after_us]}`, `halted {v,t,reason,host,window}` (Task 6, spec §6)
+- Produces:
+  - `hx.store.records.record_denial(conn, *, run_id, kind, method, url, detail, at_us, resolved_ip=None, scope_version_id=None) -> str`
+  - `hx.store.records.record_exchange(conn, *, run_id, method, url, status, req_blob, resp_blob, ms, at_us, outcome="ok", resp_len=None, surface_id=None, scope_version_id=None, seq=None) -> str`
+  - `hx.store.records.abort_run(conn, *, run_id, stop_reason, at_us) -> bool`
+  - `hx.store.records.new_id(prefix) -> str`, and the vocabulary maps `DENIAL_KIND`, `EXCHANGE_OUTCOME`, `UNRECORDABLE`
+  - `hx.halt.OperatorHalt(engagement_dir, db)` — `halt(reason)`, `resume()`, `halted`, `reason`, `sentinel_path`; `hx.halt.HaltError`
+  - `hx.bridge.server.BridgeServer.send(req, body=b"", timeout=30.0) -> dict`, `BridgeServer.BODY_KEY`
+  - `hx.bridge.server.BridgeServer(..., on_halted=None, operator_halt=None)`, plus `last_halted` and `halted_callback_error`
+  - `hx.bridge.server.BridgeError(message, *, error_class=None, retry_after_us=None)`
+- Consumed by: Plan 4's tool layer (§8's `http.send` goes through `BridgeServer.send`, and every `BridgeError` it raises becomes a `denial` row through `DENIAL_KIND`), and the integration task, which drives a real Burp through the same three calls.
+
+This is the harness half of the enforcement story. The extension decides and
+issues; Python asks, records what happened, and owns the one piece of state
+the extension is not allowed to forget. Three things ship together because
+each is useless without the others: `send()` gives the agent a way to ask,
+`records.py` gives the answer somewhere to land, and `OperatorHalt` makes
+"stop" outlive the processes that were told to stop.
+
+**One thing this task argued and won.** `record_denial` and `record_exchange`
+return **`str`**, and the Interface Contract now says `str` too. It said `-> int`
+when this task was drafted, and the argument that changed it is worth keeping:
+both tables key on `TEXT` ids (`denial.id`, `exchange.id`),
+`evidence.exchange_id` and `finding_observation.exchange_id` are `REFERENCES
+exchange(id)`, and Task 6's own protocol note says `exchange_id` "is a store row
+id, assigned by `record_exchange()`". An `int` there could only be the SQLite
+rowid, which nothing in the schema can join on — a return value that reads as
+useful and is not. Every signature, test and docstring below says `str`; there
+is no deviation left in it.
+
+**Two places this task still disagrees with the Interface Contract.** Neither is
+a silent change; each is argued here and named in the commit.
+
+1. Both writers take **more keyword-only parameters** than the contract lists:
+   `outcome`, `resp_len`, `surface_id`, `scope_version_id`, `seq`,
+   `resolved_ip`, all defaulted. Because every parameter is keyword-only, this
+   is a strict superset — a call written against the contract still binds — and
+   `outcome` in particular is not optional in practice: `exchange.outcome` is a
+   CHECK-constrained vocabulary, so a hard-coded `'ok'` would make every failed
+   send unrecordable.
+2. `BridgeServer` gains a keyword argument the contract does not name:
+   **`operator_halt`**. The contract asks for a durable halt that is re-asserted
+   after every `hello` and never cleared by `_reset()`, and the bridge has to be
+   able to *read* that state to re-assert it. It is duck-typed on `.halted` and
+   `.reason`, so `server.py` still imports nothing from the store.
+
+Three more findings, recorded rather than fixed here:
+
+- **§6 enumerates ten error classes and the send path emits thirteen.** The
+  plan's own pinned decision order (`not_configured` → `halted` →
+  `scope_denied` → …) and `Sender.issue` both emit `halted`, and the Interface
+  Contract adds `bad_frame` (a `send` with no `deadline_us`, or a body that
+  will not parse) and `engagement_mismatch`. The harness has to be able to
+  receive all three, so `SEND_PATH_ERROR_CLASSES` pins the whole set of
+  thirteen and a test fails the moment a fourteenth appears with nowhere to
+  go. §6's list is what needs amending.
+- **`unmanaged_credential` is a denial with no row to go in.** `denial.kind`'s
+  vocabulary predates the class, and widening a CHECK constraint is a schema
+  migration this plan does not do. Until then that refusal cannot satisfy §4's
+  "denials are never silent". It is the first gap to close in the store.
+- **`bad_frame` and `engagement_mismatch` have no row either, for a different
+  reason.** They are refusals like any other — §4 covers them — but neither is
+  a decision *about a request*: the extension either could not read the frame
+  or found it addressed to another engagement, so there is no method/url pair
+  it ever agreed to look at, and in the mismatch case this is not even the
+  store the refusal belongs in. `records.UNRECORDABLE` names both with that
+  reasoning attached, so nobody has to rediscover it.
+
+`docs/bridge-protocol.md` records `halt` and `resume` as carrying `id` and
+`deadline_us`. They never have: `halt()` and `resume()` call `_send()`
+directly, and only `_request()` stamps those two fields. Step 18 corrects the
+document rather than the code — a control frame nobody replies to has nothing
+to correlate and no work to abandon.
+
+
+- [ ] **Step 1: Write the failing test for the records**
+
+```python
+# tests/test_records.py
+import re
+import sqlite3
+
+import pytest
+
+from hx import engagement as engagement_mod
+from hx.store import db as db_mod
+from hx.store import records
+
+# Every class the extension may put on an `error` frame answering a `send`.
+# The first ten are S6's enumeration verbatim. The last three are NOT in that
+# list and are pinned here so they cannot become silent denials:
+#
+#   halted               the plan's pinned decision order (not_configured ->
+#                        halted -> scope_denied -> ...) and Sender.issue both
+#                        emit it; it is the class an operator stop produces.
+#   bad_frame            a send with no deadline_us, or a body that will not
+#                        parse as an HTTP request.
+#   engagement_mismatch  the frame named an engagement this extension does not
+#                        serve.
+#
+# The Interface Contract names all three. A harness that only knew the ten
+# would have nowhere to put any of them, and S6's list is what needs the
+# amendment.
+SEND_PATH_ERROR_CLASSES = frozenset({
+    "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
+    "budget_exhausted", "not_configured", "unmanaged_credential",
+    "transport_error", "timeout", "bridge_lost",
+    "halted", "bad_frame", "engagement_mismatch",
+})
+
+
+@pytest.fixture
+def conn(tmp_path):
+    c = db_mod.connect(tmp_path / "hx.db")
+    db_mod.init_schema(c)
+    c.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+              " VALUES('e-1','Example','Example Ltd',1,'active')")
+    c.execute("INSERT INTO run(id, engagement_id, kind, safety_profile,"
+              " started_us, status)"
+              " VALUES('r-1','e-1','manual','production',1700000000000000,'running')")
+    yield c
+    c.close()
+
+
+def test_a_denial_row_says_what_was_refused_and_why(conn):
+    row_id = records.record_denial(
+        conn, run_id="r-1", kind="dangerous",
+        method="POST", url="https://app.example.test/account/delete",
+        detail="path matches dangerous.path /account/delete",
+        at_us=1700000000000042)
+    assert re.fullmatch(r"d-[0-9a-f]{12}", row_id)
+    row = conn.execute("SELECT * FROM denial WHERE id=?", (row_id,)).fetchone()
+    assert row["run_id"] == "r-1"
+    assert row["ts_us"] == 1700000000000042
+    assert row["kind"] == "dangerous"
+    assert row["method"] == "POST"
+    assert row["url"] == "https://app.example.test/account/delete"
+    assert row["reason"] == "path matches dangerous.path /account/delete"
+
+
+def test_every_mapped_error_class_is_a_kind_the_schema_accepts(conn):
+    for error_class, kind in records.DENIAL_KIND.items():
+        records.record_denial(conn, run_id="r-1", kind=kind, method="GET",
+                              url="https://app.example.test/api/orders",
+                              detail=error_class, at_us=1)
+    assert conn.execute("SELECT COUNT(*) FROM denial").fetchone()[0] == \
+        len(records.DENIAL_KIND)
+
+
+def test_every_send_path_error_class_has_somewhere_to_go():
+    """A new error class with no row to go in is a silent denial, and S4 says
+    denials are never silent. This fails the moment one is added without
+    deciding where it lands -- including into records.UNRECORDABLE, which is
+    the honest answer for the five that Plan 1's schema has no vocabulary
+    for."""
+    accounted = (set(records.DENIAL_KIND) | set(records.EXCHANGE_OUTCOME)
+                 | set(records.UNRECORDABLE))
+    assert accounted == SEND_PATH_ERROR_CLASSES
+
+
+def test_a_kind_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn):
+    with pytest.raises(ValueError, match="not a denial kind"):
+        records.record_denial(conn, run_id="r-1", kind="unmanaged_credential",
+                              method="GET", url="https://app.example.test/api/orders",
+                              detail="Authorization header we did not inject",
+                              at_us=1)
+    assert conn.execute("SELECT COUNT(*) FROM denial").fetchone()[0] == 0
+
+
+def test_a_denial_against_an_unknown_run_is_refused_by_the_foreign_key(conn):
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        records.record_denial(conn, run_id="r-does-not-exist", kind="scope",
+                              method="GET", url="https://elsewhere.example.test/",
+                              detail="host not in scope", at_us=1)
+
+
+def test_a_denial_with_no_run_is_allowed(conn):
+    """not_configured happens at 02:00 before any run exists, and that denial
+    is exactly the one worth having."""
+    row_id = records.record_denial(conn, run_id=None, kind="not_configured",
+                                   method="GET", url="https://app.example.test/",
+                                   detail="no configure frame acknowledged yet",
+                                   at_us=1)
+    assert conn.execute("SELECT run_id FROM denial WHERE id=?",
+                        (row_id,)).fetchone()["run_id"] is None
+
+
+def test_an_exchange_row_records_the_pair_and_derives_recv_us(conn):
+    row_id = records.record_exchange(
+        conn, run_id="r-1", method="GET",
+        url="https://app.example.test/api/orders?page=2", status=200,
+        req_blob="a" * 64, resp_blob="b" * 64, ms=42,
+        at_us=1700000000000000, resp_len=1312)
+    assert re.fullmatch(r"x-[0-9a-f]{12}", row_id)
+    row = conn.execute("SELECT * FROM exchange WHERE id=?", (row_id,)).fetchone()
+    assert row["via"] == "send"
+    assert row["outcome"] == "ok"
+    assert row["status"] == 200
+    assert row["sent_us"] == 1700000000000000
+    assert row["recv_us"] == 1700000000042000
+    assert row["resp_len"] == 1312
+    assert row["body_shed"] == 0
+
+
+def test_a_solicited_exchange_is_never_shed(conn):
+    """S6: solicited exchanges are never shed -- they are about to become
+    evidence. Only unsolicited proxy observations may set body_shed."""
+    for outcome in ("ok", "timeout", "bridge_lost"):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=200 if outcome == "ok" else None,
+                                req_blob="a" * 64, resp_blob=None, ms=1,
+                                at_us=1, outcome=outcome)
+    assert conn.execute("SELECT COUNT(*) FROM exchange WHERE body_shed != 0"
+                        ).fetchone()[0] == 0
+
+
+def test_an_outcome_outside_the_vocabulary_is_refused(conn):
+    with pytest.raises(ValueError, match="not an exchange outcome"):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=None, req_blob=None, resp_blob=None,
+                                ms=0, at_us=1, outcome="transport_error")
+
+
+def test_an_ok_exchange_with_no_status_is_refused(conn):
+    with pytest.raises(ValueError, match="no status"):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=None, req_blob="a" * 64, resp_blob=None,
+                                ms=7, at_us=1)
+
+
+def test_a_halted_run_is_aborted_once_and_keeps_the_first_reason(conn):
+    assert records.abort_run(
+        conn, run_id="r-1",
+        stop_reason="5xx rate 0.40 on app.example.test (50 requests / 37s)",
+        at_us=1700000000900000) is True
+    row = conn.execute("SELECT status, stop_reason, ended_us FROM run"
+                       " WHERE id='r-1'").fetchone()
+    assert row["status"] == "aborted"
+    assert row["stop_reason"].startswith("5xx rate 0.40")
+    assert row["ended_us"] == 1700000000900000
+
+    assert records.abort_run(conn, run_id="r-1",
+                             stop_reason="5 consecutive connection errors",
+                             at_us=1700000001000000) is False
+    assert conn.execute("SELECT stop_reason FROM run WHERE id='r-1'"
+                        ).fetchone()["stop_reason"].startswith("5xx rate 0.40")
+
+
+def test_aborting_a_run_that_is_not_in_this_store_is_an_error(conn):
+    with pytest.raises(ValueError, match="no run"):
+        records.abort_run(conn, run_id="r-nope", stop_reason="x", at_us=1)
+
+
+def test_ids_have_the_shape_the_rest_of_the_store_uses():
+    """`hx.engagement._new_id` is this function's twin. They are not one
+    function yet -- engagement.py belongs to Plan 1 and collapsing them is a
+    refactor with its own test surface -- so this pins the shape rather than
+    letting the two drift apart unnoticed."""
+    assert re.fullmatch(r"d-[0-9a-f]{12}", records.new_id("d"))
+    assert re.fullmatch(r"d-[0-9a-f]{12}", engagement_mod._new_id("d"))
+    assert len({records.new_id("d") for _ in range(1000)}) == 1000
+```
+
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `.venv/bin/pytest tests/test_records.py -q`
+Expected: FAIL — collection error,
+`ImportError: cannot import name 'records' from 'hx.store'`.
+
+
+- [ ] **Step 3: Write `records.py`**
+
+```python
+# src/hx/store/records.py
+"""What the send path did: denial rows and exchange rows.
+
+The extension has no database access by design -- the jar's dependency list is
+deliberately empty and nothing inside Burp's JVM should be able to write the
+evidence store -- so every row the send path produces is written from here.
+Spec S4: "Any denial produces a `denial` row and a distinct error class.
+Denials are never silent."
+
+Both writers are keyword-only. Between them the two tables take twenty-one
+columns, six of which are nullable ids of the same shape, and a positional
+call site that drifted by one argument would file evidence against the wrong
+run without any type error to show for it.
+
+Neither writer opens a transaction. Each is a single INSERT (or a single
+UPDATE), which is atomic on its own under `db.connect`'s autocommit
+connection; a caller writing an exchange row and its blobs together should
+wrap the pair in `db.transaction` itself.
+"""
+from __future__ import annotations
+
+import sqlite3
+import uuid
+
+# Error class (spec S6) -> the `kind` value the denial table's CHECK
+# constraint accepts. The vocabulary is Plan 1's and cannot be widened from
+# here: an unrecognised kind is refused by SQLite itself, so this map is the
+# only supported way to get from a bridge error to a row.
+DENIAL_KIND: dict[str, str] = {
+    "scope_denied": "scope",
+    "method_denied": "method",
+    "dangerous_denied": "dangerous",
+    "rate_limited": "rate",
+    "budget_exhausted": "budget",
+    "not_configured": "not_configured",
+}
+DENIAL_KINDS = frozenset(DENIAL_KIND.values())
+
+# Error class -> the `outcome` the exchange table accepts, for a request that
+# reached the far side of the bridge and then failed. `transport_error` is
+# deliberately absent: exchange.outcome offers conn_refused, dns_error and
+# tls_error, and the extension reports one class for all three because
+# Montoya's reply does not distinguish them. Recording a guess as one of the
+# three would put a fabricated fact in the evidence store.
+EXCHANGE_OUTCOME: dict[str, str] = {
+    "timeout": "timeout",
+    "bridge_lost": "bridge_lost",
+    "rate_limited": "rate_limited",
+    "scope_denied": "scope_denied",
+}
+EXCHANGE_OUTCOMES = frozenset({
+    "ok", "timeout", "conn_refused", "dns_error", "tls_error",
+    "scope_denied", "rate_limited", "bridge_lost", "truncated",
+})
+
+# Error classes with no row of their own, named rather than forgotten.
+# `denial.kind` and `exchange.outcome` are CHECK-constrained vocabularies
+# written before these classes existed, and widening either is a schema
+# migration -- a new SCHEMA_VERSION and a table rebuild, which this plan does
+# not do. A class in here still reaches the caller as BridgeError.error_class;
+# what it does not get is a row.
+#
+#   unmanaged_credential -- a real denial (S7 refuses the request and never
+#       persists it) with no `kind` to record it under. This is the gap to
+#       close first: it is the only class here that S4 calls a denial about a
+#       request the extension agreed to look at.
+#   transport_error -- the request DID leave the JVM, so it belongs in
+#       `exchange`, but see EXCHANGE_OUTCOME above.
+#   halted -- not a per-request denial at all. One distressed host aborts the
+#       whole run, which is `run.status = 'aborted'` with a `stop_reason`;
+#       abort_run() writes it.
+#   bad_frame -- the extension could not read the frame: a send with no
+#       deadline_us, or a body that will not parse as an HTTP request. There
+#       is no method and no url it ever agreed to look at, so a `denial` row
+#       would have nothing true to put in those columns. This one is a harness
+#       bug, not a policy decision.
+#   engagement_mismatch -- the frame named an engagement this extension does
+#       not serve, so THIS store is not the one the refusal belongs in.
+#       Writing the row here would file one client's traffic against another,
+#       which is the exact failure the id on the frame exists to prevent.
+UNRECORDABLE = frozenset({"unmanaged_credential", "transport_error", "halted",
+                          "bad_frame", "engagement_mismatch"})
+
+
+def new_id(prefix: str) -> str:
+    """`<prefix>-<12 hex>`, the id shape every table in this store uses.
+
+    `hx.engagement._new_id` is this function's twin and produces the same
+    shape. They are not one function yet -- engagement.py is Plan 1's and
+    collapsing them is a refactor with its own test surface -- so a test pins
+    the shape of both rather than letting them drift apart unnoticed.
+    """
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
+                  method: str, url: str, detail: str, at_us: int,
+                  resolved_ip: str | None = None,
+                  scope_version_id: str | None = None) -> str:
+    """Record one refused request. Returns the row id.
+
+    `kind` is a schema value, not an error class: map it through DENIAL_KIND.
+    The check below is redundant with the table's CHECK constraint and exists
+    for the message -- SQLite answers a bad kind with "CHECK constraint
+    failed: denial", which names neither the value nor the vocabulary.
+
+    `run_id` may be None. A `not_configured` denial at 02:00 happens before
+    any run row exists, and that denial is exactly the one worth having.
+    """
+    if kind not in DENIAL_KINDS:
+        raise ValueError(
+            f"{kind!r} is not a denial kind; the schema accepts "
+            f"{sorted(DENIAL_KINDS)}. Map an error class through "
+            "records.DENIAL_KIND, and see records.UNRECORDABLE for the "
+            "classes that have no row to go in yet."
+        )
+    row_id = new_id("d")
+    conn.execute(
+        "INSERT INTO denial(id, run_id, ts_us, kind, method, url, resolved_ip,"
+        " reason, scope_version_id) VALUES(?,?,?,?,?,?,?,?,?)",
+        (row_id, run_id, at_us, kind, method, url, resolved_ip, detail,
+         scope_version_id),
+    )
+    return row_id
+
+
+def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
+                    method: str, url: str, status: int | None,
+                    req_blob: str | None, resp_blob: str | None, ms: int,
+                    at_us: int, outcome: str = "ok",
+                    resp_len: int | None = None,
+                    surface_id: str | None = None,
+                    scope_version_id: str | None = None,
+                    seq: int | None = None) -> str:
+    """Record one request that was issued. Returns the row id.
+
+    `req_blob` and `resp_blob` are blob-store digests of the REDACTED bytes.
+    Redaction happens inside the JVM, before these ever reach Python (S7): the
+    blob store is content-addressed, so hashing raw bytes and redacting
+    afterwards means the raw bytes are already on disk.
+
+    `via` is always 'send' here. The other two values in that vocabulary
+    belong to the proxy and the crawler, which are their own egress point and
+    their own plan.
+
+    `identity`, `identity_generation` and `identity_state` stay NULL. Identity
+    injection ships in Plan 5; writing 'assumed' now would be a claim about
+    authentication that nothing in this plan can support.
+    """
+    if outcome not in EXCHANGE_OUTCOMES:
+        raise ValueError(
+            f"{outcome!r} is not an exchange outcome; the schema accepts "
+            f"{sorted(EXCHANGE_OUTCOMES)}. Map an error class through "
+            "records.EXCHANGE_OUTCOME."
+        )
+    if outcome == "ok" and status is None:
+        # 'ok' means a response came back. A row claiming one with no status
+        # is a row that reads as evidence and is not.
+        raise ValueError("an 'ok' exchange with no status is not an exchange "
+                         "that happened; give it the outcome it really had")
+    row_id = new_id("x")
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " recv_us, method, url, status, req_blob, resp_blob, resp_len,"
+        " body_shed, scope_version_id, seq)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (row_id, run_id, surface_id, "send", outcome, at_us,
+         at_us + ms * 1000, method, url, status, req_blob, resp_blob,
+         resp_len,
+         # S6: solicited exchanges are NEVER shed -- they are about to become
+         # evidence. Only unsolicited proxy observations may set this.
+         0,
+         scope_version_id, seq),
+    )
+    return row_id
+
+
+def abort_run(conn: sqlite3.Connection, *, run_id: str,
+              stop_reason: str, at_us: int) -> bool:
+    """Stop a run. True if this call stopped it, False if it was already over.
+
+    S4: "One distressed host aborts the whole run" -- `run.status = aborted`
+    with a `stop_reason`, not just that host -- so this is a single update on
+    the run rather than a per-host mark.
+
+    The UPDATE is guarded on `status='running'`, which makes the writer both
+    idempotent and order-independent: the FIRST stop_reason wins, and it is
+    the one that explains what happened. A second `halted` frame from another
+    host arriving while the first is still being written, or an operator halt
+    racing the same stop, must not replace the diagnosis with a symptom.
+
+    Returning False rather than raising is deliberate. This is called from the
+    bridge's `halted` handler, and two distressed hosts inside one window is a
+    perfectly ordinary thing for a struggling target to do. An unknown
+    run_id raises rather than returning False; see the comment below.
+    """
+    cur = conn.execute(
+        "UPDATE run SET status='aborted', stop_reason=?, ended_us=?"
+        " WHERE id=? AND status='running'",
+        (stop_reason, at_us, run_id),
+    )
+    if cur.rowcount == 1:
+        return True
+    if conn.execute("SELECT id FROM run WHERE id=?", (run_id,)).fetchone() is None:
+        # Not "already stopped" -- this store has never heard of the run. The
+        # caller is holding an id from somewhere else, and silently doing
+        # nothing would leave a live run marked as running forever.
+        raise ValueError(f"no run {run_id!r} in this store")
+    return False
+```
+
+
+- [ ] **Step 4: Run it and watch it pass**
+
+Run: `.venv/bin/pytest tests/test_records.py -q`
+Expected: PASS — 13 passed.
+
+
+- [ ] **Step 5: Write the failing test for the durable halt**
+
+```python
+# tests/test_halt.py
+import os
+import sqlite3
+import stat
+import threading
+
+import pytest
+
+from hx import halt as halt_mod
+from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
+
+
+@pytest.fixture
+def engagement(tmp_path):
+    root = tmp_path / "engagement"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+                 " VALUES('e-1','Example','Example Ltd',1,'active')")
+    yield root, conn
+    conn.close()
+
+
+def test_a_fresh_engagement_is_not_halted(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    assert h.halted is False
+    assert h.reason is None
+    assert not h.sentinel_path.exists()
+
+
+def test_halt_writes_the_sentinel_and_the_row(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    h.halt("client called: stop everything")
+
+    assert h.halted is True
+    assert h.reason == "client called: stop everything"
+    assert h.sentinel_path == root / "HALTED"
+    assert stat.S_IMODE(h.sentinel_path.stat().st_mode) == 0o600
+    assert h.sentinel_path.read_text().splitlines()[0] == "client called: stop everything"
+
+    row = conn.execute(
+        "SELECT actor, tool, why FROM agent_action WHERE tool='halt'").fetchone()
+    assert row["actor"] == "operator"
+    assert row["why"] == "client called: stop everything"
+
+
+def test_a_halt_survives_the_harness_dying(engagement):
+    root, conn = engagement
+    halt_mod.OperatorHalt(root, conn).halt("client called: stop everything")
+    revived = halt_mod.OperatorHalt(root, conn)
+    assert revived.halted is True
+    assert revived.reason == "client called: stop everything"
+
+
+def test_a_halt_survives_the_store_being_unavailable(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    h.halt("client called: stop everything")
+    conn.execute("DELETE FROM agent_action")
+    assert halt_mod.OperatorHalt(root, conn).halted is True
+
+
+def test_a_sentinel_created_from_a_shell_is_a_halt(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    h.sentinel_path.write_text("socket was dead, stopped by hand\n")
+    assert h.halted is True
+    assert h.reason == "socket was dead, stopped by hand"
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root ignores directory permissions")
+def test_a_sentinel_that_cannot_be_read_is_a_halt(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    h.sentinel_path.write_text("stopped by hand\n")
+    os.chmod(root, 0o000)
+    try:
+        assert h.halted is True
+        assert "cannot be read" in h.reason
+    finally:
+        os.chmod(root, 0o700)
+
+
+def test_only_resume_lifts_it(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    h.halt("scope was wrong")
+    assert halt_mod.OperatorHalt(root, conn).halted is True
+    h.resume()
+    assert h.halted is False
+    assert h.reason is None
+    assert not h.sentinel_path.exists()
+    assert halt_mod.OperatorHalt(root, conn).halted is False
+    assert conn.execute("SELECT COUNT(*) FROM agent_action WHERE tool='resume'").fetchone()[0] == 1
+
+
+def test_resume_clears_a_shell_created_sentinel(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    h.sentinel_path.write_text("stopped by hand\n")
+    h.resume()
+    assert h.halted is False
+
+
+def test_the_sentinel_is_written_before_the_row(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+
+    class Broken:
+        def execute(self, *a, **k):
+            raise sqlite3.ProgrammingError("SQLite objects created in a thread")
+
+    h._db = Broken()
+    with pytest.raises(sqlite3.ProgrammingError):
+        h.halt("client called: stop everything")
+    assert h.halted is True
+    assert h.sentinel_path.exists()
+
+
+def test_halted_and_reason_never_touch_the_database(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    h.halt("client called: stop everything")
+    out = {}
+
+    def read_it():
+        try:
+            out["halted"] = h.halted
+            out["reason"] = h.reason
+        except BaseException as exc:
+            out["exc"] = exc
+
+    t = threading.Thread(target=read_it)
+    t.start()
+    t.join(timeout=5)
+    assert "exc" not in out, out
+    assert out["halted"] is True
+    assert out["reason"] == "client called: stop everything"
+
+
+def test_the_store_connection_really_is_thread_confined(engagement):
+    root, conn = engagement
+    out = {}
+
+    def query():
+        try:
+            conn.execute("SELECT id FROM engagement").fetchone()
+        except BaseException as exc:
+            out["exc"] = exc
+
+    t = threading.Thread(target=query)
+    t.start()
+    t.join(timeout=5)
+    assert isinstance(out.get("exc"), sqlite3.ProgrammingError), out
+
+
+def test_a_reason_with_newlines_still_halts(engagement):
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    h.halt("client called\nstop everything\n")
+    assert h.halted is True
+    assert h.reason == "client called stop everything"
+    assert len(h.sentinel_path.read_text().splitlines()) == 2
+
+
+def test_a_store_with_no_engagement_row_is_refused(tmp_path):
+    root = tmp_path / "empty"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    try:
+        with pytest.raises(halt_mod.HaltError, match="exactly one engagement"):
+            halt_mod.OperatorHalt(root, conn)
+    finally:
+        conn.close()
+```
+
+
+- [ ] **Step 6: Run it and watch it fail**
+
+Run: `.venv/bin/pytest tests/test_halt.py -q`
+Expected: FAIL — collection error,
+`ImportError: cannot import name 'halt' from 'hx'`.
+
+
+- [ ] **Step 7: Write `halt.py`**
+
+```python
+# src/hx/halt.py
+"""The durable operator halt.
+
+Spec S4 gives the kill switch three independent paths -- a `halt` frame, the
+STOP button in the harness's Burp suite tab, and a sentinel file the extension
+polls -- so that any one of them works when the others are wedged. This module
+owns the sentinel file and makes the frame survive a restart.
+
+An operator halt is durable: it is a row in the engagement store AND a file on
+disk, so it survives the harness dying, Burp dying, or both. Two findings the
+Plan 2 review left open live here: a second `hello` used to erase the halt,
+and a halt did not survive a Burp restart -- precisely when someone has
+already hit stop. A reconnect therefore does not clear it (the bridge
+re-asserts `halt` after any peer's hello, before any configure), a `configure`
+re-authorises scope and never issuance, and only `resume()` re-arms.
+
+**Nothing here reads the database except `__init__`.** The bridge's read
+thread asks `halted` and `reason` on every hello, and a connection from
+`hx.store.db.connect` belongs to the thread that created it: used anywhere
+else it raises `sqlite3.ProgrammingError`, which tests/test_halt.py proves by
+doing it rather than asserting it in a comment. So the row is read once, at
+construction, on the owning thread, and from then on the armed flag lives in
+memory beside a sentinel file that costs one stat().
+
+The writers (`halt`, `resume`) do touch the database and must be called from
+the thread that opened it. `halt()` is ordered so that this cannot become a
+failure to stop: see the comment on the method.
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+import threading
+import time
+import uuid
+from pathlib import Path
+
+from hx.store.records import new_id
+
+# The extension polls for this file by NAME in the engagement directory; the
+# same path is passed to the jar as -Dhx.halt_sentinel.
+SENTINEL_NAME = "HALTED"
+
+# agent_action.tool values. Plan 1's schema has no halt table -- and adding
+# one is a migration this plan does not do -- so the halt log lives in the
+# only table that has an engagement, a nullable run, an actor, a timestamp and
+# a free-text `why`. The state is the latest of these two rows, which also
+# makes it an audit trail: who stopped the run, when, and why.
+HALT_TOOL = "halt"
+RESUME_TOOL = "resume"
+ACTOR = "operator"
+
+
+class HaltError(Exception):
+    """The halt state cannot be read or established."""
+
+
+def _now_us() -> int:
+    return time.time_ns() // 1000
+
+
+class OperatorHalt:
+    def __init__(self, engagement_dir: Path, db: sqlite3.Connection) -> None:
+        self.engagement_dir = Path(engagement_dir)
+        self._db = db
+        # halt() and resume() each write two places. The lock keeps a second
+        # caller from interleaving between them and leaving the file saying
+        # one thing and the row another.
+        self._lock = threading.Lock()
+
+        rows = db.execute("SELECT id FROM engagement").fetchall()
+        if len(rows) != 1:
+            # Same invariant `engagement.open_()` enforces: one engagement per
+            # database. Guessing which one a halt belongs to is not an option.
+            raise HaltError(
+                f"expected exactly one engagement row in {engagement_dir}, "
+                f"found {len(rows)}"
+            )
+        self._engagement_id = rows[0][0]
+
+        row = db.execute(
+            "SELECT tool, why FROM agent_action WHERE engagement_id = ?"
+            " AND tool IN (?, ?) ORDER BY ts_us DESC, rowid DESC LIMIT 1",
+            (self._engagement_id, HALT_TOOL, RESUME_TOOL),
+        ).fetchone()
+        # rowid breaks the tie as well as ts_us: two events inside the same
+        # microsecond are possible, and the later INSERT is the later event.
+        self._armed = row is not None and row[0] == HALT_TOOL
+        self._reason = row[1] if self._armed else None
+
+    # ---- state ---------------------------------------------------------
+
+    @property
+    def sentinel_path(self) -> Path:
+        return self.engagement_dir / SENTINEL_NAME
+
+    def _sentinel_present(self) -> bool:
+        try:
+            os.stat(self.sentinel_path)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # S4: "If it cannot be read -- permissions, a vanished directory,
+            # an I/O error -- the extension treats that as halted. Unknown
+            # state is stop." This side answers the same way.
+            #
+            # os.stat with two explicit branches, not Path.exists(): pathlib
+            # decides for us which errno counts as "no", through a private
+            # helper (`pathlib._ignore_error`) whose contents are an
+            # implementation detail. On this interpreter EACCES propagates out
+            # of Path.exists() and ENOENT returns False, which happens to be
+            # right -- but a fail-closed answer must not rest on the contents
+            # of a private list.
+            return True
+
+    @property
+    def halted(self) -> bool:
+        """True if either the store or the filesystem says stop.
+
+        A union, not an agreement. An operator can `touch` the sentinel from a
+        shell when the socket is dead or the agent has stopped responding --
+        S4 names that as the reason the file exists -- and that halt has no
+        row behind it. The reverse case is a harness that died between the two
+        writes.
+        """
+        return self._armed or self._sentinel_present()
+
+    @property
+    def reason(self) -> str | None:
+        if self._armed:
+            return self._reason
+        if not self._sentinel_present():
+            return None
+        try:
+            text = self.sentinel_path.read_text(encoding="utf-8",
+                                                errors="replace")
+        except OSError:
+            return f"{self.sentinel_path} exists but cannot be read"
+        return text.split("\n")[0].strip() or f"{self.sentinel_path} exists"
+
+    # ---- transitions ---------------------------------------------------
+
+    def halt(self, reason: str) -> None:
+        """Stop issuance, durably.
+
+        The sentinel is written FIRST and the row second, deliberately. The
+        file is the mechanism that actually stops the extension -- it polls it
+        and it works when the bridge is dead -- while the row is what explains
+        the stop afterwards. If the INSERT fails (a broken store, or this
+        being called from a thread that does not own the connection) the halt
+        is already in force and the exception says the audit line is missing.
+        A failure to explain must not become a failure to stop.
+        """
+        # Collapsed to one line, not refused. codec.build_config_body refuses
+        # a config value containing a newline rather than escaping it, and
+        # that is right there because refusing a config value is the safe
+        # answer; refusing to HALT over the formatting of a reason string is
+        # the fail-open direction, so this one is normalised instead.
+        one_line = " ".join(str(reason).split())
+        with self._lock:
+            self._write_sentinel(one_line)
+            self._armed = True
+            self._reason = one_line
+            self._db.execute(
+                "INSERT INTO agent_action(id, engagement_id, run_id, ts_us,"
+                " actor, tool, why) VALUES(?,?,?,?,?,?,?)",
+                (new_id("a"), self._engagement_id, None, _now_us(),
+                 ACTOR, HALT_TOOL, one_line),
+            )
+
+    def resume(self) -> None:
+        """Re-arm issuance. The only thing that lifts a halt.
+
+        The mirror of halt(), under the same rule: every ordering failure
+        leaves issuance STOPPED. The row goes in first, so a failure to write
+        it leaves the sentinel in place and the halt standing; removing the
+        file first and then failing would lift a halt with no record of who
+        lifted it.
+        """
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO agent_action(id, engagement_id, run_id, ts_us,"
+                " actor, tool, why) VALUES(?,?,?,?,?,?,?)",
+                (new_id("a"), self._engagement_id, None, _now_us(),
+                 ACTOR, RESUME_TOOL, "operator resumed issuance"),
+            )
+            self._armed = False
+            self._reason = None
+            try:
+                os.unlink(self.sentinel_path)
+            except FileNotFoundError:
+                pass
+
+    # ---- the file ------------------------------------------------------
+
+    def _write_sentinel(self, reason: str) -> None:
+        """Create the sentinel atomically, at 0o600, never half-written.
+
+        Same shape as `engagement._write_config_secure`, for the same reasons:
+        O_EXCL at the final mode so the file never exists world-readable even
+        for an instant, and a rename so a reader never sees a partial file.
+
+        The extension keys on the file EXISTING, not on what is in it -- a
+        reader that needed the content would have to decide what a truncated
+        file means, and S4 has already decided that unreadable is halted. The
+        two lines are for the human who finds the file: the reason, and the
+        microsecond it was written.
+        """
+        tmp = self.engagement_dir / f".{uuid.uuid4().hex}.{SENTINEL_NAME}"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(f"{reason}\n{_now_us()}\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.sentinel_path)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        # The rename is atomic against a concurrent reader the moment it
+        # returns; this fsync is what makes it survive a power cut as well.
+        # The failure modes S4 names -- the harness dying, Burp dying -- do
+        # not need it, but a halt is the one state worth the extra syscall.
+        dir_fd = os.open(str(self.engagement_dir), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+```
+
+
+- [ ] **Step 8: Run it and watch it pass**
+
+Run: `.venv/bin/pytest tests/test_halt.py -q`
+Expected: PASS — 13 passed. `test_a_sentinel_that_cannot_be_read_is_a_halt`
+skips when the suite runs as root, which it should not.
+
+
+- [ ] **Step 9: Sabotage — make the sentinel file stop counting**
+
+In `OperatorHalt.halted`, drop the union:
+
+```python
+        return self._armed
+```
+
+Run: `.venv/bin/pytest tests/test_halt.py -q`
+
+Expected: FAIL, three red, and all three are the same claim from different
+directions — a halt that only the database knows about is not durable:
+
+```
+FAILED tests/test_halt.py::test_a_halt_survives_the_store_being_unavailable
+FAILED tests/test_halt.py::test_a_sentinel_created_from_a_shell_is_a_halt
+FAILED tests/test_halt.py::test_a_sentinel_that_cannot_be_read_is_a_halt
+3 failed, 10 passed
+```
+
+Restore: `git checkout -- src/hx/halt.py`
+
+
+- [ ] **Step 10: Write the failing tests for `send()`, the `halted` frame and the re-assert**
+
+First the imports. Replace the import block at the top of
+`tests/test_bridge_server.py`:
+
+```python
+# tests/test_bridge_server.py -- the import block, replaced
+import os
+import socket
+import stat
+import struct
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from hx import halt as halt_mod
+from hx.bridge import codec, server
+from hx.store import db as db_mod
+from hx.store import records
+from hx.store.paths import secure_mkdir
+```
+
+Then append this to the end of the same file. It reuses the existing
+`_client()` helper and adds its own fixtures; the module's `srv` fixture is
+left alone, which is why the new one is `srv_with_halt`.
+
+```python
+# tests/test_bridge_server.py -- appended: the send path and the durable halt
+# ---- the send path, the halted frame, and the durable halt ----------------
+#
+# Everything below drives a REAL OperatorHalt against a real engagement
+# database. A stub would hide the guarantee these tests exist for: the bridge
+# reads `halted` and `reason` from its read thread, and the store connection
+# they would otherwise touch belongs to another thread entirely.
+
+
+@pytest.fixture
+def store(tmp_path):
+    root = tmp_path / "engagement"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+                 " VALUES('e-1','Example','Example Ltd',1,'active')")
+    conn.execute("INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                 " started_us, status)"
+                 " VALUES('r-1','e-1','manual','production',1700000000000000,"
+                 "'running')")
+    yield root, conn
+    conn.close()
+
+
+@pytest.fixture
+def srv_with_halt(tmp_path, store):
+    root, conn = store
+    oh = halt_mod.OperatorHalt(root, conn)
+    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
+                            operator_halt=oh)
+    s.start()
+    yield s, oh, conn
+    s.stop()
+
+
+def _hello(c, engagement_id="e-1"):
+    c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                            "pid": os.getpid(), "burp_version": "2026.7.3",
+                            "instance_id": "i-1",
+                            "engagement_id": engagement_id}))
+
+
+def _await(predicate, message, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError(message)
+
+
+def _configured(s, c):
+    """hello plus one acknowledged configure. Returns the peer's reader."""
+    reader = codec.FrameReader(c)
+    _hello(c)
+    _await(lambda: s.state == "connected", "the hello never landed")
+    out = {}
+
+    def go():
+        try:
+            out["epoch"] = s.configure(
+                {"scope.include": ["https://app.example.test/*"]},
+                scope_sha256="a" * 64, profile="production")
+        except server.BridgeError as exc:
+            out["err"] = exc
+
+    t = threading.Thread(target=go)
+    t.start()
+    header, _ = reader.read()
+    c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                            "config_epoch": 1}))
+    t.join(timeout=5)
+    assert out.get("epoch") == 1, out
+    return reader
+
+
+# Real bytes, loopback-shaped hostname, real header names. Nothing in this
+# project has ever sent a request off the machine and these tests do not
+# either: the peer is a socket in tmp_path.
+REQ = b"GET /api/orders?page=2 HTTP/1.1\r\nHost: app.example.test\r\n\r\n"
+RESP = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Set-Cookie: session={{observed:set-cookie}}; HttpOnly\r\n\r\n"
+        b'{"orders":[]}')
+
+
+def test_send_returns_the_result_frame_and_its_body(srv_with_halt):
+    """The body is the point. A result frame's bytes are the redacted response
+    -- the evidence about to be hashed into the blob store -- and _deliver()
+    used to hand back the header alone and drop them."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+        t = threading.Thread(target=lambda: out.update(reply=s.send(
+            {"target_host": "app.example.test", "target_port": 443,
+             "tls": True, "identity_id": None}, REQ)))
+        t.start()
+
+        header, body = reader.read()
+        assert header["t"] == "send"
+        assert header["engagement_id"] == "e-1", (
+            "S6: every send carries the engagement id and the extension "
+            "refuses a mismatch"
+        )
+        assert header["target_host"] == "app.example.test"
+        assert isinstance(header["id"], int) and header["id"] > 0
+        assert header["deadline_us"] > time.time_ns() // 1000
+        assert body == REQ, "the request bytes travel verbatim in the body"
+
+        c.sendall(codec.encode({"v": 1, "t": "result", "id": header["id"],
+                                "status": 200, "bytes": len(RESP), "ms": 42,
+                                "outcome": "ok", "config_epoch": 1}, RESP))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["reply"]["status"] == 200
+        assert out["reply"]["config_epoch"] == 1
+        assert out["reply"][server.BridgeServer.BODY_KEY] == RESP
+    finally:
+        c.close()
+
+
+def test_send_raises_the_peers_class_and_its_retry_hint(srv_with_halt):
+    """S6 makes the class load-bearing for the agent: rate_limited means slow
+    down and retry, the three *_denied classes mean the answer will not
+    change, budget_exhausted means the run is over. A caller that only got a
+    message string would have to parse English to tell them apart."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+
+        def go():
+            try:
+                s.send({"target_host": "app.example.test"}, REQ)
+            except server.BridgeError as exc:
+                out["err"] = exc
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "rate_limited",
+                                "detail": "5 rps, 200000us to the next slot",
+                                "retry_after_us": 200_000}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["err"].error_class == "rate_limited"
+        assert out["err"].retry_after_us == 200_000
+        assert "5 rps" in str(out["err"])
+        # And it is a class the store can actually record, which is the other
+        # half of "denials are never silent".
+        assert records.DENIAL_KIND[out["err"].error_class] == "rate"
+    finally:
+        c.close()
+
+
+def test_send_never_retries(srv_with_halt):
+    """S6: a replayed state-changing request is worse than a failed one. One
+    call, one frame on the wire, whatever the answer was."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+
+        def go():
+            try:
+                s.send({"target_host": "app.example.test"}, REQ)
+            except server.BridgeError as exc:
+                out["err"] = exc
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "transport_error",
+                                "detail": "connection reset"}))
+        t.join(timeout=5)
+        assert out["err"].error_class == "transport_error"
+
+        # Nothing else may arrive. A short timeout, not the helper's 5s: this
+        # asserts an absence, so the wait is pure cost.
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            reader.read()
+    finally:
+        c.close()
+
+
+def test_an_in_flight_send_fails_with_bridge_lost(srv_with_halt):
+    """S6 names bridge_lost as distinct from timeout: the peer went away, the
+    request may or may not have been issued, and nothing may replay it."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    reader = _configured(s, c)
+    out = {}
+
+    def go():
+        try:
+            s.send({"target_host": "app.example.test"}, REQ)
+        except server.BridgeError as exc:
+            out["err"] = exc
+
+    t = threading.Thread(target=go)
+    t.start()
+    reader.read()          # the send frame is on the wire and unanswered
+    c.close()
+    t.join(timeout=5)
+    assert not t.is_alive(), "the caller was left blocked on a dead peer"
+    assert out["err"].error_class == "bridge_lost"
+
+
+def test_a_send_nobody_answers_fails_with_timeout(srv_with_halt):
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.2)
+        assert exc.value.error_class == "timeout", (
+            "a peer that is alive and slow is not a peer that vanished"
+        )
+        assert exc.value.retry_after_us is None
+    finally:
+        c.close()
+
+
+def test_send_before_configure_never_reaches_the_wire(srv_with_halt):
+    """DENY-ALL is the initial state on both sides. The extension would refuse
+    this too -- but a request that was never framed cannot be issued by a
+    version-skewed jar either."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _hello(c)
+        _await(lambda: s.state == "connected", "the hello never landed")
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ)
+        assert exc.value.error_class == "not_configured"
+
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
+def test_send_refuses_a_caller_supplied_engagement_id(srv_with_halt):
+    """Client A's traffic must never land in client B's store, and the id on
+    the frame is what the extension checks. A caller able to overwrite it
+    would be addressing whichever extension answered."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        with pytest.raises(server.BridgeError, match="engagement_id"):
+            s.send({"target_host": "app.example.test",
+                    "engagement_id": "SOMEONE-ELSE"}, REQ)
+    finally:
+        c.close()
+
+
+def test_a_halted_frame_stops_issuance_and_aborts_the_run(srv_with_halt):
+    """S6's unsolicited `halted` frame, {reason, host, window}, no id. Without
+    it an auto-halt is invisible until the next send fails and
+    `run.status = aborted` has no stop_reason to record."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        seen = []
+        # The callback runs on the READ THREAD, so it may not touch this
+        # store's connection: it belongs to this thread. Hand the frame over
+        # and do the writing here -- which is what a harness must do too.
+        s.on_halted = seen.append
+
+        c.sendall(codec.encode({"v": 1, "t": "halted",
+                                "reason": "5xx rate 0.40",
+                                "host": "app.example.test",
+                                "window": "50 requests / 37s"}))
+        _await(lambda: s.state == "halted", "the halted frame was ignored")
+        _await(lambda: seen, "on_halted never fired")
+
+        frame = seen[0]
+        assert records.abort_run(
+            conn, run_id="r-1", at_us=1700000000900000,
+            stop_reason=f"{frame['reason']} on {frame['host']} "
+                        f"({frame['window']})") is True
+        row = conn.execute("SELECT status, stop_reason FROM run WHERE id='r-1'"
+                           ).fetchone()
+        assert row["status"] == "aborted"
+        assert row["stop_reason"] == ("5xx rate 0.40 on app.example.test "
+                                      "(50 requests / 37s)")
+
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert exc.value.error_class == "halted"
+    finally:
+        c.close()
+
+
+def test_a_halted_callback_that_throws_drops_to_deny_all(srv_with_halt):
+    """The callback is what makes an auto-halt durable. If it threw, nothing
+    was recorded, and carrying on beside a peer whose stop nobody wrote down
+    is the one thing DENY-ALL exists to prevent."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+
+        def boom(header):
+            raise RuntimeError("the store is gone")
+
+        s.on_halted = boom
+        c.sendall(codec.encode({"v": 1, "t": "halted", "reason": "5xx rate 0.40",
+                                "host": "app.example.test",
+                                "window": "50 requests / 37s"}))
+        _await(lambda: s.state == "waiting",
+               "a throwing on_halted must close the connection")
+        assert isinstance(s.halted_callback_error, RuntimeError)
+    finally:
+        c.close()
+
+
+def test_a_durable_halt_is_reasserted_before_any_configure(srv_with_halt):
+    """The task this whole module exists for.
+
+    Two findings from the Plan 2 review meet here: a second `hello` erased the
+    halt, and a halt did not survive a Burp restart -- precisely when someone
+    has already hit stop. The assertion is about ORDER ON THE WIRE, not about
+    state afterwards: a harness pushes scope from on_hello, so a re-assert
+    that happened after that callback would leave the extension configured and
+    armed for the length of a round trip.
+
+    The second half is just as load-bearing. The configure still commits its
+    scope and its epoch -- narrowing scope during an emergency stop is exactly
+    what an operator should be able to do -- and it does NOT re-arm issuance.
+    """
+    s, oh, conn = srv_with_halt
+    oh.halt("client called: stop everything")
+
+    threads = []
+    out = {}
+
+    def push_scope():
+        try:
+            out["epoch"] = s.configure(
+                {"scope.include": ["https://app.example.test/*"]},
+                scope_sha256="b" * 64, profile="production")
+        except server.BridgeError as exc:
+            out["err"] = exc
+
+    def on_hello(header):
+        # Appended BEFORE start(): t.start() can be preempted the instant the
+        # new thread runs, and the main thread below is fast enough to reach
+        # threads[0] first. Measured as an IndexError under a full-suite run.
+        t = threading.Thread(target=push_scope)
+        threads.append(t)
+        t.start()
+
+    s.on_hello = on_hello
+
+    c = _client(s.socket_path)
+    try:
+        reader = codec.FrameReader(c)
+        _hello(c)
+
+        first, _ = reader.read()
+        assert first["t"] == "halt", (
+            "a reconnecting extension must be told it is still halted BEFORE "
+            f"it is handed a scope; the first frame it received was {first!r}"
+        )
+        assert first["reason"] == "client called: stop everything"
+
+        second, body = reader.read()
+        assert second["t"] == "configure"
+        assert codec.parse_config_body(body)["scope.include"] == \
+            ["https://app.example.test/*"]
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": second["id"],
+                                "config_epoch": 4}))
+        threads[0].join(timeout=5)
+        assert out.get("epoch") == 4, out
+
+        assert s.state == "halted", (
+            "a configure re-authorises scope, never issuance; only resume does"
+        )
+        assert s.config_epoch == 4, "the corrected scope must still commit"
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert exc.value.error_class == "halted"
+    finally:
+        c.close()
+
+
+def test_a_reset_never_clears_the_durable_halt(srv_with_halt):
+    """_reset() returns this side to DENY-ALL, which is right, and it has no
+    business touching the halt: the halt is not part of a connection's
+    lifetime. It lives in OperatorHalt, on disk."""
+    s, oh, conn = srv_with_halt
+    oh.halt("operator pressed stop")
+    s._reset()
+    assert s.state == "waiting"
+    assert oh.halted is True
+    assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True
+
+
+def test_a_shell_created_sentinel_stops_send(srv_with_halt):
+    """S4: the sentinel file exists to work when the bridge does not. Nothing
+    told this bridge anything -- no frame, no halt() call -- and the next send
+    must still be refused."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        assert s.state == "configured"
+
+        oh.sentinel_path.write_text("socket was dead, stopped by hand\n")
+
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert exc.value.error_class == "halted", (
+            "a sentinel file is a halt even when no frame ever said so; this "
+            f"send was refused as {exc.value.error_class!r} instead"
+        )
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
+def test_halt_arms_the_durable_record_and_only_resume_clears_it(srv_with_halt):
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+
+        s.halt("operator pressed stop")
+        header, _ = reader.read()
+        assert header["t"] == "halt"
+        assert oh.halted is True
+        assert oh.sentinel_path.exists()
+        assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True
+
+        s.resume()
+        header, _ = reader.read()
+        assert header["t"] == "resume"
+        assert oh.halted is False
+        assert not oh.sentinel_path.exists()
+        assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is False
+    finally:
+        c.close()
+```
+
+
+- [ ] **Step 11: Run them and watch them fail**
+
+Run: `.venv/bin/pytest tests/test_bridge_server.py -q`
+
+Expected: FAIL — 13 errors, all from the fixture:
+`TypeError: BridgeServer.__init__() got an unexpected keyword argument
+'operator_halt'`. The 27 tests that were already in the file still pass.
+
+There is a second missing piece underneath that one. Comment out
+`operator_halt=oh` in the fixture and re-run: 12 failed, 28 passed, four of
+them on
+`AttributeError: 'BridgeServer' object has no attribute 'send'. Did you mean:
+'_send'?` and one on `halted_callback_error`. Put it back before continuing.
+
+
+- [ ] **Step 12: `BridgeError` carries the send path's vocabulary**
+
+Replace the class at the top of `src/hx/bridge/server.py`:
+
+```python
+# src/hx/bridge/server.py -- BridgeError, replaced
+class BridgeError(Exception):
+    """The bridge cannot start, or was asked to do something out of order.
+
+    `error_class` is the send path's vocabulary (spec S6): the class the peer
+    put on an `error` frame, or the class this side refused under before the
+    frame ever reached the wire. It is None when the failure is not a send-path
+    failure at all -- a malformed call, a configure the peer refused -- so a
+    caller mapping classes onto `denial` rows through `records.DENIAL_KIND`
+    must check for None rather than index blindly.
+
+    `retry_after_us` is set only for `rate_limited`, the one class that carries
+    a retry hint. NOTHING IN THIS FILE RETRIES: S6 is explicit that a replayed
+    state-changing request is worse than a failed one, so retry is a decision
+    the caller makes explicitly, and records.
+    """
+
+    def __init__(self, message: str, *, error_class: str | None = None,
+                 retry_after_us: int | None = None):
+        super().__init__(message)
+        self.error_class = error_class
+        self.retry_after_us = retry_after_us
+```
+
+Every existing raise still works: the two new fields are keyword-only and
+default to None, and the twenty-odd `pytest.raises(..., match=...)` assertions
+in the file read the message, which is unchanged.
+
+Now name the classes on the four raises that already existed. In `_send()`:
+
+```python
+# src/hx/bridge/server.py -- _send(), the not-connected raise
+            raise BridgeError("not connected", error_class="bridge_lost")
+```
+
+```python
+# src/hx/bridge/server.py -- _send(), the OSError arm
+            raise BridgeError(f"send failed: {exc}",
+                              error_class="bridge_lost") from exc
+```
+
+And in `_request()`:
+
+```python
+# src/hx/bridge/server.py -- _request(), the timeout arm
+            # S6 distinguishes timeout from bridge_lost and from
+            # conn_refused, and the agent acts differently on each: this one
+            # means the peer is alive and did not answer in time.
+            raise BridgeError(f"no reply to {header['t']} within {timeout}s",
+                              error_class="timeout")
+```
+
+```python
+# src/hx/bridge/server.py -- _request(), the disconnected arm
+                raise BridgeError(
+                    f"peer disconnected before replying to {header['t']}",
+                    # S6: every outstanding send fails with bridge_lost when
+                    # the peer goes away, distinct from timeout, and NEVER
+                    # auto-retried across the reconnect.
+                    error_class="bridge_lost",
+                )
+```
+
+
+- [ ] **Step 13: The constructor, the hello re-assert, the `halted` arm, and the body**
+
+`__init__` is **extended, not rewritten**. Three things change and nothing is
+removed:
+
+- two class constants are added beside the existing `_DENYING_CONFIGURE_ERRORS`
+  — leave that one exactly where it is;
+- the signature gains `on_halted=None, operator_halt=None`;
+- four assignments go in at the top of the body, above `self.state`.
+
+Every assignment already in there stays. `BridgeServer` needs sixteen more
+fields than the four new ones — `state`, `config_epoch`, `peer_uid`,
+`peer_pid`, `hello`, `rejected_hellos`, `_srv`, `_conn`, `_thread`,
+`_stopping`, `_pending`, `_replies`, `_next_id`, `_generation`, `_lock`,
+`_send_lock` — and a constructor that sets only the new ones dies on the first
+frame with `AttributeError: 'BridgeServer' object has no attribute 'state'`.
+
+Here is the full merged result, so there is nothing to reconstruct. New in
+this block: the docstring, `on_halted` and `operator_halt` in the signature,
+and the four assignments between `self.on_hello` and `self.state`. Everything
+from `self.state = "waiting"` down is the file as it already stands, reproduced
+so the block can be pasted whole.
+
+```python
+# src/hx/bridge/server.py -- two class constants added, and __init__ extended
+    # The key a delivered frame's body arrives under. It mirrors
+    # BridgeClient.BODY_KEY on the Java side, and codec._check_header refuses a
+    # bytes value, so a reply dict that ever got re-encoded as a frame with the
+    # body still attached fails loudly instead of putting evidence in a header.
+    BODY_KEY = "@body"
+
+    # Keys send() stamps itself. A caller able to set any of them could address
+    # another engagement's extension, collide with a live correlation id, or
+    # hand itself a deadline the peer would honour -- so they are refused
+    # rather than silently overwritten, which would leave the caller believing
+    # something else happened.
+    _RESERVED_SEND_KEYS = frozenset({"v", "t", "id", "deadline_us",
+                                     "engagement_id"})
+
+    def __init__(self, socket_path: Path, engagement_id: str, on_hello=None,
+                 on_halted=None, operator_halt=None):
+        """
+        `on_hello` and `on_halted` are both called ON THE READ THREAD, so
+        neither may touch a sqlite3 connection opened elsewhere: it belongs to
+        the thread that created it and raises ProgrammingError anywhere else
+        (tests/test_halt.py demonstrates it). Hand the work to the thread that
+        owns the store instead.
+
+        `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
+        module keeps no dependency on the store, and tests can attach anything
+        with `.halted` and `.reason`. Both are read on the read thread, which
+        is why OperatorHalt answers them from memory and a stat() rather than
+        from the database.
+        """
+        self.socket_path = Path(socket_path)
+        self.engagement_id = engagement_id
+        self.on_hello = on_hello
+        self.on_halted = on_halted
+        self.operator_halt = operator_halt
+        # The last unsolicited `halted` frame, kept so a harness with no
+        # on_halted callback installed can still see why issuance stopped.
+        self.last_halted: dict | None = None
+        self.halted_callback_error: BaseException | None = None
+
+        self.state = "waiting"
+        self.config_epoch = 0
+        self.peer_uid: int | None = None
+        self.peer_pid: int | None = None
+        self.hello: dict | None = None
+        self.rejected_hellos = 0
+
+        self._srv: socket.socket | None = None
+        self._conn: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+        self._pending: dict[int, threading.Event] = {}
+        self._replies: dict[int, dict] = {}
+        self._next_id = 0
+        self._generation = 0     # bumped per accepted connection; see _reset
+        self._lock = threading.Lock()
+        # A SEPARATE mutex from self._lock, deliberately. Reusing the state
+        # mutex would hold it across a blocking sendall() and stall the
+        # _deliver() that wakes the _request() waiting on the very frame being
+        # written.
+        self._send_lock = threading.Lock()
+```
+
+In `_handle()`, the hello arm gains the re-assert immediately before the
+`on_hello` callback:
+
+```python
+# src/hx/bridge/server.py -- _handle(), the hello arm
+            self.hello = header
+            with self._lock:
+                self.state = "connected"
+                self.config_epoch = 0   # a fresh hello is a fresh session
+            # A durable halt is re-asserted HERE, before on_hello runs and so
+            # before any configure: on_hello is where a harness pushes scope,
+            # and configure() cannot be called before a hello at all. That
+            # ordering IS the guarantee -- a peer that learned its scope first
+            # would be armed for the length of a round trip.
+            if not self._reassert_halt():
+                return False
+            if self.on_hello:
+```
+
+Still in `_handle()`, replace the `configured` and `result/error/exchange`
+arms with these three:
+
+```python
+# src/hx/bridge/server.py -- _handle(), the halted arm and body-carrying delivery
+        if t == "halted":
+            # Unsolicited, no id: auto-halt is extension-initiated, so there is
+            # no outstanding request to answer. Without this frame an auto-halt
+            # is invisible until the next send fails, and `run.status =
+            # aborted` has no stop_reason to record. The frame is
+            # {reason, host, window}.
+            self.last_halted = header
+            with self._lock:
+                self.state = "halted"
+            if self.on_halted:
+                try:
+                    self.on_halted(header)
+                except Exception as exc:
+                    # The callback is what makes this durable -- it is where
+                    # the run is marked aborted and, if the harness wants the
+                    # stop to survive a Burp restart, where OperatorHalt.halt
+                    # is called. A callback that threw recorded nothing, so
+                    # drop to DENY-ALL rather than carry on beside a peer whose
+                    # stop nothing has written down.
+                    self.halted_callback_error = exc
+                    return False
+            return True
+
+        if t == "configured":
+            self._deliver(header, body)
+            return True
+
+        if t in ("result", "error", "exchange"):
+            self._deliver(header, body)
+            return True
+```
+
+And add `_reassert_halt()` just above `_deliver()`, which grows a body
+parameter:
+
+```python
+# src/hx/bridge/server.py -- _reassert_halt(), and _deliver()'s new signature
+    def _reassert_halt(self) -> bool:
+        """Tell a freshly connected peer it is still halted. False to close.
+
+        Two findings from the Plan 2 review meet on this method: a second
+        `hello` erased the halt (the epoch reset above is right -- a fresh
+        hello IS a fresh session -- but the halt is not part of that session),
+        and a halt did not survive a Burp restart, which is precisely when
+        someone has already hit stop. `_reset()` cannot clear it either: the
+        state lives in OperatorHalt, on disk, not in this object.
+        """
+        if self.operator_halt is None or not self.operator_halt.halted:
+            return True
+        reason = self.operator_halt.reason or "halted, no reason recorded"
+        try:
+            self._send({"v": codec.PROTOCOL_VERSION, "t": "halt",
+                        "reason": reason})
+        except BridgeError:
+            # The connection is the thing that just failed, so it is the thing
+            # to give up on: a peer that never received the halt must not be
+            # left believing it may issue. Returning False closes it, and
+            # _serve's finally puts this side back to DENY-ALL.
+            return False
+        with self._lock:
+            self.state = "halted"
+        return True
+
+    def _deliver(self, header: dict, body: bytes = b"") -> None:
+        rid = header.get("id")
+        # A `result` frame's body is the redacted response bytes -- the
+        # evidence the caller is about to hash into the blob store. Delivering
+        # the header alone dropped it silently.
+        header = {**header, self.BODY_KEY: body}
+        with self._lock:
+```
+
+
+- [ ] **Step 14: `send()`, and the durable halt on `halt()` / `resume()`**
+
+Insert `send()` immediately above `halt()`:
+
+```python
+# src/hx/bridge/server.py -- send(), new, above halt()
+    def send(self, req: dict, body: bytes = b"", timeout: float = 30.0) -> dict:
+        """Issue one request through the extension; return the `result` header.
+
+        `req` carries the destination and the identity the extension applies --
+        `target_host`, `target_port`, `tls`, `identity_id` -- and `body` is the
+        raw HTTP request bytes. The returned dict is the result header plus the
+        redacted response bytes under BODY_KEY.
+
+        Enforcement is the extension's (S4: every byte that leaves this machine
+        crosses one of two points inside the JVM). Everything refused here is
+        refused a second time there; nothing allowed here is thereby allowed.
+
+        Raises BridgeError. `.error_class` is the peer's class for an `error`
+        frame; `timeout` when no reply arrives in time; `bridge_lost` when the
+        peer disconnects with this send in flight; `not_configured` or `halted`
+        when this side refuses before the wire; and None when the call itself
+        was malformed, which is a bug rather than a denial.
+
+        NOTHING RETRIES.
+        """
+        bad = self._RESERVED_SEND_KEYS.intersection(req)
+        if bad:
+            raise BridgeError(
+                f"send() stamps {sorted(bad)} itself; a caller may not set "
+                "them. An engagement_id from the caller in particular would "
+                "address whichever extension answers, not this engagement's."
+            )
+        # The durable halt is consulted on EVERY send, not only at hello. An
+        # operator can create the sentinel file from a shell while the socket
+        # is dead or the agent has stopped responding -- S4 names that as the
+        # reason the file exists -- and that halt has to work with no frame
+        # ever arriving.
+        if self.operator_halt is not None and self.operator_halt.halted:
+            raise BridgeError(f"halted: {self.operator_halt.reason}",
+                              error_class="halted")
+        state = self.state
+        if state == "halted":
+            raise BridgeError("halted", error_class="halted")
+        if state != "configured":
+            # DENY-ALL is the initial and terminal state. "connected" is not
+            # configured: no configure frame has been acknowledged, so the
+            # extension would refuse this anyway, with not_configured.
+            raise BridgeError(f"not configured: bridge state is {state!r}",
+                              error_class="not_configured")
+
+        reply = self._request({"v": codec.PROTOCOL_VERSION, "t": "send",
+                               "engagement_id": self.engagement_id, **req},
+                              body, timeout=timeout)
+        t = reply.get("t")
+        if t == "result":
+            return reply
+        if t == "error":
+            raise BridgeError(
+                f"{reply.get('class', 'unspecified')}: "
+                f"{reply.get('detail', '')}".rstrip(": "),
+                error_class=reply.get("class"),
+                retry_after_us=reply.get("retry_after_us"),
+            )
+        raise BridgeError(f"peer answered a send with a {t!r} frame")
+```
+
+Then arm the durable record at the top of `halt()`, before the existing
+comment:
+
+```python
+# src/hx/bridge/server.py -- halt(), the arming that comes first
+    def halt(self, reason: str) -> None:
+        # The durable record is armed BEFORE the frame goes out. If the send
+        # fails, or the peer vanishes between the send and the commit below,
+        # the halt still stands and the next hello re-asserts it. Arming
+        # afterwards would make a dead socket -- the likeliest thing to be
+        # wrong when someone hits stop -- the one path that loses the halt.
+        if self.operator_halt is not None:
+            self.operator_halt.halt(reason)
+```
+
+and disarm it at the very end of `resume()`, outside the lock:
+
+```python
+# src/hx/bridge/server.py -- resume(), the disarm at the end
+            self.state = "configured" if self.config_epoch else "connected"
+        # Disarmed only after the frame reached the wire AND the commit above
+        # stood. Every failure before this point leaves the durable halt armed,
+        # which is the direction S4 asks for: unknown state is stop. Only
+        # resume re-arms issuance, and only a resume that actually got there.
+        if self.operator_halt is not None:
+            self.operator_halt.resume()
+```
+
+
+- [ ] **Step 15: Run them and watch them pass**
+
+Run: `.venv/bin/pytest tests/test_bridge_server.py -q`
+Expected: PASS — 40 passed: the 27 that were already there, plus 13.
+
+
+- [ ] **Step 16: Sabotage — a reconnecting extension is not told it is halted**
+
+Delete these two lines from the hello arm of `_handle()`:
+
+```python
+            if not self._reassert_halt():
+                return False
+```
+
+Run: `.venv/bin/pytest tests/test_bridge_server.py -q`
+
+Expected: FAIL, one red, and the message is the whole point — the extension
+was handed a scope while an operator halt stood:
+
+```
+FAILED tests/test_bridge_server.py::test_a_durable_halt_is_reasserted_before_any_configure
+E   AssertionError: a reconnecting extension must be told it is still halted
+    BEFORE it is handed a scope; the first frame it received was
+    {'v': 1, 't': 'configure', 'engagement_id': 'e-1', ...}
+E   assert 'configure' == 'halt'
+```
+
+Restore: `git checkout -- src/hx/bridge/server.py`
+
+
+- [ ] **Step 17: Sabotage — the sentinel file stops being consulted on send**
+
+Delete these three lines from `send()`:
+
+```python
+        if self.operator_halt is not None and self.operator_halt.halted:
+            raise BridgeError(f"halted: {self.operator_halt.reason}",
+                              error_class="halted")
+```
+
+Run: `.venv/bin/pytest tests/test_bridge_server.py -q`
+
+Expected: FAIL, one red — the request went out over a bridge that thought it
+was configured, and the only reason it failed at all is that nobody answered
+it:
+
+```
+FAILED tests/test_bridge_server.py::test_a_shell_created_sentinel_stops_send
+E   AssertionError: a sentinel file is a halt even when no frame ever said so;
+    this send was refused as 'timeout' instead
+E   assert 'timeout' == 'halted'
+```
+
+Restore: `git checkout -- src/hx/bridge/server.py`
+
+
+- [ ] **Step 18: Correct the protocol document**
+
+In `docs/bridge-protocol.md`, under "Frame types", give the `error` row its
+retry hint, add the `halted` row, and fix the two control frames. Replace:
+
+```
+  burp -> py   error       {v,t,id,class,detail}
+  burp -> py   exchange    {v,t,...}   unsolicited; no id. Defined in a later plan.
+  py -> burp   halt        {v,t,id,deadline_us,reason}
+  py -> burp   resume      {v,t,id,deadline_us}
+```
+
+with:
+
+```
+  burp -> py   error       {v,t,id,class,detail[,retry_after_us]}
+  burp -> py   exchange    {v,t,...}   unsolicited; no id. Defined in a later plan.
+  burp -> py   halted      {v,t,reason,host,window}
+                           unsolicited; no id. Auto-halt is extension-initiated,
+                           so there is no outstanding id to answer. It is what
+                           `run.status = aborted` takes its stop_reason from.
+  py -> burp   halt        {v,t,reason}
+  py -> burp   resume      {v,t}
+```
+
+`retry_after_us` is bracketed because it is optional: `rate_limited` is the one
+class with a number to give, and the extension's own test asserts a `*_denied`
+class carries no retry hint. The distinction is load-bearing for the agent —
+`rate_limited` means slow down and ask again, a `*_denied` class means the
+answer will not change — and `BridgeError.retry_after_us` is where this side
+surfaces it. The field was already on the wire; only the document did not say
+so, which is how a Plan 4 tool writer would have missed it.
+
+`halt` and `resume` never carried `id` or `deadline_us`: they go out through
+`_send()`, and only `_request()` stamps those two fields. Nothing replies to
+them, so there is nothing to correlate and no work to abandon at a deadline.
+The document has said otherwise since Plan 2.
+
+
+- [ ] **Step 19: Re-sync Plan 2's blocks for the two files this task modified**
+
+`docs/superpowers/plans/2026-08-21-bridge-transport.md` carries
+`src/hx/bridge/server.py` and `tests/test_bridge_server.py` as **full-file**
+code blocks, and `tests/test_plan_matches_repo.py` byte-compares both against
+the files they name. Step 10 rewrote the test file's import block and appended
+thirteen tests; Steps 12–14 changed the server. Plan 2's blocks are therefore
+stale the moment those steps land, and the next `pytest -q` goes red on a plan
+nothing in this task mentions.
+
+The rule the failure prints is the one to follow: **sync the block from the
+file, never the file from the block.** Do it mechanically — a hand-edited
+block is exactly the drift this test exists to catch:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+
+# Built rather than written out, so no run of three backticks appears inside
+# this fenced block for a markdown reader to trip over.
+FENCE = "`" * 3
+
+plan = Path("docs/superpowers/plans/2026-08-21-bridge-transport.md")
+text = plan.read_text()
+for path in ("src/hx/bridge/server.py", "tests/test_bridge_server.py"):
+    marker = f"{FENCE}python\n# {path}\n"
+    n = text.count(marker)
+    assert n == 1, f"{path}: expected one full-file block in the plan, found {n}"
+    start = text.index(marker)
+    end = text.index(f"\n{FENCE}", start + len(marker))
+    text = text[:start] + marker + Path(path).read_text().rstrip("\n") + text[end:]
+plan.write_text(text)
+PY
+```
+
+Run: `.venv/bin/pytest tests/test_plan_matches_repo.py -q`
+Expected: PASS. Running the script a second time must change nothing — it is a
+fixed point once the blocks match, which is how you tell it re-synced the
+blocks you meant rather than mangling a fence.
+
+Note what this does NOT do: it never touches
+`docs/superpowers/plans/2026-08-22-enforcement-send-path.md`. The blocks in this
+task that name a path with a `--` suffix are partial and the comparison skips
+them by design; the four full-file blocks are handled in the next step.
+
+
+- [ ] **Step 20: Run everything**
+
+Run: `.venv/bin/pytest -q`
+
+Expected: PASS. 39 tests are new here — 13 in `tests/test_records.py`, 13 in
+`tests/test_halt.py`, 13 appended to `tests/test_bridge_server.py` — and
+`tests/test_plan_matches_repo.py` now byte-compares this task's four full-file
+blocks (`records.py`, `halt.py`, `test_records.py`, `test_halt.py`) against the
+files, on top of Plan 2's two that Step 19 just re-synced. If any differ,
+**sync the block from the file**, never the other way. The partial blocks above
+name a path with a `--` suffix, so the comparison skips them; that also means
+nothing mechanical guards them, and they are the ones to re-read by eye before
+committing.
+
+Run: `.venv/bin/pytest tests/test_bridge_server.py -q` three times.
+Expected: PASS every time. Six of the thirteen new tests run threads against a
+live socket, and a race that only shows up under load is the kind this file has
+already had once.
+
+
+- [ ] **Step 21: Commit**
+
+```bash
+git add src/hx/halt.py src/hx/store/records.py src/hx/bridge/server.py \
+        tests/test_halt.py tests/test_records.py tests/test_bridge_server.py \
+        docs/bridge-protocol.md \
+        docs/superpowers/plans/2026-08-21-bridge-transport.md
+git commit -m "feat(harness): send(), a halt that outlives everything, and the rows
+
+BridgeServer.send() rides the existing correlation-id machinery and answers in
+the send path's own vocabulary: the peer's class on an error frame, timeout
+when a live peer does not answer, bridge_lost when it vanishes mid-flight.
+Nothing retries. A replayed state-changing request is worse than a failed one,
+so retry is a decision the caller makes and records.
+
+OperatorHalt makes stop durable: a row in the engagement store AND a sentinel
+file, so it survives the harness dying, Burp dying, or both. It closes two
+findings the bridge review left open -- a second hello erased the halt, and a
+halt did not survive a Burp restart -- by re-asserting on every hello, before
+any configure, and by never being something _reset() can touch. A configure
+still commits its scope and its epoch while halted; only resume re-arms.
+
+records.py gives every denial somewhere to land, which is what S4 means by
+never silent, and a test pins the whole error-class vocabulary -- thirteen
+classes, three of them absent from S6's list of ten -- so a fourteenth cannot
+be added with nowhere to record it. records.UNRECORDABLE names the five that
+get no row, each with the reason: unmanaged_credential and transport_error
+want a CHECK vocabulary Plan 1 does not have, bad_frame and
+engagement_mismatch are refusals about a frame rather than about a request,
+and halted is a run-level abort that abort_run() writes instead.
+
+Row ids are str, not int: exchange and denial ids are TEXT, and evidence and
+finding_observation join on them.
+
+docs/bridge-protocol.md gains the halted frame and error's optional
+retry_after_us, and loses the id/deadline_us it wrongly claimed for halt and
+resume. Plan 2's full-file blocks for server.py and test_bridge_server.py are
+re-synced from the files, as tests/test_plan_matches_repo.py requires."
+```
+
+---
+
+### Task 8: End to end against real Burp and a real target
+
+**Files:**
+- Create: `tests/integration/target_server.py`
+- Create: `tests/integration/conftest.py`
+- Create: `tests/integration/test_send_path.py`
+- Create: `tests/test_target_server.py` (fast suite, no JVM)
+- Modify: `tests/integration/burp_fixture.py` — `launch_burp` passes `-Dhx.halt_sentinel`
+- Modify: `docs/superpowers/plans/2026-08-21-bridge-transport.md` — re-sync its byte-compared copy of `burp_fixture.py`
+- Test: `tests/integration/test_send_path.py`
+
+**Interfaces:**
+- Consumes:
+  - `hx.bridge.server.BridgeServer(socket_path, engagement_id, on_hello=None, on_halted=None, operator_halt=None)` — `start()`, `stop()`, `configure(pairs, scope_sha256, profile) -> int`, `halt(reason)`, `resume()`, `state`, `config_epoch` (Plan 2, widened by Task 7). The rig passes `operator_halt`: Task 7's hello re-assert and its per-send sentinel check both hang off that argument, and a rig that leaves it `None` exercises neither.
+  - `hx.bridge.server.BridgeServer.send(req: dict, body: bytes = b"", timeout: float = 30.0) -> dict` (Task 7). The returned mapping is the `result` frame's header **plus the frame's body bytes under `BridgeServer.BODY_KEY`** — `"@body"`, pinned by the Interface Contract. The response bytes cannot ride in a flat JSON header, and this test reads them back out.
+  - `hx.bridge.server.BridgeServer._send(header)` and `._request(header, body, timeout)` (Plan 2, private). Two call sites, both there so that a frame under test actually reaches the JVM instead of being answered by this side's own guards. Each says so where it is used.
+  - `hx.bridge.server.BridgeError` with `.error_class` and `.retry_after_us` (Task 7). Both are `None` — not absent — on a `BridgeError` this side raised before the wire, so a caller that classifies an arbitrary failure must treat `None` as "no send-path class" rather than assume one.
+  - `hx.bridge.server.BridgeServer.on_halted: Callable[[dict], None] | None` (Task 7) — the unsolicited `halted` frame, `{v, t, reason, host, window}`.
+  - `hx.bridge.codec.PROTOCOL_VERSION`, `hx.bridge.codec.CONFIG_KEYS` (Plan 2)
+  - `hx.halt.OperatorHalt(engagement_dir: Path, db: sqlite3.Connection)` — `halt(reason)`, `resume()`, `halted`, `reason`, `sentinel_path` (Task 7)
+  - `hx.store.records.record_denial(conn, *, run_id, kind, method, url, detail, at_us) -> str` (Task 7)
+  - `hx.store.records.record_exchange(conn, *, run_id, method, url, status, req_blob, resp_blob, ms, at_us) -> str` (Task 7)
+  - `hx.store.records.abort_run(conn, *, run_id, stop_reason, at_us) -> bool` (Task 7). Defined once, there. This task calls it and does not redefine it.
+  - `hx.store.records.DENIAL_KIND` and `hx.store.records.UNRECORDABLE` (Task 7) — the error-class vocabularies, also defined once there.
+  - `hx.engagement.create(root, cfg, *, author) -> Engagement`, `hx.engagement.now_us()`, `hx.config.Config`, `hx.config.dumps` (Plan 1)
+  - `hx.store.blobs.BlobStore.put(bytes) -> (digest, len)`, `.get(digest, expected_len) -> bytes`, `.root` (Plan 1)
+  - `tests.integration.burp_fixture` — `missing()`, `launch_burp()`, `wait_for()`
+  - The extension as built by Tasks 1–7, unmodified. **This task changes no Java.** `Sender.java` and `HxExtension.java` are byte-compared against Task 6's blocks by `tests/test_plan_matches_repo.py`; editing them here would make that plan stale and the fast suite red.
+- Produces:
+  - `tests.integration.target_server.TargetServer(host="127.0.0.1", max_delay_s=MAX_DELAY_S)` — `start()`, `stop()`, `origin`, `host`, `port`, `hits`, `hits_for(path)`, `clear()`
+  - `tests.integration.target_server.Hit(method, path, query, headers, body)`
+  - `tests.integration.target_server.SESSION_COOKIE_VALUE` — the one credential literal the whole suite searches for
+  - `tests.integration.conftest.Rig` and the `rig` fixture — `configure()`, `send()`, `get()`, `send_unguarded()`, `sentinel`, `last_request`
+
+**One dependency this task asserts rather than assumes.** The Interface
+Contract pins the seam that carries the unsolicited `halted` frame —
+`BridgeClient.haltNotifier()` on one end, `Sender.setHaltNotifier(...)` on the
+other — but a pinned seam is two connectors, not a wire. `HxExtension` is what
+joins them, and nothing else in this plan notices if it does not: §6 says
+"auto-halt is extension-initiated, so there is no outstanding `id` to
+answer... without this frame an auto-halt is invisible until the next `send`
+fails, and `run.status = aborted` has no `stop_reason` to record". A `Sender`
+with no notifier installed answers the *next* send with class `halted` and
+pushes nothing, which looks exactly like a working auto-halt from every other
+test in this plan. `test_five_hundreds_from_the_slow_route_abort_the_whole_run`
+waits ten seconds for the frame and fails with that quotation if it never
+arrives. `Distress.window()` exists in Task 3 to fill that frame's third field
+and has no other caller, which is a second way the same gap shows up.
+
+**What this task deliberately does not do.** It does not test the *unreadable*
+sentinel (§4: "if it cannot be read... the extension treats that as halted").
+The sentinel lives inside the engagement directory alongside the database, so
+making it unreadable at this level would break the store the assertions read
+from. That behaviour belongs to `HaltSwitch`'s own unit test, where a scratch
+directory can be chmod'd freely.
+
+Nor does it exercise the rate limiter (§6). `Sender` is driven from the
+bridge's one read loop, so this harness's sends go out one at a time, never
+concurrently, and a real send through this real Burp is measured, end to end,
+at roughly a second -- independent of which side of the bridge that second is
+actually spent in. A harness that cannot place two sends inside one second
+cannot exceed any `limit.rate_rps` this suite could configure, so no
+configured rate can ever trip the limiter through this path, at any setting.
+That is not a gap: the limiter's own logic is already proved exactly, at its
+boundaries, in Task 2, against an injected `Clock` that can place two
+issuances a microsecond apart without waiting for either. What this task
+proves instead is the budget half of the same gate --
+`test_the_run_budget_is_exhausted_and_stays_exhausted` -- because
+`Limiter.check` answers `budget_exhausted` with no clock in the decision at
+all, so a harness slow to issue requests exhausts it exactly as surely as a
+fast one would.
+
+---
+
+- [ ] **Step 1: Write the failing test for the target server**
+
+The instrument before the experiment. Six of this task's assertions are of the
+form *"the target server never received the request"*, and every one of them
+passes forever if the request log silently records nothing. Seven guards on the
+previous branch passed with the thing they guarded deleted; a request log is
+exactly that shape of hazard, so it gets a test of its own — in the **fast**
+suite, with no JVM anywhere near it.
+
+```python
+# tests/test_target_server.py
+"""The instrument, checked before anything is measured with it.
+
+Six assertions in tests/integration/test_send_path.py are of the form "the
+target server never received this request". Every one of them passes forever
+if the request log records nothing -- which is the failure this file exists to
+make impossible. It is in the FAST suite on purpose: it needs a loopback
+socket and a few milliseconds, not a 900 MB JVM.
+"""
+from __future__ import annotations
+
+import http.client
+import json
+import time
+
+import pytest
+
+from tests.integration import target_server as ts
+
+
+@pytest.fixture
+def target():
+    server = ts.TargetServer("127.0.0.1")
+    server.start()
+    yield server
+    server.stop()
+
+
+def _get(server: ts.TargetServer, path: str, headers: dict | None = None):
+    conn = http.client.HTTPConnection(server.host, server.port, timeout=5)
+    try:
+        conn.request("GET", path, headers=headers or {})
+        response = conn.getresponse()
+        return response.status, dict(response.getheaders()), response.read()
+    finally:
+        conn.close()
+
+
+def test_a_served_request_is_recorded_before_it_is_answered(target):
+    status, _headers, body = _get(target, "/api/orders")
+    assert status == 200
+    assert json.loads(body)["orders"][0]["id"] == 1
+
+    assert len(target.hits) == 1
+    hit = target.hits[0]
+    assert hit.method == "GET"
+    assert hit.path == "/api/orders"
+    assert hit.query == ""
+
+
+def test_the_routes_the_gate_should_refuse_are_recorded_too(target):
+    """A log that only records the requests hx is allowed to make cannot
+    witness one it was not. Every route answers and every route is logged."""
+    _get(target, "/account/logout")
+    conn = http.client.HTTPConnection(target.host, target.port, timeout=5)
+    try:
+        conn.request("POST", "/api/orders", body=b'{"total":"1.00"}',
+                     headers={"Content-Type": "application/json"})
+        assert conn.getresponse().status == 201
+    finally:
+        conn.close()
+
+    assert [(h.method, h.path) for h in target.hits] == [
+        ("GET", "/account/logout"),
+        ("POST", "/api/orders"),
+    ]
+    assert target.hits[1].body == b'{"total":"1.00"}'
+
+
+def test_a_request_header_is_recorded_verbatim(target):
+    """The unmanaged-credential assertion reads Cookie back off this log."""
+    _get(target, "/api/orders", {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"})
+    assert target.hits[0].headers["Cookie"] == f"session={ts.SESSION_COOKIE_VALUE}"
+
+
+def test_the_login_route_sets_a_cookie_worth_redacting(target):
+    status, headers, _body = _get(target, "/login")
+    assert status == 200
+    assert headers["Set-Cookie"] == (
+        f"session={ts.SESSION_COOKIE_VALUE}; Path=/; HttpOnly; SameSite=Lax")
+
+
+def test_the_flaky_route_returns_the_status_it_is_asked_for(target):
+    assert _get(target, "/flaky?status=500")[0] == 500
+    assert _get(target, "/flaky?status=503")[0] == 503
+    assert _get(target, "/flaky")[0] == 500
+
+
+def test_the_slow_route_is_slow_and_can_also_be_a_five_hundred(target):
+    began = time.monotonic()
+    status, _headers, _body = _get(target, "/slow?ms=150&status=500")
+    assert status == 500
+    assert time.monotonic() - began >= 0.15
+
+
+def test_an_absurd_delay_is_clamped_rather_than_honoured():
+    """A typo in a query string must not wedge the suite for an hour.
+
+    The clamp is lowered to 50 ms for this test rather than waiting out the
+    5 s default: a guard whose test costs five seconds every fast run is a
+    guard someone eventually deletes.
+    """
+    server = ts.TargetServer("127.0.0.1", max_delay_s=0.05)
+    server.start()
+    try:
+        began = time.monotonic()
+        _get(server, "/slow?ms=3600000")
+        assert time.monotonic() - began < 1.0
+    finally:
+        server.stop()
+
+
+def test_two_loopback_targets_keep_separate_logs():
+    """The whole out-of-scope claim rests on this.
+
+    127.0.0.2 is a second loopback address: a real listening server that only
+    this machine can reach. An out-of-scope send that escaped the gate would
+    be DELIVERED there and appear in ITS log -- which is a different and much
+    stronger observation than a connection refusal, since a refusal looks
+    identical whether the gate worked or the port was simply shut.
+    """
+    first = ts.TargetServer("127.0.0.1")
+    second = ts.TargetServer("127.0.0.2")
+    first.start()
+    second.start()
+    try:
+        assert first.port != second.port or first.host != second.host
+        _get(first, "/health")
+        assert [h.path for h in first.hits] == ["/health"]
+        assert second.hits == []
+        _get(second, "/health")
+        assert [h.path for h in second.hits] == ["/health"]
+    finally:
+        first.stop()
+        second.stop()
+
+
+def test_a_non_loopback_target_is_refused_by_the_constructor():
+    """Nothing in this project has ever sent a request off the machine. This
+    is the line that keeps a typo in a test from changing that."""
+    with pytest.raises(ValueError, match="loopback only"):
+        ts.TargetServer("0.0.0.0")
+    with pytest.raises(ValueError, match="loopback only"):
+        ts.TargetServer("192.168.1.10")
+
+
+def test_stop_is_safe_on_a_server_that_never_started():
+    """BaseServer.shutdown() blocks on an event only serve_forever() sets, so
+    calling it on an unstarted server hangs forever -- and a teardown that
+    hangs is worse than one that leaks, because pytest reports neither. The
+    rig registers stop() BEFORE start(), so this path is real."""
+    server = ts.TargetServer("127.0.0.1")
+    server.stop()
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cd /path/to/hx && python -m pytest tests/test_target_server.py -q`
+
+Expected: FAIL at collection with
+
+```
+ImportError while importing test module '.../tests/test_target_server.py'.
+...
+ModuleNotFoundError: No module named 'tests.integration.target_server'
+```
+
+- [ ] **Step 3: Write the loopback target server**
+
+```python
+# tests/integration/target_server.py
+"""A loopback-only HTTP target for the integration suite.
+
+Nothing in this project has ever sent a request off the machine, and this
+module is what keeps that true while still proving the send path end to end:
+`hx` needs something real to answer, so it gets a server on 127.0.0.0/8 and
+nowhere else. The constructor refuses any other address rather than trusting
+every future caller to pass a loopback one.
+
+Two instances run at once. The in-scope target binds 127.0.0.1 and the
+out-of-scope target binds 127.0.0.2 -- a second loopback address, reachable
+from this machine and only this machine. That pairing is what makes "the
+request was refused" and "the request was never issued" different claims: a
+scope-denied send that escaped the gate would be DELIVERED to the second
+server and appear in its log, rather than dying on a connection refusal that
+looks identical whether the gate worked or the port was simply shut.
+
+Every request is recorded BEFORE it is answered, so the assertions in
+test_send_path.py can be made against what the server saw rather than against
+what the bridge said.
+"""
+from __future__ import annotations
+
+import functools
+import json
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+# The value that must never be found on disk. It stands in for a live
+# production session cookie, and it is distinctive enough that a byte search
+# over the whole blob tree means something. It is written in exactly one
+# place: the redaction assertions and the credential assertions both import
+# it, so a change here cannot leave one of them checking a stale literal.
+SESSION_COOKIE_VALUE = "s3cr3t-live-session-2f9a41c0"
+
+# The most /slow will ever sleep, whatever the query string says. A typo in a
+# test ("ms=3600000") would otherwise wedge the suite for an hour with no
+# diagnostic; five seconds is longer than any deadline this suite sets and
+# still short enough that a wedged run is a failure rather than a lunch break.
+# Per-server overridable, so the test for the clamp does not cost five
+# seconds of every fast run.
+MAX_DELAY_S = 5.0
+
+
+@dataclass(frozen=True)
+class Hit:
+    """One request, as the target server received it.
+
+    `headers` collapses repeated field names to the last value. Nothing in
+    this suite asserts on a repeated request header; if something ever does,
+    it needs the raw list rather than this mapping.
+    """
+
+    method: str
+    path: str
+    query: str
+    headers: dict[str, str]
+    body: bytes
+
+
+def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
+    values = params.get(name)
+    if not values:
+        return default
+    try:
+        return int(values[0])
+    except ValueError:
+        return default
+
+
+class _Handler(BaseHTTPRequestHandler):
+    # HTTP/1.0 -- the default -- lets a response omit Content-Length and end
+    # at the connection teardown instead. The send path measures how many
+    # bytes came back and Burp reads a length, so be explicit about both.
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        """Silence the stderr access log.
+
+        The structured request log on TargetServer is the record the
+        assertions read; the stderr line is the same information interleaved
+        with Burp's own launcher output, in a suite where reading the output
+        is how a failure gets diagnosed.
+        """
+
+    def do_GET(self):
+        self._dispatch("GET")
+
+    def do_HEAD(self):
+        self._dispatch("HEAD")
+
+    def do_OPTIONS(self):
+        self._dispatch("OPTIONS")
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
+
+    def _dispatch(self, method: str) -> None:
+        parts = urlsplit(self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+
+        # Recorded BEFORE the answer. A route that raises on its way to a
+        # response must still leave evidence that the request arrived --
+        # "the target never received it" is the claim this log carries.
+        self.server.target.record(Hit(
+            method=method,
+            path=parts.path,
+            query=parts.query,
+            headers={name: value for name, value in self.headers.items()},
+            body=body,
+        ))
+
+        params = parse_qs(parts.query)
+        if parts.path == "/health":
+            self._reply(200, {"ok": True})
+        elif parts.path == "/api/orders":
+            # POST is the method the allowlist forbids. It answers 201 rather
+            # than refusing: if the allowlist ever fails open, the evidence
+            # should be a created order in this log, not an error a caller
+            # could mistake for the gate having worked.
+            self._reply(201 if method == "POST" else 200,
+                        {"created": True} if method == "POST"
+                        else {"orders": [{"id": 1, "total": "12.00"}]})
+        elif parts.path == "/account/logout":
+            # On the dangerous-path denylist, and deliberately harmless here.
+            self._reply(200, {"logged_out": True})
+        elif parts.path == "/login":
+            self._reply(200, {"welcome": True}, extra=[
+                ("Set-Cookie",
+                 f"session={SESSION_COOKIE_VALUE}; Path=/; HttpOnly; SameSite=Lax"),
+            ])
+        elif parts.path == "/flaky":
+            self._reply(_int_param(params, "status", 500), {"error": "upstream"})
+        elif parts.path == "/slow":
+            time.sleep(min(_int_param(params, "ms", 250) / 1000.0,
+                           self.server.target.max_delay_s))
+            self._reply(_int_param(params, "status", 200), {"slow": True})
+        else:
+            self._reply(404, {"error": "no such route"})
+
+    def _reply(self, status: int, payload: dict,
+               extra: tuple[tuple[str, str], ...] = ()) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in extra:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+
+class _Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            # A client closing a keep-alive connection, or Burp dropping one
+            # on a deadline. Both are normal here and neither is a defect;
+            # the default prints a full traceback to stderr, which competes
+            # with the diagnostics a failing integration test actually needs.
+            # Anything else still gets the loud treatment.
+            return
+        super().handle_error(request, client_address)
+
+
+class TargetServer:
+    """One loopback HTTP target, with a log of everything it received."""
+
+    def __init__(self, host: str = "127.0.0.1",
+                 max_delay_s: float = MAX_DELAY_S) -> None:
+        if not host.startswith("127."):
+            raise ValueError(
+                f"target servers are loopback only, not {host!r}: nothing in "
+                "this project has ever sent a request off the machine"
+            )
+        self.max_delay_s = max_delay_s
+        self._hits: list[Hit] = []
+        self._lock = threading.Lock()
+        self._httpd = _Server((host, 0), _Handler)
+        # Read by every handler through self.server. Set before any thread is
+        # serving, so there is no window in which a handler sees it missing.
+        self._httpd.target = self
+        self.host, self.port = self._httpd.server_address[0], self._httpd.server_address[1]
+        # poll_interval, not the 0.5 s default: shutdown() only returns after
+        # the loop next wakes, so the default costs up to half a second per
+        # teardown and this suite tears down two servers per test.
+        self._thread = threading.Thread(
+            target=functools.partial(self._httpd.serve_forever, poll_interval=0.05),
+            name=f"target-{self.host}", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Safe to call whether or not start() ever ran.
+
+        BaseServer.shutdown() waits on an event that only serve_forever()
+        sets, so calling it on a server whose thread never started blocks for
+        ever. The rig registers this callback BEFORE calling start(), exactly
+        so a failure during construction is cleaned up -- which makes the
+        unstarted case the normal one on the unhappy path, and a teardown
+        that hangs is worse than one that leaks: pytest reports neither, but
+        it at least finishes after a leak.
+        """
+        if self._thread.is_alive():
+            self._httpd.shutdown()
+            self._thread.join(timeout=5)
+        self._httpd.server_close()
+
+    @property
+    def origin(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def record(self, hit: Hit) -> None:
+        # ThreadingHTTPServer answers each request on its own thread.
+        with self._lock:
+            self._hits.append(hit)
+
+    @property
+    def hits(self) -> list[Hit]:
+        """A snapshot. Callers iterate it while the server may still be
+        answering, and a list mutating under a comprehension is a flake that
+        only ever appears on someone else's machine."""
+        with self._lock:
+            return list(self._hits)
+
+    def hits_for(self, path: str) -> list[Hit]:
+        return [hit for hit in self.hits if hit.path == path]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._hits.clear()
+```
+
+- [ ] **Step 4: Run it and watch it pass**
+
+Run: `cd /path/to/hx && python -m pytest tests/test_target_server.py -q`
+
+Expected: PASS — `10 passed`, in well under a second and with no `java`
+process anywhere.
+
+- [ ] **Step 5: Teach the Burp launcher about the halt sentinel**
+
+Task 6's `HxExtension` reads `-Dhx.halt_sentinel` and **refuses to initialise
+without it** — deliberately, because an extension live with only two of §4's
+three kill paths is worse than one that says it is idle. The launcher does not
+pass it yet, so every integration test would hang at the handshake with
+`hx: -Dhx.socket, -Dhx.engagement and -Dhx.halt_sentinel are required;
+extension idle` in `burp.log` and nothing on the bridge.
+
+Replace `launch_burp` in `tests/integration/burp_fixture.py` with this:
+
+```python
+# tests/integration/burp_fixture.py -- launch_burp gains the halt sentinel
+
+def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
+                sentinel: Path | None = None) -> subprocess.Popen:
+    """Burp's output goes to workdir/burp.log, never to a pipe.
+
+    An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
+    buffer fills and the test hangs with no diagnostic. A file also means a
+    failing test can quote what Burp actually said.
+
+    `sentinel` is the halt file the extension polls. It is defaulted rather
+    than made required so the handshake tests do not have to invent one, but
+    the property is ALWAYS passed: HxExtension refuses to initialise without
+    it, and the symptom of omitting it is a test that hangs at the handshake
+    with one line in burp.log and nothing on the bridge. The default path
+    must not exist at launch -- an existing sentinel means halted -- so it is
+    named inside the per-run workdir rather than anywhere shared.
+    """
+    home = make_home(workdir)
+    sentinel = Path(sentinel) if sentinel is not None else workdir / "halt.sentinel"
+    log = (workdir / "burp.log").open("wb")
+    cmd = [
+        "java",
+        "-Djava.awt.headless=true",
+        f"-Duser.home={home}",
+        f"-Dhx.socket={socket_path}",
+        f"-Dhx.engagement={engagement_id}",
+        f"-Dhx.halt_sentinel={sentinel}",
+        "-Dhx.instance=integration",
+        *ADD_OPENS,
+        "-cp", f"{BURP_JAR}:{EXT_JAR}",
+        "burp.StartBurp",
+        "--developer-extension-class-name=hx.HxExtension",
+        "--disable-auto-update",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
+                            stderr=subprocess.STDOUT, cwd=LAB)
+    proc.stdin.write(b"\n\n")     # bare newline selects Community Edition
+    proc.stdin.flush()
+    return proc
+```
+
+Then confirm the two existing integration tests still handshake:
+
+Run: `cd /path/to/hx && python -m pytest -m integration tests/integration/test_real_burp.py -q`
+
+Expected: PASS — `2 passed`. If it reports `2 skipped`, read the skip reason:
+a stale jar (`run extension/build.sh`) is the usual cause and a skipped
+integration suite reads almost exactly like a passing one on a terminal.
+
+- [ ] **Step 6: Re-sync Plan 2's byte-compared copy of `burp_fixture.py`**
+
+`tests/test_plan_matches_repo.py` compares plan code blocks against the files
+they name across **every** plan in `docs/superpowers/plans/`, not just this
+one. `tests/integration/burp_fixture.py` is carried as a full-file block in
+`2026-08-21-bridge-transport.md`, so the edit in Step 5 has just made that
+block stale: the fast suite goes red in another plan's test id, which is where
+nobody thinks to look. Confirm it first, so the fix is a fix and not a ritual:
+
+```bash
+cd /path/to/hx
+python -m pytest tests/test_plan_matches_repo.py -q \
+    -k 'bridge-transport and burp_fixture'
+```
+
+Expected: FAIL — `1 failed`, naming the first line that differs.
+
+```
+E   Failed: 2026-08-21-bridge-transport.md has stale code for
+    tests/integration/burp_fixture.py at line 195:
+      plan: 'def launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subprocess.Popen:'
+      repo: 'def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,'
+    Sync the plan from the file; never edit the block by hand.
+```
+
+Sync the block **from** the file — never the other way round, and never by
+hand, which is the mistake that put four fixed defects back into a plan on the
+last branch:
+
+```bash
+cd /path/to/hx
+python - <<'PY'
+from pathlib import Path
+
+PLAN = Path("docs/superpowers/plans/2026-08-21-bridge-transport.md")
+SOURCE = Path("tests/integration/burp_fixture.py")
+# The fence is assembled rather than written out. A literal one inside this
+# script would itself look like the start of a code block to the regex in
+# tests/test_plan_matches_repo.py, which would then compare THIS plan's
+# "block" for burp_fixture.py against the file and fail for ever.
+FENCE = "`" * 3
+OPENING = FENCE + "python\n# " + str(SOURCE) + "\n"
+
+text = PLAN.read_text()
+if text.count(OPENING) != 1:
+    raise SystemExit(f"expected exactly 1 block for {SOURCE}, found {text.count(OPENING)}")
+start = text.index(OPENING) + len(OPENING)
+end = text.index("\n" + FENCE + "\n", start) + 1
+PLAN.write_text(text[:start] + SOURCE.read_text().rstrip("\n") + "\n" + text[end:])
+print(f"re-synced {SOURCE} into {PLAN}")
+PY
+```
+
+Run: `python -m pytest tests/test_plan_matches_repo.py -q`
+
+Expected: PASS — every block green, including the one just rewritten. Running
+the sync a second time must change nothing; if `git diff` on the plan is
+non-empty after a second run, the block boundaries were found wrong and the
+file has been damaged rather than synced.
+
+- [ ] **Step 7: Write the rig**
+
+One engagement, one bridge, one real Burp, two loopback targets, and a
+teardown that cannot leak any of them.
+
+```python
+# tests/integration/conftest.py
+"""The rig: one engagement, one bridge, one real Burp, two loopback targets.
+
+Everything is registered on an ExitStack as it is created, so a failure
+part-way through construction unwinds whatever already exists, and a failing
+TEST unwinds all of it. That is not defensiveness for its own sake: on this
+branch a kill that lived at the end of a try block was jumped over by an
+assertion twice, leaving a 900 MB JVM per debugging attempt.
+
+The rig deliberately does NOT push a configure frame. DENY-ALL is the initial
+state and a test that wants to prove it needs a live, unconfigured extension
+to prove it against; every other test calls rig.configure() on its first line.
+
+Everything expensive happens inside the fixture, never at import. A conftest
+is imported during COLLECTION, including on a fast `pytest` run that then
+deselects every test in this directory, so an exception at module level here
+is not a skipped suite -- it is a collection error for the whole repository.
+That has already happened twice on this branch from burp_fixture.missing().
+"""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import subprocess
+import uuid
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Sequence
+
+import pytest
+
+from hx import config, engagement
+from hx.bridge import codec, server
+from hx.halt import OperatorHalt
+from tests.integration import burp_fixture as bf
+from tests.integration.target_server import TargetServer
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    proc.kill()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        # Warn rather than raise: this runs during unwind, and an exception
+        # here would REPLACE the assertion that actually failed the test.
+        warnings.warn(f"Burp pid {proc.pid} survived kill(); it may still be running")
+
+
+@dataclass
+class Rig:
+    eng: engagement.Engagement
+    srv: server.BridgeServer
+    proc: subprocess.Popen
+    target: TargetServer
+    offside: TargetServer
+    halt: OperatorHalt
+    run_id: str
+    workdir: Path
+    last_request: bytes = field(default=b"", init=False)
+
+    @property
+    def sentinel(self) -> Path:
+        return self.halt.sentinel_path
+
+    def configure(self, *, max_requests: int = 2000) -> int:
+        """Push the scope, the method allowlist and the limits this rig tests.
+
+        `limit.rate_rps` is taken from the engagement config rather than
+        written out here. S4 puts the limits inside the extension and the
+        configure body is how they get there, so the number in the config, the
+        number on the wire and the number a test computes its bounds from are
+        one number. Two of them written separately is how a test ends up
+        asserting against a rate nothing honours.
+
+        `limit.max_requests` has no engagement-config field yet, so this is the
+        rig's own choice, and it is a parameter rather than a second constant
+        for exactly one reason: every test but the budget test wants it far
+        above anything that test issues, so the per-run budget never trips
+        first and quietly turns whatever it is testing into a budget test.
+        `Limits.arm` only ever arms once per run (its own docstring: "ARMED
+        ONCE"), so a caller wanting a number other than the default must pass
+        it on the FIRST configure of the test -- a later configure with a
+        different value is silently ignored, by design, so that a scope push
+        mid-run can never hand a run more requests than it started with.
+
+        The distress thresholds are deliberately NOT here. Plan 2's config-key
+        vocabulary (`codec.CONFIG_KEYS`) has no key for them and
+        `build_config_body` refuses an unrecognised key outright, so the
+        auto-halt test is written against the S4 production defaults the
+        extension carries: a 5xx rate above 20%, over a window that needs ten
+        answered samples on a host before it may trip.
+        """
+        pairs = {
+            "scope.include": [f"{self.target.origin}/*"],
+            "method.allow": ["GET", "HEAD", "OPTIONS"],
+            "dangerous.path": ["*/logout*", "*/password*"],
+            "limit.rate_rps": [str(self.eng.config.rate_limit_rps)],
+            "limit.max_requests": [str(max_requests)],
+        }
+        scope_sha256 = hashlib.sha256(
+            config.dumps(self.eng.config).encode("utf-8")).hexdigest()
+        return self.srv.configure(pairs, scope_sha256=scope_sha256,
+                                  profile=self.eng.config.safety_profile)
+
+    def send(self, method: str, target_path: str, *,
+             to: TargetServer | None = None,
+             headers: Sequence[tuple[str, str]] = (),
+             body: bytes = b"", timeout: float = 15.0,
+             guarded: bool = True) -> dict:
+        """Issue one request through the whole stack.
+
+        The DESTINATION travels in the frame header, not in the Host line:
+        Burp connects to the service the header names, so that is what the
+        scope decision has to be about. The Host line is set to match only so
+        the target server sees a well-formed request.
+
+        `guarded=False` skips this side's own refusals; see send_unguarded,
+        which is its only caller and carries the reason.
+        """
+        dest = to or self.target
+        lines = [f"{method} {target_path} HTTP/1.1",
+                 f"Host: {dest.host}:{dest.port}",
+                 "User-Agent: hx-integration/0.1",
+                 "Accept: application/json"]
+        lines += [f"{name}: {value}" for name, value in headers]
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        # ISO-8859-1 for the same reason Sender.parse reads it that way: HTTP
+        # field values are octets, and one octet is one char here.
+        raw = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
+        self.last_request = raw
+        req = {"identity_id": None, "target_host": dest.host,
+               "target_port": dest.port, "tls": False}
+        if guarded:
+            return self.srv.send(req, raw, timeout=timeout)
+        return self._past_the_local_guards(req, raw, timeout)
+
+    def get(self, target_path: str, **kwargs) -> dict:
+        return self.send("GET", target_path, **kwargs)
+
+    def send_unguarded(self, method: str, target_path: str, **kwargs) -> dict:
+        """Send with THIS side's refusals off, so the extension's are the only
+        ones left.
+
+        BridgeServer.send refuses locally whenever the durable halt is armed or
+        its own state says halted. That is right in production -- two gates are
+        better than one -- and fatal to a test of the kill switch: the frame
+        never reaches the JVM, the assertion is satisfied by the harness's own
+        bookkeeping, and it goes on passing with the extension wide open. This
+        is that shape of vacuous guard, and it is the shape this project has
+        already been bitten by seven times.
+
+        So this path builds the same `send` frame and hands it straight to the
+        request/reply machinery. A refusal that comes back through it came back
+        from the JVM. Every caller pairs it with an assertion on `target.hits`,
+        because the target server's own log is the one witness no state on this
+        side can fake.
+        """
+        return self.send(method, target_path, guarded=False, **kwargs)
+
+    def _past_the_local_guards(self, req: dict, raw: bytes,
+                               timeout: float) -> dict:
+        reply = self.srv._request(
+            {"v": codec.PROTOCOL_VERSION, "t": "send",
+             "engagement_id": self.srv.engagement_id, **req},
+            raw, timeout=timeout)
+        if reply.get("t") == "result":
+            return reply
+        # The same translation BridgeServer.send does on the way out, so a
+        # caller cannot tell the two paths apart by the shape of the failure --
+        # only by which side refused, which is the whole point.
+        raise server.BridgeError(
+            f"{reply.get('class', 'unspecified')}: "
+            f"{reply.get('detail', '')}".rstrip(": "),
+            error_class=reply.get("class"),
+            retry_after_us=reply.get("retry_after_us"))
+
+
+@pytest.fixture
+def rig(tmp_path):
+    if bf.missing():
+        pytest.skip("missing: " + ", ".join(bf.missing()))
+
+    with contextlib.ExitStack() as stack:
+        # stop() is registered BEFORE start() on both servers: a start() that
+        # raises must still close the socket it already bound.
+        target = TargetServer("127.0.0.1")
+        stack.callback(target.stop)
+        target.start()
+        offside = TargetServer("127.0.0.2")
+        stack.callback(offside.stop)
+        offside.start()
+
+        cfg = config.Config(name="integration", client="loopback",
+                            scope_include=[f"{target.origin}/*"])
+        eng = engagement.create(tmp_path / "engagement", cfg, author="integration")
+        stack.callback(eng.db.close)
+
+        # Plan 4 owns run lifecycle; this is the one row the exchange,
+        # denial and abort assertions need to hang off.
+        run_id = f"r-{uuid.uuid4().hex[:12]}"
+        eng.db.execute(
+            "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+            " started_us, status) VALUES(?,?,?,?,?,?)",
+            (run_id, eng.id, "manual", cfg.safety_profile,
+             engagement.now_us(), "running"))
+
+        operator_halt = OperatorHalt(eng.root, eng.db)
+        # Wired into the bridge, not left dangling. Task 7 hangs two behaviours
+        # off this argument -- the halt re-asserted after every hello, and the
+        # sentinel consulted on every send -- and a rig that leaves it None
+        # exercises neither, in the one place they could be exercised against a
+        # real reconnecting extension. The price is that this side now refuses
+        # a send of its own accord while the sentinel exists, which is why the
+        # halt test sends through Rig.send_unguarded.
+        srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id=eng.id,
+                                  operator_halt=operator_halt)
+        stack.callback(srv.stop)
+        srv.start()
+
+        proc = bf.launch_burp(srv.socket_path, eng.id, tmp_path / "burp",
+                              sentinel=operator_halt.sentinel_path)
+        stack.callback(_reap, proc)
+
+        if not bf.wait_for(lambda: srv.state == "connected"):
+            raise AssertionError(
+                "Burp never completed the hello handshake; see "
+                f"{tmp_path / 'burp' / 'burp.log'}")
+
+        yield Rig(eng=eng, srv=srv, proc=proc, target=target, offside=offside,
+                  halt=operator_halt, run_id=run_id, workdir=tmp_path)
+```
+
+- [ ] **Step 8: Write the end-to-end test**
+
+```python
+# tests/integration/test_send_path.py
+"""The gate, proved rather than asserted.
+
+Everything below crosses the whole stack: Python `send()`, the Unix socket,
+the real extension inside a real headless Burp, out to a loopback HTTP server,
+and back. Fakes prove the logic and they already do, exhaustively, in
+extension/test; what only this file can prove is that the gate is in the path
+that actually issues requests.
+
+Two rules run through it:
+
+  * A denial is asserted on the TARGET SERVER'S OWN LOG, not on the error
+    class. "An error came back" and "the request was never issued" are
+    different claims and only the second one is §4's invariant. The
+    out-of-scope destination is a second live loopback server for exactly
+    this reason -- an escaped request would be delivered and recorded there.
+
+  * Nothing here sleeps to approach a boundary except where a real poller
+    makes waiting the only honest option, and each of those waits is bounded
+    and named. The rate limiter is not one of them -- see "What this task
+    deliberately does not do" above -- and the budget test proves its half
+    of the same gate with no sleep at all, because the budget has no clock
+    in its decision.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+
+import pytest
+
+from hx import engagement
+from hx.bridge import codec, server
+from hx.store import records
+from tests.integration import burp_fixture as bf
+from tests.integration import target_server
+
+pytestmark = pytest.mark.integration
+
+# HxExtension builds its HaltSwitch with HaltSwitch.DEFAULT_POLL_MS, which is
+# 500 ms -- two polls a second in the extension's own poller. The loop below
+# that actually spends this budget gets far fewer chances than that: each
+# iteration pays for one unguarded send through a real Burp (measured at
+# roughly a second) plus its own 0.2 s sleep, so the 5 s budget buys about
+# four probes, not ten -- still comfortably more than the two polls the
+# extension needs to notice the sentinel.
+SENTINEL_POLL_S = 0.5
+SENTINEL_HALT_BUDGET_S = 5.0
+
+# Error class -> `denial.kind` is records.DENIAL_KIND, imported rather than
+# restated. A second copy here would be the copy nothing tests, and the two
+# would agree right up until Plan 1's CHECK constraint grew a value.
+# unmanaged_credential is in neither: see records.UNRECORDABLE, and the
+# assertion that pins the gap in test_the_gate_refuses_four_ways.
+
+
+def _blobs_containing(eng, needle: bytes) -> list[Path]:
+    """Every blob whose bytes contain `needle`. Empty is the only good answer.
+
+    Content-addressed storage is the reason this is a tree walk rather than a
+    query: once raw bytes are hashed in, they are in every backup taken since,
+    and no row has to reference them for that to be true.
+    """
+    return [p for p in sorted(eng.blobs.root.rglob("*"))
+            if p.is_file() and needle in p.read_bytes()]
+
+
+def _issue_until(rig, target_path: str, *, want: str, attempts: int = 40) -> list:
+    """Send `target_path` until the gate answers with error class `want`.
+
+    A rate limit is slept out rather than treated as the answer. §6 says
+    nothing retries automatically; this is a caller deciding to, explicitly,
+    which is precisely the distinction that class exists to support. Every
+    other error class is returned to the test rather than swallowed.
+    """
+    seen: list = []
+    for _ in range(attempts):
+        try:
+            seen.append(rig.get(target_path)["status"])
+        except server.BridgeError as exc:
+            # A BridgeError this side raised before the wire -- a malformed
+            # call -- has error_class None rather than a send-path class, so
+            # None is a real answer here and not a missing attribute.
+            error_class = exc.error_class
+            if error_class == "rate_limited":
+                time.sleep(exc.retry_after_us / 1_000_000 + 0.02)
+                continue
+            seen.append(error_class)
+            if error_class == want:
+                return seen
+            raise AssertionError(
+                f"waiting for {want}, got {error_class}: {exc} (so far: {seen})"
+            ) from exc
+    raise AssertionError(f"{attempts} attempts and no {want}: {seen}")
+
+
+def test_deny_all_holds_then_an_in_scope_get_becomes_an_exchange_row(rig):
+    """The happy path, and the state it starts from.
+
+    DENY-ALL first: a live extension that has not been configured refuses
+    everything. That is the 02:00 Burp-restart window in §4, and this is the
+    only place it is exercised against a real JVM rather than a fake.
+    """
+    with pytest.raises(server.BridgeError) as unconfigured:
+        rig.get("/api/orders")
+    assert unconfigured.value.error_class == "not_configured"
+    assert rig.target.hits == [], \
+        f"an unconfigured extension issued {rig.target.hits}"
+
+    assert rig.configure() == 1
+
+    reply = rig.get("/api/orders")
+    assert reply["t"] == "result"
+    assert reply["status"] == 200
+    assert reply["outcome"] == "ok"
+    assert reply["config_epoch"] == 1, \
+        "the result must carry the epoch that authorised the scope it was decided under"
+    # BODY_KEY carries the redacted raw HTTP response -- status line and
+    # headers included, exactly what Sender put there -- not the parsed
+    # entity body, so split them before handing anything to json.loads.
+    raw = reply[server.BridgeServer.BODY_KEY]
+    _head, _, body = raw.partition(b"\r\n\r\n")
+    assert json.loads(body)["orders"][0]["id"] == 1
+
+    hits = rig.target.hits_for("/api/orders")
+    assert [hit.method for hit in hits] == ["GET"]
+
+    # The harness's half: what came back becomes evidence. Plan 4 owns the
+    # loop that does this for real; here it is one call, against a reply that
+    # crossed a real socket from a real Burp. The blob holds the raw response
+    # -- record_exchange's own docstring: "digests of the REDACTED bytes" --
+    # not the entity body split out of it above, so a reader of the row later
+    # gets back what actually crossed the wire, headers included.
+    req_blob, _req_len = rig.eng.blobs.put(rig.last_request)
+    resp_blob, resp_len = rig.eng.blobs.put(raw)
+    # The row id, not a bare truthiness check: record_exchange returns the id
+    # of the row it wrote, `x-` and twelve hex. A plain `assert` on the return
+    # would be just as satisfied by True, by a rowcount, or by the run_id it
+    # was handed back unchanged.
+    assert records.record_exchange(
+        rig.eng.db, run_id=rig.run_id, method="GET",
+        url=f"{rig.target.origin}/api/orders", status=reply["status"],
+        req_blob=req_blob, resp_blob=resp_blob, ms=reply["ms"],
+        at_us=engagement.now_us()).startswith("x-")
+
+    row = rig.eng.db.execute(
+        "SELECT method, url, status, via, req_blob, resp_blob FROM exchange"
+        " WHERE run_id=?", (rig.run_id,)).fetchone()
+    assert row["method"] == "GET"
+    assert row["url"] == f"{rig.target.origin}/api/orders"
+    assert row["status"] == 200
+    assert row["via"] == "send"
+    assert row["req_blob"] == req_blob
+    assert rig.eng.blobs.get(row["resp_blob"], resp_len) == raw
+
+
+def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
+    rig.configure()
+
+    # A successful send FIRST. Without it, every "the log is empty" assertion
+    # below is also satisfied by a target server that never worked at all.
+    assert rig.get("/health")["status"] == 200
+
+    refusals = {}
+
+    # Scope. 127.0.0.2 is a live server on a second loopback address, so a
+    # request that escaped the gate would be DELIVERED there -- not refused
+    # by a closed port, which would look identical to the gate working.
+    with pytest.raises(server.BridgeError) as exc:
+        rig.send("GET", "/api/orders", to=rig.offside)
+    refusals["scope"] = exc.value
+
+    # Method: the allowlist is GET/HEAD/OPTIONS.
+    with pytest.raises(server.BridgeError) as exc:
+        rig.send("POST", "/api/orders", body=b'{"total":"1.00"}')
+    refusals["method"] = exc.value
+
+    # Dangerous path: in scope, allowed method, still refused. "In scope" and
+    # "safe to touch automatically" are different questions (§4).
+    with pytest.raises(server.BridgeError) as exc:
+        rig.get("/account/logout")
+    refusals["dangerous"] = exc.value
+
+    # A credential this extension did not inject (§7). Refused, and never
+    # persisted -- there is nothing to persist, because it was never issued.
+    cookie = f"session={target_server.SESSION_COOKIE_VALUE}"
+    with pytest.raises(server.BridgeError) as exc:
+        rig.get("/api/orders", headers=[("Cookie", cookie)])
+    refusals["credential"] = exc.value
+
+    assert {name: e.error_class for name, e in refusals.items()} == {
+        "scope": "scope_denied",
+        "method": "method_denied",
+        "dangerous": "dangerous_denied",
+        "credential": "unmanaged_credential",
+    }
+
+    # The assertions this test exists for, on what the SERVERS saw.
+    assert rig.offside.hits == [], \
+        f"the out-of-scope target received {[(h.method, h.path) for h in rig.offside.hits]}"
+    assert [hit.path for hit in rig.target.hits] == ["/health"], \
+        f"the in-scope target received {[(h.method, h.path) for h in rig.target.hits]}"
+    assert _blobs_containing(rig.eng, target_server.SESSION_COOKIE_VALUE.encode()) == []
+
+    # Denials are never silent (§4): each one becomes a row.
+    for name in ("scope", "method", "dangerous"):
+        assert records.record_denial(
+            rig.eng.db, run_id=rig.run_id,
+            kind=records.DENIAL_KIND[refusals[name].error_class],
+            method="POST" if name == "method" else "GET",
+            url=f"{rig.target.origin}/api/orders",
+            detail=str(refusals[name]), at_us=engagement.now_us())
+    kinds = [r["kind"] for r in rig.eng.db.execute(
+        "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us, rowid",
+        (rig.run_id,))]
+    assert kinds == ["scope", "method", "dangerous"]
+
+    # A gap, pinned rather than papered over: Plan 1's denial.kind CHECK
+    # lists scope, method, dangerous, rate, budget and not_configured. There
+    # is no kind for unmanaged_credential -- nor for halted, transport_error,
+    # timeout or bridge_lost -- so §6's error classes are wider than the
+    # table that is supposed to record them. records.UNRECORDABLE is where
+    # that is written down; this is where it is demonstrated, and when the
+    # schema grows a kind these two assertions are what will say so.
+    assert "unmanaged_credential" in records.UNRECORDABLE
+    with pytest.raises((sqlite3.IntegrityError, ValueError)):
+        records.record_denial(
+            rig.eng.db, run_id=rig.run_id, kind="unmanaged_credential",
+            method="GET", url=f"{rig.target.origin}/api/orders",
+            detail="a Cookie header this extension did not inject",
+            at_us=engagement.now_us())
+
+
+def test_a_set_cookie_is_redacted_before_anything_can_hash_it(rig):
+    """§7's one item that cannot be retrofitted.
+
+    The application hands back a live session cookie the extension never
+    injected, so the injected-range mechanism cannot reach it; response
+    Set-Cookie VALUES are replaced by header name instead, before the bytes
+    cross the bridge, because the blob store on this side is content-addressed
+    and hashing raw bytes means the raw bytes are already on disk.
+    """
+    rig.configure()
+    reply = rig.get("/login")
+    assert reply["status"] == 200
+
+    raw = reply[server.BridgeServer.BODY_KEY]
+    assert b"Set-Cookie: session={{observed:set-cookie}}" in raw, raw
+    # The name and the attributes stay, so session-fixation and cookie-flag
+    # checks still have something to look at.
+    assert b"Path=/" in raw and b"HttpOnly" in raw and b"SameSite=Lax" in raw
+    assert target_server.SESSION_COOKIE_VALUE.encode() not in raw
+
+    # And it stays gone through the store. Read the blob BACK, rather than
+    # asserting on the bytes still in memory.
+    req_blob, _req_len = rig.eng.blobs.put(rig.last_request)
+    digest, size = rig.eng.blobs.put(raw)
+    records.record_exchange(
+        rig.eng.db, run_id=rig.run_id, method="GET",
+        url=f"{rig.target.origin}/login", status=reply["status"],
+        req_blob=req_blob, resp_blob=digest, ms=reply["ms"],
+        at_us=engagement.now_us())
+    stored = rig.eng.blobs.get(digest, size)
+    assert target_server.SESSION_COOKIE_VALUE.encode() not in stored
+    assert b"{{observed:set-cookie}}" in stored
+
+    # Not "not in the blob we just wrote" -- not anywhere in the tree.
+    assert _blobs_containing(rig.eng, target_server.SESSION_COOKIE_VALUE.encode()) == []
+
+    # The server really did send it, so the absence above is redaction and
+    # not a route that quietly stopped setting a cookie.
+    assert rig.target.hits_for("/login")
+
+
+def test_the_run_budget_is_exhausted_and_stays_exhausted(rig):
+    """§6's other limit, and the one this suite can actually prove end to end.
+
+    The rate limiter cannot be exercised here. `Sender` is driven from the
+    bridge's one read loop, so this harness's sends go out one at a time,
+    never concurrently, and a real send through this real Burp costs on the
+    order of a second, end to end -- independent of which side of the bridge
+    that second is actually spent in. A harness that cannot place two sends
+    inside one second cannot exceed any `limit.rate_rps` this suite could
+    configure, so no configured rate can ever trip the limiter through this
+    path. See "What this task deliberately does not do" above: the limiter's
+    own logic is already proved exactly, at its boundaries, against an
+    injected Clock, in Task 2.
+
+    The budget has no clock in its decision at all -- `Limiter.check` only
+    counts -- so it is exhausted by a slow harness exactly as surely as by a
+    fast one, which is what makes it the one limit provable here.
+    """
+    # max_requests=2, not the rig's default of 2000: Limits.arm only ever
+    # arms once per run, so this has to be the FIRST configure this test
+    # issues (see Rig.configure's docstring).
+    rig.configure(max_requests=2)
+
+    assert rig.get("/health")["status"] == 200
+    assert rig.get("/health")["status"] == 200
+
+    with pytest.raises(server.BridgeError) as exc:
+        rig.get("/health")
+    assert exc.value.error_class == "budget_exhausted"
+    assert str(exc.value) == \
+        "budget_exhausted: run budget spent: 2 of 2 requests issued"
+
+    # The refusal never reached the target -- the budget is enforced before
+    # issuance, not after -- and the target's own request log is the witness
+    # this side cannot fake.
+    assert len(rig.target.hits_for("/health")) == 2
+
+    # Monotonic by construction, and there is deliberately no way to refill it
+    # (Limiter.check's own comment): a further attempt spends nothing and is
+    # refused exactly the same way, for ever. A `configure` re-authorises
+    # scope, not issuance.
+    with pytest.raises(server.BridgeError) as again:
+        rig.get("/health")
+    assert again.value.error_class == "budget_exhausted"
+    assert len(rig.target.hits_for("/health")) == 2
+
+    # Denials are never silent (§4), same as the four-ways test above.
+    assert records.record_denial(
+        rig.eng.db, run_id=rig.run_id,
+        kind=records.DENIAL_KIND["budget_exhausted"],
+        method="GET", url=f"{rig.target.origin}/health",
+        detail=str(exc.value), at_us=engagement.now_us()).startswith("d-")
+    row = rig.eng.db.execute(
+        "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us, rowid",
+        (rig.run_id,)).fetchone()
+    assert row["kind"] == "budget"
+
+
+def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
+    """Two of §4's three kill paths, and the rule that they are independent.
+
+    Both halves are arranged so the `send` frame actually leaves this process,
+    which is the whole difficulty of testing a kill switch from a harness that
+    holds one of the buttons. BridgeServer.send refuses locally whenever the
+    durable halt is armed or its own state says halted; written the obvious
+    way, every assertion below is satisfied by that bookkeeping alone and goes
+    on passing with the extension wide open.
+
+    So the sentinel half goes out through rig.send_unguarded(), and the frame
+    half puts the halt frame on the wire itself so rig.srv.state never leaves
+    "configured". Each refusal is also checked against rig.target.hits: the
+    target server's own request log is the one witness this side cannot fake.
+    """
+    rig.configure()
+    assert rig.get("/api/orders")["status"] == 200
+
+    rig.halt.halt("operator pressed stop during the integration run")
+    assert rig.halt.halted is True
+    assert rig.halt.reason == "operator pressed stop during the integration run"
+    assert rig.sentinel.exists()
+
+    deadline = time.monotonic() + SENTINEL_HALT_BUDGET_S
+    halted_class = None
+    while time.monotonic() < deadline and halted_class is None:
+        try:
+            # Unguarded: this side would otherwise refuse the send itself, on
+            # the strength of the sentinel it just wrote, and never ask the
+            # extension anything.
+            rig.send_unguarded("GET", "/health")
+        except server.BridgeError as exc:
+            halted_class = exc.error_class
+            assert halted_class == "halted", exc
+        time.sleep(0.2)
+    assert halted_class == "halted", (
+        f"issuance continued {SENTINEL_HALT_BUDGET_S}s after the sentinel "
+        f"appeared at {rig.sentinel}")
+
+    # The refusal, and the evidence that it WAS a refusal. `halted` arrived
+    # over the wire from a JVM that read the sentinel file, and the target's
+    # log did not move.
+    before = len(rig.target.hits)
+    with pytest.raises(server.BridgeError) as exc:
+        rig.send_unguarded("GET", "/api/orders")
+    assert exc.value.error_class == "halted"
+    assert len(rig.target.hits) == before, \
+        "a halted extension issued a request anyway"
+
+    # Now a halt FRAME joins the sentinel. Two paths, one state.
+    #
+    # The frame goes out directly rather than through rig.srv.halt(), which
+    # would also arm the durable halt and move this side's state to "halted" --
+    # and then every send below is refused here, without the extension being
+    # asked. The frame is what is under test, so the frame is all that is sent.
+    rig.srv._send({"v": codec.PROTOCOL_VERSION, "t": "halt",
+                   "reason": "operator pressed stop"})
+
+    # Removing the sentinel must NOT re-arm: the frame is still in force, and
+    # a kill switch that any one of its three paths can cancel is not three
+    # independent paths, it is one with three buttons.
+    rig.halt.resume()
+    assert not rig.sentinel.exists()
+    assert rig.halt.halted is False
+    assert rig.srv.state == "configured", \
+        "this side must still believe it may issue, or what follows is a " \
+        "test of the harness and not of the extension"
+    time.sleep(SENTINEL_POLL_S * 3)          # three chances to notice
+
+    before = len(rig.target.hits)
+    with pytest.raises(server.BridgeError) as exc:
+        rig.get("/api/orders")
+    assert exc.value.error_class == "halted", \
+        "removing the sentinel re-armed issuance while a halt frame was in force"
+    assert len(rig.target.hits) == before, \
+        "removing the sentinel re-armed issuance: the request reached the target"
+
+    # Only resume re-arms, and the target's log is what says the request was
+    # issued this time rather than merely permitted.
+    rig.srv.resume()
+    assert rig.get("/api/orders")["status"] == 200
+    assert len(rig.target.hits) == before + 1
+
+
+def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
+    """§4's auto-halt, and the frame that makes it visible.
+
+    The 5xx rule needs ten answered samples on a host before it may trip, so
+    ten 500s is the earliest it can fire and the eleventh send is the first
+    one refused.
+    """
+    rig.configure()
+
+    frames: list[dict] = []
+    # Appended, not acted on. This callback runs on the bridge's read-loop
+    # thread, and sqlite3 connections are single-thread by default, so the
+    # store write below belongs to the thread that owns the run.
+    rig.srv.on_halted = frames.append
+
+    seen = _issue_until(rig, "/slow?ms=40&status=500", want="halted")
+    assert seen.count(500) >= 10, \
+        f"the 5xx rule needs ten answered samples before it may trip; got {seen}"
+    assert seen[-1] == "halted"
+
+    assert bf.wait_for(lambda: bool(frames), timeout=10), (
+        "auto-halt is extension-initiated, so there is no outstanding id to "
+        "answer: without an unsolicited `halted` frame it is invisible until "
+        "the next send fails and run.status has no stop_reason to record")
+    frame = frames[0]
+    assert frame["t"] == "halted"
+    assert "5xx rate" in frame["reason"], frame
+    assert frame["host"] == rig.target.host, frame
+    assert frame["window"], frame
+
+    assert records.abort_run(
+        rig.eng.db, run_id=rig.run_id,
+        stop_reason=f"{frame['reason']} on {frame['host']}",
+        at_us=engagement.now_us()) is True
+    row = rig.eng.db.execute(
+        "SELECT status, stop_reason, ended_us FROM run WHERE id=?",
+        (rig.run_id,)).fetchone()
+    assert row["status"] == "aborted"
+    assert "5xx rate" in row["stop_reason"]
+    assert row["ended_us"] is not None
+
+    # One distressed host aborts the WHOLE run, and a human decides when it
+    # restarts. `resume` lifts an operator halt; it does not undo distress.
+    rig.srv.resume()
+    with pytest.raises(server.BridgeError) as exc:
+        rig.get("/health")
+    assert exc.value.error_class == "halted", \
+        "a resume frame un-did an auto-halt; distress has no reset by design"
+```
+
+- [ ] **Step 9: Run the integration suite and watch it pass**
+
+Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q`
+
+Expected: PASS — `8 passed`: the two handshake tests in
+`tests/integration/test_real_burp.py` plus this file's six. Roughly three to
+five minutes, because each test pays its own ~5 s of Burp startup, and the
+sentinel and auto-halt tests deliberately spend seconds waiting on a real
+poller and a real rolling window. (The budget test does not wait on anything
+-- its limit has no clock in it -- and the rate limiter is not tested here at
+all; see "What this task deliberately does not do" above.)
+
+`8 skipped` is not a pass. Read the reason it prints and fix that first.
+
+- [ ] **Step 10: Sabotage — widen the scope so the out-of-scope target is in it**
+
+The assertion that matters most in this file is `rig.offside.hits == []`, and
+an empty list is what you also get from a target nobody could reach. Prove the
+instrument.
+
+Two edits, because a widened scope also makes the `pytest.raises` above go red
+first and pytest stops a test at its first failing assertion — the wrong half
+to read.
+
+First, in `tests/integration/conftest.py`, in `Rig.configure`, change:
+
+```python
+            "scope.include": [f"{self.target.origin}/*"],
+```
+
+to:
+
+```python
+            "scope.include": [f"{self.target.origin}/*", f"{self.offside.origin}/*"],
+```
+
+Second, in `tests/integration/test_send_path.py`, replace the scope-refusal
+block with a plain send and a placeholder, so the test runs on to the log:
+
+```python
+    rig.send("GET", "/api/orders", to=rig.offside)
+    refusals["scope"] = server.BridgeError("scope_denied")
+    refusals["scope"].error_class = "scope_denied"
+```
+
+Run: `cd /path/to/hx && python -m pytest -m integration -q -k refuses_four_ways`
+
+Expected: FAIL on the log rather than on the error class — the request was
+delivered to a real server on a second loopback address, which is the exact
+observation the un-sabotaged assertion depends on being able to make:
+
+```
+E       AssertionError: the out-of-scope target received [('GET', '/api/orders')]
+```
+
+Restore: `cd /path/to/hx && git checkout -- tests/integration/conftest.py tests/integration/test_send_path.py`
+
+- [ ] **Step 11: Sabotage — delete the halt check from `Sender`**
+
+In `extension/src/hx/send/Sender.java`, delete:
+
+```java
+        if (halt.halted()) {
+            String why = halt.reason();
+            return error(id, "halted", why == null ? "halted, no reason recorded" : why);
+        }
+```
+
+Rebuild — this is not optional, and getting it wrong produces a green-looking
+run rather than a red one:
+
+Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q -k sentinel`
+
+Expected: FAIL with
+
+```
+E       AssertionError: issuance continued 5.0s after the sentinel appeared at ...
+```
+
+A result of `1 skipped` means the jar was not rebuilt: `missing()` reports
+`extension jar is older than its sources` and the suite is skipped, not run.
+A skipped sabotage proves nothing at all.
+
+Restore: `cd /path/to/hx && git checkout -- extension/src/hx/send/Sender.java && extension/build.sh`
+
+- [ ] **Step 12: Sabotage — let the sentinel poller cancel a halt frame**
+
+This one is described rather than quoted, because `HaltSwitch` is Task 5's
+file: in its poll loop, make the sentinel's *absence* clear the halted state
+outright — that is, replace whatever combines the frame flag with the file's
+existence (`framed || sentinelPresent`) by an assignment from the file alone.
+That is the single most tempting simplification in the class and it silently
+collapses the two kill paths this class owns into one.
+
+Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q -k sentinel`
+
+Expected: FAIL with
+
+```
+E       AssertionError: removing the sentinel re-armed issuance while a halt frame was in force
+```
+
+Nothing on this side can produce that line. It is reached through `rig.get`,
+with `rig.srv.state` still `configured` and the durable halt disarmed, so the
+refusal it was waiting for could only have come from the JVM. Confirm the
+other half of the same claim by deleting the two lines above it — the
+`pytest.raises` block and the error-class assertion — and re-running. The
+target server's own log then fails instead:
+
+```
+E       AssertionError: removing the sentinel re-armed issuance: the request reached the target
+```
+
+Restore both: `cd /path/to/hx && git checkout -- extension/src/hx/send/HaltSwitch.java tests/integration/test_send_path.py && extension/build.sh`
+
+- [ ] **Step 13: Sabotage — send the raw response across the bridge**
+
+In `extension/src/hx/send/Sender.java`, change:
+
+```java
+        byte[] redacted = redactor.redactResponse(reply.raw());
+```
+
+to:
+
+```java
+        byte[] redacted = reply.raw();
+```
+
+Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q -k set_cookie`
+
+Expected: FAIL at the first assertion, and — the point of the test — the
+credential is then found on disk, because a content-addressed store hashed it
+the moment it arrived:
+
+```
+E       AssertionError: assert b'Set-Cookie: session={{observed:set-cookie}}' in b'HTTP/1.1 200 OK\r\n...Set-Cookie: session=s3cr3t-live-session-2f9a41c0; Path=/...'
+```
+
+Confirm the second half by deleting the three assertions above the blob write
+and re-running: `_blobs_containing(...) == []` must then fail with a path
+under `blobs/`. Restore both.
+
+Restore: `cd /path/to/hx && git checkout -- extension/src/hx/send/Sender.java tests/integration/test_send_path.py && extension/build.sh`
+
+- [ ] **Step 14: Sabotage — remove the unmanaged-credential check**
+
+In `extension/src/hx/send/Sender.java`, delete:
+
+```java
+        String credential = redactor.unmanagedCredential(req);
+        if (credential != null)
+            return error(id, "unmanaged_credential", "request carries a " + credential
+                         + " header this extension did not inject");
+```
+
+Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q -k refuses_four_ways`
+
+Expected: FAIL, twice, and the second one is the one that matters — the live
+credential was put on the wire:
+
+```
+E       AssertionError: assert {'credential': 'scope_denied', ...} == {'credential': 'unmanaged_credential', ...}
+E       AssertionError: the in-scope target received [('GET', '/health'), ('GET', '/api/orders')]
+```
+
+Restore: `cd /path/to/hx && git checkout -- extension/src/hx/send/Sender.java && extension/build.sh`
+
+- [ ] **Step 15: Prove a failing test leaks neither a Burp nor a port**
+
+The teardown is the reason the rig is built on an ExitStack, and a teardown
+nobody has watched run is a teardown that has not been tested. Make one test
+fail on purpose, in the middle, after Burp and both servers exist.
+
+Add a bare `assert False, "deliberate"` as the first line of
+`test_the_run_budget_is_exhausted_and_stays_exhausted`, then:
+
+```bash
+cd /path/to/hx
+python -m pytest -m integration -q -k budget_is_exhausted ; echo "exit=$?"
+pgrep -fa 'burp.StartBurp' || echo "no Burp survived"
+ss -ltn 'src 127.0.0.2' || echo "no target port survived"
+```
+
+Expected: `1 failed`, then `no Burp survived`, then `no target port survived`.
+
+Restore: `cd /path/to/hx && git checkout -- tests/integration/test_send_path.py`
+
+- [ ] **Step 16: Prove the fast suite is still fast and JVM-free**
+
+```bash
+cd /path/to/hx
+time python -m pytest -q
+pgrep -fa 'burp.StartBurp' || echo "no JVM in the fast suite"
+```
+
+Expected: PASS, in single-digit seconds, and `no JVM in the fast suite`. The
+one new fast file, `tests/test_target_server.py`, adds a loopback socket and
+ten short tests, all measured in milliseconds.
+
+`tests/test_plan_matches_repo.py` must be green too, and "green" there has a
+failure mode of its own: a block whose file does not exist is SKIPPED, and a
+skipped byte-compare reads exactly like a passing one on a `-q` line. So name
+the five and look at them:
+
+```bash
+cd /path/to/hx
+python -m pytest tests/test_plan_matches_repo.py -v -rs 2>&1 | \
+    grep -E 'target_server|conftest|test_send_path|burp_fixture'
+```
+
+Expected: five lines, every one `PASSED` — the four full-file blocks this
+task adds (`tests/test_target_server.py`, `tests/integration/target_server.py`,
+`tests/integration/conftest.py`, `tests/integration/test_send_path.py`) and
+`2026-08-21-bridge-transport.md::tests/integration/burp_fixture.py`, which
+Step 6 re-synced. A `SKIPPED` among them means that file was never written, so
+its block was never compared and the plan could say anything at all.
+
+The one partial block this task adds — `burp_fixture.py -- launch_burp gains
+the halt sentinel` — is not in that list and must not be. The suffix on its
+marker means the path does not end in `.py`, so the regex in
+`test_plan_matches_repo.py` never yields it at all, exactly as with Task 6's
+`BridgeClient` blocks.
+
+- [ ] **Step 17: Commit**
+
+```bash
+cd /path/to/hx
+git add tests/integration/target_server.py tests/integration/conftest.py \
+        tests/integration/test_send_path.py tests/integration/burp_fixture.py \
+        tests/test_target_server.py \
+        docs/superpowers/plans/2026-08-22-enforcement-send-path.md \
+        docs/superpowers/plans/2026-08-21-bridge-transport.md
+git commit -m "$(cat <<'EOF'
+test(send-path): the gate proved end to end against real Burp and a loopback target
+
+Six tests across the whole stack -- Python send(), the socket, the real
+extension inside a real headless Burp, out to a stdlib HTTP server on
+127.0.0.1, and back. Everything stays on the machine: the out-of-scope
+destination is a SECOND loopback server on 127.0.0.2, so a scope-denied
+request that escaped the gate would be delivered and logged rather than dying
+on a connection refusal that looks the same whether the gate worked or the
+port was shut.
+
+Every denial is asserted on the target server's own request log, not on the
+error class. "An error came back" and "the request was never issued" are
+different claims and only the second one is the invariant in S4. Five
+sabotage steps back that up: widening scope makes the out-of-scope log
+non-empty, deleting Sender's halt check lets issuance continue past the
+sentinel, collapsing HaltSwitch's two halt sources lets a sentinel removal
+cancel a halt frame, returning the raw response puts a live session cookie
+into the content-addressed blob store, and removing the credential check puts
+one on the wire.
+
+The halt test is the one to read twice. BridgeServer.send refuses locally
+whenever the durable halt is armed or its own state says halted, so a kill
+switch tested the obvious way from this side is checked against the harness's
+own bookkeeping and passes with the extension wide open. The sentinel half
+therefore sends through Rig.send_unguarded, which puts the frame on the wire
+with those local refusals skipped, and the frame half writes the halt frame
+directly so the server never leaves state 'configured'. Both halves assert on
+the target server's request log as well as on the error class.
+
+Also here:
+
+- launch_burp passes -Dhx.halt_sentinel. HxExtension refuses to initialise
+  without it, so without this every integration test hangs at the handshake
+  with one line in burp.log. Plan 2 carries burp_fixture.py as a byte-compared
+  full-file block, so that block is re-synced from the file in the same
+  commit; test_plan_matches_repo.py is red across plans otherwise.
+
+- The rig hands its OperatorHalt to BridgeServer, so the halt re-asserted
+  after every hello and the sentinel consulted on every send are exercised
+  against a real reconnecting extension rather than only against fakes.
+
+- tests/test_target_server.py, in the FAST suite, because six assertions in
+  the integration file are "the target never received this" and all six pass
+  for ever if the request log records nothing.
+
+One dependency is asserted rather than assumed and will fail loudly if it is
+missing: HxExtension joining BridgeClient.haltNotifier() to Sender, which is
+what turns an auto-halt into the unsolicited `halted` frame S6 requires.
+EOF
+)"
+```
