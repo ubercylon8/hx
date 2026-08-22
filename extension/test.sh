@@ -11,3 +11,4 @@ javac --release 21 -nowarn -Xlint:-options \
       -cp "$MONTOYA" -d build/test-classes \
       $(find src test -name '*.java')
 java -cp "build/test-classes:$MONTOYA" hx.bridge.CodecTest
+java -cp "build/test-classes:$MONTOYA" hx.bridge.BridgeClientTest
