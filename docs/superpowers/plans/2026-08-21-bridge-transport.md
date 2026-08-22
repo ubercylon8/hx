@@ -4247,7 +4247,11 @@ reviewer confirmed reverting each one fails nothing:
 | the `@Deprecated` annotations on `configEpoch()`/`scopeConfig()` | an annotation; verified by inspection only |
 | the **top-of-`handle()`** `closed` guard | deleting it alone fails nothing — the commit-lock guard catches every exit reachable today. A coverage hole, not a live defect |
 | `Frame.Reader`'s shrink branch | never taken: the largest frame in the suite is 100 000 bytes, the trigger is 4 MB |
-| all of `HxExtension` | no test exists for it at all; it needs a MontoyaApi fake |
+| `HxExtension`'s unloading handler and its missing-`-Dhx.socket` branch | `initialize()`'s happy path is exercised end to end by Task 5's integration test — a real Burp loads this class and dials in — but neither of these two branches is, and no unit test exists; that still needs a MontoyaApi fake |
+| `make_home()` (Task 5) | nothing asserts what it builds: the `burpbrowser` symlink, the deleted `.userPrefs` lock, the copied `.BurpSuite` tree. A mistake there surfaces as a Burp that will not start, blamed on Burp |
+| the rest of `missing()` (Task 5) | `tests/test_burp_fixture.py` covers the EULA, stale-jar and `.BurpSuite` guards in both directions, but not the burp-jar row, and nothing checks that the `skipif` wiring actually consumes what `missing()` returns |
+| the `finally` reaper in both integration tests (Task 5) | proving it would need a test that fails mid-test and then reads the process table. A leak is a 900 MB JVM outliving the run, never a red test |
+| "the fast suite never launches Burp" (Task 5) | deleting `addopts` from `pyproject.toml` fails nothing. It just makes `pytest` 13 seconds slower and starts two JVMs — which is what the property is for |
 
 That list is longer than the three rows this table shipped with, and it is
 still not everything: a reviewer sabotage-verified **fourteen** more behaviours
@@ -4290,13 +4294,23 @@ runs at 1, 2 and 24 cores when the guard is removed.
 - Create: `tests/integration/__init__.py`
 - Create: `tests/integration/test_real_burp.py`
 - Create: `tests/integration/burp_fixture.py`
+- Create: `tests/test_burp_fixture.py` — the fixture's own prerequisite checks, in the **fast** suite
 - Modify: `pyproject.toml` — register the `integration` marker
 
 **Interfaces:**
-- Consumes: `hx.bridge.server.BridgeServer`, `extension/build/hx-bridge.jar`
-- Produces:
-  - `tests.integration.burp_fixture.burp_available() -> bool`
-  - `tests.integration.burp_fixture.launch_burp(socket_path, engagement_id) -> subprocess.Popen`
+- Consumes: `hx.bridge.server.BridgeServer`, `extension/build/hx-bridge.jar`, and the mtimes of `extension/src/**/*.java` (the stale-jar check)
+- Produces, all in `tests.integration.burp_fixture`:
+  - `missing() -> list[str]` — the unsatisfied prerequisites, each named
+  - `burp_available() -> bool` — `not missing()`
+  - `make_home(workdir: Path) -> Path` — a private `$HOME` per run
+  - `launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subprocess.Popen`
+  - `wait_for(predicate, timeout: float = 90.0, interval: float = 0.5) -> bool`
+
+All five are public names in the module and this block used to list two of
+them. Under-declaring is the same defect a reviewer caught in Task 4's header,
+and it costs the same way: the next task reads the block, believes it, and
+writes a call with the wrong arity — `launch_burp` takes a `workdir`, and
+always has.
 
 - [ ] **Step 1: Register the marker so the slow test is opt-in**
 
@@ -4344,6 +4358,7 @@ LAB = Path(os.environ.get("HX_BURP_LAB", Path.home() / "F0RT1KA" / "burp-lab"))
 BURP_JAR = LAB / "burpsuite_desktop_v2026.7.3.jar"
 SEED_HOME = LAB / "burphome"          # copied from, never run against
 EXT_JAR = Path(__file__).resolve().parents[2] / "extension" / "build" / "hx-bridge.jar"
+EXT_SRC = Path(__file__).resolve().parents[2] / "extension" / "src"
 
 ADD_OPENS = [
     "--add-opens", "java.base/java.lang=ALL-UNNAMED",
@@ -4368,6 +4383,8 @@ def missing() -> list[str]:
         absent.append(f"burp jar: {BURP_JAR}")
     if not EXT_JAR.exists():
         absent.append(f"extension jar (run extension/build.sh): {EXT_JAR}")
+    elif _jar_is_stale():
+        absent.append("extension jar is older than its sources (run extension/build.sh)")
     if not (SEED_HOME / ".java").is_dir():
         absent.append(f"seed burp home: {SEED_HOME / '.java'}")
     elif not _eula_accepted():
@@ -4376,15 +4393,50 @@ def missing() -> list[str]:
         # why. The pref lives in the seed home, so a cleared or regenerated
         # home takes it with it.
         absent.append(f"burp.eula not accepted in {SEED_HOME / '.java'}")
+    if not (SEED_HOME / ".BurpSuite").is_dir():
+        # make_home() copies this tree as well as .java. Checking only .java
+        # let burp_available() return True and the launch then die on a
+        # FileNotFoundError halfway through the copy -- reproduced -- which is
+        # precisely the unnamed failure this function exists to prevent.
+        absent.append(f"seed burp home: {SEED_HOME / '.BurpSuite'}")
     return absent
+
+
+def _jar_is_stale() -> bool:
+    """True when any extension source is newer than the jar built from it.
+
+    Nothing in the suite runs build.sh and the jar is gitignored, so an edit
+    to BridgeClient.java without a rebuild leaves `-m integration` reporting
+    2 passed while certifying this plan's central claim against an artifact
+    that no longer matches the code. mtime is a coarse signal, and it errs in
+    the safe direction: a touched but unchanged source skips the run with a
+    reason that names the fix, rather than passing it silently.
+    """
+    try:
+        jar = EXT_JAR.stat().st_mtime
+        return any(src.stat().st_mtime > jar for src in EXT_SRC.rglob("*.java"))
+    except OSError:
+        # A missing jar is the caller's row, not ours. The broader catch is
+        # the lesson from _eula_accepted() above: anything raised out of
+        # missing() is not a skip, it is a collection error for the entire
+        # repository. A source that vanishes between the glob and the stat --
+        # a rebuild or a checkout running alongside the suite -- is no
+        # evidence that the jar is stale, so say nothing and let the run go.
+        return False
 
 
 def _eula_accepted() -> bool:
     prefs = SEED_HOME / ".java" / ".userPrefs" / "burp" / "prefs.xml"
     try:
+        # Searched as bytes. Burp rewrites this 1.75 MB file on exit, and a
+        # torn write that lands mid-multibyte-character makes read_text()
+        # raise UnicodeDecodeError -- which is not an OSError, so it escaped
+        # this function, escaped missing(), and turned every pytest run in
+        # the repo into a collection error with zero tests run. Reproduced;
+        # a byte search cannot raise it at all.
         # The key is "burp.eula", not "eula" -- a check for the short
         # name reports every accepted home as unaccepted.
-        return 'key="burp.eula"' in prefs.read_text()
+        return b'key="burp.eula"' in prefs.read_bytes()
     except OSError:
         return False
 
@@ -4489,7 +4541,17 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
         assert srv.hello["engagement_id"] == "e-integration"
         assert srv.hello["instance_id"] == "integration"
         assert "2026" in srv.hello["burp_version"], srv.hello
-        assert srv.peer_uid is not None
+        # Ties the handshake to the JVM this test launched. peer_pid comes
+        # from SO_PEERCRED -- the kernel fills it in and a peer cannot forge
+        # it. The assertion this replaced, `peer_uid is not None`, could not
+        # fail: _serve() sets peer_uid before the read loop and returns on a
+        # uid mismatch, so state == "connected" already implies it.
+        assert srv.peer_pid == proc.pid
+        # The same number, self-reported in the hello frame. Weaker evidence
+        # than the credential above, and worth checking separately: it is
+        # what an operator sees, and it agreeing with the kernel is what
+        # makes it trustworthy.
+        assert srv.hello["pid"] == proc.pid
 
         pairs = {"scope.include": ["https://app.example.test/*"],
                  "limit.rate_rps": ["5"]}
@@ -4511,12 +4573,18 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
                     reason=f"missing: {', '.join(bf.missing())}")
 def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     """A Burp restart is a reconnect, not an outage -- and the reconnected
-    extension knows nothing, because extensionData does not survive."""
+    extension knows nothing, because extensionData does not survive.
+
+    Both halves are here. Killing Burp proves the bridge returns to DENY-ALL;
+    only the second Burp dialling the same live BridgeServer proves the
+    "reconnect, not an outage" half, which is this plan's headline claim and
+    was otherwise exercised against fakes alone.
+    """
     srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-restart")
     srv.start()
-    proc = None
+    proc = proc2 = None
     try:
-        proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path)
+        proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "first")
         assert bf.wait_for(lambda: srv.state == "connected")
         srv.configure({"scope.include": ["https://a/*"]},
                       scope_sha256="abc", profile="production")
@@ -4527,14 +4595,29 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
         assert bf.wait_for(lambda: srv.state == "waiting", timeout=30), \
             "dropped connection must return the bridge to DENY-ALL"
         assert srv.config_epoch == 0
+
+        # The restart. Same socket, same server object, never stopped.
+        proc2 = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "second")
+        assert bf.wait_for(lambda: srv.state == "connected"), \
+            "a restarted Burp must reconnect to the still-listening bridge"
+        assert srv.peer_pid == proc2.pid, "the bridge is talking to the old JVM"
+        # Still DENY-ALL: the reconnected extension carries nothing over,
+        # because extensionData does not survive a Burp restart.
+        assert srv.config_epoch == 0
+
+        epoch = srv.configure({"scope.include": ["https://b/*"]},
+                              scope_sha256="def", profile="production")
+        assert epoch == 1, "a fresh extension numbers its first scope 1"
+        assert srv.state == "configured"
     finally:
-        # The kill above is inside the try for a reason -- it IS the restart
+        # The first kill is inside the try for a reason -- it IS the restart
         # under test -- so on any earlier failure a 900 MB JVM would outlive
-        # the run, once per debugging attempt. Reaping an already-reaped
-        # Popen is a no-op, so this is safe on the happy path too.
-        if proc:
-            proc.kill()
-            proc.wait(timeout=15)
+        # the run, once per debugging attempt. Two of them, now. Reaping an
+        # already-reaped Popen is a no-op, so this is safe on the happy path.
+        for p in (proc, proc2):
+            if p:
+                p.kill()
+                p.wait(timeout=15)
         srv.stop()
 ```
 
@@ -4545,19 +4628,19 @@ cd extension && ./build.sh && cd ..
 .venv/bin/pytest -m integration tests/integration -v
 ```
 
-Expected: 2 passed in about 9 seconds. (This said 60-120s, which contradicted the same document's measured ~5s to hello.)
+Expected: 2 passed in about 13 seconds. (This said 60-120s, which contradicted the same document's measured ~5s to hello, then 9s until round 1's restart test began launching a second Burp.)
 
 If Burp never connects, read the launch output — the fixture merges stderr into stdout — and check the two failure modes established during research: the EULA prompt (needs `burp.eula` pre-accepted in `$BURP_HOME/.java/.userPrefs/burp/prefs.xml`) and the licence prompt (needs the bare newline the fixture already writes).
 
 - [ ] **Step 5: Confirm the fast suite is still fast**
 
 Run: `time .venv/bin/pytest -q`
-Expected: PASS, 188 passed and 2 deselected in about 6 seconds — the integration tests excluded by `addopts`. What matters is that no JVM starts, not the exact count; the count moves every round.
+Expected: PASS, 202 passed and 2 deselected in about 6 seconds — the integration tests excluded by `addopts`. What matters is that no JVM starts, not the exact count; the count moves every round. It has: this line said 188 when it was written, the suite was at 189 by the commit that finished the task, and 202 once round 1 added `tests/test_burp_fixture.py`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/__init__.py tests/integration pyproject.toml
+git add tests/__init__.py tests/integration tests/test_burp_fixture.py pyproject.toml
 git commit -m "test(bridge): real headless Burp completes the handshake end to end"
 ```
 

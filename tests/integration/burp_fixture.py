@@ -25,6 +25,7 @@ LAB = Path(os.environ.get("HX_BURP_LAB", Path.home() / "F0RT1KA" / "burp-lab"))
 BURP_JAR = LAB / "burpsuite_desktop_v2026.7.3.jar"
 SEED_HOME = LAB / "burphome"          # copied from, never run against
 EXT_JAR = Path(__file__).resolve().parents[2] / "extension" / "build" / "hx-bridge.jar"
+EXT_SRC = Path(__file__).resolve().parents[2] / "extension" / "src"
 
 ADD_OPENS = [
     "--add-opens", "java.base/java.lang=ALL-UNNAMED",
@@ -49,6 +50,8 @@ def missing() -> list[str]:
         absent.append(f"burp jar: {BURP_JAR}")
     if not EXT_JAR.exists():
         absent.append(f"extension jar (run extension/build.sh): {EXT_JAR}")
+    elif _jar_is_stale():
+        absent.append("extension jar is older than its sources (run extension/build.sh)")
     if not (SEED_HOME / ".java").is_dir():
         absent.append(f"seed burp home: {SEED_HOME / '.java'}")
     elif not _eula_accepted():
@@ -57,15 +60,50 @@ def missing() -> list[str]:
         # why. The pref lives in the seed home, so a cleared or regenerated
         # home takes it with it.
         absent.append(f"burp.eula not accepted in {SEED_HOME / '.java'}")
+    if not (SEED_HOME / ".BurpSuite").is_dir():
+        # make_home() copies this tree as well as .java. Checking only .java
+        # let burp_available() return True and the launch then die on a
+        # FileNotFoundError halfway through the copy -- reproduced -- which is
+        # precisely the unnamed failure this function exists to prevent.
+        absent.append(f"seed burp home: {SEED_HOME / '.BurpSuite'}")
     return absent
+
+
+def _jar_is_stale() -> bool:
+    """True when any extension source is newer than the jar built from it.
+
+    Nothing in the suite runs build.sh and the jar is gitignored, so an edit
+    to BridgeClient.java without a rebuild leaves `-m integration` reporting
+    2 passed while certifying this plan's central claim against an artifact
+    that no longer matches the code. mtime is a coarse signal, and it errs in
+    the safe direction: a touched but unchanged source skips the run with a
+    reason that names the fix, rather than passing it silently.
+    """
+    try:
+        jar = EXT_JAR.stat().st_mtime
+        return any(src.stat().st_mtime > jar for src in EXT_SRC.rglob("*.java"))
+    except OSError:
+        # A missing jar is the caller's row, not ours. The broader catch is
+        # the lesson from _eula_accepted() above: anything raised out of
+        # missing() is not a skip, it is a collection error for the entire
+        # repository. A source that vanishes between the glob and the stat --
+        # a rebuild or a checkout running alongside the suite -- is no
+        # evidence that the jar is stale, so say nothing and let the run go.
+        return False
 
 
 def _eula_accepted() -> bool:
     prefs = SEED_HOME / ".java" / ".userPrefs" / "burp" / "prefs.xml"
     try:
+        # Searched as bytes. Burp rewrites this 1.75 MB file on exit, and a
+        # torn write that lands mid-multibyte-character makes read_text()
+        # raise UnicodeDecodeError -- which is not an OSError, so it escaped
+        # this function, escaped missing(), and turned every pytest run in
+        # the repo into a collection error with zero tests run. Reproduced;
+        # a byte search cannot raise it at all.
         # The key is "burp.eula", not "eula" -- a check for the short
         # name reports every accepted home as unaccepted.
-        return 'key="burp.eula"' in prefs.read_text()
+        return b'key="burp.eula"' in prefs.read_bytes()
     except OSError:
         return False
 
