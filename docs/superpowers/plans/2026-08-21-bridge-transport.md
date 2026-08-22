@@ -981,11 +981,19 @@ public class CodecTest {
      *  outer map AND every inner list. */
     static void configBodyResultIsFrozen() {
         byte[] body = "scope.include\thttps://a/*\n".getBytes(StandardCharsets.UTF_8);
-        Map<String, List<String>> got = ConfigBody.parse(body);
+        // A fresh parse per assertion. Sharing one map lets the first
+        // assertion corrupt the second: if the outer map is NOT frozen, the
+        // put() succeeds and replaces the value with an immutable List.of(),
+        // so the inner-list assertion then passes for entirely the wrong
+        // reason and the failure output points at one level when both are
+        // broken.
+        Map<String, List<String>> outer = ConfigBody.parse(body);
         expectThrows("the map itself rejects mutation", UnsupportedOperationException.class,
-                     () -> got.put("scope.include", List.of("https://evil/*")));
+                     () -> outer.put("scope.include", List.of("https://evil/*")));
+
+        Map<String, List<String>> inner = ConfigBody.parse(body);
         expectThrows("an inner list rejects mutation", UnsupportedOperationException.class,
-                     () -> got.get("scope.include").add("https://evil/*"));
+                     () -> inner.get("scope.include").add("https://evil/*"));
     }
 
     /** The vectors Python recorded. If these disagree, the two codecs have drifted. */
@@ -1645,13 +1653,19 @@ public final class ConfigBody {
         // requests under a scope no configure frame ever set, no epoch bump
         // and no log line to show for it.
         //
-        // Both levels are needed. Map.copyOf alone would leave each inner
-        // ArrayList mutable. Map.copyOf itself is also the wrong outer
-        // wrapper regardless: it does not preserve iteration order, and this
-        // parser's contract -- repeated keys accumulate IN ORDER -- is what
-        // CodecTest's "config repeated keys accumulate in order" asserts.
-        // Collections.unmodifiableMap over the LinkedHashMap keeps that order
-        // and rejects mutation without copying it away.
+        // Both levels are needed: Map.copyOf alone would leave each inner
+        // ArrayList mutable, and mutating a scope list in place authorises a
+        // scope no configure frame ever set -- no epoch bump, no log line.
+        //
+        // The outer wrapper is unmodifiableMap over a LinkedHashMap rather
+        // than Map.copyOf so that ITERATION order survives. Be clear about
+        // what does and does not depend on that: CodecTest's "repeated keys
+        // accumulate in order" asserts on the inner List, which List.copyOf
+        // preserves either way -- swapping in Map.copyOf keeps the whole suite
+        // green. Nothing tests map iteration order. It is preserved here
+        // because a config's key order is the operator's, and an unordered
+        // rendering of someone's scope in a report is a defect no test will
+        // catch for you.
         Map<String, List<String>> frozen = new LinkedHashMap<>();
         out.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
         return Collections.unmodifiableMap(frozen);
@@ -2984,8 +2998,18 @@ git commit -m "feat(bridge): unix socket server with peercred check and deny-all
   - `BridgeClient.connect()` / `BridgeClient.close()`
   - `BridgeClient.isConfigured() -> boolean`
   - `BridgeClient.maySend() -> boolean` — configured and not halted
-  - `BridgeClient.configEpoch() -> long`
-  - `BridgeClient.scopeConfig() -> Map<String,List<String>>`
+  - `BridgeClient.authorisation() -> BridgeClient.Authorisation` — **the only
+    coherent way to read a decision.** Epoch and scope in ONE read
+  - `hx.bridge.BridgeClient.Authorisation(long epoch, Map<String,List<String>> scope)`
+    — a record; `scope` is deeply immutable
+  - `BridgeClient.configEpoch() -> long` — **@Deprecated, do not use on a
+    decision path**
+  - `BridgeClient.scopeConfig() -> Map<String,List<String>>` — **@Deprecated**,
+    same reason: calling these two separately is two reads of one record and a
+    commit lands between them. The natural order, `scopeConfig()` then
+    `configEpoch()`, measured wrong in 393/400 trials and wrong in the unsafe
+    direction — decide under the superseded wider scope, stamp it with the
+    epoch that narrowed it
   - `BridgeClient.checkMaySend() -> void` — throws `NotConfigured` unless configured and not halted
   - `hx.bridge.BridgeClient.NotConfigured extends RuntimeException`
   - `hx.HxExtension implements BurpExtension`
@@ -4220,17 +4244,42 @@ reviewer confirmed reverting each one fails nothing:
 | `volatile` on `channel`/`in`/`out` and on `HxExtension.client` | a visibility bug needs a weakly-ordered CPU to observe; x86 hides it |
 | the `Reader` single-thread comment | a comment |
 | `StringBuffer` in `FakeMontoya` | races only under a schedule the suite does not force |
+| the `@Deprecated` annotations on `configEpoch()`/`scopeConfig()` | an annotation; verified by inspection only |
+| the **top-of-`handle()`** `closed` guard | deleting it alone fails nothing — the commit-lock guard catches every exit reachable today. A coverage hole, not a live defect |
+| `Frame.Reader`'s shrink branch | never taken: the largest frame in the suite is 100 000 bytes, the trigger is 4 MB |
+| all of `HxExtension` | no test exists for it at all; it needs a MontoyaApi fake |
+
+That list is longer than the three rows this table shipped with, and it is
+still not everything: a reviewer sabotage-verified **fourteen** more behaviours
+with no failing check, including the single-read `authorisation()`, the
+one-write publication, the ack epoch hoist, and the `gen`/`_conn` guard on the
+Python reset. Treat this table as "the ones worth naming", never as "everything
+else is covered".
 
 Do not add a test that "covers" these by asserting something adjacent. An
 earlier commit in this task claimed every fix was sabotage-verified when three
 were not; the honest record is this table.
 
-**The one guard that is machine-dependent.** `closeIsTerminalAgainstTheReadLoop`
-is a *detector*, not the guard: measured 19-20/20 on 24 cores, 1-4/20 on two,
-and **0/20 on one** — a clean pass on defective code, on the machine shape CI
-most often has. The guard is the deterministic check beside it, which calls
-`handle()` directly on a closed client. Keep both, and never let the detector
-be the only thing standing behind this invariant.
+**The guard is `theCommitIsExclusiveWithClose`.** Not the detector beside it,
+and not the check that calls `handle()` directly on a closed client — that one
+feeds a `configure` frame, so the commit-lock guard satisfies it whether or not
+the top-of-`handle()` guard exists, and it cannot discriminate between them.
+
+`closeIsTerminalAgainstTheReadLoop` is a **detector**, and a scheduler-dependent
+one. Against a defective client it measured 19-20/20 on 24 cores but **0/20 on
+one core, and 0/20 in two runs of three on two cores** — a clean, silent pass on
+broken code, on the machine shape CI most often has.
+
+`theCommitIsExclusiveWithClose` does not depend on scheduling at all: the test
+thread holds `commitLock`, so the helper parks inside `handle()` by
+construction, and monitor reentrancy lets `close()` through. It fails 100% of
+runs at 1, 2 and 24 cores when the guard is removed.
+
+> If you change either `closed` guard in `handle()`, check it against
+> `theCommitIsExclusiveWithClose`. Do **not** judge by the detector's
+> resurrection count: it reads 0/20 on correct and broken code alike at low
+> core counts. Both `commitLock`'s package-private visibility and `handle()`'s
+> exist to make that test possible — neither is an oversight to tidy up.
 
 ---
 

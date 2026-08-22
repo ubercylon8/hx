@@ -178,11 +178,19 @@ public class CodecTest {
      *  outer map AND every inner list. */
     static void configBodyResultIsFrozen() {
         byte[] body = "scope.include\thttps://a/*\n".getBytes(StandardCharsets.UTF_8);
-        Map<String, List<String>> got = ConfigBody.parse(body);
+        // A fresh parse per assertion. Sharing one map lets the first
+        // assertion corrupt the second: if the outer map is NOT frozen, the
+        // put() succeeds and replaces the value with an immutable List.of(),
+        // so the inner-list assertion then passes for entirely the wrong
+        // reason and the failure output points at one level when both are
+        // broken.
+        Map<String, List<String>> outer = ConfigBody.parse(body);
         expectThrows("the map itself rejects mutation", UnsupportedOperationException.class,
-                     () -> got.put("scope.include", List.of("https://evil/*")));
+                     () -> outer.put("scope.include", List.of("https://evil/*")));
+
+        Map<String, List<String>> inner = ConfigBody.parse(body);
         expectThrows("an inner list rejects mutation", UnsupportedOperationException.class,
-                     () -> got.get("scope.include").add("https://evil/*"));
+                     () -> inner.get("scope.include").add("https://evil/*"));
     }
 
     /** The vectors Python recorded. If these disagree, the two codecs have drifted. */

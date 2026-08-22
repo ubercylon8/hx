@@ -38,13 +38,19 @@ public final class ConfigBody {
         // requests under a scope no configure frame ever set, no epoch bump
         // and no log line to show for it.
         //
-        // Both levels are needed. Map.copyOf alone would leave each inner
-        // ArrayList mutable. Map.copyOf itself is also the wrong outer
-        // wrapper regardless: it does not preserve iteration order, and this
-        // parser's contract -- repeated keys accumulate IN ORDER -- is what
-        // CodecTest's "config repeated keys accumulate in order" asserts.
-        // Collections.unmodifiableMap over the LinkedHashMap keeps that order
-        // and rejects mutation without copying it away.
+        // Both levels are needed: Map.copyOf alone would leave each inner
+        // ArrayList mutable, and mutating a scope list in place authorises a
+        // scope no configure frame ever set -- no epoch bump, no log line.
+        //
+        // The outer wrapper is unmodifiableMap over a LinkedHashMap rather
+        // than Map.copyOf so that ITERATION order survives. Be clear about
+        // what does and does not depend on that: CodecTest's "repeated keys
+        // accumulate in order" asserts on the inner List, which List.copyOf
+        // preserves either way -- swapping in Map.copyOf keeps the whole suite
+        // green. Nothing tests map iteration order. It is preserved here
+        // because a config's key order is the operator's, and an unordered
+        // rendering of someone's scope in a report is a defect no test will
+        // catch for you.
         Map<String, List<String>> frozen = new LinkedHashMap<>();
         out.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
         return Collections.unmodifiableMap(frozen);
