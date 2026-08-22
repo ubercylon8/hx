@@ -154,17 +154,32 @@ def test_configure_carries_id_and_deadline(srv):
         while srv.state != "connected" and time.time() < deadline:
             time.sleep(0.01)
         assert srv.state == "connected"
-        threading.Thread(
-            target=lambda: srv.configure({"scope.include": ["https://a/*"]},
-                                         scope_sha256="x", profile="production"),
-            daemon=True,
-        ).start()
+        result = {}
+
+        def do_configure():
+            # The test never sends a "configured" ack, and closes the
+            # connection in its finally below. _reset()'s wake-on-disconnect
+            # (round 1) now surfaces that immediately as BridgeError, where
+            # it previously just blocked for the full 10s timeout unnoticed --
+            # that is the desired prompt-wakeup behaviour, not a bug. Catch it
+            # here rather than let it become an unhandled thread exception.
+            try:
+                srv.configure({"scope.include": ["https://a/*"]},
+                              scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_configure)
+        t.start()
         header, _ = codec.FrameReader(c).read()
         assert isinstance(header["id"], int) and header["id"] > 0
         assert isinstance(header["deadline_us"], int)
         assert header["deadline_us"] > time.time_ns() // 1000
     finally:
         c.close()
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_configure thread never finished"
+        assert "error" in result, "closing without an ack must raise BridgeError"
 
 
 def test_configure_before_hello_is_refused(srv):
@@ -335,3 +350,83 @@ def test_so_peercred_rejects_a_foreign_uid(srv, monkeypatch):
         assert srv.state == "waiting"
     finally:
         c.close()
+
+
+def test_configure_commit_loses_race_to_a_concurrent_reset_deterministically(srv, monkeypatch):
+    """Round 2: the generation token read _generation as a guard but never
+    advanced it, so it only detected "a NEW connection superseded an old
+    one". It could not detect THIS connection resetting between _request()
+    returning and configure()'s commit -- the caller still saw
+    gen == self._generation and clobbered the "waiting" _reset() had just
+    written. The natural-timing test above measured 0/60 for this because the
+    accept thread happens to win that inner race on this machine -- favourable
+    scheduling, not a closed gap. This closes the window deterministically
+    instead of relying on timing: it delays configure()'s resumption after
+    _request() returns, giving the accept thread's _reset() every chance to
+    run to completion first, and asserts configure() detects it rather than
+    silently committing over it.
+    """
+    real_request = server.BridgeServer._request
+
+    def delayed_request(self, *args, **kwargs):
+        reply = real_request(self, *args, **kwargs)
+        time.sleep(0.08)  # matches the ~80ms window the reviewer used
+        return reply
+
+    monkeypatch.setattr(server.BridgeServer, "_request", delayed_request)
+
+    for _ in range(20):
+        c = _client(srv.socket_path)
+        try:
+            c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                    "pid": 1, "burp_version": "x",
+                                    "instance_id": "i-1", "engagement_id": "e-1"}))
+            deadline = time.time() + 5
+            while srv.state != "connected" and time.time() < deadline:
+                time.sleep(0.01)
+            assert srv.state == "connected"
+
+            result = {}
+
+            def do_configure():
+                try:
+                    result["epoch"] = srv.configure(
+                        {"scope.include": ["https://a/*"]},
+                        scope_sha256="x", profile="production",
+                    )
+                except server.BridgeError as exc:
+                    result["error"] = exc
+
+            t = threading.Thread(target=do_configure)
+            t.start()
+
+            header, _ = codec.FrameReader(c).read()
+            c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                    "config_epoch": 1}))
+            # Close now, while do_configure is still asleep inside the
+            # widened window: the accept thread's _reset() must run and
+            # complete (including advancing the generation) well before
+            # do_configure wakes up to commit.
+            c.close()
+            t.join(timeout=5)
+            assert not t.is_alive(), "do_configure thread never finished"
+
+            assert "error" in result, (
+                "configure() must detect a disconnect that happened during "
+                f"its widened commit window, not silently succeed (result={result!r})"
+            )
+            assert isinstance(result["error"], server.BridgeError)
+
+            deadline = time.time() + 5
+            while srv.state != "waiting" and time.time() < deadline:
+                time.sleep(0.01)
+            assert srv.state == "waiting", (
+                f"a disconnect during configure()'s commit window must not "
+                f"leave the bridge looking configured (result={result!r})"
+            )
+            assert srv.config_epoch == 0
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass

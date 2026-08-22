@@ -156,6 +156,12 @@ class BridgeServer:
         with self._lock:
             if gen is not None and gen != self._generation:
                 return
+            # Advance the generation as well as guarding on it. Without this,
+            # the token only detects "a NEW connection superseded an old one" --
+            # it cannot detect this same connection resetting between a caller's
+            # _request() returning and its commit, so the caller still sees
+            # gen == self._generation and clobbers the waiting state.
+            self._generation += 1
             self.state = "waiting"
             self.config_epoch = 0
             self._conn = None
@@ -271,16 +277,34 @@ class BridgeServer:
             # Commit only if this is still the same connection. Without the
             # guard, a peer that acks and immediately disconnects leaves
             # state="configured" with no peer attached -- reproduced 59/60.
-            if gen != self._generation:
+            # The generation check alone caught a NEW connection superseding
+            # this one; it missed THIS connection resetting in the window
+            # between _request() returning and this commit (reproduced 10/10
+            # once that window was widened), because _reset() did not used to
+            # advance the generation it guards on. The _conn check is belt
+            # and braces: the generation check is the structural fix, this
+            # makes the invariant obvious to the next reader.
+            if gen != self._generation or self._conn is None:
                 raise BridgeError("peer disconnected before configure completed")
             self.config_epoch = int(reply["config_epoch"])
             self.state = "configured"
         return self.config_epoch
 
     def halt(self, reason: str) -> None:
+        # Same send-then-mutate shape as configure(), so the same guard: a
+        # peer that disconnects between the send and this commit must not
+        # leave state looking like anything other than what _reset() wrote.
+        gen = self._generation
         self._send({"v": codec.PROTOCOL_VERSION, "t": "halt", "reason": reason})
-        self.state = "halted"
+        with self._lock:
+            if gen != self._generation or self._conn is None:
+                raise BridgeError("peer disconnected before halt completed")
+            self.state = "halted"
 
     def resume(self) -> None:
+        gen = self._generation
         self._send({"v": codec.PROTOCOL_VERSION, "t": "resume"})
-        self.state = "configured" if self.config_epoch else "connected"
+        with self._lock:
+            if gen != self._generation or self._conn is None:
+                raise BridgeError("peer disconnected before resume completed")
+            self.state = "configured" if self.config_epoch else "connected"
