@@ -1670,6 +1670,12 @@ class BridgeServer:
         with self._lock:
             if gen is not None and gen != self._generation:
                 return
+            # Advance the generation as well as guarding on it. Without this,
+            # the token only detects "a NEW connection superseded an old one" --
+            # it cannot detect this same connection resetting between a caller's
+            # _request() returning and its commit, so the caller still sees
+            # gen == self._generation and clobbers the waiting state.
+            self._generation += 1
             self.state = "waiting"
             self.config_epoch = 0
             self._conn = None
@@ -1775,7 +1781,7 @@ class BridgeServer:
             # Commit only if this is still the same connection. Without the
             # guard, a peer that acks and immediately disconnects leaves
             # state="configured" with no peer attached -- reproduced 59/60.
-            if gen != self._generation:
+            if gen != self._generation or self._conn is None:
                 raise BridgeError("peer disconnected before configure completed")
             self.config_epoch = int(reply["config_epoch"])
             self.state = "configured"
