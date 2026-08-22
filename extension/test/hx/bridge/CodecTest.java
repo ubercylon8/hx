@@ -39,6 +39,7 @@ public class CodecTest {
         readerDistinguishesCleanCloseFromTruncation();
         readerRejectsAnOversizedPrefixBeforeAllocating();
         configBody();
+        configBodyResultIsFrozen();
         goldenVectors();
         malformedInputsAreRejected();
         invalidUtf8HeaderIsRejected();
@@ -168,6 +169,20 @@ public class CodecTest {
                      () -> ConfigBody.parse("scope.includ\tx\n".getBytes(StandardCharsets.UTF_8)));
         expectThrows("config line without a tab is an error", Frame.FrameError.class,
                      () -> ConfigBody.parse("scope.include x\n".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /** ConfigBody.parse() is the only producer of the map BridgeClient hands
+     *  out via authorisation()/scopeConfig(). A holder that could widen it in
+     *  place would be authorising itself for a scope no configure frame ever
+     *  set -- no epoch bump, no log line. Both levels must be frozen: the
+     *  outer map AND every inner list. */
+    static void configBodyResultIsFrozen() {
+        byte[] body = "scope.include\thttps://a/*\n".getBytes(StandardCharsets.UTF_8);
+        Map<String, List<String>> got = ConfigBody.parse(body);
+        expectThrows("the map itself rejects mutation", UnsupportedOperationException.class,
+                     () -> got.put("scope.include", List.of("https://evil/*")));
+        expectThrows("an inner list rejects mutation", UnsupportedOperationException.class,
+                     () -> got.get("scope.include").add("https://evil/*"));
     }
 
     /** The vectors Python recorded. If these disagree, the two codecs have drifted. */

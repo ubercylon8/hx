@@ -142,6 +142,7 @@ public class BridgeClientTest {
             closeIsTerminalAgainstTheReadLoop();
             losingThePeerDropsToDenyAll();
             aFailedHelloLeavesNoChannelBehind();
+            theCommitIsExclusiveWithClose();
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -446,6 +447,64 @@ public class BridgeClientTest {
         } finally {
             Files.deleteIfExists(sock); Files.deleteIfExists(dir);
         }
+    }
+
+    /**
+     * The commit-lock guard, deterministically. The top-of-handle() guard
+     * cannot satisfy this one: the frame is already past it and parked on the
+     * monitor when close() runs.
+     *
+     * Monitor reentrancy is what makes it deterministic. This thread holds
+     * commitLock, so the helper cannot get past `synchronized (commitLock)` in
+     * handle(); close() takes the SAME monitor and this thread already owns it,
+     * so it proceeds. When this block exits, the helper acquires the monitor
+     * and must observe `closed`.
+     *
+     * The park is verified by LOCK IDENTITY, not by Thread.State alone: a
+     * thread stuck on a class-initialisation monitor is also BLOCKED, and
+     * accepting that would let the helper still be BEFORE the top-of-handle()
+     * guard when close() lands -- which passes for the wrong reason and stops
+     * covering the commit-lock guard at all.
+     */
+    static void theCommitIsExclusiveWithClose() throws Exception {
+        Path dir = Files.createTempDirectory("hxexcl");
+        try (Live l = live(dir, "x.sock")) {
+            final boolean[] refused = {false};
+            Thread t;
+            synchronized (l.client.commitLock) {
+                t = new Thread(() -> {
+                    try { refused[0] = !l.client.handle(
+                            Frame.decode(Frame.encode(configureFrame("e-1", 7L), CFG))); }
+                    catch (IOException e) { refused[0] = false; }
+                });
+                t.setDaemon(true);
+                t.start();
+                check("the configure is parked on commitLock itself",
+                      waitUntilBlockedOn(t, l.client.commitLock));
+                l.client.close();          // reentrant: this thread holds the monitor
+            }
+            t.join(5000);
+            check("a commit parked on commitLock is refused once close() has run", refused[0]);
+            check("and close() stays terminal", !l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("x.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** True once `t` is BLOCKED on `monitor` specifically. */
+    static boolean waitUntilBlockedOn(Thread t, Object monitor) throws Exception {
+        java.lang.management.ThreadMXBean mx = java.lang.management.ManagementFactory.getThreadMXBean();
+        int want = System.identityHashCode(monitor);
+        long end = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < end) {
+            java.lang.management.ThreadInfo info = mx.getThreadInfo(t.threadId());
+            if (info != null && t.getState() == Thread.State.BLOCKED) {
+                java.lang.management.LockInfo li = info.getLockInfo();
+                if (li != null && li.getIdentityHashCode() == want) return true;
+            }
+            Thread.sleep(1);
+        }
+        return false;
     }
 
     static final byte[] CFG =

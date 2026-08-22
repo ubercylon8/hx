@@ -633,3 +633,66 @@ def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
         assert srv.config_epoch == 0, srv.config_epoch
     finally:
         c.close()
+
+
+def test_a_non_denying_configure_error_leaves_state_alone(srv):
+    """engagement_mismatch and bad_frame answer error but leave the extension
+    configured and live -- unlike bad_config and protocol_mismatch, which
+    call denyAll() before answering. Resetting THIS side for those two would
+    make it report state='connected', config_epoch=0 while the extension is
+    still configured and sending: the reverse of the disagreement the reset
+    exists to fix, and the more dangerous direction, since the operator's
+    console would then say nothing may be sent while it can.
+
+    Unreachable through a real client today -- a mismatched engagement_id is
+    rejected at hello, and _request() always stamps deadline_us -- so this
+    needs a version-skewed jar, the same scenario the plan names for
+    bad_config. Reached here directly, the same way
+    test_an_error_reply_to_configure_reports_what_the_peer_said reaches its
+    own class string."""
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    out = {}
+
+    def configure_into(key):
+        def run():
+            try:
+                out[key] = srv.configure({"scope.include": ["https://a/*"]},
+                                         scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out[key] = exc
+        return run
+
+    try:
+        # A first configure that IS acknowledged: epoch 1, state 'configured'.
+        t = threading.Thread(target=configure_into("first"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["first"] == 1, out
+        assert srv.state == "configured"
+        assert srv.config_epoch == 1
+
+        # A second configure is refused, but with a class the extension does
+        # NOT deny for.
+        t = threading.Thread(target=configure_into("second"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "engagement_mismatch",
+                                "detail": "e-1 != e-2"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert isinstance(out["second"], server.BridgeError), out
+        assert "engagement_mismatch" in str(out["second"]), out
+
+        assert srv.state == "configured", (
+            "the extension is still configured and live after this class of "
+            f"refusal; this side must not go on claiming {srv.state!r}"
+        )
+        assert srv.config_epoch == 1, srv.config_epoch
+    finally:
+        c.close()

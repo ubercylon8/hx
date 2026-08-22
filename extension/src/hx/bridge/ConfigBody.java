@@ -30,6 +30,23 @@ public final class ConfigBody {
                 throw new Frame.FrameError("unrecognised config key: " + key);
             out.computeIfAbsent(key, k -> new ArrayList<>()).add(line.substring(tab + 1));
         }
-        return out;
+        // parse() is the ONLY producer of a Map<String, List<String>> that
+        // BridgeClient hands out (authorisation().scope() / scopeConfig()),
+        // and nothing downstream mutates it after this call returns. Freeze
+        // it here so that invariant holds by construction rather than by
+        // convention: a holder that widened scope in place would authorise
+        // requests under a scope no configure frame ever set, no epoch bump
+        // and no log line to show for it.
+        //
+        // Both levels are needed. Map.copyOf alone would leave each inner
+        // ArrayList mutable. Map.copyOf itself is also the wrong outer
+        // wrapper regardless: it does not preserve iteration order, and this
+        // parser's contract -- repeated keys accumulate IN ORDER -- is what
+        // CodecTest's "config repeated keys accumulate in order" asserts.
+        // Collections.unmodifiableMap over the LinkedHashMap keeps that order
+        // and rejects mutation without copying it away.
+        Map<String, List<String>> frozen = new LinkedHashMap<>();
+        out.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
+        return Collections.unmodifiableMap(frozen);
     }
 }

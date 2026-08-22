@@ -56,7 +56,12 @@ public final class BridgeClient {
     // makes the window narrow (~ns); this monitor makes it not exist. In a
     // component whose whole job is refusing to send, "too small to observe" is
     // not the same as "cannot happen".
-    private final Object commitLock = new Object();
+    //
+    // Package-private, not private: BridgeClientTest.theCommitIsExclusiveWith-
+    // Close() takes this monitor itself to park a commit inside handle()'s
+    // `synchronized (commitLock)` deterministically. See the note on handle()
+    // below -- this field's visibility is load-bearing for that test.
+    final Object commitLock = new Object();
 
     private final AtomicBoolean configured = new AtomicBoolean(false);
     private final AtomicBoolean halted = new AtomicBoolean(false);
@@ -88,7 +93,29 @@ public final class BridgeClient {
     }
 
     public boolean isConfigured() { return configured.get(); }
+
+    /**
+     * @deprecated Two reads of {@link #committed}: a commit can land between
+     * this call and a following {@link #scopeConfig()} (or vice versa), so
+     * the pair straddles the commit and a decision can be made under one
+     * epoch's scope while stamped with the other's epoch -- the natural read
+     * order, {@code scopeConfig()} then {@code configEpoch()}, is the
+     * dangerous one, since it yields the new epoch with the old, superseded
+     * scope. Any decision that must send with an epoch and the scope that
+     * epoch actually authorises has to read both in the one call
+     * {@link #authorisation()} makes. Retained for callers that read only
+     * this field.
+     * @see BridgeClient#authorisation()
+     */
+    @Deprecated
     public long configEpoch() { return committed.epoch(); }
+
+    /**
+     * @deprecated See {@link #configEpoch()}: this is the other half of the
+     * same straddle. Retained for callers that read only this field.
+     * @see BridgeClient#authorisation()
+     */
+    @Deprecated
     public Map<String, List<String>> scopeConfig() { return committed.scope(); }
 
     /**
@@ -189,7 +216,18 @@ public final class BridgeClient {
 
     /** Package-private, not private: BridgeClientTest calls this directly to
      *  check that a closed client refuses a frame without needing to win a
-     *  race first. BridgeClient is final, so nothing escapes hx.bridge. */
+     *  race first. BridgeClient is final, so nothing escapes hx.bridge.
+     *
+     *  Both this method's visibility and commitLock's are load-bearing for
+     *  theCommitIsExclusiveWithClose(): that test holds commitLock on its own
+     *  thread, calls handle() directly from a second thread so it parks on
+     *  `synchronized (commitLock)` below, then calls close() -- which takes
+     *  the same monitor -- reentrantly from the first thread. Make either
+     *  member private again and that test cannot compile, let alone run; a
+     *  later "tidy-up" that does so would silently delete the only
+     *  deterministic coverage of the commit-lock guard, leaving only the
+     *  scheduler-dependent race detector, which passes clean at 1-2 vCPU on
+     *  broken code. */
     boolean handle(Frame.Decoded f) throws IOException {
         if (closed) return false;
         Object v = f.header.get("v");

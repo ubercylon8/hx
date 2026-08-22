@@ -31,6 +31,19 @@ def socket_path_for(engagement_id: str) -> Path:
 
 
 class BridgeServer:
+    # Error classes under which BridgeClient.handle() actually drops to
+    # DENY-ALL: `bad_config` calls denyAll() before answering, and
+    # `protocol_mismatch` returns false out of handle(), which trips
+    # readLoop()'s finally block. `engagement_mismatch` and `bad_frame`
+    # answer error and carry on configured -- resetting THIS side for those
+    # would make it report state="connected", config_epoch=0 while the
+    # extension is still configured and live, the reverse of the bug this
+    # reset exists to fix, and the more dangerous direction: the operator's
+    # console says nothing may be sent while it can. See the `case` arms in
+    # extension/src/hx/bridge/BridgeClient.java's handle() for the exact
+    # strings.
+    _DENYING_CONFIGURE_ERRORS = frozenset({"bad_config", "protocol_mismatch"})
+
     def __init__(self, socket_path: Path, engagement_id: str, on_hello=None):
         self.socket_path = Path(socket_path)
         self.engagement_id = engagement_id
@@ -272,20 +285,24 @@ class BridgeServer:
             codec.build_config_body(pairs),
         )
         if reply.get("t") == "error":
-            # The extension answers a refused configure by dropping to
+            # The extension answers SOME refused configures by dropping to
             # DENY-ALL at epoch 0 -- including a refused RE-configure, which
-            # discards the scope it was already holding. Leaving this side
-            # reporting state='configured' epoch=1 makes the two ends of the
-            # bridge disagree about whether anything may be sent at all, and
-            # it is this side that operators and Plan 5 read. Verified against
-            # a live extension before the reset was added.
+            # discards the scope it was already holding -- but not all of
+            # them. Only reset this side for the classes that actually deny;
+            # see _DENYING_CONFIGURE_ERRORS. Resetting for the others would
+            # make this side report state='connected', config_epoch=0 while
+            # the extension is still configured and sending -- the opposite
+            # disagreement from the one this reset was added to fix, and it
+            # is this side that operators and Plan 5 read. Verified against a
+            # live extension before the reset was added.
             #
             # Same gen/_conn guard as the success path: a newer connection's
             # state is not ours to clobber.
-            with self._lock:
-                if gen == self._generation and self._conn is not None:
-                    self.state = "connected"
-                    self.config_epoch = 0
+            if reply.get("class") in self._DENYING_CONFIGURE_ERRORS:
+                with self._lock:
+                    if gen == self._generation and self._conn is not None:
+                        self.state = "connected"
+                        self.config_epoch = 0
             # Surface what the peer actually said. Falling through to the
             # generic message below turns "engagement_mismatch: e-1 != e-2"
             # into "acknowledged configure without a config_epoch", which

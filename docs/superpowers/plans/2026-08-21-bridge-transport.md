@@ -842,6 +842,7 @@ public class CodecTest {
         readerDistinguishesCleanCloseFromTruncation();
         readerRejectsAnOversizedPrefixBeforeAllocating();
         configBody();
+        configBodyResultIsFrozen();
         goldenVectors();
         malformedInputsAreRejected();
         invalidUtf8HeaderIsRejected();
@@ -971,6 +972,20 @@ public class CodecTest {
                      () -> ConfigBody.parse("scope.includ\tx\n".getBytes(StandardCharsets.UTF_8)));
         expectThrows("config line without a tab is an error", Frame.FrameError.class,
                      () -> ConfigBody.parse("scope.include x\n".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /** ConfigBody.parse() is the only producer of the map BridgeClient hands
+     *  out via authorisation()/scopeConfig(). A holder that could widen it in
+     *  place would be authorising itself for a scope no configure frame ever
+     *  set -- no epoch bump, no log line. Both levels must be frozen: the
+     *  outer map AND every inner list. */
+    static void configBodyResultIsFrozen() {
+        byte[] body = "scope.include\thttps://a/*\n".getBytes(StandardCharsets.UTF_8);
+        Map<String, List<String>> got = ConfigBody.parse(body);
+        expectThrows("the map itself rejects mutation", UnsupportedOperationException.class,
+                     () -> got.put("scope.include", List.of("https://evil/*")));
+        expectThrows("an inner list rejects mutation", UnsupportedOperationException.class,
+                     () -> got.get("scope.include").add("https://evil/*"));
     }
 
     /** The vectors Python recorded. If these disagree, the two codecs have drifted. */
@@ -1622,7 +1637,24 @@ public final class ConfigBody {
                 throw new Frame.FrameError("unrecognised config key: " + key);
             out.computeIfAbsent(key, k -> new ArrayList<>()).add(line.substring(tab + 1));
         }
-        return out;
+        // parse() is the ONLY producer of a Map<String, List<String>> that
+        // BridgeClient hands out (authorisation().scope() / scopeConfig()),
+        // and nothing downstream mutates it after this call returns. Freeze
+        // it here so that invariant holds by construction rather than by
+        // convention: a holder that widened scope in place would authorise
+        // requests under a scope no configure frame ever set, no epoch bump
+        // and no log line to show for it.
+        //
+        // Both levels are needed. Map.copyOf alone would leave each inner
+        // ArrayList mutable. Map.copyOf itself is also the wrong outer
+        // wrapper regardless: it does not preserve iteration order, and this
+        // parser's contract -- repeated keys accumulate IN ORDER -- is what
+        // CodecTest's "config repeated keys accumulate in order" asserts.
+        // Collections.unmodifiableMap over the LinkedHashMap keeps that order
+        // and rejects mutation without copying it away.
+        Map<String, List<String>> frozen = new LinkedHashMap<>();
+        out.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
+        return Collections.unmodifiableMap(frozen);
     }
 }
 ```
@@ -2316,6 +2348,69 @@ def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
         assert srv.config_epoch == 0, srv.config_epoch
     finally:
         c.close()
+
+
+def test_a_non_denying_configure_error_leaves_state_alone(srv):
+    """engagement_mismatch and bad_frame answer error but leave the extension
+    configured and live -- unlike bad_config and protocol_mismatch, which
+    call denyAll() before answering. Resetting THIS side for those two would
+    make it report state='connected', config_epoch=0 while the extension is
+    still configured and sending: the reverse of the disagreement the reset
+    exists to fix, and the more dangerous direction, since the operator's
+    console would then say nothing may be sent while it can.
+
+    Unreachable through a real client today -- a mismatched engagement_id is
+    rejected at hello, and _request() always stamps deadline_us -- so this
+    needs a version-skewed jar, the same scenario the plan names for
+    bad_config. Reached here directly, the same way
+    test_an_error_reply_to_configure_reports_what_the_peer_said reaches its
+    own class string."""
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    out = {}
+
+    def configure_into(key):
+        def run():
+            try:
+                out[key] = srv.configure({"scope.include": ["https://a/*"]},
+                                         scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out[key] = exc
+        return run
+
+    try:
+        # A first configure that IS acknowledged: epoch 1, state 'configured'.
+        t = threading.Thread(target=configure_into("first"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["first"] == 1, out
+        assert srv.state == "configured"
+        assert srv.config_epoch == 1
+
+        # A second configure is refused, but with a class the extension does
+        # NOT deny for.
+        t = threading.Thread(target=configure_into("second"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "engagement_mismatch",
+                                "detail": "e-1 != e-2"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert isinstance(out["second"], server.BridgeError), out
+        assert "engagement_mismatch" in str(out["second"]), out
+
+        assert srv.state == "configured", (
+            "the extension is still configured and live after this class of "
+            f"refusal; this side must not go on claiming {srv.state!r}"
+        )
+        assert srv.config_epoch == 1, srv.config_epoch
+    finally:
+        c.close()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2360,6 +2455,19 @@ def socket_path_for(engagement_id: str) -> Path:
 
 
 class BridgeServer:
+    # Error classes under which BridgeClient.handle() actually drops to
+    # DENY-ALL: `bad_config` calls denyAll() before answering, and
+    # `protocol_mismatch` returns false out of handle(), which trips
+    # readLoop()'s finally block. `engagement_mismatch` and `bad_frame`
+    # answer error and carry on configured -- resetting THIS side for those
+    # would make it report state="connected", config_epoch=0 while the
+    # extension is still configured and live, the reverse of the bug this
+    # reset exists to fix, and the more dangerous direction: the operator's
+    # console says nothing may be sent while it can. See the `case` arms in
+    # extension/src/hx/bridge/BridgeClient.java's handle() for the exact
+    # strings.
+    _DENYING_CONFIGURE_ERRORS = frozenset({"bad_config", "protocol_mismatch"})
+
     def __init__(self, socket_path: Path, engagement_id: str, on_hello=None):
         self.socket_path = Path(socket_path)
         self.engagement_id = engagement_id
@@ -2601,20 +2709,24 @@ class BridgeServer:
             codec.build_config_body(pairs),
         )
         if reply.get("t") == "error":
-            # The extension answers a refused configure by dropping to
+            # The extension answers SOME refused configures by dropping to
             # DENY-ALL at epoch 0 -- including a refused RE-configure, which
-            # discards the scope it was already holding. Leaving this side
-            # reporting state='configured' epoch=1 makes the two ends of the
-            # bridge disagree about whether anything may be sent at all, and
-            # it is this side that operators and Plan 5 read. Verified against
-            # a live extension before the reset was added.
+            # discards the scope it was already holding -- but not all of
+            # them. Only reset this side for the classes that actually deny;
+            # see _DENYING_CONFIGURE_ERRORS. Resetting for the others would
+            # make this side report state='connected', config_epoch=0 while
+            # the extension is still configured and sending -- the opposite
+            # disagreement from the one this reset was added to fix, and it
+            # is this side that operators and Plan 5 read. Verified against a
+            # live extension before the reset was added.
             #
             # Same gen/_conn guard as the success path: a newer connection's
             # state is not ours to clobber.
-            with self._lock:
-                if gen == self._generation and self._conn is not None:
-                    self.state = "connected"
-                    self.config_epoch = 0
+            if reply.get("class") in self._DENYING_CONFIGURE_ERRORS:
+                with self._lock:
+                    if gen == self._generation and self._conn is not None:
+                        self.state = "connected"
+                        self.config_epoch = 0
             # Surface what the peer actually said. Falling through to the
             # generic message below turns "engagement_mismatch: e-1 != e-2"
             # into "acknowledged configure without a config_epoch", which
@@ -3174,6 +3286,7 @@ public class BridgeClientTest {
             closeIsTerminalAgainstTheReadLoop();
             losingThePeerDropsToDenyAll();
             aFailedHelloLeavesNoChannelBehind();
+            theCommitIsExclusiveWithClose();
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -3480,6 +3593,64 @@ public class BridgeClientTest {
         }
     }
 
+    /**
+     * The commit-lock guard, deterministically. The top-of-handle() guard
+     * cannot satisfy this one: the frame is already past it and parked on the
+     * monitor when close() runs.
+     *
+     * Monitor reentrancy is what makes it deterministic. This thread holds
+     * commitLock, so the helper cannot get past `synchronized (commitLock)` in
+     * handle(); close() takes the SAME monitor and this thread already owns it,
+     * so it proceeds. When this block exits, the helper acquires the monitor
+     * and must observe `closed`.
+     *
+     * The park is verified by LOCK IDENTITY, not by Thread.State alone: a
+     * thread stuck on a class-initialisation monitor is also BLOCKED, and
+     * accepting that would let the helper still be BEFORE the top-of-handle()
+     * guard when close() lands -- which passes for the wrong reason and stops
+     * covering the commit-lock guard at all.
+     */
+    static void theCommitIsExclusiveWithClose() throws Exception {
+        Path dir = Files.createTempDirectory("hxexcl");
+        try (Live l = live(dir, "x.sock")) {
+            final boolean[] refused = {false};
+            Thread t;
+            synchronized (l.client.commitLock) {
+                t = new Thread(() -> {
+                    try { refused[0] = !l.client.handle(
+                            Frame.decode(Frame.encode(configureFrame("e-1", 7L), CFG))); }
+                    catch (IOException e) { refused[0] = false; }
+                });
+                t.setDaemon(true);
+                t.start();
+                check("the configure is parked on commitLock itself",
+                      waitUntilBlockedOn(t, l.client.commitLock));
+                l.client.close();          // reentrant: this thread holds the monitor
+            }
+            t.join(5000);
+            check("a commit parked on commitLock is refused once close() has run", refused[0]);
+            check("and close() stays terminal", !l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("x.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** True once `t` is BLOCKED on `monitor` specifically. */
+    static boolean waitUntilBlockedOn(Thread t, Object monitor) throws Exception {
+        java.lang.management.ThreadMXBean mx = java.lang.management.ManagementFactory.getThreadMXBean();
+        int want = System.identityHashCode(monitor);
+        long end = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < end) {
+            java.lang.management.ThreadInfo info = mx.getThreadInfo(t.threadId());
+            if (info != null && t.getState() == Thread.State.BLOCKED) {
+                java.lang.management.LockInfo li = info.getLockInfo();
+                if (li != null && li.getIdentityHashCode() == want) return true;
+            }
+            Thread.sleep(1);
+        }
+        return false;
+    }
+
     static final byte[] CFG =
             "scope.include\thttps://RACE/*\n".getBytes(StandardCharsets.UTF_8);
 
@@ -3569,7 +3740,12 @@ public final class BridgeClient {
     // makes the window narrow (~ns); this monitor makes it not exist. In a
     // component whose whole job is refusing to send, "too small to observe" is
     // not the same as "cannot happen".
-    private final Object commitLock = new Object();
+    //
+    // Package-private, not private: BridgeClientTest.theCommitIsExclusiveWith-
+    // Close() takes this monitor itself to park a commit inside handle()'s
+    // `synchronized (commitLock)` deterministically. See the note on handle()
+    // below -- this field's visibility is load-bearing for that test.
+    final Object commitLock = new Object();
 
     private final AtomicBoolean configured = new AtomicBoolean(false);
     private final AtomicBoolean halted = new AtomicBoolean(false);
@@ -3601,7 +3777,29 @@ public final class BridgeClient {
     }
 
     public boolean isConfigured() { return configured.get(); }
+
+    /**
+     * @deprecated Two reads of {@link #committed}: a commit can land between
+     * this call and a following {@link #scopeConfig()} (or vice versa), so
+     * the pair straddles the commit and a decision can be made under one
+     * epoch's scope while stamped with the other's epoch -- the natural read
+     * order, {@code scopeConfig()} then {@code configEpoch()}, is the
+     * dangerous one, since it yields the new epoch with the old, superseded
+     * scope. Any decision that must send with an epoch and the scope that
+     * epoch actually authorises has to read both in the one call
+     * {@link #authorisation()} makes. Retained for callers that read only
+     * this field.
+     * @see BridgeClient#authorisation()
+     */
+    @Deprecated
     public long configEpoch() { return committed.epoch(); }
+
+    /**
+     * @deprecated See {@link #configEpoch()}: this is the other half of the
+     * same straddle. Retained for callers that read only this field.
+     * @see BridgeClient#authorisation()
+     */
+    @Deprecated
     public Map<String, List<String>> scopeConfig() { return committed.scope(); }
 
     /**
@@ -3702,7 +3900,18 @@ public final class BridgeClient {
 
     /** Package-private, not private: BridgeClientTest calls this directly to
      *  check that a closed client refuses a frame without needing to win a
-     *  race first. BridgeClient is final, so nothing escapes hx.bridge. */
+     *  race first. BridgeClient is final, so nothing escapes hx.bridge.
+     *
+     *  Both this method's visibility and commitLock's are load-bearing for
+     *  theCommitIsExclusiveWithClose(): that test holds commitLock on its own
+     *  thread, calls handle() directly from a second thread so it parks on
+     *  `synchronized (commitLock)` below, then calls close() -- which takes
+     *  the same monitor -- reentrantly from the first thread. Make either
+     *  member private again and that test cannot compile, let alone run; a
+     *  later "tidy-up" that does so would silently delete the only
+     *  deterministic coverage of the commit-lock guard, leaving only the
+     *  scheduler-dependent race detector, which passes clean at 1-2 vCPU on
+     *  broken code. */
     boolean handle(Frame.Decoded f) throws IOException {
         if (closed) return false;
         Object v = f.header.get("v");
