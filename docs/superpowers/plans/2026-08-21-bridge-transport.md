@@ -316,7 +316,7 @@ def test_missing_required_header_fields_are_refused_on_encode():
         codec.encode({"v": 1})
 
 
-def test_read_frame_reassembles_across_socket_chunks():
+def test_frame_reader_reassembles_across_socket_chunks():
     """Stream sockets split writes wherever they like."""
     payload = b"x" * 100_000
     raw = codec.encode({"v": 1, "t": "result", "id": 5}, payload)
@@ -324,9 +324,23 @@ def test_read_frame_reassembles_across_socket_chunks():
     try:
         for i in range(0, len(raw), 4096):
             a.sendall(raw[i : i + 4096])
-        header, body = codec.read_frame(b)
+        header, body = codec.FrameReader(b).read()
         assert header["id"] == 5
         assert body == payload
+    finally:
+        a.close()
+        b.close()
+
+
+def test_frame_reader_handles_coalesced_frames():
+    """One recv may deliver several whole frames. A reader that returns after
+    the first and drops the rest loses them silently, and the loss surfaces
+    later as a misleading "peer closed mid-frame"."""
+    a, b = socket.socketpair()
+    try:
+        a.sendall(b"".join(codec.encode({"v": 1, "t": "hello", "id": i}) for i in (1, 2, 3)))
+        reader = codec.FrameReader(b)
+        assert [reader.read()[0]["id"] for _ in range(3)] == [1, 2, 3]
     finally:
         a.close()
         b.close()
@@ -1414,7 +1428,7 @@ def test_configure_round_trip_returns_an_epoch(srv):
         t = threading.Thread(target=do_configure)
         t.start()
 
-        header, body = codec.read_frame(c)
+        header, body = codec.FrameReader(c).read()
         assert header["t"] == "configure"
         assert header["engagement_id"] == "e-1"
         assert header["scope_sha256"] == "deadbeef"
@@ -1441,7 +1455,7 @@ def test_configure_carries_id_and_deadline(srv):
                                          scope_sha256="x", profile="production"),
             daemon=True,
         ).start()
-        header, _ = codec.read_frame(c)
+        header, _ = codec.FrameReader(c).read()
         assert isinstance(header["id"], int) and header["id"] > 0
         assert isinstance(header["deadline_us"], int)
         assert header["deadline_us"] > time.time_ns() // 1000
