@@ -2021,7 +2021,8 @@ git commit -m "feat(bridge): unix socket server with peercred check and deny-all
 **Interfaces:**
 - Consumes: `hx.bridge.Frame`, `hx.bridge.Json`, `hx.bridge.ConfigBody` (Task 2)
 - Produces:
-  - `hx.bridge.BridgeClient(Path socketPath, String engagementId, String instanceId, Logger log)`
+  - `hx.bridge.BridgeClient(Path socketPath, String engagementId, String instanceId, BridgeClient.Log log)`
+  - `hx.bridge.BridgeClient.Log` — `info(String)` / `error(String)`; Montoya's `Logging` is adapted to it in `HxExtension`, the test fake implements it directly
   - `BridgeClient.connect()` / `BridgeClient.close()`
   - `BridgeClient.isConfigured() -> boolean`
   - `BridgeClient.maySend() -> boolean` — configured and not halted
