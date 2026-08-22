@@ -2748,7 +2748,7 @@ git commit -m "fix(bridge): deny-all on every exit from the read loop"
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
-    "integration: loads a real headless Burp Suite; slow (~40s) and needs the jar",
+    "integration: loads a real headless Burp Suite; needs the jar (~5s to hello, ~20s per test)",
 ]
 addopts = "-m 'not integration'"
 ```
@@ -2758,25 +2758,32 @@ addopts = "-m 'not integration'"
 - [ ] **Step 2: Write the fixture**
 
 ```python
-# tests/integration/burp_fixture.py
 """Launch a real headless Burp Suite Community with the hx extension loaded.
 
-Everything here was established empirically during the research phase:
+Everything here was established empirically, most of it the hard way:
   - Burp asks for a licence key on stdin; a bare newline selects Community.
   - The EULA gate is a single Java Preferences key, burp.eula.
   - Launching with -cp instead of -jar means the jar manifest's Add-Opens is
     ignored, so every --add-opens must be repeated on the command line.
+  - Burp throws `java.lang.Error: no ComponentUI class` twice while building a
+    Swing UI it cannot have under -Djava.awt.headless=true. This is NOISE. A
+    known-good instance logs it identically and runs for hours. Do not chase it.
+  - api.logging().logToOutput() does NOT reach the process stdout. You cannot
+    detect that the extension loaded by reading the log -- observe the bridge
+    instead. `hello` arriving IS the readiness signal.
+  - Startup to hello measured at ~5s, not the ~40s originally assumed.
 """
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
 
 LAB = Path(os.environ.get("HX_BURP_LAB", Path.home() / "F0RT1KA" / "burp-lab"))
 BURP_JAR = LAB / "burpsuite_desktop_v2026.7.3.jar"
-BURP_HOME = LAB / "burphome"
+SEED_HOME = LAB / "burphome"          # copied from, never run against
 EXT_JAR = Path(__file__).resolve().parents[2] / "extension" / "build" / "hx-bridge.jar"
 
 ADD_OPENS = [
@@ -2789,15 +2796,65 @@ ADD_OPENS = [
 ]
 
 
+def missing() -> list[str]:
+    """Which prerequisites are absent, for a skip reason that names them.
+
+    A bare False here once sent a debugger into a Burp stack trace when the
+    real problem was an unbuilt extension jar: Burp starts happily with a
+    classpath entry that does not exist, loads no extension, and never dials
+    in. Say which path is missing.
+    """
+    absent = []
+    if not BURP_JAR.exists():
+        absent.append(f"burp jar: {BURP_JAR}")
+    if not EXT_JAR.exists():
+        absent.append(f"extension jar (run extension/build.sh): {EXT_JAR}")
+    if not (SEED_HOME / ".java").is_dir():
+        absent.append(f"seed burp home: {SEED_HOME / '.java'}")
+    return absent
+
+
 def burp_available() -> bool:
-    return BURP_JAR.exists() and EXT_JAR.exists()
+    return not missing()
 
 
-def launch_burp(socket_path: Path, engagement_id: str) -> subprocess.Popen:
+def make_home(workdir: Path) -> Path:
+    """A private $HOME per run.
+
+    Sharing one Burp home across runs means sharing a Java Preferences lock and
+    a sessions directory with any other Burp on the machine -- including one a
+    developer left running. The prefs are 3 MB and cheap to copy; the embedded
+    browser is 650 MB, read-mostly, and gets a symlink instead.
+    """
+    home = workdir / "burphome"
+    (home / ".BurpSuite").mkdir(parents=True)
+    shutil.copytree(SEED_HOME / ".java", home / ".java")
+    for lock in (home / ".java" / ".userPrefs").glob(".user*"):
+        lock.unlink()                 # a copied lock file belongs to the seed
+    for entry in (SEED_HOME / ".BurpSuite").iterdir():
+        target = home / ".BurpSuite" / entry.name
+        if entry.name == "burpbrowser":
+            target.symlink_to(entry)
+        elif entry.is_dir():
+            shutil.copytree(entry, target)
+        else:
+            shutil.copy2(entry, target)
+    return home
+
+
+def launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subprocess.Popen:
+    """Burp's output goes to workdir/burp.log, never to a pipe.
+
+    An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
+    buffer fills and the test hangs with no diagnostic. A file also means a
+    failing test can quote what Burp actually said.
+    """
+    home = make_home(workdir)
+    log = (workdir / "burp.log").open("wb")
     cmd = [
         "java",
         "-Djava.awt.headless=true",
-        f"-Duser.home={BURP_HOME}",
+        f"-Duser.home={home}",
         f"-Dhx.socket={socket_path}",
         f"-Dhx.engagement={engagement_id}",
         "-Dhx.instance=integration",
@@ -2807,10 +2864,8 @@ def launch_burp(socket_path: Path, engagement_id: str) -> subprocess.Popen:
         "--developer-extension-class-name=hx.HxExtension",
         "--disable-auto-update",
     ]
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, cwd=LAB,
-    )
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
+                            stderr=subprocess.STDOUT, cwd=LAB)
     proc.stdin.write(b"\n\n")     # bare newline selects Community Edition
     proc.stdin.flush()
     return proc
@@ -2840,7 +2895,7 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.skipif(not bf.burp_available(),
-                    reason="Burp jar or extension jar not built")
+                    reason=f"missing: {', '.join(bf.missing())}")
 def test_real_burp_dials_in_and_handshakes(tmp_path):
     """The whole point of this plan, proved against the real container.
 
@@ -2851,7 +2906,7 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
     srv.start()
     proc = None
     try:
-        proc = bf.launch_burp(srv.socket_path, "e-integration")
+        proc = bf.launch_burp(srv.socket_path, "e-integration", tmp_path)
 
         assert bf.wait_for(lambda: srv.state == "connected"), \
             "Burp never completed the hello handshake"
@@ -2878,14 +2933,14 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
 
 
 @pytest.mark.skipif(not bf.burp_available(),
-                    reason="Burp jar or extension jar not built")
+                    reason=f"missing: {', '.join(bf.missing())}")
 def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     """A Burp restart is a reconnect, not an outage -- and the reconnected
     extension knows nothing, because extensionData does not survive."""
     srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-restart")
     srv.start()
     try:
-        proc = bf.launch_burp(srv.socket_path, "e-restart")
+        proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path)
         assert bf.wait_for(lambda: srv.state == "connected")
         srv.configure({"scope.include": ["https://a/*"]},
                       scope_sha256="abc", profile="production")
