@@ -473,8 +473,22 @@ def test_every_malformed_case_is_rejected_by_decode():
     for c in data["cases"]:
         head = c["header_text"].encode("utf-8")
         raw = len(head + b"\n").to_bytes(4, "big") + head + b"\n"
-        with pytest.raises(codec.FrameError):
+        with pytest.raises(codec.FrameError) as exc:
             codec.decode(raw)
+        # Rejected is not enough: it has to be rejected by the rule the case
+        # exists to pin. Every case carried only the key "a", so
+        # _check_header's required-field rule fired first and five of them --
+        # integer_beyond_int64, lone_surrogate, nested_object,
+        # unpaired_low_surrogate, high_surrogate_not_followed_by_escape --
+        # never reached their own rule at all. Deleting the unpaired-surrogate
+        # check in codec.py outright still left the suite at 179 passed. The
+        # \"v\":1,\"t\":\"x\" prefix in the vectors file is what fixed that,
+        # and this assertion is what stops it being stripped again.
+        assert "missing required field" not in str(exc.value), (
+            f"{c['name']} is being rejected for a missing required field, not by "
+            f"the rule it exists to pin ({str(exc.value)!r}). Restore the "
+            f'\'"v":1,"t":"x",\' prefix in {MALFORMED.name}.'
+        )
 
 
 def test_encode_refuses_an_integer_outside_signed_64_bit_range():
@@ -1044,12 +1058,46 @@ public class CodecTest {
     }
 
     /**
-     * 0xC3 0x28 is not valid UTF-8: 0xC3 starts a 2-byte sequence that must be
-     * followed by a continuation byte (0x80-0xBF), and 0x28 '(' is not one.
      * Java's default decoder REPLACES malformed bytes with U+FFFD instead of
-     * raising, which would silently accept a frame Python rejects outright.
+     * raising, silently accepting a frame Python rejects outright. Frame.decode
+     * therefore decodes the header STRICTLY, and this is the check that pins it.
+     *
+     * The bad byte has to sit INSIDE an otherwise well-formed header for the
+     * check to be able to fail. This one guarded the strict decoder with
+     * {0xC3, 0x28} alone, which is not JSON under EITHER decoding: Json.parse
+     * threw regardless, so replacing the CharsetDecoder with a lenient
+     * `new String(...)` still printed ok. Measured.
+     *
+     * Direction matters, which is why this is worth pinning at all. On
+     * 000000147b2276223a312c2274223a2268656cff6f227d0a:
+     *
+     *   JAVA lenient : ACCEPTED   t = "hel\uFFFDo"
+     *   JAVA strict  : REJECTED   header bytes are not valid UTF-8
+     *   PYTHON       : REJECTED   'utf-8' codec can't decode byte 0xff
+     *
+     * Strict means FrameError, which trips readLoop()'s finally and denyAll().
+     * Lenient means a mangled `t` falls through to
+     * `default -> error(f, "unknown_frame"); return true` and the connection
+     * CARRIES ON under the standing scope -- on a frame the harness would
+     * never have accepted.
      */
     static void invalidUtf8HeaderIsRejected() {
+        // {"v":1,"t":"hel<0xFF>o"} -- valid JSON with both required fields the
+        // moment 0xFF is leniently replaced by U+FFFD, so a lenient decode is
+        // ACCEPTED here rather than dying in the parser.
+        byte[] inside = new byte[] {
+            '{', '"', 'v', '"', ':', '1', ',', '"', 't', '"', ':', '"',
+            'h', 'e', 'l', (byte) 0xFF, 'o', '"', '}'
+        };
+        byte[] rawInside = rawFrame(inside);
+        expectThrows("invalid UTF-8 INSIDE an otherwise valid header raises FrameError, "
+                     + "not a U+FFFD-mangled frame type",
+                     Frame.FrameError.class, () -> Frame.decode(rawInside));
+
+        // Kept as well: 0xC3 starts a 2-byte sequence that must be followed by
+        // a continuation byte (0x80-0xBF), and 0x28 '(' is not one. This one
+        // cannot distinguish strict from lenient on its own -- see above -- but
+        // it costs nothing and pins the truncated-sequence shape too.
         byte[] bad = new byte[] { (byte) 0xC3, 0x28 };
         byte[] raw = rawFrame(bad);
         expectThrows("invalid UTF-8 header (0xC3 0x28) raises FrameError, not U+FFFD",
@@ -1751,6 +1799,13 @@ def srv(tmp_path):
 def _client(path):
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     c.connect(str(path))
+    # Every blocking read in this file -- thirteen of them, bare c.recv() and
+    # codec.FrameReader(c).read() alike -- goes through this helper. Without a
+    # timeout, a server that never answers HANGS the run rather than failing
+    # it: deleting the SO_PEERCRED uid check was measured wedging pytest
+    # indefinitely. Sabotage is this project's review method, so a defect that
+    # cannot report itself is a real cost.
+    c.settimeout(5)
     return c
 
 
@@ -1925,8 +1980,40 @@ def test_configure_carries_id_and_deadline(srv):
 
 
 def test_configure_before_hello_is_refused(srv):
-    with pytest.raises(server.BridgeError, match="not connected"):
-        srv.configure({"scope.include": ["https://a/*"]}, scope_sha256="x", profile="production")
+    """What the precondition holds back is real, not hypothetical: _serve()
+    assigns self._conn BEFORE the hello is read, so an un-helloed peer is a
+    perfectly good socket to write to. Driven directly, it received the
+    engagement id, the scope_sha256 and every scope pattern.
+
+    `match=` therefore names the WHOLE message. "not connected" on its own is
+    also what _send() raises when self._conn is None, so with the precondition
+    deleted this test still passed -- on the wrong raise, from two frames
+    further down, after the scope had already gone out. The peer-receives-
+    nothing assertion is the one that cannot be satisfied by the wrong raise
+    at all.
+    """
+    c = _client(srv.socket_path)
+    try:
+        # Wait for the server to have accepted and stored the socket: that is
+        # precisely the window in which only the precondition stands between a
+        # caller and a scope on the wire.
+        deadline = time.time() + 5
+        while srv._conn is None and time.time() < deadline:
+            time.sleep(0.005)
+        assert srv._conn is not None, "the server should have accepted the connection"
+        assert srv.state == "waiting", "no hello has been sent"
+
+        with pytest.raises(server.BridgeError, match="cannot configure before hello"):
+            srv.configure({"scope.include": ["https://SECRET/*"]},
+                          scope_sha256="deadbeef", profile="production")
+
+        # Nothing at all may have reached the peer. A short timeout, not the
+        # helper's 5s: this asserts an absence, so the wait is pure cost.
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
 
 
 def test_reconnect_resets_to_deny_all(srv):
@@ -2364,6 +2451,145 @@ def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
         c.close()
 
 
+def test_send_serialises_concurrent_writers(srv):
+    """_send() wrote the socket with no mutex at all, while its Java
+    counterpart is a deliberate `private synchronized void send`. Two threads
+    inside one sendall() splice two frames together on the wire and the peer
+    then decodes neither -- and every write on this side is a control frame:
+    halt, resume, configure.
+
+    Deterministic rather than scheduler-dependent. The stand-in socket parks
+    halfway through each write, which is exactly what a real sendall() does
+    when the socket buffer fills mid-frame, and both writers meet at a barrier
+    IF the code lets them be inside at once. Serialised, the first writer
+    breaks the barrier on its timeout and the second sails straight through.
+    """
+    chunks: list[bytes] = []
+    gate = threading.Barrier(2, timeout=0.5)
+    state_lock_was_free = []
+
+    class SplittingConn:
+        def sendall(self, data):
+            half = len(data) // 2
+            chunks.append(data[:half])
+            # Parked mid-frame. The state mutex must NOT be held here: this
+            # lock has to be a separate one, or a blocking send stalls the
+            # _deliver() that wakes the _request() waiting on this very frame.
+            free = srv._lock.acquire(blocking=False)
+            if free:
+                srv._lock.release()
+            state_lock_was_free.append(free)
+            try:
+                gate.wait()
+            except threading.BrokenBarrierError:
+                pass
+            chunks.append(data[half:])
+
+    srv._conn = SplittingConn()
+    try:
+        # Two frames of DIFFERENT lengths, so a spliced wire cannot decode by
+        # luck: frame one's length prefix would then span frame two's bytes.
+        writers = [
+            threading.Thread(target=srv._send, args=(
+                {"v": 1, "t": "halt", "reason": "a" * 200},)),
+            threading.Thread(target=srv._send, args=(
+                {"v": 1, "t": "resume"},)),
+        ]
+        for w in writers:
+            w.start()
+        for w in writers:
+            w.join(timeout=10)
+            assert not w.is_alive()
+
+        assert all(state_lock_was_free), (
+            "the send mutex must be separate from self._lock: holding the state "
+            "mutex across a blocking sendall() stalls _deliver()"
+        )
+
+        wire = b"".join(chunks)
+        first, _, consumed = codec.decode(wire)
+        second, _, _ = codec.decode(wire[consumed:])
+        assert {first["t"], second["t"]} == {"halt", "resume"}, (
+            f"two writers spliced their frames together on the wire: {wire!r}"
+        )
+    finally:
+        srv._conn = None
+
+
+def test_a_configure_does_not_lift_a_halt(srv):
+    """An operator halts BECAUSE the scope went wrong, then pushes the
+    corrected scope -- the most likely next action there is. Writing
+    state="configured" over "halted" here re-armed issuance with no `resume`
+    on the wire, no log line, and both consoles reading "configured". Only
+    resume() may lift a halt.
+
+    The other half is just as load-bearing: the scope and the epoch must still
+    commit. Narrowing scope during an emergency stop is exactly what an
+    operator should be able to do, which is why "halted" stays in configure()'s
+    accepted-state tuple rather than being refused outright. A configure
+    re-authorises SCOPE, not ISSUANCE. The extension half of this lives in
+    BridgeClientTest.aConfigureDoesNotLiftAHalt().
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    out = {}
+
+    def configure_into(key, pattern):
+        def run():
+            try:
+                out[key] = srv.configure({"scope.include": [pattern]},
+                                         scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out[key] = exc
+        return run
+
+    try:
+        t = threading.Thread(target=configure_into("first", "https://WIDE/*"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["first"] == 1, out
+        assert srv.state == "configured"
+
+        srv.halt("scope was wrong")
+        header, _ = reader.read()
+        assert header["t"] == "halt"
+        assert srv.state == "halted"
+
+        # The corrected, NARROWER scope, pushed while halted.
+        t = threading.Thread(target=configure_into("second", "https://NARROW/*"))
+        t.start()
+        header, body = reader.read()
+        assert header["t"] == "configure"
+        assert codec.parse_config_body(body)["scope.include"] == ["https://NARROW/*"]
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 2}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["second"] == 2, out
+
+        assert srv.state == "halted", (
+            "a configure frame must not lift an operator halt; only resume() may"
+        )
+        assert srv.config_epoch == 2, (
+            "the corrected scope must still commit -- narrowing scope during an "
+            "emergency stop is exactly what an operator should be able to do"
+        )
+
+        # resume() is the frame that IS allowed to re-arm issuance, and it
+        # returns to "configured" under the epoch-2 scope.
+        srv.resume()
+        header, _ = reader.read()
+        assert header["t"] == "resume"
+        assert srv.state == "configured"
+        assert srv.config_epoch == 2
+    finally:
+        c.close()
+
+
 def test_a_non_denying_configure_error_leaves_state_alone(srv):
     """engagement_mismatch and bad_frame answer error but leave the extension
     configured and live -- unlike bad_config and protocol_mismatch, which
@@ -2503,6 +2729,11 @@ class BridgeServer:
         self._next_id = 0
         self._generation = 0     # bumped per accepted connection; see _reset
         self._lock = threading.Lock()
+        # A SEPARATE mutex from self._lock, deliberately. Reusing the state
+        # mutex would hold it across a blocking sendall() and stall the
+        # _deliver() that wakes the _request() waiting on the very frame being
+        # written.
+        self._send_lock = threading.Lock()
 
     # ---- lifecycle ---------------------------------------------------
 
@@ -2671,8 +2902,18 @@ class BridgeServer:
         conn = self._conn          # snapshot: the accept thread may null it
         if conn is None:
             raise BridgeError("not connected")
+        # Encoded OUTSIDE the mutex: it touches nothing shared, and holding a
+        # send mutex across it would serialise work that needs no serialising.
+        frame = codec.encode(header, body)
         try:
-            conn.sendall(codec.encode(header, body))
+            # sendall() is not atomic -- it loops over send() and a large frame
+            # parks mid-write once the socket buffer fills -- so two callers
+            # inside it splice their frames together and the peer decodes
+            # neither. Every write on this side is a control frame: halt,
+            # resume, configure. The Java counterpart is a deliberate
+            # `private synchronized void send` for exactly this reason.
+            with self._send_lock:
+                conn.sendall(frame)
         except OSError as exc:
             raise BridgeError(f"send failed: {exc}") from exc
 
@@ -2765,7 +3006,16 @@ class BridgeServer:
             if gen != self._generation or self._conn is None:
                 raise BridgeError("peer disconnected before configure completed")
             self.config_epoch = int(reply["config_epoch"])
-            self.state = "configured"
+            # A configure re-authorises SCOPE, not ISSUANCE. An operator who
+            # halted because the scope went wrong, and is now pushing the
+            # corrected scope, has not asked for issuance back -- only resume()
+            # does that. Writing "configured" over "halted" here re-armed the
+            # bridge with no `resume` on the wire and no log line, and the
+            # extension's commit used to clear its own `halted` flag to match.
+            # "halted" is still an accepted state on the way in (see the
+            # precondition above): narrowing scope during an emergency stop is
+            # exactly what an operator should be able to do.
+            self.state = "halted" if self.state == "halted" else "configured"
         return self.config_epoch
 
     def halt(self, reason: str) -> None:
@@ -3311,6 +3561,7 @@ public class BridgeClientTest {
             losingThePeerDropsToDenyAll();
             aFailedHelloLeavesNoChannelBehind();
             theCommitIsExclusiveWithClose();
+            aConfigureDoesNotLiftAHalt();
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -3659,6 +3910,69 @@ public class BridgeClientTest {
         }
     }
 
+    /**
+     * A configure frame must NOT lift an operator halt. The commit used to end
+     * with `halted.set(false)`, so the most likely next action after halting --
+     * halt because the scope went wrong, push the corrected scope -- re-armed
+     * issuance with no resume() on the wire, no log line, and both consoles
+     * reading "configured".
+     *
+     * The other half of the assertion matters just as much: the epoch and the
+     * scope must still commit. Narrowing scope during an emergency stop is
+     * exactly what an operator should be able to do, so "configure is refused
+     * while halted" would be the wrong fix. A configure re-authorises SCOPE,
+     * not ISSUANCE.
+     */
+    static void aConfigureDoesNotLiftAHalt() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltcfg");
+        try (Live l = live(dir, "h.sock")) {              // configured, epoch 1, WIDE
+            check("configured before the halt", l.client.maySend());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "scope was wrong"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !l.client.maySend());
+            check("halt blocks sending", !l.client.maySend());
+
+            // The corrected, NARROWER scope, pushed while halted.
+            l.out.write(Frame.encode(configureFrame("e-1", 4L),
+                    "scope.include\thttps://NARROW/*\n".getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded ack = l.reader.read();
+            // Reading the ack is the happens-before edge: the commit completes
+            // before the ack is written, so nothing below has to poll.
+            check("the configure while halted is acknowledged",
+                  "configured".equals(ack.header.get("t")));
+
+            boolean stillHalted = false;
+            String message = "";
+            try { l.client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { stillHalted = true; message = e.getMessage(); }
+            check("a configure does not lift an operator halt", stillHalted);
+            check("and the refusal still names the halt, not a missing configure ("
+                  + message + ")", message.startsWith("halted:"));
+            check("and maySend() agrees", !l.client.maySend());
+
+            // ...while the scope and epoch it carried DID commit.
+            BridgeClient.Authorisation au = l.client.authorisation();
+            check("the configure still advanced the epoch (" + au.epoch() + ")",
+                  au.epoch() == 2L);
+            check("ack reports the advanced epoch",
+                  Long.valueOf(2L).equals(ack.header.get("config_epoch")));
+            check("the narrowed scope is in force",
+                  au.scope().get("scope.include").equals(List.of("https://NARROW/*")));
+
+            // And a resume -- the frame that IS allowed to re-arm issuance --
+            // does so, under the epoch-2 scope.
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0]));
+            l.out.flush();
+            waitUntil(l.client::maySend);
+            check("resume is what re-arms issuance", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("h.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
     /** True once `t` is BLOCKED on `monitor` specifically. */
     static boolean waitUntilBlockedOn(Thread t, Object monitor) throws Exception {
         java.lang.management.ThreadMXBean mx = java.lang.management.ManagementFactory.getThreadMXBean();
@@ -3985,7 +4299,13 @@ public final class BridgeClient {
                     // authorises. Both are visible, or neither is.
                     committed = new Authorisation(epoch, scope);
                     configured.set(true);
-                    halted.set(false);
+                    // NOT halted.set(false). A configure re-authorises SCOPE,
+                    // not ISSUANCE. An operator halts BECAUSE the scope went
+                    // wrong and then pushes the corrected scope -- the most
+                    // likely next action of all -- and clearing the halt here
+                    // re-armed issuance with no `resume` on the wire, no log
+                    // line, and both consoles reading "configured". Only a
+                    // `resume` frame lifts a halt.
                 }
 
                 Map<String, Object> ack = new LinkedHashMap<>();

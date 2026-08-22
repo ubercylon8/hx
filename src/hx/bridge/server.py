@@ -65,6 +65,11 @@ class BridgeServer:
         self._next_id = 0
         self._generation = 0     # bumped per accepted connection; see _reset
         self._lock = threading.Lock()
+        # A SEPARATE mutex from self._lock, deliberately. Reusing the state
+        # mutex would hold it across a blocking sendall() and stall the
+        # _deliver() that wakes the _request() waiting on the very frame being
+        # written.
+        self._send_lock = threading.Lock()
 
     # ---- lifecycle ---------------------------------------------------
 
@@ -233,8 +238,18 @@ class BridgeServer:
         conn = self._conn          # snapshot: the accept thread may null it
         if conn is None:
             raise BridgeError("not connected")
+        # Encoded OUTSIDE the mutex: it touches nothing shared, and holding a
+        # send mutex across it would serialise work that needs no serialising.
+        frame = codec.encode(header, body)
         try:
-            conn.sendall(codec.encode(header, body))
+            # sendall() is not atomic -- it loops over send() and a large frame
+            # parks mid-write once the socket buffer fills -- so two callers
+            # inside it splice their frames together and the peer decodes
+            # neither. Every write on this side is a control frame: halt,
+            # resume, configure. The Java counterpart is a deliberate
+            # `private synchronized void send` for exactly this reason.
+            with self._send_lock:
+                conn.sendall(frame)
         except OSError as exc:
             raise BridgeError(f"send failed: {exc}") from exc
 
@@ -327,7 +342,16 @@ class BridgeServer:
             if gen != self._generation or self._conn is None:
                 raise BridgeError("peer disconnected before configure completed")
             self.config_epoch = int(reply["config_epoch"])
-            self.state = "configured"
+            # A configure re-authorises SCOPE, not ISSUANCE. An operator who
+            # halted because the scope went wrong, and is now pushing the
+            # corrected scope, has not asked for issuance back -- only resume()
+            # does that. Writing "configured" over "halted" here re-armed the
+            # bridge with no `resume` on the wire and no log line, and the
+            # extension's commit used to clear its own `halted` flag to match.
+            # "halted" is still an accepted state on the way in (see the
+            # precondition above): narrowing scope during an emergency stop is
+            # exactly what an operator should be able to do.
+            self.state = "halted" if self.state == "halted" else "configured"
         return self.config_epoch
 
     def halt(self, reason: str) -> None:

@@ -277,7 +277,13 @@ public final class BridgeClient {
                     // authorises. Both are visible, or neither is.
                     committed = new Authorisation(epoch, scope);
                     configured.set(true);
-                    halted.set(false);
+                    // NOT halted.set(false). A configure re-authorises SCOPE,
+                    // not ISSUANCE. An operator halts BECAUSE the scope went
+                    // wrong and then pushes the corrected scope -- the most
+                    // likely next action of all -- and clearing the halt here
+                    // re-armed issuance with no `resume` on the wire, no log
+                    // line, and both consoles reading "configured". Only a
+                    // `resume` frame lifts a halt.
                 }
 
                 Map<String, Object> ack = new LinkedHashMap<>();

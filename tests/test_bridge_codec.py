@@ -255,8 +255,22 @@ def test_every_malformed_case_is_rejected_by_decode():
     for c in data["cases"]:
         head = c["header_text"].encode("utf-8")
         raw = len(head + b"\n").to_bytes(4, "big") + head + b"\n"
-        with pytest.raises(codec.FrameError):
+        with pytest.raises(codec.FrameError) as exc:
             codec.decode(raw)
+        # Rejected is not enough: it has to be rejected by the rule the case
+        # exists to pin. Every case carried only the key "a", so
+        # _check_header's required-field rule fired first and five of them --
+        # integer_beyond_int64, lone_surrogate, nested_object,
+        # unpaired_low_surrogate, high_surrogate_not_followed_by_escape --
+        # never reached their own rule at all. Deleting the unpaired-surrogate
+        # check in codec.py outright still left the suite at 179 passed. The
+        # \"v\":1,\"t\":\"x\" prefix in the vectors file is what fixed that,
+        # and this assertion is what stops it being stripped again.
+        assert "missing required field" not in str(exc.value), (
+            f"{c['name']} is being rejected for a missing required field, not by "
+            f"the rule it exists to pin ({str(exc.value)!r}). Restore the "
+            f'\'"v":1,"t":"x",\' prefix in {MALFORMED.name}.'
+        )
 
 
 def test_encode_refuses_an_integer_outside_signed_64_bit_range():

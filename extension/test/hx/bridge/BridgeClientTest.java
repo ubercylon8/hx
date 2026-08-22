@@ -143,6 +143,7 @@ public class BridgeClientTest {
             losingThePeerDropsToDenyAll();
             aFailedHelloLeavesNoChannelBehind();
             theCommitIsExclusiveWithClose();
+            aConfigureDoesNotLiftAHalt();
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -488,6 +489,69 @@ public class BridgeClientTest {
             check("and close() stays terminal", !l.client.maySend());
         } finally {
             Files.deleteIfExists(dir.resolve("x.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A configure frame must NOT lift an operator halt. The commit used to end
+     * with `halted.set(false)`, so the most likely next action after halting --
+     * halt because the scope went wrong, push the corrected scope -- re-armed
+     * issuance with no resume() on the wire, no log line, and both consoles
+     * reading "configured".
+     *
+     * The other half of the assertion matters just as much: the epoch and the
+     * scope must still commit. Narrowing scope during an emergency stop is
+     * exactly what an operator should be able to do, so "configure is refused
+     * while halted" would be the wrong fix. A configure re-authorises SCOPE,
+     * not ISSUANCE.
+     */
+    static void aConfigureDoesNotLiftAHalt() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltcfg");
+        try (Live l = live(dir, "h.sock")) {              // configured, epoch 1, WIDE
+            check("configured before the halt", l.client.maySend());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "scope was wrong"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !l.client.maySend());
+            check("halt blocks sending", !l.client.maySend());
+
+            // The corrected, NARROWER scope, pushed while halted.
+            l.out.write(Frame.encode(configureFrame("e-1", 4L),
+                    "scope.include\thttps://NARROW/*\n".getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded ack = l.reader.read();
+            // Reading the ack is the happens-before edge: the commit completes
+            // before the ack is written, so nothing below has to poll.
+            check("the configure while halted is acknowledged",
+                  "configured".equals(ack.header.get("t")));
+
+            boolean stillHalted = false;
+            String message = "";
+            try { l.client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { stillHalted = true; message = e.getMessage(); }
+            check("a configure does not lift an operator halt", stillHalted);
+            check("and the refusal still names the halt, not a missing configure ("
+                  + message + ")", message.startsWith("halted:"));
+            check("and maySend() agrees", !l.client.maySend());
+
+            // ...while the scope and epoch it carried DID commit.
+            BridgeClient.Authorisation au = l.client.authorisation();
+            check("the configure still advanced the epoch (" + au.epoch() + ")",
+                  au.epoch() == 2L);
+            check("ack reports the advanced epoch",
+                  Long.valueOf(2L).equals(ack.header.get("config_epoch")));
+            check("the narrowed scope is in force",
+                  au.scope().get("scope.include").equals(List.of("https://NARROW/*")));
+
+            // And a resume -- the frame that IS allowed to re-arm issuance --
+            // does so, under the epoch-2 scope.
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0]));
+            l.out.flush();
+            waitUntil(l.client::maySend);
+            check("resume is what re-arms issuance", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("h.sock")); Files.deleteIfExists(dir);
         }
     }
 

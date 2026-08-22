@@ -22,6 +22,13 @@ def srv(tmp_path):
 def _client(path):
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     c.connect(str(path))
+    # Every blocking read in this file -- thirteen of them, bare c.recv() and
+    # codec.FrameReader(c).read() alike -- goes through this helper. Without a
+    # timeout, a server that never answers HANGS the run rather than failing
+    # it: deleting the SO_PEERCRED uid check was measured wedging pytest
+    # indefinitely. Sabotage is this project's review method, so a defect that
+    # cannot report itself is a real cost.
+    c.settimeout(5)
     return c
 
 
@@ -196,8 +203,40 @@ def test_configure_carries_id_and_deadline(srv):
 
 
 def test_configure_before_hello_is_refused(srv):
-    with pytest.raises(server.BridgeError, match="not connected"):
-        srv.configure({"scope.include": ["https://a/*"]}, scope_sha256="x", profile="production")
+    """What the precondition holds back is real, not hypothetical: _serve()
+    assigns self._conn BEFORE the hello is read, so an un-helloed peer is a
+    perfectly good socket to write to. Driven directly, it received the
+    engagement id, the scope_sha256 and every scope pattern.
+
+    `match=` therefore names the WHOLE message. "not connected" on its own is
+    also what _send() raises when self._conn is None, so with the precondition
+    deleted this test still passed -- on the wrong raise, from two frames
+    further down, after the scope had already gone out. The peer-receives-
+    nothing assertion is the one that cannot be satisfied by the wrong raise
+    at all.
+    """
+    c = _client(srv.socket_path)
+    try:
+        # Wait for the server to have accepted and stored the socket: that is
+        # precisely the window in which only the precondition stands between a
+        # caller and a scope on the wire.
+        deadline = time.time() + 5
+        while srv._conn is None and time.time() < deadline:
+            time.sleep(0.005)
+        assert srv._conn is not None, "the server should have accepted the connection"
+        assert srv.state == "waiting", "no hello has been sent"
+
+        with pytest.raises(server.BridgeError, match="cannot configure before hello"):
+            srv.configure({"scope.include": ["https://SECRET/*"]},
+                          scope_sha256="deadbeef", profile="production")
+
+        # Nothing at all may have reached the peer. A short timeout, not the
+        # helper's 5s: this asserts an absence, so the wait is pure cost.
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
 
 
 def test_reconnect_resets_to_deny_all(srv):
@@ -631,6 +670,145 @@ def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
             f"must not go on claiming {srv.state!r}"
         )
         assert srv.config_epoch == 0, srv.config_epoch
+    finally:
+        c.close()
+
+
+def test_send_serialises_concurrent_writers(srv):
+    """_send() wrote the socket with no mutex at all, while its Java
+    counterpart is a deliberate `private synchronized void send`. Two threads
+    inside one sendall() splice two frames together on the wire and the peer
+    then decodes neither -- and every write on this side is a control frame:
+    halt, resume, configure.
+
+    Deterministic rather than scheduler-dependent. The stand-in socket parks
+    halfway through each write, which is exactly what a real sendall() does
+    when the socket buffer fills mid-frame, and both writers meet at a barrier
+    IF the code lets them be inside at once. Serialised, the first writer
+    breaks the barrier on its timeout and the second sails straight through.
+    """
+    chunks: list[bytes] = []
+    gate = threading.Barrier(2, timeout=0.5)
+    state_lock_was_free = []
+
+    class SplittingConn:
+        def sendall(self, data):
+            half = len(data) // 2
+            chunks.append(data[:half])
+            # Parked mid-frame. The state mutex must NOT be held here: this
+            # lock has to be a separate one, or a blocking send stalls the
+            # _deliver() that wakes the _request() waiting on this very frame.
+            free = srv._lock.acquire(blocking=False)
+            if free:
+                srv._lock.release()
+            state_lock_was_free.append(free)
+            try:
+                gate.wait()
+            except threading.BrokenBarrierError:
+                pass
+            chunks.append(data[half:])
+
+    srv._conn = SplittingConn()
+    try:
+        # Two frames of DIFFERENT lengths, so a spliced wire cannot decode by
+        # luck: frame one's length prefix would then span frame two's bytes.
+        writers = [
+            threading.Thread(target=srv._send, args=(
+                {"v": 1, "t": "halt", "reason": "a" * 200},)),
+            threading.Thread(target=srv._send, args=(
+                {"v": 1, "t": "resume"},)),
+        ]
+        for w in writers:
+            w.start()
+        for w in writers:
+            w.join(timeout=10)
+            assert not w.is_alive()
+
+        assert all(state_lock_was_free), (
+            "the send mutex must be separate from self._lock: holding the state "
+            "mutex across a blocking sendall() stalls _deliver()"
+        )
+
+        wire = b"".join(chunks)
+        first, _, consumed = codec.decode(wire)
+        second, _, _ = codec.decode(wire[consumed:])
+        assert {first["t"], second["t"]} == {"halt", "resume"}, (
+            f"two writers spliced their frames together on the wire: {wire!r}"
+        )
+    finally:
+        srv._conn = None
+
+
+def test_a_configure_does_not_lift_a_halt(srv):
+    """An operator halts BECAUSE the scope went wrong, then pushes the
+    corrected scope -- the most likely next action there is. Writing
+    state="configured" over "halted" here re-armed issuance with no `resume`
+    on the wire, no log line, and both consoles reading "configured". Only
+    resume() may lift a halt.
+
+    The other half is just as load-bearing: the scope and the epoch must still
+    commit. Narrowing scope during an emergency stop is exactly what an
+    operator should be able to do, which is why "halted" stays in configure()'s
+    accepted-state tuple rather than being refused outright. A configure
+    re-authorises SCOPE, not ISSUANCE. The extension half of this lives in
+    BridgeClientTest.aConfigureDoesNotLiftAHalt().
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    out = {}
+
+    def configure_into(key, pattern):
+        def run():
+            try:
+                out[key] = srv.configure({"scope.include": [pattern]},
+                                         scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out[key] = exc
+        return run
+
+    try:
+        t = threading.Thread(target=configure_into("first", "https://WIDE/*"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["first"] == 1, out
+        assert srv.state == "configured"
+
+        srv.halt("scope was wrong")
+        header, _ = reader.read()
+        assert header["t"] == "halt"
+        assert srv.state == "halted"
+
+        # The corrected, NARROWER scope, pushed while halted.
+        t = threading.Thread(target=configure_into("second", "https://NARROW/*"))
+        t.start()
+        header, body = reader.read()
+        assert header["t"] == "configure"
+        assert codec.parse_config_body(body)["scope.include"] == ["https://NARROW/*"]
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 2}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["second"] == 2, out
+
+        assert srv.state == "halted", (
+            "a configure frame must not lift an operator halt; only resume() may"
+        )
+        assert srv.config_epoch == 2, (
+            "the corrected scope must still commit -- narrowing scope during an "
+            "emergency stop is exactly what an operator should be able to do"
+        )
+
+        # resume() is the frame that IS allowed to re-arm issuance, and it
+        # returns to "configured" under the epoch-2 scope.
+        srv.resume()
+        header, _ = reader.read()
+        assert header["t"] == "resume"
+        assert srv.state == "configured"
+        assert srv.config_epoch == 2
     finally:
         c.close()
 

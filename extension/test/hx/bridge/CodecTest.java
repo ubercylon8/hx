@@ -241,12 +241,46 @@ public class CodecTest {
     }
 
     /**
-     * 0xC3 0x28 is not valid UTF-8: 0xC3 starts a 2-byte sequence that must be
-     * followed by a continuation byte (0x80-0xBF), and 0x28 '(' is not one.
      * Java's default decoder REPLACES malformed bytes with U+FFFD instead of
-     * raising, which would silently accept a frame Python rejects outright.
+     * raising, silently accepting a frame Python rejects outright. Frame.decode
+     * therefore decodes the header STRICTLY, and this is the check that pins it.
+     *
+     * The bad byte has to sit INSIDE an otherwise well-formed header for the
+     * check to be able to fail. This one guarded the strict decoder with
+     * {0xC3, 0x28} alone, which is not JSON under EITHER decoding: Json.parse
+     * threw regardless, so replacing the CharsetDecoder with a lenient
+     * `new String(...)` still printed ok. Measured.
+     *
+     * Direction matters, which is why this is worth pinning at all. On
+     * 000000147b2276223a312c2274223a2268656cff6f227d0a:
+     *
+     *   JAVA lenient : ACCEPTED   t = "hel\uFFFDo"
+     *   JAVA strict  : REJECTED   header bytes are not valid UTF-8
+     *   PYTHON       : REJECTED   'utf-8' codec can't decode byte 0xff
+     *
+     * Strict means FrameError, which trips readLoop()'s finally and denyAll().
+     * Lenient means a mangled `t` falls through to
+     * `default -> error(f, "unknown_frame"); return true` and the connection
+     * CARRIES ON under the standing scope -- on a frame the harness would
+     * never have accepted.
      */
     static void invalidUtf8HeaderIsRejected() {
+        // {"v":1,"t":"hel<0xFF>o"} -- valid JSON with both required fields the
+        // moment 0xFF is leniently replaced by U+FFFD, so a lenient decode is
+        // ACCEPTED here rather than dying in the parser.
+        byte[] inside = new byte[] {
+            '{', '"', 'v', '"', ':', '1', ',', '"', 't', '"', ':', '"',
+            'h', 'e', 'l', (byte) 0xFF, 'o', '"', '}'
+        };
+        byte[] rawInside = rawFrame(inside);
+        expectThrows("invalid UTF-8 INSIDE an otherwise valid header raises FrameError, "
+                     + "not a U+FFFD-mangled frame type",
+                     Frame.FrameError.class, () -> Frame.decode(rawInside));
+
+        // Kept as well: 0xC3 starts a 2-byte sequence that must be followed by
+        // a continuation byte (0x80-0xBF), and 0x28 '(' is not one. This one
+        // cannot distinguish strict from lenient on its own -- see above -- but
+        // it costs nothing and pins the truncated-sequence shape too.
         byte[] bad = new byte[] { (byte) 0xC3, 0x28 };
         byte[] raw = rawFrame(bad);
         expectThrows("invalid UTF-8 header (0xC3 0x28) raises FrameError, not U+FFFD",
