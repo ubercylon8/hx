@@ -60,8 +60,23 @@ public final class BridgeClient {
 
     private final AtomicBoolean configured = new AtomicBoolean(false);
     private final AtomicBoolean halted = new AtomicBoolean(false);
-    private volatile long configEpoch = 0;
-    private volatile Map<String, List<String>> scopeConfig = Map.of();
+
+    /**
+     * The epoch and the scope it authorises, published together.
+     *
+     * They were two volatile fields, and a caller holding no lock cannot read
+     * two volatiles coherently no matter where the writes sit: the review
+     * measured maySend() answering true with configEpoch()==1 while
+     * scopeConfig() already returned the epoch-2 scope. A request only epoch 2
+     * permits then goes out stamped epoch 1 -- an evidence line claiming
+     * authorisation from an epoch that never granted it. Moving the writes
+     * inside commitLock did not fix it (still 9/200); one reference does,
+     * because there is only one write to observe.
+     */
+    public record Authorisation(long epoch, Map<String, List<String>> scope) { }
+    private static final Authorisation DENIED = new Authorisation(0, Map.of());
+    private volatile Authorisation committed = DENIED;
+
     private volatile String haltReason = null;
     private long epochCounter = 0;
 
@@ -73,8 +88,20 @@ public final class BridgeClient {
     }
 
     public boolean isConfigured() { return configured.get(); }
-    public long configEpoch() { return configEpoch; }
-    public Map<String, List<String>> scopeConfig() { return scopeConfig; }
+    public long configEpoch() { return committed.epoch(); }
+    public Map<String, List<String>> scopeConfig() { return committed.scope(); }
+
+    /**
+     * Epoch and scope in ONE read. Publishing them through a single reference
+     * makes the STATE coherent, but configEpoch() then scopeConfig() is still
+     * two reads of it and a commit can land between them: a busy poll measured
+     * 11/400 there, against 32/400 for the two-field version this replaced.
+     * Narrower is not closed. Anything that decides under a scope and then
+     * stamps the epoch that granted it -- Plan 3's send path, and the evidence
+     * line behind it -- must take the pair from here, once.
+     */
+    public Authorisation authorisation() { return committed; }
+
     public boolean maySend() { return configured.get() && !halted.get(); }
 
     /** Drop to DENY-ALL. Returns whether the client had been configured.
@@ -82,8 +109,7 @@ public final class BridgeClient {
      *  so no observer sees permission outlive the scope behind it. */
     private boolean denyAll() {
         boolean was = configured.getAndSet(false);
-        configEpoch = 0;
-        scopeConfig = Map.of();
+        committed = DENIED;
         return was;
     }
 
@@ -149,11 +175,22 @@ public final class BridgeClient {
         }
     }
 
+    /** Test seam: is the dialled channel still open? Package-private and
+     *  BridgeClient is final, so it cannot escape hx.bridge. F6 -- a channel
+     *  outliving a failed hello -- has no other observable. */
+    boolean channelIsOpen() {
+        SocketChannel c = channel;
+        return c != null && c.isOpen();
+    }
+
     private void closeChannel() {
         try { if (channel != null) channel.close(); } catch (IOException ignored) { }
     }
 
-    private boolean handle(Frame.Decoded f) throws IOException {
+    /** Package-private, not private: BridgeClientTest calls this directly to
+     *  check that a closed client refuses a frame without needing to win a
+     *  race first. BridgeClient is final, so nothing escapes hx.bridge. */
+    boolean handle(Frame.Decoded f) throws IOException {
         if (closed) return false;
         Object v = f.header.get("v");
         if (!Long.valueOf(PROTOCOL_VERSION).equals(v)) {
@@ -176,8 +213,9 @@ public final class BridgeClient {
                           + " but this extension serves " + engagementId);
                     return true;
                 }
+                Map<String, List<String>> scope;
                 try {
-                    scopeConfig = ConfigBody.parse(f.body);
+                    scope = ConfigBody.parse(f.body);
                 } catch (Frame.FrameError e) {
                     // Unknown intent means DENY, not "carry on under the last
                     // intent". The likeliest trigger is an operator NARROWING
@@ -190,12 +228,16 @@ public final class BridgeClient {
                     error(f, "bad_config", e.getMessage());
                     return true;
                 }
+                long epoch;
                 synchronized (commitLock) {
                     // Either close() got here first -- and we must not undo it
                     // -- or it cannot arrive until this commit is complete and
                     // will then clear it. No ordering in between exists.
                     if (closed) return false;
-                    configEpoch = ++epochCounter;
+                    epoch = ++epochCounter;
+                    // One write publishes the epoch and the scope it
+                    // authorises. Both are visible, or neither is.
+                    committed = new Authorisation(epoch, scope);
                     configured.set(true);
                     halted.set(false);
                 }
@@ -204,7 +246,11 @@ public final class BridgeClient {
                 ack.put("v", PROTOCOL_VERSION);
                 ack.put("t", "configured");
                 ack.put("id", f.header.get("id"));
-                ack.put("config_epoch", configEpoch);
+                // The epoch WE committed, not whatever configEpoch() says now:
+                // a close() between the commit and here zeroes it, and the ack
+                // would then claim config_epoch 0 for a configure that was in
+                // fact acknowledged under epoch N.
+                ack.put("config_epoch", epoch);
                 send(ack, new byte[0]);
             }
             case "halt" -> {

@@ -7,9 +7,13 @@ package hx.bridge;
  */
 public final class FakeMontoya {
 
+    /** StringBuffer, not StringBuilder: the bridge logs from its read-loop
+     *  thread while the test reads from main. StringBuilder is not thread-safe,
+     *  so that pairing can lose or corrupt a line -- in the one assertion that
+     *  proves the deny-all transition was announced. */
     public static final class Logger implements BridgeClient.Log {
-        public final StringBuilder out = new StringBuilder();
-        public final StringBuilder err = new StringBuilder();
+        public final StringBuffer out = new StringBuffer();
+        public final StringBuffer err = new StringBuffer();
         public void info(String s) { out.append(s).append('\n'); }
         public void error(String s) { err.append(s).append('\n'); }
         public boolean sawInfo(String needle) { return out.toString().contains(needle); }

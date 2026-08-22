@@ -96,6 +96,10 @@ public final class Frame {
      * mirrors codec.FrameReader on the Python side, including reading the
      * length prefix first so draining a large frame is linear rather than
      * re-parsing a growing buffer once per chunk.
+     *
+     * A Reader belongs to exactly one thread. It is not merely unsynchronised:
+     * `buf` and the hoisted `chunk` are per-Reader staging, so two concurrent
+     * read() calls scribble over each other's bytes.
      */
     public static final class Reader {
         private final InputStream in;
@@ -121,9 +125,14 @@ public final class Frame {
                         System.arraycopy(buf, d.consumed, buf, 0, len - d.consumed);
                         len -= d.consumed;
                         // One 64 MB frame must not pin 64 MB for the life of
-                        // the connection.
-                        if (buf.length > (1 << 20) && len < (buf.length >>> 2))
-                            buf = Arrays.copyOf(buf, Math.max(len, 65536));
+                        // the connection -- but shrinking to 64 KB after every
+                        // ordinary frame is worse than the leak it prevents:
+                        // Plan 3's `exchange` frames carry HTTP bodies, and 200
+                        // x 2 MB measured 206 ms of drop-and-re-double against
+                        // 122 ms with this hysteresis. Trigger well above the
+                        // working set, and never shrink below 1 MB.
+                        if (buf.length > (1 << 22) && len < (buf.length >>> 2))
+                            buf = Arrays.copyOf(buf, Math.max(len, 1 << 20));
                         return d;
                     }
                 }

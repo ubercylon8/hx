@@ -272,6 +272,20 @@ class BridgeServer:
             codec.build_config_body(pairs),
         )
         if reply.get("t") == "error":
+            # The extension answers a refused configure by dropping to
+            # DENY-ALL at epoch 0 -- including a refused RE-configure, which
+            # discards the scope it was already holding. Leaving this side
+            # reporting state='configured' epoch=1 makes the two ends of the
+            # bridge disagree about whether anything may be sent at all, and
+            # it is this side that operators and Plan 5 read. Verified against
+            # a live extension before the reset was added.
+            #
+            # Same gen/_conn guard as the success path: a newer connection's
+            # state is not ours to clobber.
+            with self._lock:
+                if gen == self._generation and self._conn is not None:
+                    self.state = "connected"
+                    self.config_epoch = 0
             # Surface what the peer actually said. Falling through to the
             # generic message below turns "engagement_mismatch: e-1 != e-2"
             # into "acknowledged configure without a config_epoch", which

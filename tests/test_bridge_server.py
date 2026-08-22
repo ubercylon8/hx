@@ -578,3 +578,58 @@ def test_an_error_reply_to_configure_reports_what_the_peer_said(srv):
         assert "without a config_epoch" not in out["err"], out
     finally:
         c.close()
+
+
+def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
+    """The extension answers a refused configure by dropping to DENY-ALL at
+    epoch 0 -- it discards the scope it was already holding. If this side went
+    on reporting state='configured' epoch=1 the two ends of the bridge would
+    disagree about whether anything may be sent, and this is the end operators
+    and the CLI read."""
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    out = {}
+
+    def configure_into(key):
+        def run():
+            try:
+                out[key] = srv.configure({"scope.include": ["https://a/*"]},
+                                         scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out[key] = exc
+        return run
+
+    try:
+        # A first configure that IS acknowledged: epoch 1, state 'configured'.
+        t = threading.Thread(target=configure_into("first"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["first"] == 1, out
+        assert srv.state == "configured"
+        assert srv.config_epoch == 1
+
+        # The second is refused. An operator NARROWING scope with a key the
+        # installed extension predates is the likeliest way to land here, so
+        # the wider epoch-1 scope is exactly what must not survive.
+        t = threading.Thread(target=configure_into("second"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "bad_config",
+                                "detail": "unknown key scope.exclude_ports"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert isinstance(out["second"], server.BridgeError), out
+        assert "bad_config" in str(out["second"]), out
+
+        assert srv.state == "connected", (
+            "the peer is at DENY-ALL after refusing the configure; this side "
+            f"must not go on claiming {srv.state!r}"
+        )
+        assert srv.config_epoch == 0, srv.config_epoch
+    finally:
+        c.close()

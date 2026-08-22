@@ -13,7 +13,12 @@ import java.nio.file.Path;
  */
 public class HxExtension implements BurpExtension {
 
-    private BridgeClient client;
+    // Written on Burp's initialize thread, read by the unloading handler on
+    // another -- the same cross-thread edge the bridge's own fields were fixed
+    // for. Read it ONCE into a local there too: `if (client != null)
+    // client.close()` races itself, NPEs inside the handler, and skips the
+    // close() that was the point of the handler.
+    private volatile BridgeClient client;
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -45,7 +50,8 @@ public class HxExtension implements BurpExtension {
         t.start();
 
         api.extension().registerUnloadingHandler(() -> {
-            if (client != null) client.close();
+            BridgeClient c = client;
+            if (c != null) c.close();
         });
         api.logging().logToOutput("hx: bridge dialling " + sock);
     }
