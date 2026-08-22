@@ -4316,6 +4316,7 @@ addopts = "-m 'not integration'"
 - [ ] **Step 2: Write the fixture**
 
 ```python
+# tests/integration/burp_fixture.py
 """Launch a real headless Burp Suite Community with the hx extension loaded.
 
 Everything here was established empirically, most of it the hard way:
@@ -4369,7 +4370,23 @@ def missing() -> list[str]:
         absent.append(f"extension jar (run extension/build.sh): {EXT_JAR}")
     if not (SEED_HOME / ".java").is_dir():
         absent.append(f"seed burp home: {SEED_HOME / '.java'}")
+    elif not _eula_accepted():
+        # Checked because the failure mode is silence: Burp waits at the EULA
+        # gate forever and the test times out with nothing in the log to say
+        # why. The pref lives in the seed home, so a cleared or regenerated
+        # home takes it with it.
+        absent.append(f"burp.eula not accepted in {SEED_HOME / '.java'}")
     return absent
+
+
+def _eula_accepted() -> bool:
+    prefs = SEED_HOME / ".java" / ".userPrefs" / "burp" / "prefs.xml"
+    try:
+        # The key is "burp.eula", not "eula" -- a check for the short
+        # name reports every accepted home as unaccepted.
+        return 'key="burp.eula"' in prefs.read_text()
+    except OSError:
+        return False
 
 
 def burp_available() -> bool:
@@ -4528,14 +4545,14 @@ cd extension && ./build.sh && cd ..
 .venv/bin/pytest -m integration tests/integration -v
 ```
 
-Expected: 2 passed, roughly 60–120 seconds total.
+Expected: 2 passed in about 9 seconds. (This said 60-120s, which contradicted the same document's measured ~5s to hello.)
 
 If Burp never connects, read the launch output — the fixture merges stderr into stdout — and check the two failure modes established during research: the EULA prompt (needs `burp.eula` pre-accepted in `$BURP_HOME/.java/.userPrefs/burp/prefs.xml`) and the licence prompt (needs the bare newline the fixture already writes).
 
 - [ ] **Step 5: Confirm the fast suite is still fast**
 
 Run: `time .venv/bin/pytest -q`
-Expected: PASS, 144 passed, under 2 seconds — the integration tests excluded by `addopts`.
+Expected: PASS, 188 passed and 2 deselected in about 6 seconds — the integration tests excluded by `addopts`. What matters is that no JVM starts, not the exact count; the count moves every round.
 
 - [ ] **Step 6: Commit**
 

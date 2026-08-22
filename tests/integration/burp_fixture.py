@@ -51,7 +51,23 @@ def missing() -> list[str]:
         absent.append(f"extension jar (run extension/build.sh): {EXT_JAR}")
     if not (SEED_HOME / ".java").is_dir():
         absent.append(f"seed burp home: {SEED_HOME / '.java'}")
+    elif not _eula_accepted():
+        # Checked because the failure mode is silence: Burp waits at the EULA
+        # gate forever and the test times out with nothing in the log to say
+        # why. The pref lives in the seed home, so a cleared or regenerated
+        # home takes it with it.
+        absent.append(f"burp.eula not accepted in {SEED_HOME / '.java'}")
     return absent
+
+
+def _eula_accepted() -> bool:
+    prefs = SEED_HOME / ".java" / ".userPrefs" / "burp" / "prefs.xml"
+    try:
+        # The key is "burp.eula", not "eula" -- a check for the short
+        # name reports every accepted home as unaccepted.
+        return 'key="burp.eula"' in prefs.read_text()
+    except OSError:
+        return False
 
 
 def burp_available() -> bool:
