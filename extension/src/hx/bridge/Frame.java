@@ -1,6 +1,5 @@
 package hx.bridge;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -80,19 +79,56 @@ public final class Frame {
         return new Decoded(header, Arrays.copyOfRange(buf, nl + 1, end), end);
     }
 
-    /** Read exactly one frame, reassembling across however many chunks arrive. */
-    public static Decoded read(InputStream in) throws IOException {
-        ByteArrayOutputStream buf = new ByteArrayOutputStream();
-        byte[] chunk = new byte[65536];
-        while (true) {
-            try {
-                return decode(buf.toByteArray());
-            } catch (Incomplete ignored) {
-                // fall through and read more
+    /** Peer closed the connection. Distinct from Incomplete, which means
+     *  "call again with more bytes". */
+    public static class PeerClosed extends RuntimeException {
+        public PeerClosed(String m) { super(m); }
+    }
+
+    /**
+     * Reads frames from a stream, owning the buffer across calls.
+     *
+     * A bare read(InputStream) cannot be correct in a loop. decode() reports
+     * `consumed` precisely because one read may deliver more than one frame,
+     * and a method that returns after the first frame has nowhere to put the
+     * remainder -- so it drops it, and the loss surfaces later as a misleading
+     * "peer closed mid-frame". Owning the buffer is that somewhere. This
+     * mirrors codec.FrameReader on the Python side, including reading the
+     * length prefix first so draining a large frame is linear rather than
+     * re-parsing a growing buffer once per chunk.
+     */
+    public static final class Reader {
+        private final InputStream in;
+        private byte[] buf = new byte[0];
+        private int len = 0;                       // bytes of buf actually in use
+
+        public Reader(InputStream in) { this.in = in; }
+
+        public Decoded read() throws IOException {
+            byte[] chunk = new byte[65536];
+            while (true) {
+                if (len >= 4) {
+                    long length = ((long) (buf[0] & 0xff) << 24) | ((buf[1] & 0xff) << 16)
+                                | ((buf[2] & 0xff) << 8) | (buf[3] & 0xff);
+                    // Checked before allocation: the prefix is attacker-influenced.
+                    if (length > MAX_FRAME)
+                        throw new FrameError("declared frame of " + length
+                                             + " exceeds MAX_FRAME " + MAX_FRAME);
+                    int end = (int) (4 + length);
+                    if (len >= end) {
+                        Decoded d = decode(Arrays.copyOfRange(buf, 0, end));
+                        System.arraycopy(buf, d.consumed, buf, 0, len - d.consumed);
+                        len -= d.consumed;
+                        return d;
+                    }
+                }
+                int n = in.read(chunk);
+                if (n < 0) throw new PeerClosed(len > 0 ? "peer closed mid-frame" : "peer closed");
+                if (len + n > buf.length)
+                    buf = Arrays.copyOf(buf, Math.max(len + n, Math.max(1024, buf.length * 2)));
+                System.arraycopy(chunk, 0, buf, len, n);
+                len += n;
             }
-            int n = in.read(chunk);
-            if (n < 0) throw new Incomplete("peer closed mid-frame");
-            buf.write(chunk, 0, n);
         }
     }
 }

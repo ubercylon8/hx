@@ -4,6 +4,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.util.*;
 
 /** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
@@ -32,6 +34,10 @@ public class CodecTest {
         incompleteIsDistinctFromCorrupt();
         oversizedLengthIsRefused();
         readReassemblesAcrossChunks();
+        readerKeepsCoalescedFrames();
+        readerSurvivesArbitraryChunkBoundaries();
+        readerDistinguishesCleanCloseFromTruncation();
+        readerRejectsAnOversizedPrefixBeforeAllocating();
         configBody();
         goldenVectors();
         malformedInputsAreRejected();
@@ -86,8 +92,69 @@ public class CodecTest {
         byte[] payload = new byte[100_000];
         new Random(42).nextBytes(payload);
         byte[] raw = Frame.encode(Map.of("v", 1L, "t", "result", "id", 5L), payload);
-        Frame.Decoded d = Frame.read(new ByteArrayInputStream(raw));
+        Frame.Decoded d = new Frame.Reader(new ByteArrayInputStream(raw)).read();
         check("read() reassembles a large frame", Arrays.equals(d.body, payload));
+    }
+
+    static void readerKeepsCoalescedFrames() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+        byte[] f2 = Frame.encode(Map.of("v", 1L, "t", "halt"), "body".getBytes(StandardCharsets.UTF_8));
+        ByteArrayOutputStream both = new ByteArrayOutputStream();
+        both.write(f1); both.write(f2);
+
+        Frame.Reader r = new Frame.Reader(new ByteArrayInputStream(both.toByteArray()));
+        check("coalesced frame 1", "configure".equals(r.read().header.get("t")));
+        Frame.Decoded second = r.read();
+        // The whole point: a call-local buffer loses this one.
+        check("coalesced frame 2 survives", "halt".equals(second.header.get("t")));
+        check("coalesced frame 2 body intact",
+              "body".equals(new String(second.body, StandardCharsets.UTF_8)));
+    }
+
+    static void readerSurvivesArbitraryChunkBoundaries() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+        byte[] f2 = Frame.encode(Map.of("v", 1L, "t", "halt"), "body".getBytes(StandardCharsets.UTF_8));
+        ByteArrayOutputStream three = new ByteArrayOutputStream();
+        three.write(f1); three.write(f2); three.write(f1);
+        final byte[] all = three.toByteArray();
+
+        InputStream sevenAtATime = new InputStream() {
+            int i = 0;
+            public int read() { return i < all.length ? (all[i++] & 0xff) : -1; }
+            public int read(byte[] b, int off, int l) {
+                if (i >= all.length) return -1;
+                int n = Math.min(7, Math.min(l, all.length - i));
+                System.arraycopy(all, i, b, off, n); i += n; return n;
+            }
+        };
+        Frame.Reader r = new Frame.Reader(sevenAtATime);
+        check("7-byte chunks: frame 1", "configure".equals(r.read().header.get("t")));
+        check("7-byte chunks: frame 2", "halt".equals(r.read().header.get("t")));
+        check("7-byte chunks: frame 3", "configure".equals(r.read().header.get("t")));
+    }
+
+    static void readerDistinguishesCleanCloseFromTruncation() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+
+        Frame.Reader clean = new Frame.Reader(new ByteArrayInputStream(f1));
+        clean.read();
+        boolean ok = false;
+        try { clean.read(); } catch (Frame.PeerClosed e) { ok = "peer closed".equals(e.getMessage()); }
+        check("clean close at a frame boundary is not an error condition", ok);
+
+        byte[] truncated = Arrays.copyOfRange(f1, 0, f1.length - 3);
+        ok = false;
+        try { new Frame.Reader(new ByteArrayInputStream(truncated)).read(); }
+        catch (Frame.PeerClosed e) { ok = "peer closed mid-frame".equals(e.getMessage()); }
+        check("a truncated frame is reported as mid-frame", ok);
+    }
+
+    static void readerRejectsAnOversizedPrefixBeforeAllocating() throws Exception {
+        byte[] huge = new byte[] {(byte) 0x7f, (byte) 0xff, (byte) 0xff, (byte) 0xff, 'x'};
+        boolean ok = false;
+        try { new Frame.Reader(new ByteArrayInputStream(huge)).read(); }
+        catch (Frame.FrameError e) { ok = e.getMessage().contains("exceeds MAX_FRAME"); }
+        check("oversized length prefix rejected before allocation", ok);
     }
 
     static void configBody() {
