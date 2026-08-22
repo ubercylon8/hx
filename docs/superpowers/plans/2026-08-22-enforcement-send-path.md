@@ -10035,21 +10035,41 @@ making it unreadable at this level would break the store the assertions read
 from. That behaviour belongs to `HaltSwitch`'s own unit test, where a scratch
 directory can be chmod'd freely.
 
-Nor does it exercise the rate limiter (§6). `Sender` is driven from the
-bridge's one read loop, so this harness's sends go out one at a time, never
-concurrently, and a real send through this real Burp is measured, end to end,
-at roughly a second -- independent of which side of the bridge that second is
-actually spent in. A harness that cannot place two sends inside one second
-cannot exceed any `limit.rate_rps` this suite could configure, so no
-configured rate can ever trip the limiter through this path, at any setting.
-That is not a gap: the limiter's own logic is already proved exactly, at its
-boundaries, in Task 2, against an injected `Clock` that can place two
-issuances a microsecond apart without waiting for either. What this task
-proves instead is the budget half of the same gate --
-`test_the_run_budget_is_exhausted_and_stays_exhausted` -- because
-`Limiter.check` answers `budget_exhausted` with no clock in the decision at
-all, so a harness slow to issue requests exhausts it exactly as surely as a
-fast one would.
+Nor does it **measure** anything, and one measurement is worth writing down
+here because an earlier draft of this task got it wrong. That draft deleted
+the rate-limit test and said the bridge could not place two sends inside one
+second. The observation was real -- every send cost ~1003 ms -- but the cause
+was not the bridge. Burp's send call returns when the **socket closes**, not
+when the response is complete: on the wire the full response is in hand in
+~80 µs, and against a peer that holds the connection open Burp waits a fixed
+~1002 ms for a FIN it has already stopped needing, then closes the connection
+itself. Per request that is **1,003 ms** against a keep-alive target and
+**0.27 ms** (p50, n=300, 2,896 req/s) against one that closes. There is no
+throttle at any level and no configuration that changes it; Burp does not
+trust a `Connection: close` *header* either, it waits for the actual FIN.
+
+The per-send cost is therefore a property of the **target**, not of hx or of
+this harness. `tests/integration/target_server.py` closes deliberately -- its
+`protocol_version` line says so and `tests/test_target_server.py` asserts it
+-- which is what makes `limit.rate_rps` reachable here at all, and
+`test_the_rate_limit_trips_and_its_retry_hint_is_true` is what reaches it.
+Against a real host, which mostly keeps connections alive, the ceiling is
+about **one request per second per thread**; that is the measurement the
+spec's §2 row now carries, and nothing in this suite characterises it.
+
+What this task still does not do is hit the limiter's boundaries -- the
+request at the limit, the microsecond before the window rolls, the microsecond
+it rolls. Those need a clock a test can move by hand, and they are proved
+exactly in Task 2 against an injected `Clock` that can place two issuances a
+microsecond apart without waiting for either. What only this file can add is
+that the decision is in the path that issues requests and that the number it
+carries survives the whole way out -- `Limiter` → `Decision` → the `error`
+frame's optional `retry_after_us` → `BridgeError.retry_after_us` -- and is
+still true when a caller waits it out. The budget half of the same gate is
+proved by `test_the_run_budget_is_exhausted_and_stays_exhausted`, which needs
+none of this: `Limiter.check` answers `budget_exhausted` with no clock in the
+decision at all, so a harness slow to issue requests exhausts it exactly as
+surely as a fast one would.
 
 ---
 
@@ -10071,11 +10091,19 @@ target server never received this request". Every one of them passes forever
 if the request log records nothing -- which is the failure this file exists to
 make impossible. It is in the FAST suite on purpose: it needs a loopback
 socket and a few milliseconds, not a 900 MB JVM.
+
+One test here is not about the log at all. This server CLOSES every
+connection, and that is the only reason a send through Burp costs 0.27 ms
+rather than 1,003 ms -- which is in turn the only reason the integration
+suite's rate-limit test can trip a sub-second limit. A maintainer "fixing"
+the target to keep-alive would not fail that test, it would make it vacuous,
+so the close is asserted here where it costs milliseconds.
 """
 from __future__ import annotations
 
 import http.client
 import json
+import socket
 import time
 
 import pytest
@@ -10111,6 +10139,47 @@ def test_a_served_request_is_recorded_before_it_is_answered(target):
     assert hit.method == "GET"
     assert hit.path == "/api/orders"
     assert hit.query == ""
+
+
+def test_every_response_is_followed_by_a_close(target):
+    """The property the integration suite's rate-limit test stands on.
+
+    Burp's send call returns when the SOCKET closes, not when the response is
+    complete: against a peer that holds the connection open it waits a fixed
+    ~1002 ms for a FIN, which is 1,003 ms per request instead of 0.27 ms. At
+    a second a send the bridge's single read loop cannot place two sends
+    inside one second, and no sub-second rate limit is reachable at all.
+
+    Read to EOF rather than trusting a header. `Connection: close` is a claim
+    and the FIN is the fact -- Burp does not trust the header either -- and
+    the request below is HTTP/1.1 with no Connection header of its own,
+    exactly what the rig puts on the wire.
+    """
+    sock = socket.create_connection((target.host, target.port), timeout=5)
+    chunks = []
+    try:
+        sock.sendall(f"GET /health HTTP/1.1\r\nHost: {target.host}\r\n\r\n"
+                     .encode("iso-8859-1"))
+        while True:
+            data = sock.recv(4096)
+            if not data:                      # FIN
+                break
+            chunks.append(data)
+    except TimeoutError as exc:
+        raise AssertionError(
+            "the target held the connection open after answering; every send "
+            "through Burp now costs ~1.003s and no sub-second rate limit can "
+            "be tripped. See _Handler.protocol_version."
+        ) from exc
+    finally:
+        sock.close()
+
+    raw = b"".join(chunks)
+    assert raw.startswith(b"HTTP/1.0 200 OK\r\n"), raw
+    # Explicit anyway, so the byte count Burp reports is not the count of
+    # everything it read until teardown.
+    assert b"Content-Length: 12\r\n" in raw, raw
+    assert raw.endswith(b'{"ok": true}'), raw
 
 
 def test_the_routes_the_gate_should_refuse_are_recorded_too(target):
@@ -10308,10 +10377,36 @@ def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    # HTTP/1.0 -- the default -- lets a response omit Content-Length and end
-    # at the connection teardown instead. The send path measures how many
-    # bytes came back and Burp reads a length, so be explicit about both.
-    protocol_version = "HTTP/1.1"
+    # HTTP/1.0 -- BaseHTTPRequestHandler's default -- and it is load-bearing.
+    # It is what makes this server CLOSE the connection after every response.
+    #
+    # The cost of a send through Burp is decided entirely by whether the peer
+    # closes. Burp's send call returns when the SOCKET closes, not when the
+    # response is complete: measured on the wire, the whole response is in
+    # hand in ~80 us, and against a peer that holds the connection open Burp
+    # then waits a fixed ~1002 ms for a FIN it has already stopped needing
+    # and closes the connection itself. Per request that is 1,003 ms against
+    # a keep-alive target and 0.27 ms (p50, n=300) against one that closes.
+    # There is no throttle at any level and no configuration that changes it;
+    # Burp does not trust a `Connection: close` HEADER either, it waits for
+    # the actual FIN. Those two are Burp's own call. Measured through this
+    # rig's whole path instead -- Python, the socket, the JVM, this server,
+    # and back -- the same pair is 0.59 ms p50 (n=300, min 0.30, p90 1.01)
+    # and 1,004 ms p50, so the bridge adds a fraction of a millisecond and
+    # decides nothing.
+    #
+    # So do not "fix" this to HTTP/1.1 keep-alive. At a second a send, one
+    # bridge read loop cannot place two sends inside one second, and NO
+    # `limit.rate_rps` this suite could configure could ever be exceeded --
+    # which would not fail test_the_rate_limit_trips_and_its_retry_hint_is_true
+    # in tests/integration/test_send_path.py, it would make it vacuous.
+    # tests/test_target_server.py asserts the close directly, in the fast
+    # suite, so that edit goes red rather than quiet.
+    #
+    # Content-Length is NOT what this line is for: _reply() sends it on every
+    # response whatever the protocol version, so the byte count Burp reads
+    # and the length hx records are explicit either way.
+    protocol_version = "HTTP/1.0"
 
     def log_message(self, fmt, *args):
         """Silence the stderr access log.
@@ -10398,8 +10493,9 @@ class _Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
         if isinstance(exc, (ConnectionError, TimeoutError)):
-            # A client closing a keep-alive connection, or Burp dropping one
-            # on a deadline. Both are normal here and neither is a defect;
+            # A peer that goes away mid-exchange: Burp dropping a connection
+            # on a deadline, or a test client closing early. Both are normal
+            # here and neither is a defect;
             # the default prints a full traceback to stderr, which competes
             # with the diagnostics a failing integration test actually needs.
             # Anything else still gets the loud treatment.
@@ -10480,7 +10576,7 @@ class TargetServer:
 
 Run: `cd /path/to/hx && python -m pytest tests/test_target_server.py -q`
 
-Expected: PASS — `10 passed`, in well under a second and with no `java`
+Expected: PASS — `11 passed`, in well under a second and with no `java`
 process anywhere.
 
 - [ ] **Step 5: Teach the Burp launcher about the halt sentinel**
@@ -10684,7 +10780,9 @@ class Rig:
         configure body is how they get there, so the number in the config, the
         number on the wire and the number a test computes its bounds from are
         one number. Two of them written separately is how a test ends up
-        asserting against a rate nothing honours.
+        asserting against a rate nothing honours. The value the fixture picks
+        is 3 rather than the config default of 5, and the reason is at the
+        Config() call: 5 is what the extension falls back to on its own.
 
         `limit.max_requests` has no engagement-config field yet, so this is the
         rig's own choice, and it is a parameter rather than a second constant
@@ -10805,8 +10903,15 @@ def rig(tmp_path):
         stack.callback(offside.stop)
         offside.start()
 
+        # rate_limit_rps is 3, and deliberately NOT hx.config's default of 5.
+        # 5 is also HxExtension.DEFAULT_RATE_RPS -- the number Limits falls
+        # back to when the configure body omits the key -- so a configured 5
+        # and an ignored configure body are the same observation, and the
+        # rate-limit test would agree with an extension that never read the
+        # frame. 3 makes those two answers different.
         cfg = config.Config(name="integration", client="loopback",
-                            scope_include=[f"{target.origin}/*"])
+                            scope_include=[f"{target.origin}/*"],
+                            rate_limit_rps=3)
         eng = engagement.create(tmp_path / "engagement", cfg, author="integration")
         stack.callback(eng.db.close)
 
@@ -10865,12 +10970,13 @@ Two rules run through it:
     out-of-scope destination is a second live loopback server for exactly
     this reason -- an escaped request would be delivered and recorded there.
 
-  * Nothing here sleeps to approach a boundary except where a real poller
-    makes waiting the only honest option, and each of those waits is bounded
-    and named. The rate limiter is not one of them -- see "What this task
-    deliberately does not do" above -- and the budget test proves its half
-    of the same gate with no sleep at all, because the budget has no clock
-    in its decision.
+  * Nothing here sleeps to approach a boundary except where a real clock or
+    a real poller makes waiting the only honest option, and each of those
+    waits is bounded, named and derived rather than guessed. The rate-limit
+    test is the one that sleeps on purpose: part way into the window, so a
+    limiter answering a flat one second whatever it is asked cannot pass, and
+    then for exactly the wait its refusal named. The budget test sleeps for
+    nothing at all, because the budget has no clock in its decision.
 """
 from __future__ import annotations
 
@@ -10890,14 +10996,54 @@ from tests.integration import target_server
 pytestmark = pytest.mark.integration
 
 # HxExtension builds its HaltSwitch with HaltSwitch.DEFAULT_POLL_MS, which is
-# 500 ms -- two polls a second in the extension's own poller. The loop below
-# that actually spends this budget gets far fewer chances than that: each
-# iteration pays for one unguarded send through a real Burp (measured at
-# roughly a second) plus its own 0.2 s sleep, so the 5 s budget buys about
-# four probes, not ten -- still comfortably more than the two polls the
-# extension needs to notice the sentinel.
+# 500 ms, so the extension needs at most two polls -- one second -- to notice
+# a sentinel that has just appeared. The loop that spends this budget is paced
+# by its own 0.2 s sleep and almost nothing else: a send against a target that
+# closes its connections costs 0.59 ms p50 of it (see
+# target_server._Handler.protocol_version), and a send the extension has
+# already halted never leaves the JVM at all. So 5 s buys roughly 25 probes
+# for a wait that needs about five.
+#
+# The one thing that can eat into it is the rate limit -- probing at 5/s
+# against a configured rate_rps of 3 trips it -- which the loop sleeps out
+# rather than counting as an answer. The window is a second and the halt
+# lands inside one, so there is at most one such sleep and it is a partial
+# window.
+#
+# This budget was also 5 s when a send cost ~1.003 s and bought four probes
+# against the two polls needed. The Burp half of a send is now ~3,700x
+# cheaper and the number has not moved, because 5 s is the honest answer to
+# "how long may issuance continue after the operator pressed stop" -- which is
+# what the failure message says -- rather than an estimate of how long the
+# loop takes.
 SENTINEL_POLL_S = 0.5
 SENTINEL_HALT_BUDGET_S = 5.0
+
+# Limiter's window is one second. Written out rather than derived from the
+# extension's own constant, which is private for exactly this reason: a test
+# that computes its expectation from the number it is checking agrees with
+# itself whatever that number says. LimiterTest takes the same line.
+RATE_WINDOW_US = 1_000_000
+RATE_WINDOW_S = RATE_WINDOW_US / 1_000_000
+
+# How far into the window the rate-limit test waits before spending the send
+# that must be refused. Any value strictly inside the window works; 0.4 s is
+# picked so the only correct retry hint (~0.6 s) is nowhere near a full
+# second, which is what a limiter that answers a flat window whatever it is
+# asked would return.
+RATE_PROBE_OFFSET_S = 0.4
+
+# What the retry-hint arithmetic allows for the two clocks involved running at
+# slightly different rates. The extension times its window with Instant.now();
+# this side brackets the same interval with time.monotonic(). 5 ms is 12,000
+# ppm over the ~0.4 s the two marks span -- orders of magnitude more than any
+# host drifts -- and it is a small widening of a band that the first send's
+# own latency already makes ~45 ms wide (measured: hint 564,647 us inside a
+# band of [556,199, 601,565]). What matters is that both stay an order of
+# magnitude short of the ~435 ms between a computed hint and a flat
+# one-second answer, so this slack cannot hide the failure it exists to
+# tolerate around.
+CLOCK_SKEW_SLACK_US = 5_000
 
 # Error class -> `denial.kind` is records.DENIAL_KIND, imported rather than
 # restated. A second copy here would be the copy nothing tests, and the two
@@ -10917,6 +11063,17 @@ def _blobs_containing(eng, needle: bytes) -> list[Path]:
             if p.is_file() and needle in p.read_bytes()]
 
 
+def _span_us(began: float, ended: float) -> int:
+    """A time.monotonic() interval in microseconds, rounded outward.
+
+    Used only to BRACKET an interval the extension timed on its own clock, so
+    the rounding direction matters: int() would truncate toward zero and could
+    make a bracket one microsecond too narrow, which is a flake rather than a
+    finding.
+    """
+    return int((ended - began) * 1_000_000) + 1
+
+
 def _issue_until(rig, target_path: str, *, want: str, attempts: int = 40) -> list:
     """Send `target_path` until the gate answers with error class `want`.
 
@@ -10924,6 +11081,12 @@ def _issue_until(rig, target_path: str, *, want: str, attempts: int = 40) -> lis
     nothing retries automatically; this is a caller deciding to, explicitly,
     which is precisely the distinction that class exists to support. Every
     other error class is returned to the test rather than swallowed.
+
+    That branch is live, not defensive: the only caller wants eleven answered
+    samples from a host that replies in 40 ms, which is well above the 3/s
+    this rig configures. Measured, it is refused five times on the way -- at
+    3, 4, 6, 7 and 9 samples in -- and each refusal costs one attempt out of
+    `attempts`, which is why 40 is not 15.
     """
     seen: list = []
     for _ in range(attempts):
@@ -11124,23 +11287,137 @@ def test_a_set_cookie_is_redacted_before_anything_can_hash_it(rig):
     assert rig.target.hits_for("/login")
 
 
+def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
+    """§6's first limit, and the promise the refusal carries.
+
+    A limiter that denies but lies about when to retry is worse than one that
+    just denies: the agent obeys `retry_after_us`, so a hint that is short
+    spins and a hint that is long stalls a run for no reason. The arithmetic
+    is proved exactly in Task 2 against a clock the test moves by hand. What
+    only this file can show is that the decision sits in the path that issues
+    requests and that the number survives all the way out -- Limiter, the
+    Decision, the `error` frame's optional field, BridgeError -- and is still
+    true when a real caller waits it out against a real Burp.
+
+    This test can exist at all only because the target server closes its
+    connections. Burp's send call returns when the SOCKET closes, so a
+    keep-alive target costs ~1.003 s a send, the bridge's one read loop cannot
+    then place two sends inside one second, and no configured rate is
+    reachable. See target_server._Handler.protocol_version, which says the
+    same thing from the other end.
+    """
+    rps = rig.eng.config.rate_limit_rps
+    rig.configure()
+
+    # The burst. It shares one window with room to spare -- three sends
+    # measured at 37 ms in total, against a window of a second -- so the
+    # FIRST of them is the one whose departure the retry hint has to be
+    # about. Most of those 37 ms are the first send alone, ~35 ms of them,
+    # against 0.59 ms p50 for a warm one. That is why first_start and
+    # first_done are separate marks rather than one: the bracket around the
+    # first issuance has to be wide enough to hold whatever the first send
+    # costs, and a single mark would make it a guess.
+    first_start = time.monotonic()
+    assert rig.get("/health")["status"] == 200
+    first_done = time.monotonic()
+    for n in range(2, rps + 1):
+        assert rig.get("/health")["status"] == 200, \
+            f"issuance {n} of {rps} was refused inside its own window"
+
+    # Part way in, deliberately: a limiter that answers a flat one second
+    # whatever it is asked passes a hint checked at the top of the window and
+    # fails one checked here.
+    time.sleep(RATE_PROBE_OFFSET_S)
+
+    hits_before = len(rig.target.hits_for("/health"))
+    refusal_start = time.monotonic()
+    refusal = None
+    try:
+        rig.get("/health")
+    except server.BridgeError as exc:
+        refusal = exc
+    refusal_done = time.monotonic()
+
+    assert refusal is not None, (
+        f"send {rps + 1} was allowed {refusal_done - first_start:.3f}s after "
+        f"send 1, against a configured limit.rate_rps of {rps}. Either the "
+        "extension is not reading limit.rate_rps out of the configure body "
+        f"(its own fallback is 5, which {rps + 1} sends would not exceed), or "
+        "the target is holding its connections open and each send is costing "
+        "~1.003s -- see target_server._Handler.protocol_version.")
+    assert refusal.error_class == "rate_limited", refusal
+    assert f"{rps}/s" in str(refusal), (
+        f"the refusal names a rate other than the {rps}/s configured: {refusal}")
+
+    assert refusal_done - first_start < RATE_WINDOW_S, (
+        f"the burst and the refusal spanned {refusal_done - first_start:.3f}s, "
+        f"longer than the {RATE_WINDOW_S}s window, so the first issuance had "
+        "already left it and nothing below can be concluded")
+
+    # The arithmetic, bracketed rather than approximated. The extension put
+    # the first issuance on its window at some instant A with
+    # first_start <= A <= first_done, and decided this refusal at some B with
+    # refusal_start <= B <= refusal_done. The hint it must carry is exactly
+    # A + RATE_WINDOW_US - B, so widening each end to the interval that
+    # brackets it gives two inequalities that hold for every A and B in range.
+    hint = refusal.retry_after_us
+    assert isinstance(hint, int), f"retry_after_us is {hint!r}, not an integer"
+    assert 0 < hint <= RATE_WINDOW_US, (
+        f"a {RATE_WINDOW_S}s window cannot produce a wait of {hint}us")
+    lowest = RATE_WINDOW_US - _span_us(first_start, refusal_done) - CLOCK_SKEW_SLACK_US
+    highest = RATE_WINDOW_US - _span_us(first_done, refusal_start) + CLOCK_SKEW_SLACK_US
+    assert lowest <= hint <= highest, (
+        f"retry_after_us is {hint}us; the oldest issuance in the window leaves "
+        f"it between {lowest}us and {highest}us from when this refusal was "
+        f"decided. {RATE_WINDOW_US}us would be the answer for a limiter that "
+        "returns the whole window instead of the wait for its oldest entry")
+
+    # Still limited, and the target's own request log -- the one witness this
+    # side cannot fake -- says so.
+    for _ in range(3):
+        with pytest.raises(server.BridgeError) as again:
+            rig.get("/health")
+        assert again.value.error_class == "rate_limited"
+    assert len(rig.target.hits_for("/health")) == hits_before, \
+        "a rate-limited extension issued a request anyway"
+
+    # The promise itself. Waiting exactly what the refusal asked for -- plus
+    # whatever the three refusals above cost, which can only overshoot -- and
+    # the gate opens. "Not a microsecond more" is Task 2's half of this: a
+    # wall clock cannot place a send a microsecond early.
+    time.sleep(hint / 1_000_000)
+    assert rig.get("/health")["status"] == 200, (
+        "the gate refused, named a wait, and was still refusing after it")
+    assert len(rig.target.hits_for("/health")) == hits_before + 1
+
+    # Denials are never silent (§4). rate_limited has a kind of its own,
+    # unlike unmanaged_credential.
+    assert records.record_denial(
+        rig.eng.db, run_id=rig.run_id,
+        kind=records.DENIAL_KIND["rate_limited"],
+        method="GET", url=f"{rig.target.origin}/health",
+        detail=str(refusal), at_us=engagement.now_us()).startswith("d-")
+    row = rig.eng.db.execute(
+        "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us, rowid",
+        (rig.run_id,)).fetchone()
+    assert row["kind"] == "rate"
+
+
 def test_the_run_budget_is_exhausted_and_stays_exhausted(rig):
-    """§6's other limit, and the one this suite can actually prove end to end.
+    """§6's other limit, and the one that depends on nothing at all.
 
-    The rate limiter cannot be exercised here. `Sender` is driven from the
-    bridge's one read loop, so this harness's sends go out one at a time,
-    never concurrently, and a real send through this real Burp costs on the
-    order of a second, end to end -- independent of which side of the bridge
-    that second is actually spent in. A harness that cannot place two sends
-    inside one second cannot exceed any `limit.rate_rps` this suite could
-    configure, so no configured rate can ever trip the limiter through this
-    path. See "What this task deliberately does not do" above: the limiter's
-    own logic is already proved exactly, at its boundaries, against an
-    injected Clock, in Task 2.
+    The rate-limit test next door needs the target server to close its
+    connections before a sub-second limit is even reachable. This one needs
+    nothing: `Limiter.check` only counts, with no clock in the decision, so
+    the budget is exhausted by a slow harness exactly as surely as by a fast
+    one and this test would pass unchanged against a keep-alive target at a
+    second a send. That is why it is the limit to reach for when a timing
+    question is in doubt.
 
-    The budget has no clock in its decision at all -- `Limiter.check` only
-    counts -- so it is exhausted by a slow harness exactly as surely as by a
-    fast one, which is what makes it the one limit provable here.
+    max_requests is 2 here against the rig's default of 2000, so it also says
+    that the number in the configure body is the number enforced -- and 2000
+    happens to be HxExtension.DEFAULT_MAX_REQUESTS, the fallback, which is
+    exactly why the test may not use the default.
     """
     # max_requests=2, not the rig's default of 2000: Limits.arm only ever
     # arms once per run, so this has to be the FIRST configure this test
@@ -11214,6 +11491,17 @@ def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
             # extension anything.
             rig.send_unguarded("GET", "/health")
         except server.BridgeError as exc:
+            if exc.error_class == "rate_limited":
+                # Not an answer to the question this loop is asking. Probing
+                # at 5/s against a configured 3/s trips the limit before the
+                # extension has necessarily noticed the sentinel, and the
+                # decision order answers `halted` before `rate_limited`, so a
+                # rate limit here means the halt has NOT landed yet. Sleep
+                # what the refusal asked for and ask again -- §6's own
+                # prescription, and the sentinel budget above allows for one
+                # of these.
+                time.sleep(exc.retry_after_us / 1_000_000 + 0.02)
+                continue
             halted_class = exc.error_class
             assert halted_class == "halted", exc
         time.sleep(0.2)
@@ -11320,15 +11608,19 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
 
 Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q`
 
-Expected: PASS — `8 passed`: the two handshake tests in
-`tests/integration/test_real_burp.py` plus this file's six. Roughly three to
-five minutes, because each test pays its own ~5 s of Burp startup, and the
-sentinel and auto-halt tests deliberately spend seconds waiting on a real
-poller and a real rolling window. (The budget test does not wait on anything
--- its limit has no clock in it -- and the rate limiter is not tested here at
-all; see "What this task deliberately does not do" above.)
+Expected: PASS — `9 passed`, in about a minute: 55 s measured, of which 39 s
+is this file's seven tests and the rest is the two handshake tests in
+`tests/integration/test_real_burp.py`. Almost all of it is Burp: every test
+pays its own ~4.5 s of startup, and only three wait on anything else -- the
+rate-limit test on ~1 s of real window, the sentinel test on a real 500 ms
+poller (1.9 s), and the auto-halt test on a real rolling window plus the rate
+limit it trips five times on the way to ten samples (3.1 s). The sends
+themselves are not the cost: 0.59 ms p50 end to end against a target that
+closes its connections, where the first draft of this task measured ~1.003 s
+each and put "three to five minutes" here. (The budget test waits on nothing
+at all -- its limit has no clock in it.)
 
-`8 skipped` is not a pass. Read the reason it prints and fix that first.
+`9 skipped` is not a pass. Read the reason it prints and fix that first.
 
 - [ ] **Step 10: Sabotage — widen the scope so the out-of-scope target is in it**
 
@@ -11452,7 +11744,7 @@ credential is then found on disk, because a content-addressed store hashed it
 the moment it arrived:
 
 ```
-E       AssertionError: assert b'Set-Cookie: session={{observed:set-cookie}}' in b'HTTP/1.1 200 OK\r\n...Set-Cookie: session=s3cr3t-live-session-2f9a41c0; Path=/...'
+E       AssertionError: assert b'Set-Cookie: session={{observed:set-cookie}}' in b'HTTP/1.0 200 OK\r\n...Set-Cookie: session=s3cr3t-live-session-2f9a41c0; Path=/...'
 ```
 
 Confirm the second half by deleting the three assertions above the blob write
@@ -11484,7 +11776,70 @@ E       AssertionError: the in-scope target received [('GET', '/health'), ('GET'
 
 Restore: `cd /path/to/hx && git checkout -- extension/src/hx/send/Sender.java && extension/build.sh`
 
-- [ ] **Step 15: Prove a failing test leaks neither a Burp nor a port**
+- [ ] **Step 15: Sabotage — cut the configured rate out of the limiter's wiring**
+
+The rate limiter's numbers reach it through `Limits.arm`, out of the same
+authorisation snapshot the request is decided under. The tempting
+simplification is to stop reading the configure body and keep the jar's own
+default — "it is only a fallback" — and the rig configures `3` rather than the
+config default of `5` precisely so that this is visible at all.
+
+In `extension/src/hx/send/Limits.java`, change:
+
+```java
+        long rps = positive(auth, "limit.rate_rps", defaultRatePerSecond);
+```
+
+to:
+
+```java
+        long rps = defaultRatePerSecond;
+```
+
+Run: `extension/build.sh && python -m pytest -m integration -q -k retry_hint`
+
+Expected: FAIL — four sends against a limit of three are all allowed, because
+the limit in force is the jar's five:
+
+```
+E       AssertionError: send 4 was allowed 0.432s after send 1, against a
+        configured limit.rate_rps of 3. Either the extension is not reading
+        limit.rate_rps out of the configure body (its own fallback is 5, which
+        4 sends would not exceed), or the target is holding its connections
+        open and each send is costing ~1.003s
+```
+
+Then the other half — a limiter that refuses but lies about the wait. Restore
+the line above and instead change, in `extension/src/hx/policy/Limiter.java`:
+
+```java
+                return Decision.rateLimited(leavesWindowAt - now,
+```
+
+to:
+
+```java
+                return Decision.rateLimited(WINDOW_US,
+```
+
+Re-run the same command. The refusal still arrives and still carries the right
+class; what goes red is the arithmetic, by ~400 ms (an un-sabotaged run of
+the same test measured a hint of 564,647 µs inside its own band):
+
+```
+E       AssertionError: retry_after_us is 1000000us; the oldest issuance in
+        the window leaves it between 559377us and 600701us from when this
+        refusal was decided. 1000000us would be the answer for a limiter that
+        returns the whole window instead of the wait for its oldest entry
+```
+
+That is the assertion this test exists for. A denial that names a wait the
+caller can trust is a different thing from a denial, and only the second half
+of §6 — "`rate_limited` means slow down and retry" — depends on it.
+
+Restore: `cd /path/to/hx && git checkout -- extension/src/hx/policy/Limiter.java extension/src/hx/send/Limits.java && extension/build.sh`
+
+- [ ] **Step 16: Prove a failing test leaks neither a Burp nor a port**
 
 The teardown is the reason the rig is built on an ExitStack, and a teardown
 nobody has watched run is a teardown that has not been tested. Make one test
@@ -11504,7 +11859,7 @@ Expected: `1 failed`, then `no Burp survived`, then `no target port survived`.
 
 Restore: `cd /path/to/hx && git checkout -- tests/integration/test_send_path.py`
 
-- [ ] **Step 16: Prove the fast suite is still fast and JVM-free**
+- [ ] **Step 17: Prove the fast suite is still fast and JVM-free**
 
 ```bash
 cd /path/to/hx
@@ -11514,7 +11869,7 @@ pgrep -fa 'burp.StartBurp' || echo "no JVM in the fast suite"
 
 Expected: PASS, in single-digit seconds, and `no JVM in the fast suite`. The
 one new fast file, `tests/test_target_server.py`, adds a loopback socket and
-ten short tests, all measured in milliseconds.
+eleven short tests, all measured in milliseconds.
 
 `tests/test_plan_matches_repo.py` must be green too, and "green" there has a
 failure mode of its own: a block whose file does not exist is SKIPPED, and a
@@ -11540,7 +11895,7 @@ marker means the path does not end in `.py`, so the regex in
 `test_plan_matches_repo.py` never yields it at all, exactly as with Task 6's
 `BridgeClient` blocks.
 
-- [ ] **Step 17: Commit**
+- [ ] **Step 18: Commit**
 
 ```bash
 cd /path/to/hx
@@ -11552,7 +11907,7 @@ git add tests/integration/target_server.py tests/integration/conftest.py \
 git commit -m "$(cat <<'EOF'
 test(send-path): the gate proved end to end against real Burp and a loopback target
 
-Six tests across the whole stack -- Python send(), the socket, the real
+Seven tests across the whole stack -- Python send(), the socket, the real
 extension inside a real headless Burp, out to a stdlib HTTP server on
 127.0.0.1, and back. Everything stays on the machine: the out-of-scope
 destination is a SECOND loopback server on 127.0.0.2, so a scope-denied
@@ -11562,13 +11917,26 @@ port was shut.
 
 Every denial is asserted on the target server's own request log, not on the
 error class. "An error came back" and "the request was never issued" are
-different claims and only the second one is the invariant in S4. Five
+different claims and only the second one is the invariant in S4. Six
 sabotage steps back that up: widening scope makes the out-of-scope log
 non-empty, deleting Sender's halt check lets issuance continue past the
 sentinel, collapsing HaltSwitch's two halt sources lets a sentinel removal
 cancel a halt frame, returning the raw response puts a live session cookie
-into the content-addressed blob store, and removing the credential check puts
-one on the wire.
+into the content-addressed blob store, removing the credential check puts one
+on the wire, and cutting limit.rate_rps out of Limits.arm -- or answering a
+flat window instead of the wait for the oldest issuance -- takes the rate
+limiter's refusal or its retry hint with it.
+
+The target server speaks HTTP/1.0 and closes every connection, and that is
+load-bearing rather than incidental. Burp's send call returns when the SOCKET
+closes rather than when the response is complete: against a keep-alive peer it
+waits a fixed ~1002 ms for a FIN and each send costs 1,003 ms, against one
+that closes it costs 0.27 ms. At a second a send the bridge's one read loop
+cannot place two sends inside one second and no sub-second limit.rate_rps is
+reachable at all -- which is why an earlier draft of this task deleted its
+rate-limit test and recorded the wrong reason for it. The close is asserted
+directly in the fast suite so that "fixing" the target to keep-alive goes red
+rather than quiet, and spec S2 now carries the measurement.
 
 The halt test is the one to read twice. BridgeServer.send refuses locally
 whenever the durable halt is armed or its own state says halted, so a kill
@@ -11593,7 +11961,13 @@ Also here:
 
 - tests/test_target_server.py, in the FAST suite, because six assertions in
   the integration file are "the target never received this" and all six pass
-  for ever if the request log records nothing.
+  for ever if the request log records nothing -- and because the connection
+  close the rate-limit test stands on needs an assertion of its own.
+
+- The rig configures limit.rate_rps = 3, not the config default of 5, because
+  5 is also HxExtension.DEFAULT_RATE_RPS: configured and built-in being the
+  same number would make the rate-limit test agree with an extension that
+  never read the configure body.
 
 One dependency is asserted rather than assumed and will fail loudly if it is
 missing: HxExtension joining BridgeClient.haltNotifier() to Sender, which is
