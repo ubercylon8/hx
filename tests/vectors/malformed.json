@@ -70,6 +70,16 @@
       "name": "high_surrogate_not_followed_by_escape",
       "header_text": "{\"a\":\"\\ud83dX\"}",
       "why": "a high surrogate followed by a plain character instead of a \\u low-surrogate escape; a supplementary character must be a PAIR of escapes"
+    },
+    {
+      "name": "raw_control_char_0x01_in_string",
+      "header_text": "{\"a\":\"\u0001\"}",
+      "why": "a literal 0x01 byte, unescaped, directly inside a JSON string value; RFC 8259 forbids raw control characters in strings -- only the ESCAPED form (\\u0001) is legal"
+    },
+    {
+      "name": "raw_newline_0x0a_in_string",
+      "header_text": "{\"a\":\"\n\"}",
+      "why": "a literal 0x0A (LF) byte, unescaped, directly inside a JSON string value; only the ESCAPED form (\\n) is legal JSON"
     }
   ]
 }

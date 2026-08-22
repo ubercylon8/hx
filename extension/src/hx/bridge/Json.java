@@ -122,6 +122,12 @@ public final class Json {
             while (true) {
                 char c = next();
                 if (c == '"') return b.toString();
+                if (c < 0x20)
+                    // RFC 8259 forbids raw control characters in a string, and
+                    // Python's json.loads rejects them. Accepting them here
+                    // would let a frame be valid on one side of the bridge only.
+                    throw new JsonError(
+                        String.format("raw control character U+%04X in string", (int) c));
                 if (c != '\\') { b.append(c); continue; }
                 char esc = next();
                 switch (esc) {
