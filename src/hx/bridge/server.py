@@ -50,6 +50,7 @@ class BridgeServer:
         self._pending: dict[int, threading.Event] = {}
         self._replies: dict[int, dict] = {}
         self._next_id = 0
+        self._generation = 0     # bumped per accepted connection; see _reset
         self._lock = threading.Lock()
 
     # ---- lifecycle ---------------------------------------------------
@@ -109,10 +110,22 @@ class BridgeServer:
                 continue
             except OSError:
                 return
-            self._serve(conn)
+            try:
+                self._serve(conn)
+            except Exception:
+                # The accept loop is a daemon thread. If it dies the server
+                # looks alive and silently never accepts again, so no
+                # exception may escape here.
+                try:
+                    conn.close()
+                except OSError:
+                    pass
 
     def _serve(self, conn: socket.socket) -> None:
-        self._conn = conn
+        with self._lock:
+            self._generation += 1
+            gen = self._generation
+            self._conn = conn
         try:
             creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
                                     struct.calcsize("3i"))
@@ -131,16 +144,28 @@ class BridgeServer:
         except (codec.PeerClosed, codec.Incomplete, codec.FrameError, OSError):
             return
         finally:
-            self._reset()
+            self._reset(gen)
             try:
                 conn.close()
             except OSError:
                 pass
 
-    def _reset(self) -> None:
-        self.state = "waiting"
-        self.config_epoch = 0
-        self._conn = None
+    def _reset(self, gen: int | None = None) -> None:
+        """Return to DENY-ALL. `gen` guards against a slow teardown of an old
+        connection wiping the state of a newer one."""
+        with self._lock:
+            if gen is not None and gen != self._generation:
+                return
+            self.state = "waiting"
+            self.config_epoch = 0
+            self._conn = None
+            # A waiter blocked on a reply that will now never arrive must not
+            # outlive the connection, and a stale reply must not be collected
+            # by a future request.
+            for ev in self._pending.values():
+                ev.set()
+            self._pending.clear()
+            self._replies.clear()
 
     def _handle(self, header: dict, body: bytes) -> bool:
         """Return False to close the connection."""
@@ -154,7 +179,9 @@ class BridgeServer:
                 self.rejected_hellos += 1
                 return False
             self.hello = header
-            self.state = "connected"
+            with self._lock:
+                self.state = "connected"
+                self.config_epoch = 0   # a fresh hello is a fresh session
             if self.on_hello:
                 self.on_hello(header)
             return True
@@ -172,17 +199,25 @@ class BridgeServer:
     def _deliver(self, header: dict) -> None:
         rid = header.get("id")
         with self._lock:
-            self._replies[rid] = header
             ev = self._pending.get(rid)
-        if ev:
-            ev.set()
+            if ev is None:
+                # Nobody is waiting: the caller timed out, or this is an
+                # unsolicited frame. Recording it would leak an entry that
+                # nothing ever collects, forever, on a long-lived bridge.
+                return
+            self._replies[rid] = header
+        ev.set()
 
     # ---- outbound ------------------------------------------------------
 
     def _send(self, header: dict, body: bytes = b"") -> None:
-        if self._conn is None:
+        conn = self._conn          # snapshot: the accept thread may null it
+        if conn is None:
             raise BridgeError("not connected")
-        self._conn.sendall(codec.encode(header, body))
+        try:
+            conn.sendall(codec.encode(header, body))
+        except OSError as exc:
+            raise BridgeError(f"send failed: {exc}") from exc
 
     def _request(self, header: dict, body: bytes = b"", timeout: float = 10.0) -> dict:
         with self._lock:
@@ -203,12 +238,23 @@ class BridgeServer:
             raise BridgeError(f"no reply to {header['t']} within {timeout}s")
         with self._lock:
             self._pending.pop(rid, None)
+            # _reset() also sets every pending event, on disconnect, so that a
+            # waiter does not outlive its connection -- that wakeup carries no
+            # reply. Without this check, .pop(rid) raises a bare KeyError
+            # instead of the documented BridgeError. Reproduced directly:
+            # a peer that closes without ever replying woke this waiter via
+            # _reset(), with no entry in _replies for it to collect.
+            if rid not in self._replies:
+                raise BridgeError(
+                    f"peer disconnected before replying to {header['t']}"
+                )
             return self._replies.pop(rid)
 
     def configure(self, pairs: dict[str, list[str]], scope_sha256: str,
                   profile: str) -> int:
         if self.state not in ("connected", "configured", "halted"):
             raise BridgeError("not connected: cannot configure before hello")
+        gen = self._generation
         reply = self._request(
             {
                 "v": codec.PROTOCOL_VERSION,
@@ -219,8 +265,16 @@ class BridgeServer:
             },
             codec.build_config_body(pairs),
         )
-        self.config_epoch = int(reply["config_epoch"])
-        self.state = "configured"
+        if "config_epoch" not in reply:
+            raise BridgeError("peer acknowledged configure without a config_epoch")
+        with self._lock:
+            # Commit only if this is still the same connection. Without the
+            # guard, a peer that acks and immediately disconnects leaves
+            # state="configured" with no peer attached -- reproduced 59/60.
+            if gen != self._generation:
+                raise BridgeError("peer disconnected before configure completed")
+            self.config_epoch = int(reply["config_epoch"])
+            self.state = "configured"
         return self.config_epoch
 
     def halt(self, reason: str) -> None:

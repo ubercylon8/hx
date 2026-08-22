@@ -1,6 +1,7 @@
 import os
 import socket
 import stat
+import struct
 import threading
 import time
 from pathlib import Path
@@ -181,6 +182,11 @@ def test_reconnect_resets_to_deny_all(srv):
     deadline = time.time() + 5
     while srv.state != "connected" and time.time() < deadline:
         time.sleep(0.01)
+    # Without this, the test passes even when hello handling is completely
+    # broken: state never leaves "waiting", so the second poll's precondition
+    # is already true. Verified by sabotage -- it passed in 5.22s with hello
+    # handling entirely disabled.
+    assert srv.state == "connected"
     c.close()
 
     deadline = time.time() + 5
@@ -210,5 +216,122 @@ def test_peer_credentials_are_recorded(srv):
             time.sleep(0.01)
         assert srv.peer_uid == os.getuid()
         assert srv.peer_pid > 0
+    finally:
+        c.close()
+
+
+def test_configure_ack_then_immediate_disconnect_ends_in_deny_all(srv):
+    """Critical, fix round 1: configure() wrote self.state = "configured" and
+    self.config_epoch from the caller's thread with no ordering against
+    _reset() on the accept thread. A peer that acks configure and immediately
+    disconnects could leave state="configured" with no peer attached at all --
+    falsifying DENY-ALL as the terminal state. Reproduced 59/60 runs before
+    the generation-token fix, so this loops enough times to be meaningful.
+    """
+    for _ in range(60):
+        c = _client(srv.socket_path)
+        try:
+            c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                    "pid": 1, "burp_version": "x",
+                                    "instance_id": "i-1", "engagement_id": "e-1"}))
+            deadline = time.time() + 5
+            while srv.state != "connected" and time.time() < deadline:
+                time.sleep(0.01)
+            assert srv.state == "connected"
+
+            result = {}
+
+            def do_configure():
+                try:
+                    result["epoch"] = srv.configure(
+                        {"scope.include": ["https://a/*"]},
+                        scope_sha256="x", profile="production",
+                    )
+                except server.BridgeError as exc:
+                    result["error"] = exc
+
+            t = threading.Thread(target=do_configure)
+            t.start()
+
+            header, _ = codec.FrameReader(c).read()
+            c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                    "config_epoch": 1}))
+            c.close()
+            t.join(timeout=5)
+            assert not t.is_alive(), "do_configure thread never finished"
+
+            deadline = time.time() + 5
+            while srv.state != "waiting" and time.time() < deadline:
+                time.sleep(0.01)
+            assert srv.state == "waiting", (
+                "a peer that acked configure and vanished must not leave the "
+                f"bridge looking configured (result={result!r})"
+            )
+            assert srv.config_epoch == 0
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+def test_late_reply_after_timeout_does_not_leak_into_replies(srv):
+    """Important, fix round 1: _deliver used to record a reply before checking
+    whether anyone was waiting for it. A reply that arrives after its caller
+    gave up left an entry nothing ever collects -- unbounded growth on a
+    bridge meant to run for a whole engagement."""
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1", "pid": 1,
+                                "burp_version": "x", "instance_id": "i-1",
+                                "engagement_id": "e-1"}))
+        deadline = time.time() + 5
+        while srv.state != "connected" and time.time() < deadline:
+            time.sleep(0.01)
+        assert srv.state == "connected"
+
+        with pytest.raises(server.BridgeError, match="no reply"):
+            srv._request({"v": 1, "t": "configure", "engagement_id": "e-1"},
+                         timeout=0.1)
+
+        # Only now does the peer read and ack the request the server already
+        # gave up waiting on.
+        header, _ = codec.FrameReader(c).read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        time.sleep(0.3)  # give the late reply a chance to be (mis)handled
+        assert srv._replies == {}, "a reply nobody awaits must not be recorded"
+    finally:
+        c.close()
+
+
+def test_so_peercred_rejects_a_foreign_uid(srv, monkeypatch):
+    """The one security-critical branch in the file, previously uncovered.
+    Cannot actually connect as another uid in a test, so fake the credential
+    lookup SO_PEERCRED reports."""
+    real_getsockopt = socket.socket.getsockopt
+
+    def fake_getsockopt(self, level, optname, buflen=0):
+        if optname == socket.SO_PEERCRED:
+            return struct.pack("3i", 12345, os.getuid() + 1, os.getgid())
+        return real_getsockopt(self, level, optname, buflen)
+
+    monkeypatch.setattr(socket.socket, "getsockopt", fake_getsockopt)
+
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                "pid": os.getpid(), "burp_version": "x",
+                                "instance_id": "i-1", "engagement_id": "e-1"}))
+        # The server closes without ever reading the hello it left unread in
+        # its receive buffer, so Linux resets the connection (RST) rather
+        # than closing it cleanly (FIN) -- both mean "never served".
+        try:
+            data = c.recv(4096)
+        except ConnectionResetError:
+            data = b""
+        assert data == b"", "a foreign uid must never be served"
+        time.sleep(0.2)
+        assert srv.state == "waiting"
     finally:
         c.close()
