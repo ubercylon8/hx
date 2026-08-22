@@ -1120,7 +1120,6 @@ public final class Json {
 // extension/src/hx/bridge/Frame.java
 package hx.bridge;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -1200,19 +1199,70 @@ public final class Frame {
         return new Decoded(header, Arrays.copyOfRange(buf, nl + 1, end), end);
     }
 
-    /** Read exactly one frame, reassembling across however many chunks arrive. */
-    public static Decoded read(InputStream in) throws IOException {
-        ByteArrayOutputStream buf = new ByteArrayOutputStream();
-        byte[] chunk = new byte[65536];
-        while (true) {
-            try {
-                return decode(buf.toByteArray());
-            } catch (Incomplete ignored) {
-                // fall through and read more
+    /** Peer closed the connection. Distinct from Incomplete, which means
+     *  "call again with more bytes". */
+    public static class PeerClosed extends RuntimeException {
+        public PeerClosed(String m) { super(m); }
+    }
+
+    /**
+     * Reads frames from a stream, owning the buffer across calls.
+     *
+     * A bare read(InputStream) cannot be correct in a loop. decode() reports
+     * `consumed` precisely because one read may deliver more than one frame,
+     * and a method that returns after the first frame has nowhere to put the
+     * remainder -- so it drops it, and the loss surfaces later as a misleading
+     * "peer closed mid-frame". Owning the buffer is that somewhere. This
+     * mirrors codec.FrameReader on the Python side, including reading the
+     * length prefix first so draining a large frame is linear rather than
+     * re-parsing a growing buffer once per chunk.
+     *
+     * A Reader belongs to exactly one thread. It is not merely unsynchronised:
+     * `buf` and the hoisted `chunk` are per-Reader staging, so two concurrent
+     * read() calls scribble over each other's bytes.
+     */
+    public static final class Reader {
+        private final InputStream in;
+        private byte[] buf = new byte[0];
+        private int len = 0;                       // bytes of buf actually in use
+
+        public Reader(InputStream in) { this.in = in; }
+
+        private final byte[] chunk = new byte[65536];   // one per Reader, not per call
+
+        public Decoded read() throws IOException {
+            while (true) {
+                if (len >= 4) {
+                    long length = ((long) (buf[0] & 0xff) << 24) | ((buf[1] & 0xff) << 16)
+                                | ((buf[2] & 0xff) << 8) | (buf[3] & 0xff);
+                    // Checked before allocation: the prefix is attacker-influenced.
+                    if (length > MAX_FRAME)
+                        throw new FrameError("declared frame of " + length
+                                             + " exceeds MAX_FRAME " + MAX_FRAME);
+                    int end = (int) (4 + length);
+                    if (len >= end) {
+                        Decoded d = decode(Arrays.copyOfRange(buf, 0, end));
+                        System.arraycopy(buf, d.consumed, buf, 0, len - d.consumed);
+                        len -= d.consumed;
+                        // One 64 MB frame must not pin 64 MB for the life of
+                        // the connection -- but shrinking to 64 KB after every
+                        // ordinary frame is worse than the leak it prevents:
+                        // Plan 3's `exchange` frames carry HTTP bodies, and 200
+                        // x 2 MB measured 206 ms of drop-and-re-double against
+                        // 122 ms with this hysteresis. Trigger well above the
+                        // working set, and never shrink below 1 MB.
+                        if (buf.length > (1 << 22) && len < (buf.length >>> 2))
+                            buf = Arrays.copyOf(buf, Math.max(len, 1 << 20));
+                        return d;
+                    }
+                }
+                int n = in.read(chunk);
+                if (n < 0) throw new PeerClosed(len > 0 ? "peer closed mid-frame" : "peer closed");
+                if (len + n > buf.length)
+                    buf = Arrays.copyOf(buf, Math.max(len + n, Math.max(1024, buf.length * 2)));
+                System.arraycopy(chunk, 0, buf, len, n);
+                len += n;
             }
-            int n = in.read(chunk);
-            if (n < 0) throw new Incomplete("peer closed mid-frame");
-            buf.write(chunk, 0, n);
         }
     }
 }
@@ -1776,6 +1826,20 @@ class BridgeServer:
             codec.build_config_body(pairs),
         )
         if reply.get("t") == "error":
+            # The extension answers a refused configure by dropping to
+            # DENY-ALL at epoch 0 -- including a refused RE-configure, which
+            # discards the scope it was already holding. Leaving this side
+            # reporting state='configured' epoch=1 makes the two ends of the
+            # bridge disagree about whether anything may be sent at all, and
+            # it is this side that operators and Plan 5 read. Verified against
+            # a live extension before the reset was added.
+            #
+            # Same gen/_conn guard as the success path: a newer connection's
+            # state is not ours to clobber.
+            with self._lock:
+                if gen == self._generation and self._conn is not None:
+                    self.state = "connected"
+                    self.config_epoch = 0
             # Surface what the peer actually said. Falling through to the
             # generic message below turns "engagement_mismatch: e-1 != e-2"
             # into "acknowledged configure without a config_epoch", which
@@ -1790,6 +1854,13 @@ class BridgeServer:
             # Commit only if this is still the same connection. Without the
             # guard, a peer that acks and immediately disconnects leaves
             # state="configured" with no peer attached -- reproduced 59/60.
+            # The generation check alone caught a NEW connection superseding
+            # this one; it missed THIS connection resetting in the window
+            # between _request() returning and this commit (reproduced 10/10
+            # once that window was widened), because _reset() did not used to
+            # advance the generation it guards on. The _conn check is belt
+            # and braces: the generation check is the structural fix, this
+            # makes the invariant obvious to the next reader.
             if gen != self._generation or self._conn is None:
                 raise BridgeError("peer disconnected before configure completed")
             self.config_epoch = int(reply["config_epoch"])
@@ -2053,64 +2124,16 @@ delete the trap rather than documenting it: a method that is correct exactly
 once per stream and silently lossy on every later call is not worth keeping.
 
 **Delete** `public static Decoded read(InputStream in)` from
-`extension/src/hx/bridge/Frame.java` entirely, and append this in its place,
-inside the `Frame` class:
+`extension/src/hx/bridge/Frame.java` entirely and add `PeerClosed` and
+`Reader` in its place. The full, current `Frame.java` is in Task 2's code
+block — including two refinements that came out of Task 4's review and are
+part of the final file: the shrink policy at line `buf.length > (1 << 22)`
+(without hysteresis it re-doubled the buffer on every large frame: 115 ms vs
+47 ms over 200 x 2 MB) and the note that a `Reader` belongs to exactly one
+thread, since the hoisted `chunk` field is shared staging.
 
-```java
-
-    /** Peer closed the connection. Distinct from Incomplete, which means
-     *  "call again with more bytes". */
-    public static class PeerClosed extends RuntimeException {
-        public PeerClosed(String m) { super(m); }
-    }
-
-    /**
-     * Reads frames from a stream, owning the buffer across calls.
-     *
-     * A bare read(InputStream) cannot be correct in a loop. decode() reports
-     * `consumed` precisely because one read may deliver more than one frame,
-     * and a method that returns after the first frame has nowhere to put the
-     * remainder -- so it drops it, and the loss surfaces later as a misleading
-     * "peer closed mid-frame". Owning the buffer is that somewhere. This
-     * mirrors codec.FrameReader on the Python side, including reading the
-     * length prefix first so draining a large frame is linear rather than
-     * re-parsing a growing buffer once per chunk.
-     */
-    public static final class Reader {
-        private final InputStream in;
-        private byte[] buf = new byte[0];
-        private int len = 0;                       // bytes of buf actually in use
-
-        public Reader(InputStream in) { this.in = in; }
-
-        public Decoded read() throws IOException {
-            byte[] chunk = new byte[65536];
-            while (true) {
-                if (len >= 4) {
-                    long length = ((long) (buf[0] & 0xff) << 24) | ((buf[1] & 0xff) << 16)
-                                | ((buf[2] & 0xff) << 8) | (buf[3] & 0xff);
-                    // Checked before allocation: the prefix is attacker-influenced.
-                    if (length > MAX_FRAME)
-                        throw new FrameError("declared frame of " + length
-                                             + " exceeds MAX_FRAME " + MAX_FRAME);
-                    int end = (int) (4 + length);
-                    if (len >= end) {
-                        Decoded d = decode(Arrays.copyOfRange(buf, 0, end));
-                        System.arraycopy(buf, d.consumed, buf, 0, len - d.consumed);
-                        len -= d.consumed;
-                        return d;
-                    }
-                }
-                int n = in.read(chunk);
-                if (n < 0) throw new PeerClosed(len > 0 ? "peer closed mid-frame" : "peer closed");
-                if (len + n > buf.length)
-                    buf = Arrays.copyOf(buf, Math.max(len + n, Math.max(1024, buf.length * 2)));
-                System.arraycopy(chunk, 0, buf, len, n);
-                len += n;
-            }
-        }
-    }
-```
+Do not transcribe a second copy here: an earlier version of this plan carried
+the Reader twice and the two drifted apart the moment one was fixed.
 
 `PeerClosed` is new, and deliberately distinct from `Incomplete`: `Incomplete`
 means "call again with more bytes", which the Reader now handles internally and
@@ -2215,9 +2238,13 @@ package hx.bridge;
  */
 public final class FakeMontoya {
 
+    /** StringBuffer, not StringBuilder: the bridge logs from its read-loop
+     *  thread while the test reads from main. StringBuilder is not thread-safe,
+     *  so that pairing can lose or corrupt a line -- in the one assertion that
+     *  proves the deny-all transition was announced. */
     public static final class Logger implements BridgeClient.Log {
-        public final StringBuilder out = new StringBuilder();
-        public final StringBuilder err = new StringBuilder();
+        public final StringBuffer out = new StringBuffer();
+        public final StringBuffer err = new StringBuffer();
         public void info(String s) { out.append(s).append('\n'); }
         public void error(String s) { err.append(s).append('\n'); }
         public boolean sawInfo(String needle) { return out.toString().contains(needle); }
@@ -2234,6 +2261,7 @@ import java.io.*;
 import java.net.*;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 
@@ -2286,10 +2314,9 @@ public class BridgeClientTest {
                 cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", 1L);
                 cfg.put("engagement_id", "e-1"); cfg.put("scope_sha256", "abc");
                 cfg.put("profile", "production");
-                // The real peer stamps id AND deadline_us on every frame it
-                // sends through _request(), and configure() is its only caller.
-                // Omit it and the client correctly rejects the frame as
-                // bad_frame -- the fake would be misrepresenting the peer.
+                // configure is the one request frame, and BridgeServer._request
+                // stamps id and deadline_us onto every one of them. A fake that
+                // omits it is not the peer: the client answers bad_frame.
                 cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
                 out.write(Frame.encode(cfg, "scope.include\thttps://a/*\nlimit.rate_rps\t5\n"
                         .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
@@ -2305,6 +2332,13 @@ public class BridgeClientTest {
                 check("configured after ack", client.isConfigured());
                 check("scope config parsed",
                       client.scopeConfig().get("scope.include").equals(List.of("https://a/*")));
+                // The coherent read. configEpoch() then scopeConfig() is two
+                // volatile reads and a commit can land between them; this is
+                // the one an evidence line has to use.
+                BridgeClient.Authorisation au = client.authorisation();
+                check("authorisation() carries the epoch and the scope together",
+                      au.epoch() == client.configEpoch()
+                      && au.scope().equals(client.scopeConfig()));
                 client.checkMaySend();   // must not throw now
 
                 // 4. halt / resume
@@ -2317,8 +2351,9 @@ public class BridgeClientTest {
 
                 out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0])); out.flush();
                 waitUntil(() -> client.maySend());
-                client.checkMaySend();
-                check("resume unblocks sending", true);
+                boolean resumed = client.maySend();
+                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { resumed = false; }
+                check("resume unblocks sending", resumed);
 
                 // 5. an engagement_id mismatch on configure is refused
                 Map<String, Object> wrong = new LinkedHashMap<>(cfg);
@@ -2329,8 +2364,41 @@ public class BridgeClientTest {
                       "error".equals(err.header.get("t")));
                 check("error class names the mismatch",
                       String.valueOf(err.header.get("class")).contains("engagement"));
+
+                // 6. a protocol-mismatch frame while configured must trip
+                // DENY-ALL through readLoop's OTHER exit path. handle()
+                // returns false here, and the bare `return` that used to
+                // follow skipped both catch blocks entirely: configured
+                // stayed true, configEpoch kept its value, and maySend()
+                // would answer true forever with a dead read loop and no
+                // control channel behind it. This is the exact leak the
+                // finally block in readLoop() exists to close.
+                check("configured before the protocol-mismatch frame", client.maySend());
+                Map<String, Object> badVersion = new LinkedHashMap<>();
+                badVersion.put("v", 2L); badVersion.put("t", "halt"); badVersion.put("reason", "operator");
+                out.write(Frame.encode(badVersion, new byte[0])); out.flush();
+                Frame.Decoded mismatch = reader.read();
+                check("protocol mismatch answered with error",
+                      "error".equals(mismatch.header.get("t")));
+                check("error class names the protocol mismatch",
+                      "protocol_mismatch".equals(mismatch.header.get("class")));
+                waitUntil(() -> !client.maySend());
+                check("protocol mismatch trips DENY-ALL via readLoop's return path",
+                      !client.maySend());
+                boolean deniedAfterMismatch = false;
+                try { client.checkMaySend(); }
+                catch (BridgeClient.NotConfigured e) { deniedAfterMismatch = true; }
+                check("checkMaySend throws after the protocol-mismatch DENY-ALL",
+                      deniedAfterMismatch);
             }
             client.close();
+
+            closedIsSticky();
+            aClosedClientDoesNotGoLive();
+            aRefusedConfigureDropsToDenyAll();
+            closeIsTerminalAgainstTheReadLoop();
+            losingThePeerDropsToDenyAll();
+            aFailedHelloLeavesNoChannelBehind();
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -2339,6 +2407,306 @@ public class BridgeClientTest {
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
     }
+
+    /** Drive a fresh client to "configured" and hand back the pieces. */
+    static final class Live implements AutoCloseable {
+        final BridgeClient client; final SocketChannel peer;
+        final OutputStream out; final Frame.Reader reader; final FakeMontoya.Logger log;
+        final ServerSocketChannel server;
+        Live(ServerSocketChannel server, BridgeClient c, SocketChannel p,
+             OutputStream o, Frame.Reader r, FakeMontoya.Logger l) {
+            this.server = server; this.client = c; this.peer = p;
+            this.out = o; this.reader = r; this.log = l;
+        }
+        public void close() throws Exception {
+            client.close(); peer.close(); server.close();
+        }
+    }
+
+    static Map<String, Object> configureFrame(String engagement, long id) {
+        Map<String, Object> cfg = new LinkedHashMap<>();
+        cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", id);
+        cfg.put("engagement_id", engagement); cfg.put("scope_sha256", "abc");
+        cfg.put("profile", "production");
+        cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
+        return cfg;
+    }
+
+    static Live live(Path dir, String name) throws Exception {
+        Path sock = dir.resolve(name);
+        ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
+        server.bind(UnixDomainSocketAddress.of(sock));
+        FakeMontoya.Logger log = new FakeMontoya.Logger();
+        BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
+        // Daemon: a read loop that leaks past the end of a test must fail the
+        // suite by way of its assertions, not outlive main() and hang the JVM.
+        Thread dial = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
+        dial.setDaemon(true);
+        dial.start();
+        SocketChannel peer = server.accept();
+        OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+        Frame.Reader reader = new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
+        reader.read();                                   // the hello
+        out.write(Frame.encode(configureFrame("e-1", 1L),
+                  "scope.include\thttps://WIDE/*\n".getBytes(StandardCharsets.UTF_8)));
+        out.flush();
+        reader.read();                                   // the ack
+        waitUntil(client::isConfigured);
+        return new Live(server, client, peer, out, reader, log);
+    }
+
+    /** close() must be sticky: a client closed before its dial completes must
+     *  never go on to hello, configure and live sending. Reproduced by the
+     *  review as an UNLOADED extension holding a control channel. */
+    static void closedIsSticky() throws Exception {
+        Path dir = Files.createTempDirectory("hxsticky");
+        Path sock = dir.resolve("s.sock");
+        try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+            server.bind(UnixDomainSocketAddress.of(sock));
+            BridgeClient client = new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+            client.close();
+
+            // On a thread with a join timeout: an unfixed client's connect()
+            // dials, sends hello and blocks in readLoop forever, so a direct
+            // call would hang the suite instead of failing it.
+            final boolean[] refused = {false};
+            Thread dial = new Thread(() -> {
+                try { client.connect(); }
+                catch (IOException e) { refused[0] = true; }
+                catch (Exception ignored) { }
+            });
+            dial.setDaemon(true);
+            dial.start();
+            dial.join(3000);
+
+            check("connect() on a closed client returns instead of dialling", !dial.isAlive());
+            check("connect() on a closed client is refused", refused[0]);
+            check("a closed client never reports maySend", !client.maySend());
+        } finally {
+            Files.deleteIfExists(sock); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A configure arriving after close() must not resurrect the client. */
+    static void aClosedClientDoesNotGoLive() throws Exception {
+        Path dir = Files.createTempDirectory("hxresurrect");
+        try (Live l = live(dir, "r.sock")) {
+            check("live before close", l.client.maySend());
+            l.client.close();
+            check("closed client denies immediately", !l.client.maySend());
+
+            // A second configure lands after close(): the read loop must not
+            // act on it.
+            try {
+                l.out.write(Frame.encode(configureFrame("e-1", 2L),
+                        "scope.include\thttps://SNEAKY/*\n".getBytes(StandardCharsets.UTF_8)));
+                l.out.flush();
+            } catch (IOException ignored) { /* channel already shut: also fine */ }
+            Thread.sleep(150);
+            check("a configure after close() does not resurrect the client", !l.client.maySend());
+            check("and leaves no epoch behind", l.client.configEpoch() == 0);
+            check("and leaves no scope behind", l.client.scopeConfig().isEmpty());
+
+            // The same property without a race in it. closeIsTerminalAgainst-
+            // TheReadLoop() below can only catch the defect when the scheduler
+            // cooperates -- measured 0/20 on ONE core against 11-14/20 on 24 --
+            // and CI runners are commonly 2 vCPU, so on its own that guard can
+            // go quietly vacuous. This one cannot: it hands handle() a frame
+            // directly on this thread, on a client that was configured before
+            // close(), and it must be refused.
+            boolean refused;
+            try {
+                refused = !l.client.handle(
+                        Frame.decode(Frame.encode(configureFrame("e-1", 9L), CFG)));
+            } catch (IOException e) {
+                // It got as far as writing an ack down a channel close() shut,
+                // which means it did not refuse the frame. Caught so this
+                // reports as a failed check rather than killing the runner
+                // part-way through the suite.
+                refused = false;
+            }
+            check("handle() refuses a frame on a closed client", refused);
+            check("and did not re-enable sending", !l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("r.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A configure we cannot parse means the operator's intent is unknown.
+     *  Keeping the PREVIOUS, wider scope would send exactly where a narrowing
+     *  operator just said not to. */
+    static void aRefusedConfigureDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxbadcfg");
+        try (Live l = live(dir, "b.sock")) {
+            check("wide scope is in force first",
+                  l.client.scopeConfig().toString().contains("WIDE"));
+
+            l.out.write(Frame.encode(configureFrame("e-1", 3L),
+                    "this-is-not-a-config-body\n".getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded err = l.reader.read();
+            check("unparseable configure is answered with an error",
+                  "error".equals(err.header.get("t")));
+            check("error class names the config",
+                  String.valueOf(err.header.get("class")).contains("config"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a refused configure drops to DENY-ALL", !l.client.maySend());
+            check("the superseded wider scope is dropped", l.client.scopeConfig().isEmpty());
+            check("and its epoch with it", l.client.configEpoch() == 0);
+        } finally {
+            Files.deleteIfExists(dir.resolve("b.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** The most common terminal path of all, and previously untested. */
+    static void losingThePeerDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxpeergone");
+        try (Live l = live(dir, "p.sock")) {
+            check("configured while the peer is up", l.client.maySend());
+            l.peer.close();
+
+            waitUntil(() -> !l.client.maySend());
+            check("losing the peer drops to DENY-ALL", !l.client.maySend());
+            check("epoch zeroed on peer loss", l.client.configEpoch() == 0);
+            check("scope dropped on peer loss", l.client.scopeConfig().isEmpty());
+            // maySend() flipping is not a happens-before edge for the log line:
+            // denyAll() lands two statements before log.info(). Wait on the
+            // thing being asserted.
+            waitUntil(() -> l.log.sawInfo("deny-all"));
+            check("and the transition is logged",
+                  l.log.sawInfo("deny-all"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("p.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * close() must be terminal the instant it returns. The read loop runs on
+     * its own thread and may be part-way through a `configure` that was
+     * already sitting in the Reader's buffer when close() ran; if the commit
+     * is not exclusive with close(), the loop sets configured back to true
+     * behind close()'s back and maySend() answers true for as long as it takes
+     * to write the ack -- microseconds in which Plan 3 will send.
+     *
+     * Two details are load-bearing, both learned the hard way. A COALESCED
+     * BACKLOG of configure frames, because with one there is nothing for
+     * close() to race. And a BUSY POLL, because the window opens a few us
+     * AFTER close() returns: a sample at t=0 lands before it, a sample at
+     * t=2ms lands after it, and both report all-clear. Point samples measured
+     * 0/40 on code that a poll catches 39/40.
+     *
+     * This is a DETECTOR, not the guard. It is scheduler-dependent: against
+     * the defective client the review measured 11-14/20 on 24 cores, 1-3/20 on
+     * two, and 0/20 pinned to one -- so on a 2-vCPU CI runner it can pass
+     * clean on broken code. The guard is the deterministic handle()-after-
+     * close() check in aClosedClientDoesNotGoLive(). A 64-frame backlog and
+     * an ack read before close() (which proves the loop is already chewing
+     * through the backlog rather than parked on the socket) took the detector
+     * to 18-20/20 on multi-core without losing the 2-core signal.
+     */
+    static void closeIsTerminalAgainstTheReadLoop() throws Exception {
+        Path dir = Files.createTempDirectory("hxclose");
+        int resurrections = 0, attempts = 20;
+        try {
+            for (int i = 0; i < attempts; i++) {
+                Path sock = dir.resolve("c" + i + ".sock");
+                try (ServerSocketChannel server =
+                             ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+                    server.bind(UnixDomainSocketAddress.of(sock));
+                    BridgeClient client =
+                            new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+                    Thread t = new Thread(() -> {
+                        try { client.connect(); } catch (Exception ignored) { } });
+                    t.setDaemon(true);
+                    t.start();
+                    try (SocketChannel peer = server.accept()) {
+                        OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+                        Frame.Reader reader =
+                                new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
+                        reader.read();                                   // hello
+
+                        out.write(Frame.encode(configureFrame("e-1", 0L), CFG));
+                        out.flush();
+                        reader.read();                                   // the ack
+                        waitUntil(client::isConfigured);
+
+                        ByteArrayOutputStream backlog = new ByteArrayOutputStream();
+                        for (int j = 1; j <= BACKLOG; j++)
+                            backlog.write(Frame.encode(configureFrame("e-1", j), CFG));
+                        out.write(backlog.toByteArray()); out.flush();
+
+                        // Gate on the first ack: it says the read loop has the
+                        // whole backlog in its Reader and is committing frames
+                        // out of it, so close() lands mid-backlog rather than
+                        // before the bytes have even arrived.
+                        reader.read();
+
+                        client.close();
+
+                        long end = System.nanoTime() + 5_000_000L;       // 5 ms
+                        while (System.nanoTime() < end)
+                            if (client.maySend()) { resurrections++; break; }
+                    }
+                }
+                Files.deleteIfExists(sock);
+            }
+        } finally {
+            Files.deleteIfExists(dir);
+        }
+        check("close() is terminal: the read loop cannot re-enable sending behind it ("
+              + resurrections + "/" + attempts + " resurrections)", resurrections == 0);
+    }
+
+    /** Frames left buffered in the client's Reader when close() lands. Two was
+     *  enough to see the defect on a busy machine and nowhere near enough on a
+     *  quiet one. */
+    static final int BACKLOG = 64;
+
+    /**
+     * F6: a dialled channel must not outlive a failed hello. Reverting the
+     * closeChannel() in connect()'s catch failed nothing before this existed --
+     * an unloadable extension would hold an open control channel with no
+     * reader on it, and connect()'s caller would have no way to shut it.
+     *
+     * Deterministic, not a race, and the instance_id is what makes it so. At
+     * 8 MB the hello cannot fit in the socket buffer (212992 bytes here), so
+     * the write BLOCKS. Whether the peer's close lands before the write starts
+     * or while it is parked, the write fails; there is no interleaving in
+     * which it quietly succeeds and the client sails on into readLoop().
+     */
+    static void aFailedHelloLeavesNoChannelBehind() throws Exception {
+        Path dir = Files.createTempDirectory("hxhello");
+        Path sock = dir.resolve("h.sock");
+        try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+            server.bind(UnixDomainSocketAddress.of(sock));
+            BridgeClient client = new BridgeClient(
+                    sock, "e-1", "i-".repeat(4 << 20), new FakeMontoya.Logger());
+
+            Thread killer = new Thread(() -> {
+                try (SocketChannel peer = server.accept()) {
+                    // Accepted and dropped on the floor: nothing will ever
+                    // drain this hello.
+                } catch (IOException ignored) { }
+            });
+            killer.setDaemon(true);
+            killer.start();
+
+            boolean threw = false;
+            try { client.connect(); } catch (Exception e) { threw = true; }
+            killer.join(5000);
+
+            check("a hello that cannot be written propagates out of connect()", threw);
+            check("and the dialled channel does not outlive the failed hello",
+                  !client.channelIsOpen());
+            check("and the client is still denying", !client.maySend());
+        } finally {
+            Files.deleteIfExists(sock); Files.deleteIfExists(dir);
+        }
+    }
+
+    static final byte[] CFG =
+            "scope.include\thttps://RACE/*\n".getBytes(StandardCharsets.UTF_8);
 
     interface Cond { boolean ok(); }
 
@@ -2412,14 +2780,41 @@ public final class BridgeClient {
     private final String instanceId;
     private final Log log;
 
-    private SocketChannel channel;
-    private InputStream in;
-    private OutputStream out;
+    private volatile SocketChannel channel;
+    private volatile InputStream in;
+    private volatile OutputStream out;
+
+    // F1: close() must be STICKY. Without it a client that was closed before
+    // its dial completed goes on to hello, configure and live sending -- an
+    // unloaded extension holding a control channel on a daemon thread.
+    private volatile boolean closed = false;
+
+    // close() and the read loop's configure commit both mutate the permission
+    // state from different threads. Re-checking `closed` after the commit only
+    // makes the window narrow (~ns); this monitor makes it not exist. In a
+    // component whose whole job is refusing to send, "too small to observe" is
+    // not the same as "cannot happen".
+    private final Object commitLock = new Object();
 
     private final AtomicBoolean configured = new AtomicBoolean(false);
     private final AtomicBoolean halted = new AtomicBoolean(false);
-    private volatile long configEpoch = 0;
-    private volatile Map<String, List<String>> scopeConfig = Map.of();
+
+    /**
+     * The epoch and the scope it authorises, published together.
+     *
+     * They were two volatile fields, and a caller holding no lock cannot read
+     * two volatiles coherently no matter where the writes sit: the review
+     * measured maySend() answering true with configEpoch()==1 while
+     * scopeConfig() already returned the epoch-2 scope. A request only epoch 2
+     * permits then goes out stamped epoch 1 -- an evidence line claiming
+     * authorisation from an epoch that never granted it. Moving the writes
+     * inside commitLock did not fix it (still 9/200); one reference does,
+     * because there is only one write to observe.
+     */
+    public record Authorisation(long epoch, Map<String, List<String>> scope) { }
+    private static final Authorisation DENIED = new Authorisation(0, Map.of());
+    private volatile Authorisation committed = DENIED;
+
     private volatile String haltReason = null;
     private long epochCounter = 0;
 
@@ -2431,9 +2826,30 @@ public final class BridgeClient {
     }
 
     public boolean isConfigured() { return configured.get(); }
-    public long configEpoch() { return configEpoch; }
-    public Map<String, List<String>> scopeConfig() { return scopeConfig; }
+    public long configEpoch() { return committed.epoch(); }
+    public Map<String, List<String>> scopeConfig() { return committed.scope(); }
+
+    /**
+     * Epoch and scope in ONE read. Publishing them through a single reference
+     * makes the STATE coherent, but configEpoch() then scopeConfig() is still
+     * two reads of it and a commit can land between them: a busy poll measured
+     * 11/400 there, against 32/400 for the two-field version this replaced.
+     * Narrower is not closed. Anything that decides under a scope and then
+     * stamps the epoch that granted it -- Plan 3's send path, and the evidence
+     * line behind it -- must take the pair from here, once.
+     */
+    public Authorisation authorisation() { return committed; }
+
     public boolean maySend() { return configured.get() && !halted.get(); }
+
+    /** Drop to DENY-ALL. Returns whether the client had been configured.
+     *  `configured` is cleared FIRST: maySend() reads only that and `halted`,
+     *  so no observer sees permission outlive the scope behind it. */
+    private boolean denyAll() {
+        boolean was = configured.getAndSet(false);
+        committed = DENIED;
+        return was;
+    }
 
     /** Throws unless the extension is configured and not halted. */
     public void checkMaySend() {
@@ -2444,6 +2860,7 @@ public final class BridgeClient {
     }
 
     public void connect() throws IOException {
+        if (closed) throw new IOException("this client is closed; make a new one");
         channel = SocketChannel.open(UnixDomainSocketAddress.of(socketPath));
         in = Channels.newInputStream(channel);
         out = Channels.newOutputStream(channel);
@@ -2456,7 +2873,15 @@ public final class BridgeClient {
         hello.put("burp_version", System.getProperty("hx.burp.version", "unknown"));
         hello.put("instance_id", instanceId);
         hello.put("engagement_id", engagementId);
-        send(hello, new byte[0]);
+        try {
+            send(hello, new byte[0]);
+        } catch (IOException | RuntimeException e) {
+            closeChannel();          // F6: a dialled channel must not outlive a failed hello
+            throw e;
+        }
+        // close() may have run while we were dialling: it had no channel to
+        // shut and nothing configured to clear, so it left no trace here.
+        if (closed) { closeChannel(); return; }
 
         readLoop();
     }
@@ -2482,19 +2907,29 @@ public final class BridgeClient {
             // issuing requests that nothing could halt. This is the same shape
             // as the Python side's _reset() in _serve()'s finally, and for the
             // same reason.
-            boolean wasConfigured = configured.getAndSet(false);
-            configEpoch = 0;
-            scopeConfig = Map.of();
+            boolean wasConfigured = denyAll();
             closeChannel();
             if (wasConfigured) log.info("hx: control channel gone, deny-all");
         }
+    }
+
+    /** Test seam: is the dialled channel still open? Package-private and
+     *  BridgeClient is final, so it cannot escape hx.bridge. F6 -- a channel
+     *  outliving a failed hello -- has no other observable. */
+    boolean channelIsOpen() {
+        SocketChannel c = channel;
+        return c != null && c.isOpen();
     }
 
     private void closeChannel() {
         try { if (channel != null) channel.close(); } catch (IOException ignored) { }
     }
 
-    private boolean handle(Frame.Decoded f) throws IOException {
+    /** Package-private, not private: BridgeClientTest calls this directly to
+     *  check that a closed client refuses a frame without needing to win a
+     *  race first. BridgeClient is final, so nothing escapes hx.bridge. */
+    boolean handle(Frame.Decoded f) throws IOException {
+        if (closed) return false;
         Object v = f.header.get("v");
         if (!Long.valueOf(PROTOCOL_VERSION).equals(v)) {
             error(f, "protocol_mismatch", "expected v=" + PROTOCOL_VERSION + " got " + v);
@@ -2516,21 +2951,44 @@ public final class BridgeClient {
                           + " but this extension serves " + engagementId);
                     return true;
                 }
+                Map<String, List<String>> scope;
                 try {
-                    scopeConfig = ConfigBody.parse(f.body);
+                    scope = ConfigBody.parse(f.body);
                 } catch (Frame.FrameError e) {
+                    // Unknown intent means DENY, not "carry on under the last
+                    // intent". The likeliest trigger is an operator NARROWING
+                    // scope with a key this jar predates: keeping the old,
+                    // wider scope would then send exactly where they just said
+                    // not to. Unlike engagement_mismatch and bad_frame above --
+                    // neither of which is our peer trying to configure us --
+                    // this one is, and it failed.
+                    denyAll();
                     error(f, "bad_config", e.getMessage());
                     return true;
                 }
-                configEpoch = ++epochCounter;
-                configured.set(true);
-                halted.set(false);
+                long epoch;
+                synchronized (commitLock) {
+                    // Either close() got here first -- and we must not undo it
+                    // -- or it cannot arrive until this commit is complete and
+                    // will then clear it. No ordering in between exists.
+                    if (closed) return false;
+                    epoch = ++epochCounter;
+                    // One write publishes the epoch and the scope it
+                    // authorises. Both are visible, or neither is.
+                    committed = new Authorisation(epoch, scope);
+                    configured.set(true);
+                    halted.set(false);
+                }
 
                 Map<String, Object> ack = new LinkedHashMap<>();
                 ack.put("v", PROTOCOL_VERSION);
                 ack.put("t", "configured");
                 ack.put("id", f.header.get("id"));
-                ack.put("config_epoch", configEpoch);
+                // The epoch WE committed, not whatever configEpoch() says now:
+                // a close() between the commit and here zeroes it, and the ack
+                // would then claim config_epoch 0 for a configure that was in
+                // fact acknowledged under epoch N.
+                ack.put("config_epoch", epoch);
                 send(ack, new byte[0]);
             }
             case "halt" -> {
@@ -2561,10 +3019,11 @@ public final class BridgeClient {
     }
 
     public void close() {
-        configured.set(false);
-        configEpoch = 0;
-        scopeConfig = Map.of();
-        closeChannel();
+        synchronized (commitLock) {
+            closed = true;           // sticky: checked by connect() and handle()
+            denyAll();
+        }
+        closeChannel();              // I/O outside the monitor
     }
 }
 ```
@@ -2588,7 +3047,12 @@ import java.nio.file.Path;
  */
 public class HxExtension implements BurpExtension {
 
-    private BridgeClient client;
+    // Written on Burp's initialize thread, read by the unloading handler on
+    // another -- the same cross-thread edge the bridge's own fields were fixed
+    // for. Read it ONCE into a local there too: `if (client != null)
+    // client.close()` races itself, NPEs inside the handler, and skips the
+    // close() that was the point of the handler.
+    private volatile BridgeClient client;
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -2620,7 +3084,8 @@ public class HxExtension implements BurpExtension {
         t.start();
 
         api.extension().registerUnloadingHandler(() -> {
-            if (client != null) client.close();
+            BridgeClient c = client;
+            if (c != null) c.close();
         });
         api.logging().logToOutput("hx: bridge dialling " + sock);
     }
@@ -2723,6 +3188,65 @@ extension/test.sh && extension/build.sh
 git add extension src/hx/bridge/server.py tests/test_bridge_server.py
 git commit -m "fix(bridge): deny-all on every exit from the read loop"
 ```
+
+---
+
+- [ ] **Step 8: what two more review rounds changed, and what is NOT covered**
+
+The code blocks above are the **final** files, synced from the repository — not
+the first draft plus a list of patches. Transcribe them as they stand. This
+note exists so the shape of that code is legible, and so nobody re-derives a
+defect that was already paid for.
+
+**`close()` is sticky and exclusive.** Three demonstrated ways an extension
+could send after being closed: Burp's unloading handler firing before the dial
+completed (an *unloaded* extension holding a live control channel), `close()`
+followed by `connect()` on the same object, and a `configure` already sitting
+in the `Reader`'s buffer — which needs no syscall, so shutting the socket does
+not stop it being processed. Hence `volatile boolean closed`, checked in
+`connect()` and in `handle()`, and a `commitLock` making the commit and
+`close()` mutually exclusive. A commit-then-recheck was tried first and
+rejected: it makes the window nanoseconds instead of ~9 us, but narrowness is
+an incidental property of how long `send(ack)` takes.
+
+**Epoch and scope are one value.** `configEpoch()` and `scopeConfig()` as two
+volatile fields were measured returning an incoherent pair 5-9 times in 200: a
+live client reporting epoch 1 while already serving the epoch 2 scope. A
+request that only the new scope permits then gets stamped with the old epoch in
+evidence — an audit line claiming authorisation from an epoch that did not
+grant it. Publishing through one `Committed` reference was still not enough:
+two reads of that reference straddle a commit 11 times in 400. Only
+`authorisation()`, returning the pair in a single read, measured 0/400.
+
+> **Plan 3 must read `authorisation()` once per decision.** Calling
+> `configEpoch()` and `scopeConfig()` separately on the send path reintroduces
+> the straddle. Nothing in the type system enforces this yet.
+
+**An unparseable configure denies.** It does not keep the previous scope. The
+trigger is version skew — an operator NARROWING scope with a key this jar
+predates — where retaining the old wider scope sends exactly where they just
+said not to. `engagement_mismatch` and `bad_frame` are unchanged: neither is
+our peer trying to configure us.
+
+**Coverage, stated honestly.** These fixes have **no test behind them** and a
+reviewer confirmed reverting each one fails nothing:
+
+| Unguarded | Why |
+|---|---|
+| `volatile` on `channel`/`in`/`out` and on `HxExtension.client` | a visibility bug needs a weakly-ordered CPU to observe; x86 hides it |
+| the `Reader` single-thread comment | a comment |
+| `StringBuffer` in `FakeMontoya` | races only under a schedule the suite does not force |
+
+Do not add a test that "covers" these by asserting something adjacent. An
+earlier commit in this task claimed every fix was sabotage-verified when three
+were not; the honest record is this table.
+
+**The one guard that is machine-dependent.** `closeIsTerminalAgainstTheReadLoop`
+is a *detector*, not the guard: measured 19-20/20 on 24 cores, 1-4/20 on two,
+and **0/20 on one** — a clean pass on defective code, on the machine shape CI
+most often has. The guard is the deterministic check beside it, which calls
+`handle()` directly on a closed client. Keep both, and never let the detector
+be the only thing standing behind this invariant.
 
 ---
 
