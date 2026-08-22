@@ -25,6 +25,19 @@ def _client(path):
     return c
 
 
+def _connected(srv):
+    """Drive srv to state 'connected' and return the live client socket."""
+    c = _client(srv.socket_path)
+    c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                            "pid": 1, "burp_version": "x",
+                            "instance_id": "i-1", "engagement_id": "e-1"}))
+    deadline = time.time() + 5
+    while srv.state != "connected" and time.time() < deadline:
+        time.sleep(0.005)
+    assert srv.state == "connected"
+    return c
+
+
 def test_socket_and_directory_permissions(tmp_path):
     s = server.BridgeServer(tmp_path / "sub" / "b.sock", engagement_id="e-1")
     s.start()
@@ -352,7 +365,110 @@ def test_so_peercred_rejects_a_foreign_uid(srv, monkeypatch):
         c.close()
 
 
-def test_configure_commit_loses_race_to_a_concurrent_reset_deterministically(srv, monkeypatch):
+def test_configure_refuses_to_commit_when_a_reset_ran_in_the_gap(srv):
+    """The whole point of the guard, deterministically: no threads, no sleeps.
+    The stub performs the disconnect inside the window between _request()
+    returning and configure()'s commit."""
+    c = _connected(srv)
+    try:
+        def stub_request(header, body=b""):
+            srv._reset(srv._generation)
+            return {"v": 1, "t": "configured", "id": 1, "config_epoch": 7}
+        srv._request = stub_request
+
+        with pytest.raises(server.BridgeError,
+                           match="peer disconnected before configure completed"):
+            srv.configure({"scope.include": ["https://a/*"]},
+                          scope_sha256="x", profile="production")
+        assert srv.state == "waiting"
+        assert srv.config_epoch == 0
+    finally:
+        c.close()
+
+
+def test_configure_refuses_to_commit_when_the_socket_slot_was_refilled(srv):
+    """Deliberately white-box, and the only test that isolates the generation
+    token. It refills self._conn without going through accept(), so the
+    `_conn is None` clause cannot fire and only `gen != self._generation`
+    is left to catch the stale commit. Delete `self._generation += 1` from
+    _reset() and this test fails; that is what it exists for."""
+    c = _connected(srv)
+    successor, other = socket.socketpair()
+    try:
+        def stub_request(header, body=b""):
+            srv._reset(srv._generation)
+            srv._conn = successor          # slot refilled: _conn is NOT None
+            return {"v": 1, "t": "configured", "id": 1, "config_epoch": 7}
+        srv._request = stub_request
+
+        with pytest.raises(server.BridgeError,
+                           match="peer disconnected before configure completed"):
+            srv.configure({"scope.include": ["https://a/*"]},
+                          scope_sha256="x", profile="production")
+        assert srv.state == "waiting"
+        assert srv.config_epoch == 0
+    finally:
+        srv._conn = None
+        successor.close()
+        other.close()
+        c.close()
+
+
+def test_reset_advances_the_generation_it_guards_on(srv):
+    """The invariant is internal, so test it internally rather than pretend a
+    black-box test can see it."""
+    g0 = srv._generation
+    srv._reset(g0)
+    assert srv._generation > g0, "a real reset must advance the generation"
+
+    g1 = srv._generation
+    srv.state = "configured"
+    srv.config_epoch = 9
+    srv._reset(g0)                          # stale token: must be a no-op
+    assert srv._generation == g1
+    assert srv.state == "configured" and srv.config_epoch == 9
+
+
+def test_halt_and_resume_refuse_to_commit_after_a_reset_in_the_gap(srv):
+    """halt()/resume() have the same send-then-mutate shape as configure(),
+    so they get the same test. Without this, the guard on them is unexercised
+    by the whole suite."""
+    for method, message in (
+        (lambda: srv.halt("operator"), "peer disconnected before halt completed"),
+        (lambda: srv.resume(), "peer disconnected before resume completed"),
+    ):
+        c = _connected(srv)
+        try:
+            def stub_send(header, body=b""):
+                srv._reset(srv._generation)
+            srv._send = stub_send
+
+            with pytest.raises(server.BridgeError, match=message):
+                method()
+            assert srv.state == "waiting"
+        finally:
+            del srv._send          # fall back to the real bound method
+            c.close()
+
+
+def test_halt_and_resume_commit_on_the_happy_path(srv):
+    c = _connected(srv)
+    try:
+        srv.halt("operator asked")
+        assert srv.state == "halted"
+        reader = codec.FrameReader(c)
+        header, _ = reader.read()
+        assert header["t"] == "halt" and header["reason"] == "operator asked"
+
+        srv.resume()
+        assert srv.state == "connected"     # no config_epoch yet
+        header, _ = reader.read()
+        assert header["t"] == "resume"
+    finally:
+        c.close()
+
+
+def test_configure_never_leaves_a_lying_state_under_stress(srv, monkeypatch):
     """Round 2: the generation token read _generation as a guard but never
     advanced it, so it only detected "a NEW connection superseded an old
     one". It could not detect THIS connection resetting between _request()
@@ -360,8 +476,8 @@ def test_configure_commit_loses_race_to_a_concurrent_reset_deterministically(srv
     gen == self._generation and clobbered the "waiting" _reset() had just
     written. The natural-timing test above measured 0/60 for this because the
     accept thread happens to win that inner race on this machine -- favourable
-    scheduling, not a closed gap. This closes the window deterministically
-    instead of relying on timing: it delays configure()'s resumption after
+    scheduling, not a closed gap. This closes the window instead of relying
+    on timing: it delays configure()'s resumption after
     _request() returns, giving the accept thread's _reset() every chance to
     run to completion first, and asserts configure() detects it rather than
     silently committing over it.
@@ -415,7 +531,11 @@ def test_configure_commit_loses_race_to_a_concurrent_reset_deterministically(srv
                 "configure() must detect a disconnect that happened during "
                 f"its widened commit window, not silently succeed (result={result!r})"
             )
-            assert isinstance(result["error"], server.BridgeError)
+            # Whichever mechanism fires, the forbidden outcome is the same:
+            # state that claims a peer the server no longer has.
+            assert not (srv.state == "configured" and srv._conn is None), (
+                f"lying state after a disconnect mid-configure (result={result!r})"
+            )
 
             deadline = time.time() + 5
             while srv.state != "waiting" and time.time() < deadline:
