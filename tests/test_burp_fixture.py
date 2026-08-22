@@ -183,3 +183,75 @@ def test_every_row_can_be_reported_at_once(lab):
         f"burp.eula not accepted in {bf.SEED_HOME / '.java'}",
         f"seed burp home: {bf.SEED_HOME / '.BurpSuite'}",
     ]
+
+
+# ---- nothing may raise out of missing() -------------------------------
+#
+# It runs at import time, so an exception is not a skipped test -- it is
+# `Interrupted: 1 error during collection` for the whole repository. Twice now
+# that has happened from code added to make missing() safer.
+
+
+def test_an_unreadable_prerequisite_is_reported_not_raised(lab, monkeypatch):
+    """Path.exists() swallows only ENOENT/ENOTDIR/EBADF/ELOOP, so EACCES,
+    ESTALE and ENOTCONN still propagate. Reproduced with a chmod 000 lab:
+
+        PermissionError [Errno 13] ... burpsuite_desktop_v2026.7.3.jar
+
+    A CI runner under another uid or a stale NFS mount is enough.
+    """
+    def denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "exists", denied)
+
+    reasons = bf.missing()                       # must not raise
+    assert reasons, "an unreadable prerequisite must be reported as missing"
+    assert "could not be checked" in reasons[0]
+    assert "Permission denied" in reasons[0]
+    assert bf.burp_available() is False
+
+
+def test_a_stale_nfs_mount_is_reported_not_raised(lab, monkeypatch):
+    def stale(*_args, **_kwargs):
+        raise OSError(116, "Stale file handle")
+
+    monkeypatch.setattr(Path, "is_dir", stale)
+    reasons = bf.missing()
+    assert reasons and "could not be checked" in reasons[0]
+
+
+# ---- a future mtime is a broken clock, not a stale jar ----------------
+
+
+def test_a_future_dated_source_is_named_as_such(lab):
+    """Treating it as staleness disables the suite PERMANENTLY: no rebuild can
+    stamp the jar later than a source dated years ahead. Reproduced -- two
+    honest rebuilds, still reported stale both times."""
+    import time
+
+    src = lab / "ext" / "src" / "hx" / "HxExtension.java"
+    future = time.time() + 10 * 365 * 86400
+    os.utime(src, (future, future))
+
+    reasons = bf.missing()
+    assert len(reasons) == 1, reasons
+    assert "dated in the future" in reasons[0]
+    assert "run extension/build.sh" not in reasons[0], (
+        "a broken clock must not be reported as a stale jar: rebuilding cannot fix it"
+    )
+
+    # And a rebuild does not clear it, which is the whole point.
+    os.utime(bf.EXT_JAR, None)
+    assert any("dated in the future" in r for r in bf.missing())
+
+    os.utime(src, (1_000_000, 1_000_000))
+    assert bf.missing() == []
+
+
+def test_a_genuinely_stale_jar_still_fires(lab):
+    """The guard must keep working after being taught about future dates."""
+    src = lab / "ext" / "src" / "hx" / "HxExtension.java"
+    os.utime(src, (3_000_000, 3_000_000))        # newer than the jar's 2_000_000
+    reasons = bf.missing()
+    assert reasons == ["extension jar is older than its sources (run extension/build.sh)"]

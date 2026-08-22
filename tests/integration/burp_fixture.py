@@ -44,13 +44,47 @@ def missing() -> list[str]:
     real problem was an unbuilt extension jar: Burp starts happily with a
     classpath entry that does not exist, loads no extension, and never dials
     in. Say which path is missing.
+
+    NOTHING may raise out of this function. It runs at import time, so an
+    exception here is not a skipped test -- it is `Interrupted: 1 error during
+    collection` for the entire repository, fast suite included. That has now
+    happened twice, both times from code added to make this function safer:
+    once from a UnicodeDecodeError reading a torn prefs.xml, once from a
+    dangling symlink under the source tree.
+
+    The individual checks are not enough on their own. Path.exists() and
+    Path.is_dir() swallow only a narrow errno whitelist -- ENOENT, ENOTDIR,
+    EBADF, ELOOP -- so EACCES, ESTALE and ENOTCONN still propagate. A
+    permission-tightened lab directory, a CI runner under another uid, or a
+    stale NFS mount is enough. Reproduced directly:
+
+        PermissionError [Errno 13] ... burpsuite_desktop_v2026.7.3.jar
+
+    So the whole body is wrapped, and an unreadable prerequisite is reported
+    as a missing one.
     """
+    try:
+        return _missing()
+    except OSError as exc:
+        return [f"prerequisites under {LAB} could not be checked: {exc}"]
+
+
+def _missing() -> list[str]:
     absent = []
     if not BURP_JAR.exists():
         absent.append(f"burp jar: {BURP_JAR}")
     if not EXT_JAR.exists():
         absent.append(f"extension jar (run extension/build.sh): {EXT_JAR}")
-    elif _jar_is_stale():
+    elif (newest := _newest_source_mtime()) > time.time() + 60:
+        # A future timestamp is a broken clock, not a stale jar, and treating
+        # it as staleness disables the integration suite PERMANENTLY: no
+        # rebuild can stamp the jar later than a source dated years ahead.
+        # Reproduced -- two honest rebuilds, still reported stale both times.
+        absent.append(
+            f"a source under {EXT_SRC} is dated in the future "
+            f"({newest - time.time():.0f}s ahead); fix the clock or re-touch it"
+        )
+    elif newest > _jar_mtime():
         absent.append("extension jar is older than its sources (run extension/build.sh)")
     if not (SEED_HOME / ".java").is_dir():
         absent.append(f"seed burp home: {SEED_HOME / '.java'}")
@@ -80,8 +114,7 @@ def _jar_is_stale() -> bool:
     reason that names the fix, rather than passing it silently.
     """
     try:
-        jar = EXT_JAR.stat().st_mtime
-        return any(src.stat().st_mtime > jar for src in EXT_SRC.rglob("*.java"))
+        return _newest_source_mtime() > _jar_mtime()
     except OSError:
         # A missing jar is the caller's row, not ours. The broader catch is
         # the lesson from _eula_accepted() above: anything raised out of
@@ -90,6 +123,29 @@ def _jar_is_stale() -> bool:
         # a rebuild or a checkout running alongside the suite -- is no
         # evidence that the jar is stale, so say nothing and let the run go.
         return False
+
+
+def _jar_mtime() -> float:
+    return EXT_JAR.stat().st_mtime
+
+
+def _newest_source_mtime() -> float:
+    """0.0 when there are no sources -- absence is not evidence of staleness.
+
+    A source that cannot be stat'd is skipped rather than raised: a dangling
+    symlink, or a file that vanishes between the glob and the stat because a
+    checkout or a rebuild is running alongside the suite, is no evidence that
+    the jar is stale. Disabling the integration suite over a transient race
+    would be the wrong direction -- unlike an unreadable LAB, which really
+    does mean the prerequisites are unknown.
+    """
+    newest = 0.0
+    for src in EXT_SRC.rglob("*.java"):
+        try:
+            newest = max(newest, src.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
 
 
 def _eula_accepted() -> bool:
