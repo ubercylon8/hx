@@ -18,3 +18,7 @@ packages = ["src/hx"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: loads a real headless Burp Suite; needs the jar (~5s to hello, ~20s per test)",
+]
+addopts = "-m 'not integration'"

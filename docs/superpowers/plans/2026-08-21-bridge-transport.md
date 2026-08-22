@@ -4497,6 +4497,7 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     extension knows nothing, because extensionData does not survive."""
     srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-restart")
     srv.start()
+    proc = None
     try:
         proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path)
         assert bf.wait_for(lambda: srv.state == "connected")
@@ -4510,6 +4511,13 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
             "dropped connection must return the bridge to DENY-ALL"
         assert srv.config_epoch == 0
     finally:
+        # The kill above is inside the try for a reason -- it IS the restart
+        # under test -- so on any earlier failure a 900 MB JVM would outlive
+        # the run, once per debugging attempt. Reaping an already-reaped
+        # Popen is a no-op, so this is safe on the happy path too.
+        if proc:
+            proc.kill()
+            proc.wait(timeout=15)
         srv.stop()
 ```
 
