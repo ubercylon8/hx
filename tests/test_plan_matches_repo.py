@@ -56,25 +56,35 @@ def _blocks():
     for plan in PLANS:
         if _is_pending(plan):
             continue
-        for lang, _, path, body in BLOCK.findall(plan.read_text()):
+        for lang, prefix, path, body in BLOCK.findall(plan.read_text()):
             path = path.strip()
             if path.endswith((".java", ".py")):
-                yield plan.name, path, body
+                yield plan.name, path, f"{prefix} {path}", body
 
 
 def _cases():
     seen = list(_blocks())
-    return [pytest.param(p, path, body, id=f"{p}::{path}") for p, path, body in seen]
+    return [pytest.param(p, path, marker, body, id=f"{p}::{path}")
+            for p, path, marker, body in seen]
 
 
-@pytest.mark.parametrize("plan_name,path,body", _cases())
-def test_plan_block_matches_the_file_it_names(plan_name, path, body):
+@pytest.mark.parametrize("plan_name,path,marker,body", _cases())
+def test_plan_block_matches_the_file_it_names(plan_name, path, marker, body):
     target = REPO / path
     if not target.exists():
         pytest.skip(f"{path} is not implemented yet")
 
     want = target.read_text().rstrip("\n")
+
+    # The marker line naming the file is normally the block's own scaffolding and
+    # not part of the file. But some source files open with exactly that line as
+    # their own header comment, and then it IS part of the file -- so the block is
+    # byte-identical fence to fence while a body-only comparison calls it stale.
+    # Decide by looking at the file rather than by convention: whichever the file
+    # does, both are legitimate, and neither should need the other to change.
     got = body.rstrip("\n")
+    if want.startswith(marker + "\n") or want == marker:
+        got = f"{marker}\n{got}"
     if want == got:
         return
 
@@ -109,3 +119,22 @@ def test_at_most_one_plan_is_pending():
         f"{len(pending)} plans are marked pending: {pending}. "
         "Finish one and remove its marker before starting the next."
     )
+
+
+def test_a_file_whose_first_line_is_its_own_path_marker_is_compared_whole(tmp_path):
+    """The comparison must follow the file, not a convention.
+
+    Plan 2's Java sources open with `package`; Plan 3's open with a comment
+    naming their own path -- the same line the plan block uses as its marker. A
+    body-only comparison is right for the first and wrong for the second, and
+    getting it wrong makes six correct blocks look stale at once.
+    """
+    marker = "// extension/src/hx/policy/Policy.java"
+    body = "package hx.policy;\n\nfinal class Policy { }"
+
+    # A file that repeats the marker as its own header: compare including it.
+    with_header = f"{marker}\n{body}"
+    assert with_header.startswith(marker + "\n")
+
+    # A file that does not: the marker is scaffolding and must be dropped.
+    assert not body.startswith(marker + "\n")
