@@ -90,9 +90,17 @@ def test_connect_applies_required_pragmas(tmp_path: Path):
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    # 1 == NORMAL. Three of the four spec-mandated pragmas were asserted
+    # here and not this one -- the asymmetry is exactly what let it get
+    # dropped unnoticed.
+    assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
 
 
 def test_init_schema_creates_every_table(tmp_path: Path):
+    """A subset assertion (`set(db.TABLES) <= present`) passes even if
+    TABLES were empty -- assert equality against what the database actually
+    has (minus sqlite's own internal tables) so a table dropped from TABLES
+    is caught too, not just one missing from the schema."""
     conn = db.connect(tmp_path / "hx.db")
     db.init_schema(conn)
     present = {
@@ -100,8 +108,9 @@ def test_init_schema_creates_every_table(tmp_path: Path):
         for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
+        if not r[0].startswith("sqlite_")
     }
-    assert set(db.TABLES) <= present
+    assert set(db.TABLES) == present
 
 
 def test_init_schema_is_idempotent(tmp_path: Path):
@@ -118,6 +127,20 @@ def test_readonly_connection_opens(tmp_path: Path):
     ro = db.connect(path, readonly=True)
     assert ro.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert ro.execute("SELECT COUNT(*) FROM engagement").fetchone()[0] == 0
+
+
+def test_readonly_connection_cannot_write(tmp_path: Path):
+    """The existing test above only ever reads through the readonly
+    connection, so a `mode=ro` typo or a dropped flag would not be caught.
+    Prove the connection actually refuses a write."""
+    path = tmp_path / "hx.db"
+    db.init_schema(db.connect(path))
+    ro = db.connect(path, readonly=True)
+    with pytest.raises(sqlite3.OperationalError):
+        ro.execute(
+            "INSERT INTO engagement(id, name, client, created_us, status)"
+            " VALUES('e1','acme','Acme',1,'active')"
+        )
 
 
 def test_foreign_keys_are_actually_enforced(tmp_path: Path):
@@ -152,6 +175,373 @@ def test_dedupe_key_uniqueness_holds_per_engagement(tmp_path: Path):
             " VALUES('f2','e1',?,'SQLi dup','High','Firm','agent','new','insertion')",
             (key,),
         )
+
+
+def test_connect_sets_file_permissions(tmp_path: Path):
+    """Verify directory (0o700) and database file (0o600) have restricted permissions."""
+    path = tmp_path / "restricted" / "hx.db"
+    db.connect(path)
+    assert (path.parent.stat().st_mode & 0o777) == 0o700
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_trg_agent_cannot_confirm_blocks_confirmed_status(tmp_path: Path):
+    """Agent attempting to set status to 'confirmed' raises IntegrityError."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level)"
+        " VALUES('f1','e1','key1','SQLi','High','Firm','agent','new','insertion')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO finding_status_event(id, finding_id, to_status, actor, ts_us)"
+            " VALUES('se1','f1','confirmed','agent',1000)"
+        )
+
+
+def test_trg_agent_cannot_confirm_blocks_reported_status(tmp_path: Path):
+    """Agent attempting to set status to 'reported' raises IntegrityError."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level)"
+        " VALUES('f1','e1','key1','SQLi','High','Firm','agent','new','insertion')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO finding_status_event(id, finding_id, to_status, actor, ts_us)"
+            " VALUES('se1','f1','reported','agent',1000)"
+        )
+
+
+def test_human_can_confirm_finding(tmp_path: Path):
+    """Human actor can set status to 'confirmed' without trigger blocking."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level)"
+        " VALUES('f1','e1','key1','SQLi','High','Firm','agent','new','insertion')"
+    )
+    # Must not raise
+    conn.execute(
+        "INSERT INTO finding_status_event(id, finding_id, to_status, actor, ts_us)"
+        " VALUES('se1','f1','confirmed','human',1000)"
+    )
+
+
+def test_agent_can_set_other_statuses(tmp_path: Path):
+    """Agent can set status to statuses other than 'confirmed' and 'reported'."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level)"
+        " VALUES('f1','e1','key1','SQLi','High','Firm','agent','new','insertion')"
+    )
+    # Must not raise
+    conn.execute(
+        "INSERT INTO finding_status_event(id, finding_id, to_status, actor, ts_us)"
+        " VALUES('se1','f1','triaged','agent',1000)"
+    )
+
+
+def test_dangling_first_seen_run_rejected(tmp_path: Path):
+    """A dangling first_seen_run reference is rejected by FK constraint."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+            " path_template, first_seen_run)"
+            " VALUES('s1','e1','GET','https','app.acme.com',443,'/api/users','NO_SUCH_RUN')"
+        )
+
+
+def test_scope_version_update_rejected(tmp_path: Path):
+    """UPDATE on scope_version is blocked by append-only trigger."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    conn.execute(
+        "INSERT INTO scope_version(id, engagement_id, yaml, sha256, effective_from_us, author)"
+        " VALUES('sv1','e1','scope: all','abc123',1000,'admin')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE scope_version SET yaml='scope: modified' WHERE id='sv1'"
+        )
+
+
+def test_scope_version_delete_rejected(tmp_path: Path):
+    """DELETE on scope_version is blocked by append-only trigger."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    conn.execute(
+        "INSERT INTO scope_version(id, engagement_id, yaml, sha256, effective_from_us, author)"
+        " VALUES('sv1','e1','scope: all','abc123',1000,'admin')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "DELETE FROM scope_version WHERE id='sv1'"
+        )
+
+
+# --- I4: finding_status_event/evidence must be append-only under UPDATE and
+# DELETE too, and the agent-cannot-confirm rule must hold under UPDATE, not
+# just INSERT ---
+
+
+def _seed_finding(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level)"
+        " VALUES('f1','e1','key1','SQLi','High','Firm','agent','new','insertion')"
+    )
+
+
+def test_finding_status_event_update_rejected(tmp_path: Path):
+    """finding_status_event is append-only: UPDATE was previously
+    unguarded, letting any row (including one recording an agent's own
+    'triaged') be silently rewritten into 'confirmed' after the fact."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    _seed_finding(conn)
+    conn.execute(
+        "INSERT INTO finding_status_event(id, finding_id, to_status, actor, ts_us)"
+        " VALUES('se1','f1','triaged','human',1000)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE finding_status_event SET to_status='confirmed' WHERE id='se1'"
+        )
+
+
+def test_finding_status_event_delete_rejected(tmp_path: Path):
+    """finding_status_event is append-only: DELETE was previously
+    unguarded, letting a status transition vanish from the audit trail."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    _seed_finding(conn)
+    conn.execute(
+        "INSERT INTO finding_status_event(id, finding_id, to_status, actor, ts_us)"
+        " VALUES('se1','f1','triaged','human',1000)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM finding_status_event WHERE id='se1'")
+
+
+def test_agent_cannot_confirm_via_update(tmp_path: Path):
+    """The agent-cannot-confirm rule extended to UPDATE: an agent-authored
+    row cannot be rewritten into confirmed/reported either. (The blanket
+    append-only trigger above also blocks this UPDATE; this proves the
+    row-level rule holds independently, in case append-only is ever
+    relaxed.)"""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    _seed_finding(conn)
+    conn.execute(
+        "INSERT INTO finding_status_event(id, finding_id, to_status, actor, ts_us)"
+        " VALUES('se1','f1','triaged','agent',1000)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE finding_status_event SET to_status='confirmed' WHERE id='se1'"
+        )
+
+
+def test_human_actor_events_still_insert_with_new_triggers_active(tmp_path: Path):
+    """Positive case: legitimate human-actor INSERTs into
+    finding_status_event still succeed once the append-only and
+    agent-cannot-confirm-update triggers are both in place -- they guard
+    UPDATE/DELETE, not INSERT."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    _seed_finding(conn)
+    # Must not raise.
+    conn.execute(
+        "INSERT INTO finding_status_event(id, finding_id, to_status, actor, ts_us)"
+        " VALUES('se1','f1','triaged','human',1000)"
+    )
+    conn.execute(
+        "INSERT INTO finding_status_event(id, finding_id, from_status, to_status,"
+        " actor, ts_us) VALUES('se2','f1','triaged','confirmed','human',2000)"
+    )
+    count = conn.execute(
+        "SELECT COUNT(*) AS n FROM finding_status_event"
+    ).fetchone()["n"]
+    assert count == 2
+
+
+def test_evidence_update_rejected(tmp_path: Path):
+    """evidence is immutable: UPDATE was previously unguarded."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    _seed_finding(conn)
+    conn.execute(
+        "INSERT INTO evidence(id, finding_id, seq, role, kind, captured_us)"
+        " VALUES('ev1','f1',1,'primary','response',1000)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE evidence SET note='tampered' WHERE id='ev1'")
+
+
+def test_evidence_delete_rejected(tmp_path: Path):
+    """evidence is immutable: DELETE was previously unguarded."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    _seed_finding(conn)
+    conn.execute(
+        "INSERT INTO evidence(id, finding_id, seq, role, kind, captured_us)"
+        " VALUES('ev1','f1',1,'primary','response',1000)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM evidence WHERE id='ev1'")
+
+
+# --- I5: exactly one engagement row per database ---
+
+
+def test_engagement_singleton_trigger_rejects_second_row(tmp_path: Path):
+    """`quarantine` and every unqualified `open_()` lookup presume a single
+    authoritative engagement row. A second INSERT must be rejected, not
+    silently accepted."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO engagement(id, name, client, created_us, status)"
+            " VALUES('e2','globex','Globex',2,'active')"
+        )
+
+
+# --- M8: run.safety_profile has a CHECK, like every other enum column ---
+
+
+def test_run_safety_profile_invalid_value_rejected(tmp_path: Path):
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us, status)"
+            " VALUES('r1','e1','manual','yolo',1,'running')"
+        )
+
+
+# --- I7: db.connect must never widen an existing database's permissions,
+# and must never let it exist on disk at a looser mode than 0o600 ---
+
+
+def test_connect_never_widens_a_restricted_database(tmp_path: Path):
+    """A database deliberately set to 0o400 must not be healed back to
+    writable on open -- that would make `engagement.status = 'sealed'`
+    unenforceable at the filesystem level. `connect()` itself does not
+    raise (the pragmas it applies -- journal_mode=WAL is already the
+    current mode, and synchronous/foreign_keys/busy_timeout are
+    per-connection settings, not file writes) so the property is proven two
+    ways: the mode on disk is untouched, and an actual write through the
+    returned connection genuinely fails."""
+    path = tmp_path / "hx.db"
+    db.init_schema(db.connect(path))
+    path.chmod(0o400)
+
+    conn = db.connect(path)
+    assert (path.stat().st_mode & 0o777) == 0o400, "connect() healed permissions back to writable"
+
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute(
+            "INSERT INTO engagement(id, name, client, created_us, status)"
+            " VALUES('e1','acme','Acme',1,'active')"
+        )
+
+
+def test_connect_tightens_a_loose_existing_database(tmp_path: Path):
+    """An existing database at a looser mode (e.g. group/other-readable
+    0o644) is tightened to 0o600 on open, not left as-is."""
+    path = tmp_path / "hx.db"
+    db.init_schema(db.connect(path))
+    path.chmod(0o644)
+    db.connect(path)
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_connect_creates_a_fresh_database_at_0o600(tmp_path: Path):
+    """No create-then-chmod window: the database file is created directly
+    at its final mode."""
+    path = tmp_path / "hx.db"
+    db.connect(path)
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+# --- New: transaction() groups multi-statement writes atomically ---
+
+
+def test_transaction_commits_on_success(tmp_path: Path):
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO engagement(id, name, client, created_us, status)"
+            " VALUES('e1','acme','Acme',1,'active')"
+        )
+    count = conn.execute("SELECT COUNT(*) AS n FROM engagement").fetchone()["n"]
+    assert count == 1
+
+
+def test_transaction_rolls_back_on_exception(tmp_path: Path):
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    with pytest.raises(RuntimeError):
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO engagement(id, name, client, created_us, status)"
+                " VALUES('e1','acme','Acme',1,'active')"
+            )
+            raise RuntimeError("simulated failure mid-transaction")
+    count = conn.execute("SELECT COUNT(*) AS n FROM engagement").fetchone()["n"]
+    assert count == 0
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -409,11 +799,15 @@ silently ignores every REFERENCES clause in the schema.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
+from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+from hx.store.paths import secure_mkdir
+
+SCHEMA_VERSION = 2
 
 TABLES: tuple[str, ...] = (
     "engagement",
@@ -434,10 +828,28 @@ TABLES: tuple[str, ...] = (
 
 
 def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
+    path = Path(path)
     if readonly:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     else:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        secure_mkdir(path.parent)
+        if not path.exists():
+            # Pre-create at the final mode so the database file never exists
+            # on disk at a looser permission than 0o600, even for an
+            # instant -- the create-then-chmod window this closes is the
+            # same class of bug fixed for config.yaml.
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        else:
+            # Only ever TIGHTEN an existing file's permissions, never widen
+            # them. `path.chmod(0o600)` unconditionally healed a
+            # deliberately-restricted file (e.g. 0o400 on a sealed
+            # engagement) back to writable on every open -- making
+            # `engagement.status = 'sealed'` unenforceable at the
+            # filesystem level.
+            mode = path.stat().st_mode & 0o777
+            if mode & 0o077:
+                path.chmod(mode & 0o700)
         conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     if not readonly:
@@ -458,6 +870,31 @@ def _schema_sql() -> str:
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_schema_sql())
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection):
+    """Group statements into one all-or-nothing unit.
+
+    Connections from `connect()` are autocommit (isolation_level=None), so
+    any multi-statement write that is not wrapped in an explicit
+    BEGIN/COMMIT is not atomic -- a failure partway through leaves whatever
+    already ran committed. Exactly one place in this codebase remembered
+    that on its own before this helper existed; two more call sites are
+    coming in later plans, and this is cheap insurance against one of them
+    forgetting.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass  # transaction already gone; do not mask the original error
+        raise
+    else:
+        conn.execute("COMMIT")
 ```
 
 - [ ] **Step 6: Run tests to verify they pass**
@@ -531,22 +968,6 @@ def test_truncated_blob_on_disk_is_detected(tmp_path: Path):
         store.get(digest)
 
 
-def test_put_repairs_a_same_length_corruption(tmp_path: Path):
-    """The nastier torn write: same length, wrong bytes.
-
-    A size-only dedupe check accepts this forever, so put() returns success
-    while holding the correct bytes and the digest stays poisoned. put() must
-    re-verify and repair.
-    """
-    store = BlobStore(tmp_path)
-    digest, _ = store.put(b"a" * 500)
-    store.path_for(digest).write_bytes(b"b" * 500)  # same length, wrong content
-
-    again, length = store.put(b"a" * 500)
-    assert again == digest and length == 500
-    assert store.get(digest) == b"a" * 500, "put() did not repair the blob"
-
-
 def test_large_blob_round_trips(tmp_path: Path):
     store = BlobStore(tmp_path)
     payload = bytes(range(256)) * 8000  # ~2 MB, larger than a Burp response
@@ -559,6 +980,113 @@ def test_no_temp_files_left_behind(tmp_path: Path):
     store = BlobStore(tmp_path)
     store.put(b"x" * 1000)
     assert list((tmp_path / "tmp").glob("*")) == []
+
+
+def test_directories_created_with_mode_0o700(tmp_path: Path):
+    """Directories must be created with mode 0o700 for proper access control."""
+    store = BlobStore(tmp_path)
+    digest, _ = store.put(b"test data")
+
+    # Check that tmp directory is 0o700
+    tmp_dir_mode = (tmp_path / "tmp").stat().st_mode & 0o777
+    assert tmp_dir_mode == 0o700, f"tmp directory mode is {oct(tmp_dir_mode)}, expected 0o700"
+
+    # Check that digest directories are 0o700
+    blob_path = store.path_for(digest)
+    for parent in [blob_path.parent, blob_path.parent.parent]:
+        parent_mode = parent.stat().st_mode & 0o777
+        assert parent_mode == 0o700, f"Directory {parent} mode is {oct(parent_mode)}, expected 0o700"
+
+
+def test_blob_file_created_with_mode_0o600(tmp_path: Path):
+    """Blob files must be created with mode 0o600."""
+    store = BlobStore(tmp_path)
+    digest, _ = store.put(b"sensitive client data")
+
+    blob_path = store.path_for(digest)
+    file_mode = blob_path.stat().st_mode & 0o777
+    assert file_mode == 0o600, f"Blob file mode is {oct(file_mode)}, expected 0o600"
+
+
+def test_put_repairs_a_same_length_corruption(tmp_path: Path):
+    """The nastier torn write: same length, wrong bytes."""
+    store = BlobStore(tmp_path)
+    digest, _ = store.put(b"a" * 500)
+    store.path_for(digest).write_bytes(b"b" * 500)  # same length, wrong content
+
+    again, length = store.put(b"a" * 500)
+    assert again == digest and length == 500
+    assert store.get(digest) == b"a" * 500, "put() did not repair the blob"
+
+
+def test_nested_directory_creation_secures_all_levels(tmp_path: Path):
+    """All directories created by BlobStore should be 0o700, even if parents don't exist."""
+    # Create BlobStore at a path where parents don't exist
+    nested_root = tmp_path / "nonexistent" / "nested" / "root"
+    store = BlobStore(nested_root)
+    digest, _ = store.put(b"test data")
+
+    # Check that directories created by BlobStore are 0o700
+    tmp_dir = nested_root / "tmp"
+    for path in [tmp_dir, nested_root, tmp_path / "nonexistent" / "nested"]:
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o700, f"Created directory {path} has mode {oct(mode)}, expected 0o700"
+
+
+# --- M1: path_for() must validate the digest format, not treat an
+# arbitrary string as a filesystem path ---
+
+
+def test_path_for_rejects_absolute_path_escape(tmp_path: Path):
+    """Without a format check, an absolute component resets the join --
+    `path_for("/etc/passwd")` used to return `/etc/passwd` outright,
+    escaping the engagement root entirely."""
+    store = BlobStore(tmp_path)
+    with pytest.raises(CorruptBlob):
+        store.path_for("/etc/passwd")
+
+
+def test_path_for_rejects_relative_path_escape(tmp_path: Path):
+    store = BlobStore(tmp_path)
+    with pytest.raises(CorruptBlob):
+        store.path_for("../../etc/passwd")
+
+
+def test_path_for_rejects_malformed_digest(tmp_path: Path):
+    store = BlobStore(tmp_path)
+    with pytest.raises(CorruptBlob):
+        store.path_for("abc")
+
+
+def test_path_for_accepts_a_real_digest(tmp_path: Path):
+    store = BlobStore(tmp_path)
+    digest, _ = store.put(b"hello")
+    assert store.path_for(digest) == store.root / digest[:2] / digest[2:4] / digest
+
+
+def test_get_rejects_malformed_digest_without_touching_disk(tmp_path: Path):
+    """get() must fail the format check before it ever reads a file --
+    otherwise a malformed digest is a file-existence/size oracle via the
+    exception message."""
+    store = BlobStore(tmp_path)
+    with pytest.raises(CorruptBlob):
+        store.get("/etc/passwd")
+
+
+def test_preexisting_directories_left_alone(tmp_path: Path):
+    """Regression test: BlobStore must not chmod pre-existing directories."""
+    # Create a pre-existing directory with mode 0o755
+    preexisting = tmp_path / "preexisting"
+    preexisting.mkdir(mode=0o755)
+
+    # Create BlobStore in a subdirectory beneath it
+    store_root = preexisting / "store" / "root"
+    store = BlobStore(store_root)
+    store.put(b"test data")
+
+    # Assert the pre-existing directory was NOT modified
+    mode = preexisting.stat().st_mode & 0o777
+    assert mode == 0o755, f"Pre-existing directory was modified to {oct(mode)}, expected 0o755"
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -581,8 +1109,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import uuid
 from pathlib import Path
+
+from hx.store.paths import secure_mkdir
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 class CorruptBlob(Exception):
@@ -591,21 +1124,27 @@ class CorruptBlob(Exception):
 
 class BlobStore:
     def __init__(self, root: Path):
-        self.root = Path(root)
+        self.root = Path(root).resolve()
         self.tmp = self.root / "tmp"
-        self.tmp.mkdir(parents=True, exist_ok=True)
+        secure_mkdir(self.tmp)
 
     def path_for(self, digest: str) -> Path:
+        """Resolve a digest to its on-disk path.
+
+        `digest` must be a bare 64-character lowercase hex sha256. Without
+        this check, an absolute or `..`-laden string resets or escapes the
+        join (`path_for("/etc/passwd")` returns `/etc/passwd` outright), and
+        blob refs will arrive over the bridge from the JVM in Plan 2 -- an
+        attacker-controlled string reaching this function is not hypothetical
+        there.
+        """
+        if not _HEX64.fullmatch(digest):
+            raise CorruptBlob(f"not a valid digest: {digest!r}")
         return self.root / digest[:2] / digest[2:4] / digest
 
     def put(self, data: bytes) -> tuple[str, int]:
         digest = hashlib.sha256(data).hexdigest()
         final = self.path_for(digest)
-        # Trusting st_size here is the bug the design warns about: a torn write
-        # that happens to preserve length (bit rot, a zero-filled tail after a
-        # crash) would be accepted forever, and put() would report success while
-        # holding the correct bytes. Re-hash what is actually on disk; on any
-        # mismatch fall through and repair it via the atomic path below.
         if final.exists():
             try:
                 if hashlib.sha256(final.read_bytes()).hexdigest() == digest:
@@ -613,12 +1152,30 @@ class BlobStore:
             except OSError:
                 pass  # unreadable: repair it
 
-        final.parent.mkdir(parents=True, exist_ok=True)
+        # Create directories with mode 0o700
+        secure_mkdir(final.parent)
+
+        # Create staging file with mode 0o600
         staging = self.tmp / f"{uuid.uuid4().hex}.part"
-        with open(staging, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
+        fd = os.open(str(staging), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except Exception:
+            # The `with` block already closed fd via fdopen()'s __exit__ in
+            # the common case (write/fsync failure inside the block); this
+            # only catches fd surviving unclosed if fdopen() itself raised
+            # before the file object existed to close it. Closing an
+            # already-closed fd raises OSError (EBADF), which is the one
+            # error worth swallowing here -- anything else should surface.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            staging.unlink(missing_ok=True)
+            raise
 
         written = staging.read_bytes()
         if hashlib.sha256(written).hexdigest() != digest:
@@ -723,8 +1280,12 @@ scope:
     assert cfg.checks["active_mutate"] is False
     assert cfg.checks["active_dos"] is False
     assert cfg.checks["passive"] is True
-    assert cfg.rate_limit_rps <= 10
-    assert "logout" in " ".join(cfg.dangerous_paths)
+    # `<= 10` and a substring of a joined string both pass even if the real
+    # default drifted -- e.g. a join could make an unrelated pair of entries
+    # spell "logout" across a boundary. Assert the actual documented default
+    # value and check membership in the list itself.
+    assert cfg.rate_limit_rps == 5
+    assert "*/logout*" in cfg.dangerous_paths
 
 
 def test_empty_scope_include_is_rejected(tmp_path: Path):
@@ -757,6 +1318,193 @@ def test_dumps_round_trips(tmp_path: Path):
     p2 = tmp_path / "again.yaml"
     p2.write_text(config.dumps(cfg), encoding="utf-8")
     assert config.load(p2) == cfg
+
+
+def test_checks_string_false_is_rejected(tmp_path: Path):
+    """String 'false' must not coerce to bool True; must be rejected."""
+    p = _write(
+        tmp_path,
+        'name: a\nclient: b\nscope:\n  include: ["https://a/*"]\nchecks:\n  active_mutate: "false"\n',
+    )
+    with pytest.raises(config.ConfigError, match="active_mutate.*boolean"):
+        config.load(p)
+
+
+def test_checks_true_bool_is_honoured(tmp_path: Path):
+    """A real bool true in checks must be accepted."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nchecks:\n  active_mutate: true\n",
+    )
+    cfg = config.load(p)
+    assert cfg.checks["active_mutate"] is True
+
+
+def test_checks_unknown_class_is_rejected(tmp_path: Path):
+    """An unknown check class must be rejected, with a message naming valid classes."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nchecks:\n  no_such_class: true\n",
+    )
+    with pytest.raises(config.ConfigError, match="no_such_class.*valid check class.*passive.*active_mutate"):
+        config.load(p)
+
+
+def test_dangerous_paths_string_is_rejected(tmp_path: Path):
+    """A string dangerous_paths must not be iterated into chars; must be rejected."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\ndangerous_paths: custom\n",
+    )
+    with pytest.raises(config.ConfigError, match="dangerous_paths.*list"):
+        config.load(p)
+
+
+def test_scope_include_string_is_rejected(tmp_path: Path):
+    """A string scope.include must not be iterated into chars; must be rejected."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: 'https://a/*'\n",
+    )
+    with pytest.raises(config.ConfigError, match="include.*list"):
+        config.load(p)
+
+
+def test_rate_limit_rps_zero_is_rejected(tmp_path: Path):
+    """rate_limit_rps must be >= 1, not 0."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nrate_limit_rps: 0\n",
+    )
+    with pytest.raises(config.ConfigError, match="rate_limit_rps.*integer >= 1"):
+        config.load(p)
+
+
+def test_rate_limit_rps_negative_is_rejected(tmp_path: Path):
+    """rate_limit_rps must be >= 1, not negative."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nrate_limit_rps: -5\n",
+    )
+    with pytest.raises(config.ConfigError, match="rate_limit_rps.*integer >= 1"):
+        config.load(p)
+
+
+def test_rate_limit_rps_bool_is_rejected(tmp_path: Path):
+    """bool is an int subclass; rate_limit_rps: true must be rejected."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nrate_limit_rps: true\n",
+    )
+    with pytest.raises(config.ConfigError, match="rate_limit_rps.*integer >= 1"):
+        config.load(p)
+
+
+def test_scope_string_raises_config_error(tmp_path: Path):
+    """scope: 'oops' must raise ConfigError, not AttributeError."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope: oops\n",
+    )
+    with pytest.raises(config.ConfigError, match="scope.*mapping"):
+        config.load(p)
+
+
+def test_checks_string_raises_config_error(tmp_path: Path):
+    """checks: 'yes' must raise ConfigError, not ValueError."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\nchecks: yes\n",
+    )
+    with pytest.raises(config.ConfigError, match="checks.*mapping"):
+        config.load(p)
+
+
+def test_explicit_empty_dangerous_paths_is_honoured(tmp_path: Path):
+    """An explicit empty dangerous_paths: [] must NOT be replaced by defaults."""
+    p = _write(
+        tmp_path,
+        "name: a\nclient: b\nscope:\n  include: ['https://a/*']\ndangerous_paths: []\n",
+    )
+    cfg = config.load(p)
+    assert cfg.dangerous_paths == []
+
+
+def test_invalid_yaml_raises_config_error(tmp_path: Path):
+    """Malformed YAML must raise ConfigError, not yaml.YAMLError."""
+    p = _write(tmp_path, "{ invalid yaml: [")
+    with pytest.raises(config.ConfigError, match="invalid YAML"):
+        config.load(p)
+
+
+# --- M6: name and client are the only unvalidated types in this module ---
+
+
+def test_name_int_is_rejected(tmp_path: Path):
+    """`if not raw.get(required)` is a truthiness test: `name: 123` is
+    truthy and used to load fine, reaching the database and the report as
+    a coerced value."""
+    p = _write(
+        tmp_path,
+        "name: 123\nclient: Acme\nscope:\n  include: ['https://a/*']\n",
+    )
+    with pytest.raises(config.ConfigError, match="name"):
+        config.load(p)
+
+
+def test_client_bool_is_rejected(tmp_path: Path):
+    """`client: true` is truthy and used to load fine for the same reason."""
+    p = _write(
+        tmp_path,
+        "name: acme\nclient: true\nscope:\n  include: ['https://a/*']\n",
+    )
+    with pytest.raises(config.ConfigError, match="client"):
+        config.load(p)
+
+
+def test_name_blank_string_is_rejected(tmp_path: Path):
+    """A whitespace-only name is a string (truthy), but not a real name."""
+    p = _write(
+        tmp_path,
+        "name: '   '\nclient: Acme\nscope:\n  include: ['https://a/*']\n",
+    )
+    with pytest.raises(config.ConfigError, match="name"):
+        config.load(p)
+
+
+# --- Test-suite fix: a direct Config() construction, bypassing load()
+# entirely ---
+
+
+def test_direct_config_construction_has_safe_defaults():
+    """`hx new` builds Config(...) directly and never calls load() -- so
+    every default_factory field must be independently proven safe here,
+    not only when reached through the YAML-parsing path."""
+    cfg = config.Config(
+        name="acme-2026-09",
+        client="Acme Corp",
+        scope_include=["https://app.acme.com/*"],
+    )
+    assert cfg.safety_profile == "production"
+    assert cfg.checks["active_mutate"] is False
+    assert cfg.checks["active_dos"] is False
+    assert cfg.rate_limit_rps == 5
+    assert "*/logout*" in cfg.dangerous_paths
+    assert cfg.scope_exclude == []
+    assert cfg.identities == {}
+
+
+def test_direct_config_construction_round_trips_through_dumps_and_load(tmp_path: Path):
+    """The same direct-construction path `hx new` uses, proven to still
+    dump and reload correctly -- not just to have safe field values."""
+    cfg = config.Config(
+        name="acme-2026-09",
+        client="Acme Corp",
+        scope_include=["https://app.acme.com/*"],
+    )
+    p = tmp_path / "config.yaml"
+    p.write_text(config.dumps(cfg), encoding="utf-8")
+    assert config.load(p) == cfg
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -843,9 +1591,7 @@ def _string_list(raw: dict, key: str, default: list[str]) -> list[str]:
     empty -- the operator said so in the file, which is what the spec's
     "written down explicitly, where it is recorded and reviewable" requires.
 
-    A non-list is REJECTED rather than coerced. `list("custom")` yields
-    ['c','u','s','t','o','m'], which for dangerous_paths is a denylist that
-    looks populated and matches nothing.
+    A non-list is REJECTED rather than coerced.
     """
     if key not in raw or raw[key] is None:
         return list(default)
@@ -867,8 +1613,8 @@ def _positive_int(raw: dict, key: str, default: int) -> int:
 
 def load(path: Path) -> Config:
     # A YAML syntax error is "nonsense" by this module's own definition of
-    # ConfigError. Wrapping it here means no caller — the CLI, the agent tool
-    # layer, the web app — has to know PyYAML is the parser underneath.
+    # ConfigError. Wrapping it here means no caller has to know PyYAML is
+    # the parser underneath.
     try:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as exc:
@@ -876,9 +1622,17 @@ def load(path: Path) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
 
+    # `if not raw.get(required)` is a truthiness test: `name: 123` and
+    # `name: true` pass it (both truthy) and reach the database and the
+    # report as coerced values. Every other field in this module rejects
+    # rather than coerces; name/client must not be the exception.
     for required in ("name", "client"):
-        if not raw.get(required):
-            raise ConfigError(f"config is missing required key: {required}")
+        value = raw.get(required)
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"config key {required!r} must be a non-empty string, "
+                f"got {value!r} ({type(value).__name__})"
+            )
 
     profile = raw.get("safety_profile", "production")
     if profile not in VALID_PROFILES:
@@ -891,18 +1645,18 @@ def load(path: Path) -> Config:
     if not include:
         raise ConfigError("scope.include must list at least one target pattern")
 
-    # Every check flag must be a real bool. A quoted "false" is a truthy
-    # string, so an operator writing `active_mutate: "false"` to DISABLE
-    # state-changing checks would silently ENABLE them.
+    # Build checks by iterating over what was written, rejecting unknown keys
+    # and non-bool values. Do not use dict.update().
     checks = dict(DEFAULT_CHECKS)
-    for name, value in _mapping(raw, "checks").items():
-        if name not in DEFAULT_CHECKS:
+    checks_raw = _mapping(raw, "checks")
+    for key, value in checks_raw.items():
+        if key not in DEFAULT_CHECKS:
             raise ConfigError(
-                f"unknown check class {name!r}; valid: {sorted(DEFAULT_CHECKS)}"
+                f"checks.{key} is not a valid check class. Valid classes are: {', '.join(DEFAULT_CHECKS.keys())}"
             )
         if not isinstance(value, bool):
-            raise ConfigError(f"checks.{name} must be true or false, got {value!r}")
-        checks[name] = value
+            raise ConfigError(f"checks.{key} must be a boolean, got {type(value).__name__}")
+        checks[key] = value
 
     return Config(
         name=raw["name"],
@@ -979,6 +1733,7 @@ git commit -m "feat(config): engagement config with safe-by-default values"
 ```python
 # tests/test_engagement.py
 import hashlib
+import os
 import stat
 from pathlib import Path
 
@@ -1055,6 +1810,346 @@ def test_two_engagements_share_nothing(tmp_path: Path):
     assert a.blobs.get(digest) == b"acme secret response"
     assert not b.blobs.path_for(digest).exists(), "blob leaked across engagements"
     assert a.root != b.root and a.id != b.id
+
+
+# --- Controller fix (a): ancestor directories must not be created world-readable ---
+
+
+def test_preexisting_ancestor_directory_is_left_alone(tmp_path: Path):
+    """Regression test: create() must not chmod a pre-existing ancestor.
+
+    root.mkdir(parents=True, mode=0o700) only applies the mode to the leaf
+    directory it creates; any missing ancestor is created at the umask
+    default, which can be world-readable and would leak the list of clients
+    under engagement.
+    """
+    engagements_dir = tmp_path / "engagements"
+    engagements_dir.mkdir(mode=0o755)
+
+    eng = engagement.create(engagements_dir / "acme", _cfg(), author="jimx")
+
+    mode = stat.S_IMODE(engagements_dir.stat().st_mode)
+    assert mode == 0o755, f"pre-existing ancestor mode {oct(mode)} was changed"
+    leaf_mode = stat.S_IMODE(eng.root.stat().st_mode)
+    assert leaf_mode == 0o700
+
+
+def test_missing_ancestor_directories_are_created_0o700(tmp_path: Path):
+    """Any ancestor directory create() has to make on the way down must be
+    0o700, not just the leaf engagement directory."""
+    root = tmp_path / "clients" / "confidential" / "acme"
+    engagement.create(root, _cfg(), author="jimx")
+
+    for ancestor in (tmp_path / "clients", tmp_path / "clients" / "confidential", root):
+        mode = stat.S_IMODE(ancestor.stat().st_mode)
+        assert mode == 0o700, f"{ancestor} mode {oct(mode)} is not 0o700"
+
+
+# --- Controller fix (b): config.yaml must never exist at a world-readable mode ---
+
+
+def test_config_yaml_created_via_open_excl_mode_0o600(tmp_path: Path, monkeypatch):
+    """Regression test: config.yaml must be created at 0o600 from the first
+    byte on disk, not written world-readable (write_text default mode, e.g.
+    0o644) and chmodded afterwards. os.open with O_EXCL and the final mode
+    closes that window; O_EXCL also rules out a TOCTOU race on the path."""
+    real_open = os.open
+    calls = []
+
+    def spying_open(path, flags, mode=0o777, *args, **kwargs):
+        if os.fspath(path).endswith("config.yaml"):
+            calls.append((flags, mode))
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(engagement.os, "open", spying_open)
+
+    engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+
+    assert calls, "config.yaml was not created via os.open"
+    flags, mode = calls[0]
+    assert flags & os.O_EXCL, "config.yaml creation must use O_EXCL"
+    assert mode == 0o600, f"config.yaml opened with mode {oct(mode)}, must be 0o600"
+
+
+def test_config_yaml_final_mode_is_0o600(tmp_path: Path):
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    mode = stat.S_IMODE((eng.root / "config.yaml").stat().st_mode)
+    assert mode == 0o600
+
+
+# --- Controller fix (c): engagement creation must be atomic ---
+
+
+def test_scope_recording_failure_rolls_back_engagement_insert(tmp_path: Path, monkeypatch):
+    """db.connect uses isolation_level=None (autocommit): without an
+    explicit transaction, the engagement INSERT commits before
+    _record_scope runs, so a failure between them leaves an engagement row
+    with no scope_version -- authorisation that can never be answered.
+
+    Exercised directly against `_create_engagement_and_scope`, on a
+    connection this test owns, so the assertion isn't hidden behind the
+    directory cleanup that fix (d) performs around the full create() flow.
+    """
+    from hx.store import db as db_mod
+
+    conn = db_mod.connect(tmp_path / "hx.db")
+    db_mod.init_schema(conn)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated failure recording scope")
+
+    monkeypatch.setattr(engagement, "_record_scope", boom)
+
+    with pytest.raises(RuntimeError):
+        engagement._create_engagement_and_scope(
+            conn, "e-test", _cfg(), "config.yaml", author="jimx", reason="x"
+        )
+
+    count = conn.execute("SELECT COUNT(*) AS n FROM engagement").fetchone()["n"]
+    assert count == 0, "engagement row survived a failed scope recording"
+    conn.close()
+
+
+# --- Controller fix (d): create() must not strand a half-made engagement ---
+
+
+def test_failed_create_leaves_no_directory_behind(tmp_path: Path, monkeypatch):
+    """End-to-end companion to the fix (c) test above: going through the
+    public create() with the same failure must not strand a directory (and
+    therefore not an engagement row either -- the whole tree, db included,
+    is gone)."""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(engagement, "_record_scope", boom)
+
+    with pytest.raises(RuntimeError):
+        engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+
+    assert not (tmp_path / "acme").exists()
+
+
+def test_create_succeeds_after_a_prior_failed_attempt(tmp_path: Path, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(engagement, "_record_scope", boom)
+    with pytest.raises(RuntimeError):
+        engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    monkeypatch.undo()
+
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    assert eng.root.exists()
+    assert (eng.root / "hx.db").exists()
+
+
+def test_failed_create_does_not_remove_a_preexisting_directory(tmp_path: Path):
+    """create() must only remove a directory tree it created itself. If the
+    target path already existed (e.g. a concurrent create lost the race, or
+    someone hand-crafted the directory), failure must not delete it."""
+    target = tmp_path / "acme"
+    target.mkdir(mode=0o700)
+    marker = target / "sentinel"
+    marker.write_text("do not delete me")
+
+    with pytest.raises(engagement.EngagementError, match="exists"):
+        engagement.create(target, _cfg(), author="jimx")
+
+    assert marker.exists()
+
+
+# --- Fix round 1: open_() must not leak its connection on error paths ---
+
+
+def test_open_closes_connection_on_failure_after_connect(tmp_path: Path, monkeypatch):
+    """A failure after db.connect() succeeds (e.g. config.yaml missing) must
+    not leak the connection. Relying on refcounting to eventually close it
+    is not acceptable for a public API: a caller holding the exception (a
+    CLI logging the traceback, pytest) keeps the handle open indefinitely.
+    """
+    import sqlite3
+
+    from hx.store import db as db_mod
+
+    engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    (tmp_path / "acme" / "config.yaml").unlink()
+
+    captured = {}
+    real_connect = db_mod.connect
+
+    def spying_connect(path, **kwargs):
+        conn = real_connect(path, **kwargs)
+        captured["conn"] = conn
+        return conn
+
+    monkeypatch.setattr(db_mod, "connect", spying_connect)
+
+    with pytest.raises(FileNotFoundError):
+        engagement.open_(tmp_path / "acme")
+
+    assert "conn" in captured, "open_() never reached db.connect()"
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured["conn"].execute("SELECT 1")
+
+
+# --- Regression test for the self-review fix: BlobStore inside create()'s try ---
+
+
+def test_blobstore_construction_failure_still_triggers_cleanup(tmp_path: Path, monkeypatch):
+    """Every other failure-injection test stubs `_record_scope`, which runs
+    before `BlobStore(root/'blobs')` is constructed, so none of them ever
+    reach that line. Without this test, a future edit that moved the
+    BlobStore construction back outside create()'s try/except would leave
+    fix (d) enforced there only by discipline, and the suite would stay
+    green."""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated BlobStore construction failure")
+
+    monkeypatch.setattr(engagement.blobs_mod, "BlobStore", boom)
+
+    with pytest.raises(RuntimeError):
+        engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+
+    assert not (tmp_path / "acme").exists()
+
+
+# --- I1: record_scope_version's config.yaml rewrite must be atomic and 0o600 ---
+
+
+def test_record_scope_version_recreates_missing_config_yaml_at_0o600(tmp_path: Path):
+    """record_scope_version must route through the same atomic-replace
+    helper as create(): a bare write_text() on a missing file lands at the
+    umask default (e.g. 0o644), not 0o600, and `_write_config_secure` sat
+    unused for exactly this call site."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    (eng.root / "config.yaml").unlink()
+
+    engagement.record_scope_version(eng, author="jimx", reason="rewrite after deletion")
+
+    mode = stat.S_IMODE((eng.root / "config.yaml").stat().st_mode)
+    assert mode == 0o600
+
+
+def test_record_scope_version_writes_exact_dumps_output(tmp_path: Path):
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.config.scope_include.append("https://api.acme.com/*")
+
+    engagement.record_scope_version(eng, author="jimx", reason="client added API host")
+
+    on_disk = (eng.root / "config.yaml").read_text(encoding="utf-8")
+    assert on_disk == config.dumps(eng.config)
+
+
+def test_record_scope_version_leaves_no_tmp_file_behind(tmp_path: Path):
+    """Truncate-then-write with no temp file, no fsync, no rename meant a
+    write interrupted partway left `config.yaml` as valid YAML with a
+    shorter `dangerous_paths` list -- `logout` and `delete` are among the
+    last entries `dumps()` emits. The fix's temp file must not survive a
+    successful write either."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.config.scope_include.append("https://api.acme.com/*")
+
+    engagement.record_scope_version(eng, author="jimx", reason="client added API host")
+
+    hidden = [p.name for p in eng.root.iterdir() if p.name.startswith(".")]
+    assert hidden == [], f"leftover temp file(s): {hidden}"
+
+
+# --- I2: config.yaml and the recorded scope of record must never diverge ---
+
+
+def test_open_raises_on_hand_edited_config_yaml(tmp_path: Path):
+    """A hand edit to config.yaml after create() must not silently become
+    the live scope while the recorded scope_version history says something
+    else. There is no legitimate hand-edit workflow in this store --
+    record_scope_version is the API -- so divergence raises, it does not
+    warn."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.db.close()
+
+    (eng.root / "config.yaml").write_text(
+        "name: acme-2026-09\nclient: Acme Corp\nsafety_profile: production\n"
+        "scope:\n  include: ['https://app.acme.com/*', 'https://evil.example.com/*']\n"
+        "  exclude: []\nrender_allow: []\ndangerous_paths: []\nchecks: {}\n"
+        "rate_limit_rps: 5\nmax_concurrency: 2\nidentities: {}\n"
+        "preserve_segments: []\nslug_threshold: 12\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(engagement.EngagementError, match="diverges"):
+        engagement.open_(tmp_path / "acme")
+
+
+def test_open_succeeds_when_config_yaml_matches_the_recorded_scope(tmp_path: Path):
+    """The normal create() -> open_() round trip must still succeed: both
+    files are written from the same dumps() output at create() time."""
+    created = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    created.db.close()
+
+    reopened = engagement.open_(tmp_path / "acme")
+    assert reopened.id == created.id
+
+
+# --- I5: exactly one engagement row, enforced defensively in open_() too,
+# not only by the schema trigger ---
+
+
+def test_open_raises_when_engagement_table_has_two_rows(tmp_path: Path):
+    """The schema trigger (tested in test_db.py) prevents a second row
+    through normal INSERT; this proves open_() itself does not trust
+    `SELECT ... LIMIT 1` with no ORDER BY, which would pick an arbitrary
+    row if a second one ever got in some other way (e.g. a hand-crafted
+    database, or a future migration bug)."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.db.execute("DROP TRIGGER trg_engagement_singleton")
+    eng.db.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e-rogue','globex','Globex',2,'active')"
+    )
+    eng.db.close()
+
+    with pytest.raises(engagement.EngagementError, match="exactly one"):
+        engagement.open_(tmp_path / "acme")
+
+
+# --- I6: an engagement created by a different schema version must not open ---
+
+
+def test_open_rejects_a_different_schema_version(tmp_path: Path):
+    """There is no migration mechanism, so every schema gap is currently
+    permanent -- silently proceeding on a version mismatch would run
+    queries against tables/triggers the store does not actually have."""
+    eng = engagement.create(tmp_path / "acme", _cfg(), author="jimx")
+    eng.db.execute("PRAGMA user_version=99")
+    eng.db.close()
+
+    with pytest.raises(engagement.EngagementError, match="schema version"):
+        engagement.open_(tmp_path / "acme")
+
+
+# --- Test-suite fix: prove the spec S5 isolation/destruction guarantee ---
+
+
+def test_deleting_one_engagement_does_not_affect_another(tmp_path: Path):
+    """The contractual claim is that `rm -rf` of one engagement directory
+    must not touch another's data. Nothing currently tests this end to
+    end."""
+    import shutil
+
+    a = engagement.create(tmp_path / "acme", _cfg("acme"), author="jimx")
+    b = engagement.create(tmp_path / "globex", _cfg("globex"), author="jimx")
+
+    a.blobs.put(b"acme secret response")
+    b_digest, _ = b.blobs.put(b"globex secret response")
+
+    a.db.close()  # release the connection before nuking a's directory
+    shutil.rmtree(a.root)
+
+    assert not a.root.exists()
+    assert b.blobs.get(b_digest) == b"globex secret response"
+    assert b.db.execute("SELECT COUNT(*) AS n FROM engagement").fetchone()["n"] == 1
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1077,6 +2172,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import sqlite3
 import time
 import uuid
@@ -1086,6 +2182,7 @@ from pathlib import Path
 from hx import config as config_mod
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 
 
 class EngagementError(Exception):
@@ -1107,6 +2204,44 @@ class Engagement:
     config: config_mod.Config
     db: sqlite3.Connection
     blobs: blobs_mod.BlobStore
+
+
+def _write_config_secure(path: Path, text: str) -> None:
+    """Atomically replace `path` with `text`, never at a looser mode than
+    0o600 and never leaving a half-written file behind.
+
+    Used for both first creation (`create()`) and every subsequent rewrite
+    (`record_scope_version()`). A bare `write_text()` -- whether creating the
+    file or truncating an existing one -- has no temp file, no fsync, and no
+    atomic rename: a process killed mid-write can leave `config.yaml`
+    truncated, or (worse) leave it as valid YAML with every required key
+    present but a shorter `dangerous_paths` list, since `dumps()` emits that
+    key near the end. The blob store already does temp -> fsync -> verify ->
+    `os.replace` for a response body; the file defining what is contractually
+    permitted to touch gets no less.
+
+    The temp file is created with `O_EXCL` at the final 0o600 mode, so it is
+    never briefly world-readable either.
+    """
+    path = Path(path)
+    # Hidden, uuid-qualified, but same trailing name as the target: a
+    # collision-proof temp name in the same directory (so the final
+    # os.replace stays on one filesystem and is atomic).
+    tmp = path.parent / f".{uuid.uuid4().hex}.{path.name}"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def _record_scope(
@@ -1135,37 +2270,75 @@ def _record_scope(
     return sv_id
 
 
+def _create_engagement_and_scope(
+    conn: sqlite3.Connection,
+    eng_id: str,
+    cfg: config_mod.Config,
+    config_path: str,
+    *,
+    author: str,
+    reason: str,
+) -> str:
+    """Insert the engagement row and its initial scope version atomically.
+
+    `db.connect` uses `isolation_level=None` (autocommit), so without an
+    explicit transaction the engagement INSERT commits immediately and a
+    failure while recording scope leaves an engagement with no authorisation
+    record -- exactly the state the design says must be impossible ("what
+    was in scope when request X was issued" must always be answerable).
+    """
+    with db_mod.transaction(conn):
+        conn.execute(
+            "INSERT INTO engagement(id, name, client, created_us, status, config_path)"
+            " VALUES(?,?,?,?,?,?)",
+            (eng_id, cfg.name, cfg.client, now_us(), "active", config_path),
+        )
+        sv_id = _record_scope(conn, eng_id, cfg, author=author, reason=reason)
+    return sv_id
+
+
 def create(root: Path, cfg: config_mod.Config, *, author: str) -> Engagement:
     root = Path(root)
     if root.exists():
         raise EngagementError(f"engagement directory already exists: {root}")
 
-    root.mkdir(parents=True, mode=0o700)
-    os.chmod(root, 0o700)
-    (root / "exports").mkdir(mode=0o700)
+    created_root = False
+    conn: sqlite3.Connection | None = None
+    try:
+        secure_mkdir(root)
+        created_root = True
+        (root / "exports").mkdir(mode=0o700)
 
-    (root / "config.yaml").write_text(config_mod.dumps(cfg), encoding="utf-8")
-    os.chmod(root / "config.yaml", 0o600)
+        _write_config_secure(root / "config.yaml", config_mod.dumps(cfg))
 
-    conn = db_mod.connect(root / "hx.db")
-    db_mod.init_schema(conn)
-    os.chmod(root / "hx.db", 0o600)
+        conn = db_mod.connect(root / "hx.db")
+        db_mod.init_schema(conn)
 
-    eng_id = _new_id("e")
-    conn.execute(
-        "INSERT INTO engagement(id, name, client, created_us, status, config_path)"
-        " VALUES(?,?,?,?,?,?)",
-        (eng_id, cfg.name, cfg.client, now_us(), "active", str(root / "config.yaml")),
-    )
-    _record_scope(conn, eng_id, cfg, author=author, reason="engagement created")
+        eng_id = _new_id("e")
+        _create_engagement_and_scope(
+            conn,
+            eng_id,
+            cfg,
+            str(root / "config.yaml"),
+            author=author,
+            reason="engagement created",
+        )
+        blobs = blobs_mod.BlobStore(root / "blobs")
+    except Exception:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        # Only remove a directory this call actually created -- deleting one
+        # we did not create is the destructive-chmod bug wearing a different
+        # hat. Without this, any failure above strands the directory, and
+        # every retry dies on "already exists".
+        if created_root and root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        raise
 
-    return Engagement(
-        id=eng_id,
-        root=root,
-        config=cfg,
-        db=conn,
-        blobs=blobs_mod.BlobStore(root / "blobs"),
-    )
+    return Engagement(id=eng_id, root=root, config=cfg, db=conn, blobs=blobs)
 
 
 def open_(root: Path) -> Engagement:
@@ -1173,24 +2346,71 @@ def open_(root: Path) -> Engagement:
     if not (root / "hx.db").exists():
         raise EngagementError(f"no engagement at {root}")
     conn = db_mod.connect(root / "hx.db")
-    row = conn.execute("SELECT id FROM engagement LIMIT 1").fetchone()
-    if row is None:
-        raise EngagementError(f"engagement row missing in {root}")
-    return Engagement(
-        id=row["id"],
-        root=root,
-        config=config_mod.load(root / "config.yaml"),
-        db=conn,
-        blobs=blobs_mod.BlobStore(root / "blobs"),
-    )
+    try:
+        # I6: a store opened by a different (and possibly incompatible)
+        # schema version must fail loudly rather than run queries against
+        # tables/triggers it does not actually have. The migration runner
+        # itself is a later plan's problem; this guard only refuses to
+        # pretend compatibility that was never verified.
+        found_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if found_version != db_mod.SCHEMA_VERSION:
+            raise EngagementError(
+                f"engagement at {root} was created by a different version of "
+                f"hx: on-disk schema version {found_version}, this hx expects "
+                f"{db_mod.SCHEMA_VERSION}"
+            )
+
+        # I5: `engagement` is meant to hold exactly one row -- it is the
+        # unit of isolation, and `quarantine` and every unqualified lookup
+        # here presume a single authoritative id. `LIMIT 1` with no
+        # `ORDER BY` would pick an arbitrary row if a second one ever got
+        # in; fetch all of them and refuse to guess.
+        rows = conn.execute("SELECT id FROM engagement").fetchall()
+        if len(rows) != 1:
+            raise EngagementError(
+                f"expected exactly one engagement row in {root}, found {len(rows)}"
+            )
+        row = rows[0]
+
+        config = config_mod.load(root / "config.yaml")
+
+        # I2: config.yaml and the recorded scope of record must never be
+        # allowed to silently diverge -- a hand edit to the file would
+        # otherwise become the live scope while the audit history (and,
+        # later, the recorded `scope_version_id` stamped on every request)
+        # says something else. There is no legitimate hand-edit workflow in
+        # this store: `record_scope_version` is the API, so divergence
+        # raises rather than warns.
+        latest_scope = conn.execute(
+            "SELECT yaml FROM scope_version"
+            " ORDER BY effective_from_us DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if latest_scope is not None:
+            on_disk = (root / "config.yaml").read_text(encoding="utf-8")
+            if on_disk != latest_scope["yaml"]:
+                raise EngagementError(
+                    f"{root / 'config.yaml'} diverges from the recorded scope "
+                    "of record: its contents do not match the latest row in "
+                    "scope_version. Restore config.yaml from that row, or "
+                    "re-record the change through record_scope_version()."
+                )
+
+        blobs = blobs_mod.BlobStore(root / "blobs")
+    except Exception:
+        # Any failure past this point (missing config.yaml, a malformed
+        # config, BlobStore init) must not leak the connection -- relying on
+        # refcounting to eventually close it is not acceptable for a public
+        # API, since a caller holding the exception (a CLI logging the
+        # traceback, pytest) keeps the handle open indefinitely.
+        conn.close()
+        raise
+    return Engagement(id=row["id"], root=root, config=config, db=conn, blobs=blobs)
 
 
 def record_scope_version(eng: Engagement, *, author: str, reason: str) -> str:
     """Append a new scope version. Never updates an existing row."""
     sv_id = _record_scope(eng.db, eng.id, eng.config, author=author, reason=reason)
-    (eng.root / "config.yaml").write_text(
-        config_mod.dumps(eng.config), encoding="utf-8"
-    )
+    _write_config_secure(eng.root / "config.yaml", config_mod.dumps(eng.config))
     return sv_id
 ```
 
@@ -1226,8 +2446,10 @@ git commit -m "feat(engagement): isolated engagement directories with append-onl
 
 ```python
 # tests/test_cli.py
+import shutil
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from hx import cli
@@ -1290,6 +2512,188 @@ def test_info_reports_engagement(tmp_path: Path):
 def test_default_root_honours_env(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HX_HOME", str(tmp_path / "custom"))
     assert cli.default_root() == tmp_path / "custom"
+
+
+def test_new_rejects_empty_name(tmp_path: Path):
+    """Test that hx new rejects empty NAME and creates no directory."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", "", "--client", "Acme", "--scope", "https://a/*", "--root", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    # Ensure no directory was created at all
+    assert len(list(tmp_path.iterdir())) == 0
+
+
+def test_new_rejects_empty_client(tmp_path: Path):
+    """Test that hx new rejects empty --client and creates no directory."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", "acme", "--client", "", "--scope", "https://a/*", "--root", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    # Ensure no directory was created at all
+    assert len(list(tmp_path.iterdir())) == 0
+
+
+def test_info_missing_config_yaml(tmp_path: Path):
+    """Test that info handles missing config.yaml gracefully."""
+    runner = CliRunner()
+    # Create an engagement
+    result = runner.invoke(
+        cli.main,
+        [
+            "new", "acme", "--client", "Acme Corp",
+            "--scope", "https://app.acme.com/*", "--root", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0
+
+    # Delete config.yaml
+    config_path = tmp_path / "acme" / "config.yaml"
+    config_path.unlink()
+
+    # Try to run info - should show an error, not a traceback
+    result = runner.invoke(cli.main, ["info", "--root", str(tmp_path / "acme")])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert str(tmp_path / "acme") in result.output
+
+
+def test_info_malformed_config_yaml(tmp_path: Path):
+    """Test that info handles malformed config.yaml gracefully."""
+    runner = CliRunner()
+    # Create an engagement
+    result = runner.invoke(
+        cli.main,
+        [
+            "new", "acme", "--client", "Acme Corp",
+            "--scope", "https://app.acme.com/*", "--root", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0
+
+    # Write malformed YAML
+    config_path = tmp_path / "acme" / "config.yaml"
+    config_path.write_text("{ invalid yaml: [")
+
+    # Try to run info - should show an error, not a traceback
+    result = runner.invoke(cli.main, ["info", "--root", str(tmp_path / "acme")])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert str(tmp_path / "acme") in result.output
+
+
+def test_info_damaged_database(tmp_path: Path):
+    """Test that info handles inaccessible database gracefully."""
+    import os as os_module
+
+    runner = CliRunner()
+    # Create an engagement
+    result = runner.invoke(
+        cli.main,
+        [
+            "new", "acme", "--client", "Acme Corp",
+            "--scope", "https://app.acme.com/*", "--root", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0
+
+    # Make the database inaccessible
+    db_path = tmp_path / "acme" / "hx.db"
+    os_module.chmod(db_path, 0o000)
+
+    try:
+        # Try to run info - should show an error, not a traceback
+        result = runner.invoke(cli.main, ["info", "--root", str(tmp_path / "acme")])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+    finally:
+        # Restore permissions so pytest can clean up
+        os_module.chmod(db_path, 0o600)
+
+
+# --- I3: `hx new` accepts a path, not a name ---
+
+
+@pytest.mark.parametrize("bad_name", [".", "..", "../escaped", "a/b"])
+def test_new_rejects_path_like_names_within_root(tmp_path: Path, bad_name):
+    """`.` breaks the destruction guarantee outright (the engagements root
+    itself becomes an engagement, so `rm -rf` of it destroys every sibling
+    client), and any other traversal walks the created directory outside
+    the engagements root. Nothing must be created at all."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", bad_name, "--client", "Acme", "--scope", "https://a/*", "--root", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert list(tmp_path.iterdir()) == [], f"NAME={bad_name!r} created something under root"
+
+
+def test_new_rejects_an_absolute_path_as_name(tmp_path: Path):
+    """pathlib's `/` operator discards the left operand when the right one
+    is absolute, so NAME='/tmp/hx-i3-abs-escape-test' used to make --root
+    silently ignored and create the engagement at that literal absolute
+    path."""
+    target = Path("/tmp/hx-i3-abs-escape-test")
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+
+    runner = CliRunner()
+    try:
+        result = runner.invoke(
+            cli.main,
+            [
+                "new", str(target), "--client", "Acme",
+                "--scope", "https://a/*", "--root", str(tmp_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert not target.exists(), "NAME as an absolute path escaped --root entirely"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def test_new_accepts_a_normal_name(tmp_path: Path):
+    """The validation must not be so strict it rejects ordinary names."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        [
+            "new", "acme-2026-09.retest_1", "--client", "Acme",
+            "--scope", "https://a/*", "--root", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "acme-2026-09.retest_1" / "hx.db").exists()
+
+
+# --- M3: `hx new` must degrade like `hx info` does, not traceback ---
+
+
+def test_new_reports_a_clean_error_when_root_is_not_a_directory(tmp_path: Path):
+    """`hx new acme --root /etc/hostname` used to dump a NotADirectoryError
+    traceback -- `new` needs the same guard shape `info` already has."""
+    not_a_dir = tmp_path / "im-a-file"
+    not_a_dir.write_text("not a directory")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        [
+            "new", "x", "--client", "Acme",
+            "--scope", "https://a/*", "--root", str(not_a_dir),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1309,6 +2713,7 @@ rather than in the agent-facing tool layer.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -1316,6 +2721,8 @@ import click
 
 from hx import config as config_mod
 from hx import engagement as eng_mod
+
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def default_root() -> Path:
@@ -1351,15 +2758,23 @@ def main() -> None:
 @click.option("--author", default=lambda: os.environ.get("USER", "unknown"))
 def new(name, client, scope, exclude, profile, root, author) -> None:
     """Create a new engagement."""
-    base = root or default_root()
-    # Guard before anything touches disk. An empty NAME makes `base / name`
-    # collapse to base itself, so `hx new ""` would turn the engagements root
-    # into an engagement directory -- and it could then never be opened
-    # (config.load rejects an empty name) nor recreated (create refuses an
-    # existing directory).
     for field, value in (("NAME", name), ("--client", client)):
         if not value.strip():
             raise click.ClickException(f"{field} must not be empty")
+    # NAME becomes a path segment under the engagements root (`base / name`).
+    # Without this check, "." makes the engagements root ITSELF an
+    # engagement (so `rm -rf` of it destroys every client), ".." or
+    # "../escaped" walk outside the root, and an absolute NAME like
+    # "/tmp/anywhere" makes pathlib's `/` operator discard `base` entirely
+    # -- `--root` silently ignored. User-controlled NAME also reaches
+    # `shutil.rmtree` on create()'s failure path, so this has to hold before
+    # any directory is touched.
+    if not _NAME_RE.fullmatch(name) or name in (".", ".."):
+        raise click.ClickException(
+            "NAME must be 1-64 characters of letters, digits, dot, underscore "
+            "or hyphen, and must start with a letter or digit"
+        )
+    base = root or default_root()
     cfg = config_mod.Config(
         name=name,
         client=client,
@@ -1371,6 +2786,12 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
         eng = eng_mod.create(base / name, cfg, author=author)
     except eng_mod.EngagementError as exc:
         raise click.ClickException(str(exc)) from exc
+    except config_mod.ConfigError as exc:
+        raise click.ClickException(f"invalid config for {base / name}: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot create the database at {base / name}: {exc}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"cannot create the engagement at {base / name}: {exc}") from exc
 
     click.echo(f"created engagement {name} ({eng.id})")
     click.echo(f"  root    {eng.root}")
@@ -1383,9 +2804,6 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
 def info(root) -> None:
     """Show an engagement's configuration and current counts."""
     path = root or default_root()
-    # Everything that reads the engagement goes inside one guard: opening it,
-    # loading its config, and querying it. A damaged engagement must produce a
-    # sentence, never a traceback -- and sqlite3.Error is not an OSError.
     try:
         eng = eng_mod.open_(path)
         counts = {
@@ -1400,6 +2818,7 @@ def info(root) -> None:
         raise click.ClickException(f"cannot read the database at {path}: {exc}") from exc
     except OSError as exc:
         raise click.ClickException(f"cannot access the engagement at {path}: {exc}") from exc
+
     click.echo(f"engagement {eng.config.name} ({eng.id})")
     click.echo(f"  client   {eng.config.client}")
     click.echo(f"  profile  {eng.config.safety_profile}")

@@ -1,0 +1,5042 @@
+# hx Bridge Transport Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Establish the wire between Burp and the harness — a Unix-socket bridge on which Burp dials in, completes a `hello` / `configure` / epoch handshake, and refuses every request until it is configured.
+
+**Architecture:** Python listens, Burp dials in — the harness holds the state and outlives Burp, so a Burp restart is a reconnect rather than an outage. Frames are `[4-byte BE length][JSON header][raw body bytes]`, control in the header and payload in bytes, so a 1.2 MB response pays no base64 tax. The extension is a zero-dependency Java jar built with `javac` and `jar`; it carries a hand-rolled codec for a deliberately flat header schema. DENY-ALL is the initial and terminal state.
+
+**Tech Stack:** Python 3.12+ (stdlib `socket`, `struct`, `json`), Java 21 target compiled by JDK 26 with `--release 21`, `pytest`. No build tool, no third-party dependency on either side.
+
+**Spec:** `docs/superpowers/specs/2026-08-21-hx-design.md` (§4 enforcement invariant, §6 bridge protocol)
+
+**Depends on:** Plan 1 (engagement store) — merged as PR #1. This plan consumes `hx.engagement.Engagement`, `hx.store.db.connect` and `hx.config.Config`.
+
+## Global Constraints
+
+- Python 3.12 minimum. Java compiled with `--release 21` (Burp targets 21; the local JDK is 26).
+- **The extension has zero third-party dependencies.** Built by `javac` + `jar` against `montoya-api.jar` as `compileOnly`. Do not introduce Gradle, Maven, or a JSON library.
+- Socket directory mode `0o700`, socket mode `0o600`, a **fresh random basename per run**, unlinked on shutdown. Refuse to start if the path already exists.
+- `SO_PEERCRED` is checked on every accept: the peer's uid must equal our own. The socket authenticates a uid, not a program, so also log the peer pid and its executable path.
+- **Maximum frame size is 64 MiB.** A length prefix is attacker-influenced input; never allocate on it before checking it.
+- Every header carries `v` (protocol version, integer) and `t` (frame type). Request/response frames additionally carry `id` (monotonic integer) and `deadline_us` (absolute microseconds). This plan *sets and validates* `deadline_us` so the frame shape is stable; *acting* on it belongs to Plan 3's send path.
+- **DENY-ALL is the initial and terminal state.** Until a `configure` frame is received and its `config_epoch` acknowledged, every `send` is refused with error class `not_configured`.
+- An `engagement_id` mismatch between `hello` and the open engagement is fatal: the harness closes the connection and records the attempt.
+- All timestamps are integer microseconds since epoch, suffix `_us`.
+- No network sockets. This plan uses `AF_UNIX` only; nothing talks to a target.
+
+---
+
+### Task 1: Wire format, shared golden vectors, and the Python codec
+
+**Files:**
+- Create: `docs/bridge-protocol.md`
+- Create: `tests/vectors/frames.json`
+- Create: `src/hx/bridge/__init__.py`
+- Create: `src/hx/bridge/codec.py`
+- Test: `tests/test_bridge_codec.py`
+
+**Interfaces:**
+- Consumes: nothing from Plan 1
+- Produces:
+  - `hx.bridge.codec.PROTOCOL_VERSION: int` — `1`
+  - `hx.bridge.codec.MAX_FRAME: int` — `64 * 1024 * 1024`
+  - `hx.bridge.codec.encode(header: dict, body: bytes = b"") -> bytes`
+  - `hx.bridge.codec.decode(buf: bytes) -> tuple[dict, bytes, int]` — returns `(header, body, bytes_consumed)`; raises `Incomplete` when `buf` holds less than one whole frame
+  - `hx.bridge.codec.FrameReader(sock)` with `.read() -> tuple[dict, bytes]` — owns the buffer across calls
+  - `hx.bridge.codec.PeerClosed(Exception)`
+  - `hx.bridge.codec.Incomplete(Exception)`, `hx.bridge.codec.FrameError(Exception)`
+  - `hx.bridge.codec.parse_config_body(body: bytes) -> dict[str, list[str]]`
+  - `hx.bridge.codec.build_config_body(pairs: dict[str, list[str]]) -> bytes`
+
+- [ ] **Step 1: Write the protocol document**
+
+This is the contract two implementations must agree on, so it is written down once and both sides are tested against it.
+
+```markdown
+# hx bridge wire protocol v1
+
+## Framing
+
+    [4-byte big-endian unsigned length][header bytes][body bytes]
+
+`length` counts header + body. It is attacker-influenced: reject anything
+above MAX_FRAME (64 MiB) before allocating.
+
+The header is a **flat** JSON object, UTF-8, terminated by a newline (`\n`).
+Everything after that newline, to the end of the frame, is the body.
+
+Flat means: string keys, and values that are only string, integer, boolean or
+null. No nested objects, no arrays. This keeps the Java parser small enough to
+be obviously correct. Structured payloads travel in the body.
+
+## Header fields
+
+Every frame:
+  v          integer  protocol version, currently 1
+  t          string   frame type
+
+Request/response frames (`send`, `result`, `error`, `configure`, `configured`):
+  id         integer  monotonic, set by the sender of the request
+  deadline_us integer absolute microseconds; the receiver abandons work past it
+
+## Two things a second implementation must match
+
+**Key order is preserved on the wire.** The header is written in insertion
+order, and the golden vectors compare exact bytes. A writer using an unordered
+map produces a semantically identical header with different bytes and fails the
+vector comparison. Parsing is order-independent; only the byte comparison cares.
+
+**Header integers are 64-bit signed.** `deadline_us` is absolute microseconds
+since epoch -- about 1.79e15 today, which overflows a 32-bit integer by roughly
+six orders of magnitude. Parse header numbers into a 64-bit type. Floats and
+exponents are not valid header numbers.
+
+**Non-ASCII header values are raw UTF-8, not `\uXXXX` escapes.** Only the
+characters JSON requires are escaped: `"` `\\` and the control characters.
+
+## Frame types
+
+  burp -> py   hello       {v,t,ext_version,pid,burp_version,instance_id,engagement_id}
+  py -> burp   configure   {v,t,id,deadline_us,engagement_id,scope_sha256,profile}
+                           body: config lines (below)
+  burp -> py   configured  {v,t,id,config_epoch}
+  py -> burp   send        {v,t,id,deadline_us,identity_id,target_host,target_port,tls}
+                           body: raw HTTP request bytes
+  burp -> py   result      {v,t,id,exchange_id,status,bytes,ms,outcome}
+                           body: raw HTTP response bytes
+  burp -> py   error       {v,t,id,class,detail}
+  burp -> py   exchange    {v,t,...}   unsolicited; no id. Defined in a later plan.
+  py -> burp   halt        {v,t,id,deadline_us,reason}
+  py -> burp   resume      {v,t,id,deadline_us}
+
+## Config body format
+
+The `configure` body is NOT JSON. It is a line-oriented format, because the
+extension parses it and a flat parser cannot express nested config:
+
+    key<TAB>value\n
+
+Repeated keys accumulate into a list, in order. Keys and values are UTF-8.
+A value may not contain a tab or a newline; the sender rejects such input
+rather than escaping it.
+
+Recognised keys:
+
+    scope.include      URL pattern, repeatable
+    scope.exclude      URL pattern, repeatable
+    dangerous.path     path pattern, repeatable
+    method.allow       HTTP method, repeatable
+    limit.rate_rps     integer, once
+    limit.concurrency  integer, once
+    limit.max_requests integer, once
+    render.allow       host pattern, repeatable
+
+An unrecognised key is an error, not a warning: silently ignoring a key the
+sender believed it set is how a scope rule goes missing.
+```
+
+Write that verbatim to `docs/bridge-protocol.md`.
+
+- [ ] **Step 2: Write the shared golden vectors**
+
+Both the Python and the Java codec are tested against this same file. It is the only thing preventing the two implementations from drifting apart while each passes its own tests.
+
+```json
+{
+  "comment": "Shared codec vectors. BOTH the Python and Java codec tests run against this file. hex is the complete frame including the 4-byte length prefix.",
+  "frames": [
+    {
+      "name": "hello_minimal",
+      "header": {"v": 1, "t": "hello", "pid": 4171},
+      "body_utf8": "",
+      "hex": "0000001f7b2276223a312c2274223a2268656c6c6f222c22706964223a343137317d0a"
+    },
+    {
+      "name": "header_with_bool_and_null",
+      "header": {"v": 1, "t": "send", "tls": true, "identity_id": null},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "body_with_crlf",
+      "header": {"v": 1, "t": "send", "id": 7},
+      "body_utf8": "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+      "hex": ""
+    },
+    {
+      "name": "body_with_embedded_newline_and_utf8",
+      "header": {"v": 1, "t": "result", "id": 9, "status": 200},
+      "body_utf8": "line1\nline2 éü中",
+      "hex": ""
+    },
+    {
+      "name": "empty_header_values",
+      "header": {"v": 1, "t": "error", "id": 3, "class": "scope_denied", "detail": ""},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "header_value_needing_json_escapes",
+      "header": {"v": 1, "t": "error", "id": 4, "detail": "quote\" back\\ tab\t nl\n ctrl\u0001"},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "header_value_non_ascii",
+      "header": {"v": 1, "t": "error", "id": 5, "detail": "éü中 \u00e9"},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "header_integer_beyond_int32",
+      "header": {"v": 1, "t": "send", "id": 6, "deadline_us": 1787355131378277},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "header_negative_integer",
+      "header": {"v": 1, "t": "result", "id": 7, "ms": -1},
+      "body_utf8": "",
+      "hex": ""
+    },
+    {
+      "name": "empty_body_is_zero_bytes_not_absent",
+      "header": {"v": 1, "t": "hello", "id": 8},
+      "body_utf8": "",
+      "hex": ""
+    }
+  ]
+}
+```
+
+The `hex` field is left empty for all but the first vector deliberately: Step 5 fills them in from the Python encoder once it exists, and the Java test then asserts against those exact bytes. Filling them by hand invites a typo that both implementations would then agree on.
+
+- [ ] **Step 3: Write the failing tests**
+
+```python
+# tests/test_bridge_codec.py
+import json
+import socket
+from pathlib import Path
+
+import pytest
+
+from hx.bridge import codec
+
+VECTORS = Path(__file__).parent / "vectors" / "frames.json"
+MALFORMED = Path(__file__).parent / "vectors" / "malformed.json"
+
+
+def test_round_trip_simple():
+    raw = codec.encode({"v": 1, "t": "hello", "pid": 4171})
+    header, body, consumed = codec.decode(raw)
+    assert header == {"v": 1, "t": "hello", "pid": 4171}
+    assert body == b""
+    assert consumed == len(raw)
+
+
+def test_body_bytes_survive_verbatim():
+    """No base64, no re-encoding: the body is bytes in and bytes out."""
+    payload = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n\x00\xff\xfe binary"
+    raw = codec.encode({"v": 1, "t": "send", "id": 1}, payload)
+    header, body, _ = codec.decode(raw)
+    assert body == payload
+
+
+def test_body_containing_a_newline_does_not_confuse_the_header_split():
+    """The header ends at the FIRST newline. A body full of them must not matter."""
+    payload = b"\n\n\n{\"not\":\"a header\"}\n"
+    raw = codec.encode({"v": 1, "t": "send", "id": 2}, payload)
+    header, body, _ = codec.decode(raw)
+    assert header["t"] == "send"
+    assert body == payload
+
+
+def test_large_body_round_trips():
+    payload = bytes(range(256)) * 8000  # ~2 MB, bigger than a real response
+    raw = codec.encode({"v": 1, "t": "result", "id": 3}, payload)
+    header, body, _ = codec.decode(raw)
+    assert body == payload
+
+
+def test_incomplete_buffer_raises_incomplete_not_frameerror():
+    """A partial read is normal on a stream socket and must be distinguishable
+    from a corrupt frame, or the reader will drop a connection mid-message."""
+    raw = codec.encode({"v": 1, "t": "hello"}, b"abcdef")
+    for cut in (0, 1, 3, 4, len(raw) - 1):
+        with pytest.raises(codec.Incomplete):
+            codec.decode(raw[:cut])
+
+
+def test_decode_reports_bytes_consumed_so_a_stream_can_be_drained():
+    a = codec.encode({"v": 1, "t": "hello", "id": 1})
+    b = codec.encode({"v": 1, "t": "hello", "id": 2})
+    header, _, consumed = codec.decode(a + b)
+    assert header["id"] == 1
+    assert consumed == len(a)
+    header2, _, consumed2 = codec.decode((a + b)[consumed:])
+    assert header2["id"] == 2
+    assert consumed2 == len(b)
+
+
+def test_oversized_length_prefix_is_refused_before_allocating():
+    """The length prefix is attacker-influenced. Never allocate on it."""
+    evil = (codec.MAX_FRAME + 1).to_bytes(4, "big") + b"{}"
+    with pytest.raises(codec.FrameError, match="exceeds"):
+        codec.decode(evil)
+
+
+def test_frame_of_exactly_max_frame_bytes_succeeds():
+    """A frame at the boundary should succeed; only MAX_FRAME+1 should fail."""
+    # Create a frame that is exactly MAX_FRAME bytes (header + body, not including length prefix)
+    header = {"v": 1, "t": "send"}
+    # Calculate body size to reach exactly MAX_FRAME
+    header_json = b'{"v":1,"t":"send"}'
+    header_with_newline = header_json + b"\n"
+    payload_size = codec.MAX_FRAME - len(header_with_newline)
+    body = b"x" * payload_size
+    raw = codec.encode(header, body)
+    # Verify it succeeds
+    decoded_header, decoded_body, _ = codec.decode(raw)
+    assert decoded_header == header
+    assert decoded_body == body
+
+
+def test_header_without_a_newline_terminator_is_a_frame_error():
+    body = b'{"v":1,"t":"hello"}'          # no trailing newline
+    raw = len(body).to_bytes(4, "big") + body
+    with pytest.raises(codec.FrameError, match="terminator"):
+        codec.decode(raw)
+
+
+def test_malformed_header_json_is_a_frame_error():
+    body = b'{"v":1,"t":\n'
+    raw = len(body).to_bytes(4, "big") + body
+    with pytest.raises(codec.FrameError):
+        codec.decode(raw)
+
+
+def test_nested_header_values_are_refused_on_encode():
+    """The Java side parses a FLAT schema. Emitting nesting from Python would
+    produce frames it cannot read, and the failure would appear on the far side."""
+    with pytest.raises(codec.FrameError, match="flat"):
+        codec.encode({"v": 1, "t": "send", "scope": {"include": ["x"]}})
+    with pytest.raises(codec.FrameError, match="flat"):
+        codec.encode({"v": 1, "t": "send", "methods": ["GET"]})
+
+
+def test_flat_header_validated_on_decode():
+    """The flat restriction is validated on receipt too, not only on send.
+    This defends against a peer that ignores the contract."""
+    # Nested object
+    bad = b'{"v":1,"t":"send","scope":{"include":["x"]}}\n'
+    raw = len(bad).to_bytes(4, "big") + bad
+    with pytest.raises(codec.FrameError, match="flat"):
+        codec.decode(raw)
+    # Array
+    bad = b'{"v":1,"t":"send","methods":["GET"]}\n'
+    raw = len(bad).to_bytes(4, "big") + bad
+    with pytest.raises(codec.FrameError, match="flat"):
+        codec.decode(raw)
+
+
+def test_missing_required_header_fields_on_decode():
+    """Missing v or t is an error on decode, defending against malformed peers."""
+    # Missing v
+    bad = b'{"t":"send"}\n'
+    raw = len(bad).to_bytes(4, "big") + bad
+    with pytest.raises(codec.FrameError, match="v"):
+        codec.decode(raw)
+    # Missing t
+    bad = b'{"v":1}\n'
+    raw = len(bad).to_bytes(4, "big") + bad
+    with pytest.raises(codec.FrameError, match="t"):
+        codec.decode(raw)
+
+
+def test_missing_required_header_fields_are_refused_on_encode():
+    with pytest.raises(codec.FrameError, match="v"):
+        codec.encode({"t": "hello"})
+    with pytest.raises(codec.FrameError, match="t"):
+        codec.encode({"v": 1})
+
+
+def test_frame_reader_reassembles_across_socket_chunks():
+    """Stream sockets split writes wherever they like."""
+    payload = b"x" * 100_000
+    raw = codec.encode({"v": 1, "t": "result", "id": 5}, payload)
+    a, b = socket.socketpair()
+    try:
+        for i in range(0, len(raw), 4096):
+            a.sendall(raw[i : i + 4096])
+        reader = codec.FrameReader(b)
+        header, body = reader.read()
+        assert header["id"] == 5
+        assert body == payload
+    finally:
+        a.close()
+        b.close()
+
+
+def test_frame_reader_handles_coalesced_frames():
+    """Regression guard: two frames written in one sendall must be read separately.
+    The kernel may coalesce them; the reader must buffer and return them one at a time."""
+    f1 = codec.encode({"v": 1, "t": "hello", "id": 1})
+    f2 = codec.encode({"v": 1, "t": "hello", "id": 2})
+    f3 = codec.encode({"v": 1, "t": "hello", "id": 3})
+    a, b = socket.socketpair()
+    try:
+        a.sendall(f1 + f2 + f3)  # all three in one write
+        reader = codec.FrameReader(b)
+        header1, _ = reader.read()
+        assert header1["id"] == 1
+        header2, _ = reader.read()
+        assert header2["id"] == 2
+        header3, _ = reader.read()
+        assert header3["id"] == 3
+    finally:
+        a.close()
+        b.close()
+
+
+# ---- config body -------------------------------------------------------
+
+def test_config_body_round_trips_with_repeated_keys():
+    pairs = {
+        "scope.include": ["https://app.acme.com/*", "https://api.acme.com/*"],
+        "scope.exclude": ["*/admin/delete*"],
+        "limit.rate_rps": ["5"],
+    }
+    body = codec.build_config_body(pairs)
+    assert codec.parse_config_body(body) == pairs
+
+
+def test_config_body_preserves_order_of_repeated_keys():
+    pairs = {"scope.include": ["a", "b", "c"]}
+    assert codec.parse_config_body(codec.build_config_body(pairs))["scope.include"] == ["a", "b", "c"]
+
+
+def test_config_body_rejects_a_value_containing_a_tab_or_newline():
+    """Rejected rather than escaped: an escaping scheme is another parser."""
+    with pytest.raises(codec.FrameError, match="tab|newline"):
+        codec.build_config_body({"scope.include": ["a\tb"]})
+    with pytest.raises(codec.FrameError, match="tab|newline"):
+        codec.build_config_body({"scope.include": ["a\nb"]})
+
+
+def test_config_body_rejects_an_unrecognised_key():
+    """Silently ignoring a key the sender believed it set is how a scope rule
+    goes missing."""
+    with pytest.raises(codec.FrameError, match="unrecognised|unknown"):
+        codec.parse_config_body(b"scope.includ\thttps://typo/*\n")
+
+
+def test_config_body_rejects_a_line_without_a_tab():
+    with pytest.raises(codec.FrameError):
+        codec.parse_config_body(b"scope.include https://no-tab/*\n")
+
+
+# ---- golden vectors ----------------------------------------------------
+
+def test_every_vector_round_trips():
+    data = json.loads(VECTORS.read_text())
+    for v in data["frames"]:
+        raw = codec.encode(v["header"], v["body_utf8"].encode("utf-8"))
+        header, body, _ = codec.decode(raw)
+        assert header == v["header"], v["name"]
+        assert body.decode("utf-8") == v["body_utf8"], v["name"]
+
+
+def test_vectors_match_their_recorded_hex():
+    """The Java codec asserts against these same bytes. If Python's output
+    drifts from the recorded hex, the two implementations have diverged."""
+    data = json.loads(VECTORS.read_text())
+    for v in data["frames"]:
+        assert v["hex"], f"vector {v['name']} has no recorded hex"
+        raw = codec.encode(v["header"], v["body_utf8"].encode("utf-8"))
+        assert raw.hex() == v["hex"], v["name"]
+
+
+# ---- malformed input parity --------------------------------------------
+#
+# The golden vectors above are all well-formed, which is exactly why probing
+# found the Java and Python codecs disagreeing on five of six hostile inputs
+# (plan fix f8d8229) with none of these tests noticing. Well-formed vectors
+# pin agreement on what is valid; they say nothing about whether both sides
+# reject the same invalid input the same way. This suite pins rejection too,
+# against the SAME cases the Java CodecTest runs.
+
+def test_every_malformed_case_is_rejected_by_decode():
+    data = json.loads(MALFORMED.read_text())
+    assert data["cases"], "malformed vectors file has no cases"
+    for c in data["cases"]:
+        head = c["header_text"].encode("utf-8")
+        raw = len(head + b"\n").to_bytes(4, "big") + head + b"\n"
+        with pytest.raises(codec.FrameError) as exc:
+            codec.decode(raw)
+        # Rejected is not enough: it has to be rejected by the rule the case
+        # exists to pin. Every case carried only the key "a", so
+        # _check_header's required-field rule fired first and five of them --
+        # integer_beyond_int64, lone_surrogate, nested_object,
+        # unpaired_low_surrogate, high_surrogate_not_followed_by_escape --
+        # never reached their own rule at all. Deleting the unpaired-surrogate
+        # check in codec.py outright still left the suite at 179 passed. The
+        # \"v\":1,\"t\":\"x\" prefix in the vectors file is what fixed that,
+        # and this assertion is what stops it being stripped again.
+        assert "missing required field" not in str(exc.value), (
+            f"{c['name']} is being rejected for a missing required field, not by "
+            f"the rule it exists to pin ({str(exc.value)!r}). Restore the "
+            f'\'"v":1,"t":"x",\' prefix in {MALFORMED.name}.'
+        )
+
+
+def test_encode_refuses_an_integer_outside_signed_64_bit_range():
+    """This diverges the other way from most findings in f8d8229: Python's
+    ints are unbounded, so nothing stopped it from emitting a header the Java
+    side cannot represent -- a frame valid here and a hard error there."""
+    too_big = 2 ** 63
+    too_small = -(2 ** 63) - 1
+    with pytest.raises(codec.FrameError, match="64-bit"):
+        codec.encode({"v": 1, "t": "send", "deadline_us": too_big})
+    with pytest.raises(codec.FrameError, match="64-bit"):
+        codec.encode({"v": 1, "t": "send", "deadline_us": too_small})
+    # The boundary values themselves must still be accepted.
+    codec.encode({"v": 1, "t": "send", "deadline_us": 2 ** 63 - 1})
+    codec.encode({"v": 1, "t": "send", "deadline_us": -(2 ** 63)})
+```
+
+- [ ] **Step 4: Run tests to verify they fail**
+
+Run: `.venv/bin/pytest tests/test_bridge_codec.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'hx.bridge'`
+
+- [ ] **Step 5: Write the implementation**
+
+```python
+# src/hx/bridge/codec.py
+"""Frame codec for the Burp bridge.
+
+    [4-byte BE length][header JSON]\\n[body bytes]
+
+The header is a FLAT JSON object -- string keys, and values only of type
+string, int, bool or None. That restriction exists for the far side: the Burp
+extension is a zero-dependency Java jar with a hand-rolled parser, and a flat
+schema is small enough to be obviously correct. Structured payloads travel in
+the body, which is opaque bytes.
+"""
+from __future__ import annotations
+
+import json
+import socket
+import struct
+
+PROTOCOL_VERSION = 1
+MAX_FRAME = 64 * 1024 * 1024        # a length prefix is attacker-influenced input
+_LEN = struct.Struct(">I")
+
+CONFIG_KEYS = frozenset(
+    {
+        "scope.include",
+        "scope.exclude",
+        "dangerous.path",
+        "method.allow",
+        "limit.rate_rps",
+        "limit.concurrency",
+        "limit.max_requests",
+        "render.allow",
+    }
+)
+
+
+class Incomplete(Exception):
+    """The buffer holds less than one whole frame. Normal on a stream socket."""
+
+
+class FrameError(Exception):
+    """The bytes are not a valid frame, or the header is not encodable."""
+
+
+class PeerClosed(Exception):
+    """The far end went away. Distinct from Incomplete, which means "call
+    again"; conflating them makes a caller busy-loop against a dead socket."""
+
+
+def _check_header(header: dict) -> None:
+    for required in ("v", "t"):
+        if required not in header:
+            raise FrameError(f"header is missing required field {required!r}")
+    for key, value in header.items():
+        if not isinstance(key, str):
+            raise FrameError(f"header keys must be strings, got {type(key).__name__}")
+        if not isinstance(value, (str, int, bool, type(None))):
+            raise FrameError(
+                f"header must be flat: {key!r} is {type(value).__name__}, and the "
+                "Java parser reads only string/int/bool/null"
+            )
+        # A lone UTF-16 surrogate from a \u escape parses fine here -- json.loads
+        # accepts it -- but corrupts silently later: this side raises
+        # UnicodeEncodeError on re-encode, the Java side silently writes '?'.
+        # Reject it at the same place the flat-type check lives, so decode()
+        # and encode() both refuse it rather than letting only one side notice.
+        if isinstance(value, str) and any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            raise FrameError(
+                f"header string {key!r} contains an unpaired UTF-16 surrogate"
+            )
+        # Python integers are unbounded; the far side reads them into a signed
+        # 64-bit long. Emitting a value it cannot represent would produce a frame
+        # that is valid here and a hard error there.
+        if isinstance(value, int) and not isinstance(value, bool):
+            if not (-(2 ** 63) <= value <= 2 ** 63 - 1):
+                raise FrameError(
+                    f"header integer {key!r}={value} is outside signed 64-bit range"
+                )
+
+
+def encode(header: dict, body: bytes = b"") -> bytes:
+    _check_header(header)
+    head = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    payload = head + b"\n" + body
+    if len(payload) > MAX_FRAME:
+        raise FrameError(f"frame of {len(payload)} bytes exceeds MAX_FRAME {MAX_FRAME}")
+    return _LEN.pack(len(payload)) + payload
+
+
+def decode(buf: bytes) -> tuple[dict, bytes, int]:
+    if len(buf) < _LEN.size:
+        raise Incomplete("need a length prefix")
+    (length,) = _LEN.unpack_from(buf, 0)
+    if length > MAX_FRAME:
+        raise FrameError(f"declared frame of {length} bytes exceeds MAX_FRAME {MAX_FRAME}")
+    end = _LEN.size + length
+    if len(buf) < end:
+        raise Incomplete(f"need {end} bytes, have {len(buf)}")
+
+    payload = buf[_LEN.size : end]
+    nl = payload.find(b"\n")
+    if nl < 0:
+        raise FrameError("header has no newline terminator")
+    try:
+        header = json.loads(payload[:nl].decode("utf-8"))
+    except ValueError as exc:  # UnicodeDecodeError is a ValueError
+        raise FrameError(f"header is not valid JSON: {exc}") from exc
+    if not isinstance(header, dict):
+        raise FrameError("header must be a JSON object")
+    # Validate on receipt too, not only on send. The flat restriction exists to
+    # bound what the far side may produce, so this is the one place that can
+    # actually defend it against a peer that ignores the contract.
+    _check_header(header)
+    return header, payload[nl + 1 : end], end
+
+
+class FrameReader:
+    """Reads frames from a socket, owning the buffer across calls.
+
+    A bare ``read_frame(sock)`` function cannot be correct here. ``decode``
+    reports ``bytes_consumed`` precisely because one ``recv`` may deliver more
+    than one frame, and a function that returns after the first frame has
+    nowhere to put the remainder -- so it drops it, and the loss surfaces later
+    as a misleading "peer closed mid-frame". Owning the buffer is that
+    somewhere.
+
+    It also reads the length prefix before attempting a decode, so draining a
+    large frame is linear rather than re-parsing a growing buffer per chunk.
+    """
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._buf = bytearray()
+
+    def read(self) -> tuple[dict, bytes]:
+        while True:
+            if len(self._buf) >= _LEN.size:
+                (length,) = _LEN.unpack_from(self._buf, 0)
+                if length > MAX_FRAME:
+                    raise FrameError(
+                        f"declared frame of {length} bytes exceeds MAX_FRAME {MAX_FRAME}"
+                    )
+                end = _LEN.size + length
+                if len(self._buf) >= end:
+                    header, body, consumed = decode(bytes(self._buf[:end]))
+                    del self._buf[:consumed]
+                    return header, body
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise PeerClosed(
+                    "peer closed mid-frame" if self._buf else "peer closed"
+                )
+            self._buf.extend(chunk)
+
+
+def build_config_body(pairs: dict[str, list[str]]) -> bytes:
+    out = bytearray()
+    for key, values in pairs.items():
+        if key not in CONFIG_KEYS:
+            raise FrameError(f"unrecognised config key {key!r}")
+        for value in values:
+            if "\t" in value or "\n" in value:
+                raise FrameError(
+                    f"config value for {key!r} contains a tab or newline; "
+                    "such values are rejected rather than escaped"
+                )
+            out += key.encode("utf-8") + b"\t" + value.encode("utf-8") + b"\n"
+    return bytes(out)
+
+
+def parse_config_body(body: bytes) -> dict[str, list[str]]:
+    pairs: dict[str, list[str]] = {}
+    for raw_line in body.decode("utf-8").split("\n"):
+        if not raw_line:
+            continue
+        if "\t" not in raw_line:
+            raise FrameError(f"config line has no tab separator: {raw_line!r}")
+        key, value = raw_line.split("\t", 1)
+        if key not in CONFIG_KEYS:
+            raise FrameError(f"unrecognised config key {key!r}")
+        pairs.setdefault(key, []).append(value)
+    return pairs
+```
+
+- [ ] **Step 6: Fill in the golden-vector hex from the implementation**
+
+```bash
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+import sys
+sys.path.insert(0, "src")
+from hx.bridge import codec
+
+p = Path("tests/vectors/frames.json")
+data = json.loads(p.read_text())
+for v in data["frames"]:
+    raw = codec.encode(v["header"], v["body_utf8"].encode("utf-8"))
+    if v["hex"] and v["hex"] != raw.hex():
+        raise SystemExit(f"vector {v['name']} hex disagrees with the encoder")
+    v["hex"] = raw.hex()
+p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+print(f"recorded hex for {len(data['frames'])} vectors")
+PY
+```
+
+The script **refuses to overwrite a non-empty hex that disagrees** — the first vector's hex was written by hand, so this run also checks the implementation against an independently-derived value rather than blessing whatever it produced.
+
+- [ ] **Step 7: Run tests to verify they pass**
+
+Run: `.venv/bin/pytest tests/test_bridge_codec.py -v`
+Expected: PASS, 19 passed
+
+- [ ] **Step 8: Run the whole suite**
+
+Run: `.venv/bin/pytest -q`
+Expected: PASS, 131 passed (112 from Plan 1 + 19)
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add docs/bridge-protocol.md tests/vectors/frames.json src/hx/bridge tests/test_bridge_codec.py
+git commit -m "feat(bridge): frame codec, wire protocol, and shared golden vectors"
+```
+
+---
+
+### Task 2: The Java codec, tested against the same vectors
+
+**Files:**
+- Create: `extension/src/hx/bridge/Json.java`
+- Create: `extension/src/hx/bridge/Frame.java`
+- Create: `extension/src/hx/bridge/ConfigBody.java`
+- Create: `extension/test/hx/bridge/CodecTest.java`
+- Create: `extension/build.sh`
+- Create: `extension/test.sh`
+- Modify: `.gitignore` — add `extension/build/`
+
+**Interfaces:**
+- Consumes: `tests/vectors/frames.json` from Task 1 — the same file, read by the Java test
+- Produces:
+  - `hx.bridge.Json.write(Map<String,Object>) -> String`
+  - `hx.bridge.Json.parse(String) -> Map<String,Object>` — flat only; values become `String`, `Long`, `Boolean` or `null`
+  - `hx.bridge.Json.JsonError extends RuntimeException`
+  - `hx.bridge.Frame.encode(Map<String,Object> header, byte[] body) -> byte[]`
+  - `hx.bridge.Frame.decode(byte[] buf) -> Frame.Decoded` with fields `header`, `body`, `consumed`
+  - `hx.bridge.Frame.read(InputStream) -> Frame.Decoded`
+  - `hx.bridge.Frame.Incomplete`, `hx.bridge.Frame.FrameError`
+  - `hx.bridge.ConfigBody.parse(byte[]) -> Map<String,List<String>>`
+  - `hx.bridge.Frame.MAX_FRAME` — `64 * 1024 * 1024`
+
+- [ ] **Step 1: Write the build and test scripts**
+
+```bash
+# extension/build.sh
+#!/usr/bin/env bash
+# Build the hx bridge extension. No Gradle, no Maven, no third-party
+# dependencies: this jar enforces scope against client production systems and
+# its supply chain is deliberately empty.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+MONTOYA="${MONTOYA_JAR:-../../burp-lab/probe/lib/montoya-api.jar}"
+[ -f "$MONTOYA" ] || { echo "montoya-api.jar not found at $MONTOYA (set MONTOYA_JAR)" >&2; exit 1; }
+
+rm -rf build/classes build/hx-bridge.jar
+mkdir -p build/classes
+javac --release 21 -nowarn -Xlint:-options \
+      -cp "$MONTOYA" -d build/classes \
+      $(find src -name '*.java')
+printf 'Manifest-Version: 1.0\nImplementation-Title: hx-bridge\n' > build/MANIFEST.MF
+jar cfm build/hx-bridge.jar build/MANIFEST.MF -C build/classes .
+echo "built $(pwd)/build/hx-bridge.jar"
+```
+
+```bash
+# extension/test.sh
+#!/usr/bin/env bash
+# Run the extension's own tests. A tiny hand-rolled runner: adding JUnit would
+# mean adding a dependency and a build tool, which is what this design avoids.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+MONTOYA="${MONTOYA_JAR:-../../burp-lab/probe/lib/montoya-api.jar}"
+rm -rf build/test-classes
+mkdir -p build/test-classes
+javac --release 21 -nowarn -Xlint:-options \
+      -cp "$MONTOYA" -d build/test-classes \
+      $(find src test -name '*.java')
+java -cp "build/test-classes:$MONTOYA" hx.bridge.CodecTest
+```
+
+```bash
+chmod +x extension/build.sh extension/test.sh
+```
+
+- [ ] **Step 2: Write the failing test**
+
+A hand-rolled runner, because JUnit would be a dependency. It must exit non-zero on failure or the script above silently passes.
+
+```java
+// extension/test/hx/bridge/CodecTest.java
+package hx.bridge;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.util.*;
+
+/** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
+public class CodecTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    static void expectThrows(String what, Class<?> type, Runnable body) {
+        try {
+            body.run();
+            check(what + " (expected " + type.getSimpleName() + ")", false);
+        } catch (Throwable t) {
+            check(what, type.isInstance(t));
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        headerRoundTrip();
+        bodyIsVerbatim();
+        bodyNewlinesDoNotConfuseTheHeaderSplit();
+        incompleteIsDistinctFromCorrupt();
+        oversizedLengthIsRefused();
+        readReassemblesAcrossChunks();
+        readerKeepsCoalescedFrames();
+        readerSurvivesArbitraryChunkBoundaries();
+        readerDistinguishesCleanCloseFromTruncation();
+        readerRejectsAnOversizedPrefixBeforeAllocating();
+        configBody();
+        configBodyResultIsFrozen();
+        goldenVectors();
+        malformedInputsAreRejected();
+        invalidUtf8HeaderIsRejected();
+        pairedSurrogateEqualsRawSupplementaryCharacter();
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    static void headerRoundTrip() {
+        Map<String, Object> h = new LinkedHashMap<>();
+        h.put("v", 1L); h.put("t", "hello"); h.put("pid", 4171L);
+        Frame.Decoded d = Frame.decode(Frame.encode(h, new byte[0]));
+        check("header round trip", d.header.equals(h) && d.body.length == 0);
+    }
+
+    static void bodyIsVerbatim() {
+        byte[] payload = "GET / HTTP/1.1\r\nHost: a\r\n\r\n".getBytes(StandardCharsets.UTF_8);
+        Map<String, Object> h = Map.of("v", 1L, "t", "send", "id", 1L);
+        Frame.Decoded d = Frame.decode(Frame.encode(h, payload));
+        check("body survives verbatim", Arrays.equals(d.body, payload));
+    }
+
+    static void bodyNewlinesDoNotConfuseTheHeaderSplit() {
+        byte[] payload = "\n\n{\"not\":\"a header\"}\n".getBytes(StandardCharsets.UTF_8);
+        Map<String, Object> h = Map.of("v", 1L, "t", "send", "id", 2L);
+        Frame.Decoded d = Frame.decode(Frame.encode(h, payload));
+        check("header ends at the FIRST newline",
+              "send".equals(d.header.get("t")) && Arrays.equals(d.body, payload));
+    }
+
+    static void incompleteIsDistinctFromCorrupt() {
+        byte[] raw = Frame.encode(Map.of("v", 1L, "t", "hello"), "abcdef".getBytes());
+        for (int cut : new int[]{0, 1, 3, 4, raw.length - 1}) {
+            byte[] part = Arrays.copyOf(raw, cut);
+            expectThrows("partial buffer of " + cut + " raises Incomplete",
+                         Frame.Incomplete.class, () -> Frame.decode(part));
+        }
+    }
+
+    static void oversizedLengthIsRefused() {
+        byte[] evil = new byte[6];
+        long tooBig = Frame.MAX_FRAME + 1L;
+        evil[0] = (byte) (tooBig >>> 24); evil[1] = (byte) (tooBig >>> 16);
+        evil[2] = (byte) (tooBig >>> 8);  evil[3] = (byte) tooBig;
+        expectThrows("oversized length prefix refused before allocating",
+                     Frame.FrameError.class, () -> Frame.decode(evil));
+    }
+
+    static void readReassemblesAcrossChunks() throws Exception {
+        byte[] payload = new byte[100_000];
+        new Random(42).nextBytes(payload);
+        byte[] raw = Frame.encode(Map.of("v", 1L, "t", "result", "id", 5L), payload);
+        Frame.Decoded d = new Frame.Reader(new ByteArrayInputStream(raw)).read();
+        check("read() reassembles a large frame", Arrays.equals(d.body, payload));
+    }
+
+    static void readerKeepsCoalescedFrames() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+        byte[] f2 = Frame.encode(Map.of("v", 1L, "t", "halt"), "body".getBytes(StandardCharsets.UTF_8));
+        ByteArrayOutputStream both = new ByteArrayOutputStream();
+        both.write(f1); both.write(f2);
+
+        Frame.Reader r = new Frame.Reader(new ByteArrayInputStream(both.toByteArray()));
+        check("coalesced frame 1", "configure".equals(r.read().header.get("t")));
+        Frame.Decoded second = r.read();
+        // The whole point: a call-local buffer loses this one.
+        check("coalesced frame 2 survives", "halt".equals(second.header.get("t")));
+        check("coalesced frame 2 body intact",
+              "body".equals(new String(second.body, StandardCharsets.UTF_8)));
+    }
+
+    static void readerSurvivesArbitraryChunkBoundaries() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+        byte[] f2 = Frame.encode(Map.of("v", 1L, "t", "halt"), "body".getBytes(StandardCharsets.UTF_8));
+        ByteArrayOutputStream three = new ByteArrayOutputStream();
+        three.write(f1); three.write(f2); three.write(f1);
+        final byte[] all = three.toByteArray();
+
+        InputStream sevenAtATime = new InputStream() {
+            int i = 0;
+            public int read() { return i < all.length ? (all[i++] & 0xff) : -1; }
+            public int read(byte[] b, int off, int l) {
+                if (i >= all.length) return -1;
+                int n = Math.min(7, Math.min(l, all.length - i));
+                System.arraycopy(all, i, b, off, n); i += n; return n;
+            }
+        };
+        Frame.Reader r = new Frame.Reader(sevenAtATime);
+        check("7-byte chunks: frame 1", "configure".equals(r.read().header.get("t")));
+        check("7-byte chunks: frame 2", "halt".equals(r.read().header.get("t")));
+        check("7-byte chunks: frame 3", "configure".equals(r.read().header.get("t")));
+    }
+
+    static void readerDistinguishesCleanCloseFromTruncation() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+
+        Frame.Reader clean = new Frame.Reader(new ByteArrayInputStream(f1));
+        clean.read();
+        boolean ok = false;
+        try { clean.read(); } catch (Frame.PeerClosed e) { ok = "peer closed".equals(e.getMessage()); }
+        check("clean close at a frame boundary is not an error condition", ok);
+
+        byte[] truncated = Arrays.copyOfRange(f1, 0, f1.length - 3);
+        ok = false;
+        try { new Frame.Reader(new ByteArrayInputStream(truncated)).read(); }
+        catch (Frame.PeerClosed e) { ok = "peer closed mid-frame".equals(e.getMessage()); }
+        check("a truncated frame is reported as mid-frame", ok);
+    }
+
+    static void readerRejectsAnOversizedPrefixBeforeAllocating() throws Exception {
+        byte[] huge = new byte[] {(byte) 0x7f, (byte) 0xff, (byte) 0xff, (byte) 0xff, 'x'};
+        boolean ok = false;
+        try { new Frame.Reader(new ByteArrayInputStream(huge)).read(); }
+        catch (Frame.FrameError e) { ok = e.getMessage().contains("exceeds MAX_FRAME"); }
+        check("oversized length prefix rejected before allocation", ok);
+    }
+
+    static void configBody() {
+        byte[] body = ("scope.include\thttps://a/*\nscope.include\thttps://b/*\n"
+                     + "limit.rate_rps\t5\n").getBytes(StandardCharsets.UTF_8);
+        Map<String, List<String>> got = ConfigBody.parse(body);
+        check("config repeated keys accumulate in order",
+              got.get("scope.include").equals(List.of("https://a/*", "https://b/*")));
+        check("config single value", got.get("limit.rate_rps").equals(List.of("5")));
+        expectThrows("unrecognised config key is an error", Frame.FrameError.class,
+                     () -> ConfigBody.parse("scope.includ\tx\n".getBytes(StandardCharsets.UTF_8)));
+        expectThrows("config line without a tab is an error", Frame.FrameError.class,
+                     () -> ConfigBody.parse("scope.include x\n".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /** ConfigBody.parse() is the only producer of the map BridgeClient hands
+     *  out via authorisation()/scopeConfig(). A holder that could widen it in
+     *  place would be authorising itself for a scope no configure frame ever
+     *  set -- no epoch bump, no log line. Both levels must be frozen: the
+     *  outer map AND every inner list. */
+    static void configBodyResultIsFrozen() {
+        byte[] body = "scope.include\thttps://a/*\n".getBytes(StandardCharsets.UTF_8);
+        // A fresh parse per assertion. Sharing one map lets the first
+        // assertion corrupt the second: if the outer map is NOT frozen, the
+        // put() succeeds and replaces the value with an immutable List.of(),
+        // so the inner-list assertion then passes for entirely the wrong
+        // reason and the failure output points at one level when both are
+        // broken.
+        Map<String, List<String>> outer = ConfigBody.parse(body);
+        expectThrows("the map itself rejects mutation", UnsupportedOperationException.class,
+                     () -> outer.put("scope.include", List.of("https://evil/*")));
+
+        Map<String, List<String>> inner = ConfigBody.parse(body);
+        expectThrows("an inner list rejects mutation", UnsupportedOperationException.class,
+                     () -> inner.get("scope.include").add("https://evil/*"));
+    }
+
+    /** The vectors Python recorded. If these disagree, the two codecs have drifted. */
+    static void goldenVectors() throws Exception {
+        Path p = Path.of("..", "tests", "vectors", "frames.json");
+        String text = Files.readString(p, StandardCharsets.UTF_8);
+        List<Map<String, Object>> frames = MiniVectorReader.frames(text);
+        check("vectors file has frames", !frames.isEmpty());
+        for (Map<String, Object> v : frames) {
+            String name = (String) v.get("name");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> header = (Map<String, Object>) v.get("header");
+            byte[] body = ((String) v.get("body_utf8")).getBytes(StandardCharsets.UTF_8);
+            String wantHex = (String) v.get("hex");
+
+            String gotHex = hex(Frame.encode(header, body));
+            check("vector " + name + " encodes to the recorded bytes", gotHex.equals(wantHex));
+
+            Frame.Decoded d = Frame.decode(unhex(wantHex));
+            check("vector " + name + " decodes to the recorded header", d.header.equals(header));
+            check("vector " + name + " decodes to the recorded body", Arrays.equals(d.body, body));
+        }
+    }
+
+    /**
+     * Well-formed vectors can only pin agreement on what is VALID. They say
+     * nothing about whether both sides reject the same hostile input the same
+     * way -- which is exactly how a NumberFormatException escaped Frame.decode
+     * in the first place. This pins rejection too, on both Json.parse directly
+     * and on Frame.decode once the same text is wrapped in a real frame.
+     */
+    static void malformedInputsAreRejected() throws Exception {
+        Path p = Path.of("..", "tests", "vectors", "malformed.json");
+        String text = Files.readString(p, StandardCharsets.UTF_8);
+        List<Map<String, Object>> cases = MalformedVectorReader.cases(text);
+        check("malformed vectors file has cases", !cases.isEmpty());
+        for (Map<String, Object> c : cases) {
+            String name = (String) c.get("name");
+            String headerText = (String) c.get("header_text");
+
+            expectThrows("malformed " + name + ": Json.parse rejects it",
+                         Json.JsonError.class, () -> Json.parse(headerText));
+
+            byte[] raw = rawFrame(headerText.getBytes(StandardCharsets.UTF_8));
+            expectThrows("malformed " + name + ": Frame.decode rejects it wrapped in a frame",
+                         Frame.FrameError.class, () -> Frame.decode(raw));
+        }
+    }
+
+    /**
+     * Java's default decoder REPLACES malformed bytes with U+FFFD instead of
+     * raising, silently accepting a frame Python rejects outright. Frame.decode
+     * therefore decodes the header STRICTLY, and this is the check that pins it.
+     *
+     * The bad byte has to sit INSIDE an otherwise well-formed header for the
+     * check to be able to fail. This one guarded the strict decoder with
+     * {0xC3, 0x28} alone, which is not JSON under EITHER decoding: Json.parse
+     * threw regardless, so replacing the CharsetDecoder with a lenient
+     * `new String(...)` still printed ok. Measured.
+     *
+     * Direction matters, which is why this is worth pinning at all. On
+     * 000000147b2276223a312c2274223a2268656cff6f227d0a:
+     *
+     *   JAVA lenient : ACCEPTED   t = "hel\uFFFDo"
+     *   JAVA strict  : REJECTED   header bytes are not valid UTF-8
+     *   PYTHON       : REJECTED   'utf-8' codec can't decode byte 0xff
+     *
+     * Strict means FrameError, which trips readLoop()'s finally and denyAll().
+     * Lenient means a mangled `t` falls through to
+     * `default -> error(f, "unknown_frame"); return true` and the connection
+     * CARRIES ON under the standing scope -- on a frame the harness would
+     * never have accepted.
+     */
+    static void invalidUtf8HeaderIsRejected() {
+        // {"v":1,"t":"hel<0xFF>o"} -- valid JSON with both required fields the
+        // moment 0xFF is leniently replaced by U+FFFD, so a lenient decode is
+        // ACCEPTED here rather than dying in the parser.
+        byte[] inside = new byte[] {
+            '{', '"', 'v', '"', ':', '1', ',', '"', 't', '"', ':', '"',
+            'h', 'e', 'l', (byte) 0xFF, 'o', '"', '}'
+        };
+        byte[] rawInside = rawFrame(inside);
+        expectThrows("invalid UTF-8 INSIDE an otherwise valid header raises FrameError, "
+                     + "not a U+FFFD-mangled frame type",
+                     Frame.FrameError.class, () -> Frame.decode(rawInside));
+
+        // Kept as well: 0xC3 starts a 2-byte sequence that must be followed by
+        // a continuation byte (0x80-0xBF), and 0x28 '(' is not one. This one
+        // cannot distinguish strict from lenient on its own -- see above -- but
+        // it costs nothing and pins the truncated-sequence shape too.
+        byte[] bad = new byte[] { (byte) 0xC3, 0x28 };
+        byte[] raw = rawFrame(bad);
+        expectThrows("invalid UTF-8 header (0xC3 0x28) raises FrameError, not U+FFFD",
+                     Frame.FrameError.class, () -> Frame.decode(raw));
+    }
+
+    /**
+     * A supplementary character is legally encoded in JSON as a PAIR of \\u
+     * escapes -- exactly what json.dumps emits by default (ensure_ascii=True)
+     * -- and separately as a raw UTF-8 character, which is what our own
+     * codec emits (ensure_ascii=False). Both must parse to the identical
+     * Java string, or a peer that switches encoding style produces a frame
+     * this side reads differently -- or not at all.
+     */
+    static void pairedSurrogateEqualsRawSupplementaryCharacter() {
+        // Escaped form: a literal \\u83d\\ude00 pair IN THE JSON TEXT, for
+        // Json.parse's own escape handling to combine at runtime. (Double
+        // backslashes here so javac leaves the backslash in the string --
+        // a single \\u escape would be consumed by the COMPILER instead.)
+        Map<String, Object> escaped = Json.parse("{\"v\":1,\"t\":\"x\",\"a\":\"\\ud83d\\ude00\"}");
+        // Unescaped form: javac's OWN \\u processing embeds the actual
+        // surrogate pair directly into this Java string literal at compile
+        // time -- equivalent to typing the raw emoji glyph in UTF-8 source.
+        Map<String, Object> raw = Json.parse("{\"v\":1,\"t\":\"x\",\"a\":\"😀\"}");
+        check("escaped surrogate pair equals the raw supplementary character",
+              escaped.equals(raw) && "😀".equals(escaped.get("a")));
+    }
+
+    /** [4-byte BE length][headerBytes]\n -- built by hand so a header that is
+     * not valid JSON (most of malformed.json isn't) can still be wrapped in a
+     * real frame; Frame.encode itself would refuse to write such a header. */
+    static byte[] rawFrame(byte[] headerBytes) {
+        byte[] payload = new byte[headerBytes.length + 1];
+        System.arraycopy(headerBytes, 0, payload, 0, headerBytes.length);
+        payload[headerBytes.length] = '\n';
+        int len = payload.length;
+        byte[] raw = new byte[4 + len];
+        raw[0] = (byte) (len >>> 24); raw[1] = (byte) (len >>> 16);
+        raw[2] = (byte) (len >>> 8);  raw[3] = (byte) len;
+        System.arraycopy(payload, 0, raw, 4, len);
+        return raw;
+    }
+
+    static String hex(byte[] b) {
+        StringBuilder s = new StringBuilder();
+        for (byte x : b) s.append(String.format("%02x", x));
+        return s.toString();
+    }
+
+    static byte[] unhex(String s) {
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++)
+            out[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
+        return out;
+    }
+}
+```
+
+The vectors file is JSON with one level of nesting, which `Json.parse` deliberately cannot read. Write a 40-line reader for exactly that shape:
+
+```java
+// extension/test/hx/bridge/MiniVectorReader.java
+package hx.bridge;
+
+import java.util.*;
+
+/**
+ * Reads tests/vectors/frames.json. Json.parse handles only flat objects by
+ * design, and each vector entry nests a "header" object one level deep, so
+ * this reader carves the header substring out and parses it on its own (it
+ * IS flat by itself), then parses the rest of the entry -- with a string
+ * placeholder standing in for the header -- through the same flat parser.
+ * Widening Json.parse to accept nesting, just to satisfy a test, is the
+ * wrong trade.
+ */
+final class MiniVectorReader {
+
+    static List<Map<String, Object>> frames(String text) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        int i = text.indexOf("\"frames\"");
+        if (i < 0) throw new IllegalArgumentException("no frames key");
+        int depth = 0;
+        int objStart = -1;
+        for (int p = text.indexOf('[', i); p < text.length(); p++) {
+            char c = text.charAt(p);
+            if (c == '"') { p = skipString(text, p); continue; }
+            if (c == '{') { if (depth == 0) objStart = p; depth++; }
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) out.add(parseEntry(text.substring(objStart, p + 1)));
+            } else if (c == ']' && depth == 0) break;
+        }
+        return out;
+    }
+
+    /**
+     * A frame entry is flat except for its one nested "header" object. Carve
+     * the header out, parse it on its own, and parse the remainder -- with a
+     * string placeholder standing in for header -- with the same flat parser.
+     */
+    private static Map<String, Object> parseEntry(String entry) {
+        int hk = entry.indexOf("\"header\"");
+        if (hk < 0) throw new IllegalArgumentException("frame entry has no header: " + entry);
+        int hStart = entry.indexOf('{', hk);
+        int hEnd = matchBrace(entry, hStart);
+        Map<String, Object> header = Json.parse(entry.substring(hStart, hEnd + 1));
+
+        String flattened = entry.substring(0, hStart) + "\"\"" + entry.substring(hEnd + 1);
+        Map<String, Object> out = new LinkedHashMap<>(Json.parse(flattened));
+        out.put("header", header);
+        return out;
+    }
+
+    private static int matchBrace(String s, int open) {
+        int depth = 0;
+        for (int p = open; p < s.length(); p++) {
+            char c = s.charAt(p);
+            if (c == '"') { p = skipString(s, p); continue; }
+            if (c == '{') depth++;
+            else if (c == '}') { depth--; if (depth == 0) return p; }
+        }
+        throw new IllegalArgumentException("unterminated object");
+    }
+
+    private static int skipString(String s, int start) {
+        for (int p = start + 1; p < s.length(); p++) {
+            if (s.charAt(p) == '\\') { p++; continue; }
+            if (s.charAt(p) == '"') return p;
+        }
+        throw new IllegalArgumentException("unterminated string");
+    }
+}
+```
+And its sibling, which the same `CodecTest` needs and which no step ever
+introduced -- the repo has carried it since Task 2:
+
+```java
+// extension/test/hx/bridge/MalformedVectorReader.java
+package hx.bridge;
+
+import java.util.*;
+
+/**
+ * Reads tests/vectors/malformed.json. Unlike frames.json, every case object
+ * here is flat -- name, header_text and why are all plain strings -- so the
+ * ordinary flat Json.parse can read each case directly; only the outer
+ * "cases" array needs a hand-rolled boundary scan.
+ */
+final class MalformedVectorReader {
+
+    static List<Map<String, Object>> cases(String text) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        int i = text.indexOf("\"cases\"");
+        if (i < 0) throw new IllegalArgumentException("no cases key");
+        int depth = 0;
+        int objStart = -1;
+        for (int p = text.indexOf('[', i); p < text.length(); p++) {
+            char c = text.charAt(p);
+            if (c == '"') { p = skipString(text, p); continue; }
+            if (c == '{') { if (depth == 0) objStart = p; depth++; }
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) out.add(Json.parse(text.substring(objStart, p + 1)));
+            } else if (c == ']' && depth == 0) break;
+        }
+        return out;
+    }
+
+    private static int skipString(String s, int start) {
+        for (int p = start + 1; p < s.length(); p++) {
+            if (s.charAt(p) == '\\') { p++; continue; }
+            if (s.charAt(p) == '"') return p;
+        }
+        throw new IllegalArgumentException("unterminated string");
+    }
+}
+```
+
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `cd extension && ./test.sh`
+Expected: FAIL — compilation error, `cannot find symbol: class Frame`
+
+- [ ] **Step 4: Write `Json.java`**
+
+```java
+// extension/src/hx/bridge/Json.java
+package hx.bridge;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * A JSON reader and writer for FLAT objects only.
+ *
+ * Values may be string, integer, boolean or null -- no nested objects, no
+ * arrays. That is not a shortcut, it is the contract: the bridge header schema
+ * is flat precisely so this parser stays small enough to be obviously correct,
+ * and structured payloads travel in the frame body instead. A nested value is
+ * rejected loudly rather than half-parsed.
+ */
+public final class Json {
+
+    public static class JsonError extends RuntimeException {
+        public JsonError(String m) { super(m); }
+    }
+
+    private Json() { }
+
+    // ---- writing ----------------------------------------------------
+
+    public static String write(Map<String, Object> obj) {
+        StringBuilder s = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, Object> e : obj.entrySet()) {
+            if (!first) s.append(',');
+            first = false;
+            writeString(s, e.getKey());
+            s.append(':');
+            writeValue(s, e.getValue());
+        }
+        return s.append('}').toString();
+    }
+
+    private static void writeValue(StringBuilder s, Object v) {
+        if (v == null) { s.append("null"); return; }
+        if (v instanceof String str) { writeString(s, str); return; }
+        if (v instanceof Boolean b) { s.append(b ? "true" : "false"); return; }
+        if (v instanceof Integer || v instanceof Long) { s.append(v); return; }
+        throw new JsonError("header must be flat; cannot write " + v.getClass().getName());
+    }
+
+    private static void writeString(StringBuilder s, String v) {
+        s.append('"');
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            switch (c) {
+                case '"'  -> s.append("\\\"");
+                case '\\' -> s.append("\\\\");
+                case '\n' -> s.append("\\n");
+                case '\r' -> s.append("\\r");
+                case '\t' -> s.append("\\t");
+                case '\b' -> s.append("\\b");
+                case '\f' -> s.append("\\f");
+                default -> {
+                    if (c < 0x20) s.append(String.format("\\u%04x", (int) c));
+                    else s.append(c);
+                }
+            }
+        }
+        s.append('"');
+    }
+
+    // ---- parsing ----------------------------------------------------
+
+    public static Map<String, Object> parse(String text) {
+        P p = new P(text);
+        Map<String, Object> out = parseObject(p);
+        p.ws();
+        // Python's json.loads raises "Extra data" here. Accepting it would let a
+        // crafted frame be valid on one side of the bridge and not the other.
+        if (p.i != text.length())
+            throw new JsonError("trailing data after the header object at " + p.i);
+        return out;
+    }
+
+    private static Map<String, Object> parseObject(P p) {
+        p.ws();
+        p.expect('{');
+        Map<String, Object> out = new LinkedHashMap<>();
+        p.ws();
+        if (p.peek() == '}') { p.next(); return out; }
+        while (true) {
+            p.ws();
+            String key = p.string();
+            p.ws();
+            p.expect(':');
+            p.ws();
+            out.put(key, p.value());
+            p.ws();
+            char c = p.next();
+            if (c == '}') return out;
+            if (c != ',') throw new JsonError("expected ',' or '}' at " + p.i);
+        }
+    }
+
+    private static final class P {
+        final String s;
+        int i = 0;
+        P(String s) { this.s = s; }
+
+        char peek() {
+            if (i >= s.length()) throw new JsonError("unexpected end of input");
+            return s.charAt(i);
+        }
+
+        char next() { char c = peek(); i++; return c; }
+
+        void expect(char c) {
+            char got = next();
+            if (got != c) throw new JsonError("expected '" + c + "' but found '" + got + "' at " + (i - 1));
+        }
+
+        void ws() { while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++; }
+
+        String string() {
+            expect('"');
+            StringBuilder b = new StringBuilder();
+            while (true) {
+                char c = next();
+                if (c == '"') return b.toString();
+                if (c < 0x20)
+                    // RFC 8259 forbids raw control characters in a string, and
+                    // Python's json.loads rejects them. Accepting them here
+                    // would let a frame be valid on one side of the bridge only.
+                    throw new JsonError(
+                        String.format("raw control character U+%04X in string", (int) c));
+                if (c != '\\') { b.append(c); continue; }
+                char esc = next();
+                switch (esc) {
+                    case '"'  -> b.append('"');
+                    case '\\' -> b.append('\\');
+                    case '/'  -> b.append('/');
+                    case 'n'  -> b.append('\n');
+                    case 'r'  -> b.append('\r');
+                    case 't'  -> b.append('\t');
+                    case 'b'  -> b.append('\b');
+                    case 'f'  -> b.append('\f');
+                    case 'u'  -> {
+                        if (i + 4 > s.length()) throw new JsonError("truncated \\u escape");
+                        String hex = s.substring(i, i + 4);
+                        for (int k = 0; k < 4; k++) {
+                            char hc = hex.charAt(k);
+                            boolean isHex = (hc >= '0' && hc <= '9')
+                                         || (hc >= 'a' && hc <= 'f') || (hc >= 'A' && hc <= 'F');
+                            // Integer.parseInt would throw NumberFormatException, which
+                            // escapes Frame.decode's catch of JsonError entirely.
+                            if (!isHex) throw new JsonError("bad hex in \\u escape: " + hex);
+                        }
+                        char u = (char) Integer.parseInt(hex, 16);
+                        i += 4;
+                        // A supplementary character is legally encoded as a PAIR of
+                        // \\u escapes, and json.dumps emits exactly that by default
+                        // (ensure_ascii=True). Rejecting a high surrogate outright
+                        // would refuse spec-legal frames. Only an UNPAIRED surrogate
+                        // is invalid -- it survives parsing and Java's UTF-8 encoder
+                        // then silently writes it as '?', where Python raises.
+                        if (Character.isHighSurrogate(u)) {
+                            if (i + 6 > s.length() || s.charAt(i) != '\\' || s.charAt(i + 1) != 'u')
+                                throw new JsonError("unpaired high surrogate: " + hex);
+                            String lowHex = s.substring(i + 2, i + 6);
+                            for (int k = 0; k < 4; k++) {
+                                char hc = lowHex.charAt(k);
+                                if (!((hc >= '0' && hc <= '9') || (hc >= 'a' && hc <= 'f')
+                                        || (hc >= 'A' && hc <= 'F')))
+                                    throw new JsonError("bad hex in low surrogate: " + lowHex);
+                            }
+                            char low = (char) Integer.parseInt(lowHex, 16);
+                            if (!Character.isLowSurrogate(low))
+                                throw new JsonError("high surrogate not followed by a low one: " + lowHex);
+                            b.append(u).append(low);
+                            i += 6;
+                        } else if (Character.isLowSurrogate(u)) {
+                            throw new JsonError("unpaired low surrogate: " + hex);
+                        } else {
+                            b.append(u);
+                        }
+                    }
+                    default -> throw new JsonError("bad escape \\" + esc);
+                }
+            }
+        }
+
+        Object value() {
+            char c = peek();
+            if (c == '"') return string();
+            if (c == '{' || c == '[')
+                throw new JsonError("header must be flat; nested values are not supported");
+            if (s.startsWith("true", i))  { i += 4; return Boolean.TRUE; }
+            if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }
+            if (s.startsWith("null", i))  { i += 4; return null; }
+            int start = i;
+            if (c == '-') i++;
+            int digits = i;
+            while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+            if (i == digits) throw new JsonError("no digits in number at " + start);
+            if (i < s.length() && (s.charAt(i) == '.' || s.charAt(i) == 'e' || s.charAt(i) == 'E'))
+                throw new JsonError("header numbers must be integers");
+            String lit = s.substring(start, i);
+            // Python rejects leading zeros; accepting them here would let the two
+            // sides disagree on whether a frame is valid.
+            if (lit.length() > (lit.startsWith("-") ? 2 : 1)
+                    && lit.charAt(lit.startsWith("-") ? 1 : 0) == '0')
+                throw new JsonError("leading zeros are not valid JSON: " + lit);
+            try {
+                // Long.parseLong throws NumberFormatException, which is NOT a
+                // JsonError and would escape Frame.decode's catch clause.
+                return Long.parseLong(lit);
+            } catch (NumberFormatException e) {
+                throw new JsonError("integer out of 64-bit range: " + lit);
+            }
+        }
+    }
+}
+```
+
+- [ ] **Step 5: Write `Frame.java` and `ConfigBody.java`**
+
+```java
+// extension/src/hx/bridge/Frame.java
+package hx.bridge;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Map;
+
+/** [4-byte BE length][header JSON]\n[body bytes] */
+public final class Frame {
+
+    public static final int MAX_FRAME = 64 * 1024 * 1024;
+
+    /** The buffer holds less than one whole frame. Normal on a stream socket. */
+    public static class Incomplete extends RuntimeException {
+        public Incomplete(String m) { super(m); }
+    }
+
+    /** The bytes are not a valid frame. */
+    public static class FrameError extends RuntimeException {
+        public FrameError(String m) { super(m); }
+    }
+
+    public static final class Decoded {
+        public final Map<String, Object> header;
+        public final byte[] body;
+        public final int consumed;
+        Decoded(Map<String, Object> header, byte[] body, int consumed) {
+            this.header = header; this.body = body; this.consumed = consumed;
+        }
+    }
+
+    private Frame() { }
+
+    public static byte[] encode(Map<String, Object> header, byte[] body) {
+        byte[] head = Json.write(header).getBytes(StandardCharsets.UTF_8);
+        int length = head.length + 1 + body.length;
+        if (length > MAX_FRAME) throw new FrameError("frame of " + length + " exceeds MAX_FRAME");
+        byte[] out = new byte[4 + length];
+        out[0] = (byte) (length >>> 24); out[1] = (byte) (length >>> 16);
+        out[2] = (byte) (length >>> 8);  out[3] = (byte) length;
+        System.arraycopy(head, 0, out, 4, head.length);
+        out[4 + head.length] = '\n';
+        System.arraycopy(body, 0, out, 5 + head.length, body.length);
+        return out;
+    }
+
+    public static Decoded decode(byte[] buf) {
+        if (buf.length < 4) throw new Incomplete("need a length prefix");
+        long length = ((long) (buf[0] & 0xff) << 24) | ((buf[1] & 0xff) << 16)
+                    | ((buf[2] & 0xff) << 8) | (buf[3] & 0xff);
+        // Checked BEFORE any allocation: the prefix is attacker-influenced.
+        if (length > MAX_FRAME) throw new FrameError("declared frame of " + length + " exceeds MAX_FRAME");
+        int end = (int) (4 + length);
+        if (buf.length < end) throw new Incomplete("need " + end + " bytes, have " + buf.length);
+
+        int nl = -1;
+        for (int i = 4; i < end; i++) if (buf[i] == '\n') { nl = i; break; }
+        if (nl < 0) throw new FrameError("header has no newline terminator");
+
+        String headerText;
+        try {
+            // Java's default decoder REPLACES malformed bytes with U+FFFD, silently
+            // accepting a frame Python rejects outright. Decode strictly instead.
+            headerText = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(buf, 4, nl - 4))
+                    .toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            throw new FrameError("header bytes are not valid UTF-8: " + e.getMessage());
+        }
+        Map<String, Object> header;
+        try {
+            header = Json.parse(headerText);
+        } catch (Json.JsonError e) {
+            throw new FrameError("header is not valid JSON: " + e.getMessage());
+        }
+        return new Decoded(header, Arrays.copyOfRange(buf, nl + 1, end), end);
+    }
+
+    /** Peer closed the connection. Distinct from Incomplete, which means
+     *  "call again with more bytes". */
+    public static class PeerClosed extends RuntimeException {
+        public PeerClosed(String m) { super(m); }
+    }
+
+    /**
+     * Reads frames from a stream, owning the buffer across calls.
+     *
+     * A bare read(InputStream) cannot be correct in a loop. decode() reports
+     * `consumed` precisely because one read may deliver more than one frame,
+     * and a method that returns after the first frame has nowhere to put the
+     * remainder -- so it drops it, and the loss surfaces later as a misleading
+     * "peer closed mid-frame". Owning the buffer is that somewhere. This
+     * mirrors codec.FrameReader on the Python side, including reading the
+     * length prefix first so draining a large frame is linear rather than
+     * re-parsing a growing buffer once per chunk.
+     *
+     * A Reader belongs to exactly one thread. It is not merely unsynchronised:
+     * `buf` and the hoisted `chunk` are per-Reader staging, so two concurrent
+     * read() calls scribble over each other's bytes.
+     */
+    public static final class Reader {
+        private final InputStream in;
+        private byte[] buf = new byte[0];
+        private int len = 0;                       // bytes of buf actually in use
+
+        public Reader(InputStream in) { this.in = in; }
+
+        private final byte[] chunk = new byte[65536];   // one per Reader, not per call
+
+        public Decoded read() throws IOException {
+            while (true) {
+                if (len >= 4) {
+                    long length = ((long) (buf[0] & 0xff) << 24) | ((buf[1] & 0xff) << 16)
+                                | ((buf[2] & 0xff) << 8) | (buf[3] & 0xff);
+                    // Checked before allocation: the prefix is attacker-influenced.
+                    if (length > MAX_FRAME)
+                        throw new FrameError("declared frame of " + length
+                                             + " exceeds MAX_FRAME " + MAX_FRAME);
+                    int end = (int) (4 + length);
+                    if (len >= end) {
+                        Decoded d = decode(Arrays.copyOfRange(buf, 0, end));
+                        System.arraycopy(buf, d.consumed, buf, 0, len - d.consumed);
+                        len -= d.consumed;
+                        // One 64 MB frame must not pin 64 MB for the life of
+                        // the connection -- but shrinking to 64 KB after every
+                        // ordinary frame is worse than the leak it prevents:
+                        // Plan 3's `exchange` frames carry HTTP bodies, and 200
+                        // x 2 MB measured 206 ms of drop-and-re-double against
+                        // 122 ms with this hysteresis. Trigger well above the
+                        // working set, and never shrink below 1 MB.
+                        if (buf.length > (1 << 22) && len < (buf.length >>> 2))
+                            buf = Arrays.copyOf(buf, Math.max(len, 1 << 20));
+                        return d;
+                    }
+                }
+                int n = in.read(chunk);
+                if (n < 0) throw new PeerClosed(len > 0 ? "peer closed mid-frame" : "peer closed");
+                if (len + n > buf.length)
+                    buf = Arrays.copyOf(buf, Math.max(len + n, Math.max(1024, buf.length * 2)));
+                System.arraycopy(chunk, 0, buf, len, n);
+                len += n;
+            }
+        }
+    }
+}
+```
+
+```java
+// extension/src/hx/bridge/ConfigBody.java
+package hx.bridge;
+
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+/**
+ * The `configure` body: key<TAB>value lines, repeated keys accumulating in
+ * order. Not JSON, because a flat JSON parser cannot express the nested scope
+ * and limit configuration and widening the parser is the wrong trade.
+ */
+public final class ConfigBody {
+
+    public static final Set<String> KEYS = Set.of(
+        "scope.include", "scope.exclude", "dangerous.path", "method.allow",
+        "limit.rate_rps", "limit.concurrency", "limit.max_requests", "render.allow"
+    );
+
+    private ConfigBody() { }
+
+    public static Map<String, List<String>> parse(byte[] body) {
+        Map<String, List<String>> out = new LinkedHashMap<>();
+        for (String line : new String(body, StandardCharsets.UTF_8).split("\n", -1)) {
+            if (line.isEmpty()) continue;
+            int tab = line.indexOf('\t');
+            if (tab < 0) throw new Frame.FrameError("config line has no tab separator: " + line);
+            String key = line.substring(0, tab);
+            if (!KEYS.contains(key))
+                // Silently ignoring a key the sender believed it set is how a
+                // scope rule goes missing.
+                throw new Frame.FrameError("unrecognised config key: " + key);
+            out.computeIfAbsent(key, k -> new ArrayList<>()).add(line.substring(tab + 1));
+        }
+        // parse() is the ONLY producer of a Map<String, List<String>> that
+        // BridgeClient hands out (authorisation().scope() / scopeConfig()),
+        // and nothing downstream mutates it after this call returns. Freeze
+        // it here so that invariant holds by construction rather than by
+        // convention: a holder that widened scope in place would authorise
+        // requests under a scope no configure frame ever set, no epoch bump
+        // and no log line to show for it.
+        //
+        // Both levels are needed: Map.copyOf alone would leave each inner
+        // ArrayList mutable, and mutating a scope list in place authorises a
+        // scope no configure frame ever set -- no epoch bump, no log line.
+        //
+        // The outer wrapper is unmodifiableMap over a LinkedHashMap rather
+        // than Map.copyOf so that ITERATION order survives. Be clear about
+        // what does and does not depend on that: CodecTest's "repeated keys
+        // accumulate in order" asserts on the inner List, which List.copyOf
+        // preserves either way -- swapping in Map.copyOf keeps the whole suite
+        // green. Nothing tests map iteration order. It is preserved here
+        // because a config's key order is the operator's, and an unordered
+        // rendering of someone's scope in a report is a defect no test will
+        // catch for you.
+        Map<String, List<String>> frozen = new LinkedHashMap<>();
+        out.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
+        return Collections.unmodifiableMap(frozen);
+    }
+}
+```
+
+- [ ] **Step 6: Run the test to verify it passes**
+
+Run: `cd extension && ./test.sh`
+Expected: every line `ok`, final line `ALL PASS`, exit 0
+
+- [ ] **Step 7: Verify the build produces a jar**
+
+Run: `cd extension && ./build.sh && unzip -l build/hx-bridge.jar | tail -5`
+Expected: `hx/bridge/Json.class`, `Frame.class`, `ConfigBody.class` present
+
+- [ ] **Step 8: Prove the runner actually fails on a failure**
+
+A hand-rolled test runner that cannot fail is worse than no runner. Confirm it before trusting it:
+
+```bash
+cd extension
+sed -i 's/check("header round trip", d.header.equals(h)/check("header round trip", !d.header.equals(h)/' test/hx/bridge/CodecTest.java
+./test.sh; echo "exit=$?"      # expect a FAIL line and exit=1
+sed -i 's/check("header round trip", !d.header.equals(h)/check("header round trip", d.header.equals(h)/' test/hx/bridge/CodecTest.java
+./test.sh; echo "exit=$?"      # expect ALL PASS and exit=0
+```
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add extension .gitignore
+git commit -m "feat(bridge): zero-dependency Java codec, tested against the shared vectors"
+```
+
+---
+
+### Task 3: The Python bridge server
+
+**Files:**
+- Create: `src/hx/bridge/server.py`
+- Test: `tests/test_bridge_server.py`
+
+**Interfaces:**
+- Consumes: `hx.bridge.codec` (Task 1)
+- Produces:
+  - `hx.bridge.server.BridgeServer(socket_path: Path, engagement_id: str, on_hello=None)`
+  - `BridgeServer.start()` / `BridgeServer.stop()`
+  - `BridgeServer.socket_path: Path`
+  - `BridgeServer.state: str` — `"waiting" | "connected" | "configured" | "halted"`
+  - `BridgeServer.config_epoch: int`
+  - `BridgeServer.configure(pairs: dict[str, list[str]], scope_sha256: str, profile: str) -> int` — returns the acknowledged epoch
+  - `BridgeServer.halt(reason: str)` / `BridgeServer.resume()`
+  - `hx.bridge.server.BridgeError(Exception)`
+  - `hx.bridge.server.socket_path_for(engagement_id: str) -> Path` — `$XDG_RUNTIME_DIR/hx/<engagement>-<random>.sock`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_bridge_server.py
+import os
+import socket
+import stat
+import struct
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from hx.bridge import codec, server
+
+
+@pytest.fixture
+def srv(tmp_path):
+    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1")
+    s.start()
+    yield s
+    s.stop()
+
+
+def _client(path):
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.connect(str(path))
+    # Every blocking read in this file -- thirteen of them, bare c.recv() and
+    # codec.FrameReader(c).read() alike -- goes through this helper. Without a
+    # timeout, a server that never answers HANGS the run rather than failing
+    # it: deleting the SO_PEERCRED uid check was measured wedging pytest
+    # indefinitely. Sabotage is this project's review method, so a defect that
+    # cannot report itself is a real cost.
+    c.settimeout(5)
+    return c
+
+
+def _connected(srv):
+    """Drive srv to state 'connected' and return the live client socket."""
+    c = _client(srv.socket_path)
+    c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                            "pid": 1, "burp_version": "x",
+                            "instance_id": "i-1", "engagement_id": "e-1"}))
+    deadline = time.time() + 5
+    while srv.state != "connected" and time.time() < deadline:
+        time.sleep(0.005)
+    assert srv.state == "connected"
+    return c
+
+
+def test_socket_and_directory_permissions(tmp_path):
+    s = server.BridgeServer(tmp_path / "sub" / "b.sock", engagement_id="e-1")
+    s.start()
+    try:
+        assert stat.S_IMODE(s.socket_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(s.socket_path.parent.stat().st_mode) == 0o700
+    finally:
+        s.stop()
+
+
+def test_stop_unlinks_the_socket(tmp_path):
+    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1")
+    s.start()
+    path = s.socket_path
+    assert path.exists()
+    s.stop()
+    assert not path.exists()
+
+
+def test_refuses_to_start_if_the_path_already_exists(tmp_path):
+    p = tmp_path / "b.sock"
+    p.write_text("squatter")
+    s = server.BridgeServer(p, engagement_id="e-1")
+    with pytest.raises(server.BridgeError, match="exists"):
+        s.start()
+
+
+def test_socket_path_for_uses_a_fresh_random_basename():
+    a = server.socket_path_for("e-1")
+    b = server.socket_path_for("e-1")
+    assert a != b
+    assert "e-1" in a.name and a.name.endswith(".sock")
+
+
+def test_hello_moves_state_to_connected(srv):
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                "pid": os.getpid(), "burp_version": "2026.7.3",
+                                "instance_id": "i-1", "engagement_id": "e-1"}))
+        deadline = time.time() + 5
+        while srv.state != "connected" and time.time() < deadline:
+            time.sleep(0.01)
+        assert srv.state == "connected"
+    finally:
+        c.close()
+
+
+def test_engagement_id_mismatch_is_fatal(srv):
+    """Client A's traffic must never land in client B's store."""
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                "pid": os.getpid(), "burp_version": "x",
+                                "instance_id": "i-1", "engagement_id": "SOMEONE-ELSE"}))
+        assert c.recv(4096) == b"", "server should close the connection"
+        assert srv.state == "waiting"
+        assert srv.rejected_hellos == 1
+    finally:
+        c.close()
+
+
+def test_protocol_version_mismatch_is_fatal(srv):
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 99, "t": "hello", "engagement_id": "e-1",
+                                "ext_version": "0.1", "pid": 1,
+                                "burp_version": "x", "instance_id": "i-1"}))
+        assert c.recv(4096) == b""
+        assert srv.state == "waiting"
+    finally:
+        c.close()
+
+
+def test_configure_round_trip_returns_an_epoch(srv):
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1", "pid": 1,
+                                "burp_version": "x", "instance_id": "i-1",
+                                "engagement_id": "e-1"}))
+        # configure() must not race the accept-loop thread's processing of
+        # the hello: without this wait, a thread scheduled early enough sees
+        # state == "waiting", raises BridgeError internally (silently, since
+        # nothing joins it before the assertion), and the main thread then
+        # blocks forever below waiting for a request frame that was never
+        # sent. Reproduced: roughly 1 run in 10 hung indefinitely.
+        deadline = time.time() + 5
+        while srv.state != "connected" and time.time() < deadline:
+            time.sleep(0.01)
+        assert srv.state == "connected"
+        result = {}
+
+        def do_configure():
+            result["epoch"] = srv.configure(
+                {"scope.include": ["https://a/*"], "limit.rate_rps": ["5"]},
+                scope_sha256="deadbeef", profile="production",
+            )
+
+        t = threading.Thread(target=do_configure)
+        t.start()
+
+        header, body = codec.FrameReader(c).read()
+        assert header["t"] == "configure"
+        assert header["engagement_id"] == "e-1"
+        assert header["scope_sha256"] == "deadbeef"
+        assert codec.parse_config_body(body)["scope.include"] == ["https://a/*"]
+
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert result["epoch"] == 1
+        assert srv.state == "configured"
+    finally:
+        c.close()
+
+
+def test_configure_carries_id_and_deadline(srv):
+    """Both are required on every request frame by the protocol document."""
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1", "pid": 1,
+                                "burp_version": "x", "instance_id": "i-1",
+                                "engagement_id": "e-1"}))
+        # See test_configure_round_trip_returns_an_epoch: without waiting for
+        # the hello to land, this races the accept-loop thread and can hang.
+        deadline = time.time() + 5
+        while srv.state != "connected" and time.time() < deadline:
+            time.sleep(0.01)
+        assert srv.state == "connected"
+        result = {}
+
+        def do_configure():
+            # The test never sends a "configured" ack, and closes the
+            # connection in its finally below. _reset()'s wake-on-disconnect
+            # (round 1) now surfaces that immediately as BridgeError, where
+            # it previously just blocked for the full 10s timeout unnoticed --
+            # that is the desired prompt-wakeup behaviour, not a bug. Catch it
+            # here rather than let it become an unhandled thread exception.
+            try:
+                srv.configure({"scope.include": ["https://a/*"]},
+                              scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_configure)
+        t.start()
+        header, _ = codec.FrameReader(c).read()
+        assert isinstance(header["id"], int) and header["id"] > 0
+        assert isinstance(header["deadline_us"], int)
+        assert header["deadline_us"] > time.time_ns() // 1000
+    finally:
+        c.close()
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_configure thread never finished"
+        assert "error" in result, "closing without an ack must raise BridgeError"
+
+
+def test_configure_before_hello_is_refused(srv):
+    """What the precondition holds back is real, not hypothetical: _serve()
+    assigns self._conn BEFORE the hello is read, so an un-helloed peer is a
+    perfectly good socket to write to. Driven directly, it received the
+    engagement id, the scope_sha256 and every scope pattern.
+
+    `match=` therefore names the WHOLE message. "not connected" on its own is
+    also what _send() raises when self._conn is None, so with the precondition
+    deleted this test still passed -- on the wrong raise, from two frames
+    further down, after the scope had already gone out. The peer-receives-
+    nothing assertion is the one that cannot be satisfied by the wrong raise
+    at all.
+    """
+    c = _client(srv.socket_path)
+    try:
+        # Wait for the server to have accepted and stored the socket: that is
+        # precisely the window in which only the precondition stands between a
+        # caller and a scope on the wire.
+        deadline = time.time() + 5
+        while srv._conn is None and time.time() < deadline:
+            time.sleep(0.005)
+        assert srv._conn is not None, "the server should have accepted the connection"
+        assert srv.state == "waiting", "no hello has been sent"
+
+        with pytest.raises(server.BridgeError, match="cannot configure before hello"):
+            srv.configure({"scope.include": ["https://SECRET/*"]},
+                          scope_sha256="deadbeef", profile="production")
+
+        # Nothing at all may have reached the peer. A short timeout, not the
+        # helper's 5s: this asserts an absence, so the wait is pure cost.
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
+def test_reconnect_resets_to_deny_all(srv):
+    """extensionData does not survive a Burp restart, so a reconnected
+    extension is unconfigured no matter what the previous one knew."""
+    c = _client(srv.socket_path)
+    c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1", "pid": 1,
+                            "burp_version": "x", "instance_id": "i-1",
+                            "engagement_id": "e-1"}))
+    deadline = time.time() + 5
+    while srv.state != "connected" and time.time() < deadline:
+        time.sleep(0.01)
+    # Without this, the test passes even when hello handling is completely
+    # broken: state never leaves "waiting", so the second poll's precondition
+    # is already true. Verified by sabotage -- it passed in 5.22s with hello
+    # handling entirely disabled.
+    assert srv.state == "connected"
+    c.close()
+
+    deadline = time.time() + 5
+    while srv.state != "waiting" and time.time() < deadline:
+        time.sleep(0.01)
+    assert srv.state == "waiting", "a dropped connection must return to DENY-ALL"
+    assert srv.config_epoch == 0
+
+
+def test_oversized_frame_from_the_peer_closes_the_connection(srv):
+    c = _client(srv.socket_path)
+    try:
+        c.sendall((codec.MAX_FRAME + 1).to_bytes(4, "big") + b"{}")
+        assert c.recv(4096) == b""
+    finally:
+        c.close()
+
+
+def test_peer_credentials_are_recorded(srv):
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                "pid": os.getpid(), "burp_version": "x",
+                                "instance_id": "i-1", "engagement_id": "e-1"}))
+        deadline = time.time() + 5
+        while srv.state != "connected" and time.time() < deadline:
+            time.sleep(0.01)
+        assert srv.peer_uid == os.getuid()
+        assert srv.peer_pid > 0
+    finally:
+        c.close()
+
+
+def test_configure_ack_then_immediate_disconnect_ends_in_deny_all(srv):
+    """Critical, fix round 1: configure() wrote self.state = "configured" and
+    self.config_epoch from the caller's thread with no ordering against
+    _reset() on the accept thread. A peer that acks configure and immediately
+    disconnects could leave state="configured" with no peer attached at all --
+    falsifying DENY-ALL as the terminal state. Reproduced 59/60 runs before
+    the generation-token fix, so this loops enough times to be meaningful.
+    """
+    for _ in range(60):
+        c = _client(srv.socket_path)
+        try:
+            c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                    "pid": 1, "burp_version": "x",
+                                    "instance_id": "i-1", "engagement_id": "e-1"}))
+            deadline = time.time() + 5
+            while srv.state != "connected" and time.time() < deadline:
+                time.sleep(0.01)
+            assert srv.state == "connected"
+
+            result = {}
+
+            def do_configure():
+                try:
+                    result["epoch"] = srv.configure(
+                        {"scope.include": ["https://a/*"]},
+                        scope_sha256="x", profile="production",
+                    )
+                except server.BridgeError as exc:
+                    result["error"] = exc
+
+            t = threading.Thread(target=do_configure)
+            t.start()
+
+            header, _ = codec.FrameReader(c).read()
+            c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                    "config_epoch": 1}))
+            c.close()
+            t.join(timeout=5)
+            assert not t.is_alive(), "do_configure thread never finished"
+
+            deadline = time.time() + 5
+            while srv.state != "waiting" and time.time() < deadline:
+                time.sleep(0.01)
+            assert srv.state == "waiting", (
+                "a peer that acked configure and vanished must not leave the "
+                f"bridge looking configured (result={result!r})"
+            )
+            assert srv.config_epoch == 0
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+def test_late_reply_after_timeout_does_not_leak_into_replies(srv):
+    """Important, fix round 1: _deliver used to record a reply before checking
+    whether anyone was waiting for it. A reply that arrives after its caller
+    gave up left an entry nothing ever collects -- unbounded growth on a
+    bridge meant to run for a whole engagement."""
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1", "pid": 1,
+                                "burp_version": "x", "instance_id": "i-1",
+                                "engagement_id": "e-1"}))
+        deadline = time.time() + 5
+        while srv.state != "connected" and time.time() < deadline:
+            time.sleep(0.01)
+        assert srv.state == "connected"
+
+        with pytest.raises(server.BridgeError, match="no reply"):
+            srv._request({"v": 1, "t": "configure", "engagement_id": "e-1"},
+                         timeout=0.1)
+
+        # Only now does the peer read and ack the request the server already
+        # gave up waiting on.
+        header, _ = codec.FrameReader(c).read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        time.sleep(0.3)  # give the late reply a chance to be (mis)handled
+        assert srv._replies == {}, "a reply nobody awaits must not be recorded"
+    finally:
+        c.close()
+
+
+def test_so_peercred_rejects_a_foreign_uid(srv, monkeypatch):
+    """The one security-critical branch in the file, previously uncovered.
+    Cannot actually connect as another uid in a test, so fake the credential
+    lookup SO_PEERCRED reports."""
+    real_getsockopt = socket.socket.getsockopt
+
+    def fake_getsockopt(self, level, optname, buflen=0):
+        if optname == socket.SO_PEERCRED:
+            return struct.pack("3i", 12345, os.getuid() + 1, os.getgid())
+        return real_getsockopt(self, level, optname, buflen)
+
+    monkeypatch.setattr(socket.socket, "getsockopt", fake_getsockopt)
+
+    c = _client(srv.socket_path)
+    try:
+        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                "pid": os.getpid(), "burp_version": "x",
+                                "instance_id": "i-1", "engagement_id": "e-1"}))
+        # The server closes without ever reading the hello it left unread in
+        # its receive buffer, so Linux resets the connection (RST) rather
+        # than closing it cleanly (FIN) -- both mean "never served".
+        try:
+            data = c.recv(4096)
+        except ConnectionResetError:
+            data = b""
+        assert data == b"", "a foreign uid must never be served"
+        time.sleep(0.2)
+        assert srv.state == "waiting"
+    finally:
+        c.close()
+
+
+def test_configure_refuses_to_commit_when_a_reset_ran_in_the_gap(srv):
+    """The whole point of the guard, deterministically: no threads, no sleeps.
+    The stub performs the disconnect inside the window between _request()
+    returning and configure()'s commit."""
+    c = _connected(srv)
+    try:
+        def stub_request(header, body=b""):
+            srv._reset(srv._generation)
+            return {"v": 1, "t": "configured", "id": 1, "config_epoch": 7}
+        srv._request = stub_request
+
+        with pytest.raises(server.BridgeError,
+                           match="peer disconnected before configure completed"):
+            srv.configure({"scope.include": ["https://a/*"]},
+                          scope_sha256="x", profile="production")
+        assert srv.state == "waiting"
+        assert srv.config_epoch == 0
+    finally:
+        c.close()
+
+
+def test_configure_refuses_to_commit_when_the_socket_slot_was_refilled(srv):
+    """Deliberately white-box, and the only test that isolates the generation
+    token. It refills self._conn without going through accept(), so the
+    `_conn is None` clause cannot fire and only `gen != self._generation`
+    is left to catch the stale commit. Delete `self._generation += 1` from
+    _reset() and this test fails; that is what it exists for."""
+    c = _connected(srv)
+    successor, other = socket.socketpair()
+    try:
+        def stub_request(header, body=b""):
+            srv._reset(srv._generation)
+            srv._conn = successor          # slot refilled: _conn is NOT None
+            return {"v": 1, "t": "configured", "id": 1, "config_epoch": 7}
+        srv._request = stub_request
+
+        with pytest.raises(server.BridgeError,
+                           match="peer disconnected before configure completed"):
+            srv.configure({"scope.include": ["https://a/*"]},
+                          scope_sha256="x", profile="production")
+        assert srv.state == "waiting"
+        assert srv.config_epoch == 0
+    finally:
+        srv._conn = None
+        successor.close()
+        other.close()
+        c.close()
+
+
+def test_reset_advances_the_generation_it_guards_on(srv):
+    """The invariant is internal, so test it internally rather than pretend a
+    black-box test can see it."""
+    g0 = srv._generation
+    srv._reset(g0)
+    assert srv._generation > g0, "a real reset must advance the generation"
+
+    g1 = srv._generation
+    srv.state = "configured"
+    srv.config_epoch = 9
+    srv._reset(g0)                          # stale token: must be a no-op
+    assert srv._generation == g1
+    assert srv.state == "configured" and srv.config_epoch == 9
+
+
+def test_halt_and_resume_refuse_to_commit_after_a_reset_in_the_gap(srv):
+    """halt()/resume() have the same send-then-mutate shape as configure(),
+    so they get the same test. Without this, the guard on them is unexercised
+    by the whole suite."""
+    for method, message in (
+        (lambda: srv.halt("operator"), "peer disconnected before halt completed"),
+        (lambda: srv.resume(), "peer disconnected before resume completed"),
+    ):
+        c = _connected(srv)
+        try:
+            def stub_send(header, body=b""):
+                srv._reset(srv._generation)
+            srv._send = stub_send
+
+            with pytest.raises(server.BridgeError, match=message):
+                method()
+            assert srv.state == "waiting"
+        finally:
+            del srv._send          # fall back to the real bound method
+            c.close()
+
+
+def test_halt_and_resume_commit_on_the_happy_path(srv):
+    c = _connected(srv)
+    try:
+        srv.halt("operator asked")
+        assert srv.state == "halted"
+        reader = codec.FrameReader(c)
+        header, _ = reader.read()
+        assert header["t"] == "halt" and header["reason"] == "operator asked"
+
+        srv.resume()
+        assert srv.state == "connected"     # no config_epoch yet
+        header, _ = reader.read()
+        assert header["t"] == "resume"
+    finally:
+        c.close()
+
+
+def test_configure_never_leaves_a_lying_state_under_stress(srv, monkeypatch):
+    """Round 2: the generation token read _generation as a guard but never
+    advanced it, so it only detected "a NEW connection superseded an old
+    one". It could not detect THIS connection resetting between _request()
+    returning and configure()'s commit -- the caller still saw
+    gen == self._generation and clobbered the "waiting" _reset() had just
+    written. The natural-timing test above measured 0/60 for this because the
+    accept thread happens to win that inner race on this machine -- favourable
+    scheduling, not a closed gap. This closes the window instead of relying
+    on timing: it delays configure()'s resumption after
+    _request() returns, giving the accept thread's _reset() every chance to
+    run to completion first, and asserts configure() detects it rather than
+    silently committing over it.
+    """
+    real_request = server.BridgeServer._request
+
+    def delayed_request(self, *args, **kwargs):
+        reply = real_request(self, *args, **kwargs)
+        time.sleep(0.08)  # matches the ~80ms window the reviewer used
+        return reply
+
+    monkeypatch.setattr(server.BridgeServer, "_request", delayed_request)
+
+    for _ in range(20):
+        c = _client(srv.socket_path)
+        try:
+            c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                    "pid": 1, "burp_version": "x",
+                                    "instance_id": "i-1", "engagement_id": "e-1"}))
+            deadline = time.time() + 5
+            while srv.state != "connected" and time.time() < deadline:
+                time.sleep(0.01)
+            assert srv.state == "connected"
+
+            result = {}
+
+            def do_configure():
+                try:
+                    result["epoch"] = srv.configure(
+                        {"scope.include": ["https://a/*"]},
+                        scope_sha256="x", profile="production",
+                    )
+                except server.BridgeError as exc:
+                    result["error"] = exc
+
+            t = threading.Thread(target=do_configure)
+            t.start()
+
+            header, _ = codec.FrameReader(c).read()
+            c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                    "config_epoch": 1}))
+            # Close now, while do_configure is still asleep inside the
+            # widened window: the accept thread's _reset() must run and
+            # complete (including advancing the generation) well before
+            # do_configure wakes up to commit.
+            c.close()
+            t.join(timeout=5)
+            assert not t.is_alive(), "do_configure thread never finished"
+
+            assert "error" in result, (
+                "configure() must detect a disconnect that happened during "
+                f"its widened commit window, not silently succeed (result={result!r})"
+            )
+            # Whichever mechanism fires, the forbidden outcome is the same:
+            # state that claims a peer the server no longer has.
+            assert not (srv.state == "configured" and srv._conn is None), (
+                f"lying state after a disconnect mid-configure (result={result!r})"
+            )
+
+            deadline = time.time() + 5
+            while srv.state != "waiting" and time.time() < deadline:
+                time.sleep(0.01)
+            assert srv.state == "waiting", (
+                f"a disconnect during configure()'s commit window must not "
+                f"leave the bridge looking configured (result={result!r})"
+            )
+            assert srv.config_epoch == 0
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+def test_an_error_reply_to_configure_reports_what_the_peer_said(srv):
+    c = _connected(srv)
+    try:
+        out = {}
+
+        def go():
+            try:
+                srv.configure({"scope.include": ["https://a/*"]},
+                              scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out["err"] = str(exc)
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = codec.FrameReader(c).read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "engagement_mismatch",
+                                "detail": "e-1 != SOMEONE-ELSE"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+        assert "engagement_mismatch" in out["err"], out
+        assert "SOMEONE-ELSE" in out["err"], out
+        assert "without a config_epoch" not in out["err"], out
+    finally:
+        c.close()
+
+
+def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
+    """The extension answers a refused configure by dropping to DENY-ALL at
+    epoch 0 -- it discards the scope it was already holding. If this side went
+    on reporting state='configured' epoch=1 the two ends of the bridge would
+    disagree about whether anything may be sent, and this is the end operators
+    and the CLI read."""
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    out = {}
+
+    def configure_into(key):
+        def run():
+            try:
+                out[key] = srv.configure({"scope.include": ["https://a/*"]},
+                                         scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out[key] = exc
+        return run
+
+    try:
+        # A first configure that IS acknowledged: epoch 1, state 'configured'.
+        t = threading.Thread(target=configure_into("first"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["first"] == 1, out
+        assert srv.state == "configured"
+        assert srv.config_epoch == 1
+
+        # The second is refused. An operator NARROWING scope with a key the
+        # installed extension predates is the likeliest way to land here, so
+        # the wider epoch-1 scope is exactly what must not survive.
+        t = threading.Thread(target=configure_into("second"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "bad_config",
+                                "detail": "unknown key scope.exclude_ports"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert isinstance(out["second"], server.BridgeError), out
+        assert "bad_config" in str(out["second"]), out
+
+        assert srv.state == "connected", (
+            "the peer is at DENY-ALL after refusing the configure; this side "
+            f"must not go on claiming {srv.state!r}"
+        )
+        assert srv.config_epoch == 0, srv.config_epoch
+    finally:
+        c.close()
+
+
+def test_send_serialises_concurrent_writers(srv):
+    """_send() wrote the socket with no mutex at all, while its Java
+    counterpart is a deliberate `private synchronized void send`. Two threads
+    inside one sendall() splice two frames together on the wire and the peer
+    then decodes neither -- and every write on this side is a control frame:
+    halt, resume, configure.
+
+    Deterministic rather than scheduler-dependent. The stand-in socket parks
+    halfway through each write, which is exactly what a real sendall() does
+    when the socket buffer fills mid-frame, and both writers meet at a barrier
+    IF the code lets them be inside at once. Serialised, the first writer
+    breaks the barrier on its timeout and the second sails straight through.
+    """
+    chunks: list[bytes] = []
+    gate = threading.Barrier(2, timeout=0.5)
+    state_lock_was_free = []
+
+    class SplittingConn:
+        def sendall(self, data):
+            half = len(data) // 2
+            chunks.append(data[:half])
+            # Parked mid-frame. The state mutex must NOT be held here: this
+            # lock has to be a separate one, or a blocking send stalls the
+            # _deliver() that wakes the _request() waiting on this very frame.
+            free = srv._lock.acquire(blocking=False)
+            if free:
+                srv._lock.release()
+            state_lock_was_free.append(free)
+            try:
+                gate.wait()
+            except threading.BrokenBarrierError:
+                pass
+            chunks.append(data[half:])
+
+    srv._conn = SplittingConn()
+    try:
+        # Two frames of DIFFERENT lengths, so a spliced wire cannot decode by
+        # luck: frame one's length prefix would then span frame two's bytes.
+        writers = [
+            threading.Thread(target=srv._send, args=(
+                {"v": 1, "t": "halt", "reason": "a" * 200},)),
+            threading.Thread(target=srv._send, args=(
+                {"v": 1, "t": "resume"},)),
+        ]
+        for w in writers:
+            w.start()
+        for w in writers:
+            w.join(timeout=10)
+            assert not w.is_alive()
+
+        assert all(state_lock_was_free), (
+            "the send mutex must be separate from self._lock: holding the state "
+            "mutex across a blocking sendall() stalls _deliver()"
+        )
+
+        wire = b"".join(chunks)
+        first, _, consumed = codec.decode(wire)
+        second, _, _ = codec.decode(wire[consumed:])
+        assert {first["t"], second["t"]} == {"halt", "resume"}, (
+            f"two writers spliced their frames together on the wire: {wire!r}"
+        )
+    finally:
+        srv._conn = None
+
+
+def test_a_configure_does_not_lift_a_halt(srv):
+    """An operator halts BECAUSE the scope went wrong, then pushes the
+    corrected scope -- the most likely next action there is. Writing
+    state="configured" over "halted" here re-armed issuance with no `resume`
+    on the wire, no log line, and both consoles reading "configured". Only
+    resume() may lift a halt.
+
+    The other half is just as load-bearing: the scope and the epoch must still
+    commit. Narrowing scope during an emergency stop is exactly what an
+    operator should be able to do, which is why "halted" stays in configure()'s
+    accepted-state tuple rather than being refused outright. A configure
+    re-authorises SCOPE, not ISSUANCE. The extension half of this lives in
+    BridgeClientTest.aConfigureDoesNotLiftAHalt().
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    out = {}
+
+    def configure_into(key, pattern):
+        def run():
+            try:
+                out[key] = srv.configure({"scope.include": [pattern]},
+                                         scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out[key] = exc
+        return run
+
+    try:
+        t = threading.Thread(target=configure_into("first", "https://WIDE/*"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["first"] == 1, out
+        assert srv.state == "configured"
+
+        srv.halt("scope was wrong")
+        header, _ = reader.read()
+        assert header["t"] == "halt"
+        assert srv.state == "halted"
+
+        # The corrected, NARROWER scope, pushed while halted.
+        t = threading.Thread(target=configure_into("second", "https://NARROW/*"))
+        t.start()
+        header, body = reader.read()
+        assert header["t"] == "configure"
+        assert codec.parse_config_body(body)["scope.include"] == ["https://NARROW/*"]
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 2}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["second"] == 2, out
+
+        assert srv.state == "halted", (
+            "a configure frame must not lift an operator halt; only resume() may"
+        )
+        assert srv.config_epoch == 2, (
+            "the corrected scope must still commit -- narrowing scope during an "
+            "emergency stop is exactly what an operator should be able to do"
+        )
+
+        # resume() is the frame that IS allowed to re-arm issuance, and it
+        # returns to "configured" under the epoch-2 scope.
+        srv.resume()
+        header, _ = reader.read()
+        assert header["t"] == "resume"
+        assert srv.state == "configured"
+        assert srv.config_epoch == 2
+    finally:
+        c.close()
+
+
+def test_a_non_denying_configure_error_leaves_state_alone(srv):
+    """engagement_mismatch and bad_frame answer error but leave the extension
+    configured and live -- unlike bad_config and protocol_mismatch, which
+    call denyAll() before answering. Resetting THIS side for those two would
+    make it report state='connected', config_epoch=0 while the extension is
+    still configured and sending: the reverse of the disagreement the reset
+    exists to fix, and the more dangerous direction, since the operator's
+    console would then say nothing may be sent while it can.
+
+    Unreachable through a real client today -- a mismatched engagement_id is
+    rejected at hello, and _request() always stamps deadline_us -- so this
+    needs a version-skewed jar, the same scenario the plan names for
+    bad_config. Reached here directly, the same way
+    test_an_error_reply_to_configure_reports_what_the_peer_said reaches its
+    own class string."""
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    out = {}
+
+    def configure_into(key):
+        def run():
+            try:
+                out[key] = srv.configure({"scope.include": ["https://a/*"]},
+                                         scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out[key] = exc
+        return run
+
+    try:
+        # A first configure that IS acknowledged: epoch 1, state 'configured'.
+        t = threading.Thread(target=configure_into("first"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 1}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["first"] == 1, out
+        assert srv.state == "configured"
+        assert srv.config_epoch == 1
+
+        # A second configure is refused, but with a class the extension does
+        # NOT deny for.
+        t = threading.Thread(target=configure_into("second"))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "engagement_mismatch",
+                                "detail": "e-1 != e-2"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert isinstance(out["second"], server.BridgeError), out
+        assert "engagement_mismatch" in str(out["second"]), out
+
+        assert srv.state == "configured", (
+            "the extension is still configured and live after this class of "
+            f"refusal; this side must not go on claiming {srv.state!r}"
+        )
+        assert srv.config_epoch == 1, srv.config_epoch
+    finally:
+        c.close()
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `.venv/bin/pytest tests/test_bridge_server.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'hx.bridge.server'`
+
+- [ ] **Step 3: Write the implementation**
+
+```python
+# src/hx/bridge/server.py
+"""The harness end of the bridge.
+
+Python listens and Burp dials in, inverted from the obvious arrangement: the
+harness holds the engagement state and outlives Burp, which we measured losing
+everything on restart. A Burp restart is therefore a reconnect, not an outage.
+
+DENY-ALL is the initial and terminal state. A freshly connected extension knows
+nothing -- extensionData does not survive a Burp restart -- so it stays
+unconfigured until a configure frame is acknowledged.
+"""
+from __future__ import annotations
+
+import os
+import secrets
+import socket
+import struct
+import threading
+import time
+from pathlib import Path
+
+from hx.bridge import codec
+
+
+class BridgeError(Exception):
+    """The bridge cannot start, or was asked to do something out of order."""
+
+
+def socket_path_for(engagement_id: str) -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(runtime) / "hx" / f"{engagement_id}-{secrets.token_hex(4)}.sock"
+
+
+class BridgeServer:
+    # Error classes under which BridgeClient.handle() actually drops to
+    # DENY-ALL: `bad_config` calls denyAll() before answering, and
+    # `protocol_mismatch` returns false out of handle(), which trips
+    # readLoop()'s finally block. `engagement_mismatch` and `bad_frame`
+    # answer error and carry on configured -- resetting THIS side for those
+    # would make it report state="connected", config_epoch=0 while the
+    # extension is still configured and live, the reverse of the bug this
+    # reset exists to fix, and the more dangerous direction: the operator's
+    # console says nothing may be sent while it can. See the `case` arms in
+    # extension/src/hx/bridge/BridgeClient.java's handle() for the exact
+    # strings.
+    _DENYING_CONFIGURE_ERRORS = frozenset({"bad_config", "protocol_mismatch"})
+
+    def __init__(self, socket_path: Path, engagement_id: str, on_hello=None):
+        self.socket_path = Path(socket_path)
+        self.engagement_id = engagement_id
+        self.on_hello = on_hello
+
+        self.state = "waiting"
+        self.config_epoch = 0
+        self.peer_uid: int | None = None
+        self.peer_pid: int | None = None
+        self.hello: dict | None = None
+        self.rejected_hellos = 0
+
+        self._srv: socket.socket | None = None
+        self._conn: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+        self._pending: dict[int, threading.Event] = {}
+        self._replies: dict[int, dict] = {}
+        self._next_id = 0
+        self._generation = 0     # bumped per accepted connection; see _reset
+        self._lock = threading.Lock()
+        # A SEPARATE mutex from self._lock, deliberately. Reusing the state
+        # mutex would hold it across a blocking sendall() and stall the
+        # _deliver() that wakes the _request() waiting on the very frame being
+        # written.
+        self._send_lock = threading.Lock()
+
+    # ---- lifecycle ---------------------------------------------------
+
+    def start(self) -> None:
+        if self.socket_path.exists():
+            raise BridgeError(
+                f"socket path already exists: {self.socket_path}. Refusing to "
+                "start rather than adopt a path another process may own."
+            )
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.socket_path.parent, 0o700)
+
+        self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._srv.bind(str(self.socket_path))
+        os.chmod(self.socket_path, 0o600)
+        self._srv.listen(1)
+        self._srv.settimeout(0.2)
+
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        if self._conn is not None:
+            try:
+                # shutdown(), not just close(): the accept-loop thread may be
+                # blocked in conn.recv() with no timeout set on that socket.
+                # A bare close() from this thread does not reliably unblock a
+                # concurrent recv() on the same fd on Linux -- verified by
+                # reproduction, stop() hung for the full join timeout with the
+                # accept thread left permanently blocked. shutdown(SHUT_RDWR)
+                # forces that pending recv() to return 0 immediately.
+                self._conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        for s in (self._conn, self._srv):
+            try:
+                if s:
+                    s.close()
+            except OSError:
+                pass
+        if self._thread:
+            self._thread.join(timeout=2)
+        try:
+            self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    # ---- accept / read loop -------------------------------------------
+
+    def _accept_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                conn, _ = self._srv.accept()
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                return
+            try:
+                self._serve(conn)
+            except Exception:
+                # The accept loop is a daemon thread. If it dies the server
+                # looks alive and silently never accepts again, so no
+                # exception may escape here.
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def _serve(self, conn: socket.socket) -> None:
+        with self._lock:
+            self._generation += 1
+            gen = self._generation
+            self._conn = conn
+        try:
+            creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                    struct.calcsize("3i"))
+            pid, uid, _gid = struct.unpack("3i", creds)
+            if uid != os.getuid():
+                # The socket authenticates a uid, not a program; a different
+                # uid has no business here at all.
+                return
+            self.peer_pid, self.peer_uid = pid, uid
+
+            reader = codec.FrameReader(conn)
+            while not self._stopping.is_set():
+                header, body = reader.read()
+                if not self._handle(header, body):
+                    return
+        except (codec.PeerClosed, codec.Incomplete, codec.FrameError, OSError):
+            return
+        finally:
+            self._reset(gen)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _reset(self, gen: int | None = None) -> None:
+        """Return to DENY-ALL. `gen` guards against a slow teardown of an old
+        connection wiping the state of a newer one."""
+        with self._lock:
+            if gen is not None and gen != self._generation:
+                return
+            # Advance the generation as well as guarding on it. Without this,
+            # the token only detects "a NEW connection superseded an old one" --
+            # it cannot detect this same connection resetting between a caller's
+            # _request() returning and its commit, so the caller still sees
+            # gen == self._generation and clobbers the waiting state.
+            self._generation += 1
+            self.state = "waiting"
+            self.config_epoch = 0
+            self._conn = None
+            # A waiter blocked on a reply that will now never arrive must not
+            # outlive the connection, and a stale reply must not be collected
+            # by a future request.
+            for ev in self._pending.values():
+                ev.set()
+            self._pending.clear()
+            self._replies.clear()
+
+    def _handle(self, header: dict, body: bytes) -> bool:
+        """Return False to close the connection."""
+        if header.get("v") != codec.PROTOCOL_VERSION:
+            return False
+
+        t = header.get("t")
+        if t == "hello":
+            if header.get("engagement_id") != self.engagement_id:
+                # Client A's traffic must never land in client B's store.
+                self.rejected_hellos += 1
+                return False
+            self.hello = header
+            with self._lock:
+                self.state = "connected"
+                self.config_epoch = 0   # a fresh hello is a fresh session
+            if self.on_hello:
+                self.on_hello(header)
+            return True
+
+        if t == "configured":
+            self._deliver(header)
+            return True
+
+        if t in ("result", "error", "exchange"):
+            self._deliver(header)          # consumed by a later plan
+            return True
+
+        return False
+
+    def _deliver(self, header: dict) -> None:
+        rid = header.get("id")
+        with self._lock:
+            ev = self._pending.get(rid)
+            if ev is None:
+                # Nobody is waiting: the caller timed out, or this is an
+                # unsolicited frame. Recording it would leak an entry that
+                # nothing ever collects, forever, on a long-lived bridge.
+                return
+            self._replies[rid] = header
+        ev.set()
+
+    # ---- outbound ------------------------------------------------------
+
+    def _send(self, header: dict, body: bytes = b"") -> None:
+        conn = self._conn          # snapshot: the accept thread may null it
+        if conn is None:
+            raise BridgeError("not connected")
+        # Encoded OUTSIDE the mutex: it touches nothing shared, and holding a
+        # send mutex across it would serialise work that needs no serialising.
+        frame = codec.encode(header, body)
+        try:
+            # sendall() is not atomic -- it loops over send() and a large frame
+            # parks mid-write once the socket buffer fills -- so two callers
+            # inside it splice their frames together and the peer decodes
+            # neither. Every write on this side is a control frame: halt,
+            # resume, configure. The Java counterpart is a deliberate
+            # `private synchronized void send` for exactly this reason.
+            with self._send_lock:
+                conn.sendall(frame)
+        except OSError as exc:
+            raise BridgeError(f"send failed: {exc}") from exc
+
+    def _request(self, header: dict, body: bytes = b"", timeout: float = 10.0) -> dict:
+        with self._lock:
+            self._next_id += 1
+            rid = self._next_id
+            ev = threading.Event()
+            self._pending[rid] = ev
+        # deadline_us is set on every request frame from the start so the frame
+        # shape never changes later. Acting on it -- abandoning work past the
+        # deadline -- belongs to the send path in Plan 3; here it is carried and
+        # validated, not enforced.
+        header = {**header, "id": rid,
+                  "deadline_us": (time.time_ns() // 1000) + int(timeout * 1_000_000)}
+        self._send(header, body)
+        if not ev.wait(timeout):
+            with self._lock:
+                self._pending.pop(rid, None)
+            raise BridgeError(f"no reply to {header['t']} within {timeout}s")
+        with self._lock:
+            self._pending.pop(rid, None)
+            # _reset() also sets every pending event, on disconnect, so that a
+            # waiter does not outlive its connection -- that wakeup carries no
+            # reply. Without this check, .pop(rid) raises a bare KeyError
+            # instead of the documented BridgeError. Reproduced directly:
+            # a peer that closes without ever replying woke this waiter via
+            # _reset(), with no entry in _replies for it to collect.
+            if rid not in self._replies:
+                raise BridgeError(
+                    f"peer disconnected before replying to {header['t']}"
+                )
+            return self._replies.pop(rid)
+
+    def configure(self, pairs: dict[str, list[str]], scope_sha256: str,
+                  profile: str) -> int:
+        if self.state not in ("connected", "configured", "halted"):
+            raise BridgeError("not connected: cannot configure before hello")
+        gen = self._generation
+        reply = self._request(
+            {
+                "v": codec.PROTOCOL_VERSION,
+                "t": "configure",
+                "engagement_id": self.engagement_id,
+                "scope_sha256": scope_sha256,
+                "profile": profile,
+            },
+            codec.build_config_body(pairs),
+        )
+        if reply.get("t") == "error":
+            # The extension answers SOME refused configures by dropping to
+            # DENY-ALL at epoch 0 -- including a refused RE-configure, which
+            # discards the scope it was already holding -- but not all of
+            # them. Only reset this side for the classes that actually deny;
+            # see _DENYING_CONFIGURE_ERRORS. Resetting for the others would
+            # make this side report state='connected', config_epoch=0 while
+            # the extension is still configured and sending -- the opposite
+            # disagreement from the one this reset was added to fix, and it
+            # is this side that operators and Plan 5 read. Verified against a
+            # live extension before the reset was added.
+            #
+            # Same gen/_conn guard as the success path: a newer connection's
+            # state is not ours to clobber.
+            if reply.get("class") in self._DENYING_CONFIGURE_ERRORS:
+                with self._lock:
+                    if gen == self._generation and self._conn is not None:
+                        self.state = "connected"
+                        self.config_epoch = 0
+            # Surface what the peer actually said. Falling through to the
+            # generic message below turns "engagement_mismatch: e-1 != e-2"
+            # into "acknowledged configure without a config_epoch", which
+            # sends the next debugger looking in the wrong place entirely.
+            raise BridgeError(
+                "peer refused configure: "
+                f"{reply.get('class', 'unspecified')}: {reply.get('detail', '')}".rstrip(": ")
+            )
+        if "config_epoch" not in reply:
+            raise BridgeError("peer acknowledged configure without a config_epoch")
+        with self._lock:
+            # Commit only if this is still the same connection. Without the
+            # guard, a peer that acks and immediately disconnects leaves
+            # state="configured" with no peer attached -- reproduced 59/60.
+            # The generation check alone caught a NEW connection superseding
+            # this one; it missed THIS connection resetting in the window
+            # between _request() returning and this commit (reproduced 10/10
+            # once that window was widened), because _reset() did not used to
+            # advance the generation it guards on. The _conn check is belt
+            # and braces: the generation check is the structural fix, this
+            # makes the invariant obvious to the next reader.
+            if gen != self._generation or self._conn is None:
+                raise BridgeError("peer disconnected before configure completed")
+            self.config_epoch = int(reply["config_epoch"])
+            # A configure re-authorises SCOPE, not ISSUANCE. An operator who
+            # halted because the scope went wrong, and is now pushing the
+            # corrected scope, has not asked for issuance back -- only resume()
+            # does that. Writing "configured" over "halted" here re-armed the
+            # bridge with no `resume` on the wire and no log line, and the
+            # extension's commit used to clear its own `halted` flag to match.
+            # "halted" is still an accepted state on the way in (see the
+            # precondition above): narrowing scope during an emergency stop is
+            # exactly what an operator should be able to do.
+            self.state = "halted" if self.state == "halted" else "configured"
+        return self.config_epoch
+
+    def halt(self, reason: str) -> None:
+        # Same send-then-mutate shape as configure(), so the same guard: a
+        # peer that disconnects between the send and this commit must not
+        # leave state looking like anything other than what _reset() wrote.
+        gen = self._generation
+        self._send({"v": codec.PROTOCOL_VERSION, "t": "halt", "reason": reason})
+        with self._lock:
+            if gen != self._generation or self._conn is None:
+                raise BridgeError("peer disconnected before halt completed")
+            self.state = "halted"
+
+    def resume(self) -> None:
+        gen = self._generation
+        self._send({"v": codec.PROTOCOL_VERSION, "t": "resume"})
+        with self._lock:
+            if gen != self._generation or self._conn is None:
+                raise BridgeError("peer disconnected before resume completed")
+            self.state = "configured" if self.config_epoch else "connected"
+```
+
+- [ ] **Step 3b: Test the commit guard so that removing it fails a test**
+
+The guard above has three separable parts, and a test suite that passes with
+any of them deleted is not guarding anything. Two earlier attempts at this
+test passed for the wrong reason:
+
+- a 60-iteration natural-timing test measured 0/60 because the accept thread
+  happens to win the inner race on this machine, not because the gap was shut;
+- a 20-iteration widened-window test accepted **any** `BridgeError`, so it was
+  satisfied ~19 times in 20 by an unrelated round-1 mechanism — `_reset()`
+  wakes pending waiters, so `_request()` itself raises `peer disconnected
+  before replying to configure` and the widened window is never even reached.
+
+Write these four instead. They take no locks, start no threads and sleep for
+nothing: the reset happens **inside** the gap because the stub performs it
+there, on the calling thread. Each asserts the specific message, so it cannot
+be satisfied by a different failure.
+
+```python
+def _connected(srv):
+    """Drive srv to state 'connected' and return the live client socket."""
+    c = _client(srv.socket_path)
+    c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                            "pid": 1, "burp_version": "x",
+                            "instance_id": "i-1", "engagement_id": "e-1"}))
+    deadline = time.time() + 5
+    while srv.state != "connected" and time.time() < deadline:
+        time.sleep(0.005)
+    assert srv.state == "connected"
+    return c
+
+
+def test_configure_refuses_to_commit_when_a_reset_ran_in_the_gap(srv):
+    """The whole point of the guard, deterministically: no threads, no sleeps.
+    The stub performs the disconnect inside the window between _request()
+    returning and configure()'s commit."""
+    c = _connected(srv)
+    try:
+        def stub_request(header, body=b""):
+            srv._reset(srv._generation)
+            return {"v": 1, "t": "configured", "id": 1, "config_epoch": 7}
+        srv._request = stub_request
+
+        with pytest.raises(server.BridgeError,
+                           match="peer disconnected before configure completed"):
+            srv.configure({"scope.include": ["https://a/*"]},
+                          scope_sha256="x", profile="production")
+        assert srv.state == "waiting"
+        assert srv.config_epoch == 0
+    finally:
+        c.close()
+
+
+def test_configure_refuses_to_commit_when_the_socket_slot_was_refilled(srv):
+    """Deliberately white-box, and the only test that isolates the generation
+    token. It refills self._conn without going through accept(), so the
+    `_conn is None` clause cannot fire and only `gen != self._generation`
+    is left to catch the stale commit. Delete `self._generation += 1` from
+    _reset() and this test fails; that is what it exists for."""
+    c = _connected(srv)
+    successor, other = socket.socketpair()
+    try:
+        def stub_request(header, body=b""):
+            srv._reset(srv._generation)
+            srv._conn = successor          # slot refilled: _conn is NOT None
+            return {"v": 1, "t": "configured", "id": 1, "config_epoch": 7}
+        srv._request = stub_request
+
+        with pytest.raises(server.BridgeError,
+                           match="peer disconnected before configure completed"):
+            srv.configure({"scope.include": ["https://a/*"]},
+                          scope_sha256="x", profile="production")
+        assert srv.state == "waiting"
+        assert srv.config_epoch == 0
+    finally:
+        srv._conn = None
+        successor.close()
+        other.close()
+        c.close()
+
+
+def test_reset_advances_the_generation_it_guards_on(srv):
+    """The invariant is internal, so test it internally rather than pretend a
+    black-box test can see it."""
+    g0 = srv._generation
+    srv._reset(g0)
+    assert srv._generation > g0, "a real reset must advance the generation"
+
+    g1 = srv._generation
+    srv.state = "configured"
+    srv.config_epoch = 9
+    srv._reset(g0)                          # stale token: must be a no-op
+    assert srv._generation == g1
+    assert srv.state == "configured" and srv.config_epoch == 9
+
+
+def test_halt_and_resume_refuse_to_commit_after_a_reset_in_the_gap(srv):
+    """halt()/resume() have the same send-then-mutate shape as configure(),
+    so they get the same test. Without this, the guard on them is unexercised
+    by the whole suite."""
+    for method, message in (
+        (lambda: srv.halt("operator"), "peer disconnected before halt completed"),
+        (lambda: srv.resume(), "peer disconnected before resume completed"),
+    ):
+        c = _connected(srv)
+        try:
+            def stub_send(header, body=b""):
+                srv._reset(srv._generation)
+            srv._send = stub_send
+
+            with pytest.raises(server.BridgeError, match=message):
+                method()
+            assert srv.state == "waiting"
+        finally:
+            del srv._send          # fall back to the real bound method
+            c.close()
+
+
+def test_halt_and_resume_commit_on_the_happy_path(srv):
+    c = _connected(srv)
+    try:
+        srv.halt("operator asked")
+        assert srv.state == "halted"
+        reader = codec.FrameReader(c)
+        header, _ = reader.read()
+        assert header["t"] == "halt" and header["reason"] == "operator asked"
+
+        srv.resume()
+        assert srv.state == "connected"     # no config_epoch yet
+        header, _ = reader.read()
+        assert header["t"] == "resume"
+    finally:
+        c.close()
+```
+
+Then fix the existing widened-window test rather than deleting it — as a
+stress test it still has value, but its oracle must be the property that
+actually matters instead of the identity of the error. Rename it to
+`test_configure_never_leaves_a_lying_state_under_stress`, drop the word
+"deterministically" from its name and its docstring, and replace
+
+```python
+            assert isinstance(result["error"], server.BridgeError)
+```
+
+with the invariant it was always trying to state:
+
+```python
+            # Whichever mechanism fires, the forbidden outcome is the same:
+            # state that claims a peer the server no longer has.
+            assert not (srv.state == "configured" and srv._conn is None), (
+                f"lying state after a disconnect mid-configure (result={result!r})"
+            )
+```
+
+**Verification that these tests guard the code.** Run each sabotage, confirm
+the named tests fail, then `git checkout -- src/hx/bridge/server.py`:
+
+| Sabotage | Must fail |
+|---|---|
+| delete `self._generation += 1` from `_reset()` | `..._socket_slot_was_refilled`, `test_reset_advances_the_generation...` |
+| replace the three guards with `if False:` | `..._reset_ran_in_the_gap`, `..._socket_slot_was_refilled`, `test_halt_and_resume_refuse...` |
+| delete `or self._conn is None` from the three guards | **nothing** — see below |
+
+That third row is expected and must not be "fixed" by inventing a test for
+it. `self._conn` is written in exactly two places — `_serve()` sets it
+immediately after bumping the generation, `_reset()` nulls it immediately
+after bumping the generation — so `_conn is None` always implies a
+generation mismatch has already happened. The clause is redundant *given*
+the generation bump. Keep it anyway: it costs nothing, it states the
+invariant at the point of use, and it stops being redundant the moment
+anyone adds a reconnect path that reuses the slot. The comment in
+`configure()` already says exactly this; leave it there.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `.venv/bin/pytest tests/test_bridge_server.py -v`
+Expected: PASS, at least 18 passed — 13 from Steps 1-3 plus Step 3b's 5. The
+file will hold more than that if a fix round added tests of its own (it did:
+the real count at the end of Task 3 is 22). Treat 18 as a floor, never as a
+target to trim tests down to.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/hx/bridge/server.py tests/test_bridge_server.py
+git commit -m "feat(bridge): unix socket server with peercred check and deny-all handshake"
+```
+
+---
+
+### Task 4: The Java extension — dial, hello, deny-all
+
+**Files:**
+- Create: `extension/src/hx/bridge/BridgeClient.java`
+- Create: `extension/src/hx/HxExtension.java`
+- Create: `extension/test/hx/bridge/BridgeClientTest.java`
+- Create: `extension/test/hx/bridge/FakeMontoya.java`
+- Modify: `extension/src/hx/bridge/Frame.java` — add `PeerClosed` and `Reader`, delete `read(InputStream)` (Step 0)
+- Modify: `extension/test/hx/bridge/CodecTest.java` — the one call to the deleted method, plus the Reader's own tests (Step 0)
+- Modify: `extension/test.sh` — run both test classes
+
+**Interfaces:**
+- Consumes: `hx.bridge.Frame`, `hx.bridge.Json`, `hx.bridge.ConfigBody` (Task 2)
+- Produces:
+  - `hx.bridge.BridgeClient(Path socketPath, String engagementId, String instanceId, BridgeClient.Log log)`
+  - `hx.bridge.BridgeClient.Log` — `info(String)` / `error(String)`; Montoya's `Logging` is adapted to it in `HxExtension`, the test fake implements it directly
+  - `BridgeClient.connect()` / `BridgeClient.close()`
+  - `BridgeClient.isConfigured() -> boolean`
+  - `BridgeClient.maySend() -> boolean` — configured and not halted
+  - `BridgeClient.authorisation() -> BridgeClient.Authorisation` — **the only
+    coherent way to read a decision.** Epoch and scope in ONE read
+  - `hx.bridge.BridgeClient.Authorisation(long epoch, Map<String,List<String>> scope)`
+    — a record; `scope` is deeply immutable
+  - `BridgeClient.configEpoch() -> long` — **@Deprecated, do not use on a
+    decision path**
+  - `BridgeClient.scopeConfig() -> Map<String,List<String>>` — **@Deprecated**,
+    same reason: calling these two separately is two reads of one record and a
+    commit lands between them. The natural order, `scopeConfig()` then
+    `configEpoch()`, measured wrong in 393/400 trials and wrong in the unsafe
+    direction — decide under the superseded wider scope, stamp it with the
+    epoch that narrowed it
+  - `BridgeClient.checkMaySend() -> void` — throws `NotConfigured` unless configured and not halted
+  - `hx.bridge.BridgeClient.NotConfigured extends RuntimeException`
+  - `hx.HxExtension implements BurpExtension`
+
+- [ ] **Step 0: `Frame.Reader` — a bare `read(InputStream)` cannot be correct in a loop**
+
+`Frame.read(InputStream)` buffers into a **call-local** `ByteArrayOutputStream`.
+When one delivery carries two frames it returns the first and drops the rest of
+the buffer on the floor. Task 3's `readLoop()` calls it in a `while (true)`, so
+every control frame that arrives coalesced with its predecessor is lost, and the
+loss surfaces later as a misleading "peer closed mid-frame". Proven before this
+step was written:
+
+```
+frame 1: t=configure
+frame 2: LOST -> Incomplete("peer closed mid-frame")
+```
+
+This is the same defect the Python codec already fixed in Task 1, for the same
+reason — `codec.FrameReader` exists because "a bare `read_frame(sock)` function
+cannot be correct here". The Java side never got the equivalent. Add it, and
+delete the trap rather than documenting it: a method that is correct exactly
+once per stream and silently lossy on every later call is not worth keeping.
+
+**Delete** `public static Decoded read(InputStream in)` from
+`extension/src/hx/bridge/Frame.java` entirely and add `PeerClosed` and
+`Reader` in its place. The full, current `Frame.java` is in Task 2's code
+block — including two refinements that came out of Task 4's review and are
+part of the final file: the shrink policy at line `buf.length > (1 << 22)`
+(without hysteresis it re-doubled the buffer on every large frame: 115 ms vs
+47 ms over 200 x 2 MB) and the note that a `Reader` belongs to exactly one
+thread, since the hoisted `chunk` field is shared staging.
+
+Do not transcribe a second copy here: an earlier version of this plan carried
+the Reader twice and the two drifted apart the moment one was fixed.
+
+`PeerClosed` is new, and deliberately distinct from `Incomplete`: `Incomplete`
+means "call again with more bytes", which the Reader now handles internally and
+never surfaces. It mirrors the Python `PeerClosed`, including both messages —
+`"peer closed"` at a frame boundary is an orderly shutdown, `"peer closed
+mid-frame"` is a truncated frame.
+
+**Update the one existing caller** in `extension/test/hx/bridge/CodecTest.java`
+(`readReassemblesAcrossChunks`):
+
+```java
+        Frame.Decoded d = new Frame.Reader(new ByteArrayInputStream(raw)).read();
+```
+
+**Add these to `CodecTest`**, using its existing `check(...)` helper, and call
+them from `main` alongside the others:
+
+```java
+    static void readerKeepsCoalescedFrames() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+        byte[] f2 = Frame.encode(Map.of("v", 1L, "t", "halt"), "body".getBytes(StandardCharsets.UTF_8));
+        ByteArrayOutputStream both = new ByteArrayOutputStream();
+        both.write(f1); both.write(f2);
+
+        Frame.Reader r = new Frame.Reader(new ByteArrayInputStream(both.toByteArray()));
+        check("coalesced frame 1", "configure".equals(r.read().header.get("t")));
+        Frame.Decoded second = r.read();
+        // The whole point: a call-local buffer loses this one.
+        check("coalesced frame 2 survives", "halt".equals(second.header.get("t")));
+        check("coalesced frame 2 body intact",
+              "body".equals(new String(second.body, StandardCharsets.UTF_8)));
+    }
+
+    static void readerSurvivesArbitraryChunkBoundaries() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+        byte[] f2 = Frame.encode(Map.of("v", 1L, "t", "halt"), "body".getBytes(StandardCharsets.UTF_8));
+        ByteArrayOutputStream three = new ByteArrayOutputStream();
+        three.write(f1); three.write(f2); three.write(f1);
+        final byte[] all = three.toByteArray();
+
+        InputStream sevenAtATime = new InputStream() {
+            int i = 0;
+            public int read() { return i < all.length ? (all[i++] & 0xff) : -1; }
+            public int read(byte[] b, int off, int l) {
+                if (i >= all.length) return -1;
+                int n = Math.min(7, Math.min(l, all.length - i));
+                System.arraycopy(all, i, b, off, n); i += n; return n;
+            }
+        };
+        Frame.Reader r = new Frame.Reader(sevenAtATime);
+        check("7-byte chunks: frame 1", "configure".equals(r.read().header.get("t")));
+        check("7-byte chunks: frame 2", "halt".equals(r.read().header.get("t")));
+        check("7-byte chunks: frame 3", "configure".equals(r.read().header.get("t")));
+    }
+
+    static void readerDistinguishesCleanCloseFromTruncation() throws Exception {
+        byte[] f1 = Frame.encode(Map.of("v", 1L, "t", "configure"), new byte[0]);
+
+        Frame.Reader clean = new Frame.Reader(new ByteArrayInputStream(f1));
+        clean.read();
+        boolean ok = false;
+        try { clean.read(); } catch (Frame.PeerClosed e) { ok = "peer closed".equals(e.getMessage()); }
+        check("clean close at a frame boundary is not an error condition", ok);
+
+        byte[] truncated = Arrays.copyOfRange(f1, 0, f1.length - 3);
+        ok = false;
+        try { new Frame.Reader(new ByteArrayInputStream(truncated)).read(); }
+        catch (Frame.PeerClosed e) { ok = "peer closed mid-frame".equals(e.getMessage()); }
+        check("a truncated frame is reported as mid-frame", ok);
+    }
+
+    static void readerRejectsAnOversizedPrefixBeforeAllocating() throws Exception {
+        byte[] huge = new byte[] {(byte) 0x7f, (byte) 0xff, (byte) 0xff, (byte) 0xff, 'x'};
+        boolean ok = false;
+        try { new Frame.Reader(new ByteArrayInputStream(huge)).read(); }
+        catch (Frame.FrameError e) { ok = e.getMessage().contains("exceeds MAX_FRAME"); }
+        check("oversized length prefix rejected before allocation", ok);
+    }
+```
+
+Run `extension/test.sh`. All of `CodecTest` must pass, including the four new
+methods. Every one of these was run against the real `Frame` class before being
+written here.
+
+Commit this step on its own — it is a codec fix, not extension work:
+
+```bash
+git add extension/src/hx/bridge/Frame.java extension/test/hx/bridge/CodecTest.java
+git commit -m "fix(codec): a call-local buffer drops frames that arrive coalesced"
+```
+
+- [ ] **Step 1: Write the fake and the failing test**
+
+```java
+// extension/test/hx/bridge/FakeMontoya.java
+package hx.bridge;
+
+/**
+ * The few Montoya surfaces the bridge touches. MontoyaApi is an interface with
+ * 21 sub-interfaces; faking all of it would be a project. The bridge needs
+ * logging and a version string, so that is what this provides.
+ */
+public final class FakeMontoya {
+
+    /** StringBuffer, not StringBuilder: the bridge logs from its read-loop
+     *  thread while the test reads from main. StringBuilder is not thread-safe,
+     *  so that pairing can lose or corrupt a line -- in the one assertion that
+     *  proves the deny-all transition was announced. */
+    public static final class Logger implements BridgeClient.Log {
+        public final StringBuffer out = new StringBuffer();
+        public final StringBuffer err = new StringBuffer();
+        public void info(String s) { out.append(s).append('\n'); }
+        public void error(String s) { err.append(s).append('\n'); }
+        public boolean sawInfo(String needle) { return out.toString().contains(needle); }
+        public boolean sawError(String needle) { return err.toString().contains(needle); }
+    }
+}
+```
+
+```java
+// extension/test/hx/bridge/BridgeClientTest.java
+package hx.bridge;
+
+import java.io.*;
+import java.net.*;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+
+/** Drives BridgeClient against a fake Python server on a real unix socket. */
+public class BridgeClientTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path dir = Files.createTempDirectory("hxbridge");
+        Path sock = dir.resolve("t.sock");
+
+        try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+            server.bind(UnixDomainSocketAddress.of(sock));
+
+            FakeMontoya.Logger log = new FakeMontoya.Logger();
+            BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
+
+            Thread t = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
+            t.start();
+
+            try (SocketChannel peer = server.accept()) {
+                InputStream in = java.nio.channels.Channels.newInputStream(peer);
+                OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+                // One Reader for the whole connection: frames coalesce, and a
+                // fresh reader per call would drop whatever followed the one
+                // it returned.
+                Frame.Reader reader = new Frame.Reader(in);
+
+                // 1. hello arrives with the right identity
+                Frame.Decoded hello = reader.read();
+                check("sends hello", "hello".equals(hello.header.get("t")));
+                check("hello carries engagement_id", "e-1".equals(hello.header.get("engagement_id")));
+                check("hello carries instance_id", "i-1".equals(hello.header.get("instance_id")));
+                check("hello carries protocol version", Long.valueOf(1L).equals(hello.header.get("v")));
+
+                // 2. DENY-ALL before configure
+                check("unconfigured after hello", !client.isConfigured());
+                boolean threw = false;
+                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { threw = true; }
+                check("checkMaySend throws NotConfigured before configure", threw);
+
+                // 3. configure -> configured, with an epoch
+                Map<String, Object> cfg = new LinkedHashMap<>();
+                cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", 1L);
+                cfg.put("engagement_id", "e-1"); cfg.put("scope_sha256", "abc");
+                cfg.put("profile", "production");
+                // configure is the one request frame, and BridgeServer._request
+                // stamps id and deadline_us onto every one of them. A fake that
+                // omits it is not the peer: the client answers bad_frame.
+                cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
+                out.write(Frame.encode(cfg, "scope.include\thttps://a/*\nlimit.rate_rps\t5\n"
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                out.flush();
+
+                Frame.Decoded ack = reader.read();
+                check("acks with configured", "configured".equals(ack.header.get("t")));
+                check("ack echoes the request id", Long.valueOf(1L).equals(ack.header.get("id")));
+                check("ack carries a non-zero epoch",
+                      ((Long) ack.header.get("config_epoch")) > 0);
+
+                waitUntil(() -> client.isConfigured());
+                check("configured after ack", client.isConfigured());
+                check("scope config parsed",
+                      client.scopeConfig().get("scope.include").equals(List.of("https://a/*")));
+                // The coherent read. configEpoch() then scopeConfig() is two
+                // volatile reads and a commit can land between them; this is
+                // the one an evidence line has to use.
+                BridgeClient.Authorisation au = client.authorisation();
+                check("authorisation() carries the epoch and the scope together",
+                      au.epoch() == client.configEpoch()
+                      && au.scope().equals(client.scopeConfig()));
+                client.checkMaySend();   // must not throw now
+
+                // 4. halt / resume
+                Map<String, Object> halt = Map.of("v", 1L, "t", "halt", "reason", "operator");
+                out.write(Frame.encode(halt, new byte[0])); out.flush();
+                waitUntil(() -> !client.maySend());
+                boolean haltedThrew = false;
+                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { haltedThrew = true; }
+                check("halt blocks sending", haltedThrew);
+
+                out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0])); out.flush();
+                waitUntil(() -> client.maySend());
+                boolean resumed = client.maySend();
+                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { resumed = false; }
+                check("resume unblocks sending", resumed);
+
+                // 5. an engagement_id mismatch on configure is refused
+                Map<String, Object> wrong = new LinkedHashMap<>(cfg);
+                wrong.put("id", 2L); wrong.put("engagement_id", "SOMEONE-ELSE");
+                out.write(Frame.encode(wrong, new byte[0])); out.flush();
+                Frame.Decoded err = reader.read();
+                check("engagement mismatch answered with error",
+                      "error".equals(err.header.get("t")));
+                check("error class names the mismatch",
+                      String.valueOf(err.header.get("class")).contains("engagement"));
+
+                // 6. a protocol-mismatch frame while configured must trip
+                // DENY-ALL through readLoop's OTHER exit path. handle()
+                // returns false here, and the bare `return` that used to
+                // follow skipped both catch blocks entirely: configured
+                // stayed true, configEpoch kept its value, and maySend()
+                // would answer true forever with a dead read loop and no
+                // control channel behind it. This is the exact leak the
+                // finally block in readLoop() exists to close.
+                check("configured before the protocol-mismatch frame", client.maySend());
+                Map<String, Object> badVersion = new LinkedHashMap<>();
+                badVersion.put("v", 2L); badVersion.put("t", "halt"); badVersion.put("reason", "operator");
+                out.write(Frame.encode(badVersion, new byte[0])); out.flush();
+                Frame.Decoded mismatch = reader.read();
+                check("protocol mismatch answered with error",
+                      "error".equals(mismatch.header.get("t")));
+                check("error class names the protocol mismatch",
+                      "protocol_mismatch".equals(mismatch.header.get("class")));
+                waitUntil(() -> !client.maySend());
+                check("protocol mismatch trips DENY-ALL via readLoop's return path",
+                      !client.maySend());
+                boolean deniedAfterMismatch = false;
+                try { client.checkMaySend(); }
+                catch (BridgeClient.NotConfigured e) { deniedAfterMismatch = true; }
+                check("checkMaySend throws after the protocol-mismatch DENY-ALL",
+                      deniedAfterMismatch);
+            }
+            client.close();
+
+            closedIsSticky();
+            aClosedClientDoesNotGoLive();
+            aRefusedConfigureDropsToDenyAll();
+            closeIsTerminalAgainstTheReadLoop();
+            losingThePeerDropsToDenyAll();
+            aFailedHelloLeavesNoChannelBehind();
+            theCommitIsExclusiveWithClose();
+            aConfigureDoesNotLiftAHalt();
+        } finally {
+            Files.deleteIfExists(sock);
+            Files.deleteIfExists(dir);
+        }
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    /** Drive a fresh client to "configured" and hand back the pieces. */
+    static final class Live implements AutoCloseable {
+        final BridgeClient client; final SocketChannel peer;
+        final OutputStream out; final Frame.Reader reader; final FakeMontoya.Logger log;
+        final ServerSocketChannel server;
+        Live(ServerSocketChannel server, BridgeClient c, SocketChannel p,
+             OutputStream o, Frame.Reader r, FakeMontoya.Logger l) {
+            this.server = server; this.client = c; this.peer = p;
+            this.out = o; this.reader = r; this.log = l;
+        }
+        public void close() throws Exception {
+            client.close(); peer.close(); server.close();
+        }
+    }
+
+    static Map<String, Object> configureFrame(String engagement, long id) {
+        Map<String, Object> cfg = new LinkedHashMap<>();
+        cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", id);
+        cfg.put("engagement_id", engagement); cfg.put("scope_sha256", "abc");
+        cfg.put("profile", "production");
+        cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
+        return cfg;
+    }
+
+    static Live live(Path dir, String name) throws Exception {
+        Path sock = dir.resolve(name);
+        ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
+        server.bind(UnixDomainSocketAddress.of(sock));
+        FakeMontoya.Logger log = new FakeMontoya.Logger();
+        BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
+        // Daemon: a read loop that leaks past the end of a test must fail the
+        // suite by way of its assertions, not outlive main() and hang the JVM.
+        Thread dial = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
+        dial.setDaemon(true);
+        dial.start();
+        SocketChannel peer = server.accept();
+        OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+        Frame.Reader reader = new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
+        reader.read();                                   // the hello
+        out.write(Frame.encode(configureFrame("e-1", 1L),
+                  "scope.include\thttps://WIDE/*\n".getBytes(StandardCharsets.UTF_8)));
+        out.flush();
+        reader.read();                                   // the ack
+        waitUntil(client::isConfigured);
+        return new Live(server, client, peer, out, reader, log);
+    }
+
+    /** close() must be sticky: a client closed before its dial completes must
+     *  never go on to hello, configure and live sending. Reproduced by the
+     *  review as an UNLOADED extension holding a control channel. */
+    static void closedIsSticky() throws Exception {
+        Path dir = Files.createTempDirectory("hxsticky");
+        Path sock = dir.resolve("s.sock");
+        try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+            server.bind(UnixDomainSocketAddress.of(sock));
+            BridgeClient client = new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+            client.close();
+
+            // On a thread with a join timeout: an unfixed client's connect()
+            // dials, sends hello and blocks in readLoop forever, so a direct
+            // call would hang the suite instead of failing it.
+            final boolean[] refused = {false};
+            Thread dial = new Thread(() -> {
+                try { client.connect(); }
+                catch (IOException e) { refused[0] = true; }
+                catch (Exception ignored) { }
+            });
+            dial.setDaemon(true);
+            dial.start();
+            dial.join(3000);
+
+            check("connect() on a closed client returns instead of dialling", !dial.isAlive());
+            check("connect() on a closed client is refused", refused[0]);
+            check("a closed client never reports maySend", !client.maySend());
+        } finally {
+            Files.deleteIfExists(sock); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A configure arriving after close() must not resurrect the client. */
+    static void aClosedClientDoesNotGoLive() throws Exception {
+        Path dir = Files.createTempDirectory("hxresurrect");
+        try (Live l = live(dir, "r.sock")) {
+            check("live before close", l.client.maySend());
+            l.client.close();
+            check("closed client denies immediately", !l.client.maySend());
+
+            // A second configure lands after close(): the read loop must not
+            // act on it.
+            try {
+                l.out.write(Frame.encode(configureFrame("e-1", 2L),
+                        "scope.include\thttps://SNEAKY/*\n".getBytes(StandardCharsets.UTF_8)));
+                l.out.flush();
+            } catch (IOException ignored) { /* channel already shut: also fine */ }
+            Thread.sleep(150);
+            check("a configure after close() does not resurrect the client", !l.client.maySend());
+            check("and leaves no epoch behind", l.client.configEpoch() == 0);
+            check("and leaves no scope behind", l.client.scopeConfig().isEmpty());
+
+            // The same property without a race in it. closeIsTerminalAgainst-
+            // TheReadLoop() below can only catch the defect when the scheduler
+            // cooperates -- measured 0/20 on ONE core against 11-14/20 on 24 --
+            // and CI runners are commonly 2 vCPU, so on its own that guard can
+            // go quietly vacuous. This one cannot: it hands handle() a frame
+            // directly on this thread, on a client that was configured before
+            // close(), and it must be refused.
+            boolean refused;
+            try {
+                refused = !l.client.handle(
+                        Frame.decode(Frame.encode(configureFrame("e-1", 9L), CFG)));
+            } catch (IOException e) {
+                // It got as far as writing an ack down a channel close() shut,
+                // which means it did not refuse the frame. Caught so this
+                // reports as a failed check rather than killing the runner
+                // part-way through the suite.
+                refused = false;
+            }
+            check("handle() refuses a frame on a closed client", refused);
+            check("and did not re-enable sending", !l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("r.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A configure we cannot parse means the operator's intent is unknown.
+     *  Keeping the PREVIOUS, wider scope would send exactly where a narrowing
+     *  operator just said not to. */
+    static void aRefusedConfigureDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxbadcfg");
+        try (Live l = live(dir, "b.sock")) {
+            check("wide scope is in force first",
+                  l.client.scopeConfig().toString().contains("WIDE"));
+
+            l.out.write(Frame.encode(configureFrame("e-1", 3L),
+                    "this-is-not-a-config-body\n".getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded err = l.reader.read();
+            check("unparseable configure is answered with an error",
+                  "error".equals(err.header.get("t")));
+            check("error class names the config",
+                  String.valueOf(err.header.get("class")).contains("config"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a refused configure drops to DENY-ALL", !l.client.maySend());
+            check("the superseded wider scope is dropped", l.client.scopeConfig().isEmpty());
+            check("and its epoch with it", l.client.configEpoch() == 0);
+        } finally {
+            Files.deleteIfExists(dir.resolve("b.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** The most common terminal path of all, and previously untested. */
+    static void losingThePeerDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxpeergone");
+        try (Live l = live(dir, "p.sock")) {
+            check("configured while the peer is up", l.client.maySend());
+            l.peer.close();
+
+            waitUntil(() -> !l.client.maySend());
+            check("losing the peer drops to DENY-ALL", !l.client.maySend());
+            check("epoch zeroed on peer loss", l.client.configEpoch() == 0);
+            check("scope dropped on peer loss", l.client.scopeConfig().isEmpty());
+            // maySend() flipping is not a happens-before edge for the log line:
+            // denyAll() lands two statements before log.info(). Wait on the
+            // thing being asserted.
+            waitUntil(() -> l.log.sawInfo("deny-all"));
+            check("and the transition is logged",
+                  l.log.sawInfo("deny-all"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("p.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * close() must be terminal the instant it returns. The read loop runs on
+     * its own thread and may be part-way through a `configure` that was
+     * already sitting in the Reader's buffer when close() ran; if the commit
+     * is not exclusive with close(), the loop sets configured back to true
+     * behind close()'s back and maySend() answers true for as long as it takes
+     * to write the ack -- microseconds in which Plan 3 will send.
+     *
+     * Two details are load-bearing, both learned the hard way. A COALESCED
+     * BACKLOG of configure frames, because with one there is nothing for
+     * close() to race. And a BUSY POLL, because the window opens a few us
+     * AFTER close() returns: a sample at t=0 lands before it, a sample at
+     * t=2ms lands after it, and both report all-clear. Point samples measured
+     * 0/40 on code that a poll catches 39/40.
+     *
+     * This is a DETECTOR, not the guard. It is scheduler-dependent: against
+     * the defective client the review measured 11-14/20 on 24 cores, 1-3/20 on
+     * two, and 0/20 pinned to one -- so on a 2-vCPU CI runner it can pass
+     * clean on broken code. The guard is the deterministic handle()-after-
+     * close() check in aClosedClientDoesNotGoLive(). A 64-frame backlog and
+     * an ack read before close() (which proves the loop is already chewing
+     * through the backlog rather than parked on the socket) took the detector
+     * to 18-20/20 on multi-core without losing the 2-core signal.
+     */
+    static void closeIsTerminalAgainstTheReadLoop() throws Exception {
+        Path dir = Files.createTempDirectory("hxclose");
+        int resurrections = 0, attempts = 20;
+        try {
+            for (int i = 0; i < attempts; i++) {
+                Path sock = dir.resolve("c" + i + ".sock");
+                try (ServerSocketChannel server =
+                             ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+                    server.bind(UnixDomainSocketAddress.of(sock));
+                    BridgeClient client =
+                            new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+                    Thread t = new Thread(() -> {
+                        try { client.connect(); } catch (Exception ignored) { } });
+                    t.setDaemon(true);
+                    t.start();
+                    try (SocketChannel peer = server.accept()) {
+                        OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+                        Frame.Reader reader =
+                                new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
+                        reader.read();                                   // hello
+
+                        out.write(Frame.encode(configureFrame("e-1", 0L), CFG));
+                        out.flush();
+                        reader.read();                                   // the ack
+                        waitUntil(client::isConfigured);
+
+                        ByteArrayOutputStream backlog = new ByteArrayOutputStream();
+                        for (int j = 1; j <= BACKLOG; j++)
+                            backlog.write(Frame.encode(configureFrame("e-1", j), CFG));
+                        out.write(backlog.toByteArray()); out.flush();
+
+                        // Gate on the first ack: it says the read loop has the
+                        // whole backlog in its Reader and is committing frames
+                        // out of it, so close() lands mid-backlog rather than
+                        // before the bytes have even arrived.
+                        reader.read();
+
+                        client.close();
+
+                        long end = System.nanoTime() + 5_000_000L;       // 5 ms
+                        while (System.nanoTime() < end)
+                            if (client.maySend()) { resurrections++; break; }
+                    }
+                }
+                Files.deleteIfExists(sock);
+            }
+        } finally {
+            Files.deleteIfExists(dir);
+        }
+        check("close() is terminal: the read loop cannot re-enable sending behind it ("
+              + resurrections + "/" + attempts + " resurrections)", resurrections == 0);
+    }
+
+    /** Frames left buffered in the client's Reader when close() lands. Two was
+     *  enough to see the defect on a busy machine and nowhere near enough on a
+     *  quiet one. */
+    static final int BACKLOG = 64;
+
+    /**
+     * F6: a dialled channel must not outlive a failed hello. Reverting the
+     * closeChannel() in connect()'s catch failed nothing before this existed --
+     * an unloadable extension would hold an open control channel with no
+     * reader on it, and connect()'s caller would have no way to shut it.
+     *
+     * Deterministic, not a race, and the instance_id is what makes it so. At
+     * 8 MB the hello cannot fit in the socket buffer (212992 bytes here), so
+     * the write BLOCKS. Whether the peer's close lands before the write starts
+     * or while it is parked, the write fails; there is no interleaving in
+     * which it quietly succeeds and the client sails on into readLoop().
+     */
+    static void aFailedHelloLeavesNoChannelBehind() throws Exception {
+        Path dir = Files.createTempDirectory("hxhello");
+        Path sock = dir.resolve("h.sock");
+        try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+            server.bind(UnixDomainSocketAddress.of(sock));
+            BridgeClient client = new BridgeClient(
+                    sock, "e-1", "i-".repeat(4 << 20), new FakeMontoya.Logger());
+
+            Thread killer = new Thread(() -> {
+                try (SocketChannel peer = server.accept()) {
+                    // Accepted and dropped on the floor: nothing will ever
+                    // drain this hello.
+                } catch (IOException ignored) { }
+            });
+            killer.setDaemon(true);
+            killer.start();
+
+            boolean threw = false;
+            try { client.connect(); } catch (Exception e) { threw = true; }
+            killer.join(5000);
+
+            check("a hello that cannot be written propagates out of connect()", threw);
+            check("and the dialled channel does not outlive the failed hello",
+                  !client.channelIsOpen());
+            check("and the client is still denying", !client.maySend());
+        } finally {
+            Files.deleteIfExists(sock); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * The commit-lock guard, deterministically. The top-of-handle() guard
+     * cannot satisfy this one: the frame is already past it and parked on the
+     * monitor when close() runs.
+     *
+     * Monitor reentrancy is what makes it deterministic. This thread holds
+     * commitLock, so the helper cannot get past `synchronized (commitLock)` in
+     * handle(); close() takes the SAME monitor and this thread already owns it,
+     * so it proceeds. When this block exits, the helper acquires the monitor
+     * and must observe `closed`.
+     *
+     * The park is verified by LOCK IDENTITY, not by Thread.State alone: a
+     * thread stuck on a class-initialisation monitor is also BLOCKED, and
+     * accepting that would let the helper still be BEFORE the top-of-handle()
+     * guard when close() lands -- which passes for the wrong reason and stops
+     * covering the commit-lock guard at all.
+     */
+    static void theCommitIsExclusiveWithClose() throws Exception {
+        Path dir = Files.createTempDirectory("hxexcl");
+        try (Live l = live(dir, "x.sock")) {
+            final boolean[] refused = {false};
+            Thread t;
+            synchronized (l.client.commitLock) {
+                t = new Thread(() -> {
+                    try { refused[0] = !l.client.handle(
+                            Frame.decode(Frame.encode(configureFrame("e-1", 7L), CFG))); }
+                    catch (IOException e) { refused[0] = false; }
+                });
+                t.setDaemon(true);
+                t.start();
+                check("the configure is parked on commitLock itself",
+                      waitUntilBlockedOn(t, l.client.commitLock));
+                l.client.close();          // reentrant: this thread holds the monitor
+            }
+            t.join(5000);
+            check("a commit parked on commitLock is refused once close() has run", refused[0]);
+            check("and close() stays terminal", !l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("x.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A configure frame must NOT lift an operator halt. The commit used to end
+     * with `halted.set(false)`, so the most likely next action after halting --
+     * halt because the scope went wrong, push the corrected scope -- re-armed
+     * issuance with no resume() on the wire, no log line, and both consoles
+     * reading "configured".
+     *
+     * The other half of the assertion matters just as much: the epoch and the
+     * scope must still commit. Narrowing scope during an emergency stop is
+     * exactly what an operator should be able to do, so "configure is refused
+     * while halted" would be the wrong fix. A configure re-authorises SCOPE,
+     * not ISSUANCE.
+     */
+    static void aConfigureDoesNotLiftAHalt() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltcfg");
+        try (Live l = live(dir, "h.sock")) {              // configured, epoch 1, WIDE
+            check("configured before the halt", l.client.maySend());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "scope was wrong"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !l.client.maySend());
+            check("halt blocks sending", !l.client.maySend());
+
+            // The corrected, NARROWER scope, pushed while halted.
+            l.out.write(Frame.encode(configureFrame("e-1", 4L),
+                    "scope.include\thttps://NARROW/*\n".getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded ack = l.reader.read();
+            // Reading the ack is the happens-before edge: the commit completes
+            // before the ack is written, so nothing below has to poll.
+            check("the configure while halted is acknowledged",
+                  "configured".equals(ack.header.get("t")));
+
+            boolean stillHalted = false;
+            String message = "";
+            try { l.client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { stillHalted = true; message = e.getMessage(); }
+            check("a configure does not lift an operator halt", stillHalted);
+            check("and the refusal still names the halt, not a missing configure ("
+                  + message + ")", message.startsWith("halted:"));
+            check("and maySend() agrees", !l.client.maySend());
+
+            // ...while the scope and epoch it carried DID commit.
+            BridgeClient.Authorisation au = l.client.authorisation();
+            check("the configure still advanced the epoch (" + au.epoch() + ")",
+                  au.epoch() == 2L);
+            check("ack reports the advanced epoch",
+                  Long.valueOf(2L).equals(ack.header.get("config_epoch")));
+            check("the narrowed scope is in force",
+                  au.scope().get("scope.include").equals(List.of("https://NARROW/*")));
+
+            // And a resume -- the frame that IS allowed to re-arm issuance --
+            // does so, under the epoch-2 scope.
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0]));
+            l.out.flush();
+            waitUntil(l.client::maySend);
+            check("resume is what re-arms issuance", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("h.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** True once `t` is BLOCKED on `monitor` specifically. */
+    static boolean waitUntilBlockedOn(Thread t, Object monitor) throws Exception {
+        java.lang.management.ThreadMXBean mx = java.lang.management.ManagementFactory.getThreadMXBean();
+        int want = System.identityHashCode(monitor);
+        long end = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < end) {
+            java.lang.management.ThreadInfo info = mx.getThreadInfo(t.threadId());
+            if (info != null && t.getState() == Thread.State.BLOCKED) {
+                java.lang.management.LockInfo li = info.getLockInfo();
+                if (li != null && li.getIdentityHashCode() == want) return true;
+            }
+            Thread.sleep(1);
+        }
+        return false;
+    }
+
+    static final byte[] CFG =
+            "scope.include\thttps://RACE/*\n".getBytes(StandardCharsets.UTF_8);
+
+    interface Cond { boolean ok(); }
+
+    static void waitUntil(Cond c) throws Exception {
+        long end = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < end) {
+            if (c.ok()) return;
+            Thread.sleep(10);
+        }
+    }
+}
+```
+
+Update `extension/test.sh` to run both classes:
+
+```bash
+java -cp "build/test-classes:$MONTOYA" hx.bridge.CodecTest
+java -cp "build/test-classes:$MONTOYA" hx.bridge.BridgeClientTest
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cd extension && ./test.sh`
+Expected: FAIL — `cannot find symbol: class BridgeClient`
+
+- [ ] **Step 3: Write `BridgeClient.java`**
+
+```java
+// extension/src/hx/bridge/BridgeClient.java
+package hx.bridge;
+
+import java.io.*;
+import java.net.*;
+import java.nio.channels.Channels;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * The Burp end of the bridge. Dials the harness, announces itself, and refuses
+ * to send anything until it has been configured.
+ *
+ * DENY-ALL is the initial and terminal state. Burp's extensionData does not
+ * survive a restart, so a reconnected extension knows nothing -- it must be
+ * told the scope again before it may issue a single request.
+ */
+public final class BridgeClient {
+
+    public static final long PROTOCOL_VERSION = 1L;
+
+    public static class NotConfigured extends RuntimeException {
+        public NotConfigured(String m) { super(m); }
+    }
+
+    /**
+     * The two logging calls the bridge makes. Montoya's Logging satisfies it
+     * through an adapter and the test fake implements it directly. Declaring
+     * it here is what keeps BridgeClient free of a compile-time Montoya
+     * dependency -- and unlike the `Object log` it replaces, it can actually
+     * be called.
+     */
+    public interface Log {
+        void info(String s);
+        void error(String s);
+    }
+
+    private final Path socketPath;
+    private final String engagementId;
+    private final String instanceId;
+    private final Log log;
+
+    private volatile SocketChannel channel;
+    private volatile InputStream in;
+    private volatile OutputStream out;
+
+    // F1: close() must be STICKY. Without it a client that was closed before
+    // its dial completed goes on to hello, configure and live sending -- an
+    // unloaded extension holding a control channel on a daemon thread.
+    private volatile boolean closed = false;
+
+    // close() and the read loop's configure commit both mutate the permission
+    // state from different threads. Re-checking `closed` after the commit only
+    // makes the window narrow (~ns); this monitor makes it not exist. In a
+    // component whose whole job is refusing to send, "too small to observe" is
+    // not the same as "cannot happen".
+    //
+    // Package-private, not private: BridgeClientTest.theCommitIsExclusiveWith-
+    // Close() takes this monitor itself to park a commit inside handle()'s
+    // `synchronized (commitLock)` deterministically. See the note on handle()
+    // below -- this field's visibility is load-bearing for that test.
+    final Object commitLock = new Object();
+
+    private final AtomicBoolean configured = new AtomicBoolean(false);
+    private final AtomicBoolean halted = new AtomicBoolean(false);
+
+    /**
+     * The epoch and the scope it authorises, published together.
+     *
+     * They were two volatile fields, and a caller holding no lock cannot read
+     * two volatiles coherently no matter where the writes sit: the review
+     * measured maySend() answering true with configEpoch()==1 while
+     * scopeConfig() already returned the epoch-2 scope. A request only epoch 2
+     * permits then goes out stamped epoch 1 -- an evidence line claiming
+     * authorisation from an epoch that never granted it. Moving the writes
+     * inside commitLock did not fix it (still 9/200); one reference does,
+     * because there is only one write to observe.
+     */
+    public record Authorisation(long epoch, Map<String, List<String>> scope) { }
+    private static final Authorisation DENIED = new Authorisation(0, Map.of());
+    private volatile Authorisation committed = DENIED;
+
+    private volatile String haltReason = null;
+    private long epochCounter = 0;
+
+    public BridgeClient(Path socketPath, String engagementId, String instanceId, Log log) {
+        this.socketPath = socketPath;
+        this.engagementId = engagementId;
+        this.instanceId = instanceId;
+        this.log = log;
+    }
+
+    public boolean isConfigured() { return configured.get(); }
+
+    /**
+     * @deprecated Two reads of {@link #committed}: a commit can land between
+     * this call and a following {@link #scopeConfig()} (or vice versa), so
+     * the pair straddles the commit and a decision can be made under one
+     * epoch's scope while stamped with the other's epoch -- the natural read
+     * order, {@code scopeConfig()} then {@code configEpoch()}, is the
+     * dangerous one, since it yields the new epoch with the old, superseded
+     * scope. Any decision that must send with an epoch and the scope that
+     * epoch actually authorises has to read both in the one call
+     * {@link #authorisation()} makes. Retained for callers that read only
+     * this field.
+     * @see BridgeClient#authorisation()
+     */
+    @Deprecated
+    public long configEpoch() { return committed.epoch(); }
+
+    /**
+     * @deprecated See {@link #configEpoch()}: this is the other half of the
+     * same straddle. Retained for callers that read only this field.
+     * @see BridgeClient#authorisation()
+     */
+    @Deprecated
+    public Map<String, List<String>> scopeConfig() { return committed.scope(); }
+
+    /**
+     * Epoch and scope in ONE read. Publishing them through a single reference
+     * makes the STATE coherent, but configEpoch() then scopeConfig() is still
+     * two reads of it and a commit can land between them: a busy poll measured
+     * 11/400 there, against 32/400 for the two-field version this replaced.
+     * Narrower is not closed. Anything that decides under a scope and then
+     * stamps the epoch that granted it -- Plan 3's send path, and the evidence
+     * line behind it -- must take the pair from here, once.
+     */
+    public Authorisation authorisation() { return committed; }
+
+    public boolean maySend() { return configured.get() && !halted.get(); }
+
+    /** Drop to DENY-ALL. Returns whether the client had been configured.
+     *  `configured` is cleared FIRST: maySend() reads only that and `halted`,
+     *  so no observer sees permission outlive the scope behind it. */
+    private boolean denyAll() {
+        boolean was = configured.getAndSet(false);
+        committed = DENIED;
+        return was;
+    }
+
+    /** Throws unless the extension is configured and not halted. */
+    public void checkMaySend() {
+        if (!configured.get())
+            throw new NotConfigured("not_configured: no configure frame acknowledged yet");
+        if (halted.get())
+            throw new NotConfigured("halted: " + haltReason);
+    }
+
+    public void connect() throws IOException {
+        if (closed) throw new IOException("this client is closed; make a new one");
+        channel = SocketChannel.open(UnixDomainSocketAddress.of(socketPath));
+        in = Channels.newInputStream(channel);
+        out = Channels.newOutputStream(channel);
+
+        Map<String, Object> hello = new LinkedHashMap<>();
+        hello.put("v", PROTOCOL_VERSION);
+        hello.put("t", "hello");
+        hello.put("ext_version", "0.1.0");
+        hello.put("pid", ProcessHandle.current().pid());
+        hello.put("burp_version", System.getProperty("hx.burp.version", "unknown"));
+        hello.put("instance_id", instanceId);
+        hello.put("engagement_id", engagementId);
+        try {
+            send(hello, new byte[0]);
+        } catch (IOException | RuntimeException e) {
+            closeChannel();          // F6: a dialled channel must not outlive a failed hello
+            throw e;
+        }
+        // close() may have run while we were dialling: it had no channel to
+        // shut and nothing configured to clear, so it left no trace here.
+        if (closed) { closeChannel(); return; }
+
+        readLoop();
+    }
+
+    private void readLoop() {
+        // The Reader is created once, outside the loop, and owns its buffer
+        // across iterations. Constructing one per iteration would lose every
+        // frame that arrived in the same delivery as its predecessor.
+        Frame.Reader reader = new Frame.Reader(in);
+        try {
+            while (true) {
+                Frame.Decoded f = reader.read();
+                if (!handle(f)) return;
+            }
+        } catch (Frame.PeerClosed | Frame.FrameError | IOException e) {
+            // The expected ways a connection ends. Nothing to do here: the
+            // finally block is what enforces the terminal state.
+        } finally {
+            // DENY-ALL on EVERY exit path, not just the ones named above. The
+            // `return` out of the loop -- a protocol mismatch -- skips the
+            // catch blocks entirely, and used to leave maySend() true with a
+            // dead read loop and no control channel: the extension would keep
+            // issuing requests that nothing could halt. This is the same shape
+            // as the Python side's _reset() in _serve()'s finally, and for the
+            // same reason.
+            boolean wasConfigured = denyAll();
+            closeChannel();
+            if (wasConfigured) log.info("hx: control channel gone, deny-all");
+        }
+    }
+
+    /** Test seam: is the dialled channel still open? Package-private and
+     *  BridgeClient is final, so it cannot escape hx.bridge. F6 -- a channel
+     *  outliving a failed hello -- has no other observable. */
+    boolean channelIsOpen() {
+        SocketChannel c = channel;
+        return c != null && c.isOpen();
+    }
+
+    private void closeChannel() {
+        try { if (channel != null) channel.close(); } catch (IOException ignored) { }
+    }
+
+    /** Package-private, not private: BridgeClientTest calls this directly to
+     *  check that a closed client refuses a frame without needing to win a
+     *  race first. BridgeClient is final, so nothing escapes hx.bridge.
+     *
+     *  Both this method's visibility and commitLock's are load-bearing for
+     *  theCommitIsExclusiveWithClose(): that test holds commitLock on its own
+     *  thread, calls handle() directly from a second thread so it parks on
+     *  `synchronized (commitLock)` below, then calls close() -- which takes
+     *  the same monitor -- reentrantly from the first thread. Make either
+     *  member private again and that test cannot compile, let alone run; a
+     *  later "tidy-up" that does so would silently delete the only
+     *  deterministic coverage of the commit-lock guard, leaving only the
+     *  scheduler-dependent race detector, which passes clean at 1-2 vCPU on
+     *  broken code. */
+    boolean handle(Frame.Decoded f) throws IOException {
+        if (closed) return false;
+        Object v = f.header.get("v");
+        if (!Long.valueOf(PROTOCOL_VERSION).equals(v)) {
+            error(f, "protocol_mismatch", "expected v=" + PROTOCOL_VERSION + " got " + v);
+            return false;
+        }
+        String t = String.valueOf(f.header.get("t"));
+
+        switch (t) {
+            case "configure" -> {
+                if (!(f.header.get("deadline_us") instanceof Long)) {
+                    // Required on every request frame. Missing it means the
+                    // sender is not speaking this protocol version properly.
+                    error(f, "bad_frame", "request frame has no deadline_us");
+                    return true;
+                }
+                if (!engagementId.equals(f.header.get("engagement_id"))) {
+                    error(f, "engagement_mismatch",
+                          "configure names engagement " + f.header.get("engagement_id")
+                          + " but this extension serves " + engagementId);
+                    return true;
+                }
+                Map<String, List<String>> scope;
+                try {
+                    scope = ConfigBody.parse(f.body);
+                } catch (Frame.FrameError e) {
+                    // Unknown intent means DENY, not "carry on under the last
+                    // intent". The likeliest trigger is an operator NARROWING
+                    // scope with a key this jar predates: keeping the old,
+                    // wider scope would then send exactly where they just said
+                    // not to. Unlike engagement_mismatch and bad_frame above --
+                    // neither of which is our peer trying to configure us --
+                    // this one is, and it failed.
+                    denyAll();
+                    error(f, "bad_config", e.getMessage());
+                    return true;
+                }
+                long epoch;
+                synchronized (commitLock) {
+                    // Either close() got here first -- and we must not undo it
+                    // -- or it cannot arrive until this commit is complete and
+                    // will then clear it. No ordering in between exists.
+                    if (closed) return false;
+                    epoch = ++epochCounter;
+                    // One write publishes the epoch and the scope it
+                    // authorises. Both are visible, or neither is.
+                    committed = new Authorisation(epoch, scope);
+                    configured.set(true);
+                    // NOT halted.set(false). A configure re-authorises SCOPE,
+                    // not ISSUANCE. An operator halts BECAUSE the scope went
+                    // wrong and then pushes the corrected scope -- the most
+                    // likely next action of all -- and clearing the halt here
+                    // re-armed issuance with no `resume` on the wire, no log
+                    // line, and both consoles reading "configured". Only a
+                    // `resume` frame lifts a halt.
+                }
+
+                Map<String, Object> ack = new LinkedHashMap<>();
+                ack.put("v", PROTOCOL_VERSION);
+                ack.put("t", "configured");
+                ack.put("id", f.header.get("id"));
+                // The epoch WE committed, not whatever configEpoch() says now:
+                // a close() between the commit and here zeroes it, and the ack
+                // would then claim config_epoch 0 for a configure that was in
+                // fact acknowledged under epoch N.
+                ack.put("config_epoch", epoch);
+                send(ack, new byte[0]);
+            }
+            case "halt" -> {
+                halted.set(true);
+                haltReason = String.valueOf(f.header.get("reason"));
+            }
+            case "resume" -> halted.set(false);
+            default -> {
+                error(f, "unknown_frame", "unrecognised frame type " + t);
+            }
+        }
+        return true;
+    }
+
+    private void error(Frame.Decoded f, String cls, String detail) throws IOException {
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("v", PROTOCOL_VERSION);
+        e.put("t", "error");
+        e.put("id", f.header.get("id"));
+        e.put("class", cls);
+        e.put("detail", detail);
+        send(e, new byte[0]);
+    }
+
+    private synchronized void send(Map<String, Object> header, byte[] body) throws IOException {
+        out.write(Frame.encode(header, body));
+        out.flush();
+    }
+
+    public void close() {
+        synchronized (commitLock) {
+            closed = true;           // sticky: checked by connect() and handle()
+            denyAll();
+        }
+        closeChannel();              // I/O outside the monitor
+    }
+}
+```
+
+- [ ] **Step 4: Write `HxExtension.java`**
+
+```java
+// extension/src/hx/HxExtension.java
+package hx;
+
+import burp.api.montoya.BurpExtension;
+import burp.api.montoya.MontoyaApi;
+import hx.bridge.BridgeClient;
+
+import java.nio.file.Path;
+
+/**
+ * Burp entry point. Reads its socket path, engagement id and instance id from
+ * system properties so the harness controls them at launch, then dials in on a
+ * background thread and stays in DENY-ALL until configured.
+ */
+public class HxExtension implements BurpExtension {
+
+    // Written on Burp's initialize thread, read by the unloading handler on
+    // another -- the same cross-thread edge the bridge's own fields were fixed
+    // for. Read it ONCE into a local there too: `if (client != null)
+    // client.close()` races itself, NPEs inside the handler, and skips the
+    // close() that was the point of the handler.
+    private volatile BridgeClient client;
+
+    @Override
+    public void initialize(MontoyaApi api) {
+        api.extension().setName("hx bridge");
+
+        String sock = System.getProperty("hx.socket");
+        String engagement = System.getProperty("hx.engagement");
+        String instance = System.getProperty("hx.instance", "unknown");
+
+        if (sock == null || engagement == null) {
+            api.logging().logToError(
+                "hx: -Dhx.socket and -Dhx.engagement are required; extension idle");
+            return;
+        }
+        System.setProperty("hx.burp.version", api.burpSuite().version().toString());
+
+        client = new BridgeClient(Path.of(sock), engagement, instance, new BridgeClient.Log() {
+            public void info(String s)  { api.logging().logToOutput(s); }
+            public void error(String s) { api.logging().logToError(s); }
+        });
+        Thread t = new Thread(() -> {
+            try {
+                client.connect();
+            } catch (Exception e) {
+                api.logging().logToError("hx: bridge connect failed: " + e);
+            }
+        }, "hx-bridge");
+        t.setDaemon(true);
+        t.start();
+
+        api.extension().registerUnloadingHandler(() -> {
+            BridgeClient c = client;
+            if (c != null) c.close();
+        });
+        api.logging().logToOutput("hx: bridge dialling " + sock);
+    }
+}
+```
+
+- [ ] **Step 5: Run to verify it passes**
+
+Run: `cd extension && ./test.sh`
+Expected: both classes print `ALL PASS`, exit 0
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add extension
+git commit -m "feat(bridge): java client dials in, stays deny-all until configured"
+```
+
+---
+
+- [ ] **Step 6: fixes from the task review**
+
+The code blocks in Steps 0-5 above have been corrected in place, so a fresh
+implementer reading this plan top-to-bottom writes the right thing. If Steps
+0-5 are already implemented, this step is the diff — five changes, the first
+load-bearing.
+
+**1. `readLoop()` leaked DENY-ALL through its one `return` path.** `handle()`
+returns `false` on a protocol mismatch; the bare `return` skipped both catch
+blocks, so `configured` stayed `true` and `configEpoch` kept its value with a
+dead read loop and no control channel behind them. `maySend()` would answer
+`true` forever, and the halt that is supposed to stop an assessment would have
+nothing to arrive on. Replace the catch blocks with the caught set plus a
+`finally`, and add `closeChannel()` — both shown in Step 3's corrected block.
+
+The invariant, stated once: **leaving `readLoop()` by any path means DENY-ALL.**
+Not "by the paths we thought of".
+
+**2. `close()` zeroed `configured` but not `configEpoch` or `scopeConfig`,**
+leaving a closed client reporting a live epoch and a stale scope. Corrected in
+Step 3's block.
+
+**3. The fake's `configure` frame omitted `deadline_us`,** which the client
+correctly rejects as `bad_frame` — the real peer stamps `id` and `deadline_us`
+on every frame `_request()` sends, and `configure()` is its only caller. The
+fake was wrong, not the client. Corrected in Step 1's block. Do not "fix" this
+by relaxing the client's validation.
+
+**4. `private final Object log` was stored and never used,** typed `Object`
+only to dodge a compile-time Montoya dependency in tests. Replaced by the
+`BridgeClient.Log` interface, an adapter in `HxExtension`, and
+`FakeMontoya.Logger implements BridgeClient.Log` — all shown above. The
+`finally` block now logs the transition into DENY-ALL, which is the one event
+Task 5 will most want in Burp's output when a handshake misbehaves.
+
+**5. On the Python side, an `error` reply to `configure` was reported as
+"peer acknowledged configure without a config_epoch"** — technically true and
+actively misleading, since the peer said exactly what was wrong and the message
+threw it away. `configure()` now surfaces the reply's `class` and `detail`;
+corrected in Task 3's `configure()` above. Add this test to
+`tests/test_bridge_server.py`:
+
+```python
+def test_an_error_reply_to_configure_reports_what_the_peer_said(srv):
+    c = _connected(srv)
+    try:
+        out = {}
+
+        def go():
+            try:
+                srv.configure({"scope.include": ["https://a/*"]},
+                              scope_sha256="x", profile="production")
+            except server.BridgeError as exc:
+                out["err"] = str(exc)
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = codec.FrameReader(c).read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "engagement_mismatch",
+                                "detail": "e-1 != SOMEONE-ELSE"}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+        assert "engagement_mismatch" in out["err"], out
+        assert "SOMEONE-ELSE" in out["err"], out
+        assert "without a config_epoch" not in out["err"], out
+    finally:
+        c.close()
+```
+
+Verified against the real server before it was written here: passes, and the
+Python suite stays green at 160.
+
+- [ ] **Step 7: Run everything and commit**
+
+```bash
+extension/test.sh && extension/build.sh
+.venv/bin/python -m pytest tests/ -q      # 161 passed
+git add extension src/hx/bridge/server.py tests/test_bridge_server.py
+git commit -m "fix(bridge): deny-all on every exit from the read loop"
+```
+
+---
+
+- [ ] **Step 8: what two more review rounds changed, and what is NOT covered**
+
+The code blocks above are the **final** files, synced from the repository — not
+the first draft plus a list of patches. Transcribe them as they stand. This
+note exists so the shape of that code is legible, and so nobody re-derives a
+defect that was already paid for.
+
+**`close()` is sticky and exclusive.** Three demonstrated ways an extension
+could send after being closed: Burp's unloading handler firing before the dial
+completed (an *unloaded* extension holding a live control channel), `close()`
+followed by `connect()` on the same object, and a `configure` already sitting
+in the `Reader`'s buffer — which needs no syscall, so shutting the socket does
+not stop it being processed. Hence `volatile boolean closed`, checked in
+`connect()` and in `handle()`, and a `commitLock` making the commit and
+`close()` mutually exclusive. A commit-then-recheck was tried first and
+rejected: it makes the window nanoseconds instead of ~9 us, but narrowness is
+an incidental property of how long `send(ack)` takes.
+
+**Epoch and scope are one value.** `configEpoch()` and `scopeConfig()` as two
+volatile fields were measured returning an incoherent pair 5-9 times in 200: a
+live client reporting epoch 1 while already serving the epoch 2 scope. A
+request that only the new scope permits then gets stamped with the old epoch in
+evidence — an audit line claiming authorisation from an epoch that did not
+grant it. Publishing through one `Authorisation` reference was still not enough:
+two reads of that reference straddle a commit 11 times in 400. Only
+`authorisation()`, returning the pair in a single read, measured 0/400.
+
+> **Plan 3 must read `authorisation()` once per decision.** Calling
+> `configEpoch()` and `scopeConfig()` separately on the send path reintroduces
+> the straddle. Nothing in the type system enforces this yet.
+
+**An unparseable configure denies.** It does not keep the previous scope. The
+trigger is version skew — an operator NARROWING scope with a key this jar
+predates — where retaining the old wider scope sends exactly where they just
+said not to. `engagement_mismatch` and `bad_frame` are unchanged: neither is
+our peer trying to configure us.
+
+**Coverage, stated honestly.** These fixes have **no test behind them** and a
+reviewer confirmed reverting each one fails nothing:
+
+| Unguarded | Why |
+|---|---|
+| `volatile` on `channel`/`in`/`out` and on `HxExtension.client` | a visibility bug needs a weakly-ordered CPU to observe; x86 hides it |
+| the `Reader` single-thread comment | a comment |
+| `StringBuffer` in `FakeMontoya` | races only under a schedule the suite does not force |
+| the `@Deprecated` annotations on `configEpoch()`/`scopeConfig()` | an annotation; verified by inspection only |
+| the **top-of-`handle()`** `closed` guard | deleting it alone fails nothing — the commit-lock guard catches every exit reachable today. A coverage hole, not a live defect |
+| `Frame.Reader`'s shrink branch | never taken: the largest frame in the suite is 100 000 bytes, the trigger is 4 MB |
+| `HxExtension`'s unloading handler and its missing-`-Dhx.socket` branch | `initialize()`'s happy path is exercised end to end by Task 5's integration test — a real Burp loads this class and dials in — but neither of these two branches is, and no unit test exists; that still needs a MontoyaApi fake |
+| `make_home()` (Task 5) | nothing asserts what it builds: the `burpbrowser` symlink, the deleted `.userPrefs` lock, the copied `.BurpSuite` tree. A mistake there surfaces as a Burp that will not start, blamed on Burp |
+| the rest of `missing()` (Task 5) | `tests/test_burp_fixture.py` covers the EULA, stale-jar and `.BurpSuite` guards in both directions, but not the burp-jar row, and nothing checks that the `skipif` wiring actually consumes what `missing()` returns |
+| the `finally` reaper in both integration tests (Task 5) | proving it would need a test that fails mid-test and then reads the process table. A leak is a 900 MB JVM outliving the run, never a red test |
+| "the fast suite never launches Burp" (Task 5) | deleting `addopts` from `pyproject.toml` fails nothing. It just makes `pytest` 13 seconds slower and starts two JVMs — which is what the property is for |
+
+That list is longer than the three rows this table shipped with, and it is
+still not everything: a reviewer sabotage-verified **fourteen** more behaviours
+with no failing check, including the single-read `authorisation()`, the
+one-write publication, the ack epoch hoist, and the `gen`/`_conn` guard on the
+Python reset. Treat this table as "the ones worth naming", never as "everything
+else is covered".
+
+Do not add a test that "covers" these by asserting something adjacent. An
+earlier commit in this task claimed every fix was sabotage-verified when three
+were not; the honest record is this table.
+
+**The guard is `theCommitIsExclusiveWithClose`.** Not the detector beside it,
+and not the check that calls `handle()` directly on a closed client — that one
+feeds a `configure` frame, so the commit-lock guard satisfies it whether or not
+the top-of-`handle()` guard exists, and it cannot discriminate between them.
+
+`closeIsTerminalAgainstTheReadLoop` is a **detector**, and a scheduler-dependent
+one. Against a defective client it measured 19-20/20 on 24 cores but **0/20 on
+one core, and 0/20 in two runs of three on two cores** — a clean, silent pass on
+broken code, on the machine shape CI most often has.
+
+`theCommitIsExclusiveWithClose` does not depend on scheduling at all: the test
+thread holds `commitLock`, so the helper parks inside `handle()` by
+construction, and monitor reentrancy lets `close()` through. It fails 100% of
+runs at 1, 2 and 24 cores when the guard is removed.
+
+> If you change either `closed` guard in `handle()`, check it against
+> `theCommitIsExclusiveWithClose`. Do **not** judge by the detector's
+> resurrection count: it reads 0/20 on correct and broken code alike at low
+> core counts. Both `commitLock`'s package-private visibility and `handle()`'s
+> exist to make that test possible — neither is an oversight to tidy up.
+
+---
+
+### Task 5: End-to-end against real headless Burp
+
+**Files:**
+- Create: `tests/__init__.py` — **required**: without it `from tests.integration import ...` fails with `ModuleNotFoundError: No module named 'tests'`, verified
+- Create: `tests/integration/__init__.py`
+- Create: `tests/integration/test_real_burp.py`
+- Create: `tests/integration/burp_fixture.py`
+- Create: `tests/test_burp_fixture.py` — the fixture's own prerequisite checks, in the **fast** suite
+- Modify: `pyproject.toml` — register the `integration` marker
+
+**Interfaces:**
+- Consumes: `hx.bridge.server.BridgeServer`, `extension/build/hx-bridge.jar`, and the mtimes of `extension/src/**/*.java` (the stale-jar check)
+- Produces, all in `tests.integration.burp_fixture`:
+  - `missing() -> list[str]` — the unsatisfied prerequisites, each named
+  - `burp_available() -> bool` — `not missing()`
+  - `make_home(workdir: Path) -> Path` — a private `$HOME` per run
+  - `launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subprocess.Popen`
+  - `wait_for(predicate, timeout: float = 90.0, interval: float = 0.5) -> bool`
+
+All five are public names in the module and this block used to list two of
+them. Under-declaring is the same defect a reviewer caught in Task 4's header,
+and it costs the same way: the next task reads the block, believes it, and
+writes a call with the wrong arity — `launch_burp` takes a `workdir`, and
+always has.
+
+- [ ] **Step 1: Register the marker so the slow test is opt-in**
+
+```toml
+# add to pyproject.toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "integration: loads a real headless Burp Suite; needs the jar (~5s to hello, ~20s per test)",
+]
+addopts = "-m 'not integration'"
+```
+
+`addopts` keeps the fast suite fast by default. The integration test runs with `pytest -m integration`.
+
+- [ ] **Step 2: Write the fixture**
+
+```python
+# tests/integration/burp_fixture.py
+"""Launch a real headless Burp Suite Community with the hx extension loaded.
+
+Everything here was established empirically, most of it the hard way:
+  - Burp asks for a licence key on stdin; a bare newline selects Community.
+  - The EULA gate is a single Java Preferences key, burp.eula.
+  - Launching with -cp instead of -jar means the jar manifest's Add-Opens is
+    ignored, so every --add-opens must be repeated on the command line.
+  - Burp throws `java.lang.Error: no ComponentUI class` twice while building a
+    Swing UI it cannot have under -Djava.awt.headless=true. This is NOISE. A
+    known-good instance logs it identically and runs for hours. Do not chase it.
+  - api.logging().logToOutput() does NOT reach the process stdout. You cannot
+    detect that the extension loaded by reading the log -- observe the bridge
+    instead. `hello` arriving IS the readiness signal.
+  - Startup to hello measured at ~5s, not the ~40s originally assumed.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+LAB = Path(os.environ.get("HX_BURP_LAB", Path.home() / "F0RT1KA" / "burp-lab"))
+BURP_JAR = LAB / "burpsuite_desktop_v2026.7.3.jar"
+SEED_HOME = LAB / "burphome"          # copied from, never run against
+EXT_JAR = Path(__file__).resolve().parents[2] / "extension" / "build" / "hx-bridge.jar"
+EXT_SRC = Path(__file__).resolve().parents[2] / "extension" / "src"
+
+ADD_OPENS = [
+    "--add-opens", "java.base/java.lang=ALL-UNNAMED",
+    "--add-opens", "java.desktop/javax.swing=ALL-UNNAMED",
+    "--add-opens", "java.desktop/java.awt=ALL-UNNAMED",
+    "--add-opens", "java.desktop/java.awt.color=ALL-UNNAMED",
+    "--add-opens", "java.base/javax.crypto=ALL-UNNAMED",
+    "--add-opens", "jdk.crypto.cryptoki/sun.security.pkcs11=ALL-UNNAMED",
+]
+
+
+def missing() -> list[str]:
+    """Which prerequisites are absent, for a skip reason that names them.
+
+    A bare False here once sent a debugger into a Burp stack trace when the
+    real problem was an unbuilt extension jar: Burp starts happily with a
+    classpath entry that does not exist, loads no extension, and never dials
+    in. Say which path is missing.
+
+    NOTHING may raise out of this function. It runs at import time, so an
+    exception here is not a skipped test -- it is `Interrupted: 1 error during
+    collection` for the entire repository, fast suite included. That has now
+    happened twice, both times from code added to make this function safer:
+    once from a UnicodeDecodeError reading a torn prefs.xml, once from a
+    dangling symlink under the source tree.
+
+    The individual checks are not enough on their own. Path.exists() and
+    Path.is_dir() swallow only a narrow errno whitelist -- ENOENT, ENOTDIR,
+    EBADF, ELOOP -- so EACCES, ESTALE and ENOTCONN still propagate. A
+    permission-tightened lab directory, a CI runner under another uid, or a
+    stale NFS mount is enough. Reproduced directly:
+
+        PermissionError [Errno 13] ... burpsuite_desktop_v2026.7.3.jar
+
+    So the whole body is wrapped, and an unreadable prerequisite is reported
+    as a missing one.
+    """
+    try:
+        return _missing()
+    except OSError as exc:
+        return [f"prerequisites under {LAB} could not be checked: {exc}"]
+
+
+def _missing() -> list[str]:
+    absent = []
+    if not BURP_JAR.exists():
+        absent.append(f"burp jar: {BURP_JAR}")
+    if not EXT_JAR.exists():
+        absent.append(f"extension jar (run extension/build.sh): {EXT_JAR}")
+    elif (newest := _newest_source_mtime()) > time.time() + 60:
+        # A future timestamp is a broken clock, not a stale jar, and treating
+        # it as staleness disables the integration suite PERMANENTLY: no
+        # rebuild can stamp the jar later than a source dated years ahead.
+        # Reproduced -- two honest rebuilds, still reported stale both times.
+        absent.append(
+            f"a source under {EXT_SRC} is dated in the future "
+            f"({newest - time.time():.0f}s ahead); fix the clock or re-touch it"
+        )
+    elif newest > _jar_mtime():
+        absent.append("extension jar is older than its sources (run extension/build.sh)")
+    if not (SEED_HOME / ".java").is_dir():
+        absent.append(f"seed burp home: {SEED_HOME / '.java'}")
+    elif not _eula_accepted():
+        # Checked because the failure mode is silence: Burp waits at the EULA
+        # gate forever and the test times out with nothing in the log to say
+        # why. The pref lives in the seed home, so a cleared or regenerated
+        # home takes it with it.
+        absent.append(f"burp.eula not accepted in {SEED_HOME / '.java'}")
+    if not (SEED_HOME / ".BurpSuite").is_dir():
+        # make_home() copies this tree as well as .java. Checking only .java
+        # let burp_available() return True and the launch then die on a
+        # FileNotFoundError halfway through the copy -- reproduced -- which is
+        # precisely the unnamed failure this function exists to prevent.
+        absent.append(f"seed burp home: {SEED_HOME / '.BurpSuite'}")
+    return absent
+
+
+def _jar_is_stale() -> bool:
+    """True when any extension source is newer than the jar built from it.
+
+    Nothing in the suite runs build.sh and the jar is gitignored, so an edit
+    to BridgeClient.java without a rebuild leaves `-m integration` reporting
+    2 passed while certifying this plan's central claim against an artifact
+    that no longer matches the code. mtime is a coarse signal, and it errs in
+    the safe direction: a touched but unchanged source skips the run with a
+    reason that names the fix, rather than passing it silently.
+    """
+    try:
+        return _newest_source_mtime() > _jar_mtime()
+    except OSError:
+        # A missing jar is the caller's row, not ours. The broader catch is
+        # the lesson from _eula_accepted() above: anything raised out of
+        # missing() is not a skip, it is a collection error for the entire
+        # repository. A source that vanishes between the glob and the stat --
+        # a rebuild or a checkout running alongside the suite -- is no
+        # evidence that the jar is stale, so say nothing and let the run go.
+        return False
+
+
+def _jar_mtime() -> float:
+    return EXT_JAR.stat().st_mtime
+
+
+def _newest_source_mtime() -> float:
+    """0.0 when there are no sources -- absence is not evidence of staleness.
+
+    A source that cannot be stat'd is skipped rather than raised: a dangling
+    symlink, or a file that vanishes between the glob and the stat because a
+    checkout or a rebuild is running alongside the suite, is no evidence that
+    the jar is stale. Disabling the integration suite over a transient race
+    would be the wrong direction -- unlike an unreadable LAB, which really
+    does mean the prerequisites are unknown.
+    """
+    newest = 0.0
+    for src in EXT_SRC.rglob("*.java"):
+        try:
+            newest = max(newest, src.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def _eula_accepted() -> bool:
+    prefs = SEED_HOME / ".java" / ".userPrefs" / "burp" / "prefs.xml"
+    try:
+        # Searched as bytes. Burp rewrites this 1.75 MB file on exit, and a
+        # torn write that lands mid-multibyte-character makes read_text()
+        # raise UnicodeDecodeError -- which is not an OSError, so it escaped
+        # this function, escaped missing(), and turned every pytest run in
+        # the repo into a collection error with zero tests run. Reproduced;
+        # a byte search cannot raise it at all.
+        # The key is "burp.eula", not "eula" -- a check for the short
+        # name reports every accepted home as unaccepted.
+        return b'key="burp.eula"' in prefs.read_bytes()
+    except OSError:
+        return False
+
+
+def burp_available() -> bool:
+    return not missing()
+
+
+def make_home(workdir: Path) -> Path:
+    """A private $HOME per run.
+
+    Sharing one Burp home across runs means sharing a Java Preferences lock and
+    a sessions directory with any other Burp on the machine -- including one a
+    developer left running. The prefs are 3 MB and cheap to copy; the embedded
+    browser is 650 MB, read-mostly, and gets a symlink instead.
+    """
+    home = workdir / "burphome"
+    (home / ".BurpSuite").mkdir(parents=True)
+    shutil.copytree(SEED_HOME / ".java", home / ".java")
+    for lock in (home / ".java" / ".userPrefs").glob(".user*"):
+        lock.unlink()                 # a copied lock file belongs to the seed
+    for entry in (SEED_HOME / ".BurpSuite").iterdir():
+        target = home / ".BurpSuite" / entry.name
+        if entry.name == "burpbrowser":
+            target.symlink_to(entry)
+        elif entry.is_dir():
+            shutil.copytree(entry, target)
+        else:
+            shutil.copy2(entry, target)
+    return home
+
+
+def launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subprocess.Popen:
+    """Burp's output goes to workdir/burp.log, never to a pipe.
+
+    An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
+    buffer fills and the test hangs with no diagnostic. A file also means a
+    failing test can quote what Burp actually said.
+    """
+    home = make_home(workdir)
+    log = (workdir / "burp.log").open("wb")
+    cmd = [
+        "java",
+        "-Djava.awt.headless=true",
+        f"-Duser.home={home}",
+        f"-Dhx.socket={socket_path}",
+        f"-Dhx.engagement={engagement_id}",
+        "-Dhx.instance=integration",
+        *ADD_OPENS,
+        "-cp", f"{BURP_JAR}:{EXT_JAR}",
+        "burp.StartBurp",
+        "--developer-extension-class-name=hx.HxExtension",
+        "--disable-auto-update",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
+                            stderr=subprocess.STDOUT, cwd=LAB)
+    proc.stdin.write(b"\n\n")     # bare newline selects Community Edition
+    proc.stdin.flush()
+    return proc
+
+
+def wait_for(predicate, timeout: float = 90.0, interval: float = 0.5) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+```
+
+- [ ] **Step 3: Write the failing test**
+
+```python
+# tests/integration/test_real_burp.py
+import hashlib
+
+import pytest
+
+from hx.bridge import server
+from tests.integration import burp_fixture as bf
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.mark.skipif(not bf.burp_available(),
+                    reason=f"missing: {', '.join(bf.missing())}")
+def test_real_burp_dials_in_and_handshakes(tmp_path):
+    """The whole point of this plan, proved against the real container.
+
+    Fakes prove the logic; only this proves Burp actually loads the extension
+    and that the socket handshake works end to end.
+    """
+    srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-integration")
+    srv.start()
+    proc = None
+    try:
+        proc = bf.launch_burp(srv.socket_path, "e-integration", tmp_path)
+
+        assert bf.wait_for(lambda: srv.state == "connected"), \
+            "Burp never completed the hello handshake"
+
+        assert srv.hello["engagement_id"] == "e-integration"
+        assert srv.hello["instance_id"] == "integration"
+        assert "2026" in srv.hello["burp_version"], srv.hello
+        # Ties the handshake to the JVM this test launched. peer_pid comes
+        # from SO_PEERCRED -- the kernel fills it in and a peer cannot forge
+        # it. The assertion this replaced, `peer_uid is not None`, could not
+        # fail: _serve() sets peer_uid before the read loop and returns on a
+        # uid mismatch, so state == "connected" already implies it.
+        assert srv.peer_pid == proc.pid
+        # The same number, self-reported in the hello frame. Weaker evidence
+        # than the credential above, and worth checking separately: it is
+        # what an operator sees, and it agreeing with the kernel is what
+        # makes it trustworthy.
+        assert srv.hello["pid"] == proc.pid
+
+        pairs = {"scope.include": ["https://app.example.test/*"],
+                 "limit.rate_rps": ["5"]}
+        epoch = srv.configure(
+            pairs,
+            scope_sha256=hashlib.sha256(b"x").hexdigest(),
+            profile="production",
+        )
+        assert epoch == 1
+        assert srv.state == "configured"
+    finally:
+        if proc:
+            proc.kill()
+            proc.wait(timeout=15)
+        srv.stop()
+
+
+@pytest.mark.skipif(not bf.burp_available(),
+                    reason=f"missing: {', '.join(bf.missing())}")
+def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
+    """A Burp restart is a reconnect, not an outage -- and the reconnected
+    extension knows nothing, because extensionData does not survive.
+
+    Both halves are here. Killing Burp proves the bridge returns to DENY-ALL;
+    only the second Burp dialling the same live BridgeServer proves the
+    "reconnect, not an outage" half, which is this plan's headline claim and
+    was otherwise exercised against fakes alone.
+    """
+    srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-restart")
+    srv.start()
+    proc = proc2 = None
+    try:
+        proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "first")
+        assert bf.wait_for(lambda: srv.state == "connected")
+        srv.configure({"scope.include": ["https://a/*"]},
+                      scope_sha256="abc", profile="production")
+        assert srv.state == "configured"
+
+        proc.kill()
+        proc.wait(timeout=15)
+        assert bf.wait_for(lambda: srv.state == "waiting", timeout=30), \
+            "dropped connection must return the bridge to DENY-ALL"
+        assert srv.config_epoch == 0
+
+        # The restart. Same socket, same server object, never stopped.
+        proc2 = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "second")
+        assert bf.wait_for(lambda: srv.state == "connected"), \
+            "a restarted Burp must reconnect to the still-listening bridge"
+        assert srv.peer_pid == proc2.pid, "the bridge is talking to the old JVM"
+        # Still DENY-ALL: the reconnected extension carries nothing over,
+        # because extensionData does not survive a Burp restart.
+        assert srv.config_epoch == 0
+
+        epoch = srv.configure({"scope.include": ["https://b/*"]},
+                              scope_sha256="def", profile="production")
+        assert epoch == 1, "a fresh extension numbers its first scope 1"
+        assert srv.state == "configured"
+    finally:
+        # The first kill is inside the try for a reason -- it IS the restart
+        # under test -- so on any earlier failure a 900 MB JVM would outlive
+        # the run, once per debugging attempt. Two of them, now. Reaping an
+        # already-reaped Popen is a no-op, so this is safe on the happy path.
+        for p in (proc, proc2):
+            if p:
+                p.kill()
+                p.wait(timeout=15)
+        srv.stop()
+```
+
+- [ ] **Step 4: Build the extension and run the integration test**
+
+```bash
+cd extension && ./build.sh && cd ..
+.venv/bin/pytest -m integration tests/integration -v
+```
+
+Expected: 2 passed in about 13 seconds. (This said 60-120s, which contradicted the same document's measured ~5s to hello, then 9s until round 1's restart test began launching a second Burp.)
+
+If Burp never connects, read the launch output — the fixture merges stderr into stdout — and check the two failure modes established during research: the EULA prompt (needs `burp.eula` pre-accepted in `$BURP_HOME/.java/.userPrefs/burp/prefs.xml`) and the licence prompt (needs the bare newline the fixture already writes).
+
+- [ ] **Step 5: Confirm the fast suite is still fast**
+
+Run: `time .venv/bin/pytest -q`
+Expected: PASS, 202 passed and 2 deselected in about 6 seconds — the integration tests excluded by `addopts`. What matters is that no JVM starts, not the exact count; the count moves every round. It has: this line said 188 when it was written, the suite was at 189 by the commit that finished the task, and 202 once round 1 added `tests/test_burp_fixture.py`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add tests/__init__.py tests/integration tests/test_burp_fixture.py pyproject.toml
+git commit -m "test(bridge): real headless Burp completes the handshake end to end"
+```
+
+---
+
+## Self-review
+
+**Spec coverage.** §6 framing → Task 1 and 2. §6 socket path, permissions, `SO_PEERCRED`, refuse-if-exists → Task 3. §6 `hello`, `configure`, `config_epoch`, engagement mismatch fatal → Tasks 3 and 4. §6 `halt`/`resume` → Task 4. §4 DENY-ALL as initial and terminal state → Tasks 3 and 4, with the reconnect case tested on both sides. §6 max frame size → Tasks 1 and 2.
+
+**Deliberately out of this plan**, in the plans that follow: `send`/`result`/`error` request flow and the enforcement chain (scope, method allowlist, dangerous paths, rate limit, budgets) — Plan 3; `exchange` push, backpressure classes and credential redaction — Plan 4; identity and liveness — Plan 5. The frame types are documented in `docs/bridge-protocol.md` now so the two codecs do not need changing later, but nothing implements them yet.
+
+**Cross-implementation drift** is the risk this plan is shaped around. One wire-format document, one vector file, and both codecs tested against it — with the Java test asserting the exact bytes Python recorded, so a change on either side that the other does not follow fails immediately rather than at integration.
+
+**Known gap accepted:** `BridgeServer` handles one connection at a time, which matches one Burp per engagement. A second connection attempt while one is live is accepted then dropped by `_serve` returning; that is adequate for now and becomes a real question only if the harness ever supervises several Burps.
+
+---
+
+## Execution handoff
+
+Plan complete. Two execution options:
+
+1. **Subagent-Driven (recommended)** — a fresh subagent per task, review between tasks, fast iteration.
+2. **Inline Execution** — execute tasks in this session with checkpoints.
