@@ -28,6 +28,30 @@ import java.util.Map;
  * distress), not a property of the request and the authorisation. Sender
  * checks it, in that position, between not_configured and this method.
  *
+ * WHAT THE RULES MATCH AGAINST: the request that goes on the wire is
+ * unchanged -- canonicalisation here decides, it never rewrites. But "the
+ * path" is two things at once: the bytes we send, and the resource the target
+ * server resolves them to. `/account/log%6fut` is a real logout on essentially
+ * every server that has ever shipped, and matching the literal bytes alone let
+ * it through. So the two kinds of rule see different things, each in its
+ * fail-closed direction:
+ *
+ *   - a DENY rule (scope.exclude, dangerous.path) matches the raw path OR its
+ *     canonical form, case-folded. Either match refuses: a denylist has to see
+ *     every reading of the request, not a favourite one.
+ *   - an ALLOW rule (scope.include) must match BOTH.
+ *
+ * The second half is not decoration, and it is not symmetric with the first.
+ * With include=/app/* a request for `/app/%2e%2e/other` matches the include as
+ * bytes while the server serves `/other`, which no include names. Requiring
+ * the canonical form to match as well is what closes that.
+ *
+ * Matching a decoded COPY while sending raw bytes -- the obvious fix -- would
+ * reintroduce exactly the decision-versus-wire mismatch the authority checks
+ * below exist to prevent. Deciding about the bytes we send is right; it only
+ * works if the matcher's idea of "the same path" also covers the target
+ * server's, which is what canonical() adds.
+ *
  * The Authorisation is a PARAMETER. It is read once per send, by
  * BridgeClient's send arm, and carried down -- epoch and scope from the one
  * reference, so the scope a request was decided under and the epoch stamped on
@@ -117,11 +141,19 @@ public final class Policy {
             return Decision.deny("method_denied",
                     req.method() + " is not in method.allow " + allowed);
 
-        String target = lower(req.target());
-        for (String pattern : dangerousPatterns(scope))
-            if (glob(lower(pattern), target))
+        // Both readings, and either one refuses. The raw form catches a
+        // pattern written against the bytes; the canonical form catches
+        // `/account/log%6fut`, `/account/%2570assword` (decoded twice) and
+        // `/ADMIN/purge`. The detail line quotes the RAW target, because that
+        // is what the operator's frame said and what they will search for.
+        String rawTarget = lower(req.target());
+        String canonicalTarget = canonicalTarget(req);
+        for (String pattern : dangerousPatterns(scope)) {
+            String p = lower(pattern);
+            if (glob(p, rawTarget) || glob(p, canonicalTarget))
                 return Decision.deny("dangerous_denied",
                         req.target() + " matches dangerous.path " + pattern);
+        }
 
         // The Gate LAST, because it is the only check with a side effect:
         // Limiter.check() spends a rate token and a budget slot, and spending
@@ -199,15 +231,21 @@ public final class Policy {
             return Decision.deny("scope_denied", "unusable scope pattern: " + e.getMessage());
         }
 
+        // Computed once, and handed to both kinds of rule: they read it
+        // differently, but neither should pay for it per pattern. The host
+        // half needs nothing of the sort -- checkHostChars refuses '%'
+        // outright, so an encoded authority never reaches a comparison.
+        String canonicalPath = canonical(t.path());
+
         // Exclude first: an exclusion is the operator naming something they
         // know they must not touch, and it beats every include it overlaps.
         for (Rule r : excludes)
-            if (r.matches(t))
+            if (r.denies(t, canonicalPath))
                 return Decision.deny("scope_denied",
                         req.url() + " matches scope.exclude " + r.source());
 
         for (Rule r : includes)
-            if (r.matches(t)) return Decision.allow();
+            if (r.allows(t, canonicalPath)) return Decision.allow();
 
         return Decision.deny("scope_denied", req.url() + " matches no scope.include pattern");
     }
@@ -346,19 +384,52 @@ public final class Policy {
             return new Rule(pattern, scheme, host, suffix, port, pathGlob);
         }
 
-        boolean matches(Target t) {
+        /** Everything but the path. Shared, because scheme, port and host
+         *  have exactly one reading each -- it is the path that has two. */
+        private boolean authorityMatches(Target t) {
             if (!scheme.equals(t.scheme())) return false;
             if (port != t.port()) return false;
-            if (hostSuffix) {
+            if (hostSuffix)
                 // ".example.test" matches api.example.test but NOT
                 // example.test: an operator scoping the subdomains has not
                 // scoped the apex, which is frequently a different service run
                 // by a different team.
-                if (!t.host().endsWith(hostPattern)) return false;
-            } else if (!hostPattern.equals(t.host())) {
-                return false;
-            }
-            return glob(pathGlob, t.path());
+                return t.host().endsWith(hostPattern);
+            return hostPattern.equals(t.host());
+        }
+
+        /**
+         * scope.exclude: EITHER reading matches, and case is folded doing it.
+         *
+         * Case-folded because `dangerous.path` already was and scope.exclude
+         * was not, and the difference was live: an operator excluding
+         * `/admin/*` was not excluding `/ADMIN/users` on a target with
+         * case-insensitive routing, which is most of them. Two denylists in
+         * one file disagreeing about what "the same path" means is the finding,
+         * not the typo.
+         */
+        boolean denies(Target t, String canonicalPath) {
+            if (!authorityMatches(t)) return false;
+            String p = lower(pathGlob);
+            return glob(p, lower(t.path())) || glob(p, canonicalPath);
+        }
+
+        /**
+         * scope.include: BOTH readings must match, or the request is out of
+         * scope.
+         *
+         * The raw half stays case-SENSITIVE. Folding case on an allow rule
+         * WIDENS it, which is the wrong direction for the one rule that
+         * authorises anything, and `/Admin` has never been authorised by a
+         * pattern naming `/admin`. The canonical half compares a lowercased
+         * pattern against a canonical path, which is lowercased by
+         * construction: an operator who wrote `/API/*` would otherwise have
+         * every request under it refused, which is fail-closed but is also
+         * just broken.
+         */
+        boolean allows(Target t, String canonicalPath) {
+            if (!authorityMatches(t)) return false;
+            return glob(pathGlob, t.path()) && glob(lower(pathGlob), canonicalPath);
         }
     }
 
@@ -402,6 +473,150 @@ public final class Policy {
         }
         while (p < pattern.length() && pattern.charAt(p) == '*') p++;
         return p == pattern.length();
+    }
+
+    // ---- canonical paths -------------------------------------------------
+
+    /**
+     * The path as the target server will read it: percent-decoded until
+     * stable, dot segments collapsed, lowercased. Pure, and it changes no byte
+     * of the request -- see the class comment for which rules take it and in
+     * which direction.
+     *
+     * Decoding runs to a FIXED POINT, not once. `%2570assword` decodes to
+     * `%70assword` and only then to `password`, and a denylist that stopped
+     * after one round would be reading the middle spelling while the server,
+     * or any proxy in front of it, reads the last. Termination is not an
+     * assumption: a round that changes anything replaces three characters with
+     * one, so the string strictly shortens and the loop is bounded by its
+     * length.
+     *
+     * The order of the three steps is load-bearing. Decoding comes FIRST, so
+     * `%2e%2e` is already `..` when dot segments are collapsed and `%2f` is
+     * already a separator when the path is split into them. Lowercasing comes
+     * LAST, on decoded text, so `%4C` and `%6c` both arrive at `l`.
+     *
+     * What this deliberately does NOT do is merge empty segments: `/app//admin`
+     * keeps its double slash. RFC 3986 normalisation does not remove one, and
+     * whether `//admin` and `/admin` are the same resource is a question only
+     * the target server answers. That leaves a prefix exclude for `/admin/*`
+     * evadable as `//admin/users` on servers that do collapse it. It is a real
+     * gap in the deny direction, it is written down here rather than papered
+     * over, and closing it needs a decision about empty segments rather than
+     * one more line.
+     */
+    static String canonical(String path) {
+        return lower(collapseDotSegments(decodeToFixedPoint(path)));
+    }
+
+    /** Percent-decoding repeated until a round changes nothing. */
+    static String decodeToFixedPoint(String s) {
+        for (;;) {
+            String next = decodeOnce(s);
+            if (next.equals(s)) return s;
+            s = next;
+        }
+    }
+
+    /**
+     * One round of percent-decoding. It NEVER throws and never rejects: a
+     * malformed escape -- a bare `%`, `%z`, a truncated `%4` at the end of the
+     * string -- is copied through verbatim and decoding carries on past it.
+     *
+     * Abandoning the whole string on one bad escape, the other reading of
+     * "return the input unchanged", would hand an attacker a switch: append a
+     * single `%` to `/account/log%6fut` and canonicalisation turns itself off
+     * for the entire path. Per-escape leniency keeps the rest decoded, so the
+     * denylist still sees `logout%`, and a test pins exactly that request.
+     * Throwing would be worse again -- anything thrown out of decide() is an
+     * implicit allow the moment a caller mishandles it, which is the failure
+     * this whole class exists to make impossible.
+     *
+     * Bytes become chars one for one, with no transcoding. Every pattern these
+     * strings are matched against is ASCII, and choosing a charset here would
+     * add a second reading of the path rather than remove one.
+     */
+    static String decodeOnce(String s) {
+        int first = s.indexOf('%');
+        if (first < 0) return s;
+        StringBuilder out = new StringBuilder(s.length());
+        out.append(s, 0, first);
+        for (int i = first; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c != '%' || i + 2 >= s.length()) { out.append(c); continue; }
+            int hi = hexDigit(s.charAt(i + 1));
+            int lo = hexDigit(s.charAt(i + 2));
+            if (hi < 0 || lo < 0) { out.append(c); continue; }
+            out.append((char) (hi * 16 + lo));
+            i += 2;
+        }
+        return out.toString();
+    }
+
+    private static int hexDigit(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    }
+
+    /**
+     * RFC 3986 remove_dot_segments, over the '/'-separated segments of a path.
+     * A `..` at the root is discarded rather than escaping it, and a trailing
+     * `.` or `..` leaves the trailing slash it implies, so `/a/b/..` is `/a/`
+     * and not `/a`.
+     */
+    static String collapseDotSegments(String path) {
+        boolean absolute = path.startsWith("/");
+        List<String> segments = new ArrayList<>();
+        int start = 0;
+        for (int i = 0; i <= path.length(); i++)
+            if (i == path.length() || path.charAt(i) == '/') {
+                segments.add(path.substring(start, i));
+                start = i + 1;
+            }
+
+        List<String> kept = new ArrayList<>();
+        boolean trailingSlash = false;
+        for (int i = absolute ? 1 : 0; i < segments.size(); i++) {
+            String seg = segments.get(i);
+            boolean last = i == segments.size() - 1;
+            if (seg.equals(".")) {
+                if (last) trailingSlash = true;
+            } else if (seg.equals("..")) {
+                if (!kept.isEmpty()) kept.remove(kept.size() - 1);
+                if (last) trailingSlash = true;
+            } else {
+                kept.add(seg);
+            }
+        }
+
+        StringBuilder out = new StringBuilder();
+        if (absolute) out.append('/');
+        for (int i = 0; i < kept.size(); i++) {
+            if (i > 0) out.append('/');
+            out.append(kept.get(i));
+        }
+        if (trailingSlash && (out.length() == 0 || out.charAt(out.length() - 1) != '/'))
+            out.append('/');
+        return out.toString();
+    }
+
+    /**
+     * The canonical form of the origin-form target, for the dangerous-path
+     * denylist, which reads path AND query.
+     *
+     * The two halves are canonicalised separately and dot segments are
+     * collapsed in the path ONLY: a `..` in a query value is a value, and a
+     * `%2f` in one is not a path separator the server will ever see. Decoding
+     * the query still matters -- on a legacy application the logout is
+     * `?action=log%6fut` at least as often as it is a path.
+     */
+    private static String canonicalTarget(HxRequest req) {
+        String path = canonical(req.path());
+        return req.query().isEmpty()
+                ? path
+                : path + "?" + lower(decodeToFixedPoint(req.query()));
     }
 
     // Locale.ROOT, not the default locale: in a Turkish locale "I" lowercases

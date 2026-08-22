@@ -247,7 +247,7 @@ with a reason, even though they produce no `denial` row.
 `Policy.decide` is the whole ruleset as a pure function: no sockets, no clock, no
 filesystem, nothing from Montoya. Everything that owns state or time sits behind `Gate`
 (Task 2's `Limiter`) or outside it entirely (`HaltSwitch`, `Distress`). That is what makes
-the ordering testable at all — 87 checks, no Burp, no sleep.
+the ordering testable at all — 150 checks, no Burp, no sleep.
 
 **On `halted`.** The Interface Contract's order is `not_configured` → `halted` →
 `scope_denied` → `method_denied` → `dangerous_denied` → `rate_limited` →
@@ -256,6 +256,37 @@ halt is live state — a `halt` frame, the sentinel file, or auto-halt on target
 not a property of a request and an authorisation. `Sender` holds that position, between
 its own `not_configured` check and this call, and `SenderTest.theRefusalOrderIsPinned`
 pins the composite. This task pins the five verdicts `Policy` owns.
+
+**On encoded, dotted and mixed-case paths** (fix round 1). The first shipped version of
+this class matched every path rule against `HxRequest.path` — the literal, un-decoded
+wire bytes — and canonicalised nothing. Measured against the built jar, `GET
+/account/log%6fut` was ALLOWED: `%6f` decodes to `o` on essentially every HTTP server, so
+the request actually issued was a real logout, the exact action the denylist exists to
+prevent. `/account/p%61ssword/change`, `/adm%69n/users`, `/admin%2fusers`,
+`/api/../admin/users`, `/api/%2e%2e/admin/users` and `/ADMIN/users` were ALLOWED against
+an exclude for `/admin/*` for the same reason, and the case bypass was live on any target
+with case-insensitive routing.
+
+Deciding about the bytes we send is right — it is why the authority-agreement checks
+exist — but it only works if the matcher's idea of "the same path" also covers the target
+server's. So the two kinds of rule read two forms of the path, each in its fail-closed
+direction, and the request on the wire is unchanged either way:
+
+- **deny rules** (`scope.exclude`, `dangerous.path`) match the raw path **OR** its
+  canonical form, and both arms fold case. `dangerous.path` already folded case;
+  `scope.exclude` did not, and that inconsistency was itself the finding.
+- **allow rules** (`scope.include`) must match the raw path **AND** its canonical form.
+  Not symmetric decoration: with `include=/app/*`, `/app/%2e%2e/other` matches the
+  include as bytes while the server serves `/other`, which no include names.
+
+`Policy.canonical` is a pure function beside `glob`: percent-decode to a fixed point (a
+denylist has to see through `%2570assword`), collapse `.` and `..` segments, lowercase, in
+that order. Its decoder is hand-written — no URL-decoding library, this jar has no
+dependencies — and it never throws: a malformed escape (`%`, `%z`, `%4`, a trailing `%`)
+is copied through verbatim and decoding continues past it, because abandoning the whole
+string on one bad escape would let an attacker disable canonicalisation by appending a
+single `%`, and because anything thrown out of `decide` is an implicit allow the moment a
+caller mishandles it.
 
 ---
 
@@ -276,7 +307,7 @@ Nothing else in `test.sh` or `build.sh` changes: both compile
 
 - [ ] **Step 2: Write the failing test**
 
-Eighty-seven checks, in the project's hand-rolled runner — `check(String, boolean)` and
+A hundred and fifty checks, in the project's hand-rolled runner — `check(String, boolean)` and
 `expectThrows`, no JUnit, because this jar has no dependencies. The ordering block near the
 bottom is the reason this task exists; everything above it exists so that a failure in the
 ordering block is unambiguous about which rule moved.
@@ -329,6 +360,11 @@ public class PolicyTest {
         methodsAreCaseSensitive();
         theDangerousDenylistShipsWithDefaults();
         operatorDangerousPatternsAddToTheDefaults();
+        canonicalIsSpelledOutCharacterByCharacter();
+        aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation();
+        aDenyRuleSeesEveryReadingOfThePath();
+        anIncludeMustMatchBothReadingsOfThePath();
+        aLegitimatelyEncodedPathIsStillAllowed();
         theRefusalOrderIsPinned();
         aBrokenGateIsNeverAnAllow();
         policyNamesNoBurpType();
@@ -746,6 +782,256 @@ public class PolicyTest {
                cfg, "dangerous_denied");
     }
 
+    // ---- canonical paths --------------------------------------------------
+
+    /** canonical() is a pure function, so it is tested as one. Catches
+     *  Throwable: a canonicaliser that throws inside decide() is an implicit
+     *  allow the moment a caller mishandles it, so "it did not throw" is part
+     *  of every one of these checks, not a separate suite. */
+    static void canon(String in, String want) {
+        String got;
+        try {
+            got = Policy.canonical(in);
+        } catch (Throwable t) {
+            check("canonical(" + in + ") threw " + t.getClass().getSimpleName(), false);
+            return;
+        }
+        check("canonical(" + in + ") is \"" + want + "\" (got \"" + got + "\")",
+              want.equals(got));
+    }
+
+    static void canonicalIsSpelledOutCharacterByCharacter() {
+        // The identity cases first: a canonicaliser that mangles ordinary
+        // paths would be caught by the scope tests above, but not clearly.
+        canon("/api/orders", "/api/orders");
+        canon("/", "/");
+        canon("", "");
+
+        // Percent-decoding. %6f is the one that shipped: it decodes to `o` on
+        // essentially every server, so /account/log%6fut IS a logout.
+        canon("/account/log%6fut", "/account/logout");
+        canon("/adm%69n/users", "/admin/users");
+        canon("/x/%41", "/x/a");                       // uppercase hex, then lowercased
+        canon("/files/annual%20report.pdf", "/files/annual report.pdf");
+
+        // %2f decodes to a separator, and it does so BEFORE the path is split
+        // into segments -- otherwise /admin%2fusers is one opaque segment that
+        // no /admin/* pattern can reach.
+        canon("/admin%2fusers", "/admin/users");
+        canon("/admin%2Fusers", "/admin/users");
+
+        // To a FIXED POINT, not once: %2570 is `%70` is `p`.
+        canon("/account/%2570assword/change", "/account/password/change");
+        canon("/api/%252e%252e/admin", "/admin");
+
+        // Dot segments, encoded and not. Decoding first is what makes the
+        // second of these behave like the first.
+        canon("/api/../admin/users", "/admin/users");
+        canon("/api/%2e%2e/admin/users", "/admin/users");
+        canon("/a/./b", "/a/b");
+        canon("/a/b/..", "/a/");                       // trailing slash survives
+        canon("/a/b/.", "/a/b/");
+        canon("/a/", "/a/");
+        canon("/..", "/");
+        canon("/../../etc/passwd", "/etc/passwd");     // .. at the root is discarded
+
+        // Case.
+        canon("/ADMIN/Users", "/admin/users");
+
+        // Empty segments are NOT merged -- see canonical()'s comment, which
+        // says so and says why. Pinned so that changing it is a decision
+        // somebody makes on purpose.
+        canon("/app//admin", "/app//admin");
+
+        // Idempotence, which is what "until stable" has to mean.
+        for (String p : List.of("/api/%252e%252e/admin", "/a%2525b", "/ADMIN/%2e%2e/x"))
+            check("canonical is idempotent on " + p,
+                  Policy.canonical(Policy.canonical(p)).equals(Policy.canonical(p)));
+    }
+
+    /**
+     * A malformed escape must not throw, and it must not switch
+     * canonicalisation off for the rest of the string either: abandoning the
+     * whole path on one bad escape would let an attacker disable the denylist
+     * by appending a single `%`.
+     */
+    static void aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation() {
+        canon("%", "%");
+        canon("/a%", "/a%");
+        canon("/a%z", "/a%z");
+        canon("/a%4", "/a%4");
+        canon("%%%", "%%%");
+        canon("/a%zz/b", "/a%zz/b");
+        // The escape is bad; the ones around it are not, and they still decode.
+        canon("/a%%41", "/a%a");
+        canon("/adm%69n/%/users", "/admin/%/users");
+
+        // The whole point, at the level that matters: a trailing `%` does not
+        // buy a logout.
+        Policy p = allowingPolicy();
+        for (String path : List.of("/account/log%6fut%", "/account/log%6fut%z",
+                                   "/account/%/log%6fut"))
+            denies("a malformed escape does not disable the denylist: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   APP, "dangerous_denied");
+    }
+
+    /**
+     * The defect this section exists for. Policy matched scope and dangerous
+     * paths against the literal wire bytes and nothing canonicalised anything,
+     * so every request below was ALLOWED against the built jar -- including
+     * `/account/log%6fut`, which is the exact action the denylist exists to
+     * prevent.
+     *
+     * A deny rule -- scope.exclude and dangerous.path -- matches the raw path
+     * OR its canonical form, case-folded. The request on the wire is unchanged.
+     */
+    static void aDenyRuleSeesEveryReadingOfThePath() {
+        Policy p = allowingPolicy();
+
+        // dangerous.path, against the shipped defaults.
+        for (String path : List.of("/account/log%6fut",              // was ALLOW
+                                   "/account/p%61ssword/change",     // was ALLOW
+                                   "/account/%2570assword/change",   // double-encoded
+                                   "/account/LOG%4FUT",              // encoded and cased
+                                   "/api/%2e%2e/account/log%6fut"))  // and dotted
+            denies("an encoded dangerous path is still dangerous: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   APP, "dangerous_denied");
+
+        // The denylist reads the query as well, so the query is decoded too --
+        // on a legacy application the logout is a parameter as often as a path.
+        denies("an encoded logout in the query is still a logout", p,
+               req("GET", "https://app.example.test/index.php?action=log%6fut",
+                   "app.example.test", "/index.php", "action=log%6fut"),
+               APP, "dangerous_denied");
+        // A `..` in a query VALUE is a value, not a step up a tree, and it must
+        // not take an ordinary request out of the run.
+        allows("but a dot-segment inside a query value is just a value", p,
+               req("GET", "https://app.example.test/api/orders?next=../x",
+                   "app.example.test", "/api/orders", "next=../x"),
+               APP);
+
+        // scope.exclude. Everything here is inside the include and named by
+        // the exclude under one reading or another.
+        BridgeClient.Authorisation cfg =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/admin/*");
+        for (String path : List.of("/adm%69n/users",          // was ALLOW
+                                   "/admin%2fusers",          // was ALLOW
+                                   "/api/../admin/users",     // was ALLOW
+                                   "/api/%2e%2e/admin/users", // was ALLOW
+                                   "/ADMIN/users",            // was ALLOW
+                                   "/%41dmin/users"))
+            denies("an encoded excluded path is still excluded: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   cfg, "scope_denied");
+
+        // Case-folding an exclude is the other half of the finding: the
+        // dangerous denylist folded case and scope.exclude did not, so an
+        // operator excluding /admin/* was not excluding it on a target with
+        // case-insensitive routing -- which is most of them.
+        denies("an exclude written in capitals still excludes the lowercase path", p,
+               req("GET", "https://app.example.test/admin/users",
+                   "app.example.test", "/admin/users", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "https://app.example.test/ADMIN/*"),
+               "scope_denied");
+
+        // The raw arm folds case too, and that is a DIFFERENT guard from the
+        // canonical arm: an exclude naming a percent-encoded literal matches
+        // the bytes and never the canonical form, so the canonical arm cannot
+        // stand in for it. `/reports/q1%20final*` against a request for
+        // `/reports/Q1%20Final.pdf` is caught by the raw arm alone -- the
+        // canonical path is `/reports/q1 final.pdf`, which that pattern does
+        // not name.
+        BridgeClient.Authorisation reports =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/reports/q1%20final*");
+        denies("an exclude naming an encoded literal folds case on the raw path", p,
+               req("GET", "https://app.example.test/reports/Q1%20Final.pdf",
+                   "app.example.test", "/reports/Q1%20Final.pdf", ""),
+               reports, "scope_denied");
+        // And the other direction, which the canonical arm also covers: the
+        // pattern's case must not matter either.
+        denies("nor does the case the operator wrote the exclude in", p,
+               req("GET", "https://app.example.test/reports/q1%20final.pdf",
+                   "app.example.test", "/reports/q1%20final.pdf", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "https://app.example.test/REPORTS/Q1%20FINAL*"),
+               "scope_denied");
+
+        // And the ordinary path under the same config is still allowed: a
+        // canonicaliser that refused everything would pass every check above.
+        allows("an ordinary path under the same exclude is untouched", p, orders(), cfg);
+    }
+
+    /**
+     * The half that is NOT symmetric decoration. Nothing is excluded here:
+     * `/app/%2e%2e/other` matches the include as bytes, and the server serves
+     * `/other`, which no include names. An allow rule must match the raw path
+     * AND its canonical form, so both interpretations have to be in scope.
+     */
+    static void anIncludeMustMatchBothReadingsOfThePath() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation app =
+                authorised("scope.include", "https://app.example.test/app/*");
+
+        allows("an ordinary path inside the included prefix", p,
+               req("GET", "https://app.example.test/app/orders",
+                   "app.example.test", "/app/orders", ""), app);
+
+        for (String path : List.of("/app/%2e%2e/other",
+                                   "/app/../other",
+                                   "/app/%252e%252e/other",
+                                   "/app/x/%2e%2e/%2e%2e/other"))
+            denies("an escape out of the included prefix is out of scope: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   app, "scope_denied");
+
+        // A `..` that stays inside the prefix is still in scope: the rule is
+        // "both readings are included", not "no request may contain a dot".
+        allows("but a dot segment that lands back inside it is in scope", p,
+               req("GET", "https://app.example.test/app/x/%2e%2e/orders",
+                   "app.example.test", "/app/x/%2e%2e/orders", ""), app);
+
+        // The raw half of the include stays case-SENSITIVE. Folding case on
+        // the one rule that authorises anything widens it, and this is the
+        // check that fails if somebody "makes it consistent" with the denies.
+        denies("an include is not widened by folding case", p,
+               req("GET", "https://app.example.test/APP/orders",
+                   "app.example.test", "/APP/orders", ""), app, "scope_denied");
+    }
+
+    /**
+     * Canonicalisation must not become a denylist of its own. Percent-encoding
+     * is ordinary and legitimate -- a space in a filename is the common case --
+     * and an operator whose scope covers the directory has scoped the file.
+     */
+    static void aLegitimatelyEncodedPathIsStillAllowed() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation files =
+                authorised("scope.include", "https://app.example.test/files/*");
+
+        String spaced = "/files/annual%20report.pdf";
+        HxRequest r = req("GET", "https://app.example.test" + spaced,
+                          "app.example.test", spaced, "");
+        allows("a space encoded as %20 in an in-scope filename", p, r, files);
+        allows("and an encoded ~ in a home directory", p,
+               req("GET", "https://app.example.test/files/%7Ejim/notes.txt",
+                   "app.example.test", "/files/%7Ejim/notes.txt", ""), files);
+        allows("and an encoded + in a report name", p,
+               req("GET", "https://app.example.test/files/q1%2Bq2.csv",
+                   "app.example.test", "/files/q1%2Bq2.csv", ""), files);
+
+        // The request that goes on the wire is unchanged: canonicalisation
+        // exists only to decide. Nothing in Policy can rewrite an HxRequest --
+        // this is here so that the day something tries, a check says so.
+        p.decide(r, files);
+        check("the request decided about still carries its raw bytes",
+              spaced.equals(r.path()) && spaced.equals(r.target()));
+    }
+
     // ---- the order -------------------------------------------------------
 
     /**
@@ -1059,6 +1345,30 @@ import java.util.Map;
  * distress), not a property of the request and the authorisation. Sender
  * checks it, in that position, between not_configured and this method.
  *
+ * WHAT THE RULES MATCH AGAINST: the request that goes on the wire is
+ * unchanged -- canonicalisation here decides, it never rewrites. But "the
+ * path" is two things at once: the bytes we send, and the resource the target
+ * server resolves them to. `/account/log%6fut` is a real logout on essentially
+ * every server that has ever shipped, and matching the literal bytes alone let
+ * it through. So the two kinds of rule see different things, each in its
+ * fail-closed direction:
+ *
+ *   - a DENY rule (scope.exclude, dangerous.path) matches the raw path OR its
+ *     canonical form, case-folded. Either match refuses: a denylist has to see
+ *     every reading of the request, not a favourite one.
+ *   - an ALLOW rule (scope.include) must match BOTH.
+ *
+ * The second half is not decoration, and it is not symmetric with the first.
+ * With include=/app/* a request for `/app/%2e%2e/other` matches the include as
+ * bytes while the server serves `/other`, which no include names. Requiring
+ * the canonical form to match as well is what closes that.
+ *
+ * Matching a decoded COPY while sending raw bytes -- the obvious fix -- would
+ * reintroduce exactly the decision-versus-wire mismatch the authority checks
+ * below exist to prevent. Deciding about the bytes we send is right; it only
+ * works if the matcher's idea of "the same path" also covers the target
+ * server's, which is what canonical() adds.
+ *
  * The Authorisation is a PARAMETER. It is read once per send, by
  * BridgeClient's send arm, and carried down -- epoch and scope from the one
  * reference, so the scope a request was decided under and the epoch stamped on
@@ -1148,11 +1458,19 @@ public final class Policy {
             return Decision.deny("method_denied",
                     req.method() + " is not in method.allow " + allowed);
 
-        String target = lower(req.target());
-        for (String pattern : dangerousPatterns(scope))
-            if (glob(lower(pattern), target))
+        // Both readings, and either one refuses. The raw form catches a
+        // pattern written against the bytes; the canonical form catches
+        // `/account/log%6fut`, `/account/%2570assword` (decoded twice) and
+        // `/ADMIN/purge`. The detail line quotes the RAW target, because that
+        // is what the operator's frame said and what they will search for.
+        String rawTarget = lower(req.target());
+        String canonicalTarget = canonicalTarget(req);
+        for (String pattern : dangerousPatterns(scope)) {
+            String p = lower(pattern);
+            if (glob(p, rawTarget) || glob(p, canonicalTarget))
                 return Decision.deny("dangerous_denied",
                         req.target() + " matches dangerous.path " + pattern);
+        }
 
         // The Gate LAST, because it is the only check with a side effect:
         // Limiter.check() spends a rate token and a budget slot, and spending
@@ -1230,15 +1548,21 @@ public final class Policy {
             return Decision.deny("scope_denied", "unusable scope pattern: " + e.getMessage());
         }
 
+        // Computed once, and handed to both kinds of rule: they read it
+        // differently, but neither should pay for it per pattern. The host
+        // half needs nothing of the sort -- checkHostChars refuses '%'
+        // outright, so an encoded authority never reaches a comparison.
+        String canonicalPath = canonical(t.path());
+
         // Exclude first: an exclusion is the operator naming something they
         // know they must not touch, and it beats every include it overlaps.
         for (Rule r : excludes)
-            if (r.matches(t))
+            if (r.denies(t, canonicalPath))
                 return Decision.deny("scope_denied",
                         req.url() + " matches scope.exclude " + r.source());
 
         for (Rule r : includes)
-            if (r.matches(t)) return Decision.allow();
+            if (r.allows(t, canonicalPath)) return Decision.allow();
 
         return Decision.deny("scope_denied", req.url() + " matches no scope.include pattern");
     }
@@ -1377,19 +1701,52 @@ public final class Policy {
             return new Rule(pattern, scheme, host, suffix, port, pathGlob);
         }
 
-        boolean matches(Target t) {
+        /** Everything but the path. Shared, because scheme, port and host
+         *  have exactly one reading each -- it is the path that has two. */
+        private boolean authorityMatches(Target t) {
             if (!scheme.equals(t.scheme())) return false;
             if (port != t.port()) return false;
-            if (hostSuffix) {
+            if (hostSuffix)
                 // ".example.test" matches api.example.test but NOT
                 // example.test: an operator scoping the subdomains has not
                 // scoped the apex, which is frequently a different service run
                 // by a different team.
-                if (!t.host().endsWith(hostPattern)) return false;
-            } else if (!hostPattern.equals(t.host())) {
-                return false;
-            }
-            return glob(pathGlob, t.path());
+                return t.host().endsWith(hostPattern);
+            return hostPattern.equals(t.host());
+        }
+
+        /**
+         * scope.exclude: EITHER reading matches, and case is folded doing it.
+         *
+         * Case-folded because `dangerous.path` already was and scope.exclude
+         * was not, and the difference was live: an operator excluding
+         * `/admin/*` was not excluding `/ADMIN/users` on a target with
+         * case-insensitive routing, which is most of them. Two denylists in
+         * one file disagreeing about what "the same path" means is the finding,
+         * not the typo.
+         */
+        boolean denies(Target t, String canonicalPath) {
+            if (!authorityMatches(t)) return false;
+            String p = lower(pathGlob);
+            return glob(p, lower(t.path())) || glob(p, canonicalPath);
+        }
+
+        /**
+         * scope.include: BOTH readings must match, or the request is out of
+         * scope.
+         *
+         * The raw half stays case-SENSITIVE. Folding case on an allow rule
+         * WIDENS it, which is the wrong direction for the one rule that
+         * authorises anything, and `/Admin` has never been authorised by a
+         * pattern naming `/admin`. The canonical half compares a lowercased
+         * pattern against a canonical path, which is lowercased by
+         * construction: an operator who wrote `/API/*` would otherwise have
+         * every request under it refused, which is fail-closed but is also
+         * just broken.
+         */
+        boolean allows(Target t, String canonicalPath) {
+            if (!authorityMatches(t)) return false;
+            return glob(pathGlob, t.path()) && glob(lower(pathGlob), canonicalPath);
         }
     }
 
@@ -1435,6 +1792,150 @@ public final class Policy {
         return p == pattern.length();
     }
 
+    // ---- canonical paths -------------------------------------------------
+
+    /**
+     * The path as the target server will read it: percent-decoded until
+     * stable, dot segments collapsed, lowercased. Pure, and it changes no byte
+     * of the request -- see the class comment for which rules take it and in
+     * which direction.
+     *
+     * Decoding runs to a FIXED POINT, not once. `%2570assword` decodes to
+     * `%70assword` and only then to `password`, and a denylist that stopped
+     * after one round would be reading the middle spelling while the server,
+     * or any proxy in front of it, reads the last. Termination is not an
+     * assumption: a round that changes anything replaces three characters with
+     * one, so the string strictly shortens and the loop is bounded by its
+     * length.
+     *
+     * The order of the three steps is load-bearing. Decoding comes FIRST, so
+     * `%2e%2e` is already `..` when dot segments are collapsed and `%2f` is
+     * already a separator when the path is split into them. Lowercasing comes
+     * LAST, on decoded text, so `%4C` and `%6c` both arrive at `l`.
+     *
+     * What this deliberately does NOT do is merge empty segments: `/app//admin`
+     * keeps its double slash. RFC 3986 normalisation does not remove one, and
+     * whether `//admin` and `/admin` are the same resource is a question only
+     * the target server answers. That leaves a prefix exclude for `/admin/*`
+     * evadable as `//admin/users` on servers that do collapse it. It is a real
+     * gap in the deny direction, it is written down here rather than papered
+     * over, and closing it needs a decision about empty segments rather than
+     * one more line.
+     */
+    static String canonical(String path) {
+        return lower(collapseDotSegments(decodeToFixedPoint(path)));
+    }
+
+    /** Percent-decoding repeated until a round changes nothing. */
+    static String decodeToFixedPoint(String s) {
+        for (;;) {
+            String next = decodeOnce(s);
+            if (next.equals(s)) return s;
+            s = next;
+        }
+    }
+
+    /**
+     * One round of percent-decoding. It NEVER throws and never rejects: a
+     * malformed escape -- a bare `%`, `%z`, a truncated `%4` at the end of the
+     * string -- is copied through verbatim and decoding carries on past it.
+     *
+     * Abandoning the whole string on one bad escape, the other reading of
+     * "return the input unchanged", would hand an attacker a switch: append a
+     * single `%` to `/account/log%6fut` and canonicalisation turns itself off
+     * for the entire path. Per-escape leniency keeps the rest decoded, so the
+     * denylist still sees `logout%`, and a test pins exactly that request.
+     * Throwing would be worse again -- anything thrown out of decide() is an
+     * implicit allow the moment a caller mishandles it, which is the failure
+     * this whole class exists to make impossible.
+     *
+     * Bytes become chars one for one, with no transcoding. Every pattern these
+     * strings are matched against is ASCII, and choosing a charset here would
+     * add a second reading of the path rather than remove one.
+     */
+    static String decodeOnce(String s) {
+        int first = s.indexOf('%');
+        if (first < 0) return s;
+        StringBuilder out = new StringBuilder(s.length());
+        out.append(s, 0, first);
+        for (int i = first; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c != '%' || i + 2 >= s.length()) { out.append(c); continue; }
+            int hi = hexDigit(s.charAt(i + 1));
+            int lo = hexDigit(s.charAt(i + 2));
+            if (hi < 0 || lo < 0) { out.append(c); continue; }
+            out.append((char) (hi * 16 + lo));
+            i += 2;
+        }
+        return out.toString();
+    }
+
+    private static int hexDigit(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    }
+
+    /**
+     * RFC 3986 remove_dot_segments, over the '/'-separated segments of a path.
+     * A `..` at the root is discarded rather than escaping it, and a trailing
+     * `.` or `..` leaves the trailing slash it implies, so `/a/b/..` is `/a/`
+     * and not `/a`.
+     */
+    static String collapseDotSegments(String path) {
+        boolean absolute = path.startsWith("/");
+        List<String> segments = new ArrayList<>();
+        int start = 0;
+        for (int i = 0; i <= path.length(); i++)
+            if (i == path.length() || path.charAt(i) == '/') {
+                segments.add(path.substring(start, i));
+                start = i + 1;
+            }
+
+        List<String> kept = new ArrayList<>();
+        boolean trailingSlash = false;
+        for (int i = absolute ? 1 : 0; i < segments.size(); i++) {
+            String seg = segments.get(i);
+            boolean last = i == segments.size() - 1;
+            if (seg.equals(".")) {
+                if (last) trailingSlash = true;
+            } else if (seg.equals("..")) {
+                if (!kept.isEmpty()) kept.remove(kept.size() - 1);
+                if (last) trailingSlash = true;
+            } else {
+                kept.add(seg);
+            }
+        }
+
+        StringBuilder out = new StringBuilder();
+        if (absolute) out.append('/');
+        for (int i = 0; i < kept.size(); i++) {
+            if (i > 0) out.append('/');
+            out.append(kept.get(i));
+        }
+        if (trailingSlash && (out.length() == 0 || out.charAt(out.length() - 1) != '/'))
+            out.append('/');
+        return out.toString();
+    }
+
+    /**
+     * The canonical form of the origin-form target, for the dangerous-path
+     * denylist, which reads path AND query.
+     *
+     * The two halves are canonicalised separately and dot segments are
+     * collapsed in the path ONLY: a `..` in a query value is a value, and a
+     * `%2f` in one is not a path separator the server will ever see. Decoding
+     * the query still matters -- on a legacy application the logout is
+     * `?action=log%6fut` at least as often as it is a path.
+     */
+    private static String canonicalTarget(HxRequest req) {
+        String path = canonical(req.path());
+        return req.query().isEmpty()
+                ? path
+                : path + "?" + lower(decodeToFixedPoint(req.query()));
+    }
+
     // Locale.ROOT, not the default locale: in a Turkish locale "I" lowercases
     // to a dotless i, so an operator who wrote a dangerous.path in capitals
     // would have it stop matching "/delete" on their laptop and nowhere else.
@@ -1448,14 +1949,14 @@ public final class Policy {
 
 Run: `cd extension && ./test.sh`
 
-Expected: `CodecTest` and `BridgeClientTest` unchanged, then `PolicyTest` printing 87
+Expected: `CodecTest` and `BridgeClientTest` unchanged, then `PolicyTest` printing 150
 `ok` lines and `ALL PASS`. Count them:
 
 ```bash
 cd extension && java -cp "build/test-classes:$MONTOYA" hx.policy.PolicyTest | grep -c '^  ok'
 ```
 
-87. If it is fewer, a check was lost in transcription — find which one before moving on.
+150. If it is fewer, a check was lost in transcription — find which one before moving on.
 
 One check in this suite has already earned its place. The scan in `policyNamesNoBurpType`
 first went red on `Policy.java` itself: the class comment explaining the scan named the
