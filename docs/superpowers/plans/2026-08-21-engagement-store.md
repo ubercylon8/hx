@@ -1635,19 +1635,39 @@ def _string_list(raw: dict, key: str, default: list[str]) -> list[str]:
         raise ConfigError(f"{key} must be a list, got {type(v).__name__}")
     if not all(isinstance(x, str) for x in v):
         raise ConfigError(f"every entry in {key} must be a string")
-    for i, x in enumerate(v):
+    check_entries(key, v)
+    return list(v)
+
+
+def check_entries(key: str, values: list[str]) -> None:
+    """Refuse a blank entry in a list of patterns.
+
+    A blank entry means nothing to any consumer, and in a scope list it is
+    actively dangerous: the extension refuses an empty pattern outright --
+    Rule.forExclude("") throws and the whole decision becomes scope_denied --
+    so one stray blank line in scope.exclude takes the engagement to deny-all
+    mid-run. Failing closed there is right; failing HERE is better, because the
+    operator finds out before the run rather than after the first refusal.
+
+    A PUBLIC function rather than a branch inside _string_list, because
+    _string_list only ever runs in load(), and load() is not the only way a
+    Config is built. `hx new` constructs one directly from its options and
+    dumps() it, so `hx new --exclude ''` wrote `exclude: ['', ...]` to
+    config.yaml AND to the scope_version row while every check in this module
+    passed -- the guard fired on the next `load()`, which is to say after the
+    engagement existed. Not a bypass (the extension still fails closed), but
+    the whole point of the guard was that the operator learns at `hx new`, and
+    on that path they did not. cli.new() calls this before it builds anything.
+
+    Narrow on purpose, and unchanged from where the check used to live: a blank
+    ENTRY is refused, an explicitly empty LIST is not. The spec requires
+    `exclude: []` to stay writable and reviewable.
+    """
+    for i, x in enumerate(values):
         if not x.strip():
-            # A blank entry means nothing to any consumer, and in a scope list
-            # it is actively dangerous: the extension refuses an empty pattern
-            # outright -- Rule.forExclude("") throws and the whole decision
-            # becomes scope_denied -- so one stray blank line in scope.exclude
-            # takes the engagement to deny-all mid-run. Failing closed there is
-            # right; failing HERE is better, because the operator finds out at
-            # `hx new` instead of after the first refusal.
             raise ConfigError(
                 f"{key}[{i}] is blank; remove the entry or give it a value"
             )
-    return list(v)
 
 
 def _positive_int(raw: dict, key: str, default: int) -> int:
@@ -2585,6 +2605,48 @@ def test_new_rejects_empty_client(tmp_path: Path):
     assert len(list(tmp_path.iterdir())) == 0
 
 
+@pytest.mark.parametrize("option", ["--scope", "--exclude"])
+def test_new_rejects_a_blank_scope_entry(tmp_path: Path, option):
+    """A blank pattern is refused at `hx new`, not at the next `load()`.
+
+    config.load() has refused a blank entry since the guard landed, but `hx new`
+    does not go through load(): it builds a Config from its options and dumps()
+    it. So `hx new --exclude ''` wrote `exclude: ['']` into config.yaml and into
+    the scope_version row, and the operator learned about it on the next open --
+    which is the one thing the guard was added to prevent. The extension still
+    fails closed on an empty pattern, so this was never a bypass; it was the
+    guard firing one step too late to be the guard.
+    """
+    runner = CliRunner()
+    args = ["new", "acme", "--client", "Acme", "--scope", "https://a/*",
+            "--root", str(tmp_path)]
+    if option == "--scope":
+        args = ["new", "acme", "--client", "Acme", "--scope", "",
+                "--root", str(tmp_path)]
+    else:
+        args += ["--exclude", ""]
+    result = runner.invoke(cli.main, args)
+    assert result.exit_code != 0, result.output
+    assert "blank" in result.output.lower(), result.output
+    # And nothing was created: the refusal comes before any directory is made.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_new_still_accepts_no_exclude_at_all(tmp_path: Path):
+    """The control. The guard refuses a blank ENTRY, never an empty LIST --
+    `exclude: []` has to stay writable, and an operator who passes no
+    `--exclude` at all is writing exactly that."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", "acme", "--client", "Acme", "--scope", "https://a/*",
+         "--root", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    text = (tmp_path / "acme" / "config.yaml").read_text(encoding="utf-8")
+    assert "exclude: []" in text
+
+
 def test_info_missing_config_yaml(tmp_path: Path):
     """Test that info handles missing config.yaml gracefully."""
     runner = CliRunner()
@@ -2808,6 +2870,18 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
     for field, value in (("NAME", name), ("--client", client)):
         if not value.strip():
             raise click.ClickException(f"{field} must not be empty")
+    # The same refusal one field along, and it has to be HERE rather than only
+    # in config.load(): this command builds a Config directly and dumps() it,
+    # so the load-time guard does not run until the engagement already exists.
+    # `hx new --exclude ""` wrote `exclude: ['']` to config.yaml and to the
+    # scope_version row, and the operator found out on the next open. The
+    # extension still fails closed on an empty pattern -- it is not a bypass --
+    # but the guard exists so that the operator learns at `hx new`.
+    for option, values in (("scope.include", scope), ("scope.exclude", exclude)):
+        try:
+            config_mod.check_entries(option, list(values))
+        except config_mod.ConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
     # NAME becomes a path segment under the engagements root (`base / name`).
     # Without this check, "." makes the engagements root ITSELF an
     # engagement (so `rm -rf` of it destroys every client), ".." or

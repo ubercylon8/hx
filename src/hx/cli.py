@@ -54,6 +54,18 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
     for field, value in (("NAME", name), ("--client", client)):
         if not value.strip():
             raise click.ClickException(f"{field} must not be empty")
+    # The same refusal one field along, and it has to be HERE rather than only
+    # in config.load(): this command builds a Config directly and dumps() it,
+    # so the load-time guard does not run until the engagement already exists.
+    # `hx new --exclude ""` wrote `exclude: ['']` to config.yaml and to the
+    # scope_version row, and the operator found out on the next open. The
+    # extension still fails closed on an empty pattern -- it is not a bypass --
+    # but the guard exists so that the operator learns at `hx new`.
+    for option, values in (("scope.include", scope), ("scope.exclude", exclude)):
+        try:
+            config_mod.check_entries(option, list(values))
+        except config_mod.ConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
     # NAME becomes a path segment under the engagements root (`base / name`).
     # Without this check, "." makes the engagements root ITSELF an
     # engagement (so `rm -rf` of it destroys every client), ".." or

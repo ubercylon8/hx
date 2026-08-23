@@ -368,6 +368,7 @@ public class PolicyTest {
         bothDotSegmentOrdersAreInTheSet();
         decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep();
         everyBestFitEntryIsGuardedByACheckOfItsOwn();
+        theBestFitFoldRefusesAnIncludeThatCarriesOne();
         anIncludeIsNotWidenedByASegmentTransform();
         aNulEndsTheStringForAnythingThatReachesACApi();
         theReadingSetIsClosedUnderItsOwnTransforms();
@@ -376,6 +377,7 @@ public class PolicyTest {
         theDangerousDenylistReadsThePathWhenAQueryIsPresent();
         anEmptyScopePatternIsAnUnusableOneAndDeniesEverything();
         aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading();
+        theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading();
         lowerFoldsTheWholeStringAndNotAPrefixOfIt();
         everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt();
         aDenyRuleSeesEveryReadingOfThePath();
@@ -383,6 +385,7 @@ public class PolicyTest {
         aPathParameterIsStrippedBeforeTheServerNormalises();
         aBackslashIsReadAsASeparator();
         aTrailingDotSpaceOrNulIsTrimmed();
+        aSegmentOfNothingButASpaceOrANulIsStillTrimmed();
         overlongUtf8IsReadAsTheAsciiItDecodesTo();
         theRawPathIsAReadingInItsOwnRight();
         aPatternIsReadEveryWayAPathIs();
@@ -1265,53 +1268,106 @@ public class PolicyTest {
      * onto printable ASCII at a fixed offset. `foldBestFit` said, in a comment,
      * that "none of the rest changes how a path is READ"; a fullwidth spelling
      * of `logout` is `logout` to any ANSI API, and the denylist is a list of
-     * words. Three live rows, on the shipped defaults, before the range folded:
+     * words.
      *
-     *   /account/(fullwidth logout)  ALLOW -- an automated logout
-     *   /account/l(U+FF0F)gout       ALLOW -- one letter is enough
-     *   /(U+FF41)dmin/users          ALLOW past exclude=/admin/*
+     * Round 8, CRITICAL AGAIN, AND THAT IS THE POINT: 105 was not the table
+     * either. 384 of bestfit1252.txt's 698 entries map a non-ASCII code point
+     * onto 0x21..0x7E and the hand-drawn table held 99 of them, so the SAME
+     * substitution walked past the same rules with a different letter:
      *
-     * ...and the control below asserted the opposite of the truth: it named
-     * U+FF10 FULLWIDTH DIGIT ZERO as "a fullwidth character bestFit() does NOT
-     * map", which the real table maps to `0`. It stayed green because `0` is
-     * not a separator, so a table entry that was missing AND a control that was
-     * wrong agreed with each other. The control is U+3042 HIRAGANA LETTER A
-     * now, verified absent rather than assumed: bestfit1252.txt's WCTABLE has
-     * 698 entries, and neither U+3042 nor any other kana is one of them --
-     * CP1252 has no representation of kana and no Latin character that looks
-     * like one, so WideCharToMultiByte substitutes the code page's default
-     * character rather than a best fit.
+     *   /account/(U+0142)ogout       ALLOW -- `l` with a stroke
+     *   /account/l(U+014D)gout       ALLOW -- `o` with a macron
+     *   /i.php?action=lo(U+0261)out  ALLOW -- a script `g`
+     *   /(U+0101)dmin/users          ALLOW past exclude=/admin/*
+     *   /adm(U+0131)n/users          ALLOW past exclude=/admin/*
+     *   /(U+03B1)dmin/users          ALLOW past exclude=/admin/*
      *
-     * DISCOVERED, not listed. The table below is built by asking foldBestFit
-     * about every code point in the BMP, so an entry cannot be added without a
-     * check or removed without a failure -- which is what "thirteen" was
-     * supposed to buy and did not.
+     * Three hand-drawn tables, three subsets, three live bypasses. The table
+     * is GENERATED from the vendor file now -- see
+     * extension/tools/bestfit_table.py, which carries the URL, the sha256 of
+     * the file, the filter and the six supplements -- and the checks below are
+     * derived from what the compiled class does rather than from a list
+     * anybody typed:
+     *
+     *   - the SIZE, so an entry cannot be added or dropped unnoticed;
+     *   - the FILTER as a property, so an entry that lands outside printable
+     *     ASCII is a red rather than a surprise;
+     *   - a DIGEST over the whole mapping, computed here from the compiled
+     *     class and pinned to a value the generator prints from the vendor
+     *     file -- which is the only one of these that catches a target
+     *     changed IN PLACE, since that leaves the size and every property
+     *     alone;
+     *   - the fullwidth block as arithmetic, which is an independent check on
+     *     94 of the generated lines;
+     *   - the six supplements named one by one, because they are the entries
+     *     the vendor file does NOT justify;
+     *   - and every entry, whatever it folds to, tied to the reading machinery
+     *     end to end.
+     *
+     * The control is U+3042 HIRAGANA LETTER A, verified absent by parsing the
+     * table rather than assumed: CP1252 has no representation of kana and no
+     * Latin character that looks like one, so WideCharToMultiByte substitutes
+     * the code page's default character rather than a best fit. (It replaced
+     * U+FF10 FULLWIDTH DIGIT ZERO, which round 6 named as "a fullwidth
+     * character bestFit() does NOT map" while the real table maps it to `0` --
+     * a test asserting the bug, green because a missing entry and a wrong
+     * control agreed with each other.)
      */
-    static void everyBestFitEntryIsGuardedByACheckOfItsOwn() {
+    static void everyBestFitEntryIsGuardedByACheckOfItsOwn() throws Exception {
         Policy p = allowingPolicy();
         BridgeClient.Authorisation cfg =
                 authorised("scope.include", "https://app.example.test/*",
                            "scope.exclude", "https://app.example.test/admin/*");
 
         // (1) The whole mapping, discovered by asking rather than by listing.
-        List<Character> mapped = new ArrayList<>();
+        Map<Character, Character> table = new LinkedHashMap<>();
         for (int c = 0x80; c <= 0xffff; c++) {
             String one = String.valueOf((char) c);
-            if (!Policy.foldBestFit(one).equals(one)) mapped.add((char) c);
+            String fit = Policy.foldBestFit(one);
+            if (!fit.equals(one)) table.put((char) c, fit.charAt(0));
         }
-        check("foldBestFit maps " + mapped.size() + " code points, every one of "
-              + "them checked below", mapped.size() == 105);
+        check("foldBestFit maps " + table.size() + " code points -- 392 entries "
+              + "of bestfit1252.txt plus 6 homoglyphs it does not carry",
+              table.size() == 398);
 
-        // (2) The fullwidth block, as one rule rather than 94 entries. Verified
-        // against the real bestfit1252.txt: 94 of its 698 WCTABLE entries are
-        // U+FF01..U+FF5E and every one maps to its code point minus 0xFEE0.
+        // (2) The FILTER, as a property of every entry rather than a claim in a
+        // comment. An entry landing outside printable ASCII would be a
+        // generation defect: it cannot change what a path says to a matcher
+        // whose patterns are ASCII, and it could substitute one non-ASCII
+        // character for another and mangle a name for no gain.
+        int printable = 0;
+        for (char fit : table.values()) if (fit >= 0x20 && fit <= 0x7e) printable++;
+        check("every one of them lands on printable ASCII, 0x20..0x7E ("
+              + printable + " of " + table.size() + ")", printable == table.size());
+
+        // (3) The digest, which is the check a target changed IN PLACE cannot
+        // pass. Recompute with:
+        //   python3 extension/tools/bestfit_table.py --digest
+        // which derives it from bestfit1252.txt, so this compares the compiled
+        // class against the vendor file and not against itself.
+        StringBuilder blob = new StringBuilder();
+        for (Map.Entry<Character, Character> e : table.entrySet())
+            blob.append(String.format("%04x:%02x%n", (int) e.getKey(), (int) e.getValue())
+                              .replace(System.lineSeparator(), "\n"));
+        java.security.MessageDigest sha = java.security.MessageDigest.getInstance("SHA-256");
+        StringBuilder hex = new StringBuilder();
+        for (byte b : sha.digest(blob.toString().getBytes(StandardCharsets.UTF_8)))
+            hex.append(String.format("%02x", b));
+        check("and the mapping digests to " + hex + ", which is what the "
+              + "generator prints from bestfit1252.txt",
+              BEST_FIT_SHA256.contentEquals(hex));
+
+        // (4) The fullwidth block, as arithmetic. U+FF01..U+FF5E is the
+        // fullwidth image of ASCII 0x21..0x7E in order, and bestfit1252 maps it
+        // as exactly that -- so this is an independent check on 94 of the
+        // generated lines, from a rule rather than from the file.
         int fullwidth = 0;
-        for (char c = 0xff01; c <= 0xff5e; c++)
-            if (Policy.foldBestFit(String.valueOf(c))
-                      .equals(String.valueOf((char) (c - Policy.FULLWIDTH_OFFSET))))
-                fullwidth++;
-        check("all 94 code points U+FF01..U+FF5E fold to their code point minus 0x"
-              + Integer.toHexString(Policy.FULLWIDTH_OFFSET).toUpperCase(Locale.ROOT)
+        for (char c = 0xff01; c <= 0xff5e; c++) {
+            Character fit = table.get(c);
+            if (fit != null && fit == (char) (c - FULLWIDTH_OFFSET)) fullwidth++;
+        }
+        check("all 94 code points U+FF01..U+FF5E fold to their code point minus "
+              + "0x" + Integer.toHexString(FULLWIDTH_OFFSET).toUpperCase(Locale.ROOT)
               + " (" + fullwidth + " of 94)", fullwidth == 94);
         check("...which is what makes a fullwidth `l` an `l` and a fullwidth "
               + "`A` an `A`",
@@ -1319,74 +1375,91 @@ public class PolicyTest {
               && "A".equals(Policy.foldBestFit("Ａ"))
               && "0".equals(Policy.foldBestFit("０")));
 
-        // (3) The entries OUTSIDE that block, one check each. Three are
-        // bestfit1252's own (U+037E, U+066A, U+2216); the rest are best fits in
-        // other code pages' tables and are kept because a PATH reading only
-        // ever denies more.
-        Map<Character, Character> outliers = new LinkedHashMap<>();
-        outliers.put('∕', '/');   // DIVISION SLASH
-        outliers.put('⁄', '/');   // FRACTION SLASH
-        outliers.put('⧸', '/');   // BIG SOLIDUS
-        outliers.put('∖', '\\');  // SET MINUS
-        outliers.put('﹨', '\\');  // SMALL REVERSE SOLIDUS
-        outliers.put('﹒', '.');   // SMALL FULL STOP
-        outliers.put('｡', '.');   // HALFWIDTH IDEOGRAPHIC FULL STOP
-        outliers.put('․', '.');   // ONE DOT LEADER
-        outliers.put(';', ';');   // GREEK QUESTION MARK
-        outliers.put('﹔', ';');   // SMALL SEMICOLON
-        outliers.put('٪', '%');   // ARABIC PERCENT SIGN
-        List<Character> outside = new ArrayList<>();
-        for (char c : mapped) if (c < 0xff01 || c > 0xff5e) outside.add(c);
-        check("the entries outside the fullwidth block are exactly the "
-              + outliers.size() + " named here (found " + outside.size() + ")",
-              new LinkedHashSet<>(outside).equals(new LinkedHashSet<>(outliers.keySet())));
-        for (Map.Entry<Character, Character> e : outliers.entrySet())
-            check(String.format("U+%04X best-fits to %s", (int) e.getKey(),
+        // (5) The SUPPLEMENTS: the six entries bestfit1252.txt does not carry,
+        // one check each. The comment they replace called them "best fits in
+        // other code pages' tables"; that was checked this round against the
+        // WCTABLEs of bestfit932, 936, 949, 950, 874, 1250-1258 and 10000 and
+        // it is FALSE -- none of the six best-fits to printable ASCII in any of
+        // them. They stay because a best-fit reading of a PATH only ever denies
+        // more and they are homoglyphs of path syntax, and they are named here
+        // because they are the part of the table no vendor file justifies.
+        // U+2024 is the sharpest: bestfit1252 DOES map it, to 0xB7 MIDDLE DOT.
+        Map<Character, Character> supplement = new LinkedHashMap<>();
+        supplement.put((char) 0x29f8, '/');   // BIG SOLIDUS
+        supplement.put((char) 0xfe68, '\\');  // SMALL REVERSE SOLIDUS
+        supplement.put((char) 0xfe52, '.');   // SMALL FULL STOP
+        supplement.put((char) 0xff61, '.');   // HALFWIDTH IDEOGRAPHIC FULL STOP
+        supplement.put((char) 0x2024, '.');   // ONE DOT LEADER (1252: MIDDLE DOT)
+        supplement.put((char) 0xfe54, ';');   // SMALL SEMICOLON
+        for (Map.Entry<Character, Character> e : supplement.entrySet())
+            check(String.format("supplement U+%04X best-fits to %s -- ours, not "
+                                + "the vendor's", (int) e.getKey(),
                                 displayable(e.getValue())),
-                  String.valueOf(e.getValue())
-                        .equals(Policy.foldBestFit(String.valueOf(e.getKey()))));
+                  e.getValue().equals(table.get(e.getKey())));
 
-        // (4) Every entry, tied to the reading machinery: the path spelt with
+        // (6) The eight entries that fold to a SPACE -- the quad and em spaces
+        // and U+3000 IDEOGRAPHIC SPACE. A space is not decoration: Windows
+        // trims a trailing space from a name, so a segment that is nothing but
+        // one of these disappears and the path shortens by a segment. Without
+        // them in the filter the row below is an ALLOW.
+        int spaces = 0;
+        for (Map.Entry<Character, Character> e : table.entrySet()) {
+            if (e.getValue() != ' ') continue;
+            spaces++;
+            String path = "/a/" + Policy.percentEncodeUtf8(String.valueOf(e.getKey()), false)
+                        + "/b/leaf";
+            denies(String.format("U+%04X is a space, so %s reads as /a/b/leaf",
+                                 (int) e.getKey(), path), p,
+                   req("GET", "https://app.example.test" + path,
+                       "app.example.test", path, ""),
+                   authorised("scope.include", "https://app.example.test/*",
+                              "scope.exclude", "https://app.example.test/a/b/*"),
+                   "scope_denied");
+        }
+        check("the space-producing entries are the 8 the file maps to 0x20 ("
+              + spaces + ")", spaces == 8);
+
+        // (7) Every entry, tied to the reading machinery: the path spelt with
         // the homoglyph must READ as the path spelt with what it folds to. An
         // entry deleted from the table fails here even when what it folds to is
         // an ordinary letter and no separator moves.
         int reads = 0;
-        for (char c : mapped) {
-            char fit = Policy.foldBestFit(String.valueOf(c)).charAt(0);
-            String spelt = "/admin/" + c + "leaf";
-            String folded = "/admin/" + fit + "leaf";
+        for (Map.Entry<Character, Character> e : table.entrySet()) {
+            String spelt = "/admin/" + e.getKey() + "leaf";
+            String folded = "/admin/" + e.getValue() + "leaf";
             String want = Policy.lower(Policy.collapseDotSegments(
                     Policy.collapseEmptySegments(folded)));
             if (Policy.readings(spelt).contains(want)) reads++;
             else check(String.format("U+%04X: %s has no reading %s",
-                                     (int) c, spelt, want), false);
+                                     (int) e.getKey(), spelt, want), false);
         }
-        check("every one of the " + mapped.size() + " entries puts the folded "
+        check("every one of the " + table.size() + " entries puts the folded "
               + "spelling in the homoglyph's reading set (" + reads + ")",
-              reads == mapped.size());
+              reads == table.size());
 
-        // (5) The separator-producing entries, end to end, one shape each.
+        // (8) The separator-producing entries, end to end, one shape each.
         // SEP: the homoglyph is where the separator goes. DOT: two of them are
         // the `..` that pops a segment. SEMI: it opens a path parameter a
         // servlet container strips. PCT: it manufactures the escape that
         // decodes to a separator.
         int separators = 0;
-        for (char c : mapped) {
-            char fit = Policy.foldBestFit(String.valueOf(c)).charAt(0);
+        for (Map.Entry<Character, Character> e : table.entrySet()) {
+            char fit = e.getValue();
             String shape = fit == '/' || fit == '\\' ? "SEP"
                          : fit == '.' ? "DOT"
                          : fit == ';' ? "SEMI"
                          : fit == '%' ? "PCT" : null;
             if (shape == null) continue;
             separators++;
-            String path = bestFitProbe(String.valueOf(c), shape);
+            String path = bestFitProbe(String.valueOf(e.getKey()), shape);
             denies(String.format("U+%04X is read as the %s it best-fits to: %s",
-                                 (int) c, shape, path), p,
+                                 (int) e.getKey(), shape, path), p,
                    req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
                    cfg, "scope_denied");
         }
-        check("the separator-producing entries are the 5 fullwidth ones plus the "
-              + "11 outside the block (" + separators + ")", separators == 16);
+        check("the separator-producing entries are 7 slashes and backslashes, 4 "
+              + "dots, 3 semicolons and 2 percents (" + separators + ")",
+              separators == 16);
 
         // The controls, one per shape, with a character that is genuinely NOT
         // in the table -- see the header for how that was verified. Without
@@ -1413,47 +1486,169 @@ public class PolicyTest {
                            "app.example.test", path, ""),
                        APP, "dangerous_denied");
 
-        // ...and the rows the fullwidth range was added for, which need no
-        // separator at all: a fullwidth SPELLING of a dangerous word is that
-        // word to an ANSI API, and one substituted letter is enough.
+        // ...and the rows that need no separator at all: a best-fit SPELLING of
+        // a dangerous word is that word to an ANSI API, and one substituted
+        // letter is enough. The first three were closed by the fullwidth block
+        // in round 7; the rest were ALLOW on that build and are what generating
+        // the table closed.
         String fullLogout = Policy.percentEncodeUtf8("ｌｏｇｏｕｔ", false);
         denies("a wholly fullwidth logout is still a logout: /account/" + fullLogout, p,
                req("GET", "https://app.example.test/account/" + fullLogout,
                    "app.example.test", "/account/" + fullLogout, ""),
                APP, "dangerous_denied");
-        String oneLetter = "/account/l" + Policy.percentEncodeUtf8("ｏ", false) + "gout";
-        denies("and one fullwidth letter inside it is enough: " + oneLetter, p,
-               req("GET", "https://app.example.test" + oneLetter,
-                   "app.example.test", oneLetter, ""),
+        for (String[] row : new String[][] {
+                {"ｏ", "a fullwidth `o`"},
+                {"ł", "a Polish `l`"},
+                {"ō", "an `o` with a macron"},
+                {"ǫ", "an `o` with an ogonek"},
+                {"ℊ", "a script `g`"},
+                {"ɡ", "an IPA `g`"},
+                {"т", null}}) {
+            if (row[1] == null) continue;               // Cyrillic: not in the table
+            String enc = Policy.percentEncodeUtf8(row[0], false);
+            String path = "/account/" + ("ł".equals(row[0]) ? enc + "ogout"
+                        : "ō".equals(row[0]) || "ǫ".equals(row[0]) || "ｏ".equals(row[0])
+                          ? "l" + enc + "gout" : "lo" + enc + "out");
+            denies(row[1] + " inside a logout is still a logout: " + path, p,
+                   req("GET", "https://app.example.test" + path,
+                       "app.example.test", path, ""),
+                   APP, "dangerous_denied");
+        }
+        // The query half of the same denylist, which reads `?action=logout`.
+        String q = "action=lo" + Policy.percentEncodeUtf8("ɡ", false) + "out";
+        denies("nor in the query: /i.php?" + q, p,
+               req("GET", "https://app.example.test/i.php?" + q,
+                   "app.example.test", "/i.php", q),
                APP, "dangerous_denied");
-        String fullAdmin = "/" + Policy.percentEncodeUtf8("ａ", false) + "dmin/users";
-        denies("nor does a fullwidth letter walk past an exclusion: " + fullAdmin, p,
-               req("GET", "https://app.example.test" + fullAdmin,
-                   "app.example.test", fullAdmin, ""),
-               cfg, "scope_denied");
+        // ...and past an exclusion, one letter at a time.
+        for (String[] row : new String[][] {
+                {"ａ", "/(fullwidth a)dmin/users"},
+                {"ā", "/(a with macron)dmin/users"},
+                {"α", "/(greek alpha)dmin/users"},
+                {"ı", "/adm(dotless i)n/users"}}) {
+            String enc = Policy.percentEncodeUtf8(row[0], false);
+            String path = "ı".equals(row[0]) ? "/adm" + enc + "n/users"
+                                             : "/" + enc + "dmin/users";
+            denies("nor does " + row[1] + " walk past an exclusion: " + path, p,
+                   req("GET", "https://app.example.test" + path,
+                       "app.example.test", path, ""),
+                   cfg, "scope_denied");
+        }
+        // The control for that group: a Cyrillic homoglyph of `a` is NOT in
+        // bestfit1252 -- CP1252 cannot spell Cyrillic, so WideCharToMultiByte
+        // substitutes the default character rather than a Latin `a` -- so this
+        // request is a different resource and is allowed. Without it the four
+        // rows above would pass with "fold every non-ASCII letter to `a`".
+        String cyrillic = "/" + Policy.percentEncodeUtf8("а", false) + "dmin/users";
+        allows("while a Cyrillic `a`, which the table does not carry, is a "
+               + "different resource: " + cyrillic, p,
+               req("GET", "https://app.example.test" + cyrillic,
+                   "app.example.test", cyrillic, ""),
+               cfg);
+    }
 
-        // THE COST OF THE RANGE, pinned rather than found later. A best-fit
-        // reading is a reading of a PATH and of a DENY pattern, never of an
-        // ALLOW pattern (see spellingReadings), so an include that CARRIES a
-        // fullwidth character now authorises nothing -- the request keeps the
-        // folded reading and the pattern does not name it. That is the same
-        // accepted cost a segment trigger in an include already has. An include
-        // spelt in ASCII is untouched, which is the half that matters: the fold
-        // changes a NAME, not the prefix a scope is anchored at.
-        allows("an ASCII include still authorises a fullwidth path under it", p,
-               req("GET", "https://app.example.test/files/ｄｏｃ.pdf",
-                   "app.example.test", "/files/ｄｏｃ.pdf", ""),
-               authorised("scope.include", "https://app.example.test/files/*"));
-        allows("and a non-ASCII name the table does not map is untouched", p,
-               req("GET", "https://app.example.test/files/テスト.pdf",
-                   "app.example.test", "/files/テスト.pdf", ""),
-               authorised("scope.include", "https://app.example.test/files/*"));
-        denies("while an include that carries one authorises nothing -- the "
-               + "accepted cost", p,
-               req("GET", "https://app.example.test/ａpp/x",
-                   "app.example.test", "/ａpp/x", ""),
-               authorised("scope.include", "https://app.example.test/ａpp/*"),
-               "scope_denied");
+    /** sha256 over the mapping foldBestFit implements: one `%04x:%02x` line per
+     *  entry, ascending, LF-terminated. Derived from bestfit1252.txt by
+     *  `python3 extension/tools/bestfit_table.py --digest`, so the check that
+     *  uses it compares this build against the VENDOR FILE rather than against
+     *  itself. It is the only check in that method that catches a target
+     *  changed in place. */
+    static final String BEST_FIT_SHA256 =
+            "bfe44920f7db50b6dc657cf6591cfce72dc149aa36f8ad8c3f3ba7a409bb48b6";
+
+    /** U+FF01..U+FF5E is the fullwidth image of ASCII 0x21..0x7E, in order, and
+     *  bestfit1252.txt maps it as exactly that. The constant lives HERE rather
+     *  than in Policy: the shipped table is 398 explicit lines with no rules in
+     *  it, and this is a cross-check on 94 of them from outside. */
+    static final int FULLWIDTH_OFFSET = 0xfee0;
+
+    /**
+     * WHAT THE GENERATED TABLE COSTS AN ENGAGEMENT, measured, both directions,
+     * and NOT settled here.
+     *
+     * A best-fit reading belongs to a PATH and to a DENY pattern, never to an
+     * ALLOW pattern -- see Policy.spellingReadings for the argument. While the
+     * fold was 105 code points that cost was theoretical: no scope file is
+     * spelt in fullwidth. The generated table is 398, and 276 of them fold to
+     * a letter or a digit, so an include whose OWN TEXT carries one authorises
+     * nothing at all -- the request keeps the folded reading and the pattern
+     * cannot name it.
+     *
+     * The rule is exact, per CODE POINT rather than per language, and the two
+     * tables below are chosen to show that: an include breaks when a code
+     * point in the table appears in the pattern's own text, and not otherwise.
+     * Czech `/přístup/*` is refused and Czech `/uživatel/*` is not, because
+     * U+0159 is in bestfit1252 and U+017E is a character 1252 can already
+     * spell; Hungarian splits the same way on U+0151 against U+00E1. So
+     * `/administración/*` is fine (Latin-1), `/płatności/*` is not (Latin
+     * Extended-A), and `/api/*` is fine whatever the leaf is spelt in.
+     *
+     * This is fail-closed and visible -- "matches no scope.include pattern" --
+     * and the remedy is an include wide enough to cover both readings. It is
+     * still a real cost on a real engagement, and whether the LETTER half of
+     * the fold should reach allow patterns as well (it cannot manufacture a
+     * separator or a `*`, so the structural argument is about the separator
+     * half alone) is a ruling for whoever owns the engagement. These rows exist
+     * so the answer is a decision rather than a discovery.
+     */
+    static void theBestFitFoldRefusesAnIncludeThatCarriesOne() {
+        Policy p = allowingPolicy();
+
+        // A scope whose own directory name folds: the request for the path the
+        // operator NAMED is refused.
+        String[][] refused = {
+            {"Polish",   "/płatności/faktura",     "/płatności/*"},
+            {"Turkish",  "/kullanıcı/profil",      "/kullanıcı/*"},
+            {"Romanian", "/plăţi/factură",         "/plăţi/*"},
+            {"Latvian",  "/lietotājs/konts",       "/lietotājs/*"},
+            {"Greek",    "/λογαριασμός/στοιχεία",  "/λογαριασμός/*"},
+            {"Czech",    "/přístup/dokument",      "/přístup/*"},
+            {"Hungarian","/nyelvő/beállítás",      "/nyelvő/*"},
+        };
+        for (String[] row : refused) {
+            String path = Policy.percentEncodeUtf8(row[1], false);
+            denies("THE COST: a " + row[0] + " include authorises nothing, not "
+                   + "even the path it spells: include=" + row[2], p,
+                   req("GET", "https://app.example.test" + path,
+                       "app.example.test", path, ""),
+                   authorised("scope.include", "https://app.example.test" + row[2]),
+                   "scope_denied");
+        }
+
+        // The other direction, and it is the larger half. Code page 1252 can
+        // spell the whole Latin-1 supplement, so nothing in it needs a best fit
+        // and no Western European scope is touched; Cyrillic and CJK have no
+        // best fit at all.
+        String[][] unaffected = {
+            {"Spanish",  "/españa/artículos",      "/españa/*"},
+            {"French",   "/café/menu",             "/café/*"},
+            {"German",   "/bücher/liste",          "/bücher/*"},
+            {"Czech",    "/uživatel/účet",         "/uživatel/*"},
+            {"Hungarian","/felhasználó/beállítás", "/felhasználó/*"},
+            {"Polish",   "/konto/wyloguj-x",       "/konto/*"},
+            {"Russian",  "/кабинет/счет",          "/кабинет/*"},
+            {"Japanese", "/テスト/a.pdf",           "/テスト/*"},
+        };
+        for (String[] row : unaffected) {
+            String path = Policy.percentEncodeUtf8(row[1], false);
+            allows("...while a " + row[0] + " include is untouched: include="
+                   + row[2], p,
+                   req("GET", "https://app.example.test" + path,
+                       "app.example.test", path, ""),
+                   authorised("scope.include", "https://app.example.test" + row[2]));
+        }
+
+        // And the half that matters most in practice: the fold changes a NAME,
+        // not the prefix a scope is anchored at, so an ASCII include still
+        // authorises a folded filename underneath it.
+        for (String[] row : refused) {
+            String leaf = Policy.percentEncodeUtf8("/files" + row[1], false);
+            allows("an ASCII include still authorises a folded path under it: "
+                   + leaf, p,
+                   req("GET", "https://app.example.test" + leaf,
+                       "app.example.test", leaf, ""),
+                   authorised("scope.include", "https://app.example.test/files/*"));
+        }
     }
 
     /** A character a check can print. */
@@ -2111,6 +2306,57 @@ public class PolicyTest {
     }
 
     /**
+     * Round 8: the ONE-CHARACTER segment, which is the only shape
+     * hasTrimmableTail's `i > start` guard is load-bearing for -- and nothing
+     * in the suite had one.
+     *
+     * `hasTrimmableTail` decides whether TRIM_TAILS is applicable at all, per
+     * segment, and it needs `i > start` only to keep `path.charAt(i - 1)` off
+     * the character BEFORE an empty segment. Weaken it to `i > start + 1` and
+     * every check in this file stays green while a segment of exactly one
+     * space or one NUL stops being trimmable:
+     *
+     *   /a/%20/b/leaf   ALLOW past exclude=/a/b/*
+     *   /a/%00/b/leaf   ALLOW past exclude=/a/b/*
+     *
+     * Both are real. Windows trims the space, the segment vanishes, and the
+     * path the server opens is `/a/b/leaf`; the NUL is trimmed the same way,
+     * and is ALSO a C string ending -- but truncateAtNul cuts the path at `/a`,
+     * which the exclusion does not name, so the truncation reading does not
+     * save this one. Every other trimmable shape in the suite carries a name
+     * in front of the trimmable character, which is why weakening the guard
+     * cost nothing.
+     */
+    static void aSegmentOfNothingButASpaceOrANulIsStillTrimmed() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation cfg =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/a/b/*");
+
+        for (String path : List.of("/a/%20/b/leaf", "/a/%00/b/leaf")) {
+            check("the reading set carries the trimmed form of " + path + ": "
+                  + Policy.readings(path),
+                  Policy.readings(path).contains("/a/b/leaf"));
+            denies("a segment of nothing but a space or a NUL is trimmed, so "
+                   + path + " does not walk past exclude=/a/b/*", p,
+                   req("GET", "https://app.example.test" + path,
+                       "app.example.test", path, ""),
+                   cfg, "scope_denied");
+        }
+
+        // The control: a one-character segment that is NOT trimmable stays a
+        // segment, so the same exclusion does not reach it. Without this the
+        // two rows above would pass with "trim every one-character segment".
+        allows("while a one-character segment that is not trimmable is still a "
+               + "segment: /a/x/b/leaf", p,
+               req("GET", "https://app.example.test/a/x/b/leaf",
+                   "app.example.test", "/a/x/b/leaf", ""), cfg);
+        check("...and /a/x/b/leaf has no reading /a/b/leaf: "
+              + Policy.readings("/a/x/b/leaf"),
+              !Policy.readings("/a/x/b/leaf").contains("/a/b/leaf"));
+    }
+
+    /**
      * F9. `%c0%ae%c0%ae/` is the overlong UTF-8 `../` that walked past IIS for
      * years. decodeOnce maps a percent-escape to one char with no transcoding,
      * so nothing else in the class would ever see the `..`: it is two chars
@@ -2467,16 +2713,31 @@ public class PolicyTest {
         //
         // RE-SEARCHED each round, and each round has found worse with a cheaper
         // search, so the number here is this round's rather than a quotation.
-        // Round 6's winner is 23 ms on this build; a 20,000-step climb from it,
-        // over an alphabet that now includes the homoglyphs the widened
-        // best-fit table folds, reached 43.1 ms during the climb and
-        // re-measures at 32 ms quiescent. The ceiling moved because the TABLE
-        // grew: a fold that used to fire on thirteen code points now fires on a
-        // hundred and five, so more members of more paths differ from their
-        // base and get derived. That is the cost of closing the fullwidth
-        // range. It is bounded by every bound above, and it degrades one
-        // enforcement thread rather than bypassing anything.
-        String costly = "/\u2216%\ufe52/D\uff0f2\u2216;%c2/.\u066a/\uff05f";
+        // Round 8's climb -- 30,000 steps over an alphabet carrying both halves
+        // of the generated best-fit table -- found the unit below at 40.2 ms
+        // quiescent against the round-7 winner's 36.8 ms on the same build.
+        //
+        // AND THE TABLE IS NOT WHY, which was worth measuring rather than
+        // assuming. The same fixtures were run against the round-7 build (105
+        // entries) and this one (398): 36.3 vs 36.8 ms for the old winner, 40.3
+        // vs 40.2 for the new one. Indistinguishable, at every load level. The
+        // worst case is driven by the READING COUNT, which MAX_READING_CHARS
+        // caps at 16 for an 8 KB target, and both builds sit on that cap. The
+        // 293 entries this round added are letters, and a letter fold adds a
+        // BASE without splitting a segment: a path of 8190 U+0142 goes from 1
+        // reading to 2 and from 0.04 ms to 0.06 ms. bestFit() itself went from
+        // a range check to a 398-case switch, which is a binary search the JIT
+        // does in single-digit nanoseconds against a pass over eight kilobytes.
+        //
+        // UNDER LOAD, stated because the ceiling is not a property of the code
+        // alone. On this 24-core machine, median over 21 runs: quiescent 40 ms,
+        // 4 busy threads 40 ms, 8 busy threads 51 ms, 24 busy threads 89 ms --
+        // over the ceiling. The round-7 build measures 106 ms in that last
+        // column, so a saturated machine already failed this check before this
+        // round and the fold did not move it. The measurement below is a MEDIAN
+        // of five rather than a single sample, so the check answers "is this
+        // code slow" rather than "was the machine busy for one sample".
+        String costly = "/\u2215\u2170\ufe52/D\uff0f2\u2216;%c2/.\u2170\u29f89\u0269/\uff05";
         StringBuilder costlyTiled = new StringBuilder();
         while (costlyTiled.length() + costly.length() <= Policy.MAX_TARGET_CHARS)
             costlyTiled.append(costly);
@@ -2484,13 +2745,20 @@ public class PolicyTest {
         HxRequest costlyReq = req("GET", "https://app.example.test" + costlyPath,
                                   "app.example.test", costlyPath, "");
         p.decide(costlyReq, APP);
-        long cStart = System.nanoTime();
-        Decision cVerdict = p.decide(costlyReq, APP);
-        long cMs = (System.nanoTime() - cStart) / 1_000_000;
+        long[] samples = new long[5];
+        Decision cVerdict = null;
+        for (int i = 0; i < samples.length; i++) {
+            long cStart = System.nanoTime();
+            cVerdict = p.decide(costlyReq, APP);
+            samples[i] = (System.nanoTime() - cStart) / 1_000_000;
+        }
+        Arrays.sort(samples);
+        long cMs = samples[samples.length / 2];
         check("the costliest target a hill climb could build (" + costlyPath.length()
               + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath.length())).size()
               + " readings) is answered " + (cVerdict.allowed() ? "allow" : cVerdict.errorClass())
-              + " in " + cMs + " ms",
+              + " in " + cMs + " ms (median of " + samples.length + ", "
+              + Arrays.toString(samples) + ")",
               cMs < 80 && cVerdict != null);
 
         // ...while a long BENIGN target is decided rather than refused: the
@@ -3074,6 +3342,52 @@ public class PolicyTest {
     }
 
     /**
+     * Round 8: the SAME fold, at the other call site, unnamed for a round.
+     *
+     * Round 7 pinned Rule.denies's `glob(lower(pattern), lower(reading))`.
+     * decide()'s dangerous.path pass has its own copy of that line and nothing
+     * pinned it, so `glob(lower(p), lower(target))` -> `glob(p, target)` left
+     * all 679 checks green and flipped a shipped DEFAULT:
+     *
+     *   /account/LOGOUT/../profile   dangerous_denied -> ALLOW
+     *   /account/PASSWORD/../x       dangerous_denied -> ALLOW
+     *
+     * The mechanism is exactly the one denies() documents. readings()
+     * lowercases only the COLLAPSED forms, so the verbatim raw reading is the
+     * one member that arrives unfolded -- and on a path with a `/../` it is
+     * also the ONLY member that still carries the dangerous segment, because
+     * every other reading pops it. The default patterns are lowercase, so
+     * without this fold the two sides never meet. The request ISSUES a logout
+     * on any server that routes before it normalises.
+     */
+    static void theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading() {
+        Policy p = allowingPolicy();
+
+        for (String[] row : new String[][] {
+                {"/account/LOGOUT/../profile", "/account/logout/../profile", "/account/profile"},
+                {"/account/PASSWORD/../x",     "/account/password/../x",     "/account/x"}}) {
+            check("the target set really is missing lower(raw) for " + row[0] + ": "
+                  + Policy.readings(row[0]),
+                  Policy.readings(row[0]).contains(row[0])
+                  && !Policy.readings(row[0]).contains(row[1])
+                  && Policy.readings(row[0]).contains(row[2]));
+            denies("an uppercase dangerous segment popped by /../ is still "
+                   + "dangerous: " + row[0], p,
+                   req("GET", "https://app.example.test" + row[0],
+                       "app.example.test", row[0], ""),
+                   APP, "dangerous_denied");
+        }
+
+        // The control: the same shape with a segment the denylist does NOT
+        // name is allowed, so the two rows above are the case fold rather than
+        // `/../` being refused outright.
+        allows("while the same shape with a benign segment is allowed", p,
+               req("GET", "https://app.example.test/account/PROFILE/../x",
+                   "app.example.test", "/account/PROFILE/../x", ""),
+               APP);
+    }
+
+    /**
      * Round 7, green sabotage. Nothing pinned that `lower()` folds the WHOLE
      * string.
      *
@@ -3183,6 +3497,51 @@ public class PolicyTest {
                req("GET", "https://app.example.test" + utf8Path,
                    "app.example.test", utf8Path, ""),
                authorised("scope.include", "https://app.example.test/files/caf%c3%a9/*"));
+
+        // Round 8: the VERBATIM decoded spelling, which addSpellings held only
+        // case-folded. Rule.allows compares the path's raw reading WITHOUT
+        // folding case -- deliberately, since folding widens the one rule that
+        // authorises -- so a pattern whose escape decodes to mixed-case ASCII
+        // covered nothing:
+        //
+        //   include=.../files/A%2eB/*      refused  /files/A.B/x
+        //   include=.../files/My%20Docs/*  refused  /files/My Docs/x
+        //
+        // while `a%2eb` and `my%20docs` were allowed, which is the same
+        // silent-in-both-directions failure patternReadings exists to prevent.
+        for (String[] row : new String[][] {
+                {"/files/A%2eB/*",     "/files/A.B/x",     "/files/A.B/*"},
+                {"/files/My%20Docs/*", "/files/My Docs/x", "/files/My Docs/*"},
+                {"/Reports/Q1%2eFinal/*", "/Reports/Q1.Final/x", "/Reports/Q1.Final/*"}}) {
+            check("the pattern's decoded spelling is held verbatim as well as "
+                  + "folded: " + Policy.spellingReadings(row[0]),
+                  Policy.spellingReadings(row[0]).contains(row[2])
+                  && Policy.spellingReadings(row[0]).contains(Policy.lower(row[2])));
+            allows("include=" + row[0] + " authorises its own request " + row[1], p,
+                   req("GET", "https://app.example.test" + row[1],
+                       "app.example.test", row[1], ""),
+                   authorised("scope.include", "https://app.example.test" + row[0]));
+        }
+
+        // ASCII ONLY, and this is the pin that says so. The decoded form of an
+        // escaped UTF-8 character is MOJIBAKE -- two Latin-1 characters that
+        // spell nothing -- and adding it verbatim would put it in the set. The
+        // check above it is what makes this one non-vacuous: the verbatim
+        // spelling IS added when the decode is ASCII.
+        check("...but a decode that is not ASCII is held folded only, so no "
+              + "mojibake spelling enters the set",
+              !Policy.spellingReadings("/files/caf%c3%a9/*")
+                     .contains("/files/cafÃ©/*")
+              && Policy.spellingReadings("/files/A%2eB/*").contains("/files/A.B/*"));
+
+        // The control the pair needs: an include is still not widened by the
+        // case fold going the other way. A pattern spelt in capitals does not
+        // authorise the lowercase resource by way of its own verbatim
+        // spelling -- the raw reading of `/files/a.b/x` is lowercase and
+        // `/files/A.B/*` does not glob it, while `/files/a.b/*` does.
+        check("the verbatim spelling matches only its own case",
+              Policy.glob("/files/A.B/*", "/files/A.B/x")
+              && !Policy.glob("/files/A.B/*", "/files/a.b/x"));
     }
 }
 ```
@@ -3615,6 +3974,17 @@ public final class Policy {
         // `/x/..%5clogout` (IIS reads the backslash as a separator) and
         // `/ADMIN/purge`. The detail line quotes the RAW target, because that
         // is what the operator's frame said and what they will search for.
+        //
+        // BOTH SIDES ARE CASE FOLDED HERE, and this is a second copy of the
+        // fold Rule.denies documents rather than a belt-and-braces one.
+        // readings() lowercases the COLLAPSED members only, so the verbatim raw
+        // reading arrives unfolded -- and on a path carrying a `/../` it is the
+        // one member that still holds the dangerous segment, because every
+        // other reading pops it. Drop this lower() and
+        // `/account/LOGOUT/../profile` becomes an ALLOW that issues a real
+        // logout, with every other check in PolicyTest green. Round 7 pinned
+        // the call in Rule.denies and left this one unnamed;
+        // theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading pins it now.
         Set<String> targets = targetReadings(req);
         for (String pattern : dangerousPatterns(scope))
             for (String p : patternReadings(pattern))
@@ -4384,10 +4754,11 @@ public final class Policy {
      *     UTF-8 reading of those bytes, which is what folds the overlong
      *     `%c0%ae%c0%ae` -- the classic IIS traversal -- back to `..`.
      *   - and the same again with the Windows ANSI best-fit mapping applied.
-     *     That is not only the separator homoglyphs -- U+FF0F into `/`, U+FF0E
-     *     into `.`, U+FF3C into a backslash -- but the WHOLE fullwidth block,
-     *     U+FF01 to U+FF5E, onto printable ASCII: a fullwidth spelling of
-     *     `logout` is `logout` to an ANSI API. See foldBestFit.
+     *     That is not the separator homoglyphs, and it is not the fullwidth
+     *     block either: it is every entry of Microsoft's bestfit1252.txt that
+     *     lands on printable ASCII, 392 of them, generated from the file. A
+     *     fullwidth spelling of `logout` is `logout` to an ANSI API, and so is
+     *     `logout` with a Polish `l`. See foldBestFit.
      *
      * Identical readings collapse, so an ordinary path like `/api/orders`
      * produces exactly ONE member and costs one glob per rule. The set only
@@ -4632,16 +5003,42 @@ public final class Policy {
      * `/*` and authorised every path on the host.
      *
      * The best-fit fold is on the excluded side even though it looks like an
-     * encoding, and it stays there now that the whole fullwidth block folds
-     * rather than five separators. Two reasons, one per half of the table.
-     * The separator homoglyphs MANUFACTURE separators -- U+FF0F becomes a `/`
-     * and U+FF05 becomes a `%` -- so an include carrying one would gain a
-     * reading that cuts the path somewhere the operator did not. The rest
-     * substitute a LETTER, which is not a different spelling of the operator's
-     * pattern but a different NAME: `include=/(U+FF41)dmin/*` folded would read
-     * as `/admin/*` and authorise the real admin area, which is the
-     * `include=/../*` failure with a homoglyph in place of a dot segment.
-     * Neither half may widen a rule that authorises.
+     * encoding. Two reasons, one per half of the table. The separator
+     * homoglyphs MANUFACTURE separators -- U+FF0F becomes a `/`, U+FF05
+     * becomes a `%`, U+FF0A becomes a `*` -- so an include carrying one would
+     * gain a reading that cuts the path, or globs it, somewhere the operator
+     * did not. The rest substitute a LETTER, which is not a different spelling
+     * of the operator's pattern but a different NAME:
+     * `include=/(U+FF41)dmin/*` folded would read as `/admin/*` and authorise
+     * the real admin area, which is the `include=/../*` failure with a
+     * homoglyph in place of a dot segment.
+     *
+     * THAT SPLIT NOW HAS A PRICE AN ENGAGEMENT CAN FEEL, and it is recorded
+     * here because the argument above was written when the fold was 105 code
+     * points nobody's scope file contains. It is 398 now, 214 of them letters
+     * and digits outside the fullwidth block, so an include whose own text
+     * carries one authorises nothing:
+     *
+     *   include=.../p(U+0142)atno(U+015B)ci/*   Polish     authorises NOTHING
+     *   include=.../kullan(U+0131)c(U+0131)/*   Turkish    authorises NOTHING
+     *   include=.../pl(U+0103)(U+0163)i/*       Romanian   authorises NOTHING
+     *   include=.../lietot(U+0101)js/*          Latvian    authorises NOTHING
+     *   include=.../(a Greek word with an alpha)/*  Greek   authorises NOTHING
+     *
+     * Measured, with the requests those patterns are for; PolicyTest carries
+     * the table and its controls. What is NOT affected is anything code page
+     * 1252 can already spell -- so Spanish, French, German, Portuguese and
+     * Italian scopes, and Cyrillic and CJK ones, are untouched -- nor an
+     * include anchored at an ASCII prefix, because the fold changes a NAME and
+     * not the prefix.
+     *
+     * It is fail-closed and visible: the operator is told the request matches
+     * no scope.include pattern. It is not settled. Whether the letter half of
+     * the fold should reach allow patterns too -- it cannot manufacture a
+     * separator or a `*`, so the structural argument above is about the
+     * separator half alone -- is a trade-off between a denylist bypass and
+     * refusing a client's own URLs, and it belongs to whoever owns the
+     * engagement rather than to this comment.
      *
      * Flat rather than a fixed point, because none of these transforms creates
      * a trigger for another: decoding already runs to a fixed point, and the
@@ -4680,11 +5077,58 @@ public final class Policy {
         out.add(lower(s));
         String decoded = decodeToFixedPoint(s);
         if (decoded.equals(s)) return;
-        out.add(lower(decoded));
+        addSpelling(out, decoded);
         String utf8 = foldOverlongUtf8(decoded);
-        if (!utf8.equals(decoded)) out.add(lower(utf8));
+        if (!utf8.equals(decoded)) addSpelling(out, utf8);
         String inert = decodeSeparatorsInert(s);
-        if (!inert.equals(decoded)) out.add(lower(inert));
+        if (!inert.equals(decoded)) addSpelling(out, inert);
+    }
+
+    /**
+     * One DERIVED spelling of an allow pattern: case-folded always, and
+     * verbatim as well when it is ASCII.
+     *
+     * The pattern the operator typed is held verbatim by addSpellings above;
+     * everything decoding produces from it was held ONLY case-folded, and that
+     * was the exact failure patternReadings exists to prevent, one axis along:
+     *
+     *   include=.../files/A%2eB/*     refused  /files/A.B/x
+     *   include=.../files/My%20Docs/* refused  /files/My Docs/x
+     *
+     * while the all-lowercase spellings of both were allowed. Rule.allows
+     * compares the path's RAW reading without folding case -- deliberately,
+     * because folding case on the one rule that authorises anything widens it
+     * -- so `/files/A.B/x` has an uppercase reading that a set holding only
+     * `/files/a.b/*` cannot cover, and allow-AND refuses on it. The operator is
+     * told their request "matches no scope.include pattern", which sends them
+     * to rewrite a pattern that was right.
+     *
+     * ASCII ONLY, and that is the whole of the condition. Adding every decoded
+     * spelling verbatim would put MOJIBAKE in the set: decodeToFixedPoint of
+     * `/files/caf%c3%a9/*` ends in the two Latin-1 characters U+00C3 U+00A9,
+     * which is not a spelling of anything -- the character the request names
+     * is the UTF-8 fold one line down. PolicyTest pins its absence, and that
+     * pin is older than this method. An ASCII decoded form has no such second
+     * reading: what it says is what a matcher will compare.
+     *
+     * It cannot widen the rule structurally either. Every string it adds is
+     * the case-variant of one the set already held, so it matches a SUBSET of
+     * what lower(s) matches once both sides are folded -- and the only side
+     * that is not folded is the path's raw reading, which is the reading this
+     * exists to cover.
+     */
+    private static void addSpelling(Set<String> out, String s) {
+        out.add(lower(s));
+        if (isAscii(s)) out.add(s);
+    }
+
+    /** Whether every character is ASCII -- asked about a DECODED string, where
+     *  a non-ASCII character means the decode produced bytes rather than
+     *  text. */
+    private static boolean isAscii(String s) {
+        for (int i = 0; i < s.length(); i++)
+            if (s.charAt(i) >= 0x80) return false;
+        return true;
     }
 
     private static final int STRIP_PARAMS = 1, FOLD_BACKSLASH = 2, TRIM_TAILS = 4,
@@ -4744,9 +5188,22 @@ public final class Policy {
         if (out.add(reading)) pending.add(reading);
     }
 
-    /** Whether trimSegmentTails() would change this path -- exactly the
-     *  condition under which it is not the identity, including the dot
-     *  segments it deliberately leaves alone. */
+    /**
+     * Whether trimSegmentTails() would change this path -- exactly the
+     * condition under which it is not the identity, including the dot segments
+     * it deliberately leaves alone.
+     *
+     * `i > start` is what keeps `charAt(i - 1)` off the character before an
+     * EMPTY segment, and the only shape that needs it is a segment of exactly
+     * one trimmable character. Weakened to `i > start + 1` it leaves every
+     * check in PolicyTest green while `/a/%20/b/leaf` and `/a/%00/b/leaf` walk
+     * past `exclude=/a/b/*` -- Windows trims the one-character name away and
+     * serves `/a/b/leaf`, and the NUL truncation reading does not save it
+     * because that reading is `/a`, which the exclusion does not name. Every
+     * other trimmable path in the suite carries a NAME in front of the
+     * trimmable character, which is why the weakening used to be free. See
+     * aSegmentOfNothingButASpaceOrANulIsStillTrimmed.
+     */
     private static boolean hasTrimmableTail(String path) {
         int start = 0;
         for (int i = 0; i <= path.length(); i++)
@@ -4950,43 +5407,55 @@ public final class Policy {
      * this tool is an agent working a pentest, which is exactly the party that
      * pastes a wordlist entry.
      *
-     * THE SEPARATORS WERE NOT THE WHOLE TABLE, and for one round this method
-     * said they were: "the separator-producing entries only... none of the rest
-     * changes how a path is READ". That is false, and it was false about the
-     * best-documented part of the table. Microsoft's bestfit1252.txt maps ALL
-     * 94 code points of the fullwidth block, U+FF01 to U+FF5E, onto printable
-     * ASCII at a fixed offset of 0xFEE0 -- so U+FF4C is `l`, U+FF21 is `A`,
-     * U+FF10 is `0`. A fullwidth SPELLING of a word is that word to any ANSI
-     * API, and this tool's denylist is a list of words. Live on the shipped
-     * defaults before the range was added:
+     * THE TABLE IS NOT DRAWN BY HAND ANY MORE, and the reason is a measurement
+     * rather than a preference. It was drawn by hand twice. Each subset was
+     * argued for in this comment, each argument was reasonable, and each left
+     * a live bypass of the denylist this tool ships:
      *
-     *   /account/(fullwidth l-o-g-o-u-t)   ALLOW -- an automated logout
-     *   /account/l(U+FF0F)gout             ALLOW -- one letter is enough
-     *   /(U+FF41)dmin/users                ALLOW past exclude=/admin/*
+     *   13 entries, "the separator-producing ones only":
+     *       /account/l(U+FF0F)gout       ALLOW -- a real logout
+     *   105 entries, the whole fullwidth block plus eleven homoglyphs:
+     *       /account/(U+0142)ogout       ALLOW -- `l` with a stroke
+     *       /account/l(U+014D)gout       ALLOW -- `o` with a macron
+     *       /i.php?action=lo(U+0261)out  ALLOW -- a script `g`
+     *       /(U+0101)dmin/users          ALLOW past exclude=/admin/*
+     *       /adm(U+0131)n/users          ALLOW past exclude=/admin/*
+     *       /(U+03B1)dmin/users          ALLOW past exclude=/admin/*
      *
-     * (Verified against the real table rather than recalled: the WCTABLE of
-     * unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WindowsBestFit/bestfit1252.txt
-     * holds 698 entries, 94 of them are U+FF01..U+FF5E, and every one of those
-     * 94 maps to its code point minus 0xFEE0 with no exceptions.)
+     * Same file, same substitution, same threat model as the fullwidth block
+     * the round before: 392 of bestfit1252.txt's 698 entries land on ASCII
+     * 0x20..0x7E -- 384 of them on 0x21..0x7E and 8 more on the space -- and
+     * the hand-drawn table held 99 of the 392. So the table is now EMITTED
+     * from the vendor file -- see bestFit -- and the only judgement left in it
+     * is a filter anyone can re-run.
      *
-     * The named entries below are the ones OUTSIDE that block, and three of
-     * them come from the same file: U+037E GREEK QUESTION MARK is `;`, U+066A
-     * ARABIC PERCENT SIGN is `%`, U+2216 SET MINUS is a backslash. The rest --
-     * the small forms, the halfwidth ideographic stop, the big solidus -- are
-     * best fits in other code pages' tables rather than 1252's, and they are
-     * kept because a PATH reading only ever denies more. U+FF05 and U+066A can
-     * create an ESCAPE, and readings() re-derives every member, so the escape
-     * they create is decoded on the next pass.
+     * THE COST, measured before it was accepted rather than discovered after.
+     * A best-fit reading belongs to a PATH and to a DENY pattern, never to an
+     * ALLOW pattern (see spellingReadings), so an include that CARRIES a
+     * folded code point authorises nothing: the request keeps the folded
+     * reading and the pattern does not name it. With the fullwidth block that
+     * cost was theoretical -- nobody's scope file is spelt in fullwidth. With
+     * the whole table it is not, because 276 entries fold to a letter or a
+     * digit and 214 of those are outside the fullwidth block:
      *
-     * A best-fit reading is a reading of a PATH and of a DENY pattern, never
-     * of an allow pattern -- see spellingReadings. The cost of that split, now
-     * that the whole fullwidth block folds: an operator whose scope.include
-     * carries a fullwidth character authorises nothing, because the request
-     * still has the folded reading and their pattern does not name it. It is
-     * the same accepted cost a segment trigger in an include already has, it
-     * is visible rather than silent, and PolicyTest pins it. An include spelt
-     * in ASCII is unaffected: `/files/*` still authorises a fullwidth filename
-     * under it, because the fold changes the name and not the prefix.
+     *   include=.../p(U+0142)atno(U+015B)ci/*   authorises NOTHING
+     *   include=.../kullan(U+0131)c(U+0131)/*   authorises NOTHING
+     *   include=.../p(U+0159)istup/*            authorises NOTHING
+     *
+     * Polish, Turkish, Czech, Slovak, Hungarian, Romanian, Baltic and part of
+     * Greek. The rule is exact rather than per-language, and it is worth
+     * stating that way: an include breaks when a code point in the TABLE
+     * appears in the pattern's own text, and not otherwise. So Czech
+     * `/p(U+0159)istup/*` is refused while `/u(U+017E)ivatel/*` is not --
+     * U+0159 is in the table, U+017E is a character 1252 can already spell.
+     * The whole Latin-1 supplement is in that second group, so Spanish, French,
+     * German, Portuguese and Italian scopes are untouched, and so are Cyrillic
+     * and CJK ones. Nor is a scope anchored at an ASCII prefix affected --
+     * `/files/*` still authorises a folded filename under it, because the fold
+     * changes a NAME and not the prefix. See the include-cost table in
+     * PolicyTest, which pins every row of this paragraph in both directions,
+     * and the round report, which is where the trade-off is argued rather than
+     * here.
      */
     static String foldBestFit(String s) {
         int i = 0;
@@ -5004,35 +5473,459 @@ public final class Policy {
     }
 
     /**
-     * The whole fullwidth block, plus the homoglyphs of the separators that
-     * live outside it.
+     * One code point, as WideCharToMultiByte would spell it in code page 1252.
      *
-     * Hex rather than character literals on purpose: these code points are
-     * homoglyphs, and a reader has no way to tell them apart in a source file.
+     * GENERATED, not curated. Every WCTABLE entry of Microsoft's own
+     * bestfit1252.txt whose source is non-ASCII and whose target is 0x20..0x7E
+     * -- 392 of its 698 -- plus six homoglyphs of path syntax that file does
+     * not cover. 398 cases, one line each, carrying the vendor's own name for
+     * the code point, so an entry cannot be dropped silently and cannot be
+     * added without saying where it came from:
      *
-     * FULLWIDTH_OFFSET is not a coincidence to be spelt out entry by entry.
-     * U+FF01..U+FF5E is the fullwidth image of ASCII 0x21..0x7E, in order, and
-     * bestfit1252.txt maps it as exactly that -- 94 entries, one subtraction.
-     * Writing them out would be 94 chances to leave one out, which is how the
-     * table came to have thirteen entries in the first place.
+     *   python3 extension/tools/bestfit_table.py --emit    # the block below
+     *   python3 extension/tools/bestfit_table.py --check   # verify this file
+     *
+     * That script holds the URL, the sha256 of the exact file the block was
+     * generated from, the filter, and the six supplements with a reason each.
+     * It is an author's tool: nothing imports it, the build does not run it,
+     * and the shipped extension still has no dependency and no network.
+     *
+     * THE SIX SUPPLEMENTS are U+29F8, U+FE68, U+FE52, U+FF61, U+2024 and
+     * U+FE54, and they are labelled in the block. The comment they replace
+     * said they were "best fits in other code pages' tables". That was FALSE,
+     * and it was checked rather than re-argued: none of the six best-fits to
+     * printable ASCII in the WCTABLE of bestfit932, 936, 949, 950, 874,
+     * 1250-1258 or 10000 either. They stay because a best-fit reading of a
+     * PATH only ever denies more and they are homoglyphs of `/`, a backslash,
+     * `.` and `;`. U+2024 is the sharpest: bestfit1252 DOES map it, to 0xB7
+     * MIDDLE DOT, and folding it to `.` is this class's judgement rather than
+     * the vendor's.
+     *
+     * SPACE IS IN THE FILTER, which is 8 entries -- the quad and em spaces and
+     * U+3000 IDEOGRAPHIC SPACE. Windows trims a trailing space from a name, so
+     * `/a/(U+3000)/b/leaf` reads as `/a/b/leaf` and an exclusion on `/a/b/*`
+     * has to see it. (bestfit1252 maps them to 0x20, so this is the file's
+     * judgement and not ours.)
+     *
+     * KNOWN LIMIT, stated rather than left to be found: 1252 is the ANSI code
+     * page of a Windows host installed for a Western locale. A Japanese host
+     * is 932 and a Chinese one 936, and their tables are larger -- the union
+     * over the fifteen named above is 530 code points against this file's 392.
+     * Folding that union would map much of CJK onto ASCII and refuse any CJK
+     * scope outright, so it is not done, and against a CJK Windows estate this
+     * fold is a SUBSET of what the target will do.
+     *
+     * Hex sources rather than character literals: these are homoglyphs, and a
+     * reader has no way to tell them apart in a source file.
+     *
+     * The two bounds are the table's own first and last entry, so the entire
+     * Latin-1 supplement -- every accented character a Western European path
+     * actually carries -- leaves in two comparisons.
      */
-    static final int FULLWIDTH_OFFSET = 0xfee0;
-
     private static char bestFit(char c) {
-        if (c >= 0xff01 && c <= 0xff5e) return (char) (c - FULLWIDTH_OFFSET);
+        if (c < 0x0100 || c > 0xff61) return c;
         switch (c) {
-            case 0x2215:            // DIVISION SLASH
-            case 0x2044:            // FRACTION SLASH
-            case 0x29f8: return '/';// BIG SOLIDUS
-            case 0x2216:            // SET MINUS
-            case 0xfe68: return '\\';// SMALL REVERSE SOLIDUS
-            case 0xfe52:            // SMALL FULL STOP
-            case 0xff61:            // HALFWIDTH IDEOGRAPHIC FULL STOP
-            case 0x2024: return '.';// ONE DOT LEADER
-            case 0x037e:            // GREEK QUESTION MARK
-            case 0xfe54: return ';';// SMALL SEMICOLON
-            case 0x066a: return '%';// ARABIC PERCENT SIGN
-            default:     return c;
+            // ---- GENERATED from bestfit1252.txt; see bestfit_table.py ----
+            case 0x0100: return 'A';  // LATIN CAPITAL LETTER A WITH MACRON
+            case 0x0101: return 'a';  // LATIN SMALL LETTER A WITH MACRON
+            case 0x0102: return 'A';  // LATIN CAPITAL LETTER A WITH BREVE
+            case 0x0103: return 'a';  // LATIN SMALL LETTER A WITH BREVE
+            case 0x0104: return 'A';  // LATIN CAPITAL LETTER A WITH OGONEK
+            case 0x0105: return 'a';  // LATIN SMALL LETTER A WITH OGONEK
+            case 0x0106: return 'C';  // LATIN CAPITAL LETTER C WITH ACUTE
+            case 0x0107: return 'c';  // LATIN SMALL LETTER C WITH ACUTE
+            case 0x0108: return 'C';  // LATIN CAPITAL LETTER C WITH CIRCUMFLEX
+            case 0x0109: return 'c';  // LATIN SMALL LETTER C WITH CIRCUMFLEX
+            case 0x010a: return 'C';  // LATIN CAPITAL LETTER C WITH DOT ABOVE
+            case 0x010b: return 'c';  // LATIN SMALL LETTER C WITH DOT ABOVE
+            case 0x010c: return 'C';  // LATIN CAPITAL LETTER C WITH CARON
+            case 0x010d: return 'c';  // LATIN SMALL LETTER C WITH CARON
+            case 0x010e: return 'D';  // LATIN CAPITAL LETTER D WITH CARON
+            case 0x010f: return 'd';  // LATIN SMALL LETTER D WITH CARON
+            case 0x0111: return 'd';  // LATIN SMALL LETTER D WITH STROKE
+            case 0x0112: return 'E';  // LATIN CAPITAL LETTER E WITH MACRON
+            case 0x0113: return 'e';  // LATIN SMALL LETTER E WITH MACRON
+            case 0x0114: return 'E';  // LATIN CAPITAL LETTER E WITH BREVE
+            case 0x0115: return 'e';  // LATIN SMALL LETTER E WITH BREVE
+            case 0x0116: return 'E';  // LATIN CAPITAL LETTER E WITH DOT ABOVE
+            case 0x0117: return 'e';  // LATIN SMALL LETTER E WITH DOT ABOVE
+            case 0x0118: return 'E';  // LATIN CAPITAL LETTER E WITH OGONEK
+            case 0x0119: return 'e';  // LATIN SMALL LETTER E WITH OGONEK
+            case 0x011a: return 'E';  // LATIN CAPITAL LETTER E WITH CARON
+            case 0x011b: return 'e';  // LATIN SMALL LETTER E WITH CARON
+            case 0x011c: return 'G';  // LATIN CAPITAL LETTER G WITH CIRCUMFLEX
+            case 0x011d: return 'g';  // LATIN SMALL LETTER G WITH CIRCUMFLEX
+            case 0x011e: return 'G';  // LATIN CAPITAL LETTER G WITH BREVE
+            case 0x011f: return 'g';  // LATIN SMALL LETTER G WITH BREVE
+            case 0x0120: return 'G';  // LATIN CAPITAL LETTER G WITH DOT ABOVE
+            case 0x0121: return 'g';  // LATIN SMALL LETTER G WITH DOT ABOVE
+            case 0x0122: return 'G';  // LATIN CAPITAL LETTER G WITH CEDILLA
+            case 0x0123: return 'g';  // LATIN SMALL LETTER G WITH CEDILLA
+            case 0x0124: return 'H';  // LATIN CAPITAL LETTER H WITH CIRCUMFLEX
+            case 0x0125: return 'h';  // LATIN SMALL LETTER H WITH CIRCUMFLEX
+            case 0x0126: return 'H';  // LATIN CAPITAL LETTER H WITH STROKE
+            case 0x0127: return 'h';  // LATIN SMALL LETTER H WITH STROKE
+            case 0x0128: return 'I';  // LATIN CAPITAL LETTER I WITH TILDE
+            case 0x0129: return 'i';  // LATIN SMALL LETTER I WITH TILDE
+            case 0x012a: return 'I';  // LATIN CAPITAL LETTER I WITH MACRON
+            case 0x012b: return 'i';  // LATIN SMALL LETTER I WITH MACRON
+            case 0x012c: return 'I';  // LATIN CAPITAL LETTER I WITH BREVE
+            case 0x012d: return 'i';  // LATIN SMALL LETTER I WITH BREVE
+            case 0x012e: return 'I';  // LATIN CAPITAL LETTER I WITH OGONEK
+            case 0x012f: return 'i';  // LATIN SMALL LETTER I WITH OGONEK
+            case 0x0130: return 'I';  // LATIN CAPITAL LETTER I WITH DOT ABOVE
+            case 0x0131: return 'i';  // LATIN SMALL LETTER DOTLESS I
+            case 0x0134: return 'J';  // LATIN CAPITAL LETTER J WITH CIRCUMFLEX
+            case 0x0135: return 'j';  // LATIN SMALL LETTER J WITH CIRCUMFLEX
+            case 0x0136: return 'K';  // LATIN CAPITAL LETTER K WITH CEDILLA
+            case 0x0137: return 'k';  // LATIN SMALL LETTER K WITH CEDILLA
+            case 0x0139: return 'L';  // LATIN CAPITAL LETTER L WITH ACUTE
+            case 0x013a: return 'l';  // LATIN SMALL LETTER L WITH ACUTE
+            case 0x013b: return 'L';  // LATIN CAPITAL LETTER L WITH CEDILLA
+            case 0x013c: return 'l';  // LATIN SMALL LETTER L WITH CEDILLA
+            case 0x013d: return 'L';  // LATIN CAPITAL LETTER L WITH CARON
+            case 0x013e: return 'l';  // LATIN SMALL LETTER L WITH CARON
+            case 0x0141: return 'L';  // LATIN CAPITAL LETTER L WITH STROKE
+            case 0x0142: return 'l';  // LATIN SMALL LETTER L WITH STROKE
+            case 0x0143: return 'N';  // LATIN CAPITAL LETTER N WITH ACUTE
+            case 0x0144: return 'n';  // LATIN SMALL LETTER N WITH ACUTE
+            case 0x0145: return 'N';  // LATIN CAPITAL LETTER N WITH CEDILLA
+            case 0x0146: return 'n';  // LATIN SMALL LETTER N WITH CEDILLA
+            case 0x0147: return 'N';  // LATIN CAPITAL LETTER N WITH CARON
+            case 0x0148: return 'n';  // LATIN SMALL LETTER N WITH CARON
+            case 0x014c: return 'O';  // LATIN CAPITAL LETTER O WITH MACRON
+            case 0x014d: return 'o';  // LATIN SMALL LETTER O WITH MACRON
+            case 0x014e: return 'O';  // LATIN CAPITAL LETTER O WITH BREVE
+            case 0x014f: return 'o';  // LATIN SMALL LETTER O WITH BREVE
+            case 0x0150: return 'O';  // LATIN CAPITAL LETTER O WITH DOUBLE ACUTE
+            case 0x0151: return 'o';  // LATIN SMALL LETTER O WITH DOUBLE ACUTE
+            case 0x0154: return 'R';  // LATIN CAPITAL LETTER R WITH ACUTE
+            case 0x0155: return 'r';  // LATIN SMALL LETTER R WITH ACUTE
+            case 0x0156: return 'R';  // LATIN CAPITAL LETTER R WITH CEDILLA
+            case 0x0157: return 'r';  // LATIN SMALL LETTER R WITH CEDILLA
+            case 0x0158: return 'R';  // LATIN CAPITAL LETTER R WITH CARON
+            case 0x0159: return 'r';  // LATIN SMALL LETTER R WITH CARON
+            case 0x015a: return 'S';  // LATIN CAPITAL LETTER S WITH ACUTE
+            case 0x015b: return 's';  // LATIN SMALL LETTER S WITH ACUTE
+            case 0x015c: return 'S';  // LATIN CAPITAL LETTER S WITH CIRCUMFLEX
+            case 0x015d: return 's';  // LATIN SMALL LETTER S WITH CIRCUMFLEX
+            case 0x015e: return 'S';  // LATIN CAPITAL LETTER S WITH CEDILLA
+            case 0x015f: return 's';  // LATIN SMALL LETTER S WITH CEDILLA
+            case 0x0162: return 'T';  // LATIN CAPITAL LETTER T WITH CEDILLA
+            case 0x0163: return 't';  // LATIN SMALL LETTER T WITH CEDILLA
+            case 0x0164: return 'T';  // LATIN CAPITAL LETTER T WITH CARON
+            case 0x0165: return 't';  // LATIN SMALL LETTER T WITH CARON
+            case 0x0166: return 'T';  // LATIN CAPITAL LETTER T WITH STROKE
+            case 0x0167: return 't';  // LATIN SMALL LETTER T WITH STROKE
+            case 0x0168: return 'U';  // LATIN CAPITAL LETTER U WITH TILDE
+            case 0x0169: return 'u';  // LATIN SMALL LETTER U WITH TILDE
+            case 0x016a: return 'U';  // LATIN CAPITAL LETTER U WITH MACRON
+            case 0x016b: return 'u';  // LATIN SMALL LETTER U WITH MACRON
+            case 0x016c: return 'U';  // LATIN CAPITAL LETTER U WITH BREVE
+            case 0x016d: return 'u';  // LATIN SMALL LETTER U WITH BREVE
+            case 0x016e: return 'U';  // LATIN CAPITAL LETTER U WITH RING ABOVE
+            case 0x016f: return 'u';  // LATIN SMALL LETTER U WITH RING ABOVE
+            case 0x0170: return 'U';  // LATIN CAPITAL LETTER U WITH DOUBLE ACUTE
+            case 0x0171: return 'u';  // LATIN SMALL LETTER U WITH DOUBLE ACUTE
+            case 0x0172: return 'U';  // LATIN CAPITAL LETTER U WITH OGONEK
+            case 0x0173: return 'u';  // LATIN SMALL LETTER U WITH OGONEK
+            case 0x0174: return 'W';  // LATIN CAPITAL LETTER W WITH CIRCUMFLEX
+            case 0x0175: return 'w';  // LATIN SMALL LETTER W WITH CIRCUMFLEX
+            case 0x0176: return 'Y';  // LATIN CAPITAL LETTER Y WITH CIRCUMFLEX
+            case 0x0177: return 'y';  // LATIN SMALL LETTER Y WITH CIRCUMFLEX
+            case 0x0179: return 'Z';  // LATIN CAPITAL LETTER Z WITH ACUTE
+            case 0x017a: return 'z';  // LATIN SMALL LETTER Z WITH ACUTE
+            case 0x017b: return 'Z';  // LATIN CAPITAL LETTER Z WITH DOT ABOVE
+            case 0x017c: return 'z';  // LATIN SMALL LETTER Z WITH DOT ABOVE
+            case 0x0180: return 'b';  // LATIN SMALL LETTER B WITH STROKE
+            case 0x0197: return 'I';  // LATIN CAPITAL LETTER I WITH STROKE
+            case 0x019a: return 'l';  // LATIN SMALL LETTER L WITH BAR
+            case 0x019f: return 'O';  // LATIN CAPITAL LETTER O WITH MIDDLE TILDE
+            case 0x01a0: return 'O';  // LATIN CAPITAL LETTER O WITH HORN
+            case 0x01a1: return 'o';  // LATIN SMALL LETTER O WITH HORN
+            case 0x01ab: return 't';  // LATIN SMALL LETTER T WITH PALATAL HOOK
+            case 0x01ae: return 'T';  // LATIN CAPITAL LETTER T WITH RETROFLEX HOOK
+            case 0x01af: return 'U';  // LATIN CAPITAL LETTER U WITH HORN
+            case 0x01b0: return 'u';  // LATIN SMALL LETTER U WITH HORN
+            case 0x01b6: return 'z';  // LATIN SMALL LETTER Z WITH STROKE
+            case 0x01c0: return '|';  // LATIN LETTER DENTAL CLICK
+            case 0x01c3: return '!';  // LATIN LETTER RETROFLEX CLICK
+            case 0x01cd: return 'A';  // LATIN CAPITAL LETTER A WITH CARON
+            case 0x01ce: return 'a';  // LATIN SMALL LETTER A WITH CARON
+            case 0x01cf: return 'I';  // LATIN CAPITAL LETTER I WITH CARON
+            case 0x01d0: return 'i';  // LATIN SMALL LETTER I WITH CARON
+            case 0x01d1: return 'O';  // LATIN CAPITAL LETTER O WITH CARON
+            case 0x01d2: return 'o';  // LATIN SMALL LETTER O WITH CARON
+            case 0x01d3: return 'U';  // LATIN CAPITAL LETTER U WITH CARON
+            case 0x01d4: return 'u';  // LATIN SMALL LETTER U WITH CARON
+            case 0x01d5: return 'U';  // LATIN CAPITAL LETTER U WITH DIAERESIS AND MACRON
+            case 0x01d6: return 'u';  // LATIN SMALL LETTER U WITH DIAERESIS AND MACRON
+            case 0x01d7: return 'U';  // LATIN CAPITAL LETTER U WITH DIAERESIS AND ACUTE
+            case 0x01d8: return 'u';  // LATIN SMALL LETTER U WITH DIAERESIS AND ACUTE
+            case 0x01d9: return 'U';  // LATIN CAPITAL LETTER U WITH DIAERESIS AND CARON
+            case 0x01da: return 'u';  // LATIN SMALL LETTER U WITH DIAERESIS AND CARON
+            case 0x01db: return 'U';  // LATIN CAPITAL LETTER U WITH DIAERESIS AND GRAVE
+            case 0x01dc: return 'u';  // LATIN SMALL LETTER U WITH DIAERESIS AND GRAVE
+            case 0x01de: return 'A';  // LATIN CAPITAL LETTER A WITH DIAERESIS AND MACRON
+            case 0x01df: return 'a';  // LATIN SMALL LETTER A WITH DIAERESIS AND MACRON
+            case 0x01e4: return 'G';  // LATIN CAPITAL LETTER G WITH STROKE
+            case 0x01e5: return 'g';  // LATIN SMALL LETTER G WITH STROKE
+            case 0x01e6: return 'G';  // LATIN CAPITAL LETTER G WITH CARON
+            case 0x01e7: return 'g';  // LATIN SMALL LETTER G WITH CARON
+            case 0x01e8: return 'K';  // LATIN CAPITAL LETTER K WITH CARON
+            case 0x01e9: return 'k';  // LATIN SMALL LETTER K WITH CARON
+            case 0x01ea: return 'O';  // LATIN CAPITAL LETTER O WITH OGONEK
+            case 0x01eb: return 'o';  // LATIN SMALL LETTER O WITH OGONEK
+            case 0x01ec: return 'O';  // LATIN CAPITAL LETTER O WITH OGONEK AND MACRON
+            case 0x01ed: return 'o';  // LATIN SMALL LETTER O WITH OGONEK AND MACRON
+            case 0x01f0: return 'j';  // LATIN SMALL LETTER J WITH CARON
+            case 0x0261: return 'g';  // LATIN SMALL LETTER SCRIPT G
+            case 0x02b9: return '\'';  // MODIFIER LETTER PRIME
+            case 0x02ba: return '"';  // MODIFIER LETTER DOUBLE PRIME
+            case 0x02bc: return '\'';  // MODIFIER LETTER APOSTROPHE
+            case 0x02c4: return '^';  // MODIFIER LETTER UP ARROWHEAD
+            case 0x02c8: return '\'';  // MODIFIER LETTER VERTICAL LINE
+            case 0x02cb: return '`';  // MODIFIER LETTER GRAVE ACCENT
+            case 0x02cd: return '_';  // MODIFIER LETTER LOW MACRON
+            case 0x0300: return '`';  // COMBINING GRAVE ACCENT
+            case 0x0302: return '^';  // COMBINING CIRCUMFLEX ACCENT
+            case 0x0303: return '~';  // COMBINING TILDE
+            case 0x030e: return '"';  // COMBINING DOUBLE VERTICAL LINE ABOVE
+            case 0x0331: return '_';  // COMBINING MACRON BELOW
+            case 0x0332: return '_';  // COMBINING LOW LINE
+            case 0x037e: return ';';  // GREEK QUESTION MARK
+            case 0x0393: return 'G';  // GREEK CAPITAL LETTER GAMMA
+            case 0x0398: return 'T';  // GREEK CAPITAL LETTER THETA
+            case 0x03a3: return 'S';  // GREEK CAPITAL LETTER SIGMA
+            case 0x03a6: return 'F';  // GREEK CAPITAL LETTER PHI
+            case 0x03a9: return 'O';  // GREEK CAPITAL LETTER OMEGA
+            case 0x03b1: return 'a';  // GREEK SMALL LETTER ALPHA
+            case 0x03b4: return 'd';  // GREEK SMALL LETTER DELTA
+            case 0x03b5: return 'e';  // GREEK SMALL LETTER EPSILON
+            case 0x03c0: return 'p';  // GREEK SMALL LETTER PI
+            case 0x03c3: return 's';  // GREEK SMALL LETTER SIGMA
+            case 0x03c4: return 't';  // GREEK SMALL LETTER TAU
+            case 0x03c6: return 'f';  // GREEK SMALL LETTER PHI
+            case 0x04bb: return 'h';  // CYRILLIC SMALL LETTER SHHA
+            case 0x0589: return ':';  // ARMENIAN FULL STOP
+            case 0x066a: return '%';  // ARABIC PERCENT SIGN
+            case 0x2000: return ' ';  // EN QUAD
+            case 0x2001: return ' ';  // EM QUAD
+            case 0x2002: return ' ';  // EN SPACE
+            case 0x2003: return ' ';  // EM SPACE
+            case 0x2004: return ' ';  // THREE-PER-EM SPACE
+            case 0x2005: return ' ';  // FOUR-PER-EM SPACE
+            case 0x2006: return ' ';  // SIX-PER-EM SPACE
+            case 0x2010: return '-';  // HYPHEN
+            case 0x2011: return '-';  // NON-BREAKING HYPHEN
+            case 0x2017: return '=';  // DOUBLE LOW LINE
+            case 0x2024: return '.';  // ONE DOT LEADER (bestfit1252 says MIDDLE DOT)  [not in any Microsoft table]
+            case 0x2032: return '\'';  // PRIME
+            case 0x2035: return '`';  // REVERSED PRIME
+            case 0x2044: return '/';  // FRACTION SLASH
+            case 0x2074: return '4';  // SUPERSCRIPT FOUR
+            case 0x2075: return '5';  // SUPERSCRIPT FIVE
+            case 0x2076: return '6';  // SUPERSCRIPT SIX
+            case 0x2077: return '7';  // SUPERSCRIPT SEVEN
+            case 0x2078: return '8';  // SUPERSCRIPT EIGHT
+            case 0x207f: return 'n';  // SUPERSCRIPT LATIN SMALL LETTER N
+            case 0x2080: return '0';  // SUBSCRIPT ZERO
+            case 0x2081: return '1';  // SUBSCRIPT ONE
+            case 0x2082: return '2';  // SUBSCRIPT TWO
+            case 0x2083: return '3';  // SUBSCRIPT THREE
+            case 0x2084: return '4';  // SUBSCRIPT FOUR
+            case 0x2085: return '5';  // SUBSCRIPT FIVE
+            case 0x2086: return '6';  // SUBSCRIPT SIX
+            case 0x2087: return '7';  // SUBSCRIPT SEVEN
+            case 0x2088: return '8';  // SUBSCRIPT EIGHT
+            case 0x2089: return '9';  // SUBSCRIPT NINE
+            case 0x20a7: return 'P';  // PESETA SIGN
+            case 0x2102: return 'C';  // DOUBLE-STRUCK CAPITAL C
+            case 0x2107: return 'E';  // EULER CONSTANT
+            case 0x210a: return 'g';  // SCRIPT SMALL G
+            case 0x210b: return 'H';  // SCRIPT CAPITAL H
+            case 0x210c: return 'H';  // BLACK-LETTER CAPITAL H
+            case 0x210d: return 'H';  // DOUBLE-STRUCK CAPITAL H
+            case 0x210e: return 'h';  // PLANCK CONSTANT
+            case 0x2110: return 'I';  // SCRIPT CAPITAL I
+            case 0x2111: return 'I';  // BLACK-LETTER CAPITAL I
+            case 0x2112: return 'L';  // SCRIPT CAPITAL L
+            case 0x2113: return 'l';  // SCRIPT SMALL L
+            case 0x2115: return 'N';  // DOUBLE-STRUCK CAPITAL N
+            case 0x2118: return 'P';  // SCRIPT CAPITAL P
+            case 0x2119: return 'P';  // DOUBLE-STRUCK CAPITAL P
+            case 0x211a: return 'Q';  // DOUBLE-STRUCK CAPITAL Q
+            case 0x211b: return 'R';  // SCRIPT CAPITAL R
+            case 0x211c: return 'R';  // BLACK-LETTER CAPITAL R
+            case 0x211d: return 'R';  // DOUBLE-STRUCK CAPITAL R
+            case 0x2124: return 'Z';  // DOUBLE-STRUCK CAPITAL Z
+            case 0x2128: return 'Z';  // BLACK-LETTER CAPITAL Z
+            case 0x212a: return 'K';  // KELVIN SIGN
+            case 0x212c: return 'B';  // SCRIPT CAPITAL B
+            case 0x212d: return 'C';  // BLACK-LETTER CAPITAL C
+            case 0x212e: return 'e';  // ESTIMATED SYMBOL
+            case 0x212f: return 'e';  // SCRIPT SMALL E
+            case 0x2130: return 'E';  // SCRIPT CAPITAL E
+            case 0x2131: return 'F';  // SCRIPT CAPITAL F
+            case 0x2133: return 'M';  // SCRIPT CAPITAL M
+            case 0x2134: return 'o';  // SCRIPT SMALL O
+            case 0x2212: return '-';  // MINUS SIGN
+            case 0x2215: return '/';  // DIVISION SLASH
+            case 0x2216: return '\\';  // SET MINUS
+            case 0x2217: return '*';  // ASTERISK OPERATOR
+            case 0x221a: return 'v';  // SQUARE ROOT
+            case 0x221e: return '8';  // INFINITY
+            case 0x2223: return '|';  // DIVIDES
+            case 0x2229: return 'n';  // INTERSECTION
+            case 0x2236: return ':';  // RATIO
+            case 0x223c: return '~';  // TILDE OPERATOR
+            case 0x2261: return '=';  // IDENTICAL TO
+            case 0x2264: return '=';  // LESS-THAN OR EQUAL TO
+            case 0x2265: return '=';  // GREATER-THAN OR EQUAL TO
+            case 0x2303: return '^';  // UP ARROWHEAD
+            case 0x2320: return '(';  // TOP HALF INTEGRAL
+            case 0x2321: return ')';  // BOTTOM HALF INTEGRAL
+            case 0x2329: return '<';  // LEFT-POINTING ANGLE BRACKET
+            case 0x232a: return '>';  // RIGHT-POINTING ANGLE BRACKET
+            case 0x2500: return '-';  // BOX DRAWINGS LIGHT HORIZONTAL
+            case 0x250c: return '+';  // BOX DRAWINGS LIGHT DOWN AND RIGHT
+            case 0x2510: return '+';  // BOX DRAWINGS LIGHT DOWN AND LEFT
+            case 0x2514: return '+';  // BOX DRAWINGS LIGHT UP AND RIGHT
+            case 0x2518: return '+';  // BOX DRAWINGS LIGHT UP AND LEFT
+            case 0x251c: return '+';  // BOX DRAWINGS LIGHT VERTICAL AND RIGHT
+            case 0x252c: return '-';  // BOX DRAWINGS LIGHT DOWN AND HORIZONTAL
+            case 0x2534: return '-';  // BOX DRAWINGS LIGHT UP AND HORIZONTAL
+            case 0x253c: return '+';  // BOX DRAWINGS LIGHT VERTICAL AND HORIZONTAL
+            case 0x2550: return '-';  // BOX DRAWINGS DOUBLE HORIZONTAL
+            case 0x2552: return '+';  // BOX DRAWINGS DOWN SINGLE AND RIGHT DOUBLE
+            case 0x2553: return '+';  // BOX DRAWINGS DOWN DOUBLE AND RIGHT SINGLE
+            case 0x2554: return '+';  // BOX DRAWINGS DOUBLE DOWN AND RIGHT
+            case 0x2555: return '+';  // BOX DRAWINGS DOWN SINGLE AND LEFT DOUBLE
+            case 0x2556: return '+';  // BOX DRAWINGS DOWN DOUBLE AND LEFT SINGLE
+            case 0x2557: return '+';  // BOX DRAWINGS DOUBLE DOWN AND LEFT
+            case 0x2558: return '+';  // BOX DRAWINGS UP SINGLE AND RIGHT DOUBLE
+            case 0x2559: return '+';  // BOX DRAWINGS UP DOUBLE AND RIGHT SINGLE
+            case 0x255a: return '+';  // BOX DRAWINGS DOUBLE UP AND RIGHT
+            case 0x255b: return '+';  // BOX DRAWINGS UP SINGLE AND LEFT DOUBLE
+            case 0x255c: return '+';  // BOX DRAWINGS UP DOUBLE AND LEFT SINGLE
+            case 0x255d: return '+';  // BOX DRAWINGS DOUBLE UP AND LEFT
+            case 0x2564: return '-';  // BOX DRAWINGS DOWN SINGLE AND HORIZONTAL DOUBLE
+            case 0x2565: return '-';  // BOX DRAWINGS DOWN DOUBLE AND HORIZONTAL SINGLE
+            case 0x2566: return '-';  // BOX DRAWINGS DOUBLE DOWN AND HORIZONTAL
+            case 0x2567: return '-';  // BOX DRAWINGS UP SINGLE AND HORIZONTAL DOUBLE
+            case 0x2568: return '-';  // BOX DRAWINGS UP DOUBLE AND HORIZONTAL SINGLE
+            case 0x2569: return '-';  // BOX DRAWINGS DOUBLE UP AND HORIZONTAL
+            case 0x256a: return '+';  // BOX DRAWINGS VERTICAL SINGLE AND HORIZONTAL DOUBLE
+            case 0x256b: return '+';  // BOX DRAWINGS VERTICAL DOUBLE AND HORIZONTAL SINGLE
+            case 0x256c: return '+';  // BOX DRAWINGS DOUBLE VERTICAL AND HORIZONTAL
+            case 0x2584: return '_';  // LOWER HALF BLOCK
+            case 0x2758: return '|';  // LIGHT VERTICAL BAR
+            case 0x29f8: return '/';  // BIG SOLIDUS  [not in any Microsoft table]
+            case 0x3000: return ' ';  // IDEOGRAPHIC SPACE
+            case 0x3008: return '<';  // LEFT ANGLE BRACKET
+            case 0x3009: return '>';  // RIGHT ANGLE BRACKET
+            case 0x301a: return '[';  // LEFT WHITE SQUARE BRACKET
+            case 0x301b: return ']';  // RIGHT WHITE SQUARE BRACKET
+            case 0xfe52: return '.';  // SMALL FULL STOP  [not in any Microsoft table]
+            case 0xfe54: return ';';  // SMALL SEMICOLON  [not in any Microsoft table]
+            case 0xfe68: return '\\';  // SMALL REVERSE SOLIDUS  [not in any Microsoft table]
+            case 0xff01: return '!';  // FULLWIDTH EXCLAMATION MARK
+            case 0xff02: return '"';  // FULLWIDTH QUOTATION MARK
+            case 0xff03: return '#';  // FULLWIDTH NUMBER SIGN
+            case 0xff04: return '$';  // FULLWIDTH DOLLAR SIGN
+            case 0xff05: return '%';  // FULLWIDTH PERCENT SIGN
+            case 0xff06: return '&';  // FULLWIDTH AMPERSAND
+            case 0xff07: return '\'';  // FULLWIDTH APOSTROPHE
+            case 0xff08: return '(';  // FULLWIDTH LEFT PARENTHESIS
+            case 0xff09: return ')';  // FULLWIDTH RIGHT PARENTHESIS
+            case 0xff0a: return '*';  // FULLWIDTH ASTERISK
+            case 0xff0b: return '+';  // FULLWIDTH PLUS SIGN
+            case 0xff0c: return ',';  // FULLWIDTH COMMA
+            case 0xff0d: return '-';  // FULLWIDTH HYPHEN-MINUS
+            case 0xff0e: return '.';  // FULLWIDTH FULL STOP
+            case 0xff0f: return '/';  // FULLWIDTH SOLIDUS
+            case 0xff10: return '0';  // FULLWIDTH DIGIT ZERO
+            case 0xff11: return '1';  // FULLWIDTH DIGIT ONE
+            case 0xff12: return '2';  // FULLWIDTH DIGIT TWO
+            case 0xff13: return '3';  // FULLWIDTH DIGIT THREE
+            case 0xff14: return '4';  // FULLWIDTH DIGIT FOUR
+            case 0xff15: return '5';  // FULLWIDTH DIGIT FIVE
+            case 0xff16: return '6';  // FULLWIDTH DIGIT SIX
+            case 0xff17: return '7';  // FULLWIDTH DIGIT SEVEN
+            case 0xff18: return '8';  // FULLWIDTH DIGIT EIGHT
+            case 0xff19: return '9';  // FULLWIDTH DIGIT NINE
+            case 0xff1a: return ':';  // FULLWIDTH COLON
+            case 0xff1b: return ';';  // FULLWIDTH SEMICOLON
+            case 0xff1c: return '<';  // FULLWIDTH LESS-THAN SIGN
+            case 0xff1d: return '=';  // FULLWIDTH EQUALS SIGN
+            case 0xff1e: return '>';  // FULLWIDTH GREATER-THAN SIGN
+            case 0xff1f: return '?';  // FULLWIDTH QUESTION MARK
+            case 0xff20: return '@';  // FULLWIDTH COMMERCIAL AT
+            case 0xff21: return 'A';  // FULLWIDTH LATIN CAPITAL LETTER A
+            case 0xff22: return 'B';  // FULLWIDTH LATIN CAPITAL LETTER B
+            case 0xff23: return 'C';  // FULLWIDTH LATIN CAPITAL LETTER C
+            case 0xff24: return 'D';  // FULLWIDTH LATIN CAPITAL LETTER D
+            case 0xff25: return 'E';  // FULLWIDTH LATIN CAPITAL LETTER E
+            case 0xff26: return 'F';  // FULLWIDTH LATIN CAPITAL LETTER F
+            case 0xff27: return 'G';  // FULLWIDTH LATIN CAPITAL LETTER G
+            case 0xff28: return 'H';  // FULLWIDTH LATIN CAPITAL LETTER H
+            case 0xff29: return 'I';  // FULLWIDTH LATIN CAPITAL LETTER I
+            case 0xff2a: return 'J';  // FULLWIDTH LATIN CAPITAL LETTER J
+            case 0xff2b: return 'K';  // FULLWIDTH LATIN CAPITAL LETTER K
+            case 0xff2c: return 'L';  // FULLWIDTH LATIN CAPITAL LETTER L
+            case 0xff2d: return 'M';  // FULLWIDTH LATIN CAPITAL LETTER M
+            case 0xff2e: return 'N';  // FULLWIDTH LATIN CAPITAL LETTER N
+            case 0xff2f: return 'O';  // FULLWIDTH LATIN CAPITAL LETTER O
+            case 0xff30: return 'P';  // FULLWIDTH LATIN CAPITAL LETTER P
+            case 0xff31: return 'Q';  // FULLWIDTH LATIN CAPITAL LETTER Q
+            case 0xff32: return 'R';  // FULLWIDTH LATIN CAPITAL LETTER R
+            case 0xff33: return 'S';  // FULLWIDTH LATIN CAPITAL LETTER S
+            case 0xff34: return 'T';  // FULLWIDTH LATIN CAPITAL LETTER T
+            case 0xff35: return 'U';  // FULLWIDTH LATIN CAPITAL LETTER U
+            case 0xff36: return 'V';  // FULLWIDTH LATIN CAPITAL LETTER V
+            case 0xff37: return 'W';  // FULLWIDTH LATIN CAPITAL LETTER W
+            case 0xff38: return 'X';  // FULLWIDTH LATIN CAPITAL LETTER X
+            case 0xff39: return 'Y';  // FULLWIDTH LATIN CAPITAL LETTER Y
+            case 0xff3a: return 'Z';  // FULLWIDTH LATIN CAPITAL LETTER Z
+            case 0xff3b: return '[';  // FULLWIDTH LEFT SQUARE BRACKET
+            case 0xff3c: return '\\';  // FULLWIDTH REVERSE SOLIDUS
+            case 0xff3d: return ']';  // FULLWIDTH RIGHT SQUARE BRACKET
+            case 0xff3e: return '^';  // FULLWIDTH CIRCUMFLEX ACCENT
+            case 0xff3f: return '_';  // FULLWIDTH LOW LINE
+            case 0xff40: return '`';  // FULLWIDTH GRAVE ACCENT
+            case 0xff41: return 'a';  // FULLWIDTH LATIN SMALL LETTER A
+            case 0xff42: return 'b';  // FULLWIDTH LATIN SMALL LETTER B
+            case 0xff43: return 'c';  // FULLWIDTH LATIN SMALL LETTER C
+            case 0xff44: return 'd';  // FULLWIDTH LATIN SMALL LETTER D
+            case 0xff45: return 'e';  // FULLWIDTH LATIN SMALL LETTER E
+            case 0xff46: return 'f';  // FULLWIDTH LATIN SMALL LETTER F
+            case 0xff47: return 'g';  // FULLWIDTH LATIN SMALL LETTER G
+            case 0xff48: return 'h';  // FULLWIDTH LATIN SMALL LETTER H
+            case 0xff49: return 'i';  // FULLWIDTH LATIN SMALL LETTER I
+            case 0xff4a: return 'j';  // FULLWIDTH LATIN SMALL LETTER J
+            case 0xff4b: return 'k';  // FULLWIDTH LATIN SMALL LETTER K
+            case 0xff4c: return 'l';  // FULLWIDTH LATIN SMALL LETTER L
+            case 0xff4d: return 'm';  // FULLWIDTH LATIN SMALL LETTER M
+            case 0xff4e: return 'n';  // FULLWIDTH LATIN SMALL LETTER N
+            case 0xff4f: return 'o';  // FULLWIDTH LATIN SMALL LETTER O
+            case 0xff50: return 'p';  // FULLWIDTH LATIN SMALL LETTER P
+            case 0xff51: return 'q';  // FULLWIDTH LATIN SMALL LETTER Q
+            case 0xff52: return 'r';  // FULLWIDTH LATIN SMALL LETTER R
+            case 0xff53: return 's';  // FULLWIDTH LATIN SMALL LETTER S
+            case 0xff54: return 't';  // FULLWIDTH LATIN SMALL LETTER T
+            case 0xff55: return 'u';  // FULLWIDTH LATIN SMALL LETTER U
+            case 0xff56: return 'v';  // FULLWIDTH LATIN SMALL LETTER V
+            case 0xff57: return 'w';  // FULLWIDTH LATIN SMALL LETTER W
+            case 0xff58: return 'x';  // FULLWIDTH LATIN SMALL LETTER X
+            case 0xff59: return 'y';  // FULLWIDTH LATIN SMALL LETTER Y
+            case 0xff5a: return 'z';  // FULLWIDTH LATIN SMALL LETTER Z
+            case 0xff5b: return '{';  // FULLWIDTH LEFT CURLY BRACKET
+            case 0xff5c: return '|';  // FULLWIDTH VERTICAL LINE
+            case 0xff5d: return '}';  // FULLWIDTH RIGHT CURLY BRACKET
+            case 0xff5e: return '~';  // FULLWIDTH TILDE
+            case 0xff61: return '.';  // HALFWIDTH IDEOGRAPHIC FULL STOP  [not in any Microsoft table]
+            // ---- END GENERATED ----
+            default: return c;
         }
     }
 

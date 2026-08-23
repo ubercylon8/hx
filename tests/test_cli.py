@@ -90,6 +90,48 @@ def test_new_rejects_empty_client(tmp_path: Path):
     assert len(list(tmp_path.iterdir())) == 0
 
 
+@pytest.mark.parametrize("option", ["--scope", "--exclude"])
+def test_new_rejects_a_blank_scope_entry(tmp_path: Path, option):
+    """A blank pattern is refused at `hx new`, not at the next `load()`.
+
+    config.load() has refused a blank entry since the guard landed, but `hx new`
+    does not go through load(): it builds a Config from its options and dumps()
+    it. So `hx new --exclude ''` wrote `exclude: ['']` into config.yaml and into
+    the scope_version row, and the operator learned about it on the next open --
+    which is the one thing the guard was added to prevent. The extension still
+    fails closed on an empty pattern, so this was never a bypass; it was the
+    guard firing one step too late to be the guard.
+    """
+    runner = CliRunner()
+    args = ["new", "acme", "--client", "Acme", "--scope", "https://a/*",
+            "--root", str(tmp_path)]
+    if option == "--scope":
+        args = ["new", "acme", "--client", "Acme", "--scope", "",
+                "--root", str(tmp_path)]
+    else:
+        args += ["--exclude", ""]
+    result = runner.invoke(cli.main, args)
+    assert result.exit_code != 0, result.output
+    assert "blank" in result.output.lower(), result.output
+    # And nothing was created: the refusal comes before any directory is made.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_new_still_accepts_no_exclude_at_all(tmp_path: Path):
+    """The control. The guard refuses a blank ENTRY, never an empty LIST --
+    `exclude: []` has to stay writable, and an operator who passes no
+    `--exclude` at all is writing exactly that."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", "acme", "--client", "Acme", "--scope", "https://a/*",
+         "--root", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    text = (tmp_path / "acme" / "config.yaml").read_text(encoding="utf-8")
+    assert "exclude: []" in text
+
+
 def test_info_missing_config_yaml(tmp_path: Path):
     """Test that info handles missing config.yaml gracefully."""
     runner = CliRunner()

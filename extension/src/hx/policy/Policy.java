@@ -252,6 +252,17 @@ public final class Policy {
         // `/x/..%5clogout` (IIS reads the backslash as a separator) and
         // `/ADMIN/purge`. The detail line quotes the RAW target, because that
         // is what the operator's frame said and what they will search for.
+        //
+        // BOTH SIDES ARE CASE FOLDED HERE, and this is a second copy of the
+        // fold Rule.denies documents rather than a belt-and-braces one.
+        // readings() lowercases the COLLAPSED members only, so the verbatim raw
+        // reading arrives unfolded -- and on a path carrying a `/../` it is the
+        // one member that still holds the dangerous segment, because every
+        // other reading pops it. Drop this lower() and
+        // `/account/LOGOUT/../profile` becomes an ALLOW that issues a real
+        // logout, with every other check in PolicyTest green. Round 7 pinned
+        // the call in Rule.denies and left this one unnamed;
+        // theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading pins it now.
         Set<String> targets = targetReadings(req);
         for (String pattern : dangerousPatterns(scope))
             for (String p : patternReadings(pattern))
@@ -1021,10 +1032,11 @@ public final class Policy {
      *     UTF-8 reading of those bytes, which is what folds the overlong
      *     `%c0%ae%c0%ae` -- the classic IIS traversal -- back to `..`.
      *   - and the same again with the Windows ANSI best-fit mapping applied.
-     *     That is not only the separator homoglyphs -- U+FF0F into `/`, U+FF0E
-     *     into `.`, U+FF3C into a backslash -- but the WHOLE fullwidth block,
-     *     U+FF01 to U+FF5E, onto printable ASCII: a fullwidth spelling of
-     *     `logout` is `logout` to an ANSI API. See foldBestFit.
+     *     That is not the separator homoglyphs, and it is not the fullwidth
+     *     block either: it is every entry of Microsoft's bestfit1252.txt that
+     *     lands on printable ASCII, 392 of them, generated from the file. A
+     *     fullwidth spelling of `logout` is `logout` to an ANSI API, and so is
+     *     `logout` with a Polish `l`. See foldBestFit.
      *
      * Identical readings collapse, so an ordinary path like `/api/orders`
      * produces exactly ONE member and costs one glob per rule. The set only
@@ -1269,16 +1281,42 @@ public final class Policy {
      * `/*` and authorised every path on the host.
      *
      * The best-fit fold is on the excluded side even though it looks like an
-     * encoding, and it stays there now that the whole fullwidth block folds
-     * rather than five separators. Two reasons, one per half of the table.
-     * The separator homoglyphs MANUFACTURE separators -- U+FF0F becomes a `/`
-     * and U+FF05 becomes a `%` -- so an include carrying one would gain a
-     * reading that cuts the path somewhere the operator did not. The rest
-     * substitute a LETTER, which is not a different spelling of the operator's
-     * pattern but a different NAME: `include=/(U+FF41)dmin/*` folded would read
-     * as `/admin/*` and authorise the real admin area, which is the
-     * `include=/../*` failure with a homoglyph in place of a dot segment.
-     * Neither half may widen a rule that authorises.
+     * encoding. Two reasons, one per half of the table. The separator
+     * homoglyphs MANUFACTURE separators -- U+FF0F becomes a `/`, U+FF05
+     * becomes a `%`, U+FF0A becomes a `*` -- so an include carrying one would
+     * gain a reading that cuts the path, or globs it, somewhere the operator
+     * did not. The rest substitute a LETTER, which is not a different spelling
+     * of the operator's pattern but a different NAME:
+     * `include=/(U+FF41)dmin/*` folded would read as `/admin/*` and authorise
+     * the real admin area, which is the `include=/../*` failure with a
+     * homoglyph in place of a dot segment.
+     *
+     * THAT SPLIT NOW HAS A PRICE AN ENGAGEMENT CAN FEEL, and it is recorded
+     * here because the argument above was written when the fold was 105 code
+     * points nobody's scope file contains. It is 398 now, 214 of them letters
+     * and digits outside the fullwidth block, so an include whose own text
+     * carries one authorises nothing:
+     *
+     *   include=.../p(U+0142)atno(U+015B)ci/*   Polish     authorises NOTHING
+     *   include=.../kullan(U+0131)c(U+0131)/*   Turkish    authorises NOTHING
+     *   include=.../pl(U+0103)(U+0163)i/*       Romanian   authorises NOTHING
+     *   include=.../lietot(U+0101)js/*          Latvian    authorises NOTHING
+     *   include=.../(a Greek word with an alpha)/*  Greek   authorises NOTHING
+     *
+     * Measured, with the requests those patterns are for; PolicyTest carries
+     * the table and its controls. What is NOT affected is anything code page
+     * 1252 can already spell -- so Spanish, French, German, Portuguese and
+     * Italian scopes, and Cyrillic and CJK ones, are untouched -- nor an
+     * include anchored at an ASCII prefix, because the fold changes a NAME and
+     * not the prefix.
+     *
+     * It is fail-closed and visible: the operator is told the request matches
+     * no scope.include pattern. It is not settled. Whether the letter half of
+     * the fold should reach allow patterns too -- it cannot manufacture a
+     * separator or a `*`, so the structural argument above is about the
+     * separator half alone -- is a trade-off between a denylist bypass and
+     * refusing a client's own URLs, and it belongs to whoever owns the
+     * engagement rather than to this comment.
      *
      * Flat rather than a fixed point, because none of these transforms creates
      * a trigger for another: decoding already runs to a fixed point, and the
@@ -1317,11 +1355,58 @@ public final class Policy {
         out.add(lower(s));
         String decoded = decodeToFixedPoint(s);
         if (decoded.equals(s)) return;
-        out.add(lower(decoded));
+        addSpelling(out, decoded);
         String utf8 = foldOverlongUtf8(decoded);
-        if (!utf8.equals(decoded)) out.add(lower(utf8));
+        if (!utf8.equals(decoded)) addSpelling(out, utf8);
         String inert = decodeSeparatorsInert(s);
-        if (!inert.equals(decoded)) out.add(lower(inert));
+        if (!inert.equals(decoded)) addSpelling(out, inert);
+    }
+
+    /**
+     * One DERIVED spelling of an allow pattern: case-folded always, and
+     * verbatim as well when it is ASCII.
+     *
+     * The pattern the operator typed is held verbatim by addSpellings above;
+     * everything decoding produces from it was held ONLY case-folded, and that
+     * was the exact failure patternReadings exists to prevent, one axis along:
+     *
+     *   include=.../files/A%2eB/*     refused  /files/A.B/x
+     *   include=.../files/My%20Docs/* refused  /files/My Docs/x
+     *
+     * while the all-lowercase spellings of both were allowed. Rule.allows
+     * compares the path's RAW reading without folding case -- deliberately,
+     * because folding case on the one rule that authorises anything widens it
+     * -- so `/files/A.B/x` has an uppercase reading that a set holding only
+     * `/files/a.b/*` cannot cover, and allow-AND refuses on it. The operator is
+     * told their request "matches no scope.include pattern", which sends them
+     * to rewrite a pattern that was right.
+     *
+     * ASCII ONLY, and that is the whole of the condition. Adding every decoded
+     * spelling verbatim would put MOJIBAKE in the set: decodeToFixedPoint of
+     * `/files/caf%c3%a9/*` ends in the two Latin-1 characters U+00C3 U+00A9,
+     * which is not a spelling of anything -- the character the request names
+     * is the UTF-8 fold one line down. PolicyTest pins its absence, and that
+     * pin is older than this method. An ASCII decoded form has no such second
+     * reading: what it says is what a matcher will compare.
+     *
+     * It cannot widen the rule structurally either. Every string it adds is
+     * the case-variant of one the set already held, so it matches a SUBSET of
+     * what lower(s) matches once both sides are folded -- and the only side
+     * that is not folded is the path's raw reading, which is the reading this
+     * exists to cover.
+     */
+    private static void addSpelling(Set<String> out, String s) {
+        out.add(lower(s));
+        if (isAscii(s)) out.add(s);
+    }
+
+    /** Whether every character is ASCII -- asked about a DECODED string, where
+     *  a non-ASCII character means the decode produced bytes rather than
+     *  text. */
+    private static boolean isAscii(String s) {
+        for (int i = 0; i < s.length(); i++)
+            if (s.charAt(i) >= 0x80) return false;
+        return true;
     }
 
     private static final int STRIP_PARAMS = 1, FOLD_BACKSLASH = 2, TRIM_TAILS = 4,
@@ -1381,9 +1466,22 @@ public final class Policy {
         if (out.add(reading)) pending.add(reading);
     }
 
-    /** Whether trimSegmentTails() would change this path -- exactly the
-     *  condition under which it is not the identity, including the dot
-     *  segments it deliberately leaves alone. */
+    /**
+     * Whether trimSegmentTails() would change this path -- exactly the
+     * condition under which it is not the identity, including the dot segments
+     * it deliberately leaves alone.
+     *
+     * `i > start` is what keeps `charAt(i - 1)` off the character before an
+     * EMPTY segment, and the only shape that needs it is a segment of exactly
+     * one trimmable character. Weakened to `i > start + 1` it leaves every
+     * check in PolicyTest green while `/a/%20/b/leaf` and `/a/%00/b/leaf` walk
+     * past `exclude=/a/b/*` -- Windows trims the one-character name away and
+     * serves `/a/b/leaf`, and the NUL truncation reading does not save it
+     * because that reading is `/a`, which the exclusion does not name. Every
+     * other trimmable path in the suite carries a NAME in front of the
+     * trimmable character, which is why the weakening used to be free. See
+     * aSegmentOfNothingButASpaceOrANulIsStillTrimmed.
+     */
     private static boolean hasTrimmableTail(String path) {
         int start = 0;
         for (int i = 0; i <= path.length(); i++)
@@ -1587,43 +1685,55 @@ public final class Policy {
      * this tool is an agent working a pentest, which is exactly the party that
      * pastes a wordlist entry.
      *
-     * THE SEPARATORS WERE NOT THE WHOLE TABLE, and for one round this method
-     * said they were: "the separator-producing entries only... none of the rest
-     * changes how a path is READ". That is false, and it was false about the
-     * best-documented part of the table. Microsoft's bestfit1252.txt maps ALL
-     * 94 code points of the fullwidth block, U+FF01 to U+FF5E, onto printable
-     * ASCII at a fixed offset of 0xFEE0 -- so U+FF4C is `l`, U+FF21 is `A`,
-     * U+FF10 is `0`. A fullwidth SPELLING of a word is that word to any ANSI
-     * API, and this tool's denylist is a list of words. Live on the shipped
-     * defaults before the range was added:
+     * THE TABLE IS NOT DRAWN BY HAND ANY MORE, and the reason is a measurement
+     * rather than a preference. It was drawn by hand twice. Each subset was
+     * argued for in this comment, each argument was reasonable, and each left
+     * a live bypass of the denylist this tool ships:
      *
-     *   /account/(fullwidth l-o-g-o-u-t)   ALLOW -- an automated logout
-     *   /account/l(U+FF0F)gout             ALLOW -- one letter is enough
-     *   /(U+FF41)dmin/users                ALLOW past exclude=/admin/*
+     *   13 entries, "the separator-producing ones only":
+     *       /account/l(U+FF0F)gout       ALLOW -- a real logout
+     *   105 entries, the whole fullwidth block plus eleven homoglyphs:
+     *       /account/(U+0142)ogout       ALLOW -- `l` with a stroke
+     *       /account/l(U+014D)gout       ALLOW -- `o` with a macron
+     *       /i.php?action=lo(U+0261)out  ALLOW -- a script `g`
+     *       /(U+0101)dmin/users          ALLOW past exclude=/admin/*
+     *       /adm(U+0131)n/users          ALLOW past exclude=/admin/*
+     *       /(U+03B1)dmin/users          ALLOW past exclude=/admin/*
      *
-     * (Verified against the real table rather than recalled: the WCTABLE of
-     * unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WindowsBestFit/bestfit1252.txt
-     * holds 698 entries, 94 of them are U+FF01..U+FF5E, and every one of those
-     * 94 maps to its code point minus 0xFEE0 with no exceptions.)
+     * Same file, same substitution, same threat model as the fullwidth block
+     * the round before: 392 of bestfit1252.txt's 698 entries land on ASCII
+     * 0x20..0x7E -- 384 of them on 0x21..0x7E and 8 more on the space -- and
+     * the hand-drawn table held 99 of the 392. So the table is now EMITTED
+     * from the vendor file -- see bestFit -- and the only judgement left in it
+     * is a filter anyone can re-run.
      *
-     * The named entries below are the ones OUTSIDE that block, and three of
-     * them come from the same file: U+037E GREEK QUESTION MARK is `;`, U+066A
-     * ARABIC PERCENT SIGN is `%`, U+2216 SET MINUS is a backslash. The rest --
-     * the small forms, the halfwidth ideographic stop, the big solidus -- are
-     * best fits in other code pages' tables rather than 1252's, and they are
-     * kept because a PATH reading only ever denies more. U+FF05 and U+066A can
-     * create an ESCAPE, and readings() re-derives every member, so the escape
-     * they create is decoded on the next pass.
+     * THE COST, measured before it was accepted rather than discovered after.
+     * A best-fit reading belongs to a PATH and to a DENY pattern, never to an
+     * ALLOW pattern (see spellingReadings), so an include that CARRIES a
+     * folded code point authorises nothing: the request keeps the folded
+     * reading and the pattern does not name it. With the fullwidth block that
+     * cost was theoretical -- nobody's scope file is spelt in fullwidth. With
+     * the whole table it is not, because 276 entries fold to a letter or a
+     * digit and 214 of those are outside the fullwidth block:
      *
-     * A best-fit reading is a reading of a PATH and of a DENY pattern, never
-     * of an allow pattern -- see spellingReadings. The cost of that split, now
-     * that the whole fullwidth block folds: an operator whose scope.include
-     * carries a fullwidth character authorises nothing, because the request
-     * still has the folded reading and their pattern does not name it. It is
-     * the same accepted cost a segment trigger in an include already has, it
-     * is visible rather than silent, and PolicyTest pins it. An include spelt
-     * in ASCII is unaffected: `/files/*` still authorises a fullwidth filename
-     * under it, because the fold changes the name and not the prefix.
+     *   include=.../p(U+0142)atno(U+015B)ci/*   authorises NOTHING
+     *   include=.../kullan(U+0131)c(U+0131)/*   authorises NOTHING
+     *   include=.../p(U+0159)istup/*            authorises NOTHING
+     *
+     * Polish, Turkish, Czech, Slovak, Hungarian, Romanian, Baltic and part of
+     * Greek. The rule is exact rather than per-language, and it is worth
+     * stating that way: an include breaks when a code point in the TABLE
+     * appears in the pattern's own text, and not otherwise. So Czech
+     * `/p(U+0159)istup/*` is refused while `/u(U+017E)ivatel/*` is not --
+     * U+0159 is in the table, U+017E is a character 1252 can already spell.
+     * The whole Latin-1 supplement is in that second group, so Spanish, French,
+     * German, Portuguese and Italian scopes are untouched, and so are Cyrillic
+     * and CJK ones. Nor is a scope anchored at an ASCII prefix affected --
+     * `/files/*` still authorises a folded filename under it, because the fold
+     * changes a NAME and not the prefix. See the include-cost table in
+     * PolicyTest, which pins every row of this paragraph in both directions,
+     * and the round report, which is where the trade-off is argued rather than
+     * here.
      */
     static String foldBestFit(String s) {
         int i = 0;
@@ -1641,35 +1751,459 @@ public final class Policy {
     }
 
     /**
-     * The whole fullwidth block, plus the homoglyphs of the separators that
-     * live outside it.
+     * One code point, as WideCharToMultiByte would spell it in code page 1252.
      *
-     * Hex rather than character literals on purpose: these code points are
-     * homoglyphs, and a reader has no way to tell them apart in a source file.
+     * GENERATED, not curated. Every WCTABLE entry of Microsoft's own
+     * bestfit1252.txt whose source is non-ASCII and whose target is 0x20..0x7E
+     * -- 392 of its 698 -- plus six homoglyphs of path syntax that file does
+     * not cover. 398 cases, one line each, carrying the vendor's own name for
+     * the code point, so an entry cannot be dropped silently and cannot be
+     * added without saying where it came from:
      *
-     * FULLWIDTH_OFFSET is not a coincidence to be spelt out entry by entry.
-     * U+FF01..U+FF5E is the fullwidth image of ASCII 0x21..0x7E, in order, and
-     * bestfit1252.txt maps it as exactly that -- 94 entries, one subtraction.
-     * Writing them out would be 94 chances to leave one out, which is how the
-     * table came to have thirteen entries in the first place.
+     *   python3 extension/tools/bestfit_table.py --emit    # the block below
+     *   python3 extension/tools/bestfit_table.py --check   # verify this file
+     *
+     * That script holds the URL, the sha256 of the exact file the block was
+     * generated from, the filter, and the six supplements with a reason each.
+     * It is an author's tool: nothing imports it, the build does not run it,
+     * and the shipped extension still has no dependency and no network.
+     *
+     * THE SIX SUPPLEMENTS are U+29F8, U+FE68, U+FE52, U+FF61, U+2024 and
+     * U+FE54, and they are labelled in the block. The comment they replace
+     * said they were "best fits in other code pages' tables". That was FALSE,
+     * and it was checked rather than re-argued: none of the six best-fits to
+     * printable ASCII in the WCTABLE of bestfit932, 936, 949, 950, 874,
+     * 1250-1258 or 10000 either. They stay because a best-fit reading of a
+     * PATH only ever denies more and they are homoglyphs of `/`, a backslash,
+     * `.` and `;`. U+2024 is the sharpest: bestfit1252 DOES map it, to 0xB7
+     * MIDDLE DOT, and folding it to `.` is this class's judgement rather than
+     * the vendor's.
+     *
+     * SPACE IS IN THE FILTER, which is 8 entries -- the quad and em spaces and
+     * U+3000 IDEOGRAPHIC SPACE. Windows trims a trailing space from a name, so
+     * `/a/(U+3000)/b/leaf` reads as `/a/b/leaf` and an exclusion on `/a/b/*`
+     * has to see it. (bestfit1252 maps them to 0x20, so this is the file's
+     * judgement and not ours.)
+     *
+     * KNOWN LIMIT, stated rather than left to be found: 1252 is the ANSI code
+     * page of a Windows host installed for a Western locale. A Japanese host
+     * is 932 and a Chinese one 936, and their tables are larger -- the union
+     * over the fifteen named above is 530 code points against this file's 392.
+     * Folding that union would map much of CJK onto ASCII and refuse any CJK
+     * scope outright, so it is not done, and against a CJK Windows estate this
+     * fold is a SUBSET of what the target will do.
+     *
+     * Hex sources rather than character literals: these are homoglyphs, and a
+     * reader has no way to tell them apart in a source file.
+     *
+     * The two bounds are the table's own first and last entry, so the entire
+     * Latin-1 supplement -- every accented character a Western European path
+     * actually carries -- leaves in two comparisons.
      */
-    static final int FULLWIDTH_OFFSET = 0xfee0;
-
     private static char bestFit(char c) {
-        if (c >= 0xff01 && c <= 0xff5e) return (char) (c - FULLWIDTH_OFFSET);
+        if (c < 0x0100 || c > 0xff61) return c;
         switch (c) {
-            case 0x2215:            // DIVISION SLASH
-            case 0x2044:            // FRACTION SLASH
-            case 0x29f8: return '/';// BIG SOLIDUS
-            case 0x2216:            // SET MINUS
-            case 0xfe68: return '\\';// SMALL REVERSE SOLIDUS
-            case 0xfe52:            // SMALL FULL STOP
-            case 0xff61:            // HALFWIDTH IDEOGRAPHIC FULL STOP
-            case 0x2024: return '.';// ONE DOT LEADER
-            case 0x037e:            // GREEK QUESTION MARK
-            case 0xfe54: return ';';// SMALL SEMICOLON
-            case 0x066a: return '%';// ARABIC PERCENT SIGN
-            default:     return c;
+            // ---- GENERATED from bestfit1252.txt; see bestfit_table.py ----
+            case 0x0100: return 'A';  // LATIN CAPITAL LETTER A WITH MACRON
+            case 0x0101: return 'a';  // LATIN SMALL LETTER A WITH MACRON
+            case 0x0102: return 'A';  // LATIN CAPITAL LETTER A WITH BREVE
+            case 0x0103: return 'a';  // LATIN SMALL LETTER A WITH BREVE
+            case 0x0104: return 'A';  // LATIN CAPITAL LETTER A WITH OGONEK
+            case 0x0105: return 'a';  // LATIN SMALL LETTER A WITH OGONEK
+            case 0x0106: return 'C';  // LATIN CAPITAL LETTER C WITH ACUTE
+            case 0x0107: return 'c';  // LATIN SMALL LETTER C WITH ACUTE
+            case 0x0108: return 'C';  // LATIN CAPITAL LETTER C WITH CIRCUMFLEX
+            case 0x0109: return 'c';  // LATIN SMALL LETTER C WITH CIRCUMFLEX
+            case 0x010a: return 'C';  // LATIN CAPITAL LETTER C WITH DOT ABOVE
+            case 0x010b: return 'c';  // LATIN SMALL LETTER C WITH DOT ABOVE
+            case 0x010c: return 'C';  // LATIN CAPITAL LETTER C WITH CARON
+            case 0x010d: return 'c';  // LATIN SMALL LETTER C WITH CARON
+            case 0x010e: return 'D';  // LATIN CAPITAL LETTER D WITH CARON
+            case 0x010f: return 'd';  // LATIN SMALL LETTER D WITH CARON
+            case 0x0111: return 'd';  // LATIN SMALL LETTER D WITH STROKE
+            case 0x0112: return 'E';  // LATIN CAPITAL LETTER E WITH MACRON
+            case 0x0113: return 'e';  // LATIN SMALL LETTER E WITH MACRON
+            case 0x0114: return 'E';  // LATIN CAPITAL LETTER E WITH BREVE
+            case 0x0115: return 'e';  // LATIN SMALL LETTER E WITH BREVE
+            case 0x0116: return 'E';  // LATIN CAPITAL LETTER E WITH DOT ABOVE
+            case 0x0117: return 'e';  // LATIN SMALL LETTER E WITH DOT ABOVE
+            case 0x0118: return 'E';  // LATIN CAPITAL LETTER E WITH OGONEK
+            case 0x0119: return 'e';  // LATIN SMALL LETTER E WITH OGONEK
+            case 0x011a: return 'E';  // LATIN CAPITAL LETTER E WITH CARON
+            case 0x011b: return 'e';  // LATIN SMALL LETTER E WITH CARON
+            case 0x011c: return 'G';  // LATIN CAPITAL LETTER G WITH CIRCUMFLEX
+            case 0x011d: return 'g';  // LATIN SMALL LETTER G WITH CIRCUMFLEX
+            case 0x011e: return 'G';  // LATIN CAPITAL LETTER G WITH BREVE
+            case 0x011f: return 'g';  // LATIN SMALL LETTER G WITH BREVE
+            case 0x0120: return 'G';  // LATIN CAPITAL LETTER G WITH DOT ABOVE
+            case 0x0121: return 'g';  // LATIN SMALL LETTER G WITH DOT ABOVE
+            case 0x0122: return 'G';  // LATIN CAPITAL LETTER G WITH CEDILLA
+            case 0x0123: return 'g';  // LATIN SMALL LETTER G WITH CEDILLA
+            case 0x0124: return 'H';  // LATIN CAPITAL LETTER H WITH CIRCUMFLEX
+            case 0x0125: return 'h';  // LATIN SMALL LETTER H WITH CIRCUMFLEX
+            case 0x0126: return 'H';  // LATIN CAPITAL LETTER H WITH STROKE
+            case 0x0127: return 'h';  // LATIN SMALL LETTER H WITH STROKE
+            case 0x0128: return 'I';  // LATIN CAPITAL LETTER I WITH TILDE
+            case 0x0129: return 'i';  // LATIN SMALL LETTER I WITH TILDE
+            case 0x012a: return 'I';  // LATIN CAPITAL LETTER I WITH MACRON
+            case 0x012b: return 'i';  // LATIN SMALL LETTER I WITH MACRON
+            case 0x012c: return 'I';  // LATIN CAPITAL LETTER I WITH BREVE
+            case 0x012d: return 'i';  // LATIN SMALL LETTER I WITH BREVE
+            case 0x012e: return 'I';  // LATIN CAPITAL LETTER I WITH OGONEK
+            case 0x012f: return 'i';  // LATIN SMALL LETTER I WITH OGONEK
+            case 0x0130: return 'I';  // LATIN CAPITAL LETTER I WITH DOT ABOVE
+            case 0x0131: return 'i';  // LATIN SMALL LETTER DOTLESS I
+            case 0x0134: return 'J';  // LATIN CAPITAL LETTER J WITH CIRCUMFLEX
+            case 0x0135: return 'j';  // LATIN SMALL LETTER J WITH CIRCUMFLEX
+            case 0x0136: return 'K';  // LATIN CAPITAL LETTER K WITH CEDILLA
+            case 0x0137: return 'k';  // LATIN SMALL LETTER K WITH CEDILLA
+            case 0x0139: return 'L';  // LATIN CAPITAL LETTER L WITH ACUTE
+            case 0x013a: return 'l';  // LATIN SMALL LETTER L WITH ACUTE
+            case 0x013b: return 'L';  // LATIN CAPITAL LETTER L WITH CEDILLA
+            case 0x013c: return 'l';  // LATIN SMALL LETTER L WITH CEDILLA
+            case 0x013d: return 'L';  // LATIN CAPITAL LETTER L WITH CARON
+            case 0x013e: return 'l';  // LATIN SMALL LETTER L WITH CARON
+            case 0x0141: return 'L';  // LATIN CAPITAL LETTER L WITH STROKE
+            case 0x0142: return 'l';  // LATIN SMALL LETTER L WITH STROKE
+            case 0x0143: return 'N';  // LATIN CAPITAL LETTER N WITH ACUTE
+            case 0x0144: return 'n';  // LATIN SMALL LETTER N WITH ACUTE
+            case 0x0145: return 'N';  // LATIN CAPITAL LETTER N WITH CEDILLA
+            case 0x0146: return 'n';  // LATIN SMALL LETTER N WITH CEDILLA
+            case 0x0147: return 'N';  // LATIN CAPITAL LETTER N WITH CARON
+            case 0x0148: return 'n';  // LATIN SMALL LETTER N WITH CARON
+            case 0x014c: return 'O';  // LATIN CAPITAL LETTER O WITH MACRON
+            case 0x014d: return 'o';  // LATIN SMALL LETTER O WITH MACRON
+            case 0x014e: return 'O';  // LATIN CAPITAL LETTER O WITH BREVE
+            case 0x014f: return 'o';  // LATIN SMALL LETTER O WITH BREVE
+            case 0x0150: return 'O';  // LATIN CAPITAL LETTER O WITH DOUBLE ACUTE
+            case 0x0151: return 'o';  // LATIN SMALL LETTER O WITH DOUBLE ACUTE
+            case 0x0154: return 'R';  // LATIN CAPITAL LETTER R WITH ACUTE
+            case 0x0155: return 'r';  // LATIN SMALL LETTER R WITH ACUTE
+            case 0x0156: return 'R';  // LATIN CAPITAL LETTER R WITH CEDILLA
+            case 0x0157: return 'r';  // LATIN SMALL LETTER R WITH CEDILLA
+            case 0x0158: return 'R';  // LATIN CAPITAL LETTER R WITH CARON
+            case 0x0159: return 'r';  // LATIN SMALL LETTER R WITH CARON
+            case 0x015a: return 'S';  // LATIN CAPITAL LETTER S WITH ACUTE
+            case 0x015b: return 's';  // LATIN SMALL LETTER S WITH ACUTE
+            case 0x015c: return 'S';  // LATIN CAPITAL LETTER S WITH CIRCUMFLEX
+            case 0x015d: return 's';  // LATIN SMALL LETTER S WITH CIRCUMFLEX
+            case 0x015e: return 'S';  // LATIN CAPITAL LETTER S WITH CEDILLA
+            case 0x015f: return 's';  // LATIN SMALL LETTER S WITH CEDILLA
+            case 0x0162: return 'T';  // LATIN CAPITAL LETTER T WITH CEDILLA
+            case 0x0163: return 't';  // LATIN SMALL LETTER T WITH CEDILLA
+            case 0x0164: return 'T';  // LATIN CAPITAL LETTER T WITH CARON
+            case 0x0165: return 't';  // LATIN SMALL LETTER T WITH CARON
+            case 0x0166: return 'T';  // LATIN CAPITAL LETTER T WITH STROKE
+            case 0x0167: return 't';  // LATIN SMALL LETTER T WITH STROKE
+            case 0x0168: return 'U';  // LATIN CAPITAL LETTER U WITH TILDE
+            case 0x0169: return 'u';  // LATIN SMALL LETTER U WITH TILDE
+            case 0x016a: return 'U';  // LATIN CAPITAL LETTER U WITH MACRON
+            case 0x016b: return 'u';  // LATIN SMALL LETTER U WITH MACRON
+            case 0x016c: return 'U';  // LATIN CAPITAL LETTER U WITH BREVE
+            case 0x016d: return 'u';  // LATIN SMALL LETTER U WITH BREVE
+            case 0x016e: return 'U';  // LATIN CAPITAL LETTER U WITH RING ABOVE
+            case 0x016f: return 'u';  // LATIN SMALL LETTER U WITH RING ABOVE
+            case 0x0170: return 'U';  // LATIN CAPITAL LETTER U WITH DOUBLE ACUTE
+            case 0x0171: return 'u';  // LATIN SMALL LETTER U WITH DOUBLE ACUTE
+            case 0x0172: return 'U';  // LATIN CAPITAL LETTER U WITH OGONEK
+            case 0x0173: return 'u';  // LATIN SMALL LETTER U WITH OGONEK
+            case 0x0174: return 'W';  // LATIN CAPITAL LETTER W WITH CIRCUMFLEX
+            case 0x0175: return 'w';  // LATIN SMALL LETTER W WITH CIRCUMFLEX
+            case 0x0176: return 'Y';  // LATIN CAPITAL LETTER Y WITH CIRCUMFLEX
+            case 0x0177: return 'y';  // LATIN SMALL LETTER Y WITH CIRCUMFLEX
+            case 0x0179: return 'Z';  // LATIN CAPITAL LETTER Z WITH ACUTE
+            case 0x017a: return 'z';  // LATIN SMALL LETTER Z WITH ACUTE
+            case 0x017b: return 'Z';  // LATIN CAPITAL LETTER Z WITH DOT ABOVE
+            case 0x017c: return 'z';  // LATIN SMALL LETTER Z WITH DOT ABOVE
+            case 0x0180: return 'b';  // LATIN SMALL LETTER B WITH STROKE
+            case 0x0197: return 'I';  // LATIN CAPITAL LETTER I WITH STROKE
+            case 0x019a: return 'l';  // LATIN SMALL LETTER L WITH BAR
+            case 0x019f: return 'O';  // LATIN CAPITAL LETTER O WITH MIDDLE TILDE
+            case 0x01a0: return 'O';  // LATIN CAPITAL LETTER O WITH HORN
+            case 0x01a1: return 'o';  // LATIN SMALL LETTER O WITH HORN
+            case 0x01ab: return 't';  // LATIN SMALL LETTER T WITH PALATAL HOOK
+            case 0x01ae: return 'T';  // LATIN CAPITAL LETTER T WITH RETROFLEX HOOK
+            case 0x01af: return 'U';  // LATIN CAPITAL LETTER U WITH HORN
+            case 0x01b0: return 'u';  // LATIN SMALL LETTER U WITH HORN
+            case 0x01b6: return 'z';  // LATIN SMALL LETTER Z WITH STROKE
+            case 0x01c0: return '|';  // LATIN LETTER DENTAL CLICK
+            case 0x01c3: return '!';  // LATIN LETTER RETROFLEX CLICK
+            case 0x01cd: return 'A';  // LATIN CAPITAL LETTER A WITH CARON
+            case 0x01ce: return 'a';  // LATIN SMALL LETTER A WITH CARON
+            case 0x01cf: return 'I';  // LATIN CAPITAL LETTER I WITH CARON
+            case 0x01d0: return 'i';  // LATIN SMALL LETTER I WITH CARON
+            case 0x01d1: return 'O';  // LATIN CAPITAL LETTER O WITH CARON
+            case 0x01d2: return 'o';  // LATIN SMALL LETTER O WITH CARON
+            case 0x01d3: return 'U';  // LATIN CAPITAL LETTER U WITH CARON
+            case 0x01d4: return 'u';  // LATIN SMALL LETTER U WITH CARON
+            case 0x01d5: return 'U';  // LATIN CAPITAL LETTER U WITH DIAERESIS AND MACRON
+            case 0x01d6: return 'u';  // LATIN SMALL LETTER U WITH DIAERESIS AND MACRON
+            case 0x01d7: return 'U';  // LATIN CAPITAL LETTER U WITH DIAERESIS AND ACUTE
+            case 0x01d8: return 'u';  // LATIN SMALL LETTER U WITH DIAERESIS AND ACUTE
+            case 0x01d9: return 'U';  // LATIN CAPITAL LETTER U WITH DIAERESIS AND CARON
+            case 0x01da: return 'u';  // LATIN SMALL LETTER U WITH DIAERESIS AND CARON
+            case 0x01db: return 'U';  // LATIN CAPITAL LETTER U WITH DIAERESIS AND GRAVE
+            case 0x01dc: return 'u';  // LATIN SMALL LETTER U WITH DIAERESIS AND GRAVE
+            case 0x01de: return 'A';  // LATIN CAPITAL LETTER A WITH DIAERESIS AND MACRON
+            case 0x01df: return 'a';  // LATIN SMALL LETTER A WITH DIAERESIS AND MACRON
+            case 0x01e4: return 'G';  // LATIN CAPITAL LETTER G WITH STROKE
+            case 0x01e5: return 'g';  // LATIN SMALL LETTER G WITH STROKE
+            case 0x01e6: return 'G';  // LATIN CAPITAL LETTER G WITH CARON
+            case 0x01e7: return 'g';  // LATIN SMALL LETTER G WITH CARON
+            case 0x01e8: return 'K';  // LATIN CAPITAL LETTER K WITH CARON
+            case 0x01e9: return 'k';  // LATIN SMALL LETTER K WITH CARON
+            case 0x01ea: return 'O';  // LATIN CAPITAL LETTER O WITH OGONEK
+            case 0x01eb: return 'o';  // LATIN SMALL LETTER O WITH OGONEK
+            case 0x01ec: return 'O';  // LATIN CAPITAL LETTER O WITH OGONEK AND MACRON
+            case 0x01ed: return 'o';  // LATIN SMALL LETTER O WITH OGONEK AND MACRON
+            case 0x01f0: return 'j';  // LATIN SMALL LETTER J WITH CARON
+            case 0x0261: return 'g';  // LATIN SMALL LETTER SCRIPT G
+            case 0x02b9: return '\'';  // MODIFIER LETTER PRIME
+            case 0x02ba: return '"';  // MODIFIER LETTER DOUBLE PRIME
+            case 0x02bc: return '\'';  // MODIFIER LETTER APOSTROPHE
+            case 0x02c4: return '^';  // MODIFIER LETTER UP ARROWHEAD
+            case 0x02c8: return '\'';  // MODIFIER LETTER VERTICAL LINE
+            case 0x02cb: return '`';  // MODIFIER LETTER GRAVE ACCENT
+            case 0x02cd: return '_';  // MODIFIER LETTER LOW MACRON
+            case 0x0300: return '`';  // COMBINING GRAVE ACCENT
+            case 0x0302: return '^';  // COMBINING CIRCUMFLEX ACCENT
+            case 0x0303: return '~';  // COMBINING TILDE
+            case 0x030e: return '"';  // COMBINING DOUBLE VERTICAL LINE ABOVE
+            case 0x0331: return '_';  // COMBINING MACRON BELOW
+            case 0x0332: return '_';  // COMBINING LOW LINE
+            case 0x037e: return ';';  // GREEK QUESTION MARK
+            case 0x0393: return 'G';  // GREEK CAPITAL LETTER GAMMA
+            case 0x0398: return 'T';  // GREEK CAPITAL LETTER THETA
+            case 0x03a3: return 'S';  // GREEK CAPITAL LETTER SIGMA
+            case 0x03a6: return 'F';  // GREEK CAPITAL LETTER PHI
+            case 0x03a9: return 'O';  // GREEK CAPITAL LETTER OMEGA
+            case 0x03b1: return 'a';  // GREEK SMALL LETTER ALPHA
+            case 0x03b4: return 'd';  // GREEK SMALL LETTER DELTA
+            case 0x03b5: return 'e';  // GREEK SMALL LETTER EPSILON
+            case 0x03c0: return 'p';  // GREEK SMALL LETTER PI
+            case 0x03c3: return 's';  // GREEK SMALL LETTER SIGMA
+            case 0x03c4: return 't';  // GREEK SMALL LETTER TAU
+            case 0x03c6: return 'f';  // GREEK SMALL LETTER PHI
+            case 0x04bb: return 'h';  // CYRILLIC SMALL LETTER SHHA
+            case 0x0589: return ':';  // ARMENIAN FULL STOP
+            case 0x066a: return '%';  // ARABIC PERCENT SIGN
+            case 0x2000: return ' ';  // EN QUAD
+            case 0x2001: return ' ';  // EM QUAD
+            case 0x2002: return ' ';  // EN SPACE
+            case 0x2003: return ' ';  // EM SPACE
+            case 0x2004: return ' ';  // THREE-PER-EM SPACE
+            case 0x2005: return ' ';  // FOUR-PER-EM SPACE
+            case 0x2006: return ' ';  // SIX-PER-EM SPACE
+            case 0x2010: return '-';  // HYPHEN
+            case 0x2011: return '-';  // NON-BREAKING HYPHEN
+            case 0x2017: return '=';  // DOUBLE LOW LINE
+            case 0x2024: return '.';  // ONE DOT LEADER (bestfit1252 says MIDDLE DOT)  [not in any Microsoft table]
+            case 0x2032: return '\'';  // PRIME
+            case 0x2035: return '`';  // REVERSED PRIME
+            case 0x2044: return '/';  // FRACTION SLASH
+            case 0x2074: return '4';  // SUPERSCRIPT FOUR
+            case 0x2075: return '5';  // SUPERSCRIPT FIVE
+            case 0x2076: return '6';  // SUPERSCRIPT SIX
+            case 0x2077: return '7';  // SUPERSCRIPT SEVEN
+            case 0x2078: return '8';  // SUPERSCRIPT EIGHT
+            case 0x207f: return 'n';  // SUPERSCRIPT LATIN SMALL LETTER N
+            case 0x2080: return '0';  // SUBSCRIPT ZERO
+            case 0x2081: return '1';  // SUBSCRIPT ONE
+            case 0x2082: return '2';  // SUBSCRIPT TWO
+            case 0x2083: return '3';  // SUBSCRIPT THREE
+            case 0x2084: return '4';  // SUBSCRIPT FOUR
+            case 0x2085: return '5';  // SUBSCRIPT FIVE
+            case 0x2086: return '6';  // SUBSCRIPT SIX
+            case 0x2087: return '7';  // SUBSCRIPT SEVEN
+            case 0x2088: return '8';  // SUBSCRIPT EIGHT
+            case 0x2089: return '9';  // SUBSCRIPT NINE
+            case 0x20a7: return 'P';  // PESETA SIGN
+            case 0x2102: return 'C';  // DOUBLE-STRUCK CAPITAL C
+            case 0x2107: return 'E';  // EULER CONSTANT
+            case 0x210a: return 'g';  // SCRIPT SMALL G
+            case 0x210b: return 'H';  // SCRIPT CAPITAL H
+            case 0x210c: return 'H';  // BLACK-LETTER CAPITAL H
+            case 0x210d: return 'H';  // DOUBLE-STRUCK CAPITAL H
+            case 0x210e: return 'h';  // PLANCK CONSTANT
+            case 0x2110: return 'I';  // SCRIPT CAPITAL I
+            case 0x2111: return 'I';  // BLACK-LETTER CAPITAL I
+            case 0x2112: return 'L';  // SCRIPT CAPITAL L
+            case 0x2113: return 'l';  // SCRIPT SMALL L
+            case 0x2115: return 'N';  // DOUBLE-STRUCK CAPITAL N
+            case 0x2118: return 'P';  // SCRIPT CAPITAL P
+            case 0x2119: return 'P';  // DOUBLE-STRUCK CAPITAL P
+            case 0x211a: return 'Q';  // DOUBLE-STRUCK CAPITAL Q
+            case 0x211b: return 'R';  // SCRIPT CAPITAL R
+            case 0x211c: return 'R';  // BLACK-LETTER CAPITAL R
+            case 0x211d: return 'R';  // DOUBLE-STRUCK CAPITAL R
+            case 0x2124: return 'Z';  // DOUBLE-STRUCK CAPITAL Z
+            case 0x2128: return 'Z';  // BLACK-LETTER CAPITAL Z
+            case 0x212a: return 'K';  // KELVIN SIGN
+            case 0x212c: return 'B';  // SCRIPT CAPITAL B
+            case 0x212d: return 'C';  // BLACK-LETTER CAPITAL C
+            case 0x212e: return 'e';  // ESTIMATED SYMBOL
+            case 0x212f: return 'e';  // SCRIPT SMALL E
+            case 0x2130: return 'E';  // SCRIPT CAPITAL E
+            case 0x2131: return 'F';  // SCRIPT CAPITAL F
+            case 0x2133: return 'M';  // SCRIPT CAPITAL M
+            case 0x2134: return 'o';  // SCRIPT SMALL O
+            case 0x2212: return '-';  // MINUS SIGN
+            case 0x2215: return '/';  // DIVISION SLASH
+            case 0x2216: return '\\';  // SET MINUS
+            case 0x2217: return '*';  // ASTERISK OPERATOR
+            case 0x221a: return 'v';  // SQUARE ROOT
+            case 0x221e: return '8';  // INFINITY
+            case 0x2223: return '|';  // DIVIDES
+            case 0x2229: return 'n';  // INTERSECTION
+            case 0x2236: return ':';  // RATIO
+            case 0x223c: return '~';  // TILDE OPERATOR
+            case 0x2261: return '=';  // IDENTICAL TO
+            case 0x2264: return '=';  // LESS-THAN OR EQUAL TO
+            case 0x2265: return '=';  // GREATER-THAN OR EQUAL TO
+            case 0x2303: return '^';  // UP ARROWHEAD
+            case 0x2320: return '(';  // TOP HALF INTEGRAL
+            case 0x2321: return ')';  // BOTTOM HALF INTEGRAL
+            case 0x2329: return '<';  // LEFT-POINTING ANGLE BRACKET
+            case 0x232a: return '>';  // RIGHT-POINTING ANGLE BRACKET
+            case 0x2500: return '-';  // BOX DRAWINGS LIGHT HORIZONTAL
+            case 0x250c: return '+';  // BOX DRAWINGS LIGHT DOWN AND RIGHT
+            case 0x2510: return '+';  // BOX DRAWINGS LIGHT DOWN AND LEFT
+            case 0x2514: return '+';  // BOX DRAWINGS LIGHT UP AND RIGHT
+            case 0x2518: return '+';  // BOX DRAWINGS LIGHT UP AND LEFT
+            case 0x251c: return '+';  // BOX DRAWINGS LIGHT VERTICAL AND RIGHT
+            case 0x252c: return '-';  // BOX DRAWINGS LIGHT DOWN AND HORIZONTAL
+            case 0x2534: return '-';  // BOX DRAWINGS LIGHT UP AND HORIZONTAL
+            case 0x253c: return '+';  // BOX DRAWINGS LIGHT VERTICAL AND HORIZONTAL
+            case 0x2550: return '-';  // BOX DRAWINGS DOUBLE HORIZONTAL
+            case 0x2552: return '+';  // BOX DRAWINGS DOWN SINGLE AND RIGHT DOUBLE
+            case 0x2553: return '+';  // BOX DRAWINGS DOWN DOUBLE AND RIGHT SINGLE
+            case 0x2554: return '+';  // BOX DRAWINGS DOUBLE DOWN AND RIGHT
+            case 0x2555: return '+';  // BOX DRAWINGS DOWN SINGLE AND LEFT DOUBLE
+            case 0x2556: return '+';  // BOX DRAWINGS DOWN DOUBLE AND LEFT SINGLE
+            case 0x2557: return '+';  // BOX DRAWINGS DOUBLE DOWN AND LEFT
+            case 0x2558: return '+';  // BOX DRAWINGS UP SINGLE AND RIGHT DOUBLE
+            case 0x2559: return '+';  // BOX DRAWINGS UP DOUBLE AND RIGHT SINGLE
+            case 0x255a: return '+';  // BOX DRAWINGS DOUBLE UP AND RIGHT
+            case 0x255b: return '+';  // BOX DRAWINGS UP SINGLE AND LEFT DOUBLE
+            case 0x255c: return '+';  // BOX DRAWINGS UP DOUBLE AND LEFT SINGLE
+            case 0x255d: return '+';  // BOX DRAWINGS DOUBLE UP AND LEFT
+            case 0x2564: return '-';  // BOX DRAWINGS DOWN SINGLE AND HORIZONTAL DOUBLE
+            case 0x2565: return '-';  // BOX DRAWINGS DOWN DOUBLE AND HORIZONTAL SINGLE
+            case 0x2566: return '-';  // BOX DRAWINGS DOUBLE DOWN AND HORIZONTAL
+            case 0x2567: return '-';  // BOX DRAWINGS UP SINGLE AND HORIZONTAL DOUBLE
+            case 0x2568: return '-';  // BOX DRAWINGS UP DOUBLE AND HORIZONTAL SINGLE
+            case 0x2569: return '-';  // BOX DRAWINGS DOUBLE UP AND HORIZONTAL
+            case 0x256a: return '+';  // BOX DRAWINGS VERTICAL SINGLE AND HORIZONTAL DOUBLE
+            case 0x256b: return '+';  // BOX DRAWINGS VERTICAL DOUBLE AND HORIZONTAL SINGLE
+            case 0x256c: return '+';  // BOX DRAWINGS DOUBLE VERTICAL AND HORIZONTAL
+            case 0x2584: return '_';  // LOWER HALF BLOCK
+            case 0x2758: return '|';  // LIGHT VERTICAL BAR
+            case 0x29f8: return '/';  // BIG SOLIDUS  [not in any Microsoft table]
+            case 0x3000: return ' ';  // IDEOGRAPHIC SPACE
+            case 0x3008: return '<';  // LEFT ANGLE BRACKET
+            case 0x3009: return '>';  // RIGHT ANGLE BRACKET
+            case 0x301a: return '[';  // LEFT WHITE SQUARE BRACKET
+            case 0x301b: return ']';  // RIGHT WHITE SQUARE BRACKET
+            case 0xfe52: return '.';  // SMALL FULL STOP  [not in any Microsoft table]
+            case 0xfe54: return ';';  // SMALL SEMICOLON  [not in any Microsoft table]
+            case 0xfe68: return '\\';  // SMALL REVERSE SOLIDUS  [not in any Microsoft table]
+            case 0xff01: return '!';  // FULLWIDTH EXCLAMATION MARK
+            case 0xff02: return '"';  // FULLWIDTH QUOTATION MARK
+            case 0xff03: return '#';  // FULLWIDTH NUMBER SIGN
+            case 0xff04: return '$';  // FULLWIDTH DOLLAR SIGN
+            case 0xff05: return '%';  // FULLWIDTH PERCENT SIGN
+            case 0xff06: return '&';  // FULLWIDTH AMPERSAND
+            case 0xff07: return '\'';  // FULLWIDTH APOSTROPHE
+            case 0xff08: return '(';  // FULLWIDTH LEFT PARENTHESIS
+            case 0xff09: return ')';  // FULLWIDTH RIGHT PARENTHESIS
+            case 0xff0a: return '*';  // FULLWIDTH ASTERISK
+            case 0xff0b: return '+';  // FULLWIDTH PLUS SIGN
+            case 0xff0c: return ',';  // FULLWIDTH COMMA
+            case 0xff0d: return '-';  // FULLWIDTH HYPHEN-MINUS
+            case 0xff0e: return '.';  // FULLWIDTH FULL STOP
+            case 0xff0f: return '/';  // FULLWIDTH SOLIDUS
+            case 0xff10: return '0';  // FULLWIDTH DIGIT ZERO
+            case 0xff11: return '1';  // FULLWIDTH DIGIT ONE
+            case 0xff12: return '2';  // FULLWIDTH DIGIT TWO
+            case 0xff13: return '3';  // FULLWIDTH DIGIT THREE
+            case 0xff14: return '4';  // FULLWIDTH DIGIT FOUR
+            case 0xff15: return '5';  // FULLWIDTH DIGIT FIVE
+            case 0xff16: return '6';  // FULLWIDTH DIGIT SIX
+            case 0xff17: return '7';  // FULLWIDTH DIGIT SEVEN
+            case 0xff18: return '8';  // FULLWIDTH DIGIT EIGHT
+            case 0xff19: return '9';  // FULLWIDTH DIGIT NINE
+            case 0xff1a: return ':';  // FULLWIDTH COLON
+            case 0xff1b: return ';';  // FULLWIDTH SEMICOLON
+            case 0xff1c: return '<';  // FULLWIDTH LESS-THAN SIGN
+            case 0xff1d: return '=';  // FULLWIDTH EQUALS SIGN
+            case 0xff1e: return '>';  // FULLWIDTH GREATER-THAN SIGN
+            case 0xff1f: return '?';  // FULLWIDTH QUESTION MARK
+            case 0xff20: return '@';  // FULLWIDTH COMMERCIAL AT
+            case 0xff21: return 'A';  // FULLWIDTH LATIN CAPITAL LETTER A
+            case 0xff22: return 'B';  // FULLWIDTH LATIN CAPITAL LETTER B
+            case 0xff23: return 'C';  // FULLWIDTH LATIN CAPITAL LETTER C
+            case 0xff24: return 'D';  // FULLWIDTH LATIN CAPITAL LETTER D
+            case 0xff25: return 'E';  // FULLWIDTH LATIN CAPITAL LETTER E
+            case 0xff26: return 'F';  // FULLWIDTH LATIN CAPITAL LETTER F
+            case 0xff27: return 'G';  // FULLWIDTH LATIN CAPITAL LETTER G
+            case 0xff28: return 'H';  // FULLWIDTH LATIN CAPITAL LETTER H
+            case 0xff29: return 'I';  // FULLWIDTH LATIN CAPITAL LETTER I
+            case 0xff2a: return 'J';  // FULLWIDTH LATIN CAPITAL LETTER J
+            case 0xff2b: return 'K';  // FULLWIDTH LATIN CAPITAL LETTER K
+            case 0xff2c: return 'L';  // FULLWIDTH LATIN CAPITAL LETTER L
+            case 0xff2d: return 'M';  // FULLWIDTH LATIN CAPITAL LETTER M
+            case 0xff2e: return 'N';  // FULLWIDTH LATIN CAPITAL LETTER N
+            case 0xff2f: return 'O';  // FULLWIDTH LATIN CAPITAL LETTER O
+            case 0xff30: return 'P';  // FULLWIDTH LATIN CAPITAL LETTER P
+            case 0xff31: return 'Q';  // FULLWIDTH LATIN CAPITAL LETTER Q
+            case 0xff32: return 'R';  // FULLWIDTH LATIN CAPITAL LETTER R
+            case 0xff33: return 'S';  // FULLWIDTH LATIN CAPITAL LETTER S
+            case 0xff34: return 'T';  // FULLWIDTH LATIN CAPITAL LETTER T
+            case 0xff35: return 'U';  // FULLWIDTH LATIN CAPITAL LETTER U
+            case 0xff36: return 'V';  // FULLWIDTH LATIN CAPITAL LETTER V
+            case 0xff37: return 'W';  // FULLWIDTH LATIN CAPITAL LETTER W
+            case 0xff38: return 'X';  // FULLWIDTH LATIN CAPITAL LETTER X
+            case 0xff39: return 'Y';  // FULLWIDTH LATIN CAPITAL LETTER Y
+            case 0xff3a: return 'Z';  // FULLWIDTH LATIN CAPITAL LETTER Z
+            case 0xff3b: return '[';  // FULLWIDTH LEFT SQUARE BRACKET
+            case 0xff3c: return '\\';  // FULLWIDTH REVERSE SOLIDUS
+            case 0xff3d: return ']';  // FULLWIDTH RIGHT SQUARE BRACKET
+            case 0xff3e: return '^';  // FULLWIDTH CIRCUMFLEX ACCENT
+            case 0xff3f: return '_';  // FULLWIDTH LOW LINE
+            case 0xff40: return '`';  // FULLWIDTH GRAVE ACCENT
+            case 0xff41: return 'a';  // FULLWIDTH LATIN SMALL LETTER A
+            case 0xff42: return 'b';  // FULLWIDTH LATIN SMALL LETTER B
+            case 0xff43: return 'c';  // FULLWIDTH LATIN SMALL LETTER C
+            case 0xff44: return 'd';  // FULLWIDTH LATIN SMALL LETTER D
+            case 0xff45: return 'e';  // FULLWIDTH LATIN SMALL LETTER E
+            case 0xff46: return 'f';  // FULLWIDTH LATIN SMALL LETTER F
+            case 0xff47: return 'g';  // FULLWIDTH LATIN SMALL LETTER G
+            case 0xff48: return 'h';  // FULLWIDTH LATIN SMALL LETTER H
+            case 0xff49: return 'i';  // FULLWIDTH LATIN SMALL LETTER I
+            case 0xff4a: return 'j';  // FULLWIDTH LATIN SMALL LETTER J
+            case 0xff4b: return 'k';  // FULLWIDTH LATIN SMALL LETTER K
+            case 0xff4c: return 'l';  // FULLWIDTH LATIN SMALL LETTER L
+            case 0xff4d: return 'm';  // FULLWIDTH LATIN SMALL LETTER M
+            case 0xff4e: return 'n';  // FULLWIDTH LATIN SMALL LETTER N
+            case 0xff4f: return 'o';  // FULLWIDTH LATIN SMALL LETTER O
+            case 0xff50: return 'p';  // FULLWIDTH LATIN SMALL LETTER P
+            case 0xff51: return 'q';  // FULLWIDTH LATIN SMALL LETTER Q
+            case 0xff52: return 'r';  // FULLWIDTH LATIN SMALL LETTER R
+            case 0xff53: return 's';  // FULLWIDTH LATIN SMALL LETTER S
+            case 0xff54: return 't';  // FULLWIDTH LATIN SMALL LETTER T
+            case 0xff55: return 'u';  // FULLWIDTH LATIN SMALL LETTER U
+            case 0xff56: return 'v';  // FULLWIDTH LATIN SMALL LETTER V
+            case 0xff57: return 'w';  // FULLWIDTH LATIN SMALL LETTER W
+            case 0xff58: return 'x';  // FULLWIDTH LATIN SMALL LETTER X
+            case 0xff59: return 'y';  // FULLWIDTH LATIN SMALL LETTER Y
+            case 0xff5a: return 'z';  // FULLWIDTH LATIN SMALL LETTER Z
+            case 0xff5b: return '{';  // FULLWIDTH LEFT CURLY BRACKET
+            case 0xff5c: return '|';  // FULLWIDTH VERTICAL LINE
+            case 0xff5d: return '}';  // FULLWIDTH RIGHT CURLY BRACKET
+            case 0xff5e: return '~';  // FULLWIDTH TILDE
+            case 0xff61: return '.';  // HALFWIDTH IDEOGRAPHIC FULL STOP  [not in any Microsoft table]
+            // ---- END GENERATED ----
+            default: return c;
         }
     }
 
