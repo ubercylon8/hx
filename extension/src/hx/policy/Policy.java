@@ -1361,15 +1361,32 @@ public final class Policy {
     /** One spelling and the readings of it that are still the same resource.
      *  Verbatim AND case-folded, because the path's raw reading is verbatim
      *  and its derived readings are lowercased, and an include has to cover
-     *  both. Plus its letter-half best-fit fold (see addLetterFold), for the
-     *  operator who typed the homoglyph as a literal character rather than as
-     *  an escape -- decodeToFixedPoint below is the identity on `s` in that
-     *  case, and this method would otherwise return before ever reaching
-     *  addSpelling. */
+     *  both. Plus its letter-half best-fit fold (see addLetterFold), called
+     *  here on `s` itself -- the pattern as the operator typed it -- rather
+     *  than only on its decoded form below.
+     *
+     *  THIS CALL IS DEFENCE IN DEPTH, NOT A NECESSITY, and an earlier version
+     *  of this comment claimed otherwise: "decodeToFixedPoint below is the
+     *  identity on `s` in that case [no escape], and this method would
+     *  otherwise return before ever reaching addSpelling." True of THIS
+     *  invocation alone -- but spellingReadings makes a SECOND call to
+     *  addSpellings, on the pattern's own percent-encoded UTF-8 spelling (see
+     *  spellingReadings' `encoded` branch), and that invocation's
+     *  decodeToFixedPoint -> foldOverlongUtf8 -> addSpelling route reaches
+     *  the identical fold on the identical homoglyph. Measured: deleting
+     *  this call is 0-red and changes 0 of 8,316 allow-side and 0 of 30,000
+     *  mixed verdicts. It is genuinely subsumed by the escaped route.
+     *
+     *  Kept anyway: an operator who types the homoglyph as a literal
+     *  character should not authorise their own request only because a
+     *  second, unrelated code path happens to reach the same fold, and the
+     *  cost is one scan that is a no-op on every ASCII pattern. Recorded as
+     *  a claim I could not falsify rather than dressed up as a necessity --
+     *  the same position two guards in Rule.denies already occupy. */
     private static void addSpellings(Set<String> out, String s) {
         out.add(s);
         out.add(lower(s));
-        addLetterFold(out, s);
+        addLetterFold(out, s);          // defence in depth -- see above
         String decoded = decodeToFixedPoint(s);
         if (decoded.equals(s)) return;
         addSpelling(out, decoded);

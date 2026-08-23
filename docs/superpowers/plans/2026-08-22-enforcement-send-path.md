@@ -370,6 +370,7 @@ public class PolicyTest {
         everyBestFitEntryIsGuardedByACheckOfItsOwn();
         theBestFitFoldSplitsByTargetClassNotByHand();
         theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne();
+        thePatternSpellingAxisOfTheLetterFoldHasInputsThatNeedIt();
         anIncludeIsNotWidenedByASegmentTransform();
         aNulEndsTheStringForAnythingThatReachesACApi();
         theReadingSetIsClosedUnderItsOwnTransforms();
@@ -1775,6 +1776,25 @@ public class PolicyTest {
         // separator-class homoglyph authorises NOTHING, which is the same
         // fail-closed shape `/app;v=1/*` has always had and not a defect the
         // ruling introduced.
+        //
+        // THE ROUTE AN OPERATOR ACTUALLY TAKES INTO THIS LIMIT, named here
+        // with its code points so it can be found by searching for the
+        // reason rather than only inferred from the shape above. Five of
+        // the table's 122 separator-half sources are COMBINING MARKS --
+        // U+0300 COMBINING GRAVE ACCENT, U+0302 COMBINING CIRCUMFLEX ACCENT,
+        // U+0303 COMBINING TILDE, U+0331 COMBINING MACRON BELOW, U+0332
+        // COMBINING LOW LINE -- which is what NFD decomposition produces,
+        // which is what macOS produces: an operator who types "año" on a
+        // Mac gets `a` followed by U+0303, not the precomposed character, so
+        // `include=https://app/año/*` typed there is scope_denied against
+        // its OWN literal path the moment it is saved. The same is true of
+        // U+2010 HYPHEN and U+2011 NON-BREAKING HYPHEN -- both routine in
+        // CMS- and Word-derived slugs -- of U+FF0D FULLWIDTH HYPHEN-MINUS
+        // and U+3000 IDEOGRAPHIC SPACE, and of U+02BC MODIFIER LETTER
+        // APOSTROPHE and U+0589 ARMENIAN FULL STOP. And it composes: an
+        // otherwise-fine Polish include becomes unsatisfiable the moment a
+        // single U+2010 appears in it, exactly as if it had been written
+        // with the fullwidth asterisk above.
         String starPath = Policy.percentEncodeUtf8(star + "/secret", false);
         denies("...nor even the include's own literal request, because the "
                + "path's best-fit reading still has a REAL asterisk in it: "
@@ -1782,6 +1802,98 @@ public class PolicyTest {
                req("GET", "https://app.example.test" + starPath,
                    "app.example.test", starPath, ""),
                authorised("scope.include", "https://app.example.test" + star + "/*"),
+               "scope_denied");
+    }
+
+    /**
+     * CLOSING ROUND on Task 1. The table just above varies the PATH's
+     * spelling every way there is while holding the PATTERN's spelling fixed
+     * at "literal, lowercase" -- every include in it is written as a plain
+     * lowercase literal. That left the whole PATTERN-spelling axis of
+     * addSpelling/addLetterFold unguarded: three deletions in those two
+     * methods leave all 753 checks green while flipping live verdicts.
+     *
+     *   F1  addSpelling's `addLetterFold(out, s)` (Policy.java:1425)
+     *       deleted -- 1,841/8,316 allow-side verdicts flip to
+     *       scope_denied. It is the only thing that covers an include
+     *       written as a PERCENT-ESCAPED homoglyph, the exact example
+     *       addSpelling's own comment names.
+     *   F2  addLetterFold's `if (isAscii(letters)) out.add(letters);`
+     *       (Policy.java:1444) deleted -- 588/8,316 flip. No include in the
+     *       suite carries an uppercase ASCII letter in its fold's output, so
+     *       nothing needed the VERBATIM (case-preserved) spelling rather
+     *       than the folded one.
+     *   F3  the same line's condition removed (`out.add(letters);`
+     *       unconditional) -- 42/8,316 flip TOWARD allow. A fold whose
+     *       output is still non-ASCII (a Latin-1 character outside
+     *       foldBestFitLetters' range survives it untouched) must never be
+     *       added verbatim, or a case-sensitive match starts succeeding on
+     *       a path the operator never scoped.
+     */
+    static void thePatternSpellingAxisOfTheLetterFoldHasInputsThatNeedIt() {
+        Policy p = allowingPolicy();
+
+        // F1. The percent-escaped homoglyph addSpelling's own comment names:
+        // `include=.../p%c5%82atnosci/*`. The RAW pattern is pure ASCII, so
+        // addSpellings' own addLetterFold(out, s) call is a no-op on it; what
+        // reaches the fold is the decoded-then-UTF8-folded spelling inside
+        // addSpelling -- addLetterFold(out, s) at Policy.java:1425 -- which
+        // is the only thing that puts the ASCII best-fit reading in the set.
+        String escPattern = "/p%c5%82atnosci/*";
+        String escPath = "/p%c5%82atnosci/x";
+        check("the pattern's own escape decodes to a letter-half homoglyph, "
+              + "so only its best-fit fold reaches the plain ASCII spelling "
+              + "the path also carries: " + Policy.spellingReadings(escPattern),
+              Policy.spellingReadings(escPattern).contains("/platnosci/*"));
+        allows("F1: include=" + escPattern + " authorises its own literal "
+               + "request " + escPath + " (deleting addSpelling's "
+               + "addLetterFold flips this to scope_denied)", p,
+               req("GET", "https://app.example.test" + escPath,
+                   "app.example.test", escPath, ""),
+               authorised("scope.include", "https://app.example.test" + escPattern));
+
+        // F2. A pattern typed as a literal character with an uppercase ASCII
+        // letter already in it -- the 'K' in Turkish "Kullanıcı" -- must
+        // authorise the exact case-preserved path a Windows best-fit routes
+        // it to. Every include in the round-9 table is lowercase, so this
+        // reading was never exercised.
+        String turkishPattern = "/Kullanıcı/*";
+        check("the letter fold's verbatim output keeps the pattern's own "
+              + "capital, a DIFFERENT string from the folded-lowercase one: "
+              + Policy.spellingReadings(turkishPattern),
+              Policy.spellingReadings(turkishPattern).contains("/Kullanici/*")
+              && Policy.spellingReadings(turkishPattern).contains("/kullanici/*"));
+        allows("F2: include=" + turkishPattern + " authorises "
+               + "/Kullanici/Ayar, the case-preserved letter fold (deleting "
+               + "addLetterFold's isAscii-guarded out.add(letters) flips "
+               + "this to scope_denied)", p,
+               req("GET", "https://app.example.test/Kullanici/Ayar",
+                   "app.example.test", "/Kullanici/Ayar", ""),
+               authorised("scope.include", "https://app.example.test" + turkishPattern));
+
+        // F3. Czech "PŘÍSTUP" folds Ř to ASCII 'R', but Í is Latin-1 and
+        // sits outside foldBestFitLetters' range, so the fold's OUTPUT is
+        // still non-ASCII. It must be held case-folded only -- verbatim
+        // would authorise /PRÍSTUP/x, a request the operator never scoped,
+        // past a pattern that only ever claimed to cover /přístup/ and its
+        // case fold.
+        String czechPattern = "/PŘÍSTUP/*";
+        check("the fold's output still carries a non-ASCII character (Í is "
+              + "outside the range foldBestFitLetters folds): "
+              + Policy.foldBestFitLetters(czechPattern),
+              Policy.foldBestFitLetters(czechPattern).indexOf('Í') >= 0);
+        allows("...control: the pattern still authorises its own "
+               + "case-folded spelling with Ř folded and Í held as-is", p,
+               req("GET", "https://app.example.test/prístup/x",
+                   "app.example.test", "/prístup/x", ""),
+               authorised("scope.include", "https://app.example.test" + czechPattern));
+        denies("F3: include=" + czechPattern + " does NOT authorise "
+               + "/PRÍSTUP/x -- the fold's non-ASCII output must stay "
+               + "case-folded only, never verbatim (removing that condition "
+               + "flips this row, and only this row, to ALLOW)", p,
+               req("GET", "https://app.example.test/PRÍSTUP/x",
+                   "app.example.test", "/PRÍSTUP/x", ""),
+               authorised("scope.include", "https://app.example.test" + czechPattern),
                "scope_denied");
     }
 
@@ -5217,15 +5329,32 @@ public final class Policy {
     /** One spelling and the readings of it that are still the same resource.
      *  Verbatim AND case-folded, because the path's raw reading is verbatim
      *  and its derived readings are lowercased, and an include has to cover
-     *  both. Plus its letter-half best-fit fold (see addLetterFold), for the
-     *  operator who typed the homoglyph as a literal character rather than as
-     *  an escape -- decodeToFixedPoint below is the identity on `s` in that
-     *  case, and this method would otherwise return before ever reaching
-     *  addSpelling. */
+     *  both. Plus its letter-half best-fit fold (see addLetterFold), called
+     *  here on `s` itself -- the pattern as the operator typed it -- rather
+     *  than only on its decoded form below.
+     *
+     *  THIS CALL IS DEFENCE IN DEPTH, NOT A NECESSITY, and an earlier version
+     *  of this comment claimed otherwise: "decodeToFixedPoint below is the
+     *  identity on `s` in that case [no escape], and this method would
+     *  otherwise return before ever reaching addSpelling." True of THIS
+     *  invocation alone -- but spellingReadings makes a SECOND call to
+     *  addSpellings, on the pattern's own percent-encoded UTF-8 spelling (see
+     *  spellingReadings' `encoded` branch), and that invocation's
+     *  decodeToFixedPoint -> foldOverlongUtf8 -> addSpelling route reaches
+     *  the identical fold on the identical homoglyph. Measured: deleting
+     *  this call is 0-red and changes 0 of 8,316 allow-side and 0 of 30,000
+     *  mixed verdicts. It is genuinely subsumed by the escaped route.
+     *
+     *  Kept anyway: an operator who types the homoglyph as a literal
+     *  character should not authorise their own request only because a
+     *  second, unrelated code path happens to reach the same fold, and the
+     *  cost is one scan that is a no-op on every ASCII pattern. Recorded as
+     *  a claim I could not falsify rather than dressed up as a necessity --
+     *  the same position two guards in Rule.denies already occupy. */
     private static void addSpellings(Set<String> out, String s) {
         out.add(s);
         out.add(lower(s));
-        addLetterFold(out, s);
+        addLetterFold(out, s);          // defence in depth -- see above
         String decoded = decodeToFixedPoint(s);
         if (decoded.equals(s)) return;
         addSpelling(out, decoded);
