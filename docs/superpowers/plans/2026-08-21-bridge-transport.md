@@ -3418,6 +3418,8 @@ public final class FakeMontoya {
 // extension/test/hx/bridge/BridgeClientTest.java
 package hx.bridge;
 
+import static hx.TestSupport.waitUntilBlockedOn;
+
 import java.io.*;
 import java.net.*;
 import java.nio.channels.ServerSocketChannel;
@@ -3971,22 +3973,6 @@ public class BridgeClientTest {
         } finally {
             Files.deleteIfExists(dir.resolve("h.sock")); Files.deleteIfExists(dir);
         }
-    }
-
-    /** True once `t` is BLOCKED on `monitor` specifically. */
-    static boolean waitUntilBlockedOn(Thread t, Object monitor) throws Exception {
-        java.lang.management.ThreadMXBean mx = java.lang.management.ManagementFactory.getThreadMXBean();
-        int want = System.identityHashCode(monitor);
-        long end = System.currentTimeMillis() + 5000;
-        while (System.currentTimeMillis() < end) {
-            java.lang.management.ThreadInfo info = mx.getThreadInfo(t.threadId());
-            if (info != null && t.getState() == Thread.State.BLOCKED) {
-                java.lang.management.LockInfo li = info.getLockInfo();
-                if (li != null && li.getIdentityHashCode() == want) return true;
-            }
-            Thread.sleep(1);
-        }
-        return false;
     }
 
     static final byte[] CFG =

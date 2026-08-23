@@ -99,13 +99,20 @@ public final class Limiter implements Gate {
         if (issued >= ratePerSecond) {
             long oldest = recent[(int) (issued % ratePerSecond)];
             // An issuance is inside the window while now - oldest < WINDOW_US,
-            // so it leaves at exactly oldest + WINDOW_US. Strictly less-than is
-            // what makes retryAfterUs positive whenever this branch is taken:
-            // if oldest + WINDOW_US - now were zero, the issuance would already
-            // be outside the window and we would not be here.
-            long leavesWindowAt = oldest + WINDOW_US;
-            if (now < leavesWindowAt) {
-                return Decision.rateLimited(leavesWindowAt - now,
+            // so it leaves in exactly WINDOW_US - (now - oldest). That is
+            // computed as two subtractions rather than as
+            // `oldest + WINDOW_US` compared against `now`: adding a constant
+            // to a clock reading near Long.MAX_VALUE overflows and wraps
+            // negative, which would make an issuance that is still inside the
+            // window look like it left long ago -- and ALLOW a request that
+            // should be refused. Subtracting two nearby clock readings first
+            // cannot overflow that way. Strictly less-than is what makes
+            // retryAfterUs positive whenever this branch is taken: if the
+            // elapsed time equalled WINDOW_US exactly, the issuance would
+            // already be outside the window and we would not be here.
+            long elapsed = now - oldest;
+            if (elapsed < WINDOW_US) {
+                return Decision.rateLimited(WINDOW_US - elapsed,
                     "rate limit " + ratePerSecond + "/s: " + ratePerSecond
                     + " requests issued in the last second");
             }

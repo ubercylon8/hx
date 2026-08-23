@@ -1,6 +1,8 @@
 // extension/test/hx/policy/LimiterTest.java
 package hx.policy;
 
+import static hx.TestSupport.waitUntilBlockedOn;
+
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -52,7 +54,9 @@ public class LimiterTest {
         theConstructorRefusesLimitsItCannotEnforce();
         theLimitIsWholeRunNotPerHost();
         aBackwardsClockCanOnlyOverRestrict();
+        theWindowArithmeticDoesNotOverflowNearLongMaxValue();
         concurrentCallersCannotExceedEitherLimit();
+        checkIsExclusiveWithItselfDeterministically();
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -284,6 +288,46 @@ public class LimiterTest {
     }
 
     /**
+     * `oldest + WINDOW_US` compared against `now` overflows when `oldest` is
+     * within WINDOW_US of Long.MAX_VALUE: the sum wraps to a large negative
+     * number, `now < leavesWindowAt` reads that as already outside the
+     * window, and a request that should still be refused is ALLOWED instead.
+     *
+     * Unreachable from a wall-clock Clock -- epoch microseconds are
+     * ~1.79e15, nine orders of magnitude short of the ~9.22e18 needed to
+     * overflow a long -- but nothing in the Clock interface or the
+     * constructor forbids an injected clock from reaching it, so it is
+     * pinned directly rather than argued away.
+     */
+    static void theWindowArithmeticDoesNotOverflowNearLongMaxValue() {
+        TickClock atMax = new TickClock(Long.MAX_VALUE);
+        Limiter l = new Limiter(atMax, 2, 1000);
+
+        check("issuance 1 of 2, at Long.MAX_VALUE", l.check(ACCOUNT).allowed());
+        check("issuance 2 of 2, at the same instant", l.check(ACCOUNT).allowed());
+
+        Decision third = l.check(ACCOUNT);
+        check("a 3rd at the same instant is refused, not let through by an "
+              + "overflowed comparison", !third.allowed());
+        check("...as rate_limited", "rate_limited".equals(third.errorClass()));
+        check("...owing the full window, 1000000us, not a negative or garbage wait",
+              third.retryAfterUs() == 1_000_000L);
+
+        TickClock near = new TickClock(Long.MAX_VALUE - 500_000L);
+        Limiter l2 = new Limiter(near, 2, 1000);
+        check("issuance 1 of 2, 500000us before Long.MAX_VALUE",
+              l2.check(ACCOUNT).allowed());
+        check("issuance 2 of 2, at the same instant", l2.check(ACCOUNT).allowed());
+
+        near.advance(100);
+        Decision late = l2.check(ACCOUNT);
+        check("100us later -- still inside the window, and now past "
+              + "Long.MAX_VALUE -- is still refused", !late.allowed());
+        check("...owing exactly the remaining 999900us",
+              late.retryAfterUs() == 999_900L);
+    }
+
+    /**
      * Deterministic despite being concurrent: the clock does not move, so the
      * window never rolls and the answer is exactly `rate`, whatever order the
      * threads run in. An unsynchronised check() reads `issued`, decides, and
@@ -320,6 +364,45 @@ public class LimiterTest {
         if (l.issued() != allowed.get())
             check("issued() disagrees with the callers: " + l.issued() + " vs " + allowed.get(), false);
         return allowed.get();
+    }
+
+    /**
+     * The mutual-exclusion guard on check(), deterministically -- the guard
+     * that concurrentCallersCannotExceedEitherLimit() above only catches
+     * probabilistically. Measured on the reviewer's machine: removing
+     * `synchronized` red 3/20 unrestricted, 3/20 under `taskset -c 0-3`, and
+     * 0/40 pinned to one or two vCPUs -- indistinguishable from a correct
+     * Limiter on exactly the core counts most CI runners and dev containers
+     * give you. A guard must not depend on scheduling.
+     *
+     * check() synchronizes on `this`, so the test can take that same monitor
+     * from the main thread first, start a helper that calls check(), and
+     * require the helper to park on the IDENTICAL monitor before the main
+     * thread lets go of it. Monitor reentrancy is what makes the outcome
+     * deterministic rather than merely probable: while this thread holds the
+     * monitor the helper cannot enter check() at all, so it is either
+     * observed BLOCKED on `limiter` or the guard is gone.
+     *
+     * Identity, not just Thread.State.BLOCKED, is what waitUntilBlockedOn
+     * checks: a thread parked on some unrelated lock -- a class-init monitor,
+     * say -- is also BLOCKED, and accepting that would pass a Limiter with no
+     * lock on check() at all, for the wrong reason.
+     */
+    static void checkIsExclusiveWithItselfDeterministically() throws Exception {
+        TickClock clock = new TickClock(T0);
+        Limiter limiter = new Limiter(clock, 5, 1000);
+
+        Thread helper;
+        synchronized (limiter) {
+            helper = new Thread(() -> limiter.check(ACCOUNT));
+            helper.setDaemon(true);
+            helper.start();
+            check("a concurrent check() is parked on Limiter's own monitor",
+                  waitUntilBlockedOn(helper, limiter));
+        }
+        helper.join(5000);
+        check("...and proceeds once the monitor is released", !helper.isAlive());
+        check("...and its issuance was actually counted", limiter.issued() == 1L);
     }
 
     /** A real request against a loopback-only test target. The limiter reads
