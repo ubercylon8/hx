@@ -11552,6 +11552,18 @@ public class HaltSwitchTest {
 
             hs.pollOnce();
             check("a fresh answer clears the stall", !hs.halted());
+
+            // STOP_JOIN_MS's comment used to claim that the state left behind
+            // by a stop() is halted "for a wedged poller". It is not: stop()
+            // retires the staleness rule along with the thread that fed it, so
+            // a halt that was ONLY a stall does not survive the stop. Harmless
+            // -- the extension is unloading -- but the comment now says this,
+            // and this is what makes it falsifiable.
+            clock.advance(300_000_001L);
+            check("a stall halts while the poller is armed", hs.halted());
+            hs.stop();
+            check("and stop() retires the staleness rule with the thread it belongs to",
+                  !hs.halted());
         } finally { hs.stop(); rmTree(dir); }
     }
 
