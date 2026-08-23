@@ -1423,6 +1423,81 @@ def test_halt_arms_the_durable_record_and_only_resume_clears_it(srv_with_halt):
         c.close()
 
 
+def test_halt_arms_the_durable_record_before_the_frame_it_cannot_send(srv_with_halt):
+    """halt() arms the durable record FIRST, and a dead socket proves it.
+
+    S4 names the dead socket as the reason the sentinel exists at all, and a
+    dead socket is the likeliest thing to be wrong at the moment someone hits
+    stop. Arming after the send makes exactly that case the one path that
+    loses the halt: the operator gets an exception and NOTHING anywhere is
+    halted -- no frame, no sentinel, no row, and the next Burp start finds no
+    standing halt to re-assert.
+
+    The mirror ordering inside OperatorHalt.halt (sentinel before row) has
+    test_the_sentinel_is_written_before_the_row behind it. This ordering, on
+    the bridge, had nothing but a comment: reversing the two statements passed
+    the entire suite except the plan's byte-compare, which a re-sync would
+    have carried the reversal straight into.
+    """
+    s, oh, conn = srv_with_halt
+    assert s._conn is None, "this test is only about the socket being dead"
+
+    with pytest.raises(server.BridgeError, match="not connected") as exc:
+        s.halt("operator pressed stop, socket already dead")
+    assert exc.value.error_class == "bridge_lost"
+
+    assert oh.halted is True, (
+        "the operator pressed stop and was told it failed; if nothing is "
+        "halted, the stop button did nothing at all"
+    )
+    assert oh.sentinel_path.exists(), (
+        "the sentinel is the path that works when the bridge does not -- it "
+        "is the one that must exist after a send that could not happen"
+    )
+    assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True, (
+        "the next Burp start reads the store and the file, not this object"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM agent_action WHERE tool=?",
+                        (halt_mod.HALT_TOOL,)).fetchone()[0] == 1, (
+        "the audit trail must say who stopped the run even when the frame "
+        "never reached anyone"
+    )
+    assert s.state == "waiting", (
+        "the bridge state is the connection's, and there is no connection; "
+        "the halt that outlives it is the one in OperatorHalt"
+    )
+
+
+def test_resume_leaves_the_durable_halt_armed_when_the_frame_cannot_be_sent(srv_with_halt):
+    """resume() disarms LAST, and the same dead socket proves it.
+
+    A resume the peer never received must not lift a standing halt. Reversed,
+    the operator is told the resume failed while issuance has been silently
+    re-armed for the next Burp start -- a lifted halt nobody asked for,
+    reported as a failure. S4's direction is the other one: unknown state is
+    stop, so every failure before the frame reaches the wire leaves the halt
+    standing.
+    """
+    s, oh, conn = srv_with_halt
+    oh.halt("operator pressed stop")
+    assert s._conn is None, "this test is only about the socket being dead"
+
+    with pytest.raises(server.BridgeError, match="not connected"):
+        s.resume()
+
+    assert oh.halted is True, (
+        "a resume nobody received lifted the halt anyway"
+    )
+    assert oh.sentinel_path.exists()
+    assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True, (
+        "and the next Burp start would have come up armed"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM agent_action WHERE tool=?",
+                        (halt_mod.RESUME_TOOL,)).fetchone()[0] == 0, (
+        "nothing was resumed, so nothing should say it was"
+    )
+
+
 def test_a_reassert_that_cannot_be_sent_closes_the_connection(srv_with_halt):
     """`_reassert_halt` returns False and the caller drops the connection.
 
