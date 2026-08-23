@@ -3,6 +3,7 @@ package hx.bridge;
 import static hx.TestSupport.waitUntilBlockedOn;
 
 import hx.TestSupport;
+import hx.send.HaltSwitch;
 
 import java.io.*;
 import java.net.*;
@@ -138,6 +139,8 @@ public class BridgeClientTest {
             t("aFailedHelloLeavesNoChannelBehind", BridgeClientTest::aFailedHelloLeavesNoChannelBehind);
             t("theCommitIsExclusiveWithClose", BridgeClientTest::theCommitIsExclusiveWithClose);
             t("aConfigureDoesNotLiftAHalt", BridgeClientTest::aConfigureDoesNotLiftAHalt);
+            t("haltFramesReachTheSwitchTheSendPathAsks", BridgeClientTest::haltFramesReachTheSwitchTheSendPathAsks);
+            t("aHaltSinkThatThrowsDropsToDenyAll", BridgeClientTest::aHaltSinkThatThrowsDropsToDenyAll);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -661,6 +664,75 @@ public class BridgeClientTest {
             check("resume is what re-arms issuance", l.client.maySend());
         } finally {
             Files.deleteIfExists(dir.resolve("h.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A `halt` frame has to reach the switch the SEND PATH asks.
+     *
+     * BridgeClient's own `halted` flag guards maySend() and checkMaySend(),
+     * and Sender calls neither: it asks HaltSwitch. Wired up wrongly -- or not
+     * at all -- a halt frame would flip a flag nothing on the send path reads,
+     * both consoles would say "halted", and requests would keep going out. The
+     * failure has no other observable: maySend() answers false either way.
+     */
+    static void haltFramesReachTheSwitchTheSendPathAsks() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsink");
+        // Unstarted, so this test runs no poller thread: the sentinel half is
+        // HaltSwitchTest's business, and the frame half needs no clock -- an
+        // unarmed switch never reads one.
+        HaltSwitch hs = new HaltSwitch(() -> 0L, dir.resolve("halt"), 500L);
+        try (Live l = live(dir, "hs.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { hs.haltedByFrame(reason); }
+                public void resumed()             { hs.resumedByFrame(); }
+            });
+            check("the send path is not halted before the frame", !hs.halted());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "operator pressed stop"), new byte[0]));
+            l.out.flush();
+            waitUntil(hs::halted);
+            check("a halt frame halts the switch the send path asks", hs.halted());
+            check("and the operator's words arrive with it",
+                  "operator pressed stop".equals(hs.reason()));
+            check("and the client's own flag agrees", !l.client.maySend());
+
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !hs.halted());
+            check("a resume frame lifts it on the send path too", !hs.halted());
+            check("and the client is sending again", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("hs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A halt that could not be delivered is an unknown state, and unknown is
+     *  stop. Not "log it and carry on": the frame that was meant to stop
+     *  issuance went nowhere. */
+    static void aHaltSinkThatThrowsDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsinkthrows");
+        try (Live l = live(dir, "ht.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { throw new IllegalStateException("switch is gone"); }
+                public void resumed()             { }
+            });
+            check("configured before the undeliverable halt", l.client.maySend());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "operator pressed stop"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !l.client.isConfigured());
+            // isConfigured(), not maySend(): the local halt flag would answer
+            // maySend() false on its own, so a client that had merely logged
+            // the failure and carried on under the standing scope would pass a
+            // maySend() check. DENY-ALL means the scope went too.
+            check("a halt that could not be delivered drops to DENY-ALL",
+                  !l.client.isConfigured());
+            check("and the transition is logged", l.log.sawError("halt sink threw, deny-all"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("ht.sock")); Files.deleteIfExists(dir);
         }
     }
 

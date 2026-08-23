@@ -11009,6 +11009,7 @@ about which check was watching.
 // extension/test/hx/send/HaltSwitchTest.java
 package hx.send;
 
+import hx.TestSupport;
 import hx.policy.TickClock;
 
 import java.nio.charset.StandardCharsets;
@@ -11033,6 +11034,14 @@ public class HaltSwitchTest {
         if (!ok) failures++;
     }
 
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(HaltSwitchTest::check, name, body);
+    }
+
     static void expectThrows(String what, Class<?> type, Runnable body) {
         try {
             body.run();
@@ -11053,28 +11062,28 @@ public class HaltSwitchTest {
     static final long T0 = 1_787_355_131_378_277L;
 
     public static void main(String[] args) throws Exception {
-        aFreshSwitchIsNotHalted();
-        aHaltFrameHaltsAndAResumeLiftsIt();
-        aHaltFrameWithNoReasonStillReportsOne();
-        anUnstartedSwitchDoesNotConsultTheSentinel();
+        t("aFreshSwitchIsNotHalted", HaltSwitchTest::aFreshSwitchIsNotHalted);
+        t("aHaltFrameHaltsAndAResumeLiftsIt", HaltSwitchTest::aHaltFrameHaltsAndAResumeLiftsIt);
+        t("aHaltFrameWithNoReasonStillReportsOne", HaltSwitchTest::aHaltFrameWithNoReasonStillReportsOne);
+        t("anUnstartedSwitchDoesNotConsultTheSentinel", HaltSwitchTest::anUnstartedSwitchDoesNotConsultTheSentinel);
 
-        aSentinelThatAlreadyExistsIsInForceBeforeStartReturns();
-        theSentinelIsPolledInBothDirections();
-        presenceIsTheSignalNotContent();
+        t("aSentinelThatAlreadyExistsIsInForceBeforeStartReturns", HaltSwitchTest::aSentinelThatAlreadyExistsIsInForceBeforeStartReturns);
+        t("theSentinelIsPolledInBothDirections", HaltSwitchTest::theSentinelIsPolledInBothDirections);
+        t("presenceIsTheSignalNotContent", HaltSwitchTest::presenceIsTheSignalNotContent);
 
-        theTwoInputsAreIndependent();
+        t("theTwoInputsAreIndependent", HaltSwitchTest::theTwoInputsAreIndependent);
 
-        anUnreadableSentinelIsHalted();
-        aSentinelOnAClosedFileSystemIsHaltedNotAnEscapedException();
-        thePollerSurvivesAFailedPollAndKeepsPolling();
-        aStalledPollerIsHalted();
+        t("anUnreadableSentinelIsHalted", HaltSwitchTest::anUnreadableSentinelIsHalted);
+        t("aSentinelOnAClosedFileSystemIsHaltedNotAnEscapedException", HaltSwitchTest::aSentinelOnAClosedFileSystemIsHaltedNotAnEscapedException);
+        t("thePollerSurvivesAFailedPollAndKeepsPolling", HaltSwitchTest::thePollerSurvivesAFailedPollAndKeepsPolling);
+        t("aStalledPollerIsHalted", HaltSwitchTest::aStalledPollerIsHalted);
 
-        thePollerIsADaemonAndDoesNotOutliveStop();
-        nothingPollsAfterStop();
-        startIsIdempotent();
-        stopIsSafeWhenNeverStartedAndNeverClearsAHalt();
-        stopThenStartPollsAgain();
-        aNonPositivePollIntervalIsRefused();
+        t("thePollerIsADaemonAndDoesNotOutliveStop", HaltSwitchTest::thePollerIsADaemonAndDoesNotOutliveStop);
+        t("nothingPollsAfterStop", HaltSwitchTest::nothingPollsAfterStop);
+        t("startIsIdempotent", HaltSwitchTest::startIsIdempotent);
+        t("stopIsSafeWhenNeverStartedAndNeverClearsAHalt", HaltSwitchTest::stopIsSafeWhenNeverStartedAndNeverClearsAHalt);
+        t("stopThenStartPollsAgain", HaltSwitchTest::stopThenStartPollsAgain);
+        t("aNonPositivePollIntervalIsRefused", HaltSwitchTest::aNonPositivePollIntervalIsRefused);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);

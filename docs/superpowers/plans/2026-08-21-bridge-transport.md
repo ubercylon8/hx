@@ -3431,6 +3431,7 @@ package hx.bridge;
 import static hx.TestSupport.waitUntilBlockedOn;
 
 import hx.TestSupport;
+import hx.send.HaltSwitch;
 
 import java.io.*;
 import java.net.*;
@@ -3566,6 +3567,8 @@ public class BridgeClientTest {
             t("aFailedHelloLeavesNoChannelBehind", BridgeClientTest::aFailedHelloLeavesNoChannelBehind);
             t("theCommitIsExclusiveWithClose", BridgeClientTest::theCommitIsExclusiveWithClose);
             t("aConfigureDoesNotLiftAHalt", BridgeClientTest::aConfigureDoesNotLiftAHalt);
+            t("haltFramesReachTheSwitchTheSendPathAsks", BridgeClientTest::haltFramesReachTheSwitchTheSendPathAsks);
+            t("aHaltSinkThatThrowsDropsToDenyAll", BridgeClientTest::aHaltSinkThatThrowsDropsToDenyAll);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -4092,6 +4095,75 @@ public class BridgeClientTest {
         }
     }
 
+    /**
+     * A `halt` frame has to reach the switch the SEND PATH asks.
+     *
+     * BridgeClient's own `halted` flag guards maySend() and checkMaySend(),
+     * and Sender calls neither: it asks HaltSwitch. Wired up wrongly -- or not
+     * at all -- a halt frame would flip a flag nothing on the send path reads,
+     * both consoles would say "halted", and requests would keep going out. The
+     * failure has no other observable: maySend() answers false either way.
+     */
+    static void haltFramesReachTheSwitchTheSendPathAsks() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsink");
+        // Unstarted, so this test runs no poller thread: the sentinel half is
+        // HaltSwitchTest's business, and the frame half needs no clock -- an
+        // unarmed switch never reads one.
+        HaltSwitch hs = new HaltSwitch(() -> 0L, dir.resolve("halt"), 500L);
+        try (Live l = live(dir, "hs.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { hs.haltedByFrame(reason); }
+                public void resumed()             { hs.resumedByFrame(); }
+            });
+            check("the send path is not halted before the frame", !hs.halted());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "operator pressed stop"), new byte[0]));
+            l.out.flush();
+            waitUntil(hs::halted);
+            check("a halt frame halts the switch the send path asks", hs.halted());
+            check("and the operator's words arrive with it",
+                  "operator pressed stop".equals(hs.reason()));
+            check("and the client's own flag agrees", !l.client.maySend());
+
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !hs.halted());
+            check("a resume frame lifts it on the send path too", !hs.halted());
+            check("and the client is sending again", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("hs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A halt that could not be delivered is an unknown state, and unknown is
+     *  stop. Not "log it and carry on": the frame that was meant to stop
+     *  issuance went nowhere. */
+    static void aHaltSinkThatThrowsDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsinkthrows");
+        try (Live l = live(dir, "ht.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { throw new IllegalStateException("switch is gone"); }
+                public void resumed()             { }
+            });
+            check("configured before the undeliverable halt", l.client.maySend());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "operator pressed stop"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !l.client.isConfigured());
+            // isConfigured(), not maySend(): the local halt flag would answer
+            // maySend() false on its own, so a client that had merely logged
+            // the failure and carried on under the standing scope would pass a
+            // maySend() check. DENY-ALL means the scope went too.
+            check("a halt that could not be delivered drops to DENY-ALL",
+                  !l.client.isConfigured());
+            check("and the transition is logged", l.log.sawError("halt sink threw, deny-all"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("ht.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
     static final byte[] CFG =
             "scope.include\thttps://RACE/*\n".getBytes(StandardCharsets.UTF_8);
 
@@ -4161,6 +4233,28 @@ public final class BridgeClient {
         void info(String s);
         void error(String s);
     }
+
+    /**
+     * Where `halt` and `resume` frames land: the switch the SEND PATH asks.
+     *
+     * HaltSwitch has the matching pair of methods but does not implement this
+     * interface -- hx.send must not take a compile-time dependency on the
+     * bridge for a two-method callback -- so HxExtension installs a delegating
+     * instance, in one place, before it dials.
+     */
+    public interface HaltSink {
+        void halted(String reason);
+        void resumed();
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile HaltSink haltSink;
+
+    /** Install the halt switch. Called before connect(): a client that goes
+     *  live with no sink routes halt frames to its own flag alone, and that
+     *  flag is not what Sender asks. */
+    public void setHaltSink(HaltSink s) { this.haltSink = s; }
 
     private final Path socketPath;
     private final String engagementId;
@@ -4423,15 +4517,51 @@ public final class BridgeClient {
                 send(ack, new byte[0]);
             }
             case "halt" -> {
+                String why = String.valueOf(f.header.get("reason"));
+                // The switch FIRST, this flag second. `halted` here governs
+                // maySend()/checkMaySend(); the send path asks HaltSwitch, and
+                // on the way DOWN the stricter authority is told first.
+                if (!notifyHalt(true, why)) return false;
                 halted.set(true);
-                haltReason = String.valueOf(f.header.get("reason"));
+                haltReason = why;
             }
-            case "resume" -> halted.set(false);
+            case "resume" -> {
+                halted.set(false);
+                // ...and on the way back UP it is told last, so no window
+                // exists in which issuance is armed and the flag behind it is
+                // not. Only a `resume` frame reaches here: a `configure` does
+                // not lift a halt.
+                if (!notifyHalt(false, null)) return false;
+            }
             default -> {
                 error(f, "unknown_frame", "unrecognised frame type " + t);
             }
         }
         return true;
+    }
+
+    /**
+     * Hand a halt or a resume to the switch. Returns false when the read loop
+     * must drop to DENY-ALL and close.
+     *
+     * A sink that throws is the one case that cannot be shrugged off: the
+     * frame that was supposed to stop issuance did not arrive anywhere, and an
+     * exception is never an implicit allow. With no sink installed at all --
+     * the state before HxExtension wires one up -- the local flag is the whole
+     * answer, and nothing can be issued through a client that has no
+     * SendHandler either.
+     */
+    private boolean notifyHalt(boolean halt, String reason) {
+        HaltSink s = haltSink;
+        if (s == null) return true;
+        try {
+            if (halt) s.halted(reason); else s.resumed();
+            return true;
+        } catch (Throwable t) {
+            log.error("hx: halt sink threw, deny-all: " + t);
+            denyAll();
+            return false;
+        }
     }
 
     private void error(Frame.Decoded f, String cls, String detail) throws IOException {

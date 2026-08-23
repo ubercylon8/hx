@@ -21,6 +21,7 @@ CLASSES=(
     hx.policy.LimiterTest
     hx.policy.DistressTest
     hx.send.RedactorTest
+    hx.send.HaltSwitchTest
 )
 
 # Every class runs, whatever the ones before it did, and the run still exits

@@ -37,6 +37,28 @@ public final class BridgeClient {
         void error(String s);
     }
 
+    /**
+     * Where `halt` and `resume` frames land: the switch the SEND PATH asks.
+     *
+     * HaltSwitch has the matching pair of methods but does not implement this
+     * interface -- hx.send must not take a compile-time dependency on the
+     * bridge for a two-method callback -- so HxExtension installs a delegating
+     * instance, in one place, before it dials.
+     */
+    public interface HaltSink {
+        void halted(String reason);
+        void resumed();
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile HaltSink haltSink;
+
+    /** Install the halt switch. Called before connect(): a client that goes
+     *  live with no sink routes halt frames to its own flag alone, and that
+     *  flag is not what Sender asks. */
+    public void setHaltSink(HaltSink s) { this.haltSink = s; }
+
     private final Path socketPath;
     private final String engagementId;
     private final String instanceId;
@@ -298,15 +320,51 @@ public final class BridgeClient {
                 send(ack, new byte[0]);
             }
             case "halt" -> {
+                String why = String.valueOf(f.header.get("reason"));
+                // The switch FIRST, this flag second. `halted` here governs
+                // maySend()/checkMaySend(); the send path asks HaltSwitch, and
+                // on the way DOWN the stricter authority is told first.
+                if (!notifyHalt(true, why)) return false;
                 halted.set(true);
-                haltReason = String.valueOf(f.header.get("reason"));
+                haltReason = why;
             }
-            case "resume" -> halted.set(false);
+            case "resume" -> {
+                halted.set(false);
+                // ...and on the way back UP it is told last, so no window
+                // exists in which issuance is armed and the flag behind it is
+                // not. Only a `resume` frame reaches here: a `configure` does
+                // not lift a halt.
+                if (!notifyHalt(false, null)) return false;
+            }
             default -> {
                 error(f, "unknown_frame", "unrecognised frame type " + t);
             }
         }
         return true;
+    }
+
+    /**
+     * Hand a halt or a resume to the switch. Returns false when the read loop
+     * must drop to DENY-ALL and close.
+     *
+     * A sink that throws is the one case that cannot be shrugged off: the
+     * frame that was supposed to stop issuance did not arrive anywhere, and an
+     * exception is never an implicit allow. With no sink installed at all --
+     * the state before HxExtension wires one up -- the local flag is the whole
+     * answer, and nothing can be issued through a client that has no
+     * SendHandler either.
+     */
+    private boolean notifyHalt(boolean halt, String reason) {
+        HaltSink s = haltSink;
+        if (s == null) return true;
+        try {
+            if (halt) s.halted(reason); else s.resumed();
+            return true;
+        } catch (Throwable t) {
+            log.error("hx: halt sink threw, deny-all: " + t);
+            denyAll();
+            return false;
+        }
     }
 
     private void error(Frame.Decoded f, String cls, String detail) throws IOException {
