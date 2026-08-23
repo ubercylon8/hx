@@ -1,6 +1,8 @@
 // extension/test/hx/policy/PolicyTest.java
 package hx.policy;
 
+import hx.TestSupport;
+
 import hx.bridge.BridgeClient;
 
 import java.nio.charset.StandardCharsets;
@@ -19,6 +21,14 @@ public class PolicyTest {
         if (!ok) failures++;
     }
 
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(PolicyTest::check, name, body);
+    }
+
     static void expectThrows(String what, Class<?> type, Runnable body) {
         try {
             body.run();
@@ -29,62 +39,62 @@ public class PolicyTest {
     }
 
     public static void main(String[] args) throws Exception {
-        theVerdictTypeCarriesItsClassAndItsHint();
-        aRequestFieldThatIsNullIsARejectedFrameNotANullPointer();
-        epochZeroIsNotConfigured();
-        anInScopeRequestIsAllowed();
-        scopeMatchesSchemeHostPortAndPath();
-        aWildcardSubdomainDoesNotMatchTheApex();
-        theHostHalfIsGuardedInBothOfItsParts();
-        aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes();
-        aPatternWithANonAsciiCharacterAuthorisesItsEncodedForm();
-        onlyTheTwoRealDotSegmentsSurviveTheTrim();
-        excludeBeatsInclude();
-        anUnusableScopePatternDeniesEverything();
-        userinfoInTheAuthorityCannotSatisfyScope();
-        aPortSmuggledIntoTheHostCannotSatisfyScope();
-        aUrlThatDisagreesWithItsOwnPathIsRefused();
-        theMethodAllowlistDefaultsToTheProductionProfile();
-        anExplicitMethodAllowReplacesTheDefault();
-        methodsAreCaseSensitive();
-        theDangerousDenylistShipsWithDefaults();
-        operatorDangerousPatternsAddToTheDefaults();
-        theReadingSetIsSpelledOutCharacterByCharacter();
-        bothDotSegmentOrdersAreInTheSet();
-        decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep();
-        everyBestFitEntryIsGuardedByACheckOfItsOwn();
-        theBestFitFoldSplitsByTargetClassNotByHand();
-        theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne();
-        thePatternSpellingAxisOfTheLetterFoldHasInputsThatNeedIt();
-        anIncludeIsNotWidenedByASegmentTransform();
-        aNulEndsTheStringForAnythingThatReachesACApi();
-        theReadingSetIsClosedUnderItsOwnTransforms();
-        aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation();
-        theQueryHalfGetsTheSameByteFoldsThePathHalfGets();
-        theDangerousDenylistReadsThePathWhenAQueryIsPresent();
-        anEmptyScopePatternIsAnUnusableOneAndDeniesEverything();
-        aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading();
-        theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading();
-        lowerFoldsTheWholeStringAndNotAPrefixOfIt();
-        everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt();
-        aDenyRuleSeesEveryReadingOfThePath();
-        anIncludeMustMatchEveryReadingOfThePath();
-        aPathParameterIsStrippedBeforeTheServerNormalises();
-        aBackslashIsReadAsASeparator();
-        aTrailingDotSpaceOrNulIsTrimmed();
-        aSegmentOfNothingButASpaceOrANulIsStillTrimmed();
-        overlongUtf8IsReadAsTheAsciiItDecodesTo();
-        theRawPathIsAReadingInItsOwnRight();
-        aPatternIsReadEveryWayAPathIs();
-        aTargetTooBigToDecideAboutIsRefused();
-        aReadingSetOverTheLimitIsRefused();
-        aLegitimatelyEncodedPathIsStillAllowed();
-        aTrailingSlashIsNotNewlyRefused();
-        aPathOfOnlySlashesDoesNotThrow();
-        aMalformedAuthorisationIsADecisionNotACrash();
-        theRefusalOrderIsPinned();
-        aBrokenGateIsNeverAnAllow();
-        policyNamesNoBurpType();
+        t("theVerdictTypeCarriesItsClassAndItsHint", PolicyTest::theVerdictTypeCarriesItsClassAndItsHint);
+        t("aRequestFieldThatIsNullIsARejectedFrameNotANullPointer", PolicyTest::aRequestFieldThatIsNullIsARejectedFrameNotANullPointer);
+        t("epochZeroIsNotConfigured", PolicyTest::epochZeroIsNotConfigured);
+        t("anInScopeRequestIsAllowed", PolicyTest::anInScopeRequestIsAllowed);
+        t("scopeMatchesSchemeHostPortAndPath", PolicyTest::scopeMatchesSchemeHostPortAndPath);
+        t("aWildcardSubdomainDoesNotMatchTheApex", PolicyTest::aWildcardSubdomainDoesNotMatchTheApex);
+        t("theHostHalfIsGuardedInBothOfItsParts", PolicyTest::theHostHalfIsGuardedInBothOfItsParts);
+        t("aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes", PolicyTest::aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes);
+        t("aPatternWithANonAsciiCharacterAuthorisesItsEncodedForm", PolicyTest::aPatternWithANonAsciiCharacterAuthorisesItsEncodedForm);
+        t("onlyTheTwoRealDotSegmentsSurviveTheTrim", PolicyTest::onlyTheTwoRealDotSegmentsSurviveTheTrim);
+        t("excludeBeatsInclude", PolicyTest::excludeBeatsInclude);
+        t("anUnusableScopePatternDeniesEverything", PolicyTest::anUnusableScopePatternDeniesEverything);
+        t("userinfoInTheAuthorityCannotSatisfyScope", PolicyTest::userinfoInTheAuthorityCannotSatisfyScope);
+        t("aPortSmuggledIntoTheHostCannotSatisfyScope", PolicyTest::aPortSmuggledIntoTheHostCannotSatisfyScope);
+        t("aUrlThatDisagreesWithItsOwnPathIsRefused", PolicyTest::aUrlThatDisagreesWithItsOwnPathIsRefused);
+        t("theMethodAllowlistDefaultsToTheProductionProfile", PolicyTest::theMethodAllowlistDefaultsToTheProductionProfile);
+        t("anExplicitMethodAllowReplacesTheDefault", PolicyTest::anExplicitMethodAllowReplacesTheDefault);
+        t("methodsAreCaseSensitive", PolicyTest::methodsAreCaseSensitive);
+        t("theDangerousDenylistShipsWithDefaults", PolicyTest::theDangerousDenylistShipsWithDefaults);
+        t("operatorDangerousPatternsAddToTheDefaults", PolicyTest::operatorDangerousPatternsAddToTheDefaults);
+        t("theReadingSetIsSpelledOutCharacterByCharacter", PolicyTest::theReadingSetIsSpelledOutCharacterByCharacter);
+        t("bothDotSegmentOrdersAreInTheSet", PolicyTest::bothDotSegmentOrdersAreInTheSet);
+        t("decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep", PolicyTest::decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep);
+        t("everyBestFitEntryIsGuardedByACheckOfItsOwn", PolicyTest::everyBestFitEntryIsGuardedByACheckOfItsOwn);
+        t("theBestFitFoldSplitsByTargetClassNotByHand", PolicyTest::theBestFitFoldSplitsByTargetClassNotByHand);
+        t("theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne", PolicyTest::theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne);
+        t("thePatternSpellingAxisOfTheLetterFoldHasInputsThatNeedIt", PolicyTest::thePatternSpellingAxisOfTheLetterFoldHasInputsThatNeedIt);
+        t("anIncludeIsNotWidenedByASegmentTransform", PolicyTest::anIncludeIsNotWidenedByASegmentTransform);
+        t("aNulEndsTheStringForAnythingThatReachesACApi", PolicyTest::aNulEndsTheStringForAnythingThatReachesACApi);
+        t("theReadingSetIsClosedUnderItsOwnTransforms", PolicyTest::theReadingSetIsClosedUnderItsOwnTransforms);
+        t("aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation", PolicyTest::aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation);
+        t("theQueryHalfGetsTheSameByteFoldsThePathHalfGets", PolicyTest::theQueryHalfGetsTheSameByteFoldsThePathHalfGets);
+        t("theDangerousDenylistReadsThePathWhenAQueryIsPresent", PolicyTest::theDangerousDenylistReadsThePathWhenAQueryIsPresent);
+        t("anEmptyScopePatternIsAnUnusableOneAndDeniesEverything", PolicyTest::anEmptyScopePatternIsAnUnusableOneAndDeniesEverything);
+        t("aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading", PolicyTest::aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading);
+        t("theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading", PolicyTest::theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading);
+        t("lowerFoldsTheWholeStringAndNotAPrefixOfIt", PolicyTest::lowerFoldsTheWholeStringAndNotAPrefixOfIt);
+        t("everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt", PolicyTest::everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt);
+        t("aDenyRuleSeesEveryReadingOfThePath", PolicyTest::aDenyRuleSeesEveryReadingOfThePath);
+        t("anIncludeMustMatchEveryReadingOfThePath", PolicyTest::anIncludeMustMatchEveryReadingOfThePath);
+        t("aPathParameterIsStrippedBeforeTheServerNormalises", PolicyTest::aPathParameterIsStrippedBeforeTheServerNormalises);
+        t("aBackslashIsReadAsASeparator", PolicyTest::aBackslashIsReadAsASeparator);
+        t("aTrailingDotSpaceOrNulIsTrimmed", PolicyTest::aTrailingDotSpaceOrNulIsTrimmed);
+        t("aSegmentOfNothingButASpaceOrANulIsStillTrimmed", PolicyTest::aSegmentOfNothingButASpaceOrANulIsStillTrimmed);
+        t("overlongUtf8IsReadAsTheAsciiItDecodesTo", PolicyTest::overlongUtf8IsReadAsTheAsciiItDecodesTo);
+        t("theRawPathIsAReadingInItsOwnRight", PolicyTest::theRawPathIsAReadingInItsOwnRight);
+        t("aPatternIsReadEveryWayAPathIs", PolicyTest::aPatternIsReadEveryWayAPathIs);
+        t("aTargetTooBigToDecideAboutIsRefused", PolicyTest::aTargetTooBigToDecideAboutIsRefused);
+        t("aReadingSetOverTheLimitIsRefused", PolicyTest::aReadingSetOverTheLimitIsRefused);
+        t("aLegitimatelyEncodedPathIsStillAllowed", PolicyTest::aLegitimatelyEncodedPathIsStillAllowed);
+        t("aTrailingSlashIsNotNewlyRefused", PolicyTest::aTrailingSlashIsNotNewlyRefused);
+        t("aPathOfOnlySlashesDoesNotThrow", PolicyTest::aPathOfOnlySlashesDoesNotThrow);
+        t("aMalformedAuthorisationIsADecisionNotACrash", PolicyTest::aMalformedAuthorisationIsADecisionNotACrash);
+        t("theRefusalOrderIsPinned", PolicyTest::theRefusalOrderIsPinned);
+        t("aBrokenGateIsNeverAnAllow", PolicyTest::aBrokenGateIsNeverAnAllow);
+        t("policyNamesNoBurpType", PolicyTest::policyNamesNoBurpType);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);

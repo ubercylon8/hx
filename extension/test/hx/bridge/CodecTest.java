@@ -1,5 +1,7 @@
 package hx.bridge;
 
+import hx.TestSupport;
+
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,6 +20,14 @@ public class CodecTest {
         if (!ok) failures++;
     }
 
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(CodecTest::check, name, body);
+    }
+
     static void expectThrows(String what, Class<?> type, Runnable body) {
         try {
             body.run();
@@ -28,22 +38,22 @@ public class CodecTest {
     }
 
     public static void main(String[] args) throws Exception {
-        headerRoundTrip();
-        bodyIsVerbatim();
-        bodyNewlinesDoNotConfuseTheHeaderSplit();
-        incompleteIsDistinctFromCorrupt();
-        oversizedLengthIsRefused();
-        readReassemblesAcrossChunks();
-        readerKeepsCoalescedFrames();
-        readerSurvivesArbitraryChunkBoundaries();
-        readerDistinguishesCleanCloseFromTruncation();
-        readerRejectsAnOversizedPrefixBeforeAllocating();
-        configBody();
-        configBodyResultIsFrozen();
-        goldenVectors();
-        malformedInputsAreRejected();
-        invalidUtf8HeaderIsRejected();
-        pairedSurrogateEqualsRawSupplementaryCharacter();
+        t("headerRoundTrip", CodecTest::headerRoundTrip);
+        t("bodyIsVerbatim", CodecTest::bodyIsVerbatim);
+        t("bodyNewlinesDoNotConfuseTheHeaderSplit", CodecTest::bodyNewlinesDoNotConfuseTheHeaderSplit);
+        t("incompleteIsDistinctFromCorrupt", CodecTest::incompleteIsDistinctFromCorrupt);
+        t("oversizedLengthIsRefused", CodecTest::oversizedLengthIsRefused);
+        t("readReassemblesAcrossChunks", CodecTest::readReassemblesAcrossChunks);
+        t("readerKeepsCoalescedFrames", CodecTest::readerKeepsCoalescedFrames);
+        t("readerSurvivesArbitraryChunkBoundaries", CodecTest::readerSurvivesArbitraryChunkBoundaries);
+        t("readerDistinguishesCleanCloseFromTruncation", CodecTest::readerDistinguishesCleanCloseFromTruncation);
+        t("readerRejectsAnOversizedPrefixBeforeAllocating", CodecTest::readerRejectsAnOversizedPrefixBeforeAllocating);
+        t("configBody", CodecTest::configBody);
+        t("configBodyResultIsFrozen", CodecTest::configBodyResultIsFrozen);
+        t("goldenVectors", CodecTest::goldenVectors);
+        t("malformedInputsAreRejected", CodecTest::malformedInputsAreRejected);
+        t("invalidUtf8HeaderIsRejected", CodecTest::invalidUtf8HeaderIsRejected);
+        t("pairedSurrogateEqualsRawSupplementaryCharacter", CodecTest::pairedSurrogateEqualsRawSupplementaryCharacter);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);

@@ -316,6 +316,8 @@ ordering block is unambiguous about which rule moved.
 // extension/test/hx/policy/PolicyTest.java
 package hx.policy;
 
+import hx.TestSupport;
+
 import hx.bridge.BridgeClient;
 
 import java.nio.charset.StandardCharsets;
@@ -334,6 +336,14 @@ public class PolicyTest {
         if (!ok) failures++;
     }
 
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(PolicyTest::check, name, body);
+    }
+
     static void expectThrows(String what, Class<?> type, Runnable body) {
         try {
             body.run();
@@ -344,62 +354,62 @@ public class PolicyTest {
     }
 
     public static void main(String[] args) throws Exception {
-        theVerdictTypeCarriesItsClassAndItsHint();
-        aRequestFieldThatIsNullIsARejectedFrameNotANullPointer();
-        epochZeroIsNotConfigured();
-        anInScopeRequestIsAllowed();
-        scopeMatchesSchemeHostPortAndPath();
-        aWildcardSubdomainDoesNotMatchTheApex();
-        theHostHalfIsGuardedInBothOfItsParts();
-        aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes();
-        aPatternWithANonAsciiCharacterAuthorisesItsEncodedForm();
-        onlyTheTwoRealDotSegmentsSurviveTheTrim();
-        excludeBeatsInclude();
-        anUnusableScopePatternDeniesEverything();
-        userinfoInTheAuthorityCannotSatisfyScope();
-        aPortSmuggledIntoTheHostCannotSatisfyScope();
-        aUrlThatDisagreesWithItsOwnPathIsRefused();
-        theMethodAllowlistDefaultsToTheProductionProfile();
-        anExplicitMethodAllowReplacesTheDefault();
-        methodsAreCaseSensitive();
-        theDangerousDenylistShipsWithDefaults();
-        operatorDangerousPatternsAddToTheDefaults();
-        theReadingSetIsSpelledOutCharacterByCharacter();
-        bothDotSegmentOrdersAreInTheSet();
-        decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep();
-        everyBestFitEntryIsGuardedByACheckOfItsOwn();
-        theBestFitFoldSplitsByTargetClassNotByHand();
-        theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne();
-        thePatternSpellingAxisOfTheLetterFoldHasInputsThatNeedIt();
-        anIncludeIsNotWidenedByASegmentTransform();
-        aNulEndsTheStringForAnythingThatReachesACApi();
-        theReadingSetIsClosedUnderItsOwnTransforms();
-        aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation();
-        theQueryHalfGetsTheSameByteFoldsThePathHalfGets();
-        theDangerousDenylistReadsThePathWhenAQueryIsPresent();
-        anEmptyScopePatternIsAnUnusableOneAndDeniesEverything();
-        aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading();
-        theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading();
-        lowerFoldsTheWholeStringAndNotAPrefixOfIt();
-        everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt();
-        aDenyRuleSeesEveryReadingOfThePath();
-        anIncludeMustMatchEveryReadingOfThePath();
-        aPathParameterIsStrippedBeforeTheServerNormalises();
-        aBackslashIsReadAsASeparator();
-        aTrailingDotSpaceOrNulIsTrimmed();
-        aSegmentOfNothingButASpaceOrANulIsStillTrimmed();
-        overlongUtf8IsReadAsTheAsciiItDecodesTo();
-        theRawPathIsAReadingInItsOwnRight();
-        aPatternIsReadEveryWayAPathIs();
-        aTargetTooBigToDecideAboutIsRefused();
-        aReadingSetOverTheLimitIsRefused();
-        aLegitimatelyEncodedPathIsStillAllowed();
-        aTrailingSlashIsNotNewlyRefused();
-        aPathOfOnlySlashesDoesNotThrow();
-        aMalformedAuthorisationIsADecisionNotACrash();
-        theRefusalOrderIsPinned();
-        aBrokenGateIsNeverAnAllow();
-        policyNamesNoBurpType();
+        t("theVerdictTypeCarriesItsClassAndItsHint", PolicyTest::theVerdictTypeCarriesItsClassAndItsHint);
+        t("aRequestFieldThatIsNullIsARejectedFrameNotANullPointer", PolicyTest::aRequestFieldThatIsNullIsARejectedFrameNotANullPointer);
+        t("epochZeroIsNotConfigured", PolicyTest::epochZeroIsNotConfigured);
+        t("anInScopeRequestIsAllowed", PolicyTest::anInScopeRequestIsAllowed);
+        t("scopeMatchesSchemeHostPortAndPath", PolicyTest::scopeMatchesSchemeHostPortAndPath);
+        t("aWildcardSubdomainDoesNotMatchTheApex", PolicyTest::aWildcardSubdomainDoesNotMatchTheApex);
+        t("theHostHalfIsGuardedInBothOfItsParts", PolicyTest::theHostHalfIsGuardedInBothOfItsParts);
+        t("aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes", PolicyTest::aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes);
+        t("aPatternWithANonAsciiCharacterAuthorisesItsEncodedForm", PolicyTest::aPatternWithANonAsciiCharacterAuthorisesItsEncodedForm);
+        t("onlyTheTwoRealDotSegmentsSurviveTheTrim", PolicyTest::onlyTheTwoRealDotSegmentsSurviveTheTrim);
+        t("excludeBeatsInclude", PolicyTest::excludeBeatsInclude);
+        t("anUnusableScopePatternDeniesEverything", PolicyTest::anUnusableScopePatternDeniesEverything);
+        t("userinfoInTheAuthorityCannotSatisfyScope", PolicyTest::userinfoInTheAuthorityCannotSatisfyScope);
+        t("aPortSmuggledIntoTheHostCannotSatisfyScope", PolicyTest::aPortSmuggledIntoTheHostCannotSatisfyScope);
+        t("aUrlThatDisagreesWithItsOwnPathIsRefused", PolicyTest::aUrlThatDisagreesWithItsOwnPathIsRefused);
+        t("theMethodAllowlistDefaultsToTheProductionProfile", PolicyTest::theMethodAllowlistDefaultsToTheProductionProfile);
+        t("anExplicitMethodAllowReplacesTheDefault", PolicyTest::anExplicitMethodAllowReplacesTheDefault);
+        t("methodsAreCaseSensitive", PolicyTest::methodsAreCaseSensitive);
+        t("theDangerousDenylistShipsWithDefaults", PolicyTest::theDangerousDenylistShipsWithDefaults);
+        t("operatorDangerousPatternsAddToTheDefaults", PolicyTest::operatorDangerousPatternsAddToTheDefaults);
+        t("theReadingSetIsSpelledOutCharacterByCharacter", PolicyTest::theReadingSetIsSpelledOutCharacterByCharacter);
+        t("bothDotSegmentOrdersAreInTheSet", PolicyTest::bothDotSegmentOrdersAreInTheSet);
+        t("decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep", PolicyTest::decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep);
+        t("everyBestFitEntryIsGuardedByACheckOfItsOwn", PolicyTest::everyBestFitEntryIsGuardedByACheckOfItsOwn);
+        t("theBestFitFoldSplitsByTargetClassNotByHand", PolicyTest::theBestFitFoldSplitsByTargetClassNotByHand);
+        t("theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne", PolicyTest::theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne);
+        t("thePatternSpellingAxisOfTheLetterFoldHasInputsThatNeedIt", PolicyTest::thePatternSpellingAxisOfTheLetterFoldHasInputsThatNeedIt);
+        t("anIncludeIsNotWidenedByASegmentTransform", PolicyTest::anIncludeIsNotWidenedByASegmentTransform);
+        t("aNulEndsTheStringForAnythingThatReachesACApi", PolicyTest::aNulEndsTheStringForAnythingThatReachesACApi);
+        t("theReadingSetIsClosedUnderItsOwnTransforms", PolicyTest::theReadingSetIsClosedUnderItsOwnTransforms);
+        t("aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation", PolicyTest::aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation);
+        t("theQueryHalfGetsTheSameByteFoldsThePathHalfGets", PolicyTest::theQueryHalfGetsTheSameByteFoldsThePathHalfGets);
+        t("theDangerousDenylistReadsThePathWhenAQueryIsPresent", PolicyTest::theDangerousDenylistReadsThePathWhenAQueryIsPresent);
+        t("anEmptyScopePatternIsAnUnusableOneAndDeniesEverything", PolicyTest::anEmptyScopePatternIsAnUnusableOneAndDeniesEverything);
+        t("aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading", PolicyTest::aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading);
+        t("theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading", PolicyTest::theDangerousPassFoldsTheCaseOfAnUncollapsedRawReading);
+        t("lowerFoldsTheWholeStringAndNotAPrefixOfIt", PolicyTest::lowerFoldsTheWholeStringAndNotAPrefixOfIt);
+        t("everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt", PolicyTest::everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt);
+        t("aDenyRuleSeesEveryReadingOfThePath", PolicyTest::aDenyRuleSeesEveryReadingOfThePath);
+        t("anIncludeMustMatchEveryReadingOfThePath", PolicyTest::anIncludeMustMatchEveryReadingOfThePath);
+        t("aPathParameterIsStrippedBeforeTheServerNormalises", PolicyTest::aPathParameterIsStrippedBeforeTheServerNormalises);
+        t("aBackslashIsReadAsASeparator", PolicyTest::aBackslashIsReadAsASeparator);
+        t("aTrailingDotSpaceOrNulIsTrimmed", PolicyTest::aTrailingDotSpaceOrNulIsTrimmed);
+        t("aSegmentOfNothingButASpaceOrANulIsStillTrimmed", PolicyTest::aSegmentOfNothingButASpaceOrANulIsStillTrimmed);
+        t("overlongUtf8IsReadAsTheAsciiItDecodesTo", PolicyTest::overlongUtf8IsReadAsTheAsciiItDecodesTo);
+        t("theRawPathIsAReadingInItsOwnRight", PolicyTest::theRawPathIsAReadingInItsOwnRight);
+        t("aPatternIsReadEveryWayAPathIs", PolicyTest::aPatternIsReadEveryWayAPathIs);
+        t("aTargetTooBigToDecideAboutIsRefused", PolicyTest::aTargetTooBigToDecideAboutIsRefused);
+        t("aReadingSetOverTheLimitIsRefused", PolicyTest::aReadingSetOverTheLimitIsRefused);
+        t("aLegitimatelyEncodedPathIsStillAllowed", PolicyTest::aLegitimatelyEncodedPathIsStillAllowed);
+        t("aTrailingSlashIsNotNewlyRefused", PolicyTest::aTrailingSlashIsNotNewlyRefused);
+        t("aPathOfOnlySlashesDoesNotThrow", PolicyTest::aPathOfOnlySlashesDoesNotThrow);
+        t("aMalformedAuthorisationIsADecisionNotACrash", PolicyTest::aMalformedAuthorisationIsADecisionNotACrash);
+        t("theRefusalOrderIsPinned", PolicyTest::theRefusalOrderIsPinned);
+        t("aBrokenGateIsNeverAnAllow", PolicyTest::aBrokenGateIsNeverAnAllow);
+        t("policyNamesNoBurpType", PolicyTest::policyNamesNoBurpType);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -6949,6 +6959,47 @@ public final class TestSupport {
 
     private TestSupport() {}
 
+    /** One test method, as {@link #t} runs it. Declared to throw, because the
+     *  whole point of the guard is the methods that do. */
+    public interface Body { void run() throws Exception; }
+
+    /**
+     * How a test class records a result. Every runner here keeps its OWN
+     * {@code check(String, boolean)} and its own {@code failures} counter, so
+     * the guard is handed the one that belongs to the class being run rather
+     * than reaching for a shared static: {@code t("x", Foo::x)} in each class
+     * is a one-line binding of {@code Foo::check}, and a FAIL raised here
+     * lands in the same count and the same summary line as every other FAIL in
+     * that class.
+     */
+    public interface Reporter { void check(String what, boolean ok); }
+
+    /**
+     * Run one test method so that a throw out of it is a NAMED FAILURE rather
+     * than the end of the run.
+     *
+     * Without this, any throw -- an NPE on a null a sabotage introduced, an
+     * IOException from a socket -- propagates out of {@code main()}: the
+     * methods after it never run, {@code failures} is never printed, and there
+     * is NO summary line at all. The exit code is still 1, so CI notices, but
+     * every count taken from that run is a count of how far the runner got.
+     * Measured on Policy.java: of 23 compiling single-guard mutants, 13 print
+     * zero FAIL lines, so the summary line is the only thing separating a real
+     * green from a truncation -- and under {@code ./test.sh | grep -c FAIL},
+     * the idiom this project's briefs prescribe, a truncation reads as 0.
+     *
+     * Catching {@link Throwable} rather than {@link Exception} is deliberate:
+     * an {@link AssertionError} or a {@link StackOverflowError} out of a test
+     * method truncates a run exactly as an NPE does.
+     */
+    public static void t(Reporter reporter, String name, Body body) {
+        try {
+            body.run();
+        } catch (Throwable e) {
+            reporter.check(name + " threw " + e, false);
+        }
+    }
+
     /**
      * True once `t` is BLOCKED on `monitor` specifically -- the deterministic
      * way to prove a thread is parked on a particular lock, as opposed to
@@ -6998,6 +7049,8 @@ the microsecond it **rolls**. No sleeps anywhere.
 // extension/test/hx/policy/LimiterTest.java
 package hx.policy;
 
+import hx.TestSupport;
+
 import static hx.TestSupport.waitUntilBlockedOn;
 
 import java.lang.reflect.Constructor;
@@ -7016,6 +7069,14 @@ public class LimiterTest {
     static void check(String what, boolean ok) {
         System.out.println((ok ? "  ok   " : "  FAIL ") + what);
         if (!ok) failures++;
+    }
+
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(LimiterTest::check, name, body);
     }
 
     static void expectThrows(String what, Class<?> type, Runnable body) {
@@ -7042,20 +7103,20 @@ public class LimiterTest {
     static final HxRequest API_ORDERS = get("api.example.test", "/v2/orders");
 
     public static void main(String[] args) throws Exception {
-        theWindowIsExactAtItsBoundaries();
-        retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore();
-        rateIsAnsweredBeforeBudget();
-        theBudgetIsMonotonicAndTimeDoesNotRefillIt();
-        nothingOnThisClassCanRefillASpentBudget();
-        aZeroBudgetIssuesNothing();
-        theConstructorRefusesLimitsItCannotEnforce();
-        theLimitIsWholeRunNotPerHost();
-        aBackwardsClockCanOnlyOverRestrict();
-        theWindowArithmeticDoesNotOverflowNearLongMaxValue();
-        aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow();
-        concurrentCallersCannotExceedEitherLimit();
-        checkIsExclusiveWithItselfDeterministically();
-        waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState();
+        t("theWindowIsExactAtItsBoundaries", LimiterTest::theWindowIsExactAtItsBoundaries);
+        t("retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore", LimiterTest::retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore);
+        t("rateIsAnsweredBeforeBudget", LimiterTest::rateIsAnsweredBeforeBudget);
+        t("theBudgetIsMonotonicAndTimeDoesNotRefillIt", LimiterTest::theBudgetIsMonotonicAndTimeDoesNotRefillIt);
+        t("nothingOnThisClassCanRefillASpentBudget", LimiterTest::nothingOnThisClassCanRefillASpentBudget);
+        t("aZeroBudgetIssuesNothing", LimiterTest::aZeroBudgetIssuesNothing);
+        t("theConstructorRefusesLimitsItCannotEnforce", LimiterTest::theConstructorRefusesLimitsItCannotEnforce);
+        t("theLimitIsWholeRunNotPerHost", LimiterTest::theLimitIsWholeRunNotPerHost);
+        t("aBackwardsClockCanOnlyOverRestrict", LimiterTest::aBackwardsClockCanOnlyOverRestrict);
+        t("theWindowArithmeticDoesNotOverflowNearLongMaxValue", LimiterTest::theWindowArithmeticDoesNotOverflowNearLongMaxValue);
+        t("aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow", LimiterTest::aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow);
+        t("concurrentCallersCannotExceedEitherLimit", LimiterTest::concurrentCallersCannotExceedEitherLimit);
+        t("checkIsExclusiveWithItselfDeterministically", LimiterTest::checkIsExclusiveWithItselfDeterministically);
+        t("waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState", LimiterTest::waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -7077,10 +7138,12 @@ public class LimiterTest {
         check("the 6th request in the same microsecond is refused", !sixth.allowed());
         check("...as rate_limited", "rate_limited".equals(sixth.errorClass()));
         check("...retrying after the whole second, 1000000us", sixth.retryAfterUs() == 1_000_000L);
-        // String.valueOf, not sixth.detail(): a broken limiter returns an
-        // ALLOW here, whose detail is null, and an NPE would abort the run --
-        // hiding the verdict of every check after this line, which is most of
-        // them.
+        // String.valueOf, not sixth.detail(): a broken limiter returns an ALLOW
+        // here, whose detail is null. The per-method guard now catches the NPE
+        // that used to end the run, so this is no longer load-bearing -- but it
+        // is still the better failure. The guard collapses a whole method into
+        // ONE line naming a throw; this keeps the eleven checks after it in
+        // theWindowIsExactAtItsBoundaries running and reports THIS one by name.
         check("...with a detail that names the limit",
               String.valueOf(sixth.detail()).contains("5/s"));
 
@@ -7919,6 +7982,8 @@ Nineteen cases. The four the task exists for — 20% exactly versus one over, th
 // extension/test/hx/policy/DistressTest.java
 package hx.policy;
 
+import hx.TestSupport;
+
 /**
  * Hand-rolled runner: JUnit would be a dependency, and this jar has none.
  *
@@ -7935,6 +8000,14 @@ public class DistressTest {
     static void check(String what, boolean ok) {
         System.out.println((ok ? "  ok   " : "  FAIL ") + what);
         if (!ok) failures++;
+    }
+
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(DistressTest::check, name, body);
     }
 
     static void expectThrows(String what, Class<?> type, Runnable body) {
@@ -7961,35 +8034,35 @@ public class DistressTest {
     static Distress fresh(TickClock clock) { return new Distress(clock, 0.20, 5.0, 5); }
 
     public static void main(String[] args) {
-        healthyTrafficNeverTrips();
-        aSlowButConsistentHostIsNotADistressedOne();
-        fiveXxRateAtExactlyTheThresholdDoesNotTrip();
-        oneMoreFiveXxOverTheThresholdTrips();
-        aRateNeedsEnoughSamplesToBeARate();
-        connectionErrorsAreNotCountedAgainstTheFiveXxRate();
-        fourErrorsThenASuccessThenFourMoreDoesNotTrip();
-        aFiveHundredThreeIsAResponseNotAConnectionError();
-        theTenthRequestEstablishesTheBaselineTheEleventhIsMeasured();
-        latencyAtExactlyFiveTimesBaselineDoesNotTrip();
-        oneMillisecondOverFiveTimesBaselineTrips();
-        aSubMillisecondBaselineDoesNotMakeJitterDistress();
-        theLatencyFloorDelaysTheRuleItDoesNotDisableIt();
-        theWindowRollsByCount();
-        theWindowRollsByTime();
-        hostsAreCountedSeparately();
-        aTrippedDistressStaysTripped();
-        aWindowThatCannotHoldASampleIsRefused();
-        theHaltedFrameCanNameTheWindow();
+        t("healthyTrafficNeverTrips", DistressTest::healthyTrafficNeverTrips);
+        t("aSlowButConsistentHostIsNotADistressedOne", DistressTest::aSlowButConsistentHostIsNotADistressedOne);
+        t("fiveXxRateAtExactlyTheThresholdDoesNotTrip", DistressTest::fiveXxRateAtExactlyTheThresholdDoesNotTrip);
+        t("oneMoreFiveXxOverTheThresholdTrips", DistressTest::oneMoreFiveXxOverTheThresholdTrips);
+        t("aRateNeedsEnoughSamplesToBeARate", DistressTest::aRateNeedsEnoughSamplesToBeARate);
+        t("connectionErrorsAreNotCountedAgainstTheFiveXxRate", DistressTest::connectionErrorsAreNotCountedAgainstTheFiveXxRate);
+        t("fourErrorsThenASuccessThenFourMoreDoesNotTrip", DistressTest::fourErrorsThenASuccessThenFourMoreDoesNotTrip);
+        t("aFiveHundredThreeIsAResponseNotAConnectionError", DistressTest::aFiveHundredThreeIsAResponseNotAConnectionError);
+        t("theTenthRequestEstablishesTheBaselineTheEleventhIsMeasured", DistressTest::theTenthRequestEstablishesTheBaselineTheEleventhIsMeasured);
+        t("latencyAtExactlyFiveTimesBaselineDoesNotTrip", DistressTest::latencyAtExactlyFiveTimesBaselineDoesNotTrip);
+        t("oneMillisecondOverFiveTimesBaselineTrips", DistressTest::oneMillisecondOverFiveTimesBaselineTrips);
+        t("aSubMillisecondBaselineDoesNotMakeJitterDistress", DistressTest::aSubMillisecondBaselineDoesNotMakeJitterDistress);
+        t("theLatencyFloorDelaysTheRuleItDoesNotDisableIt", DistressTest::theLatencyFloorDelaysTheRuleItDoesNotDisableIt);
+        t("theWindowRollsByCount", DistressTest::theWindowRollsByCount);
+        t("theWindowRollsByTime", DistressTest::theWindowRollsByTime);
+        t("hostsAreCountedSeparately", DistressTest::hostsAreCountedSeparately);
+        t("aTrippedDistressStaysTripped", DistressTest::aTrippedDistressStaysTripped);
+        t("aWindowThatCannotHoldASampleIsRefused", DistressTest::aWindowThatCannotHoldASampleIsRefused);
+        t("theHaltedFrameCanNameTheWindow", DistressTest::theHaltedFrameCanNameTheWindow);
 
         // Fix round 1: the cutoff-arithmetic overflow (critical), the
         // forward-spike/backward-correction eviction freeze (moderate), and
         // the unguarded zero-baseline clamp (minor).
-        theConstructorRefusesAWindowMsAboveTheOverflowCeiling();
-        anUnrepresentableWindowBoundTripsRatherThanGoingSilentlyDark();
-        theWindowArithmeticDoesNotOverflowNearLongMaxValueEither();
-        aTransientForwardClockSpikeDoesNotFreezeTimeBasedEvictionBehindIt();
-        aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero();
-        anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall();
+        t("theConstructorRefusesAWindowMsAboveTheOverflowCeiling", DistressTest::theConstructorRefusesAWindowMsAboveTheOverflowCeiling);
+        t("anUnrepresentableWindowBoundTripsRatherThanGoingSilentlyDark", DistressTest::anUnrepresentableWindowBoundTripsRatherThanGoingSilentlyDark);
+        t("theWindowArithmeticDoesNotOverflowNearLongMaxValueEither", DistressTest::theWindowArithmeticDoesNotOverflowNearLongMaxValueEither);
+        t("aTransientForwardClockSpikeDoesNotFreezeTimeBasedEvictionBehindIt", DistressTest::aTransientForwardClockSpikeDoesNotFreezeTimeBasedEvictionBehindIt);
+        t("aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero", DistressTest::aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero);
+        t("anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall", DistressTest::anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -8265,6 +8338,14 @@ public class DistressTest {
         // identically against commit 9a59b1a's own DistressTest.java, so the
         // original sabotage table's "11/11, matches exactly" for row 1 was
         // true by accident -- the run never got far enough to check the rest.
+        //
+        // That was the ninth false claim on this branch and the one that
+        // indicted the runner rather than the code; the per-method guard in
+        // hx.TestSupport is the general fix, and row 1 now measures 14 FAILs
+        // over a class that runs all the way to its summary line. This line
+        // keeps Objects.equals anyway, because the guard is coarser than it
+        // is: the guard reports ONE failure naming a throw and skips the four
+        // checks after it, where this reports the property that broke.
         check("a healthy host does not clear a trip",
               java.util.Objects.equals(reason, d.stopReason()));
         check("and does not steal the stop from the host that caused it",
@@ -8364,11 +8445,10 @@ public class DistressTest {
         }
         check("the reproduction trips on the first request rather than never",
               firstReason != null);
-        // java.util.Objects.equals: a sabotage that makes stopReason() go null
-        // leaves firstReason null too, and firstReason.equals(...) on a null
-        // reference would throw -- the exact mistake just found and fixed in
-        // aTrippedDistressStaysTripped above, repeated here until this line
-        // was checked against the same sabotage.
+        // java.util.Objects.equals, for the reason spelled out in
+        // aTrippedDistressStaysTripped above: firstReason.equals(...) on a null
+        // reference throws, and a throw still costs the checks after it now
+        // that the per-method guard keeps it from costing the whole class.
         check("...and does not clear across the full 30-request reproduction",
               java.util.Objects.equals(firstReason, d2.stopReason()));
     }
@@ -9441,12 +9521,16 @@ public class RedactorTest {
 }
 ```
 
-Then add the class to the runner. **Append the line; do not paste a whole `test.sh`** —
-earlier tasks in this plan added their own `java -cp` lines and a pasted copy would
-delete them:
+Then add the class to the runner.
+
+`extension/test.sh` no longer runs a bare sequence of `java` lines: it holds a
+`CLASSES` array and loops over it, so that one failing class no longer stops the
+ones after it (five bare lines under `set -e` ran 95 of 905 checks when the first
+class failed). Add the class to that array, on its own line — an appended `java`
+line lands after `exit "$rc"` and never runs.
 
 ```bash
-printf 'java -cp "build/test-classes:$MONTOYA" hx.send.RedactorTest\n' >> extension/test.sh
+    hx.send.RedactorTest
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -10499,12 +10583,16 @@ public class HaltSwitchTest {
 
 - [ ] **Step 2: Add the runner line**
 
-One line in `extension/test.sh`, after the `java` lines already there (Task 4 will have
-added `hx.send.RedactorTest` above it):
+One line in the `CLASSES` array in `extension/test.sh`, after the entries already there
+(Task 4 will have added `hx.send.RedactorTest` above it):
 
 ```bash
-java -cp "build/test-classes:$MONTOYA" hx.send.HaltSwitchTest
+    hx.send.HaltSwitchTest
 ```
+
+An appended `java` line would land after `exit "$rc"` and never run: the script
+loops over that array rather than running a bare sequence, so that one failing
+class no longer stops the ones after it.
 
 The script's `javac` line already sweeps `$(find src test -name '*.java')`, so nothing
 else in it changes.
@@ -12708,11 +12796,12 @@ public final class Sender {
 
 - [ ] **Step 6: Run `SenderTest` and watch it pass**
 
-Add the new class to the runner. Append after the lines the earlier tasks
-added, before `hx.ChokepointTest` (which does not exist yet):
+Add the new class to the `CLASSES` array in `extension/test.sh`, after the
+entries the earlier tasks added and before `hx.ChokepointTest` (which does not
+exist yet):
 
 ```bash
-java -cp "build/test-classes:$MONTOYA" hx.send.SenderTest
+    hx.send.SenderTest
 ```
 
 Run: `cd extension && ./test.sh`
@@ -12940,10 +13029,10 @@ public class ChokepointTest {
 
 - [ ] **Step 10: Run it and watch it fail**
 
-Add to `extension/test.sh`, after the `SenderTest` line:
+Add to the `CLASSES` array in `extension/test.sh`, after the `SenderTest` entry:
 
 ```bash
-java -cp "build/test-classes:$MONTOYA" hx.ChokepointTest
+    hx.ChokepointTest
 ```
 
 Run: `cd extension && ./test.sh`

@@ -1,6 +1,8 @@
 // extension/test/hx/policy/LimiterTest.java
 package hx.policy;
 
+import hx.TestSupport;
+
 import static hx.TestSupport.waitUntilBlockedOn;
 
 import java.lang.reflect.Constructor;
@@ -19,6 +21,14 @@ public class LimiterTest {
     static void check(String what, boolean ok) {
         System.out.println((ok ? "  ok   " : "  FAIL ") + what);
         if (!ok) failures++;
+    }
+
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(LimiterTest::check, name, body);
     }
 
     static void expectThrows(String what, Class<?> type, Runnable body) {
@@ -45,20 +55,20 @@ public class LimiterTest {
     static final HxRequest API_ORDERS = get("api.example.test", "/v2/orders");
 
     public static void main(String[] args) throws Exception {
-        theWindowIsExactAtItsBoundaries();
-        retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore();
-        rateIsAnsweredBeforeBudget();
-        theBudgetIsMonotonicAndTimeDoesNotRefillIt();
-        nothingOnThisClassCanRefillASpentBudget();
-        aZeroBudgetIssuesNothing();
-        theConstructorRefusesLimitsItCannotEnforce();
-        theLimitIsWholeRunNotPerHost();
-        aBackwardsClockCanOnlyOverRestrict();
-        theWindowArithmeticDoesNotOverflowNearLongMaxValue();
-        aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow();
-        concurrentCallersCannotExceedEitherLimit();
-        checkIsExclusiveWithItselfDeterministically();
-        waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState();
+        t("theWindowIsExactAtItsBoundaries", LimiterTest::theWindowIsExactAtItsBoundaries);
+        t("retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore", LimiterTest::retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore);
+        t("rateIsAnsweredBeforeBudget", LimiterTest::rateIsAnsweredBeforeBudget);
+        t("theBudgetIsMonotonicAndTimeDoesNotRefillIt", LimiterTest::theBudgetIsMonotonicAndTimeDoesNotRefillIt);
+        t("nothingOnThisClassCanRefillASpentBudget", LimiterTest::nothingOnThisClassCanRefillASpentBudget);
+        t("aZeroBudgetIssuesNothing", LimiterTest::aZeroBudgetIssuesNothing);
+        t("theConstructorRefusesLimitsItCannotEnforce", LimiterTest::theConstructorRefusesLimitsItCannotEnforce);
+        t("theLimitIsWholeRunNotPerHost", LimiterTest::theLimitIsWholeRunNotPerHost);
+        t("aBackwardsClockCanOnlyOverRestrict", LimiterTest::aBackwardsClockCanOnlyOverRestrict);
+        t("theWindowArithmeticDoesNotOverflowNearLongMaxValue", LimiterTest::theWindowArithmeticDoesNotOverflowNearLongMaxValue);
+        t("aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow", LimiterTest::aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow);
+        t("concurrentCallersCannotExceedEitherLimit", LimiterTest::concurrentCallersCannotExceedEitherLimit);
+        t("checkIsExclusiveWithItselfDeterministically", LimiterTest::checkIsExclusiveWithItselfDeterministically);
+        t("waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState", LimiterTest::waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -80,10 +90,12 @@ public class LimiterTest {
         check("the 6th request in the same microsecond is refused", !sixth.allowed());
         check("...as rate_limited", "rate_limited".equals(sixth.errorClass()));
         check("...retrying after the whole second, 1000000us", sixth.retryAfterUs() == 1_000_000L);
-        // String.valueOf, not sixth.detail(): a broken limiter returns an
-        // ALLOW here, whose detail is null, and an NPE would abort the run --
-        // hiding the verdict of every check after this line, which is most of
-        // them.
+        // String.valueOf, not sixth.detail(): a broken limiter returns an ALLOW
+        // here, whose detail is null. The per-method guard now catches the NPE
+        // that used to end the run, so this is no longer load-bearing -- but it
+        // is still the better failure. The guard collapses a whole method into
+        // ONE line naming a throw; this keeps the eleven checks after it in
+        // theWindowIsExactAtItsBoundaries running and reports THIS one by name.
         check("...with a detail that names the limit",
               String.valueOf(sixth.detail()).contains("5/s"));
 

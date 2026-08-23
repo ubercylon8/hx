@@ -2,13 +2,17 @@ package hx.bridge;
 
 import static hx.TestSupport.waitUntilBlockedOn;
 
+import hx.TestSupport;
+
 import java.io.*;
 import java.net.*;
+import java.nio.channels.Channel;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Drives BridgeClient against a fake Python server on a real unix socket. */
 public class BridgeClientTest {
@@ -18,6 +22,92 @@ public class BridgeClientTest {
     static void check(String what, boolean ok) {
         System.out.println((ok ? "  ok   " : "  FAIL ") + what);
         if (!ok) failures++;
+    }
+
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(BridgeClientTest::check, name, body);
+    }
+
+    /**
+     * Every blocking socket operation in this file carries a deadline.
+     *
+     * This is the third way a hand-rolled runner truncates, and the worst of
+     * them. A sabotage that stops BridgeClient sending its hello used to park
+     * the first {@code reader.read()} on the socket FOREVER: zero lines of
+     * output, no summary line, and no exit code at all -- a result that under
+     * {@code ./test.sh | grep -c FAIL} reads as zero failures, and a runner
+     * that has to be killed from outside. `timeout` in test.sh bounds the
+     * damage; it does not make the test report anything. A guard that can only
+     * be stopped by an outside stopwatch is not guarding.
+     *
+     * Ten seconds is twenty-five times the whole class's measured runtime
+     * (381 ms), and twice the 5 s bound {@link #waitUntil} already carries, so
+     * it can only fire on a genuine wedge. It also has to leave room for the
+     * WORST case rather than the typical one: every method wedging in turn
+     * costs one deadline each, and that total must stay inside test.sh's 300 s
+     * backstop -- 10 s buys thirty methods, against nine today.
+     */
+    static final long READ_DEADLINE_MS = 10_000L;
+
+    /**
+     * A unix-domain {@link SocketChannel} has no SO_TIMEOUT, so the deadline is
+     * a watchdog that CLOSES the channel out from under the parked call. The
+     * blocked read or accept then throws, which the per-method guard turns into
+     * a named FAIL. Whether the watchdog fired is recorded rather than inferred
+     * from the exception type: an ordinary IOException from a test that is
+     * doing its job must keep its own message.
+     */
+    static final class Deadline implements AutoCloseable {
+        private final AtomicBoolean expired = new AtomicBoolean(false);
+        private final Thread watchdog;
+
+        Deadline(Channel ch) {
+            watchdog = new Thread(() -> {
+                try { Thread.sleep(READ_DEADLINE_MS); }
+                catch (InterruptedException arrivedInTime) { return; }
+                expired.set(true);
+                try { ch.close(); } catch (IOException ignored) { }
+            });
+            watchdog.setDaemon(true);
+            watchdog.start();
+        }
+
+        boolean expired() { return expired.get(); }
+
+        public void close() { watchdog.interrupt(); }
+    }
+
+    /** {@code reader.read()} with a deadline on it. */
+    static Frame.Decoded read(Frame.Reader reader, Channel ch, String what) throws Exception {
+        try (Deadline d = new Deadline(ch)) {
+            try {
+                return reader.read();
+            } catch (IOException e) {
+                if (d.expired())
+                    throw new IOException(what + " did not arrive within "
+                                          + READ_DEADLINE_MS + " ms", e);
+                throw e;
+            }
+        }
+    }
+
+    /** {@code server.accept()} with a deadline on it: a client that never
+     *  dials wedges here exactly as a frame that never arrives wedges above. */
+    static SocketChannel accept(ServerSocketChannel server) throws Exception {
+        try (Deadline d = new Deadline(server)) {
+            try {
+                return server.accept();
+            } catch (IOException e) {
+                if (d.expired())
+                    throw new IOException("the client did not dial within "
+                                          + READ_DEADLINE_MS + " ms", e);
+                throw e;
+            }
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -30,122 +120,24 @@ public class BridgeClientTest {
             FakeMontoya.Logger log = new FakeMontoya.Logger();
             BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
 
-            Thread t = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
-            t.start();
+            // Daemon, for the same reason live()'s dial thread is one: a read
+            // loop that outlives its assertions must not keep the JVM up after
+            // main() has printed its summary.
+            Thread dial = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
+            dial.setDaemon(true);
+            dial.start();
 
-            try (SocketChannel peer = server.accept()) {
-                InputStream in = java.nio.channels.Channels.newInputStream(peer);
-                OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
-                // One Reader for the whole connection: frames coalesce, and a
-                // fresh reader per call would drop whatever followed the one
-                // it returned.
-                Frame.Reader reader = new Frame.Reader(in);
-
-                // 1. hello arrives with the right identity
-                Frame.Decoded hello = reader.read();
-                check("sends hello", "hello".equals(hello.header.get("t")));
-                check("hello carries engagement_id", "e-1".equals(hello.header.get("engagement_id")));
-                check("hello carries instance_id", "i-1".equals(hello.header.get("instance_id")));
-                check("hello carries protocol version", Long.valueOf(1L).equals(hello.header.get("v")));
-
-                // 2. DENY-ALL before configure
-                check("unconfigured after hello", !client.isConfigured());
-                boolean threw = false;
-                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { threw = true; }
-                check("checkMaySend throws NotConfigured before configure", threw);
-
-                // 3. configure -> configured, with an epoch
-                Map<String, Object> cfg = new LinkedHashMap<>();
-                cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", 1L);
-                cfg.put("engagement_id", "e-1"); cfg.put("scope_sha256", "abc");
-                cfg.put("profile", "production");
-                // configure is the one request frame, and BridgeServer._request
-                // stamps id and deadline_us onto every one of them. A fake that
-                // omits it is not the peer: the client answers bad_frame.
-                cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
-                out.write(Frame.encode(cfg, "scope.include\thttps://a/*\nlimit.rate_rps\t5\n"
-                        .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-                out.flush();
-
-                Frame.Decoded ack = reader.read();
-                check("acks with configured", "configured".equals(ack.header.get("t")));
-                check("ack echoes the request id", Long.valueOf(1L).equals(ack.header.get("id")));
-                check("ack carries a non-zero epoch",
-                      ((Long) ack.header.get("config_epoch")) > 0);
-
-                waitUntil(() -> client.isConfigured());
-                check("configured after ack", client.isConfigured());
-                check("scope config parsed",
-                      client.scopeConfig().get("scope.include").equals(List.of("https://a/*")));
-                // The coherent read. configEpoch() then scopeConfig() is two
-                // volatile reads and a commit can land between them; this is
-                // the one an evidence line has to use.
-                BridgeClient.Authorisation au = client.authorisation();
-                check("authorisation() carries the epoch and the scope together",
-                      au.epoch() == client.configEpoch()
-                      && au.scope().equals(client.scopeConfig()));
-                client.checkMaySend();   // must not throw now
-
-                // 4. halt / resume
-                Map<String, Object> halt = Map.of("v", 1L, "t", "halt", "reason", "operator");
-                out.write(Frame.encode(halt, new byte[0])); out.flush();
-                waitUntil(() -> !client.maySend());
-                boolean haltedThrew = false;
-                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { haltedThrew = true; }
-                check("halt blocks sending", haltedThrew);
-
-                out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0])); out.flush();
-                waitUntil(() -> client.maySend());
-                boolean resumed = client.maySend();
-                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { resumed = false; }
-                check("resume unblocks sending", resumed);
-
-                // 5. an engagement_id mismatch on configure is refused
-                Map<String, Object> wrong = new LinkedHashMap<>(cfg);
-                wrong.put("id", 2L); wrong.put("engagement_id", "SOMEONE-ELSE");
-                out.write(Frame.encode(wrong, new byte[0])); out.flush();
-                Frame.Decoded err = reader.read();
-                check("engagement mismatch answered with error",
-                      "error".equals(err.header.get("t")));
-                check("error class names the mismatch",
-                      String.valueOf(err.header.get("class")).contains("engagement"));
-
-                // 6. a protocol-mismatch frame while configured must trip
-                // DENY-ALL through readLoop's OTHER exit path. handle()
-                // returns false here, and the bare `return` that used to
-                // follow skipped both catch blocks entirely: configured
-                // stayed true, configEpoch kept its value, and maySend()
-                // would answer true forever with a dead read loop and no
-                // control channel behind it. This is the exact leak the
-                // finally block in readLoop() exists to close.
-                check("configured before the protocol-mismatch frame", client.maySend());
-                Map<String, Object> badVersion = new LinkedHashMap<>();
-                badVersion.put("v", 2L); badVersion.put("t", "halt"); badVersion.put("reason", "operator");
-                out.write(Frame.encode(badVersion, new byte[0])); out.flush();
-                Frame.Decoded mismatch = reader.read();
-                check("protocol mismatch answered with error",
-                      "error".equals(mismatch.header.get("t")));
-                check("error class names the protocol mismatch",
-                      "protocol_mismatch".equals(mismatch.header.get("class")));
-                waitUntil(() -> !client.maySend());
-                check("protocol mismatch trips DENY-ALL via readLoop's return path",
-                      !client.maySend());
-                boolean deniedAfterMismatch = false;
-                try { client.checkMaySend(); }
-                catch (BridgeClient.NotConfigured e) { deniedAfterMismatch = true; }
-                check("checkMaySend throws after the protocol-mismatch DENY-ALL",
-                      deniedAfterMismatch);
-            }
+            t("theControlChannelHandshake", () -> theControlChannelHandshake(server, client));
             client.close();
 
-            closedIsSticky();
-            aClosedClientDoesNotGoLive();
-            aRefusedConfigureDropsToDenyAll();
-            closeIsTerminalAgainstTheReadLoop();
-            losingThePeerDropsToDenyAll();
-            aFailedHelloLeavesNoChannelBehind();
-            theCommitIsExclusiveWithClose();
-            aConfigureDoesNotLiftAHalt();
+            t("closedIsSticky", BridgeClientTest::closedIsSticky);
+            t("aClosedClientDoesNotGoLive", BridgeClientTest::aClosedClientDoesNotGoLive);
+            t("aRefusedConfigureDropsToDenyAll", BridgeClientTest::aRefusedConfigureDropsToDenyAll);
+            t("closeIsTerminalAgainstTheReadLoop", BridgeClientTest::closeIsTerminalAgainstTheReadLoop);
+            t("losingThePeerDropsToDenyAll", BridgeClientTest::losingThePeerDropsToDenyAll);
+            t("aFailedHelloLeavesNoChannelBehind", BridgeClientTest::aFailedHelloLeavesNoChannelBehind);
+            t("theCommitIsExclusiveWithClose", BridgeClientTest::theCommitIsExclusiveWithClose);
+            t("aConfigureDoesNotLiftAHalt", BridgeClientTest::aConfigureDoesNotLiftAHalt);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -153,6 +145,120 @@ public class BridgeClientTest {
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
+    }
+
+    /**
+     * The first connection, end to end: hello, the DENY-ALL that precedes any
+     * configure, the configure itself, halt/resume, and the two frames that
+     * must be refused. A method rather than an inline block in main() so that
+     * the per-method guard covers it -- inline, a single throw in here (an
+     * unanswered read, a null header) took the other eight methods with it.
+     */
+    static void theControlChannelHandshake(ServerSocketChannel server, BridgeClient client)
+            throws Exception {
+        try (SocketChannel peer = accept(server)) {
+            InputStream in = java.nio.channels.Channels.newInputStream(peer);
+            OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+            // One Reader for the whole connection: frames coalesce, and a
+            // fresh reader per call would drop whatever followed the one
+            // it returned.
+            Frame.Reader reader = new Frame.Reader(in);
+
+            // 1. hello arrives with the right identity
+            Frame.Decoded hello = read(reader, peer, "the hello");
+            check("sends hello", "hello".equals(hello.header.get("t")));
+            check("hello carries engagement_id", "e-1".equals(hello.header.get("engagement_id")));
+            check("hello carries instance_id", "i-1".equals(hello.header.get("instance_id")));
+            check("hello carries protocol version", Long.valueOf(1L).equals(hello.header.get("v")));
+
+            // 2. DENY-ALL before configure
+            check("unconfigured after hello", !client.isConfigured());
+            boolean threw = false;
+            try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { threw = true; }
+            check("checkMaySend throws NotConfigured before configure", threw);
+
+            // 3. configure -> configured, with an epoch
+            Map<String, Object> cfg = new LinkedHashMap<>();
+            cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", 1L);
+            cfg.put("engagement_id", "e-1"); cfg.put("scope_sha256", "abc");
+            cfg.put("profile", "production");
+            // configure is the one request frame, and BridgeServer._request
+            // stamps id and deadline_us onto every one of them. A fake that
+            // omits it is not the peer: the client answers bad_frame.
+            cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
+            out.write(Frame.encode(cfg, "scope.include\thttps://a/*\nlimit.rate_rps\t5\n"
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            out.flush();
+
+            Frame.Decoded ack = read(reader, peer, "the configured ack");
+            check("acks with configured", "configured".equals(ack.header.get("t")));
+            check("ack echoes the request id", Long.valueOf(1L).equals(ack.header.get("id")));
+            check("ack carries a non-zero epoch",
+                  ((Long) ack.header.get("config_epoch")) > 0);
+
+            waitUntil(() -> client.isConfigured());
+            check("configured after ack", client.isConfigured());
+            check("scope config parsed",
+                  client.scopeConfig().get("scope.include").equals(List.of("https://a/*")));
+            // The coherent read. configEpoch() then scopeConfig() is two
+            // volatile reads and a commit can land between them; this is
+            // the one an evidence line has to use.
+            BridgeClient.Authorisation au = client.authorisation();
+            check("authorisation() carries the epoch and the scope together",
+                  au.epoch() == client.configEpoch()
+                  && au.scope().equals(client.scopeConfig()));
+            client.checkMaySend();   // must not throw now
+
+            // 4. halt / resume
+            Map<String, Object> halt = Map.of("v", 1L, "t", "halt", "reason", "operator");
+            out.write(Frame.encode(halt, new byte[0])); out.flush();
+            waitUntil(() -> !client.maySend());
+            boolean haltedThrew = false;
+            try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { haltedThrew = true; }
+            check("halt blocks sending", haltedThrew);
+
+            out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0])); out.flush();
+            waitUntil(() -> client.maySend());
+            boolean resumed = client.maySend();
+            try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { resumed = false; }
+            check("resume unblocks sending", resumed);
+
+            // 5. an engagement_id mismatch on configure is refused
+            Map<String, Object> wrong = new LinkedHashMap<>(cfg);
+            wrong.put("id", 2L); wrong.put("engagement_id", "SOMEONE-ELSE");
+            out.write(Frame.encode(wrong, new byte[0])); out.flush();
+            Frame.Decoded err = read(reader, peer, "the engagement-mismatch error");
+            check("engagement mismatch answered with error",
+                  "error".equals(err.header.get("t")));
+            check("error class names the mismatch",
+                  String.valueOf(err.header.get("class")).contains("engagement"));
+
+            // 6. a protocol-mismatch frame while configured must trip
+            // DENY-ALL through readLoop's OTHER exit path. handle()
+            // returns false here, and the bare `return` that used to
+            // follow skipped both catch blocks entirely: configured
+            // stayed true, configEpoch kept its value, and maySend()
+            // would answer true forever with a dead read loop and no
+            // control channel behind it. This is the exact leak the
+            // finally block in readLoop() exists to close.
+            check("configured before the protocol-mismatch frame", client.maySend());
+            Map<String, Object> badVersion = new LinkedHashMap<>();
+            badVersion.put("v", 2L); badVersion.put("t", "halt"); badVersion.put("reason", "operator");
+            out.write(Frame.encode(badVersion, new byte[0])); out.flush();
+            Frame.Decoded mismatch = read(reader, peer, "the protocol-mismatch error");
+            check("protocol mismatch answered with error",
+                  "error".equals(mismatch.header.get("t")));
+            check("error class names the protocol mismatch",
+                  "protocol_mismatch".equals(mismatch.header.get("class")));
+            waitUntil(() -> !client.maySend());
+            check("protocol mismatch trips DENY-ALL via readLoop's return path",
+                  !client.maySend());
+            boolean deniedAfterMismatch = false;
+            try { client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { deniedAfterMismatch = true; }
+            check("checkMaySend throws after the protocol-mismatch DENY-ALL",
+                  deniedAfterMismatch);
+        }
     }
 
     /** Drive a fresh client to "configured" and hand back the pieces. */
@@ -190,14 +296,14 @@ public class BridgeClientTest {
         Thread dial = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
         dial.setDaemon(true);
         dial.start();
-        SocketChannel peer = server.accept();
+        SocketChannel peer = accept(server);
         OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
         Frame.Reader reader = new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
-        reader.read();                                   // the hello
+        read(reader, peer, "the hello");
         out.write(Frame.encode(configureFrame("e-1", 1L),
                   "scope.include\thttps://WIDE/*\n".getBytes(StandardCharsets.UTF_8)));
         out.flush();
-        reader.read();                                   // the ack
+        read(reader, peer, "the configured ack");
         waitUntil(client::isConfigured);
         return new Live(server, client, peer, out, reader, log);
     }
@@ -291,7 +397,7 @@ public class BridgeClientTest {
             l.out.write(Frame.encode(configureFrame("e-1", 3L),
                     "this-is-not-a-config-body\n".getBytes(StandardCharsets.UTF_8)));
             l.out.flush();
-            Frame.Decoded err = l.reader.read();
+            Frame.Decoded err = read(l.reader, l.peer, "the config error");
             check("unparseable configure is answered with an error",
                   "error".equals(err.header.get("t")));
             check("error class names the config",
@@ -367,15 +473,15 @@ public class BridgeClientTest {
                         try { client.connect(); } catch (Exception ignored) { } });
                     t.setDaemon(true);
                     t.start();
-                    try (SocketChannel peer = server.accept()) {
+                    try (SocketChannel peer = accept(server)) {
                         OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
                         Frame.Reader reader =
                                 new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
-                        reader.read();                                   // hello
+                        read(reader, peer, "the hello");
 
                         out.write(Frame.encode(configureFrame("e-1", 0L), CFG));
                         out.flush();
-                        reader.read();                                   // the ack
+                        read(reader, peer, "the configured ack");
                         waitUntil(client::isConfigured);
 
                         ByteArrayOutputStream backlog = new ByteArrayOutputStream();
@@ -387,7 +493,7 @@ public class BridgeClientTest {
                         // whole backlog in its Reader and is committing frames
                         // out of it, so close() lands mid-backlog rather than
                         // before the bytes have even arrived.
-                        reader.read();
+                        read(reader, peer, "the first backlog ack");
 
                         client.close();
 
@@ -522,7 +628,8 @@ public class BridgeClientTest {
             l.out.write(Frame.encode(configureFrame("e-1", 4L),
                     "scope.include\thttps://NARROW/*\n".getBytes(StandardCharsets.UTF_8)));
             l.out.flush();
-            Frame.Decoded ack = l.reader.read();
+            Frame.Decoded ack = read(l.reader, l.peer,
+                                     "the ack for the configure sent while halted");
             // Reading the ack is the happens-before edge: the commit completes
             // before the ack is written, so nothing below has to poll.
             check("the configure while halted is acknowledged",

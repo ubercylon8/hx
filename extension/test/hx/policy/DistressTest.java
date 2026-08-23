@@ -1,6 +1,8 @@
 // extension/test/hx/policy/DistressTest.java
 package hx.policy;
 
+import hx.TestSupport;
+
 /**
  * Hand-rolled runner: JUnit would be a dependency, and this jar has none.
  *
@@ -17,6 +19,14 @@ public class DistressTest {
     static void check(String what, boolean ok) {
         System.out.println((ok ? "  ok   " : "  FAIL ") + what);
         if (!ok) failures++;
+    }
+
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(DistressTest::check, name, body);
     }
 
     static void expectThrows(String what, Class<?> type, Runnable body) {
@@ -43,35 +53,35 @@ public class DistressTest {
     static Distress fresh(TickClock clock) { return new Distress(clock, 0.20, 5.0, 5); }
 
     public static void main(String[] args) {
-        healthyTrafficNeverTrips();
-        aSlowButConsistentHostIsNotADistressedOne();
-        fiveXxRateAtExactlyTheThresholdDoesNotTrip();
-        oneMoreFiveXxOverTheThresholdTrips();
-        aRateNeedsEnoughSamplesToBeARate();
-        connectionErrorsAreNotCountedAgainstTheFiveXxRate();
-        fourErrorsThenASuccessThenFourMoreDoesNotTrip();
-        aFiveHundredThreeIsAResponseNotAConnectionError();
-        theTenthRequestEstablishesTheBaselineTheEleventhIsMeasured();
-        latencyAtExactlyFiveTimesBaselineDoesNotTrip();
-        oneMillisecondOverFiveTimesBaselineTrips();
-        aSubMillisecondBaselineDoesNotMakeJitterDistress();
-        theLatencyFloorDelaysTheRuleItDoesNotDisableIt();
-        theWindowRollsByCount();
-        theWindowRollsByTime();
-        hostsAreCountedSeparately();
-        aTrippedDistressStaysTripped();
-        aWindowThatCannotHoldASampleIsRefused();
-        theHaltedFrameCanNameTheWindow();
+        t("healthyTrafficNeverTrips", DistressTest::healthyTrafficNeverTrips);
+        t("aSlowButConsistentHostIsNotADistressedOne", DistressTest::aSlowButConsistentHostIsNotADistressedOne);
+        t("fiveXxRateAtExactlyTheThresholdDoesNotTrip", DistressTest::fiveXxRateAtExactlyTheThresholdDoesNotTrip);
+        t("oneMoreFiveXxOverTheThresholdTrips", DistressTest::oneMoreFiveXxOverTheThresholdTrips);
+        t("aRateNeedsEnoughSamplesToBeARate", DistressTest::aRateNeedsEnoughSamplesToBeARate);
+        t("connectionErrorsAreNotCountedAgainstTheFiveXxRate", DistressTest::connectionErrorsAreNotCountedAgainstTheFiveXxRate);
+        t("fourErrorsThenASuccessThenFourMoreDoesNotTrip", DistressTest::fourErrorsThenASuccessThenFourMoreDoesNotTrip);
+        t("aFiveHundredThreeIsAResponseNotAConnectionError", DistressTest::aFiveHundredThreeIsAResponseNotAConnectionError);
+        t("theTenthRequestEstablishesTheBaselineTheEleventhIsMeasured", DistressTest::theTenthRequestEstablishesTheBaselineTheEleventhIsMeasured);
+        t("latencyAtExactlyFiveTimesBaselineDoesNotTrip", DistressTest::latencyAtExactlyFiveTimesBaselineDoesNotTrip);
+        t("oneMillisecondOverFiveTimesBaselineTrips", DistressTest::oneMillisecondOverFiveTimesBaselineTrips);
+        t("aSubMillisecondBaselineDoesNotMakeJitterDistress", DistressTest::aSubMillisecondBaselineDoesNotMakeJitterDistress);
+        t("theLatencyFloorDelaysTheRuleItDoesNotDisableIt", DistressTest::theLatencyFloorDelaysTheRuleItDoesNotDisableIt);
+        t("theWindowRollsByCount", DistressTest::theWindowRollsByCount);
+        t("theWindowRollsByTime", DistressTest::theWindowRollsByTime);
+        t("hostsAreCountedSeparately", DistressTest::hostsAreCountedSeparately);
+        t("aTrippedDistressStaysTripped", DistressTest::aTrippedDistressStaysTripped);
+        t("aWindowThatCannotHoldASampleIsRefused", DistressTest::aWindowThatCannotHoldASampleIsRefused);
+        t("theHaltedFrameCanNameTheWindow", DistressTest::theHaltedFrameCanNameTheWindow);
 
         // Fix round 1: the cutoff-arithmetic overflow (critical), the
         // forward-spike/backward-correction eviction freeze (moderate), and
         // the unguarded zero-baseline clamp (minor).
-        theConstructorRefusesAWindowMsAboveTheOverflowCeiling();
-        anUnrepresentableWindowBoundTripsRatherThanGoingSilentlyDark();
-        theWindowArithmeticDoesNotOverflowNearLongMaxValueEither();
-        aTransientForwardClockSpikeDoesNotFreezeTimeBasedEvictionBehindIt();
-        aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero();
-        anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall();
+        t("theConstructorRefusesAWindowMsAboveTheOverflowCeiling", DistressTest::theConstructorRefusesAWindowMsAboveTheOverflowCeiling);
+        t("anUnrepresentableWindowBoundTripsRatherThanGoingSilentlyDark", DistressTest::anUnrepresentableWindowBoundTripsRatherThanGoingSilentlyDark);
+        t("theWindowArithmeticDoesNotOverflowNearLongMaxValueEither", DistressTest::theWindowArithmeticDoesNotOverflowNearLongMaxValueEither);
+        t("aTransientForwardClockSpikeDoesNotFreezeTimeBasedEvictionBehindIt", DistressTest::aTransientForwardClockSpikeDoesNotFreezeTimeBasedEvictionBehindIt);
+        t("aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero", DistressTest::aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero);
+        t("anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall", DistressTest::anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -347,6 +357,14 @@ public class DistressTest {
         // identically against commit 9a59b1a's own DistressTest.java, so the
         // original sabotage table's "11/11, matches exactly" for row 1 was
         // true by accident -- the run never got far enough to check the rest.
+        //
+        // That was the ninth false claim on this branch and the one that
+        // indicted the runner rather than the code; the per-method guard in
+        // hx.TestSupport is the general fix, and row 1 now measures 14 FAILs
+        // over a class that runs all the way to its summary line. This line
+        // keeps Objects.equals anyway, because the guard is coarser than it
+        // is: the guard reports ONE failure naming a throw and skips the four
+        // checks after it, where this reports the property that broke.
         check("a healthy host does not clear a trip",
               java.util.Objects.equals(reason, d.stopReason()));
         check("and does not steal the stop from the host that caused it",
@@ -446,11 +464,10 @@ public class DistressTest {
         }
         check("the reproduction trips on the first request rather than never",
               firstReason != null);
-        // java.util.Objects.equals: a sabotage that makes stopReason() go null
-        // leaves firstReason null too, and firstReason.equals(...) on a null
-        // reference would throw -- the exact mistake just found and fixed in
-        // aTrippedDistressStaysTripped above, repeated here until this line
-        // was checked against the same sabotage.
+        // java.util.Objects.equals, for the reason spelled out in
+        // aTrippedDistressStaysTripped above: firstReason.equals(...) on a null
+        // reference throws, and a throw still costs the checks after it now
+        // that the per-method guard keeps it from costing the whole class.
         check("...and does not clear across the full 30-request reproduction",
               java.util.Objects.equals(firstReason, d2.stopReason()));
     }
