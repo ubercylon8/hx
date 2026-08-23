@@ -16249,7 +16249,7 @@ different claims, and only the second is the invariant."
   - `hx.store.records.new_id(prefix) -> str`, and the vocabulary maps `DENIAL_KIND`, `EXCHANGE_OUTCOME`, `UNRECORDABLE`
   - `hx.halt.OperatorHalt(engagement_dir, db)` — `halt(reason)`, `resume()`, `halted`, `reason`, `sentinel_path`; `hx.halt.HaltError`
   - `hx.bridge.server.BridgeServer.send(req, body=b"", timeout=30.0) -> dict`, `BridgeServer.BODY_KEY`
-  - `hx.bridge.server.BridgeServer(..., on_halted=None, operator_halt=None)`, plus `last_halted` and `halted_callback_error`
+  - `hx.bridge.server.BridgeServer(..., on_halted=None, operator_halt)`, plus `last_halted` and `halted_callback_error`. **`operator_halt` is REQUIRED** (ruled 2026-08-23 in Task 7's fix round, matching `HxExtension`, which refuses to initialise without `-Dhx.halt_sentinel` for the same field): §4 promises three kill paths and an opt-in third path is not a promise.
   - `hx.bridge.server.BridgeError(message, *, error_class=None, retry_after_us=None)`
 - Consumed by: Plan 4's tool layer (§8's `http.send` goes through `BridgeServer.send`, and every `BridgeError` it raises becomes a `denial` row through `DENIAL_KIND`), and the integration task, which drives a real Burp through the same three calls.
 
@@ -18065,7 +18065,7 @@ removed:
 
 - two class constants are added beside the existing `_DENYING_CONFIGURE_ERRORS`
   — leave that one exactly where it is;
-- the signature gains `on_halted=None, operator_halt=None`;
+- the signature gains `on_halted=None` and a REQUIRED `operator_halt`;
 - four assignments go in at the top of the body, above `self.state`.
 
 Every assignment already in there stays. `BridgeServer` needs sixteen more
@@ -18554,7 +18554,7 @@ re-synced from the files, as tests/test_plan_matches_repo.py requires."
 
 **Interfaces:**
 - Consumes:
-  - `hx.bridge.server.BridgeServer(socket_path, engagement_id, on_hello=None, on_halted=None, operator_halt=None)` — `start()`, `stop()`, `configure(pairs, scope_sha256, profile) -> int`, `halt(reason)`, `resume()`, `state`, `config_epoch` (Plan 2, widened by Task 7). The rig passes `operator_halt`: Task 7's hello re-assert and its per-send sentinel check both hang off that argument, and a rig that leaves it `None` exercises neither.
+  - `hx.bridge.server.BridgeServer(socket_path, engagement_id, on_hello=None, on_halted=None, operator_halt=...)` — `start()`, `stop()`, `configure(pairs, scope_sha256, profile) -> int`, `halt(reason)`, `resume()`, `state`, `config_epoch` (Plan 2, widened by Task 7). **`operator_halt` is REQUIRED as of Task 7's fix round** — a rig CANNOT leave it `None`, and the sentence that used to stand here saying such a rig "exercises neither" describes something no longer constructible. Task 7's hello re-assert and its per-send sentinel check both hang off it. A harness with no engagement of its own supplies a sentinel in a directory of its own; `tests/integration/test_real_burp.py::_operator_halt` is the worked example.
   - `hx.bridge.server.BridgeServer.send(req: dict, body: bytes = b"", timeout: float = 30.0) -> dict` (Task 7). The returned mapping is the `result` frame's header **plus the frame's body bytes under `BridgeServer.BODY_KEY`** — `"@body"`, pinned by the Interface Contract. The response bytes cannot ride in a flat JSON header, and this test reads them back out.
   - `hx.bridge.server.BridgeServer._send(header)` and `._request(header, body, timeout)` (Plan 2, private). Two call sites, both there so that a frame under test actually reaches the JVM instead of being answered by this side's own guards. Each says so where it is used.
   - `hx.bridge.server.BridgeError` with `.error_class` and `.retry_after_us` (Task 7). Both are `None` — not absent — on a `BridgeError` this side raised before the wire, so a caller that classifies an arbitrary failure must treat `None` as "no send-path class" rather than assume one.

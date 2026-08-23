@@ -6564,7 +6564,8 @@ def make_home(workdir: Path) -> Path:
     return home
 
 
-def launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subprocess.Popen:
+def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
+                sentinel: Path) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
@@ -6580,6 +6581,12 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subproc
         f"-Dhx.socket={socket_path}",
         f"-Dhx.engagement={engagement_id}",
         "-Dhx.instance=integration",
+        # Required, not optional: HxExtension.initialize() returns early
+        # ("extension idle") without it, so the extension never dials and the
+        # handshake never happens. Task 6 made it mandatory and this fixture
+        # was not updated -- the integration tests are deselected from the
+        # default run, so nothing said so for a day.
+        f"-Dhx.halt_sentinel={sentinel}",
         *ADD_OPENS,
         "-cp", f"{BURP_JAR}:{EXT_JAR}",
         "burp.StartBurp",
@@ -6625,21 +6632,29 @@ def _operator_halt(workdir, engagement_id):
     its own supplies a sentinel in a directory of its own, which is what this
     builds.
 
-    NOTE for the integration task, from measuring these two against the real
-    container on 2026-08-23. Both fail today, for two separate reasons, and
-    both failures predate this function -- the pristine tree fails the same
-    way:
+    These two tests failed for one day, and the reason is worth keeping.
 
-      1. Burp 2026.7.3 dies during startup under this machine's JRE 26 with
-         `java.lang.Error: no ComponentUI class for: burp.Zc7w`, before the
-         extension is loaded at all. That is what the current failure is.
-      2. Behind it, `bf.launch_burp` does not pass `-Dhx.halt_sentinel`, and
-         HxExtension.initialize() refuses to come up without it ("extension
-         idle"). Even with a working JVM the handshake could not complete
-         until the fixture hands the JVM `oh.sentinel_path`.
+    Task 6 made `-Dhx.halt_sentinel` mandatory -- HxExtension.initialize()
+    returns early with "extension idle" without it -- and did not update
+    `bf.launch_burp`. The integration tests are deselected from the default
+    run, so nothing said so. The extension never dialled, `srv.state` never
+    reached "connected", and both tests timed out after 90s.
 
-    Neither is this fix round's to repair. This function exists so the Python
-    half is already correct when they are.
+    The first diagnosis was that Burp 2026.7.3 dies at startup under this
+    machine's JRE 26, because burp.log ends in `java.lang.Error: no ComponentUI
+    class for: burp.Zc7w` on the EventDispatchThread. THAT DIAGNOSIS WAS WRONG,
+    and the thing that disproved it is worth copying: burp-lab's
+    `harness-burp.log`, written by a run that demonstrably worked, is BYTE-FOR-
+    BYTE the same 6423 bytes with the same two ComponentUI errors and the same
+    tail. That log is what healthy headless Burp looks like -- Burp catches the
+    Swing failure and carries on, and nothing else writes to stdout afterwards.
+
+    Two lessons, both general. A log that ENDS at an error has not necessarily
+    FAILED at that error. And `api.logging().logToError` goes to Burp's own
+    extension log, not to stdout, so "no hx lines in burp.log" is not evidence
+    the extension did not run.
+
+    With the sentinel passed, both tests pass in ~14s.
     """
     root = workdir / "engagement"
     secure_mkdir(root)
@@ -6661,11 +6676,12 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
     """
     srv = server.BridgeServer(
         tmp_path / "hx.sock", engagement_id="e-integration",
-        operator_halt=_operator_halt(tmp_path, "e-integration"))
+        operator_halt=(oh := _operator_halt(tmp_path, "e-integration")))
     srv.start()
     proc = None
     try:
-        proc = bf.launch_burp(srv.socket_path, "e-integration", tmp_path)
+        proc = bf.launch_burp(srv.socket_path, "e-integration", tmp_path,
+                              oh.sentinel_path)
 
         assert bf.wait_for(lambda: srv.state == "connected"), \
             "Burp never completed the hello handshake"
@@ -6714,11 +6730,12 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     """
     srv = server.BridgeServer(
         tmp_path / "hx.sock", engagement_id="e-restart",
-        operator_halt=_operator_halt(tmp_path, "e-restart"))
+        operator_halt=(oh := _operator_halt(tmp_path, "e-restart")))
     srv.start()
     proc = proc2 = None
     try:
-        proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "first")
+        proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "first",
+                              oh.sentinel_path)
         assert bf.wait_for(lambda: srv.state == "connected")
         srv.configure({"scope.include": ["https://a/*"]},
                       scope_sha256="abc", profile="production")
@@ -6731,7 +6748,8 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
         assert srv.config_epoch == 0
 
         # The restart. Same socket, same server object, never stopped.
-        proc2 = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "second")
+        proc2 = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "second",
+                               oh.sentinel_path)
         assert bf.wait_for(lambda: srv.state == "connected"), \
             "a restarted Burp must reconnect to the still-listening bridge"
         assert srv.peer_pid == proc2.pid, "the bridge is talking to the old JVM"
