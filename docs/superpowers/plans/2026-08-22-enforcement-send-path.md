@@ -1,6 +1,6 @@
+<!-- plan-drift: pending -->
 # Enforcement and the Send Path Implementation Plan
 
-<!-- plan-drift: pending -->
 <!-- Remove that marker in the commit that finishes this plan. Until then
      tests/test_plan_matches_repo.py skips this plan's blocks: it modifies
      extension/src/hx/HxExtension.java, so its block describes the state
@@ -9627,6 +9627,17 @@ public class RedactorTest {
         reused.register("ident-admin", tokenStart(one), tokenEnd(one));
         r.redactRequest(one, reused);
 
+        // The binding is by IDENTITY, not by content or length: a second
+        // array holding the exact same bytes as `one` is still refused,
+        // because it is not the array these ranges were measured from. A
+        // length-only check would let this through -- the two are the same
+        // length by construction, being the same content -- which is exactly
+        // why an equal-length reuse with the credential at a different offset
+        // would otherwise be silently rewritten rather than refused.
+        expectThrows("a second request with the SAME length -- indeed identical "
+                    + "content, a different array object holding the same bytes -- is refused",
+                     Redactor.RangeError.class, () -> r.redactRequest(one.clone(), reused));
+
         byte[] shorter = bytes("GET /x HTTP/1.1\r\nHost: app.example.test\r\n\r\n");
         expectThrows("a second request SHORTER than the stale range is refused",
                      Redactor.RangeError.class, () -> r.redactRequest(shorter, reused));
@@ -10011,6 +10022,26 @@ public class RedactorTest {
               !hints.contains(SESSION)
               && hints.contains("Link: </s.css>; rel=preload\r\n"));
 
+        // RFC 9110 15.2 requires a client to parse ONE OR MORE 1xx responses
+        // before the final one, and RFC 8297 permits more than one 103 --
+        // Expect: 100-continue against an Early-Hints server produces
+        // 100-then-103 directly. `first` is what re-arms the scan for each
+        // interim head's OWN status line; a SINGLE interim head cannot show
+        // that this matters, because `first` is already true when its status
+        // line is read. Drop the reset and the SECOND interim head's status
+        // line is read as an ordinary field instead (no colon, so it also
+        // fails the Set-Cookie match), `interim` is never re-armed for it,
+        // and the blank line that follows is then taken for the end of the
+        // whole head -- so the real response, Set-Cookie and all, is
+        // returned as "body".
+        String twoHints = text(r.redactResponse(bytes(
+              "HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n"
+            + "HTTP/1.1 103 Early Hints\r\nLink: </b>\r\n\r\n"
+            + "HTTP/1.1 200 OK\r\nSet-Cookie: JSESSIONID=" + SESSION + "; Path=/\r\n\r\n")));
+        check("two 1xx responses in a row do not disable redaction of the final one",
+              !twoHints.contains(SESSION)
+              && twoHints.contains("Set-Cookie: JSESSIONID={{observed:set-cookie}}; Path=/\r\n"));
+
         // The direction the branch could break, and the reason it is keyed on
         // the CODE rather than on "another head might follow": a final
         // response still ends its head at its own blank line.
@@ -10022,11 +10053,34 @@ public class RedactorTest {
               fin.endsWith("\r\n\r\n" + body) && !fin.contains(SESSION));
 
         // A status code is exactly three digits (RFC 9112 4). "1000" is not a
-        // 1xx, and reading it as one would scan a real body as a head.
-        String plain = "just a body, with a Set-Cookie: mention in it\r\n";
+        // 1xx, and reading it as one would scan a real body as a head -- but
+        // that is invisible unless the "head" it scans has something in it a
+        // matcher could mistake for Set-Cookie. A body opening with prose
+        // that merely MENTIONS "Set-Cookie:" fails the name-length check for
+        // the same reason a real header passes it, so such a fixture yields
+        // the identical bytes whether or not 1000 is read as interim. The
+        // first line has to be an actual field.
+        String plain = "Set-Cookie: sid=" + SESSION + "; Path=/\r\n";
         String odd = text(r.redactResponse(bytes("HTTP/1.1 1000 Nonsense\r\n\r\n" + plain)));
         check("a code that is not three digits is not an interim head",
               odd.endsWith("\r\n\r\n" + plain));
+
+        // interim=false at the reset above is unfalsified without this: an
+        // interim head followed by a HEADLESS one -- no line of its own
+        // starts with HTTP/ -- never re-enters the branch that would
+        // re-derive `interim`, because that only happens from inside the
+        // "first && startsWithHttpName" check. `interim` is left stuck at
+        // whatever the interim head's OWN status line set it to, so the
+        // headless head's own blank line -- which should end the scan -- is
+        // misread as ending ANOTHER interim head, and the body that follows
+        // is scanned as a third head instead of being returned untouched.
+        String bodyLine = "Set-Cookie: not a real header, just body text\r\n";
+        String headless = text(r.redactResponse(bytes(
+              "HTTP/1.1 103 Early Hints\r\n\r\n"
+            + "X-Odd: this head has no status line of its own\r\n"
+            + "\r\n" + bodyLine)));
+        check("an interim head followed by a headless one still lets the body through untouched",
+              headless.endsWith("\r\n\r\n" + bodyLine));
     }
 
     static void aHeadWhoseFirstLineIsAFieldIsStillRedacted() {
@@ -10274,6 +10328,15 @@ public final class Redactor {
      * from -- there is no way to build one without it -- and cannot outlive
      * it, because any other array is a {@link RangeError}.
      *
+     * What identity CANNOT see is in-place mutation of the same array after
+     * binding. Moving the credential to a different offset within THIS array
+     * after construction -- or after a range has already been registered for
+     * its old position -- leaves it unprotected with no exception and no
+     * signal, because the identity check still passes: it is still the same
+     * array, just rewritten. That is inherent to checking identity rather
+     * than content, not a gap this class can close. Plan 5, which is the
+     * first caller: do not touch the array after handing it to an Injected.
+     *
      * The list is per INSTANCE, and that is load-bearing separately: two
      * requests can be built, and both range sets registered, before either is
      * redacted, so one list shared between instances leaks whichever request
@@ -10297,10 +10360,15 @@ public final class Redactor {
      * makes the list safe to touch from two threads; it does NOT order
      * registration before redaction. A range registered after redactRequest
      * has taken its snapshot is simply not in it, and the copy that crosses
-     * the bridge carries the credential with no exception and no signal:
-     * measured over 200 trials, 200 leaked when the registration was merely
-     * started on another thread and 0 when the two were made to rendezvous
-     * first. The lock decides nothing about which of them happens. The
+     * the bridge carries the credential with no exception and no signal.
+     * This is a genuine race, not a hypothetical one -- but no leak rate is
+     * recorded here, because none was reproducible: an unsynchronized race
+     * between register() and redactRequest(), and the same two actions
+     * released together from a barrier, have each now been measured at three
+     * sharply different rates by three separate attempts, in both
+     * directions. Every number was a property of a harness and a scheduler,
+     * never of this class. What holds regardless of the number is that the
+     * lock decides nothing about which of the two happens first. The
      * contract the caller has to keep, and which nothing here can check, is
      * REGISTER EVERYTHING, THEN REDACT.
      *
