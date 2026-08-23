@@ -1263,77 +1263,89 @@ public final class Policy {
      * Every way a pattern SPELLS one resource, and no way it could name a
      * different one. This is what a scope.include is read by.
      *
-     * The encoding axis only: percent-decoding (to a fixed point, with the
+     * The encoding axis: percent-decoding (to a fixed point, with the
      * separators-inert reading beside it), the UTF-8 fold, the encoded
      * spelling in both hex cases, and the case fold. Every one of those is the
      * SAME path written differently, which is what an allow rule has to cover
      * or it authorises nothing -- `include=.../files/my%20docs/*` has to
      * authorise the request whether it arrives encoded or not, and
      * `include=.../files/cafe-with-an-acute/*` has to authorise the
-     * percent-encoded UTF-8 a request actually carries.
+     * percent-encoded UTF-8 a request actually carries. PLUS, since Round 9,
+     * the LETTER half of the best-fit fold -- foldBestFitLetters, called from
+     * addSpellings -- because `include=.../p(U+0142)atno(U+015B)ci/*` has to
+     * authorise the ASCII best-fit reading a Windows target routes that
+     * request as, the same way the encoding axis already covered an escape.
      *
      * What is NOT here is the segment axis: ;params stripped, backslashes
      * folded, dot segments resolved, empty segments merged, segment tails
-     * trimmed, best-fit homoglyphs substituted. Each of those answers "which
-     * resource does this name on some server", and widening a DENY rule that
-     * way denies more while widening an ALLOW rule authorises more. The
-     * measured cost of not making the distinction: `include=/../*` resolved to
-     * `/*` and authorised every path on the host.
+     * trimmed. Each of those answers "which resource does this name on some
+     * server", and widening a DENY rule that way denies more while widening an
+     * ALLOW rule authorises more. The measured cost of not making the
+     * distinction: `include=/../*` resolved to `/*` and authorised every path
+     * on the host.
      *
-     * The best-fit fold is on the excluded side even though it looks like an
-     * encoding. Two reasons, one per half of the table. The separator
-     * homoglyphs MANUFACTURE separators -- U+FF0F becomes a `/`, U+FF05
-     * becomes a `%`, U+FF0A becomes a `*` -- so an include carrying one would
-     * gain a reading that cuts the path, or globs it, somewhere the operator
-     * did not. The rest substitute a LETTER, which is not a different spelling
-     * of the operator's pattern but a different NAME:
-     * `include=/(U+FF41)dmin/*` folded would read as `/admin/*` and authorise
-     * the real admin area, which is the `include=/../*` failure with a
-     * homoglyph in place of a dot segment.
+     * THE BEST-FIT FOLD IS SPLIT ACROSS THE TWO KINDS OF RULE, by what a
+     * fit's TARGET is rather than by a second list of code points -- see
+     * foldBestFitLetters. The separator half -- 122 of the table's 398 --
+     * stays excluded, for the same reason the segment axis is: it MANUFACTURES
+     * structure. U+FF0F becomes a `/`, U+FF05 becomes a `%`, U+FF0A becomes a
+     * `*` -- a GLOB METACHARACTER the moment it sits in a pattern's own
+     * spelling -- so an include carrying one would gain a reading that cuts
+     * the path, escapes it, or globs it, somewhere the operator did not write.
+     * foldBestFit still folds that half for a PATH and for a DENY pattern; it
+     * always has. The LETTER half -- 276 of 398 -- is different in kind, not
+     * degree: it substitutes one letter or digit for another, one code point
+     * for one code point, so it cannot split a segment, cannot merge two, and
+     * cannot manufacture a `/`, a `\`, a `.`, a `;`, a `%` or a `*`. The
+     * structural argument above never reached it, which is what made it a
+     * ruling to take rather than a bypass to close.
      *
-     * THAT SPLIT NOW HAS A PRICE AN ENGAGEMENT CAN FEEL, and it is recorded
-     * here because the argument above was written when the fold was 105 code
-     * points nobody's scope file contains. It is 398 now, 214 of them letters
-     * and digits outside the fullwidth block, so an include whose own text
-     * carries one authorises nothing:
+     * THE COST OF NOT RULING IT IN WAS MEASURED FIRST, and is worth keeping:
+     * before Round 9, an include whose own text carried a letter-half code
+     * point authorised nothing at all --
      *
-     *   include=.../p(U+0142)atno(U+015B)ci/*   Polish     authorises NOTHING
-     *   include=.../kullan(U+0131)c(U+0131)/*   Turkish    authorises NOTHING
-     *   include=.../pl(U+0103)(U+0163)i/*       Romanian   authorises NOTHING
-     *   include=.../lietot(U+0101)js/*          Latvian    authorises NOTHING
-     *   include=.../(a Greek word with an alpha)/*  Greek   authorises NOTHING
+     *   include=.../p(U+0142)atno(U+015B)ci/*   Polish     authorised NOTHING
+     *   include=.../kullan(U+0131)c(U+0131)/*   Turkish    authorised NOTHING
+     *   include=.../pl(U+0103)(U+0163)i/*       Romanian   authorised NOTHING
+     *   include=.../lietot(U+0101)js/*          Latvian    authorised NOTHING
+     *   include=.../(a Greek word with an alpha)/*  Greek   authorised NOTHING
      *
-     * Measured, with the requests those patterns are for; PolicyTest carries
-     * the table and its controls. What is NOT affected is anything code page
+     * -- and all five authorise their own request now; PolicyTest carries the
+     * table and its controls. What is still NOT affected is anything code page
      * 1252 can already spell -- so Spanish, French, German, Portuguese and
      * Italian scopes, and Cyrillic and CJK ones, are untouched -- nor an
      * include anchored at an ASCII prefix, because the fold changes a NAME and
-     * not the prefix.
+     * not the prefix, and that was true either way.
      *
-     * It is fail-closed and visible: the operator is told the request matches
-     * no scope.include pattern. It is not settled. Whether the letter half of
-     * the fold should reach allow patterns too -- it cannot manufacture a
-     * separator or a `*`, so the structural argument above is about the
-     * separator half alone -- is a trade-off between a denylist bypass and
-     * refusing a client's own URLs, and it belongs to whoever owns the
-     * engagement rather than to this comment.
+     * THE ACCEPTED COST, taken knowingly rather than found later: an include
+     * spelt with a letter homoglyph now authorises the plain spelling too.
+     * `include=/(U+FF41)dmin/*` folded reads as `/admin/*` and authorises the
+     * real admin area, which is the `include=/../*` failure with a homoglyph
+     * in place of a dot segment -- a real widening, but of one NAME to one
+     * name, never of one directory to the whole host, because the fold cannot
+     * add a `/` or a `*`. It is fail-closed and visible on the side that still
+     * refuses: an uncovered reading still tells the operator the request
+     * matches no scope.include pattern rather than being quietly allowed.
      *
      * Flat rather than a fixed point, because none of these transforms creates
      * a trigger for another: decoding already runs to a fixed point, and the
-     * rest substitute characters one for one.
+     * rest -- the case fold, the letter fold -- substitute characters one for
+     * one and cannot manufacture an escape or a separator for a later pass to
+     * find.
      *
-     * THE COST, stated rather than left to be found. An include that carries a
-     * segment trigger now authorises nothing at all -- not even the path it
-     * literally spells. `include=/app;v=1/*` refuses `/app;v=1/secret`,
-     * because that request still has the reading `/app/secret`, which a
-     * servlet container serves and the pattern does not name, and allow-AND
-     * refuses on any uncovered reading. It is the fail-closed answer, it is
-     * visible (the operator is told the request matches no scope.include
-     * pattern rather than being quietly allowed), and the remedy is one
-     * pattern wide enough to cover both readings -- `/app*` here -- because
-     * allows() asks a SINGLE rule to cover the whole set and two half-scopes
-     * deliberately do not add up. The alternative was measured:
-     * `include=/../*` authorising every path on the host.
+     * THE SEGMENT-AXIS COST, stated rather than left to be found, and
+     * unaffected by any of the above because best-fit is an encoding-axis
+     * question. An include that carries a segment trigger authorises nothing
+     * at all -- not even the path it literally spells. `include=/app;v=1/*`
+     * refuses `/app;v=1/secret`, because that request still has the reading
+     * `/app/secret`, which a servlet container serves and the pattern does not
+     * name, and allow-AND refuses on any uncovered reading. It is the
+     * fail-closed answer, it is visible (the operator is told the request
+     * matches no scope.include pattern rather than being quietly allowed), and
+     * the remedy is one pattern wide enough to cover both readings --
+     * `/app*` here -- because allows() asks a SINGLE rule to cover the whole
+     * set and two half-scopes deliberately do not add up. The alternative was
+     * measured: `include=/../*` authorising every path on the host.
      */
     static Set<String> spellingReadings(String pattern) {
         Set<String> out = new LinkedHashSet<>();
@@ -1349,10 +1361,15 @@ public final class Policy {
     /** One spelling and the readings of it that are still the same resource.
      *  Verbatim AND case-folded, because the path's raw reading is verbatim
      *  and its derived readings are lowercased, and an include has to cover
-     *  both. */
+     *  both. Plus its letter-half best-fit fold (see addLetterFold), for the
+     *  operator who typed the homoglyph as a literal character rather than as
+     *  an escape -- decodeToFixedPoint below is the identity on `s` in that
+     *  case, and this method would otherwise return before ever reaching
+     *  addSpelling. */
     private static void addSpellings(Set<String> out, String s) {
         out.add(s);
         out.add(lower(s));
+        addLetterFold(out, s);
         String decoded = decodeToFixedPoint(s);
         if (decoded.equals(s)) return;
         addSpelling(out, decoded);
@@ -1394,10 +1411,37 @@ public final class Policy {
      * what lower(s) matches once both sides are folded -- and the only side
      * that is not folded is the path's raw reading, which is the reading this
      * exists to cover.
+     *
+     * Since Round 9 it also adds the letter-half best-fit fold of `s` (see
+     * addLetterFold), which is what covers an operator who typed the
+     * homoglyph as a percent-escape -- `include=.../p%c5%82atnosci/*` --
+     * rather than as a literal character: `s` here is decodeToFixedPoint's or
+     * foldOverlongUtf8's output, so the fold reaches it exactly where
+     * addSpellings' own call reaches the literal spelling.
      */
     private static void addSpelling(Set<String> out, String s) {
         out.add(lower(s));
         if (isAscii(s)) out.add(s);
+        addLetterFold(out, s);
+    }
+
+    /**
+     * The letter-half best-fit spelling of `s` (see foldBestFitLetters),
+     * added case-folded always and verbatim when the fold left nothing but
+     * ASCII behind -- the same two rules addSpelling applies to a decoded
+     * spelling, because this is that same kind of derived spelling and not
+     * the operator's own text.
+     *
+     * A no-op whenever `s` carries none of the 276 code points, which is
+     * every ASCII pattern and every pattern in a script the table does not
+     * cover -- so the whole of Cyrillic, CJK and Latin-1 costs this method one
+     * scan and nothing more.
+     */
+    private static void addLetterFold(Set<String> out, String s) {
+        String letters = foldBestFitLetters(s);
+        if (letters.equals(s)) return;
+        out.add(lower(letters));
+        if (isAscii(letters)) out.add(letters);
     }
 
     /** Whether every character is ASCII -- asked about a DECODED string, where
@@ -1707,33 +1751,46 @@ public final class Policy {
      * from the vendor file -- see bestFit -- and the only judgement left in it
      * is a filter anyone can re-run.
      *
-     * THE COST, measured before it was accepted rather than discovered after.
-     * A best-fit reading belongs to a PATH and to a DENY pattern, never to an
-     * ALLOW pattern (see spellingReadings), so an include that CARRIES a
-     * folded code point authorises nothing: the request keeps the folded
-     * reading and the pattern does not name it. With the fullwidth block that
-     * cost was theoretical -- nobody's scope file is spelt in fullwidth. With
-     * the whole table it is not, because 276 entries fold to a letter or a
-     * digit and 214 of those are outside the fullwidth block:
+     * THE COST WAS REAL, measured before Round 9 ruled on it rather than
+     * argued about after. A best-fit reading belonged to a PATH and to a DENY
+     * pattern, never to an ALLOW pattern, so an include that CARRIED a folded
+     * code point authorised nothing: the request kept the folded reading and
+     * the pattern could not name it. With the fullwidth block that cost was
+     * theoretical -- nobody's scope file is spelt in fullwidth. With the
+     * whole table it was not, because 276 of 398 entries fold to a letter or a
+     * digit:
      *
-     *   include=.../p(U+0142)atno(U+015B)ci/*   authorises NOTHING
-     *   include=.../kullan(U+0131)c(U+0131)/*   authorises NOTHING
-     *   include=.../p(U+0159)istup/*            authorises NOTHING
+     *   include=.../p(U+0142)atno(U+015B)ci/*   authorised NOTHING
+     *   include=.../kullan(U+0131)c(U+0131)/*   authorised NOTHING
+     *   include=.../p(U+0159)istup/*            authorised NOTHING
      *
      * Polish, Turkish, Czech, Slovak, Hungarian, Romanian, Baltic and part of
-     * Greek. The rule is exact rather than per-language, and it is worth
-     * stating that way: an include breaks when a code point in the TABLE
-     * appears in the pattern's own text, and not otherwise. So Czech
-     * `/p(U+0159)istup/*` is refused while `/u(U+017E)ivatel/*` is not --
-     * U+0159 is in the table, U+017E is a character 1252 can already spell.
-     * The whole Latin-1 supplement is in that second group, so Spanish, French,
-     * German, Portuguese and Italian scopes are untouched, and so are Cyrillic
-     * and CJK ones. Nor is a scope anchored at an ASCII prefix affected --
-     * `/files/*` still authorises a folded filename under it, because the fold
-     * changes a NAME and not the prefix. See the include-cost table in
-     * PolicyTest, which pins every row of this paragraph in both directions,
-     * and the round report, which is where the trade-off is argued rather than
-     * here.
+     * Greek. RULED IN: those 276 entries -- foldBestFitLetters, just above --
+     * are now part of spellingReadings, so all three authorise their own
+     * request. The other 122, the ones that manufacture a `/`, a `\`, a `.`, a
+     * `;`, a `%` or a `*`, stayed exactly where they were: foldBestFit still
+     * folds them for a PATH and for a DENY pattern, and spellingReadings still
+     * does not. See spellingReadings for the argument the split rests on.
+     *
+     * The rule is still exact rather than per-language: an include's own text
+     * needed the fold when a code point in the LETTER half appeared in it, and
+     * not otherwise. So Czech `/p(U+0159)istup/*` needed it and has it now,
+     * while `/u(U+017E)ivatel/*` never needed one -- U+017E is a character
+     * 1252 can already spell. The whole Latin-1 supplement is in that second
+     * group, so Spanish, French, German, Portuguese and Italian scopes were
+     * never touched, and neither were Cyrillic or CJK ones. Nor is a scope
+     * anchored at an ASCII prefix affected -- `/files/*` authorises a folded
+     * filename under it either way, because the fold changes a NAME and not
+     * the prefix.
+     *
+     * THE ACCEPTED COST, taken knowingly rather than found later: an include
+     * spelt with a letter homoglyph now authorises the plain spelling too --
+     * `include=/(fullwidth a)dmin/*` also authorises `/admin/*`, which is the
+     * `include=/../*` failure with a homoglyph standing in for a dot segment.
+     * It widens one NAME to one name and never a directory to the whole host,
+     * because a letter fold cannot add a `/` or a `*`. See the include-cost
+     * table in PolicyTest, which pins every row of this paragraph in both
+     * directions, and the round report, where the ruling is recorded.
      */
     static String foldBestFit(String s) {
         int i = 0;
@@ -1744,6 +1801,47 @@ public final class Policy {
             char c = s.charAt(i);
             char fit = bestFit(c);
             if (fit == c) continue;
+            if (out == null) out = new StringBuilder(s);
+            out.setCharAt(i, fit);
+        }
+        return out == null ? s : out.toString();
+    }
+
+    /**
+     * Whether a best-fit TARGET character is a letter or a digit --
+     * `[0-9A-Za-z]` -- rather than punctuation, a separator, or the space this
+     * table also folds. Asked of what bestFit() RETURNS, not of a second list
+     * of code points: that is what makes the split below DERIVED from the
+     * table rather than drawn a third time by hand, which is the mistake this
+     * whole file exists to stop making.
+     */
+    private static boolean isLetterOrDigit(char c) {
+        return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    }
+
+    /**
+     * foldBestFit, restricted to the 276 of 398 entries whose TARGET is a
+     * letter or a digit. This is the half Round 9 ruled an ALLOW pattern may
+     * use -- see spellingReadings and addSpellings -- because it is 1:1 on
+     * characters: it substitutes one letter for another and cannot split a
+     * segment, cannot merge two, and cannot manufacture a `/`, a `\`, a `.`, a
+     * `;`, a `%` or a `*`. U+FF0F still does not become a `/` here and U+FF0A
+     * still does not become a `*`; foldBestFit is what folds those, and it
+     * stays the only one of the two an ALLOW pattern is never read by.
+     *
+     * The filter is on bestFit()'s OUTPUT for each character in `s`, not on a
+     * second table of code points, so this cannot drift from foldBestFit the
+     * way a hand-copied subset could.
+     */
+    static String foldBestFitLetters(String s) {
+        int i = 0;
+        while (i < s.length() && s.charAt(i) < 0x80) i++;
+        if (i == s.length()) return s;                  // pure ASCII: nothing to fit
+        StringBuilder out = null;
+        for (; i < s.length(); i++) {
+            char c = s.charAt(i);
+            char fit = bestFit(c);
+            if (fit == c || !isLetterOrDigit(fit)) continue;
             if (out == null) out = new StringBuilder(s);
             out.setCharAt(i, fit);
         }

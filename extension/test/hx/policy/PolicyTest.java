@@ -53,7 +53,8 @@ public class PolicyTest {
         bothDotSegmentOrdersAreInTheSet();
         decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep();
         everyBestFitEntryIsGuardedByACheckOfItsOwn();
-        theBestFitFoldRefusesAnIncludeThatCarriesOne();
+        theBestFitFoldSplitsByTargetClassNotByHand();
+        theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne();
         anIncludeIsNotWidenedByASegmentTransform();
         aNulEndsTheStringForAnythingThatReachesACApi();
         theReadingSetIsClosedUnderItsOwnTransforms();
@@ -1248,40 +1249,98 @@ public class PolicyTest {
     static final int FULLWIDTH_OFFSET = 0xfee0;
 
     /**
-     * WHAT THE GENERATED TABLE COSTS AN ENGAGEMENT, measured, both directions,
-     * and NOT settled here.
+     * ROUND 9. The table is split into a LETTER half spellingReadings may use
+     * and a SEPARATOR half it may not, and the split has to be DISCOVERED
+     * from what foldBestFit and foldBestFitLetters actually do rather than
+     * asserted from a second list -- a hand-drawn line has been wrong on this
+     * table twice already (round 6's thirteen entries, round 7's hundred and
+     * five), and a third one, even a two-way one, would be the same mistake
+     * with a different shape.
      *
-     * A best-fit reading belongs to a PATH and to a DENY pattern, never to an
-     * ALLOW pattern -- see Policy.spellingReadings for the argument. While the
-     * fold was 105 code points that cost was theoretical: no scope file is
-     * spelt in fullwidth. The generated table is 398, and 276 of them fold to
-     * a letter or a digit, so an include whose OWN TEXT carries one authorises
-     * nothing at all -- the request keeps the folded reading and the pattern
-     * cannot name it.
-     *
-     * The rule is exact, per CODE POINT rather than per language, and the two
-     * tables below are chosen to show that: an include breaks when a code
-     * point in the table appears in the pattern's own text, and not otherwise.
-     * Czech `/přístup/*` is refused and Czech `/uživatel/*` is not, because
-     * U+0159 is in bestfit1252 and U+017E is a character 1252 can already
-     * spell; Hungarian splits the same way on U+0151 against U+00E1. So
-     * `/administración/*` is fine (Latin-1), `/płatności/*` is not (Latin
-     * Extended-A), and `/api/*` is fine whatever the leaf is spelt in.
-     *
-     * This is fail-closed and visible -- "matches no scope.include pattern" --
-     * and the remedy is an include wide enough to cover both readings. It is
-     * still a real cost on a real engagement, and whether the LETTER half of
-     * the fold should reach allow patterns as well (it cannot manufacture a
-     * separator or a `*`, so the structural argument is about the separator
-     * half alone) is a ruling for whoever owns the engagement. These rows exist
-     * so the answer is a decision rather than a discovery.
+     * A code point is in the letter half exactly when foldBestFitLetters
+     * folds it the same way foldBestFit does; it is in the separator half
+     * when foldBestFit folds it and foldBestFitLetters does not. There is no
+     * third outcome, because foldBestFitLetters is a filter on foldBestFit's
+     * own output and not a second table -- see Policy.foldBestFitLetters.
      */
-    static void theBestFitFoldRefusesAnIncludeThatCarriesOne() {
+    static void theBestFitFoldSplitsByTargetClassNotByHand() {
+        int letters = 0, other = 0;
+        for (int c = 0x80; c <= 0xffff; c++) {
+            String one = String.valueOf((char) c);
+            String fit = Policy.foldBestFit(one);
+            if (fit.equals(one)) continue;                    // not in the table
+            String letterFit = Policy.foldBestFitLetters(one);
+            if (letterFit.equals(fit)) letters++;
+            else if (letterFit.equals(one)) other++;
+            else check(String.format("U+%04X folds to a THIRD spelling under "
+                                     + "foldBestFitLetters, neither foldBestFit's "
+                                     + "nor its own", c), false);
+        }
+        check("the 398-entry table splits into 276 letters/digits, which "
+              + "spellingReadings may fold, and 122 punctuation/separator/space "
+              + "entries, which stay deny-only (" + letters + "/" + other + ")",
+              letters == 276 && other == 122 && letters + other == 398);
+
+        // The boundary named on one entry from each half, rather than trusted
+        // from the count alone.
+        check("U+0142 (LATIN SMALL LETTER L WITH STROKE, target `l`) is in "
+              + "the letter half",
+              "l".equals(Policy.foldBestFitLetters("ł")));
+        check("U+FF0F (FULLWIDTH SOLIDUS, target `/`) is NOT -- it stays "
+              + "deny-only because it manufactures a separator",
+              "／".equals(Policy.foldBestFitLetters("／"))
+              && "/".equals(Policy.foldBestFit("／")));
+        check("U+FF0A (FULLWIDTH ASTERISK, target `*`) is NOT either -- the "
+              + "one that would manufacture a glob wildcard in an include's "
+              + "own spelling",
+              "＊".equals(Policy.foldBestFitLetters("＊"))
+              && "*".equals(Policy.foldBestFit("＊")));
+
+        // None of the six supplements, and none of the five entries the SIXTH
+        // FALSE CLAIM check names as 1252's own, are letters -- the split
+        // does not move any of the eleven the labelling in
+        // everyBestFitEntryIsGuardedByACheckOfItsOwn covers. All eleven
+        // best-fit to a `/`, a backslash, a `.`, a `;` or a `%`.
+        for (char cp : new char[]{0x29f8, 0xfe68, 0xfe52, 0xff61, 0x2024, 0xfe54,
+                                  0x2215, 0x2044, 0x2216, 0x037e, 0x066a})
+            check(String.format("U+%04X is in the separator half, so the "
+                                + "eleven's labelling as deny-only homoglyphs "
+                                + "is unmoved by the split", (int) cp),
+                  Policy.foldBestFitLetters(String.valueOf(cp))
+                        .equals(String.valueOf(cp)));
+    }
+
+    /**
+     * ROUND 9: THE RULING, on the cost Round 8 measured and left open.
+     *
+     * A best-fit reading used to belong to a PATH and to a DENY pattern,
+     * never to an ALLOW pattern -- see Policy.spellingReadings for the
+     * argument it rested on. The fold is 398 code points now and 276 of them
+     * fold to a letter or a digit, so an include whose OWN TEXT carried one
+     * authorised nothing at all: the request kept the folded reading and the
+     * pattern could not name it. Round 8 recommended taking the LETTER half
+     * into ALLOW patterns and leaving the separator half deny-only, because a
+     * letter fold is 1:1 on characters -- it cannot split a segment, cannot
+     * merge two, and cannot manufacture a `/`, a `%` or a `*` -- so the
+     * structural argument for excluding the fold, which is about MANUFACTURED
+     * separators, never reached it. The ruling took the recommendation:
+     * Policy.foldBestFitLetters is now part of spellingReadings, and every row
+     * below that used to refuse now allows.
+     *
+     * The rule is still exact, per CODE POINT rather than per language:
+     * Czech `/přístup/*` needed the fold and Czech `/uživatel/*` did not,
+     * because U+0159 is in bestfit1252 and U+017E is a character 1252 can
+     * already spell; Hungarian splits the same way on U+0151 against U+00E1.
+     * `/administración/*` was always fine (Latin-1); `/api/*` is fine
+     * whatever the leaf is spelt in.
+     */
+    static void theLetterHalfOfTheBestFitFoldNowCoversAnIncludeThatCarriesOne() {
         Policy p = allowingPolicy();
 
-        // A scope whose own directory name folds: the request for the path the
-        // operator NAMED is refused.
-        String[][] refused = {
+        // A scope whose own directory name folds: THE RULING is that the
+        // request for the path the operator NAMED is now allowed, where
+        // Round 8 measured it refused.
+        String[][] hadNeededTheFold = {
             {"Polish",   "/płatności/faktura",     "/płatności/*"},
             {"Turkish",  "/kullanıcı/profil",      "/kullanıcı/*"},
             {"Romanian", "/plăţi/factură",         "/plăţi/*"},
@@ -1290,20 +1349,23 @@ public class PolicyTest {
             {"Czech",    "/přístup/dokument",      "/přístup/*"},
             {"Hungarian","/nyelvő/beállítás",      "/nyelvő/*"},
         };
-        for (String[] row : refused) {
+        for (String[] row : hadNeededTheFold) {
             String path = Policy.percentEncodeUtf8(row[1], false);
-            denies("THE COST: a " + row[0] + " include authorises nothing, not "
-                   + "even the path it spells: include=" + row[2], p,
+            allows("THE RULING: a " + row[0] + " include now authorises the "
+                   + "path it spells: include=" + row[2], p,
                    req("GET", "https://app.example.test" + path,
                        "app.example.test", path, ""),
-                   authorised("scope.include", "https://app.example.test" + row[2]),
-                   "scope_denied");
+                   authorised("scope.include", "https://app.example.test" + row[2]));
         }
+        // All seven of Round 8's refused rows allow above, and the eight
+        // "unaffected" rows below still do -- none of the fifteen still
+        // refuses, and each of the fifteen has its own falsifiable check
+        // rather than a summary asserted on top of them.
 
         // The other direction, and it is the larger half. Code page 1252 can
         // spell the whole Latin-1 supplement, so nothing in it needs a best fit
         // and no Western European scope is touched; Cyrillic and CJK have no
-        // best fit at all.
+        // best fit at all. Unaffected before this round and unaffected now.
         String[][] unaffected = {
             {"Spanish",  "/españa/artículos",      "/españa/*"},
             {"French",   "/café/menu",             "/café/*"},
@@ -1325,8 +1387,10 @@ public class PolicyTest {
 
         // And the half that matters most in practice: the fold changes a NAME,
         // not the prefix a scope is anchored at, so an ASCII include still
-        // authorises a folded filename underneath it.
-        for (String[] row : refused) {
+        // authorises a folded filename underneath it. Unaffected by the
+        // ruling, since this never needed the pattern to fold at all -- only
+        // the wildcard did the work.
+        for (String[] row : hadNeededTheFold) {
             String leaf = Policy.percentEncodeUtf8("/files" + row[1], false);
             allows("an ASCII include still authorises a folded path under it: "
                    + leaf, p,
@@ -1334,6 +1398,76 @@ public class PolicyTest {
                        "app.example.test", leaf, ""),
                    authorised("scope.include", "https://app.example.test/files/*"));
         }
+
+        // THE RULING DOES NOT WIDEN, checked in both directions the ruling
+        // asked for. An ASCII include does not gain a non-ASCII spelling of
+        // itself -- the fold runs non-ASCII-to-ASCII only, never the other
+        // way -- so the Polish request's real (unfolded) reading is still
+        // uncovered and the include still refuses it.
+        String polishAscii = Policy.percentEncodeUtf8("/płatności/x", false);
+        denies("include=/platnosci/* (ASCII) does not authorise the "
+               + "non-ASCII path it best-fits from: " + polishAscii, p,
+               req("GET", "https://app.example.test" + polishAscii,
+                   "app.example.test", polishAscii, ""),
+               authorised("scope.include", "https://app.example.test/platnosci/*"),
+               "scope_denied");
+        // ...while the reverse -- the operator's own non-ASCII include,
+        // matched against the plain ASCII spelling of the same resource on a
+        // Windows/IIS target -- is exactly the ruling's point and is allowed.
+        allows("include=/płatności/* DOES authorise the plain ASCII spelling "
+               + "of its own name: /platnosci/x", p,
+               req("GET", "https://app.example.test/platnosci/x",
+                   "app.example.test", "/platnosci/x", ""),
+               authorised("scope.include", "https://app.example.test/płatności/*"));
+
+        // THE ACCEPTED COST, taken knowingly rather than found later: a letter
+        // fold is 1:1, so an include spelt with a letter homoglyph now also
+        // authorises the plain spelling -- one NAME widened to one name, never
+        // a directory widened to the whole host.
+        allows("THE ACCEPTED COST: include=/(fullwidth a)dmin/* also "
+               + "authorises /admin/x", p,
+               req("GET", "https://app.example.test/admin/x",
+                   "app.example.test", "/admin/x", ""),
+               authorised("scope.include", "https://app.example.test/ａdmin/*"));
+
+        // THE BOUNDARY THE RULING DID NOT MOVE. The separator half of the
+        // table -- 122 of 398, the ones that manufacture a `/`, a `\`, a `.`,
+        // a `;`, a `%` or a `*` rather than substitute a letter -- stays
+        // deny-only. U+FF0A FULLWIDTH ASTERISK best-fits to `*`, a GLOB
+        // METACHARACTER: folding it into an include's own spelling would let
+        // a homoglyph the operator wrote as a literal character start
+        // matching like a wildcard, which is `include=/../*` again with a
+        // different metacharacter standing in for the dot segment.
+        String star = "/app＊x";
+        check("the fullwidth asterisk is not in spellingReadings' output -- "
+              + "it stays a homoglyph, not a wildcard: "
+              + Policy.spellingReadings(star + "/*"),
+              !Policy.spellingReadings(star + "/*").contains("/app*x/*"));
+        denies("...so include=" + star + "/* does not authorise "
+               + "/appDANGERx/secret", p,
+               req("GET", "https://app.example.test/appDANGERx/secret",
+                   "app.example.test", "/appDANGERx/secret", ""),
+               authorised("scope.include", "https://app.example.test" + star + "/*"),
+               "scope_denied");
+        // ...and, tellingly, not even the include's own literal request. The
+        // PATH side still folds the WHOLE table (foldBestFit, not
+        // foldBestFitLetters -- see readings()/addBases), so a request for
+        // the operator's own literal name also carries the reading
+        // /app*x/secret with a REAL asterisk, and no pattern reading --
+        // literal, encoded, or the mojibake and UTF-8 spellings addSpellings
+        // derives from them -- contains that string, because the allow side
+        // never folds this homoglyph at all. An include built on a
+        // separator-class homoglyph authorises NOTHING, which is the same
+        // fail-closed shape `/app;v=1/*` has always had and not a defect the
+        // ruling introduced.
+        String starPath = Policy.percentEncodeUtf8(star + "/secret", false);
+        denies("...nor even the include's own literal request, because the "
+               + "path's best-fit reading still has a REAL asterisk in it: "
+               + starPath, p,
+               req("GET", "https://app.example.test" + starPath,
+                   "app.example.test", starPath, ""),
+               authorised("scope.include", "https://app.example.test" + star + "/*"),
+               "scope_denied");
     }
 
     /** A character a check can print. */
