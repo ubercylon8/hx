@@ -140,6 +140,7 @@ public class BridgeClientTest {
             t("theCommitIsExclusiveWithClose", BridgeClientTest::theCommitIsExclusiveWithClose);
             t("aConfigureDoesNotLiftAHalt", BridgeClientTest::aConfigureDoesNotLiftAHalt);
             t("haltFramesReachTheSwitchTheSendPathAsks", BridgeClientTest::haltFramesReachTheSwitchTheSendPathAsks);
+            t("aHaltFrameWithNoReasonDoesNotDeliverTheWordNull", BridgeClientTest::aHaltFrameWithNoReasonDoesNotDeliverTheWordNull);
             t("aHaltSinkThatThrowsDropsToDenyAll", BridgeClientTest::aHaltSinkThatThrowsDropsToDenyAll);
         } finally {
             Files.deleteIfExists(sock);
@@ -705,6 +706,44 @@ public class BridgeClientTest {
             check("and the client is sending again", l.client.maySend());
         } finally {
             Files.deleteIfExists(dir.resolve("hs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A `halt` frame carrying no `reason` key must not deliver the WORD
+     * "null".
+     *
+     * `String.valueOf(f.header.get("reason"))` answers the four-character
+     * string "null" for an absent key, and "null" is neither null nor blank,
+     * so HaltSwitch's "halted by frame, no reason given" fallback could never
+     * fire for a bridge-delivered halt -- the only production caller. Measured
+     * end to end, through a real socket: reason() was the literal "null" and
+     * checkMaySend() threw `NotConfigured: halted: null`. Both places an
+     * operator reads showed them the word null where the reason belongs.
+     */
+    static void aHaltFrameWithNoReasonDoesNotDeliverTheWordNull() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltnoreasonframe");
+        HaltSwitch hs = new HaltSwitch(() -> 0L, dir.resolve("halt"), 500L);
+        try (Live l = live(dir, "hn.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { hs.haltedByFrame(reason); }
+                public void resumed()             { hs.resumedByFrame(); }
+            });
+
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "halt"), new byte[0]));
+            l.out.flush();
+            waitUntil(hs::halted);
+            check("a halt frame with no reason still halts the send path", hs.halted());
+            check("and the switch's own fallback is what the send path reports ("
+                  + hs.reason() + ")",
+                  "halted by frame, no reason given".equals(hs.reason()));
+
+            String message = "";
+            try { l.client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { message = e.getMessage(); }
+            check("and the client's refusal does not read `halted: null` (" + message + ")",
+                  message.startsWith("halted:") && !message.contains("null"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("hn.sock")); Files.deleteIfExists(dir);
         }
     }
 

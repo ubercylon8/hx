@@ -167,7 +167,7 @@ public final class BridgeClient {
         if (!configured.get())
             throw new NotConfigured("not_configured: no configure frame acknowledged yet");
         if (halted.get())
-            throw new NotConfigured("halted: " + haltReason);
+            throw new NotConfigured("halted: " + (haltReason == null ? "no reason given" : haltReason));
     }
 
     public void connect() throws IOException {
@@ -320,7 +320,12 @@ public final class BridgeClient {
                 send(ack, new byte[0]);
             }
             case "halt" -> {
-                String why = String.valueOf(f.header.get("reason"));
+                // NOT String.valueOf(): for an absent key that answers the
+                // four-character string "null", which is neither null nor
+                // blank, so HaltSwitch's "no reason given" fallback could
+                // never fire for the only production caller and both
+                // consoles showed the operator the word null.
+                String why = f.header.get("reason") instanceof String r ? r : null;
                 // The switch FIRST, this flag second. `halted` here governs
                 // maySend()/checkMaySend(); the send path asks HaltSwitch, and
                 // on the way DOWN the stricter authority is told first.
