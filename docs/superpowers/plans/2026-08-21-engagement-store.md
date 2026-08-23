@@ -564,6 +564,18 @@ CREATE TABLE IF NOT EXISTS engagement (
   config_path  TEXT
 );
 
+-- Exactly one engagement per database: the engagement is the unit of
+-- isolation (spec S3), and `quarantine` and every unqualified `open_()`
+-- lookup presume a single authoritative row. Without this, a second INSERT
+-- is accepted silently and which client the store believes it holds becomes
+-- arbitrary.
+CREATE TRIGGER IF NOT EXISTS trg_engagement_singleton
+BEFORE INSERT ON engagement
+WHEN (SELECT COUNT(*) FROM engagement) > 0
+BEGIN
+  SELECT RAISE(ABORT, 'only one engagement row is permitted per database');
+END;
+
 -- Append-only. Never UPDATE a row here: "what was in scope when request X was
 -- issued" is the query that matters under dispute.
 CREATE TABLE IF NOT EXISTS scope_version (
@@ -582,8 +594,8 @@ CREATE TABLE IF NOT EXISTS authorization (
   doc_blob      TEXT,
   doc_sha256    TEXT,
   signatory     TEXT,
-  valid_from    INTEGER,
-  valid_to      INTEGER,
+  valid_from_us INTEGER,
+  valid_to_us   INTEGER,
   scope_sha256  TEXT
 );
 
@@ -591,7 +603,7 @@ CREATE TABLE IF NOT EXISTS run (
   id               TEXT PRIMARY KEY,
   engagement_id    TEXT NOT NULL REFERENCES engagement(id),
   kind             TEXT NOT NULL CHECK (kind IN ('manual','scheduled','retest')),
-  safety_profile   TEXT NOT NULL,
+  safety_profile   TEXT NOT NULL CHECK (safety_profile IN ('production','staging')),
   scope_version_id TEXT REFERENCES scope_version(id),
   started_us       INTEGER NOT NULL,
   ended_us         INTEGER,
@@ -618,9 +630,9 @@ CREATE TABLE IF NOT EXISTS surface (
   discovered_by       TEXT NOT NULL DEFAULT 'proxy'
                       CHECK (discovered_by IN ('proxy','crawl','import','agent')),
   normaliser_version  INTEGER NOT NULL DEFAULT 1,
-  first_seen_run      TEXT,
-  last_seen_run       TEXT,
-  exemplar_exchange_id TEXT,
+  first_seen_run      TEXT REFERENCES run(id),
+  last_seen_run       TEXT REFERENCES run(id),
+  exemplar_exchange_id TEXT REFERENCES exchange(id),
   UNIQUE (engagement_id, method, scheme, host, port, path_template, query_key_set)
 );
 
@@ -636,7 +648,16 @@ CREATE TABLE IF NOT EXISTS exchange (
   outcome             TEXT NOT NULL
                       CHECK (outcome IN ('ok','timeout','conn_refused','dns_error',
                                          'tls_error','scope_denied','rate_limited',
-                                         'bridge_lost','truncated')),
+                                         'bridge_lost','truncated',
+                                         -- The exchange COMPLETED but its final
+                                         -- status could not be read: a peer put
+                                         -- more interim 1xx heads in front of the
+                                         -- response than the scan tolerates.
+                                         -- `status` then holds the conservative
+                                         -- sentinel 599, so this value is the only
+                                         -- thing separating that sentinel from a
+                                         -- peer that genuinely answered 599.
+                                         'status_unreadable')),
   sent_us             INTEGER NOT NULL,
   recv_us             INTEGER,
   method              TEXT NOT NULL,
@@ -688,6 +709,10 @@ CREATE TABLE IF NOT EXISTS finding (
   severity_source    TEXT,
   confidence         TEXT NOT NULL CHECK (confidence IN ('Certain','Firm','Tentative')),
   created_by         TEXT NOT NULL CHECK (created_by IN ('agent','human','check')),
+  -- Cached projection of finding_status_event, the source of truth. Direct
+  -- `UPDATE finding SET status=...` is deliberately left unguarded here --
+  -- unlike the event log, this column is a read-optimisation, not the
+  -- record of who changed what and when.
   status             TEXT NOT NULL
                      CHECK (status IN ('new','triaged','confirmed','false_positive','reported')),
   surface_id         TEXT REFERENCES surface(id),
@@ -698,8 +723,8 @@ CREATE TABLE IF NOT EXISTS finding (
                      CHECK (scope_level IN ('engagement','host','surface','insertion')),
   payload            TEXT,
   normaliser_version INTEGER NOT NULL DEFAULT 1,
-  first_seen_run     TEXT,
-  last_seen_run      TEXT,
+  first_seen_run     TEXT REFERENCES run(id),
+  last_seen_run      TEXT REFERENCES run(id),
   UNIQUE (engagement_id, dedupe_key)
 );
 
@@ -720,19 +745,59 @@ CREATE TABLE IF NOT EXISTS finding_status_event (
   id          TEXT PRIMARY KEY,
   finding_id  TEXT NOT NULL REFERENCES finding(id),
   from_status TEXT,
-  to_status   TEXT NOT NULL,
+  to_status   TEXT NOT NULL
+               CHECK (to_status IN ('new','triaged','confirmed','false_positive','reported')),
   actor       TEXT NOT NULL CHECK (actor IN ('agent','human','check')),
   note        TEXT,
   ts_us       INTEGER NOT NULL
 );
 
 -- The agent may never confirm its own finding. Enforced by the database,
--- not by discipline.
+-- not by discipline. Covers both the initial INSERT and any later UPDATE
+-- that tries to rewrite an existing event row into a confirmed/reported one
+-- -- an UPDATE bypassed the INSERT-only version of this trigger entirely.
 CREATE TRIGGER IF NOT EXISTS trg_agent_cannot_confirm
 BEFORE INSERT ON finding_status_event
 WHEN NEW.actor = 'agent' AND NEW.to_status IN ('confirmed','reported')
 BEGIN
   SELECT RAISE(ABORT, 'agent may not set status confirmed or reported');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_cannot_confirm_update
+BEFORE UPDATE ON finding_status_event
+WHEN NEW.actor = 'agent' AND NEW.to_status IN ('confirmed','reported')
+BEGIN
+  SELECT RAISE(ABORT, 'agent may not set status confirmed or reported');
+END;
+
+-- scope_version is append-only: tamper-evidence for contract disputes.
+CREATE TRIGGER IF NOT EXISTS trg_scope_version_no_update
+BEFORE UPDATE ON scope_version
+BEGIN
+  SELECT RAISE(ABORT, 'scope_version is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_scope_version_no_delete
+BEFORE DELETE ON scope_version
+BEGIN
+  SELECT RAISE(ABORT, 'scope_version is append-only');
+END;
+
+-- finding_status_event is append-only, same rationale as scope_version: it
+-- is the audit trail of who changed a finding's status and when. An UPDATE
+-- or DELETE here would let a status transition be silently rewritten after
+-- the fact, including one that used to launder an agent-confirmed status
+-- through a legitimate human INSERT and then UPDATE it back.
+CREATE TRIGGER IF NOT EXISTS trg_finding_status_event_no_update
+BEFORE UPDATE ON finding_status_event
+BEGIN
+  SELECT RAISE(ABORT, 'finding_status_event is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_finding_status_event_no_delete
+BEFORE DELETE ON finding_status_event
+BEGIN
+  SELECT RAISE(ABORT, 'finding_status_event is append-only');
 END;
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -746,6 +811,21 @@ CREATE TABLE IF NOT EXISTS evidence (
   note        TEXT,
   captured_us INTEGER NOT NULL
 );
+
+-- Immutable, same rationale as finding_status_event: evidence is what a
+-- disputed finding is proven with, and it must not be alterable after
+-- capture.
+CREATE TRIGGER IF NOT EXISTS trg_evidence_no_update
+BEFORE UPDATE ON evidence
+BEGIN
+  SELECT RAISE(ABORT, 'evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_evidence_no_delete
+BEFORE DELETE ON evidence
+BEGIN
+  SELECT RAISE(ABORT, 'evidence is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS agent_action (
   id             TEXT PRIMARY KEY,

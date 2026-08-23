@@ -55,7 +55,7 @@ SECTION = re.compile(r"^(#{2,3} .*)$", re.M)
 # fence, wherever it falls. Deliberately the same expression, because the point
 # of the convergence check below is to read the candidate the way the check
 # that matters will read it -- not the way this script wrote it.
-BLOCK = re.compile(r"```(?:java|python)\n(?://|#) ([^\n]+)\n(.*?)```", re.S)
+BLOCK = re.compile(r"```(?:java|python|sql)\n(?://|#|--) ([^\n]+)\n(.*?)```", re.S)
 
 
 def _sections(text: str) -> dict[str, str]:
@@ -79,7 +79,9 @@ def _lang_for(path: str) -> tuple[str, str]:
         return "java", "//"
     if path.endswith(".py"):
         return "python", "#"
-    raise SystemExit(f"{path}: only .java and .py blocks are byte-compared")
+    if path.endswith(".sql"):
+        return "sql", "--"
+    raise SystemExit(f"{path}: only .java, .py and .sql blocks are byte-compared")
 
 
 def _as_the_plan_check_reads_it(text: str, path: str, marker: str) -> str | None:
