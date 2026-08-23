@@ -18953,9 +18953,12 @@ class _Handler(BaseHTTPRequestHandler):
     # Burp does not trust a `Connection: close` HEADER either, it waits for
     # the actual FIN. Those two are Burp's own call. Measured through this
     # rig's whole path instead -- Python, the socket, the JVM, this server,
-    # and back -- the same pair is 0.59 ms p50 (n=300, min 0.30, p90 1.01)
-    # and 1,004 ms p50, so the bridge adds a fraction of a millisecond and
-    # decides nothing.
+    # and back -- the same pair is 0.57 ms p50 (n=300, min 0.33, p90 1.25)
+    # and 1,004 ms p50 (n=8, min 1,003), so the bridge adds a fraction of a
+    # millisecond and decides nothing. Both re-measured against Burp
+    # 2026.7.3 on this machine, back to back with the rate limit configured
+    # out of the way; PACED at the 3/s this rig configures, the same send
+    # costs 3.1 ms p50 because every one of them is cold.
     #
     # So do not "fix" this to HTTP/1.1 keep-alive. At a second a send, one
     # bridge read loop cannot place two sends inside one second, and NO
@@ -19483,13 +19486,17 @@ def rig(tmp_path):
              engagement.now_us(), "running"))
 
         operator_halt = OperatorHalt(eng.root, eng.db)
-        # Wired into the bridge, not left dangling. Task 7 hangs two behaviours
-        # off this argument -- the halt re-asserted after every hello, and the
-        # sentinel consulted on every send -- and a rig that leaves it None
-        # exercises neither, in the one place they could be exercised against a
-        # real reconnecting extension. The price is that this side now refuses
-        # a send of its own accord while the sentinel exists, which is why the
-        # halt test sends through Rig.send_unguarded.
+        # REQUIRED, not merely wired: BridgeServer refuses to be constructed
+        # without one, the same call HxExtension makes about
+        # -Dhx.halt_sentinel and for the same field. There is no such thing
+        # as a rig that leaves it None any more, so the two behaviours Task 7
+        # hangs off it -- the halt re-asserted after every hello, and the
+        # sentinel consulted on every send -- are not optional extras this
+        # fixture opted into. What IS this fixture's choice is WHICH sentinel:
+        # the engagement's own, so the extension polls the same path this side
+        # writes. The price is that this side now refuses a send of its own
+        # accord while that file exists, which is why the halt test sends
+        # through Rig.send_unguarded.
         srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id=eng.id,
                                   operator_halt=operator_halt)
         stack.callback(srv.stop)
@@ -19524,7 +19531,7 @@ Two rules run through it:
 
   * A denial is asserted on the TARGET SERVER'S OWN LOG, not on the error
     class. "An error came back" and "the request was never issued" are
-    different claims and only the second one is §4's invariant. The
+    different claims and only the second one is S4's invariant. The
     out-of-scope destination is a second live loopback server for exactly
     this reason -- an escaped request would be delivered and recorded there.
 
@@ -19596,11 +19603,12 @@ RATE_PROBE_OFFSET_S = 0.4
 # this side brackets the same interval with time.monotonic(). 5 ms is 12,000
 # ppm over the ~0.4 s the two marks span -- orders of magnitude more than any
 # host drifts -- and it is a small widening of a band that the first send's
-# own latency already makes ~45 ms wide (measured: hint 564,647 us inside a
-# band of [556,199, 601,565]). What matters is that both stay an order of
-# magnitude short of the ~435 ms between a computed hint and a flat
-# one-second answer, so this slack cannot hide the failure it exists to
-# tolerate around.
+# own latency already makes ~37 ms wide (measured against this Burp: hint
+# 573,050 us inside a band of [564,678, 601,754]). What matters is that both
+# stay an order of magnitude short of the ~427 ms between a computed hint and
+# a flat one-second answer -- the sabotage that answers WINDOW_US was
+# measured at 1,000,000 against a band whose top was 598,971 -- so this slack
+# cannot hide the failure it exists to tolerate around.
 CLOCK_SKEW_SLACK_US = 5_000
 
 # Error class -> `denial.kind` is records.DENIAL_KIND, imported rather than
@@ -19635,21 +19643,34 @@ def _span_us(began: float, ended: float) -> int:
 def _issue_until(rig, target_path: str, *, want: str, attempts: int = 40) -> list:
     """Send `target_path` until the gate answers with error class `want`.
 
-    A rate limit is slept out rather than treated as the answer. §6 says
+    A rate limit is slept out rather than treated as the answer. S6 says
     nothing retries automatically; this is a caller deciding to, explicitly,
     which is precisely the distinction that class exists to support. Every
     other error class is returned to the test rather than swallowed.
 
     That branch is live, not defensive: the only caller wants eleven answered
     samples from a host that replies in 40 ms, which is well above the 3/s
-    this rig configures. Measured, it is refused five times on the way -- at
-    3, 4, 6, 7 and 9 samples in -- and each refusal costs one attempt out of
-    `attempts`, which is why 40 is not 15.
+    this rig configures, so it is refused several times on the way and each
+    refusal costs one attempt out of `attempts`. The COUNT is not fixed --
+    it depends on where the sends fall inside each window, and a run measured
+    here was refused three times where an earlier one was refused five -- so
+    `attempts` is 40 rather than a number derived from either. 15 would be
+    within reach of an unlucky run; 40 is not.
+
+    The sends go out UNGUARDED, and that is not a stylistic choice. The
+    auto-halt this loop waits for is announced by an unsolicited `halted`
+    frame, which moves BridgeServer's own state to "halted" -- so a guarded
+    send after that point is refused by this side's bookkeeping. MEASURED
+    against a real Burp, with rig.get(): the eleventh refusal arrives with
+    `srv.state == "halted"` and ZERO frames written to the socket, so the
+    class this loop would end on is the harness agreeing with itself and the
+    extension is never asked. The assertion still passes with the extension
+    wide open, which is exactly the shape send_unguarded exists to avoid.
     """
     seen: list = []
     for _ in range(attempts):
         try:
-            seen.append(rig.get(target_path)["status"])
+            seen.append(rig.send_unguarded("GET", target_path)["status"])
         except server.BridgeError as exc:
             # A BridgeError this side raised before the wire -- a malformed
             # call -- has error_class None rather than a send-path class, so
@@ -19671,14 +19692,27 @@ def test_deny_all_holds_then_an_in_scope_get_becomes_an_exchange_row(rig):
     """The happy path, and the state it starts from.
 
     DENY-ALL first: a live extension that has not been configured refuses
-    everything. That is the 02:00 Burp-restart window in §4, and this is the
+    everything. That is the 02:00 Burp-restart window in S4, and this is the
     only place it is exercised against a real JVM rather than a fake.
+
+    Which is why the first send goes out UNGUARDED. BridgeServer.send refuses
+    an unconfigured bridge on this side, before the wire -- rightly, two gates
+    are better than one -- and a guarded send here is answered by that
+    bookkeeping alone. MEASURED against a real Burp: guarded, ZERO frames
+    reach the socket; unguarded, one does and comes back carrying the
+    extension's own words, "no configure frame acknowledged yet". Only the
+    second of those is evidence about the JVM. The guarded refusal is
+    asserted too, immediately after, because both gates are meant to be there.
     """
     with pytest.raises(server.BridgeError) as unconfigured:
-        rig.get("/api/orders")
+        rig.send_unguarded("GET", "/api/orders")
     assert unconfigured.value.error_class == "not_configured"
     assert rig.target.hits == [], \
         f"an unconfigured extension issued {rig.target.hits}"
+
+    with pytest.raises(server.BridgeError) as locally:
+        rig.get("/api/orders")
+    assert locally.value.error_class == "not_configured"
 
     assert rig.configure() == 1
 
@@ -19734,48 +19768,65 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     # below is also satisfied by a target server that never worked at all.
     assert rig.get("/health")["status"] == 200
 
-    refusals = {}
+    refusals: dict[str, server.BridgeError | None] = {}
+
+    def attempt(name, method, target_path, **kwargs):
+        """Send, and record the refusal -- or record that there was none.
+
+        NOT `with pytest.raises(...)`. MEASURED, by deleting Sender's
+        unmanaged-credential check and re-running: the credential send then
+        SUCCEEDS and pytest.raises fails the test on the spot with a bare
+        "DID NOT RAISE BridgeError", so the three assertions below -- the
+        ones this test exists for, including the live cookie now sitting in
+        the in-scope target's request log -- are never reached at all. A
+        guard that cannot report what it caught is half a guard.
+        """
+        try:
+            rig.send(method, target_path, **kwargs)
+        except server.BridgeError as exc:
+            refusals[name] = exc
+        else:
+            refusals[name] = None
 
     # Scope. 127.0.0.2 is a live server on a second loopback address, so a
     # request that escaped the gate would be DELIVERED there -- not refused
     # by a closed port, which would look identical to the gate working.
-    with pytest.raises(server.BridgeError) as exc:
-        rig.send("GET", "/api/orders", to=rig.offside)
-    refusals["scope"] = exc.value
+    attempt("scope", "GET", "/api/orders", to=rig.offside)
 
     # Method: the allowlist is GET/HEAD/OPTIONS.
-    with pytest.raises(server.BridgeError) as exc:
-        rig.send("POST", "/api/orders", body=b'{"total":"1.00"}')
-    refusals["method"] = exc.value
+    attempt("method", "POST", "/api/orders", body=b'{"total":"1.00"}')
 
     # Dangerous path: in scope, allowed method, still refused. "In scope" and
-    # "safe to touch automatically" are different questions (§4).
-    with pytest.raises(server.BridgeError) as exc:
-        rig.get("/account/logout")
-    refusals["dangerous"] = exc.value
+    # "safe to touch automatically" are different questions (S4).
+    attempt("dangerous", "GET", "/account/logout")
 
-    # A credential this extension did not inject (§7). Refused, and never
+    # A credential this extension did not inject (S7). Refused, and never
     # persisted -- there is nothing to persist, because it was never issued.
     cookie = f"session={target_server.SESSION_COOKIE_VALUE}"
-    with pytest.raises(server.BridgeError) as exc:
-        rig.get("/api/orders", headers=[("Cookie", cookie)])
-    refusals["credential"] = exc.value
+    attempt("credential", "GET", "/api/orders",
+            headers=[("Cookie", cookie)])
 
-    assert {name: e.error_class for name, e in refusals.items()} == {
-        "scope": "scope_denied",
-        "method": "method_denied",
-        "dangerous": "dangerous_denied",
-        "credential": "unmanaged_credential",
-    }
-
-    # The assertions this test exists for, on what the SERVERS saw.
+    # The assertions this test exists for, on what the SERVERS saw, and they
+    # come FIRST: "an error came back" and "the request was never issued" are
+    # different claims, and only the second one is S4's invariant.
     assert rig.offside.hits == [], \
         f"the out-of-scope target received {[(h.method, h.path) for h in rig.offside.hits]}"
     assert [hit.path for hit in rig.target.hits] == ["/health"], \
         f"the in-scope target received {[(h.method, h.path) for h in rig.target.hits]}"
     assert _blobs_containing(rig.eng, target_server.SESSION_COOKIE_VALUE.encode()) == []
 
-    # Denials are never silent (§4): each one becomes a row.
+    # "ALLOWED" rather than an AttributeError on None: a send that was not
+    # refused at all has to name itself in the diff, not crash the assertion
+    # that is trying to describe it.
+    assert {name: (e.error_class if e else "ALLOWED")
+            for name, e in refusals.items()} == {
+        "scope": "scope_denied",
+        "method": "method_denied",
+        "dangerous": "dangerous_denied",
+        "credential": "unmanaged_credential",
+    }
+
+    # Denials are never silent (S4): each one becomes a row.
     for name in ("scope", "method", "dangerous"):
         assert records.record_denial(
             rig.eng.db, run_id=rig.run_id,
@@ -19791,7 +19842,7 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     # A gap, pinned rather than papered over: Plan 1's denial.kind CHECK
     # lists scope, method, dangerous, rate, budget and not_configured. There
     # is no kind for unmanaged_credential -- nor for halted, transport_error,
-    # timeout or bridge_lost -- so §6's error classes are wider than the
+    # timeout or bridge_lost -- so S6's error classes are wider than the
     # table that is supposed to record them. records.UNRECORDABLE is where
     # that is written down; this is where it is demonstrated, and when the
     # schema grows a kind these two assertions are what will say so.
@@ -19805,7 +19856,7 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
 
 
 def test_a_set_cookie_is_redacted_before_anything_can_hash_it(rig):
-    """§7's one item that cannot be retrofitted.
+    """S7's one item that cannot be retrofitted.
 
     The application hands back a live session cookie the extension never
     injected, so the injected-range mechanism cannot reach it; response
@@ -19846,7 +19897,7 @@ def test_a_set_cookie_is_redacted_before_anything_can_hash_it(rig):
 
 
 def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
-    """§6's first limit, and the promise the refusal carries.
+    """S6's first limit, and the promise the refusal carries.
 
     A limiter that denies but lies about when to retry is worse than one that
     just denies: the agent obeys `retry_after_us`, so a hint that is short
@@ -19868,13 +19919,14 @@ def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
     rig.configure()
 
     # The burst. It shares one window with room to spare -- three sends
-    # measured at 37 ms in total, against a window of a second -- so the
+    # measured at 28 ms in total, against a window of a second -- so the
     # FIRST of them is the one whose departure the retry hint has to be
-    # about. Most of those 37 ms are the first send alone, ~35 ms of them,
-    # against 0.59 ms p50 for a warm one. That is why first_start and
-    # first_done are separate marks rather than one: the bracket around the
-    # first issuance has to be wide enough to hold whatever the first send
-    # costs, and a single mark would make it a guess.
+    # about. Nearly all of those 28 ms are the first send alone, 25 ms of
+    # them, against 0.57 ms p50 for a warm one (measured back to back,
+    # n=300, min 0.33, p90 1.25). That is why first_start and first_done are
+    # separate marks rather than one: the bracket around the first issuance
+    # has to be wide enough to hold whatever the first send costs, and a
+    # single mark would make it a guess.
     first_start = time.monotonic()
     assert rig.get("/health")["status"] == 200
     first_done = time.monotonic()
@@ -19948,7 +20000,7 @@ def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
         "the gate refused, named a wait, and was still refusing after it")
     assert len(rig.target.hits_for("/health")) == hits_before + 1
 
-    # Denials are never silent (§4). rate_limited has a kind of its own,
+    # Denials are never silent (S4). rate_limited has a kind of its own,
     # unlike unmanaged_credential.
     assert records.record_denial(
         rig.eng.db, run_id=rig.run_id,
@@ -19962,7 +20014,7 @@ def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
 
 
 def test_the_run_budget_is_exhausted_and_stays_exhausted(rig):
-    """§6's other limit, and the one that depends on nothing at all.
+    """S6's other limit, and the one that depends on nothing at all.
 
     The rate-limit test next door needs the target server to close its
     connections before a sub-second limit is even reachable. This one needs
@@ -20005,7 +20057,7 @@ def test_the_run_budget_is_exhausted_and_stays_exhausted(rig):
     assert again.value.error_class == "budget_exhausted"
     assert len(rig.target.hits_for("/health")) == 2
 
-    # Denials are never silent (§4), same as the four-ways test above.
+    # Denials are never silent (S4), same as the four-ways test above.
     assert records.record_denial(
         rig.eng.db, run_id=rig.run_id,
         kind=records.DENIAL_KIND["budget_exhausted"],
@@ -20018,7 +20070,7 @@ def test_the_run_budget_is_exhausted_and_stays_exhausted(rig):
 
 
 def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
-    """Two of §4's three kill paths, and the rule that they are independent.
+    """Two of S4's three kill paths, and the rule that they are independent.
 
     Both halves are arranged so the `send` frame actually leaves this process,
     which is the whole difficulty of testing a kill switch from a harness that
@@ -20055,7 +20107,7 @@ def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
                 # extension has necessarily noticed the sentinel, and the
                 # decision order answers `halted` before `rate_limited`, so a
                 # rate limit here means the halt has NOT landed yet. Sleep
-                # what the refusal asked for and ask again -- §6's own
+                # what the refusal asked for and ask again -- S6's own
                 # prescription, and the sentinel budget above allows for one
                 # of these.
                 time.sleep(exc.retry_after_us / 1_000_000 + 0.02)
@@ -20097,13 +20149,24 @@ def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
         "test of the harness and not of the extension"
     time.sleep(SENTINEL_POLL_S * 3)          # three chances to notice
 
+    # NOT `with pytest.raises(...)` around the send. MEASURED, by collapsing
+    # HaltSwitch's two inputs into one and re-running: the send then SUCCEEDS,
+    # and pytest.raises fails the test with a bare "DID NOT RAISE
+    # BridgeError" before either of the two sentences below is ever reached.
+    # The diagnostic a guard prints is part of the guard, and this file's own
+    # rule is that the target server's log is the claim -- so the log is
+    # asserted FIRST, and the error class after it.
     before = len(rig.target.hits)
-    with pytest.raises(server.BridgeError) as exc:
+    refusal = None
+    try:
         rig.get("/api/orders")
-    assert exc.value.error_class == "halted", \
-        "removing the sentinel re-armed issuance while a halt frame was in force"
+    except server.BridgeError as exc:
+        refusal = exc
     assert len(rig.target.hits) == before, \
         "removing the sentinel re-armed issuance: the request reached the target"
+    assert refusal is not None and refusal.error_class == "halted", \
+        ("removing the sentinel re-armed issuance while a halt frame was in "
+         f"force; the send answered {refusal if refusal else 'successfully'}")
 
     # Only resume re-arms, and the target's log is what says the request was
     # issued this time rather than merely permitted.
@@ -20113,7 +20176,7 @@ def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
 
 
 def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
-    """§4's auto-halt, and the frame that makes it visible.
+    """S4's auto-halt, and the frame that makes it visible.
 
     The 5xx rule needs ten answered samples on a host before it may trip, so
     ten 500s is the earliest it can fire and the eleventh send is the first
