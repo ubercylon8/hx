@@ -160,6 +160,27 @@ def test_an_ok_exchange_with_no_status_is_refused(conn):
                                 ms=7, at_us=1)
 
 
+# The status each outcome may legally carry. A table rather than a
+# conditional expression, so a new outcome forces a decision here instead of
+# inheriting whichever branch it happens to fall into. The previous version of
+# the test below wrote `599` for every outcome except `ok` -- which meant this
+# module's own fixture was writing `outcome='conn_refused', status=599` rows:
+# the very pairing S5 forbids, exercised in violation by the test that was
+# supposed to be checking the vocabulary.
+LEGAL_STATUS = {
+    "ok": 200,
+    "truncated": 200,           # the response arrived; it was cut short
+    "status_unreadable": 599,   # S5's conservative sentinel, and only that
+    "scope_denied": None,       # refused before issuance; nothing answered
+    "rate_limited": None,
+    "timeout": None,            # S5: a transport failure has no HTTP status
+    "conn_refused": None,
+    "dns_error": None,
+    "tls_error": None,
+    "bridge_lost": None,
+}
+
+
 def test_every_outcome_this_module_accepts_is_one_the_schema_accepts(conn):
     """The ValueError above is redundant with a CHECK constraint only while
     the two vocabularies agree. They stopped agreeing once the extension
@@ -167,10 +188,14 @@ def test_every_outcome_this_module_accepts_is_one_the_schema_accepts(conn):
     and SQLite would have refused the row, on exactly the exchange the field
     was added to make legible. This drives every value rather than reading
     them."""
+    assert set(LEGAL_STATUS) == records.EXCHANGE_OUTCOMES, (
+        "a new outcome needs a decision about the status it may carry before "
+        "this test can drive it through an INSERT"
+    )
     for outcome in sorted(records.EXCHANGE_OUTCOMES):
         records.record_exchange(conn, run_id="r-1", method="GET",
                                 url="https://app.example.test/api/orders",
-                                status=200 if outcome == "ok" else 599,
+                                status=LEGAL_STATUS[outcome],
                                 req_blob="a" * 64, resp_blob=None, ms=1,
                                 at_us=1, outcome=outcome)
     assert conn.execute("SELECT COUNT(DISTINCT outcome) FROM exchange"
@@ -193,6 +218,62 @@ def test_the_module_and_the_schema_agree_on_the_outcome_vocabulary():
     )
     assert set(re.findall(r"'([a-z_]+)'", m.group(1))) == \
         records.EXCHANGE_OUTCOMES
+
+
+# Outcomes that mean nothing on the far side ever answered with a status.
+# Spelled out here rather than imported from records, so that dropping a value
+# from the module's own set narrows the guard AND fails this file, instead of
+# narrowing it silently.
+NO_STATUS = ("timeout", "conn_refused", "dns_error", "tls_error", "bridge_lost")
+
+
+@pytest.mark.parametrize("outcome", NO_STATUS)
+def test_a_transport_failure_that_also_carries_a_status_is_refused(conn, outcome):
+    """S5: "a transport failure has no HTTP status".
+
+    A row saying both "the connection was refused" and "the peer answered 200"
+    is not a fact about anything, and it is a check's input later. This module
+    had exactly one coherence guard -- `ok` with no status -- and the converse
+    was unguarded in both directions.
+    """
+    with pytest.raises(ValueError, match="has no HTTP status"):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=200, req_blob="a" * 64, resp_blob=None,
+                                ms=1, at_us=1, outcome=outcome)
+    assert conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+
+
+def test_the_statusless_outcomes_are_outcomes_this_module_accepts():
+    """A guard keyed on a value the vocabulary does not contain is a guard
+    that can never fire, and reads in review exactly like one that does."""
+    assert records.NO_STATUS_OUTCOMES == frozenset(NO_STATUS)
+    assert records.NO_STATUS_OUTCOMES <= records.EXCHANGE_OUTCOMES
+
+
+@pytest.mark.parametrize("status", [200, 404, 500, 598, 600, None])
+def test_status_unreadable_without_its_599_sentinel_is_refused(conn, status):
+    """The pairing this task was the deliberate verification for.
+
+    S5 is explicit that `status` HOLDS 599 for `status_unreadable` "so S4's
+    auto-halt counts it as an error rather than a healthy sample", and that
+    the outcome is the only thing separating that sentinel from a peer that
+    genuinely answered 599.
+
+    The extension pairs them by construction -- Sender.STATUS_UNREADABLE is
+    599 -- so nothing writes a bad row today. But record_exchange is the
+    SINGLE place that pairing reaches disk, and a later caller writing
+    `status=reply.get("status", 200)` would file an unreadable status as a
+    healthy 200 sample: the exact reading the amendment exists to prevent,
+    with the store's blessing and no test to notice.
+    """
+    with pytest.raises(ValueError, match="599"):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=status, req_blob="a" * 64,
+                                resp_blob="b" * 64, ms=42, at_us=1,
+                                outcome="status_unreadable")
+    assert conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
 
 
 def test_a_status_unreadable_exchange_keeps_its_599_and_stays_distinguishable(conn):

@@ -64,6 +64,31 @@ EXCHANGE_OUTCOMES = frozenset({
     "status_unreadable",
 })
 
+# The status that MUST accompany outcome='status_unreadable', and the only one.
+# S5: `status` holds the conservative sentinel 599 "so S4's auto-halt counts it
+# as an error rather than a healthy sample", and `outcome` is the only thing
+# separating that sentinel from a peer that genuinely answered 599. The two
+# travel together or the pair means nothing: an unreadable status filed as 200
+# is a healthy sample fed to the auto-halt, and a 599 with no outcome beside it
+# is a fabricated server error.
+#
+# The extension already pairs them by construction (Sender.STATUS_UNREADABLE),
+# but record_exchange is the SINGLE place the pairing reaches disk, so it is
+# the only place that can refuse a caller who breaks it.
+STATUS_UNREADABLE = 599
+
+# Outcomes that mean nothing on the far side ever answered with a status.
+# S5: "a transport failure has no HTTP status". A row carrying one anyway
+# reads as evidence of a response nobody received, and a check reads that row
+# later without ever seeing the frame it came from.
+#
+# `scope_denied` and `rate_limited` are statusless too and are deliberately
+# NOT here: they are decided BEFORE issuance, so the honest row for either is
+# a `denial`, not an exchange at all -- see EXCHANGE_OUTCOME above. Listing
+# them here would put this module's weight behind the wrong table.
+NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
+                                "tls_error", "bridge_lost"})
+
 # Error classes with no row of their own, named rather than forgotten.
 # `denial.kind` and `exchange.outcome` are CHECK-constrained vocabularies
 # written before these classes existed, and widening either is a schema
@@ -159,11 +184,14 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     blob store is content-addressed, so hashing raw bytes and redacting
     afterwards means the raw bytes are already on disk.
 
-    `outcome` and `status` come off a `result` frame unchanged. In particular
+    `outcome` and `status` come off a `result` frame unchanged in VALUE, but
+    they are not taken on trust: the two are one fact, and the three guards
+    below refuse every way of writing them so they disagree. In particular
     `outcome='status_unreadable'` with `status=599` is a completed exchange
     whose final status could not be read, NOT a peer that answered 599 -- and
     the two are indistinguishable by status alone, which is why the frame
-    carries the outcome at all.
+    carries the outcome at all. That pairing reaches disk HERE and nowhere
+    else, so this is the only place it can be enforced.
 
     `via` is always 'send' here. The other two values in that vocabulary
     belong to the proxy and the crawler, which are their own egress point and
@@ -184,6 +212,25 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
         # is a row that reads as evidence and is not.
         raise ValueError("an 'ok' exchange with no status is not an exchange "
                          "that happened; give it the outcome it really had")
+    if outcome == "status_unreadable" and status != STATUS_UNREADABLE:
+        # The converse of the guard above, and the one this task was the
+        # deliberate verification for. See STATUS_UNREADABLE.
+        raise ValueError(
+            f"outcome='status_unreadable' with status={status!r}: the two are "
+            f"one fact and must travel together. `status` holds "
+            f"{STATUS_UNREADABLE} so S4's auto-halt counts an unreadable "
+            "status as an error rather than a healthy sample, and `outcome` "
+            f"is the only thing separating that sentinel from a peer that "
+            f"genuinely answered {STATUS_UNREADABLE}."
+        )
+    if outcome in NO_STATUS_OUTCOMES and status is not None:
+        raise ValueError(
+            f"outcome={outcome!r} has no HTTP status, and this row claims "
+            f"{status!r}. S5: a transport failure has no HTTP status -- a row "
+            "saying both that the transport failed and that the peer answered "
+            "is not a fact about anything, and a check reads it later without "
+            "the frame it came from."
+        )
     row_id = new_id("x")
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
