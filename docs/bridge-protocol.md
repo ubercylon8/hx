@@ -53,8 +53,8 @@ characters JSON requires are escaped: `"` `\\` and the control characters.
                            plus retry_after_us, on rate_limited only
   burp -> py   halted      {v,t,reason,host,window}   unsolicited; no id.
   burp -> py   exchange    {v,t,...}   unsolicited; no id. Defined in a later plan.
-  py -> burp   halt        {v,t,id,deadline_us,reason}
-  py -> burp   resume      {v,t,id,deadline_us}
+  py -> burp   halt        {v,t,reason}
+  py -> burp   resume      {v,t}
 
 `send.engagement_id` is required. The extension serves exactly one engagement
 and refuses a send that names another with class `engagement_mismatch`, before
@@ -96,12 +96,15 @@ stays 599 in both cases regardless -- the auto-halt in §4 must keep counting an
 unreadable status as an error, and that property must not come to depend on a
 consumer reading a second field.
 
-Note for a consumer that persists these: the store's `exchange.outcome` is a
-DIFFERENT vocabulary (`ok | timeout | conn_refused | dns_error | tls_error |
-scope_denied | rate_limited | bridge_lost | truncated`) and does not contain
-`status_unreadable`. The wire value is about how the status was obtained; the
-store column is about how the exchange ended. Whoever writes those rows owns
-the mapping.
+Note for a consumer that persists these: the store's `exchange.outcome` takes
+this value UNCHANGED. The wire value and the column value are deliberately the
+same string, and there is no mapping layer between them -- a map between two
+vocabularies that differ by one entry is how they drift. `schema.sql`'s CHECK
+gained `status_unreadable` and `SCHEMA_VERSION` went 2 -> 3 for exactly this;
+`hx.store.records.record_exchange` takes `outcome=` straight off the frame.
+(This paragraph said the opposite until Task 7 wrote the first consumer: the
+column did not carry the value yet, and the note read as an instruction to
+build the mapping the spec forbids.)
 
 ## Error classes
 
@@ -145,6 +148,12 @@ refused in the `configure` arm, not at first use. Accepting an unreadable limit 
 is equally fail-closed and much worse to recover from: the extension dials once
 and has no reconnect, so the send-time refusal closes the channel and the
 corrected configure cannot be sent at all.
+
+`halt` and `resume` carry no `id` and no `deadline_us`. Only `_request()`
+stamps those two, and both of these go out through `_send()`: nothing replies
+to a control frame, so there is nothing to correlate and no work to abandon at
+a deadline. This document claimed both fields for them from Plan 2 until Task
+7; the code never sent them.
 
 `halted` is UNSOLICITED and carries no `id`. An auto-halt is decided by the
 extension -- a host in distress -- so there is no outstanding request to answer

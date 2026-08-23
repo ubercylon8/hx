@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from hx import halt as halt_mod
 from hx.bridge import codec, server
+from hx.store import db as db_mod
+from hx.store import records
+from hx.store.paths import secure_mkdir
 
 
 @pytest.fixture
@@ -872,5 +876,613 @@ def test_a_non_denying_configure_error_leaves_state_alone(srv):
             f"refusal; this side must not go on claiming {srv.state!r}"
         )
         assert srv.config_epoch == 1, srv.config_epoch
+    finally:
+        c.close()
+
+
+# ---- the send path, the halted frame, and the durable halt ----------------
+#
+# Everything below drives a REAL OperatorHalt against a real engagement
+# database. A stub would hide the guarantee these tests exist for: the bridge
+# reads `halted` and `reason` from its read thread, and the store connection
+# they would otherwise touch belongs to another thread entirely.
+
+
+@pytest.fixture
+def store(tmp_path):
+    root = tmp_path / "engagement"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+                 " VALUES('e-1','Example','Example Ltd',1,'active')")
+    conn.execute("INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                 " started_us, status)"
+                 " VALUES('r-1','e-1','manual','production',1700000000000000,"
+                 "'running')")
+    yield root, conn
+    conn.close()
+
+
+@pytest.fixture
+def srv_with_halt(tmp_path, store):
+    root, conn = store
+    oh = halt_mod.OperatorHalt(root, conn)
+    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
+                            operator_halt=oh)
+    s.start()
+    yield s, oh, conn
+    s.stop()
+
+
+def _hello(c, engagement_id="e-1"):
+    c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                            "pid": os.getpid(), "burp_version": "2026.7.3",
+                            "instance_id": "i-1",
+                            "engagement_id": engagement_id}))
+
+
+def _await(predicate, message, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError(message)
+
+
+def _configured(s, c):
+    """hello plus one acknowledged configure. Returns the peer's reader."""
+    reader = codec.FrameReader(c)
+    _hello(c)
+    _await(lambda: s.state == "connected", "the hello never landed")
+    out = {}
+
+    def go():
+        try:
+            out["epoch"] = s.configure(
+                {"scope.include": ["https://app.example.test/*"]},
+                scope_sha256="a" * 64, profile="production")
+        except server.BridgeError as exc:
+            out["err"] = exc
+
+    t = threading.Thread(target=go)
+    t.start()
+    header, _ = reader.read()
+    c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                            "config_epoch": 1}))
+    t.join(timeout=5)
+    assert out.get("epoch") == 1, out
+    return reader
+
+
+# Real bytes, loopback-shaped hostname, real header names. Nothing in this
+# project has ever sent a request off the machine and these tests do not
+# either: the peer is a socket in tmp_path.
+REQ = b"GET /api/orders?page=2 HTTP/1.1\r\nHost: app.example.test\r\n\r\n"
+RESP = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Set-Cookie: session={{observed:set-cookie}}; HttpOnly\r\n\r\n"
+        b'{"orders":[]}')
+
+
+def test_send_returns_the_result_frame_and_its_body(srv_with_halt):
+    """The body is the point. A result frame's bytes are the redacted response
+    -- the evidence about to be hashed into the blob store -- and _deliver()
+    used to hand back the header alone and drop them."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+        t = threading.Thread(target=lambda: out.update(reply=s.send(
+            {"target_host": "app.example.test", "target_port": 443,
+             "tls": True, "identity_id": None}, REQ)))
+        t.start()
+
+        header, body = reader.read()
+        assert header["t"] == "send"
+        assert header["engagement_id"] == "e-1", (
+            "S6: every send carries the engagement id and the extension "
+            "refuses a mismatch"
+        )
+        assert header["target_host"] == "app.example.test"
+        assert isinstance(header["id"], int) and header["id"] > 0
+        assert header["deadline_us"] > time.time_ns() // 1000
+        assert body == REQ, "the request bytes travel verbatim in the body"
+
+        c.sendall(codec.encode({"v": 1, "t": "result", "id": header["id"],
+                                "status": 200, "bytes": len(RESP), "ms": 42,
+                                "outcome": "ok", "config_epoch": 1}, RESP))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["reply"]["status"] == 200
+        assert out["reply"]["config_epoch"] == 1
+        assert out["reply"][server.BridgeServer.BODY_KEY] == RESP
+    finally:
+        c.close()
+
+
+def test_a_status_unreadable_result_reaches_the_store_unchanged(srv_with_halt):
+    """The first consumer of a wire value added one commit before this task.
+
+    S6 keeps `status` at the conservative sentinel 599 so S4's auto-halt
+    counts it as an error, and moves the distinction to `outcome`. The wire
+    value and exchange.outcome's value are deliberately the SAME STRING, so
+    what this asserts is that no mapping layer appeared between them -- the
+    frame's own outcome goes into the row, and the row can still be told
+    apart from a peer that genuinely answered 599.
+
+    The body on that frame says `HTTP/1.1 200 OK`, because that is the case
+    that made the field necessary: eight interim heads then a 200.
+    """
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+        t = threading.Thread(target=lambda: out.update(reply=s.send(
+            {"target_host": "app.example.test"}, REQ)))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "result", "id": header["id"],
+                                "status": 599, "bytes": len(RESP), "ms": 42,
+                                "outcome": "status_unreadable",
+                                "config_epoch": 1}, RESP))
+        t.join(timeout=5)
+        reply = out["reply"]
+        assert reply["status"] == 599
+        assert reply["outcome"] == "status_unreadable"
+
+        row_id = records.record_exchange(
+            conn, run_id="r-1", method="GET",
+            url="https://app.example.test/api/orders?page=2",
+            status=reply["status"], outcome=reply["outcome"],
+            req_blob="a" * 64, resp_blob="b" * 64, ms=reply["ms"],
+            at_us=1700000000000000,
+            resp_len=len(reply[server.BridgeServer.BODY_KEY]))
+        row = conn.execute("SELECT status, outcome FROM exchange WHERE id=?",
+                           (row_id,)).fetchone()
+        assert (row["status"], row["outcome"]) == (599, "status_unreadable")
+        assert b"HTTP/1.1 200 OK" in reply[server.BridgeServer.BODY_KEY], (
+            "the exchange this outcome exists for is one whose own evidence "
+            "contradicts its status"
+        )
+    finally:
+        c.close()
+
+
+def test_send_raises_the_peers_class_and_its_retry_hint(srv_with_halt):
+    """S6 makes the class load-bearing for the agent: rate_limited means slow
+    down and retry, the three *_denied classes mean the answer will not
+    change, budget_exhausted means the run is over. A caller that only got a
+    message string would have to parse English to tell them apart."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+
+        def go():
+            try:
+                s.send({"target_host": "app.example.test"}, REQ)
+            except server.BridgeError as exc:
+                out["err"] = exc
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "rate_limited",
+                                "detail": "5 rps, 200000us to the next slot",
+                                "retry_after_us": 200_000}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert out["err"].error_class == "rate_limited"
+        assert out["err"].retry_after_us == 200_000
+        assert "5 rps" in str(out["err"])
+        # And it is a class the store can actually record, which is the other
+        # half of "denials are never silent".
+        assert records.DENIAL_KIND[out["err"].error_class] == "rate"
+    finally:
+        c.close()
+
+
+def test_send_never_retries(srv_with_halt):
+    """S6: a replayed state-changing request is worse than a failed one. One
+    call, one frame on the wire, whatever the answer was."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+
+        def go():
+            try:
+                s.send({"target_host": "app.example.test"}, REQ)
+            except server.BridgeError as exc:
+                out["err"] = exc
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "transport_error",
+                                "detail": "connection reset"}))
+        t.join(timeout=5)
+        assert out["err"].error_class == "transport_error"
+
+        # Nothing else may arrive. A short timeout, not the helper's 5s: this
+        # asserts an absence, so the wait is pure cost.
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            reader.read()
+    finally:
+        c.close()
+
+
+def test_an_in_flight_send_fails_with_bridge_lost(srv_with_halt):
+    """S6 names bridge_lost as distinct from timeout: the peer went away, the
+    request may or may not have been issued, and nothing may replay it."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    reader = _configured(s, c)
+    out = {}
+
+    def go():
+        try:
+            s.send({"target_host": "app.example.test"}, REQ)
+        except server.BridgeError as exc:
+            out["err"] = exc
+
+    t = threading.Thread(target=go)
+    t.start()
+    reader.read()          # the send frame is on the wire and unanswered
+    c.close()
+    t.join(timeout=5)
+    assert not t.is_alive(), "the caller was left blocked on a dead peer"
+    assert out["err"].error_class == "bridge_lost"
+
+
+def test_a_send_nobody_answers_fails_with_timeout(srv_with_halt):
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.2)
+        assert exc.value.error_class == "timeout", (
+            "a peer that is alive and slow is not a peer that vanished"
+        )
+        assert exc.value.retry_after_us is None
+    finally:
+        c.close()
+
+
+def test_send_before_configure_never_reaches_the_wire(srv_with_halt):
+    """DENY-ALL is the initial state on both sides. The extension would refuse
+    this too -- but a request that was never framed cannot be issued by a
+    version-skewed jar either."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _hello(c)
+        _await(lambda: s.state == "connected", "the hello never landed")
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ)
+        assert exc.value.error_class == "not_configured"
+
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
+def test_send_refuses_a_caller_supplied_engagement_id(srv_with_halt):
+    """Client A's traffic must never land in client B's store, and the id on
+    the frame is what the extension checks. A caller able to overwrite it
+    would be addressing whichever extension answered."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        with pytest.raises(server.BridgeError, match="engagement_id"):
+            s.send({"target_host": "app.example.test",
+                    "engagement_id": "SOMEONE-ELSE"}, REQ)
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("key,value", [
+    ("v", 99), ("t", "halt"), ("id", 1), ("deadline_us", 1),
+    ("engagement_id", "SOMEONE-ELSE"),
+])
+def test_send_refuses_every_key_it_stamps_itself(srv_with_halt, key, value):
+    """`**req` is spliced over the frame this method builds, so a caller's key
+    WINS. Without the guard, `t` alone turns a send into a halt frame the
+    extension acts on and nobody correlates, `v` gets answered
+    protocol_mismatch and drops the channel, and `id` collides with a live
+    correlation id so one of the two callers collects the other's reply.
+
+    Refused rather than silently overwritten: a caller who set one of these
+    believed something would happen, and quietly doing something else is how
+    a scan ends up addressing an extension nobody meant to address.
+    """
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test", key: value}, REQ)
+        assert exc.value.error_class is None, (
+            "a malformed call is a harness bug, not a denial the store should "
+            "file a row for"
+        )
+        assert key in str(exc.value)
+        # And nothing reached the wire: the guard runs before _request().
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
+def test_a_halted_frame_stops_issuance_and_aborts_the_run(srv_with_halt):
+    """S6's unsolicited `halted` frame, {reason, host, window}, no id. Without
+    it an auto-halt is invisible until the next send fails and
+    `run.status = aborted` has no stop_reason to record."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        seen = []
+        # The callback runs on the READ THREAD, so it may not touch this
+        # store's connection: it belongs to this thread. Hand the frame over
+        # and do the writing here -- which is what a harness must do too.
+        s.on_halted = seen.append
+
+        c.sendall(codec.encode({"v": 1, "t": "halted",
+                                "reason": "5xx rate 0.40",
+                                "host": "app.example.test",
+                                "window": "50 requests / 37s"}))
+        _await(lambda: s.state == "halted", "the halted frame was ignored")
+        _await(lambda: seen, "on_halted never fired")
+
+        frame = seen[0]
+        assert s.last_halted == frame, (
+            "a harness with no callback installed still has to be able to see "
+            "why issuance stopped"
+        )
+        assert records.abort_run(
+            conn, run_id="r-1", at_us=1700000000900000,
+            stop_reason=f"{frame['reason']} on {frame['host']} "
+                        f"({frame['window']})") is True
+        row = conn.execute("SELECT status, stop_reason FROM run WHERE id='r-1'"
+                           ).fetchone()
+        assert row["status"] == "aborted"
+        assert row["stop_reason"] == ("5xx rate 0.40 on app.example.test "
+                                      "(50 requests / 37s)")
+
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert exc.value.error_class == "halted"
+    finally:
+        c.close()
+
+
+def test_a_halted_callback_that_throws_drops_to_deny_all(srv_with_halt):
+    """The callback is what makes an auto-halt durable. If it threw, nothing
+    was recorded, and carrying on beside a peer whose stop nobody wrote down
+    is the one thing DENY-ALL exists to prevent."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+
+        def boom(header):
+            raise RuntimeError("the store is gone")
+
+        s.on_halted = boom
+        c.sendall(codec.encode({"v": 1, "t": "halted", "reason": "5xx rate 0.40",
+                                "host": "app.example.test",
+                                "window": "50 requests / 37s"}))
+        _await(lambda: s.state == "waiting",
+               "a throwing on_halted must close the connection")
+        assert isinstance(s.halted_callback_error, RuntimeError)
+    finally:
+        c.close()
+
+
+def test_a_durable_halt_is_reasserted_before_any_configure(srv_with_halt):
+    """The task this whole module exists for.
+
+    Two findings from the Plan 2 review meet here: a second `hello` erased the
+    halt, and a halt did not survive a Burp restart -- precisely when someone
+    has already hit stop. The assertion is about ORDER ON THE WIRE, not about
+    state afterwards: a harness pushes scope from on_hello, so a re-assert
+    that happened after that callback would leave the extension configured and
+    armed for the length of a round trip.
+
+    The second half is just as load-bearing. The configure still commits its
+    scope and its epoch -- narrowing scope during an emergency stop is exactly
+    what an operator should be able to do -- and it does NOT re-arm issuance.
+    """
+    s, oh, conn = srv_with_halt
+    oh.halt("client called: stop everything")
+
+    threads = []
+    out = {}
+
+    def push_scope():
+        try:
+            out["epoch"] = s.configure(
+                {"scope.include": ["https://app.example.test/*"]},
+                scope_sha256="b" * 64, profile="production")
+        except server.BridgeError as exc:
+            out["err"] = exc
+
+    def on_hello(header):
+        # Appended BEFORE start(): t.start() can be preempted the instant the
+        # new thread runs, and the main thread below is fast enough to reach
+        # threads[0] first. Measured as an IndexError under a full-suite run.
+        t = threading.Thread(target=push_scope)
+        threads.append(t)
+        t.start()
+
+    s.on_hello = on_hello
+
+    c = _client(s.socket_path)
+    try:
+        reader = codec.FrameReader(c)
+        _hello(c)
+
+        first, _ = reader.read()
+        assert first["t"] == "halt", (
+            "a reconnecting extension must be told it is still halted BEFORE "
+            f"it is handed a scope; the first frame it received was {first!r}"
+        )
+        assert first["reason"] == "client called: stop everything"
+
+        second, body = reader.read()
+        assert second["t"] == "configure"
+        assert codec.parse_config_body(body)["scope.include"] == \
+            ["https://app.example.test/*"]
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": second["id"],
+                                "config_epoch": 4}))
+        threads[0].join(timeout=5)
+        assert out.get("epoch") == 4, out
+
+        assert s.state == "halted", (
+            "a configure re-authorises scope, never issuance; only resume does"
+        )
+        assert s.config_epoch == 4, "the corrected scope must still commit"
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert exc.value.error_class == "halted"
+    finally:
+        c.close()
+
+
+def test_a_reset_never_clears_the_durable_halt(srv_with_halt):
+    """_reset() returns this side to DENY-ALL, which is right, and it has no
+    business touching the halt: the halt is not part of a connection's
+    lifetime. It lives in OperatorHalt, on disk."""
+    s, oh, conn = srv_with_halt
+    oh.halt("operator pressed stop")
+    s._reset()
+    assert s.state == "waiting"
+    assert oh.halted is True
+    assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True
+
+
+def test_a_shell_created_sentinel_stops_send(srv_with_halt):
+    """S4: the sentinel file exists to work when the bridge does not. Nothing
+    told this bridge anything -- no frame, no halt() call -- and the next send
+    must still be refused."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        assert s.state == "configured"
+
+        oh.sentinel_path.write_text("socket was dead, stopped by hand\n")
+
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert exc.value.error_class == "halted", (
+            "a sentinel file is a halt even when no frame ever said so; this "
+            f"send was refused as {exc.value.error_class!r} instead"
+        )
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
+def test_halt_arms_the_durable_record_and_only_resume_clears_it(srv_with_halt):
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+
+        s.halt("operator pressed stop")
+        header, _ = reader.read()
+        assert header["t"] == "halt"
+        assert oh.halted is True
+        assert oh.sentinel_path.exists()
+        assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True
+
+        s.resume()
+        header, _ = reader.read()
+        assert header["t"] == "resume"
+        assert oh.halted is False
+        assert not oh.sentinel_path.exists()
+        assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is False
+    finally:
+        c.close()
+
+
+def test_a_reassert_that_cannot_be_sent_closes_the_connection(srv_with_halt):
+    """`_reassert_halt` returns False and the caller drops the connection.
+
+    Nothing else in this file exercises that arm: the send it guards only
+    fails when the socket dies inside the hello handler, so the failure is
+    injected rather than raced for. Carrying on would leave a peer that never
+    received the halt believing it may issue -- and this side, having set
+    state='halted', would show an operator a stop that is not in force
+    anywhere.
+    """
+    s, oh, conn = srv_with_halt
+    oh.halt("client called: stop everything")
+
+    real_send = s._send
+
+    def refuse(header, body=b""):
+        if header.get("t") == "halt":
+            raise server.BridgeError("send failed: [Errno 32] Broken pipe",
+                                     error_class="bridge_lost")
+        return real_send(header, body)
+
+    s._send = refuse
+
+    c = _client(s.socket_path)
+    try:
+        _hello(c)
+        # _serve's finally runs _reset(), which is the observable consequence.
+        _await(lambda: s.state == "waiting",
+               f"the connection was kept after a failed re-assert: {s.state!r}")
+        c.settimeout(0.5)
+        assert c.recv(4096) == b"", "the peer socket was left open"
+    finally:
+        c.close()
+
+
+def test_send_refuses_a_reply_that_is_not_a_result_or_an_error(srv_with_halt):
+    """_deliver routes `configured` by correlation id like anything else, so a
+    peer that answers a send with one gets that frame handed straight back.
+    Returning it as a result would put `status=None` into an evidence row and
+    call it an exchange that happened."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+
+        def go():
+            try:
+                s.send({"target_host": "app.example.test"}, REQ)
+            except server.BridgeError as exc:
+                out["err"] = exc
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 2}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert "configured" in str(out["err"])
+        assert out["err"].error_class is None
     finally:
         c.close()
