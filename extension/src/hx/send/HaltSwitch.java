@@ -264,9 +264,22 @@ public final class HaltSwitch {
             present = true;
             why = "halt sentinel present: " + sentinel;
         } catch (NoSuchFileException absent) {
-            // The one outcome that answers the question with "no".
-            present = false;
-            why = null;
+            // ENOENT names the sentinel, but it is NOT only "the operator
+            // removed the file": readAttributes answers exactly the same for a
+            // sentinel whose PARENT is gone, is a dangling symlink, or is a
+            // regular file (ENOTDIR). Measured, all three, on the real class:
+            // every one of them read as not-halted, so removing the engagement
+            // directory under a standing halt LIFTED it within one poll while
+            // the operator was looking at a path that no longer existed.
+            //
+            // "No file" only answers the question when there is a directory
+            // for the file to be missing FROM, so confirm that much before
+            // believing it. Deleting the file with the directory still there
+            // re-arms exactly as before -- this is a second question, not a
+            // latch.
+            String unconfirmed = parentIsNotADirectory();
+            present = unconfirmed != null;
+            why = unconfirmed;
         } catch (Throwable t) {
             // Everything else: AccessDeniedException, a vanished mount, a
             // ClosedFileSystemException from a provider we do not control.
@@ -275,6 +288,42 @@ public final class HaltSwitch {
             why = "halt sentinel unreadable, treating as halted: " + sentinel + ": " + t;
         }
         publishAnswer(present, why);
+    }
+
+    /**
+     * null when the sentinel's parent is confirmed to be a directory, and
+     * otherwise the reason to halt. Called only on the ENOENT path, where the
+     * question is whether "no file" is an answer or a symptom.
+     *
+     * Follows links deliberately -- the opposite of the sentinel read itself.
+     * A parent that is a symlink to a real directory is a directory the
+     * sentinel can live in, and the operator's `touch` would land inside it; a
+     * DANGLING one resolves to nothing, so the sentinel cannot be there and
+     * cannot be absent from there either. That one throws here and is caught.
+     */
+    private String parentIsNotADirectory() {
+        Path parent;
+        try {
+            parent = sentinel.getParent();
+            // A bare relative name -- "HALTED" with no directory part -- has
+            // no parent to confirm, so ask the filesystem where it would be.
+            // The production path is absolute (<engagement_root>/HALTED) and
+            // never takes this branch.
+            if (parent == null) parent = sentinel.toAbsolutePath().getParent();
+        } catch (Throwable t) {
+            return "halt sentinel's parent directory cannot be resolved, treating as halted: "
+                   + sentinel + ": " + t;
+        }
+        if (parent == null)
+            return "halt sentinel has no parent directory to confirm, treating as halted: "
+                   + sentinel;
+        try {
+            if (Files.readAttributes(parent, BasicFileAttributes.class).isDirectory()) return null;
+            return "halt sentinel's parent is not a directory, treating as halted: " + parent;
+        } catch (Throwable t) {
+            return "halt sentinel's parent directory is gone or unreadable, treating as halted: "
+                   + parent + ": " + t;
+        }
     }
 
     /** pollOnce() plus the outer net. The net is separate because pollOnce()

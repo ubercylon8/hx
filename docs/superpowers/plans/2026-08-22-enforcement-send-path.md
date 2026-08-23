@@ -11071,6 +11071,9 @@ public class HaltSwitchTest {
         t("theSentinelIsPolledInBothDirections", HaltSwitchTest::theSentinelIsPolledInBothDirections);
         t("presenceIsTheSignalNotContent", HaltSwitchTest::presenceIsTheSignalNotContent);
 
+        t("aVanishedEngagementDirectoryDoesNotLiftAHalt", HaltSwitchTest::aVanishedEngagementDirectoryDoesNotLiftAHalt);
+        t("aSentinelWhoseParentIsNotADirectoryIsHalted", HaltSwitchTest::aSentinelWhoseParentIsNotADirectoryIsHalted);
+
         t("theTwoInputsAreIndependent", HaltSwitchTest::theTwoInputsAreIndependent);
 
         t("anUnreadableSentinelIsHalted", HaltSwitchTest::anUnreadableSentinelIsHalted);
@@ -11221,6 +11224,84 @@ public class HaltSwitchTest {
             check("a dangling symlink is presence, not absence", haltedNow(dangling));
 
             check("and an absent path is still absence", !haltedNow(dir.resolve("nope")));
+        } finally { rmTree(dir); }
+    }
+
+    /**
+     * The live path, and the reason this was a HIGH finding rather than a
+     * curiosity: `readAttributes` answers NoSuchFileException for a sentinel
+     * whose PARENT is gone, which is the same answer it gives when an operator
+     * removes the file. Measured before this check existed: an operator
+     * touches the sentinel, issuance stops; the engagement directory is then
+     * removed -- `rm -rf`, an unmount, a detached volume -- and one poll later
+     * the switch answers halted=false, reason=null. The operator is looking at
+     * a directory that no longer exists and believes issuance is stopped.
+     *
+     * "No file" only answers the question when there is a directory for the
+     * file to be missing FROM. The production sentinel is
+     * `<engagement_root>/HALTED`, inside a directory hx itself creates.
+     */
+    static void aVanishedEngagementDirectoryDoesNotLiftAHalt() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltvanish");
+        Path box = Files.createDirectory(dir.resolve("engagement"));
+        Path sentinel = box.resolve("HALTED");
+        HaltSwitch hs = new HaltSwitch(new TickClock(T0), sentinel, 10L);
+        try {
+            Files.writeString(sentinel, "");
+            hs.start();
+            check("the operator's sentinel halts issuance", hs.halted());
+
+            rmTree(box);
+            long seen = hs.polls();
+            check("the poller has looked since the directory went",
+                  awaitTrue(() -> hs.polls() > seen + 1));
+            check("a vanished engagement directory does NOT lift the halt", hs.halted());
+            check("and the reason names the parent rather than reporting a deleted file",
+                  hs.reason() != null && hs.reason().contains("parent"));
+
+            // The other half: this must not become a one-way latch. Put the
+            // directory back, with no sentinel in it, and issuance re-arms --
+            // which is exactly the case a fix that halted on every ENOENT
+            // would break.
+            Files.createDirectory(box);
+            check("and putting the directory back, with no sentinel in it, re-arms issuance",
+                  awaitTrue(() -> !hs.halted()));
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    /**
+     * The three parent shapes that all read as "no halt" through a bare
+     * NoSuchFileException, one poll each and no thread. ENOTDIR is the one a
+     * fix that merely checked the parent's EXISTENCE would leave open: a
+     * regular file at the parent's path exists, and a sentinel underneath it
+     * can never be created.
+     */
+    static void aSentinelWhoseParentIsNotADirectoryIsHalted() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltparent");
+        try {
+            check("a sentinel under a directory that is not there is halted",
+                  haltedNow(dir.resolve("gone").resolve("HALTED")));
+
+            Path dangling = dir.resolve("dangling");
+            Files.createSymbolicLink(dangling, dir.resolve("nothing-here"));
+            check("a sentinel under a dangling symlink is halted",
+                  haltedNow(dangling.resolve("HALTED")));
+
+            Path regular = dir.resolve("regular");
+            Files.writeString(regular, "not a directory");
+            check("a sentinel under a regular file (ENOTDIR) is halted",
+                  haltedNow(regular.resolve("HALTED")));
+
+            // And the two shapes that ARE a directory still answer "no halt",
+            // so the guard cannot pass by halting on everything.
+            Path real = Files.createDirectory(dir.resolve("real"));
+            check("a sentinel absent from a directory that is there is not halted",
+                  !haltedNow(real.resolve("HALTED")));
+
+            Path link = dir.resolve("link-to-real");
+            Files.createSymbolicLink(link, real);
+            check("and a parent that is a symlink to a real directory is a directory",
+                  !haltedNow(link.resolve("HALTED")));
         } finally { rmTree(dir); }
     }
 
@@ -11880,9 +11961,22 @@ public final class HaltSwitch {
             present = true;
             why = "halt sentinel present: " + sentinel;
         } catch (NoSuchFileException absent) {
-            // The one outcome that answers the question with "no".
-            present = false;
-            why = null;
+            // ENOENT names the sentinel, but it is NOT only "the operator
+            // removed the file": readAttributes answers exactly the same for a
+            // sentinel whose PARENT is gone, is a dangling symlink, or is a
+            // regular file (ENOTDIR). Measured, all three, on the real class:
+            // every one of them read as not-halted, so removing the engagement
+            // directory under a standing halt LIFTED it within one poll while
+            // the operator was looking at a path that no longer existed.
+            //
+            // "No file" only answers the question when there is a directory
+            // for the file to be missing FROM, so confirm that much before
+            // believing it. Deleting the file with the directory still there
+            // re-arms exactly as before -- this is a second question, not a
+            // latch.
+            String unconfirmed = parentIsNotADirectory();
+            present = unconfirmed != null;
+            why = unconfirmed;
         } catch (Throwable t) {
             // Everything else: AccessDeniedException, a vanished mount, a
             // ClosedFileSystemException from a provider we do not control.
@@ -11891,6 +11985,42 @@ public final class HaltSwitch {
             why = "halt sentinel unreadable, treating as halted: " + sentinel + ": " + t;
         }
         publishAnswer(present, why);
+    }
+
+    /**
+     * null when the sentinel's parent is confirmed to be a directory, and
+     * otherwise the reason to halt. Called only on the ENOENT path, where the
+     * question is whether "no file" is an answer or a symptom.
+     *
+     * Follows links deliberately -- the opposite of the sentinel read itself.
+     * A parent that is a symlink to a real directory is a directory the
+     * sentinel can live in, and the operator's `touch` would land inside it; a
+     * DANGLING one resolves to nothing, so the sentinel cannot be there and
+     * cannot be absent from there either. That one throws here and is caught.
+     */
+    private String parentIsNotADirectory() {
+        Path parent;
+        try {
+            parent = sentinel.getParent();
+            // A bare relative name -- "HALTED" with no directory part -- has
+            // no parent to confirm, so ask the filesystem where it would be.
+            // The production path is absolute (<engagement_root>/HALTED) and
+            // never takes this branch.
+            if (parent == null) parent = sentinel.toAbsolutePath().getParent();
+        } catch (Throwable t) {
+            return "halt sentinel's parent directory cannot be resolved, treating as halted: "
+                   + sentinel + ": " + t;
+        }
+        if (parent == null)
+            return "halt sentinel has no parent directory to confirm, treating as halted: "
+                   + sentinel;
+        try {
+            if (Files.readAttributes(parent, BasicFileAttributes.class).isDirectory()) return null;
+            return "halt sentinel's parent is not a directory, treating as halted: " + parent;
+        } catch (Throwable t) {
+            return "halt sentinel's parent directory is gone or unreadable, treating as halted: "
+                   + parent + ": " + t;
+        }
     }
 
     /** pollOnce() plus the outer net. The net is separate because pollOnce()
