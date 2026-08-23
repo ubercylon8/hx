@@ -34,11 +34,31 @@ So this script does four things no ad-hoc version did:
     this" was printed at a moment when it had already been left.
 
 Usage:
-    scripts/sync_plan_block.py PLAN FILE [FILE ...]
+    scripts/sync_plan_block.py PLAN TARGET [TARGET ...]
+
+A TARGET is one of:
+
+    src/hx/bridge/codec.py
+        a WHOLE-FILE block, whose marker line is exactly that path.
+
+    'src/hx/bridge/server.py -- halt(), the arming that comes first@573-579'
+        an EXCERPT block, whose marker carries a ` -- ` note, synced from
+        lines 573-579 of the file. The range is 1-based and inclusive.
+
+The range is the operator's to supply and is not inferred. No algorithm knows
+which lines "the arming that comes first" means: difflib, asked, proposed a
+region for six of the eight excerpts that had drifted and garbage for the
+other two, and a sync that guesses its own region is incidents 1-3 with a
+different spelling. As a net against a mistyped start, a sync refuses unless
+the first line of the named range is already the block's first line -- append
+`!` to the range (@573-579!) to say the extent genuinely moved and you looked.
+
+An excerpt is matched on its FULL marker, note and all: twelve blocks in Plan 3
+name src/hx/bridge/server.py and differ only in that note.
 
 Exit status is 0 when every named block is in sync and nothing else moved, and
-non-zero -- with the plan untouched -- otherwise. It prints one line per file
-saying whether that file's block changed.
+non-zero -- with the plan untouched -- otherwise. It prints one line per target
+saying whether that block changed.
 """
 from __future__ import annotations
 
@@ -56,6 +76,12 @@ SECTION = re.compile(r"^(#{2,3} .*)$", re.M)
 # of the convergence check below is to read the candidate the way the check
 # that matters will read it -- not the way this script wrote it.
 BLOCK = re.compile(r"```(?:java|python|sql)\n(?://|#|--) ([^\n]+)\n(.*?)```", re.S)
+
+
+# A target naming an excerpt: everything up to the last `@N-M`, which no marker
+# in any plan contains. Anchored at the end so a marker may hold an `@` of its
+# own -- `@body` is a real key on the wire and appears in two of these notes.
+TARGET = re.compile(r"^(?P<marker>.+)@(?P<start>\d+)-(?P<end>\d+)(?P<moved>!?)$")
 
 
 def _sections(text: str) -> dict[str, str]:
@@ -84,62 +110,109 @@ def _lang_for(path: str) -> tuple[str, str]:
     raise SystemExit(f"{path}: only .java, .py and .sql blocks are byte-compared")
 
 
-def _as_the_plan_check_reads_it(text: str, path: str, marker: str) -> str | None:
-    """The block for `path`, assembled exactly as the drift test assembles it."""
+def _as_the_plan_check_reads_it(text: str, marker_text: str) -> str | None:
+    """The block marked `marker_text`, assembled exactly as the drift test assembles it.
+
+    Matched on the WHOLE marker, note and all. Twelve blocks in Plan 3 name
+    src/hx/bridge/server.py and differ only in the note after ` -- `, so a
+    path-only match would read the first of the twelve back for all of them
+    and report convergence for a block it had never written.
+    """
     for found, body in BLOCK.findall(text):
-        if found.strip() != path:
+        if found.strip() != marker_text:
             continue
-        got = body.rstrip("\n")
-        return got
+        return body.rstrip("\n")
     return None
+
+
+def _parse(target: str) -> tuple[str, str, tuple[int, int] | None, bool]:
+    """target -> (marker text, path, line span or None for whole-file, extent-moved)."""
+    m = TARGET.match(target)
+    marker_text = m.group("marker") if m else target
+    span = (int(m.group("start")), int(m.group("end"))) if m else None
+    path = marker_text.split(" -- ")[0].strip()
+    if span is None and marker_text != path:
+        raise SystemExit(
+            f"{marker_text}: this marker carries a ` -- ` note, so its block is an "
+            "EXCERPT of the file and not the whole of it. Pasting the file over it "
+            "is incident 4. Name the lines it excerpts: append @START-END."
+        )
+    if span and not (0 < span[0] <= span[1]):
+        raise SystemExit(f"{target}: @START-END must run forwards and start at 1 or more")
+    return marker_text, path, span, bool(m and m.group("moved"))
 
 
 def sync(plan_path: Path, targets: list[str]) -> int:
     text = plan_path.read_text()
     before = _sections(text)
     touched: set[str] = set()
-    wanted: list[tuple[str, str, str]] = []       # (path, marker, what the check must see)
+    wanted: list[tuple[str, str]] = []            # (marker text, what the check must see)
     changed = 0
 
-    for path in targets:
+    for target in targets:
+        marker_text, path, span, extent_moved = _parse(target)
         src = Path(path)
         if not src.exists():
             raise SystemExit(f"{path}: no such file -- refusing to invent a block")
 
         lang, comment = _lang_for(path)
-        marker = f"{comment} {path}"
+        marker = f"{comment} {marker_text}"
         opener = f"{FENCE}{lang}\n{marker}\n"
 
         n = text.count(opener)
         if n == 0:
             raise SystemExit(
-                f"{path}: no block in {plan_path} opens with `{marker}`, so there is "
-                "nothing to sync. Check the path in the marker line, or add the block."
+                f"{marker_text}: no block in {plan_path} opens with `{marker}`, so there "
+                "is nothing to sync. Check the marker line, or add the block."
             )
         if n > 1:
             raise SystemExit(
-                f"{path}: expected exactly one block, found {n}. "
-                "Two blocks for one file is incident 4 waiting to happen; "
+                f"{marker_text}: expected exactly one block, found {n}. "
+                "Two blocks for one marker is incident 4 waiting to happen; "
                 "delete the duplicate before syncing."
             )
 
         start = text.index(opener)
         end = text.index(f"\n{FENCE}", start + len(opener))
+        was = text[start + len(opener):end]
 
-        body = src.read_text().rstrip("\n")
-        # Follow the file. The drift check re-prepends the marker when the file
-        # itself opens with it, so including it here would duplicate the line.
-        if body.startswith(marker + "\n") or body == marker:
-            body = body[len(marker):].lstrip("\n")
+        if span is None:
+            body = src.read_text().rstrip("\n")
+            # Follow the file. The drift check re-prepends the marker when the file
+            # itself opens with it, so including it here would duplicate the line.
+            if body.startswith(marker + "\n") or body == marker:
+                body = body[len(marker):].lstrip("\n")
+        else:
+            lines = src.read_text().splitlines()
+            first, last = span
+            if last > len(lines):
+                raise SystemExit(
+                    f"{target}: {path} has {len(lines)} lines, so there is no line {last}."
+                )
+            # The net described at the top of this file. It catches a mistyped
+            # start -- the one way to name a plausible but wrong region -- and
+            # deliberately does NOT check the last line: a block's tail is
+            # exactly where drift shows up, and two of the eight excerpts this
+            # was written for had lost their final line to a fixed defect.
+            head = next((l for l in was.splitlines() if l.strip()), None)
+            if head is not None and lines[first - 1] != head and not extent_moved:
+                raise SystemExit(
+                    f"{target}: line {first} of {path} is not where this block starts.\n"
+                    f"  block starts: {head!r}\n"
+                    f"  {path}:{first}: {lines[first - 1]!r}\n"
+                    "Check the range. If the extent genuinely moved, say so with a "
+                    f"trailing `!`: @{first}-{last}!"
+                )
+            body = "\n".join(lines[first - 1:last])
 
         new = text[:start] + opener + body + text[end:]
         if new != text:
             changed += 1
-            print(f"  synced    {path}")
+            print(f"  synced    {target}")
         else:
-            print(f"  unchanged {path}")
+            print(f"  unchanged {target}")
         text = new
-        wanted.append((path, marker, body))
+        wanted.append((marker_text, body))
 
         heading = None
         for m in SECTION.finditer(text):
@@ -180,12 +253,12 @@ def sync(plan_path: Path, targets: list[str]) -> int:
         # next, so the plan check sees a different block from the one written
         # here and reports STALE run after run while this script reports
         # success. Read the candidate back the way that check reads it.
-        for path, marker, body in wanted:
-            got = _as_the_plan_check_reads_it(candidate, path, marker)
+        for marker_text, body in wanted:
+            got = _as_the_plan_check_reads_it(candidate, marker_text)
             if got != body:
                 raise SystemExit(
-                    f"{path}: the block does not read back as it was written, so the "
-                    "sync would never converge -- refusing. A fence inside the source "
+                    f"{marker_text}: the block does not read back as it was written, so "
+                    "the sync would never converge -- refusing. A fence inside the source "
                     "ends the block early for tests/test_plan_matches_repo.py. "
                     f"wrote {len(body.splitlines())} lines, reads back as "
                     f"{0 if got is None else len(got.splitlines())}."

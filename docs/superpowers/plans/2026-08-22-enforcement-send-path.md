@@ -12570,9 +12570,13 @@ one-liner and is now a block:
 
 ```java
 // extension/src/hx/bridge/BridgeClient.java -- the halt and resume arms of handle()
-
             case "halt" -> {
-                String why = String.valueOf(f.header.get("reason"));
+                // NOT String.valueOf(): for an absent key that answers the
+                // four-character string "null", which is neither null nor
+                // blank, so HaltSwitch's "no reason given" fallback could
+                // never fire for the only production caller and both
+                // consoles showed the operator the word null.
+                String why = f.header.get("reason") instanceof String r ? r : null;
                 // The switch FIRST, this flag second. `halted` here governs
                 // maySend()/checkMaySend(); the send path asks HaltSwitch, and
                 // on the way DOWN the stricter authority is told first.
@@ -17518,38 +17522,18 @@ left alone, which is why the new one is `srv_with_halt`.
 ```python
 # tests/test_bridge_server.py -- appended: the send path and the durable halt
 # ---- the send path, the halted frame, and the durable halt ----------------
-#
-# Everything below drives a REAL OperatorHalt against a real engagement
-# database. A stub would hide the guarantee these tests exist for: the bridge
-# reads `halted` and `reason` from its read thread, and the store connection
-# they would otherwise touch belongs to another thread entirely.
 
 
 @pytest.fixture
-def store(tmp_path):
-    root = tmp_path / "engagement"
-    secure_mkdir(root)
-    conn = db_mod.connect(root / "hx.db")
-    db_mod.init_schema(conn)
-    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
-                 " VALUES('e-1','Example','Example Ltd',1,'active')")
-    conn.execute("INSERT INTO run(id, engagement_id, kind, safety_profile,"
-                 " started_us, status)"
-                 " VALUES('r-1','e-1','manual','production',1700000000000000,"
-                 "'running')")
-    yield root, conn
-    conn.close()
+def srv_with_halt(srv, halt, store):
+    """The `srv` fixture, plus the halt and the store it was built over.
 
-
-@pytest.fixture
-def srv_with_halt(tmp_path, store):
-    root, conn = store
-    oh = halt_mod.OperatorHalt(root, conn)
-    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
-                            operator_halt=oh)
-    s.start()
-    yield s, oh, conn
-    s.stop()
+    These used to be a second server built by hand, from the days when
+    `operator_halt` was optional and only this half of the file passed one.
+    It is required now, so `srv` already has a real one and this is just the
+    unpacking the twenty tests below read.
+    """
+    return srv, halt, store[1]
 
 
 def _hello(c, engagement_id="e-1"):
@@ -17635,6 +17619,55 @@ def test_send_returns_the_result_frame_and_its_body(srv_with_halt):
         assert out["reply"]["status"] == 200
         assert out["reply"]["config_epoch"] == 1
         assert out["reply"][server.BridgeServer.BODY_KEY] == RESP
+    finally:
+        c.close()
+
+
+def test_a_status_unreadable_result_reaches_the_store_unchanged(srv_with_halt):
+    """The first consumer of a wire value added one commit before this task.
+
+    S6 keeps `status` at the conservative sentinel 599 so S4's auto-halt
+    counts it as an error, and moves the distinction to `outcome`. The wire
+    value and exchange.outcome's value are deliberately the SAME STRING, so
+    what this asserts is that no mapping layer appeared between them -- the
+    frame's own outcome goes into the row, and the row can still be told
+    apart from a peer that genuinely answered 599.
+
+    The body on that frame says `HTTP/1.1 200 OK`, because that is the case
+    that made the field necessary: eight interim heads then a 200.
+    """
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+        t = threading.Thread(target=lambda: out.update(reply=s.send(
+            {"target_host": "app.example.test"}, REQ)))
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "result", "id": header["id"],
+                                "status": 599, "bytes": len(RESP), "ms": 42,
+                                "outcome": "status_unreadable",
+                                "config_epoch": 1}, RESP))
+        t.join(timeout=5)
+        reply = out["reply"]
+        assert reply["status"] == 599
+        assert reply["outcome"] == "status_unreadable"
+
+        row_id = records.record_exchange(
+            conn, run_id="r-1", method="GET",
+            url="https://app.example.test/api/orders?page=2",
+            status=reply["status"], outcome=reply["outcome"],
+            req_blob="a" * 64, resp_blob="b" * 64, ms=reply["ms"],
+            at_us=1700000000000000,
+            resp_len=len(reply[server.BridgeServer.BODY_KEY]))
+        row = conn.execute("SELECT status, outcome FROM exchange WHERE id=?",
+                           (row_id,)).fetchone()
+        assert (row["status"], row["outcome"]) == (599, "status_unreadable")
+        assert b"HTTP/1.1 200 OK" in reply[server.BridgeServer.BODY_KEY], (
+            "the exchange this outcome exists for is one whose own evidence "
+            "contradicts its status"
+        )
     finally:
         c.close()
 
@@ -17781,10 +17814,65 @@ def test_send_refuses_a_caller_supplied_engagement_id(srv_with_halt):
         c.close()
 
 
+@pytest.mark.parametrize("key,value", [
+    ("v", 99), ("t", "halt"), ("id", 1), ("deadline_us", 1),
+    ("engagement_id", "SOMEONE-ELSE"),
+])
+def test_send_refuses_every_key_it_stamps_itself(srv_with_halt, key, value):
+    """`**req` is spliced over the frame this method builds, so a caller's key
+    WINS. Without the guard, `t` alone turns a send into a halt frame the
+    extension acts on and nobody correlates, `v` gets answered
+    protocol_mismatch and drops the channel, and `id` collides with a live
+    correlation id so one of the two callers collects the other's reply.
+
+    Refused rather than silently overwritten: a caller who set one of these
+    believed something would happen, and quietly doing something else is how
+    a scan ends up addressing an extension nobody meant to address.
+    """
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test", key: value}, REQ)
+        assert exc.value.error_class is None, (
+            "a malformed call is a harness bug, not a denial the store should "
+            "file a row for"
+        )
+        assert key in str(exc.value)
+        # And nothing reached the wire: the guard runs before _request().
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
 def test_a_halted_frame_stops_issuance_and_aborts_the_run(srv_with_halt):
     """S6's unsolicited `halted` frame, {reason, host, window}, no id. Without
     it an auto-halt is invisible until the next send fails and
-    `run.status = aborted` has no stop_reason to record."""
+    `run.status = aborted` has no stop_reason to record.
+
+    THIS TEST IS THE REFERENCE HARNESS. Plan 4's tool layer copies the shape
+    of the `on_halted` handling below, so the shape has to be the safe one.
+
+    It used to call `abort_run` and stop there, and `abort_run` alone does not
+    survive the connection the frame arrived on. Measured against a live
+    bridge with only that call:
+
+        after the halted frame:  state='halted'   operator_halt.halted=False
+        after _reset():          state='waiting'  operator_halt.halted=False
+        next send refused as 'not_configured' -- DENY-ALL, not the halt
+        run.status='aborted'  <- the only survivor, and nothing on the send
+                                 path consults it
+
+    So a reconnect and a fresh configure re-armed issuance after an auto-halt.
+    That the `halted` arm does not make the stop durable by itself is
+    defensible and is NOT changed here -- S4 scopes durability to an OPERATOR
+    halt, and the arm's own comment defers it. What is fixed is the pattern
+    this test hands to Plan 4: the harness calls `oh.halt()` beside
+    `abort_run`, and the assertions below fail if that line is ever dropped.
+    """
     s, oh, conn = srv_with_halt
     c = _client(s.socket_path)
     try:
@@ -17803,19 +17891,48 @@ def test_a_halted_frame_stops_issuance_and_aborts_the_run(srv_with_halt):
         _await(lambda: seen, "on_halted never fired")
 
         frame = seen[0]
-        assert records.abort_run(
-            conn, run_id="r-1", at_us=1700000000900000,
-            stop_reason=f"{frame['reason']} on {frame['host']} "
-                        f"({frame['window']})") is True
+        assert s.last_halted == frame, (
+            "a harness with no callback installed still has to be able to see "
+            "why issuance stopped"
+        )
+        stop_reason = (f"{frame['reason']} on {frame['host']} "
+                       f"({frame['window']})")
+        assert records.abort_run(conn, run_id="r-1", at_us=1700000000900000,
+                                 stop_reason=stop_reason) is True
         row = conn.execute("SELECT status, stop_reason FROM run WHERE id='r-1'"
                            ).fetchone()
         assert row["status"] == "aborted"
         assert row["stop_reason"] == ("5xx rate 0.40 on app.example.test "
                                       "(50 requests / 37s)")
+        # The line that makes the stop outlive this connection. `abort_run`
+        # writes the run's epitaph; only this writes the sentinel and the row
+        # the next Burp start reads. Both, or the auto-halt lasts exactly as
+        # long as the socket it arrived on.
+
+        oh.halt(f"target distress: {stop_reason}")
 
         with pytest.raises(server.BridgeError) as exc:
             s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
         assert exc.value.error_class == "halted"
+
+        # And the same refusal after the connection goes away, which is what
+        # made the missing line matter: `state` is back to DENY-ALL and a
+        # configure would lift that, but the sentinel is what send() consults
+        # first. Without oh.halt() above this is 'not_configured' -- a refusal
+        # the next configure clears.
+        s._reset()
+        assert s.state == "waiting"
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert exc.value.error_class == "halted", (
+            "an auto-halt the harness recorded must still refuse after the "
+            f"connection it arrived on is gone; this was {exc.value.error_class!r}"
+        )
+        assert oh.sentinel_path.exists()
+        assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True, (
+            "the next Burp start reads the store and the file; run.status="
+            "'aborted' is not something the send path consults"
+        )
     finally:
         c.close()
 
@@ -17971,6 +18088,146 @@ def test_halt_arms_the_durable_record_and_only_resume_clears_it(srv_with_halt):
         assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is False
     finally:
         c.close()
+
+
+def test_halt_arms_the_durable_record_before_the_frame_it_cannot_send(srv_with_halt):
+    """halt() arms the durable record FIRST, and a dead socket proves it.
+
+    S4 names the dead socket as the reason the sentinel exists at all, and a
+    dead socket is the likeliest thing to be wrong at the moment someone hits
+    stop. Arming after the send makes exactly that case the one path that
+    loses the halt: the operator gets an exception and NOTHING anywhere is
+    halted -- no frame, no sentinel, no row, and the next Burp start finds no
+    standing halt to re-assert.
+
+    The mirror ordering inside OperatorHalt.halt (sentinel before row) has
+    test_the_sentinel_is_written_before_the_row behind it. This ordering, on
+    the bridge, had nothing but a comment: reversing the two statements passed
+    the entire suite except the plan's byte-compare, which a re-sync would
+    have carried the reversal straight into.
+    """
+    s, oh, conn = srv_with_halt
+    assert s._conn is None, "this test is only about the socket being dead"
+
+    with pytest.raises(server.BridgeError, match="not connected") as exc:
+        s.halt("operator pressed stop, socket already dead")
+    assert exc.value.error_class == "bridge_lost"
+
+    assert oh.halted is True, (
+        "the operator pressed stop and was told it failed; if nothing is "
+        "halted, the stop button did nothing at all"
+    )
+    assert oh.sentinel_path.exists(), (
+        "the sentinel is the path that works when the bridge does not -- it "
+        "is the one that must exist after a send that could not happen"
+    )
+    assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True, (
+        "the next Burp start reads the store and the file, not this object"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM agent_action WHERE tool=?",
+                        (halt_mod.HALT_TOOL,)).fetchone()[0] == 1, (
+        "the audit trail must say who stopped the run even when the frame "
+        "never reached anyone"
+    )
+    assert s.state == "waiting", (
+        "the bridge state is the connection's, and there is no connection; "
+        "the halt that outlives it is the one in OperatorHalt"
+    )
+
+
+def test_resume_leaves_the_durable_halt_armed_when_the_frame_cannot_be_sent(srv_with_halt):
+    """resume() disarms LAST, and the same dead socket proves it.
+
+    A resume the peer never received must not lift a standing halt. Reversed,
+    the operator is told the resume failed while issuance has been silently
+    re-armed for the next Burp start -- a lifted halt nobody asked for,
+    reported as a failure. S4's direction is the other one: unknown state is
+    stop, so every failure before the frame reaches the wire leaves the halt
+    standing.
+    """
+    s, oh, conn = srv_with_halt
+    oh.halt("operator pressed stop")
+    assert s._conn is None, "this test is only about the socket being dead"
+
+    with pytest.raises(server.BridgeError, match="not connected"):
+        s.resume()
+
+    assert oh.halted is True, (
+        "a resume nobody received lifted the halt anyway"
+    )
+    assert oh.sentinel_path.exists()
+    assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True, (
+        "and the next Burp start would have come up armed"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM agent_action WHERE tool=?",
+                        (halt_mod.RESUME_TOOL,)).fetchone()[0] == 0, (
+        "nothing was resumed, so nothing should say it was"
+    )
+
+
+def test_a_reassert_that_cannot_be_sent_closes_the_connection(srv_with_halt):
+    """`_reassert_halt` returns False and the caller drops the connection.
+
+    Nothing else in this file exercises that arm: the send it guards only
+    fails when the socket dies inside the hello handler, so the failure is
+    injected rather than raced for. Carrying on would leave a peer that never
+    received the halt believing it may issue -- and this side, having set
+    state='halted', would show an operator a stop that is not in force
+    anywhere.
+    """
+    s, oh, conn = srv_with_halt
+    oh.halt("client called: stop everything")
+
+    real_send = s._send
+
+    def refuse(header, body=b""):
+        if header.get("t") == "halt":
+            raise server.BridgeError("send failed: [Errno 32] Broken pipe",
+                                     error_class="bridge_lost")
+        return real_send(header, body)
+
+    s._send = refuse
+
+    c = _client(s.socket_path)
+    try:
+        _hello(c)
+        # _serve's finally runs _reset(), which is the observable consequence.
+        _await(lambda: s.state == "waiting",
+               f"the connection was kept after a failed re-assert: {s.state!r}")
+        c.settimeout(0.5)
+        assert c.recv(4096) == b"", "the peer socket was left open"
+    finally:
+        c.close()
+
+
+def test_send_refuses_a_reply_that_is_not_a_result_or_an_error(srv_with_halt):
+    """_deliver routes `configured` by correlation id like anything else, so a
+    peer that answers a send with one gets that frame handed straight back.
+    Returning it as a result would put `status=None` into an evidence row and
+    call it an exchange that happened."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        out = {}
+
+        def go():
+            try:
+                s.send({"target_host": "app.example.test"}, REQ)
+            except server.BridgeError as exc:
+                out["err"] = exc
+
+        t = threading.Thread(target=go)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "configured", "id": header["id"],
+                                "config_epoch": 2}))
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert "configured" in str(out["err"])
+        assert out["err"].error_class is None
+    finally:
+        c.close()
 ```
 
 
@@ -18089,29 +18346,63 @@ so the block can be pasted whole.
     # body still attached fails loudly instead of putting evidence in a header.
     BODY_KEY = "@body"
 
-    # Keys send() stamps itself. A caller able to set any of them could address
-    # another engagement's extension, collide with a live correlation id, or
-    # hand itself a deadline the peer would honour -- so they are refused
-    # rather than silently overwritten, which would leave the caller believing
-    # something else happened.
+    # Keys send() stamps itself. `**req` is spliced OVER the frame send()
+    # builds, so a caller's key wins: `t` alone would turn a send into a halt
+    # frame nobody correlates, `engagement_id` would address whichever
+    # extension answered, and `id` would collide with a live correlation id.
+    # They are refused rather than silently overwritten, which would leave the
+    # caller believing something else happened.
     _RESERVED_SEND_KEYS = frozenset({"v", "t", "id", "deadline_us",
                                      "engagement_id"})
 
-    def __init__(self, socket_path: Path, engagement_id: str, on_hello=None,
-                 on_halted=None, operator_halt=None):
+    def __init__(self, socket_path: Path, engagement_id: str, operator_halt,
+                 on_hello=None, on_halted=None):
         """
+        `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
+        module keeps no dependency on the store, and tests can attach anything
+        with `.halted`, `.reason`, `.halt()` and `.resume()`. `.halted` and
+        `.reason` are read on the read thread, which is why OperatorHalt
+        answers them from memory and a stat() rather than from the database.
+
+        IT IS REQUIRED, and the Java side made the same call for the same
+        field: HxExtension.initialize() refuses to come up without
+        `-Dhx.halt_sentinel` because "an extension that went live without one
+        would have two of the three paths spec s4 promises, silently". The
+        same is true here. Optional, it made the whole durable halt opt-in: a
+        HALTED file placed by hand -- S4's named "the socket is dead, stop by
+        hand" path -- did not stop send(), and halt() wrote neither sentinel
+        nor audit row. Measured with the argument omitted:
+
+            sentinel on disk: True   operator_halt attr: None
+            SEND REACHED THE WIRE with a HALTED sentinel present
+            after server.halt(): agent_action rows = 0
+
+        The extension still refused via its own poller, so S4's enforcement
+        invariant held; what was lost was durability and the harness-side
+        refusal. S4 promises three paths, and an opt-in third path is not a
+        promise. A caller with no engagement -- a test harness -- supplies a
+        sentinel in a directory of its own, which is exactly the discipline
+        the Java side imposes on itself.
+
         `on_hello` and `on_halted` are both called ON THE READ THREAD, so
         neither may touch a sqlite3 connection opened elsewhere: it belongs to
         the thread that created it and raises ProgrammingError anywhere else
         (tests/test_halt.py demonstrates it). Hand the work to the thread that
         owns the store instead.
-
-        `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
-        module keeps no dependency on the store, and tests can attach anything
-        with `.halted` and `.reason`. Both are read on the read thread, which
-        is why OperatorHalt answers them from memory and a stat() rather than
-        from the database.
         """
+        if operator_halt is None:
+            # The signature already refuses an OMITTED argument. This refuses
+            # an explicit None, which is the same fail-open with a keystroke
+            # in front of it, and refuses it at construction rather than at
+            # the first send -- the Java side's `extension idle` shape.
+            raise BridgeError(
+                "operator_halt is required and may not be None. It is S4's "
+                "third kill path: the sentinel file that works when the "
+                "bridge does not. A caller with no engagement supplies an "
+                "hx.halt.OperatorHalt over a directory of its own, the same "
+                "way HxExtension refuses to initialise without "
+                "-Dhx.halt_sentinel."
+            )
         self.socket_path = Path(socket_path)
         self.engagement_id = engagement_id
         self.on_hello = on_hello
@@ -18216,7 +18507,7 @@ parameter:
         someone has already hit stop. `_reset()` cannot clear it either: the
         state lives in OperatorHalt, on disk, not in this object.
         """
-        if self.operator_halt is None or not self.operator_halt.halted:
+        if not self.operator_halt.halted:
             return True
         reason = self.operator_halt.reason or "halted, no reason recorded"
         try:
@@ -18280,7 +18571,7 @@ Insert `send()` immediately above `halt()`:
         # is dead or the agent has stopped responding -- S4 names that as the
         # reason the file exists -- and that halt has to work with no frame
         # ever arriving.
-        if self.operator_halt is not None and self.operator_halt.halted:
+        if self.operator_halt.halted:
             raise BridgeError(f"halted: {self.operator_halt.reason}",
                               error_class="halted")
         state = self.state
@@ -18320,8 +18611,7 @@ comment:
         # the halt still stands and the next hello re-asserts it. Arming
         # afterwards would make a dead socket -- the likeliest thing to be
         # wrong when someone hits stop -- the one path that loses the halt.
-        if self.operator_halt is not None:
-            self.operator_halt.halt(reason)
+        self.operator_halt.halt(reason)
 ```
 
 and disarm it at the very end of `resume()`, outside the lock:
@@ -18333,8 +18623,7 @@ and disarm it at the very end of `resume()`, outside the lock:
         # stood. Every failure before this point leaves the durable halt armed,
         # which is the direction S4 asks for: unknown state is stop. Only
         # resume re-arms issuance, and only a resume that actually got there.
-        if self.operator_halt is not None:
-            self.operator_halt.resume()
+        self.operator_halt.resume()
 ```
 
 
@@ -18374,7 +18663,8 @@ Restore: `git checkout -- src/hx/bridge/server.py`
 Delete these three lines from `send()`:
 
 ```python
-        if self.operator_halt is not None and self.operator_halt.halted:
+# src/hx/bridge/server.py -- send(), the sentinel consulted before anything is issued
+        if self.operator_halt.halted:
             raise BridgeError(f"halted: {self.operator_halt.reason}",
                               error_class="halted")
 ```
@@ -19157,25 +19447,15 @@ Replace `launch_burp` in `tests/integration/burp_fixture.py` with this:
 
 ```python
 # tests/integration/burp_fixture.py -- launch_burp gains the halt sentinel
-
 def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
-                sentinel: Path | None = None) -> subprocess.Popen:
+                sentinel: Path) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
     buffer fills and the test hangs with no diagnostic. A file also means a
     failing test can quote what Burp actually said.
-
-    `sentinel` is the halt file the extension polls. It is defaulted rather
-    than made required so the handshake tests do not have to invent one, but
-    the property is ALWAYS passed: HxExtension refuses to initialise without
-    it, and the symptom of omitting it is a test that hangs at the handshake
-    with one line in burp.log and nothing on the bridge. The default path
-    must not exist at launch -- an existing sentinel means halted -- so it is
-    named inside the per-run workdir rather than anywhere shared.
     """
     home = make_home(workdir)
-    sentinel = Path(sentinel) if sentinel is not None else workdir / "halt.sentinel"
     log = (workdir / "burp.log").open("wb")
     cmd = [
         "java",
@@ -19183,8 +19463,13 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
         f"-Duser.home={home}",
         f"-Dhx.socket={socket_path}",
         f"-Dhx.engagement={engagement_id}",
-        f"-Dhx.halt_sentinel={sentinel}",
         "-Dhx.instance=integration",
+        # Required, not optional: HxExtension.initialize() returns early
+        # ("extension idle") without it, so the extension never dials and the
+        # handshake never happens. Task 6 made it mandatory and this fixture
+        # was not updated -- the integration tests are deselected from the
+        # default run, so nothing said so for a day.
+        f"-Dhx.halt_sentinel={sentinel}",
         *ADD_OPENS,
         "-cp", f"{BURP_JAR}:{EXT_JAR}",
         "burp.StartBurp",
