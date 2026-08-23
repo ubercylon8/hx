@@ -43,8 +43,8 @@ public class RedactorTest {
         t("overlappingRangesAreRefusedAndAbuttingOnesAreNot", RedactorTest::overlappingRangesAreRefusedAndAbuttingOnesAreNot);
         t("aRangePastTheEndIsRefusedNotTruncated", RedactorTest::aRangePastTheEndIsRefusedNotTruncated);
         t("degenerateRangesAreRefused", RedactorTest::degenerateRangesAreRefused);
-        t("clearDropsTheRegistry", RedactorTest::clearDropsTheRegistry);
-        t("rangesAreNotSharedAcrossThreads", RedactorTest::rangesAreNotSharedAcrossThreads);
+        t("oneRequestsRangesCannotReachTheNext", RedactorTest::oneRequestsRangesCannotReachTheNext);
+        t("theRangesTravelWithTheRequestNotTheThread", RedactorTest::theRangesTravelWithTheRequestNotTheThread);
 
         t("anUnmanagedAuthorizationIsNamed", RedactorTest::anUnmanagedAuthorizationIsNamed);
         t("credentialHeaderMatchingIsCaseInsensitive", RedactorTest::credentialHeaderMatchingIsCaseInsensitive);
@@ -90,7 +90,7 @@ public class RedactorTest {
         // this is the only path that runs, and it must be a no-op.
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        byte[] out = r.redactRequest(raw);
+        byte[] out = r.redactRequest(raw, new Redactor.Injected());
         check("an empty registry returns the same bytes", Arrays.equals(out, raw));
         check("an empty registry still returns a copy, not the wire array", out != raw);
     }
@@ -98,8 +98,9 @@ public class RedactorTest {
     static void aRegisteredRangeBecomesTheIdentityPlaceholder() {
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        String out = text(r.redactRequest(raw));
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        String out = text(r.redactRequest(raw, injected));
         check("the injected range is replaced by the identity placeholder",
               out.contains("Authorization: {{identity:ident-admin:authz}}\r\n"));
         check("the credential is gone from the copy that crosses the bridge",
@@ -116,8 +117,9 @@ public class RedactorTest {
         Redactor r = new Redactor();
         byte[] raw = authRequest();
         byte[] wire = raw.clone();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        r.redactRequest(raw);
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        r.redactRequest(raw, injected);
         check("redactRequest does not modify its argument", Arrays.equals(raw, wire));
     }
 
@@ -130,11 +132,12 @@ public class RedactorTest {
                          + "\r\nname=x");
         // Registered LAST-first on purpose: the registry sorts, the caller
         // does not have to.
+        Redactor.Injected injected = new Redactor.Injected();
         int aStart = find(raw, "Bearer " + TOKEN);
-        r.register("ident-admin", aStart, aStart + ("Bearer " + TOKEN).length());
+        injected.register("ident-admin", aStart, aStart + ("Bearer " + TOKEN).length());
         int cStart = find(raw, "JSESSIONID=9C4A1F0E27B84D5FA3");
-        r.register("ident-admin", cStart, cStart + "JSESSIONID=9C4A1F0E27B84D5FA3".length());
-        String out = text(r.redactRequest(raw));
+        injected.register("ident-admin", cStart, cStart + "JSESSIONID=9C4A1F0E27B84D5FA3".length());
+        String out = text(r.redactRequest(raw, injected));
         check("both ranges are replaced",
               out.contains("Cookie: {{identity:ident-admin:authz}}\r\n")
               && out.contains("Authorization: {{identity:ident-admin:authz}}\r\n"));
@@ -145,14 +148,14 @@ public class RedactorTest {
         // Overlap means the two ranges disagree about what those bytes are.
         // Truncating or double-substituting either one produces bytes that
         // were never sent, so the answer is a refusal.
-        Redactor r = new Redactor();
-        r.register("ident-admin", 10, 20);
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", 10, 20);
         expectThrows("a range overlapping an earlier one is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-admin", 15, 25));
+                     Redactor.RangeError.class, () -> injected.register("ident-admin", 15, 25));
         expectThrows("a range containing an earlier one is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-b", 5, 30));
+                     Redactor.RangeError.class, () -> injected.register("ident-b", 5, 30));
         // [10,20) and [20,30) are two adjacent injected headers, not an overlap.
-        r.register("ident-b", 20, 30);
+        injected.register("ident-b", 20, 30);
         check("abutting ranges are accepted", true);
     }
 
@@ -162,44 +165,69 @@ public class RedactorTest {
         // made.
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        r.register("ident-admin", raw.length - 4, raw.length + 40);
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", raw.length - 4, raw.length + 40);
         expectThrows("a range running past the end of the request is refused",
-                     Redactor.RangeError.class, () -> r.redactRequest(raw));
+                     Redactor.RangeError.class, () -> r.redactRequest(raw, injected));
     }
 
     static void degenerateRangesAreRefused() {
-        Redactor r = new Redactor();
+        Redactor.Injected injected = new Redactor.Injected();
         expectThrows("a negative start is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-admin", -1, 5));
+                     Redactor.RangeError.class, () -> injected.register("ident-admin", -1, 5));
         expectThrows("an empty range is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-admin", 7, 7));
+                     Redactor.RangeError.class, () -> injected.register("ident-admin", 7, 7));
         expectThrows("a reversed range is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-admin", 9, 4));
+                     Redactor.RangeError.class, () -> injected.register("ident-admin", 9, 4));
         expectThrows("a range with no identity is refused",
-                     Redactor.RangeError.class, () -> r.register("", 0, 5));
+                     Redactor.RangeError.class, () -> injected.register("", 0, 5));
     }
 
-    static void clearDropsTheRegistry() {
-        // The Sender clears in a finally. One request's offsets applied to the
-        // next request's bytes would blank out a span of somebody else's body.
+    static void oneRequestsRangesCannotReachTheNext() {
+        // What clear() used to be for, now structural. One request's offsets
+        // applied to the next request's bytes do not merely leak, they blank
+        // out a span of somebody else's body -- so the ranges belong to the
+        // request, and the next request's Injected is a different object with
+        // nothing in it. There is no finally to forget and no registry to
+        // clear on the wrong thread.
         Redactor r = new Redactor();
-        byte[] raw = authRequest();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        r.clear();
-        check("after clear() the next request is verbatim",
-              Arrays.equals(r.redactRequest(raw), raw));
+        byte[] first = authRequest();
+        Redactor.Injected forFirst = new Redactor.Injected();
+        forFirst.register("ident-admin", tokenStart(first), tokenEnd(first));
+        r.redactRequest(first, forFirst);
+
+        // Deliberately LONGER than the first request's last offset: were the
+        // ranges to survive, this asks for silent corruption of an unrelated
+        // body rather than the RangeError a short fixture would provoke.
+        String body = "amount=100&to=acct-99&memo=ALONG-ENOUGH-MEMO-FIELD-THAT-SPANS-THE-WHOLE-RANGE";
+        byte[] next = bytes("POST /transfer HTTP/1.1\r\n"
+                          + "Host: app.example.test\r\n"
+                          + "Content-Length: " + body.length() + "\r\n"
+                          + "\r\n" + body);
+        check("the next request, redacted with its own Injected, is verbatim",
+              Arrays.equals(r.redactRequest(next, new Redactor.Injected()), next));
     }
 
-    static void rangesAreNotSharedAcrossThreads() throws Exception {
+    static void theRangesTravelWithTheRequestNotTheThread() throws Exception {
+        // The read loop registers what it injected and a pooled worker
+        // redacts -- the limit.concurrency shape §6 already has a config key
+        // for. With the registry held on the Redactor (a field or a
+        // ThreadLocal) the worker's is empty, so redactRequest hands back a
+        // verbatim copy WITH the credential in it: no exception, no signal,
+        // and those are the bytes that get content-addressed. The assertion
+        // this replaced said the other thread's copy equalled `raw` -- it
+        // passed if and only if the credential survived.
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        byte[][] other = new byte[1][];
-        Thread t = new Thread(() -> other[0] = r.redactRequest(raw));
-        t.start();
-        t.join();
-        check("a range registered on one thread does not rewrite another thread's request",
-              Arrays.equals(other[0], raw));
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        String[] fromWorker = new String[1];
+        Thread worker = new Thread(() -> fromWorker[0] = text(r.redactRequest(raw, injected)));
+        worker.start();
+        worker.join();
+        check("a range registered on the read loop is applied by the worker that redacts",
+              fromWorker[0].contains("Authorization: {{identity:ident-admin:authz}}\r\n")
+              && !fromWorker[0].contains(TOKEN));
     }
 
     // ---- fail closed on what we did not inject --------------------------
@@ -410,8 +438,9 @@ public class RedactorTest {
     static void redactionHappensBeforeHashing() throws Exception {
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        byte[] crossingTheBridge = r.redactRequest(raw);
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        byte[] crossingTheBridge = r.redactRequest(raw, injected);
 
         // A content-addressed store, in three lines, standing in for
         // hx.store.blobs.BlobStore.put() -- same sha256 hex digest.

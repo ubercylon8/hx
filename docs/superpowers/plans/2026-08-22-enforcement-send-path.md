@@ -9299,23 +9299,22 @@ git commit -m "feat(policy): auto-halt on target distress over a rolling per-hos
 - Consumes:
   - `public record HxRequest(String method, String url, String host, String path, String query, Map<String, List<String>> headers, byte[] body)` — `hx.policy.HxRequest` from Task 1. Only `headers()` is read here; the redactor never looks at the URL or the body.
 - Produces:
-  - `hx.send.Redactor()` — no-arg. One instance per `Sender`.
-  - `void register(String identityId, int start, int end)` — records a half-open byte range `[start, end)` that the extension injected into the serialised request. Throws `RangeError` on a degenerate range or one overlapping a range already registered. **Nothing in this plan calls it**; the first caller is Plan 5's identity injection. See *What this task deliberately does not do* below before filing it as dead code.
+  - `hx.send.Redactor()` — no-arg, and it holds no per-request state. One instance per `Sender`.
+  - `public static final class Redactor.Injected` — no-arg. **The byte ranges this extension injected into ONE serialised request**, created per request and handed to `redactRequest` alongside the bytes they were measured from. The ranges are not kept on the `Redactor`, in any form, because every registry-on-the-instance shape — a plain field or a `ThreadLocal` — leaves a silent path to redacting against the wrong registry, and that path fails OPEN: register on the read loop, redact on a pooled worker (`limit.concurrency`, §6) and the worker's registry is empty, so `redactRequest` returns a verbatim copy **including the credential**, with no exception and no signal, and those are the bytes that get content-addressed. Passing the ranges makes the compiler carry the contract: a caller cannot redact without naming the ranges for those bytes, and a range set cannot precede or outlive the array it was measured from. `register` and the internal `snapshot` are `synchronized`, which costs nothing uncontended and removes any need to reason about safe publication when the object crosses a thread.
+  - `void Redactor.Injected.register(String identityId, int start, int end)` — records a half-open byte range `[start, end)` that the extension injected into the serialised request. Throws `RangeError` on a degenerate range or one overlapping a range already registered. **Nothing in this plan calls it**; the first caller is Plan 5's identity injection. See *What this task deliberately does not do* below before filing it as dead code.
   - `String unmanagedCredential(HxRequest req)` — the header name **as the harness wrote it** for the first of `Authorization`, `Cookie`, `Proxy-Authorization` present, in that fixed order; `null` when none is. The `Sender` turns a non-null answer into error class `unmanaged_credential`, refuses issuance, and persists nothing.
-  - `byte[] redactRequest(byte[] raw)` — a new array with every registered range replaced by `{{identity:<id>:authz}}`. `raw` is never modified. Throws `RangeError` if a registered range runs past the end of `raw`. **Nothing in this plan calls it either**: Task 6's `Sender` redacts the response only, and no request bytes pass through it until Plan 5 has a range to substitute.
+  - `byte[] redactRequest(byte[] raw, Redactor.Injected injected)` — a new array with every range in `injected` replaced by `{{identity:<id>:authz}}`. Neither argument is modified. Throws `RangeError` if a range runs past the end of `raw`, or if `injected` is null. **Nothing in this plan calls it either**: Task 6's `Sender` redacts the response only, and no request bytes pass through it until Plan 5 has a range to substitute.
   - `byte[] redactResponse(byte[] raw)` — a new array with every `Set-Cookie` **value** replaced by `{{observed:set-cookie}}`, cookie name and attributes kept. `raw` is never modified.
-  - `void clear()` — drops the registry. **Task 6 must call it from a `finally` in `Sender.issue`**, wrapping the whole decide-issue-redact body, so the registry cannot outlive the request on the deny paths or when something throws. In this plan that `finally` drops a registry that is always empty; it is written now so that Plan 5's first `register` call does not also have to remember to add it. Of `register`, `redactRequest` and `clear`, it is the only one with a caller in this plan — and that caller has nothing to drop.
+  - **There is no `clear()`, deliberately.** An earlier shape kept the ranges on the `Redactor` and asked Task 6's `Sender` to drop them from a `finally`. That is what a `finally` on the *wrong thread* clears: with the ranges thread-confined, the `finally` empties the read loop's registry while the worker's list survives into its next request and writes a placeholder over the middle of an unrelated body. Nothing outlives a request now, so there is nothing to clear and no `finally` for Plan 5 to remember.
   - `public static final class Redactor.RangeError extends RuntimeException` — **not in the Interface Contract**, which lists methods, not exception types. **Task 6 must catch `Redactor.RangeError` in `Sender.issue` and answer with error class `bad_frame`** — the class the corrected contract gives a `send` frame whose content cannot be read, and a range that will not fit the bytes in hand says exactly that about the request it describes. Not `transport_error`: nothing was issued. §4, an exception is never an implicit allow, so the catch denies and the denial is reported like any other. Nothing on the send path can make it throw in this plan, because nothing there registers a range — only `RedactorTest` does, on purpose. The catch is written for Plan 5, and Plan 5's first registered range is the wrong moment to find out the send path has no answer for a bad one.
 
-**What this task deliberately does not do.** Two of this class's five methods have no
-caller anywhere in this plan: nothing calls `register`, and nothing calls
+**What this task deliberately does not do.** Two of this class's four methods have no
+caller anywhere in this plan: nothing calls `Injected.register`, and nothing calls
 `redactRequest`. Plan 5's identity injection is the first thing that registers a byte
-range, and until it does the registry is always empty, `redactRequest` would return a
+range, and until it does every `Injected` is empty, `redactRequest` would return a
 verbatim copy of every request, and no `RangeError` can reach the send path — only
-`RedactorTest` provokes one, deliberately. `clear()` does get a caller — Task 6's
-`Sender` clears in a `finally` — and it has an empty registry to drop. Only
-`unmanagedCredential` and `redactResponse` do live work on the send path this plan
-builds.
+`RedactorTest` provokes one, deliberately. Only `unmanagedCredential` and
+`redactResponse` do live work on the send path this plan builds.
 
 That is the expected state rather than an oversight, and the test
 `anEmptyRegistryLeavesTheRequestVerbatim` pins it. The machinery ships now because §7
@@ -9379,8 +9378,8 @@ public class RedactorTest {
         t("overlappingRangesAreRefusedAndAbuttingOnesAreNot", RedactorTest::overlappingRangesAreRefusedAndAbuttingOnesAreNot);
         t("aRangePastTheEndIsRefusedNotTruncated", RedactorTest::aRangePastTheEndIsRefusedNotTruncated);
         t("degenerateRangesAreRefused", RedactorTest::degenerateRangesAreRefused);
-        t("clearDropsTheRegistry", RedactorTest::clearDropsTheRegistry);
-        t("rangesAreNotSharedAcrossThreads", RedactorTest::rangesAreNotSharedAcrossThreads);
+        t("oneRequestsRangesCannotReachTheNext", RedactorTest::oneRequestsRangesCannotReachTheNext);
+        t("theRangesTravelWithTheRequestNotTheThread", RedactorTest::theRangesTravelWithTheRequestNotTheThread);
 
         t("anUnmanagedAuthorizationIsNamed", RedactorTest::anUnmanagedAuthorizationIsNamed);
         t("credentialHeaderMatchingIsCaseInsensitive", RedactorTest::credentialHeaderMatchingIsCaseInsensitive);
@@ -9426,7 +9425,7 @@ public class RedactorTest {
         // this is the only path that runs, and it must be a no-op.
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        byte[] out = r.redactRequest(raw);
+        byte[] out = r.redactRequest(raw, new Redactor.Injected());
         check("an empty registry returns the same bytes", Arrays.equals(out, raw));
         check("an empty registry still returns a copy, not the wire array", out != raw);
     }
@@ -9434,8 +9433,9 @@ public class RedactorTest {
     static void aRegisteredRangeBecomesTheIdentityPlaceholder() {
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        String out = text(r.redactRequest(raw));
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        String out = text(r.redactRequest(raw, injected));
         check("the injected range is replaced by the identity placeholder",
               out.contains("Authorization: {{identity:ident-admin:authz}}\r\n"));
         check("the credential is gone from the copy that crosses the bridge",
@@ -9452,8 +9452,9 @@ public class RedactorTest {
         Redactor r = new Redactor();
         byte[] raw = authRequest();
         byte[] wire = raw.clone();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        r.redactRequest(raw);
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        r.redactRequest(raw, injected);
         check("redactRequest does not modify its argument", Arrays.equals(raw, wire));
     }
 
@@ -9466,11 +9467,12 @@ public class RedactorTest {
                          + "\r\nname=x");
         // Registered LAST-first on purpose: the registry sorts, the caller
         // does not have to.
+        Redactor.Injected injected = new Redactor.Injected();
         int aStart = find(raw, "Bearer " + TOKEN);
-        r.register("ident-admin", aStart, aStart + ("Bearer " + TOKEN).length());
+        injected.register("ident-admin", aStart, aStart + ("Bearer " + TOKEN).length());
         int cStart = find(raw, "JSESSIONID=9C4A1F0E27B84D5FA3");
-        r.register("ident-admin", cStart, cStart + "JSESSIONID=9C4A1F0E27B84D5FA3".length());
-        String out = text(r.redactRequest(raw));
+        injected.register("ident-admin", cStart, cStart + "JSESSIONID=9C4A1F0E27B84D5FA3".length());
+        String out = text(r.redactRequest(raw, injected));
         check("both ranges are replaced",
               out.contains("Cookie: {{identity:ident-admin:authz}}\r\n")
               && out.contains("Authorization: {{identity:ident-admin:authz}}\r\n"));
@@ -9481,14 +9483,14 @@ public class RedactorTest {
         // Overlap means the two ranges disagree about what those bytes are.
         // Truncating or double-substituting either one produces bytes that
         // were never sent, so the answer is a refusal.
-        Redactor r = new Redactor();
-        r.register("ident-admin", 10, 20);
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", 10, 20);
         expectThrows("a range overlapping an earlier one is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-admin", 15, 25));
+                     Redactor.RangeError.class, () -> injected.register("ident-admin", 15, 25));
         expectThrows("a range containing an earlier one is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-b", 5, 30));
+                     Redactor.RangeError.class, () -> injected.register("ident-b", 5, 30));
         // [10,20) and [20,30) are two adjacent injected headers, not an overlap.
-        r.register("ident-b", 20, 30);
+        injected.register("ident-b", 20, 30);
         check("abutting ranges are accepted", true);
     }
 
@@ -9498,44 +9500,69 @@ public class RedactorTest {
         // made.
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        r.register("ident-admin", raw.length - 4, raw.length + 40);
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", raw.length - 4, raw.length + 40);
         expectThrows("a range running past the end of the request is refused",
-                     Redactor.RangeError.class, () -> r.redactRequest(raw));
+                     Redactor.RangeError.class, () -> r.redactRequest(raw, injected));
     }
 
     static void degenerateRangesAreRefused() {
-        Redactor r = new Redactor();
+        Redactor.Injected injected = new Redactor.Injected();
         expectThrows("a negative start is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-admin", -1, 5));
+                     Redactor.RangeError.class, () -> injected.register("ident-admin", -1, 5));
         expectThrows("an empty range is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-admin", 7, 7));
+                     Redactor.RangeError.class, () -> injected.register("ident-admin", 7, 7));
         expectThrows("a reversed range is refused",
-                     Redactor.RangeError.class, () -> r.register("ident-admin", 9, 4));
+                     Redactor.RangeError.class, () -> injected.register("ident-admin", 9, 4));
         expectThrows("a range with no identity is refused",
-                     Redactor.RangeError.class, () -> r.register("", 0, 5));
+                     Redactor.RangeError.class, () -> injected.register("", 0, 5));
     }
 
-    static void clearDropsTheRegistry() {
-        // The Sender clears in a finally. One request's offsets applied to the
-        // next request's bytes would blank out a span of somebody else's body.
+    static void oneRequestsRangesCannotReachTheNext() {
+        // What clear() used to be for, now structural. One request's offsets
+        // applied to the next request's bytes do not merely leak, they blank
+        // out a span of somebody else's body -- so the ranges belong to the
+        // request, and the next request's Injected is a different object with
+        // nothing in it. There is no finally to forget and no registry to
+        // clear on the wrong thread.
         Redactor r = new Redactor();
-        byte[] raw = authRequest();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        r.clear();
-        check("after clear() the next request is verbatim",
-              Arrays.equals(r.redactRequest(raw), raw));
+        byte[] first = authRequest();
+        Redactor.Injected forFirst = new Redactor.Injected();
+        forFirst.register("ident-admin", tokenStart(first), tokenEnd(first));
+        r.redactRequest(first, forFirst);
+
+        // Deliberately LONGER than the first request's last offset: were the
+        // ranges to survive, this asks for silent corruption of an unrelated
+        // body rather than the RangeError a short fixture would provoke.
+        String body = "amount=100&to=acct-99&memo=ALONG-ENOUGH-MEMO-FIELD-THAT-SPANS-THE-WHOLE-RANGE";
+        byte[] next = bytes("POST /transfer HTTP/1.1\r\n"
+                          + "Host: app.example.test\r\n"
+                          + "Content-Length: " + body.length() + "\r\n"
+                          + "\r\n" + body);
+        check("the next request, redacted with its own Injected, is verbatim",
+              Arrays.equals(r.redactRequest(next, new Redactor.Injected()), next));
     }
 
-    static void rangesAreNotSharedAcrossThreads() throws Exception {
+    static void theRangesTravelWithTheRequestNotTheThread() throws Exception {
+        // The read loop registers what it injected and a pooled worker
+        // redacts -- the limit.concurrency shape §6 already has a config key
+        // for. With the registry held on the Redactor (a field or a
+        // ThreadLocal) the worker's is empty, so redactRequest hands back a
+        // verbatim copy WITH the credential in it: no exception, no signal,
+        // and those are the bytes that get content-addressed. The assertion
+        // this replaced said the other thread's copy equalled `raw` -- it
+        // passed if and only if the credential survived.
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        byte[][] other = new byte[1][];
-        Thread t = new Thread(() -> other[0] = r.redactRequest(raw));
-        t.start();
-        t.join();
-        check("a range registered on one thread does not rewrite another thread's request",
-              Arrays.equals(other[0], raw));
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        String[] fromWorker = new String[1];
+        Thread worker = new Thread(() -> fromWorker[0] = text(r.redactRequest(raw, injected)));
+        worker.start();
+        worker.join();
+        check("a range registered on the read loop is applied by the worker that redacts",
+              fromWorker[0].contains("Authorization: {{identity:ident-admin:authz}}\r\n")
+              && !fromWorker[0].contains(TOKEN));
     }
 
     // ---- fail closed on what we did not inject --------------------------
@@ -9746,8 +9773,9 @@ public class RedactorTest {
     static void redactionHappensBeforeHashing() throws Exception {
         Redactor r = new Redactor();
         byte[] raw = authRequest();
-        r.register("ident-admin", tokenStart(raw), tokenEnd(raw));
-        byte[] crossingTheBridge = r.redactRequest(raw);
+        Redactor.Injected injected = new Redactor.Injected();
+        injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
+        byte[] crossingTheBridge = r.redactRequest(raw, injected);
 
         // A content-addressed store, in three lines, standing in for
         // hx.store.blobs.BlobStore.put() -- same sha256 hex digest.
@@ -9846,11 +9874,13 @@ import java.util.Map;
  *  1. What WE injected. The extension knows the exact byte range it wrote, so
  *     it replaces that range with {@code {{identity:<id>:authz}}}. Byte ranges,
  *     not header names: the range is known exactly, and a name match is a
- *     guess. Nothing registers a range until identity injection ships; until
- *     then the registry is empty and every request passes through unchanged.
- *     It is built now anyway because §7 calls this the one item that cannot be
- *     retrofitted -- once raw credentials are content-addressed into the blob
- *     store they are in every backup taken since.
+ *     guess. The ranges are handed in as an {@link Injected} alongside the
+ *     bytes they were measured from -- see that class for why they are not
+ *     kept on the Redactor. Nothing registers a range until identity injection
+ *     ships; until then an empty {@code Injected} passes every request through
+ *     unchanged. It is built now anyway because §7 calls this the one item
+ *     that cannot be retrofitted -- once raw credentials are content-addressed
+ *     into the blob store they are in every backup taken since.
  *
  *  2. What we did NOT inject. {@link #unmanagedCredential} names an
  *     Authorization, Cookie or Proxy-Authorization header the harness supplied
@@ -9911,42 +9941,61 @@ public final class Redactor {
     private record Range(String identityId, int start, int end) { }
 
     /**
-     * Thread-confined, not shared. A range is a byte offset into ONE request;
-     * applied to another it does not merely leak, it substitutes a placeholder
-     * over whatever happens to sit at those offsets in the other request's
-     * body. Today the send path runs on the bridge's single read-loop thread,
-     * so a plain field would be correct -- but `limit.concurrency` is already
-     * in the configure body (§6), and the day it is honoured a shared registry
-     * corrupts evidence silently. clear() calls remove(), so a pooled thread
-     * carries nothing into its next task.
-     */
-    private final ThreadLocal<List<Range>> ranges = ThreadLocal.withInitial(ArrayList::new);
-
-    /**
-     * Record a half-open byte range [start, end) that this extension injected
-     * into the request bytes on behalf of {@code identityId}.
+     * The byte ranges this extension injected into ONE serialised request.
      *
-     * Overlaps are rejected here, where the caller that made the mistake is
-     * still on the stack. Abutting ranges -- [10,20) and [20,30) -- are two
-     * adjacent injected headers and are fine.
+     * The ranges live here, next to the bytes they were measured from, rather
+     * than on the Redactor -- and that is the whole of the design. A range is
+     * a byte offset into ONE request; applied to another it does not merely
+     * leak, it substitutes a placeholder over whatever happens to sit at those
+     * offsets in the other request's body. Making the caller pass this object
+     * to {@link Redactor#redactRequest} MAKES THE COMPILER CARRY THE CONTRACT:
+     * a caller physically cannot redact without naming the ranges for those
+     * bytes, and a range set cannot precede or outlive the array it was
+     * measured from. There is nothing to clear, because nothing survives the
+     * request.
+     *
+     * Every registry kept on the instance -- a plain field or a ThreadLocal --
+     * leaves a silent path to redacting against the WRONG registry, and it
+     * fails OPEN. With a ThreadLocal: register on the read loop, redact on a
+     * pooled worker (the `limit.concurrency` case §6 already has a config key
+     * for) and the worker's registry is empty, so redactRequest hands back a
+     * verbatim copy INCLUDING the credential, with no exception and no signal
+     * of any kind -- and that is what gets content-addressed. §7 calls this
+     * the one item that cannot be retrofitted, so the shape has to be the one
+     * that cannot desync rather than the one that usually does not.
+     *
+     * synchronized because this object legitimately crosses threads -- the
+     * read loop may build it and a worker redact with it. It costs nothing
+     * uncontended and it removes any need to reason about safe publication.
      */
-    public void register(String identityId, int start, int end) {
-        if (identityId == null || identityId.isEmpty())
-            throw new RangeError("a registered range must name an identity");
-        if (start < 0 || end <= start)
-            throw new RangeError("not a range: [" + start + "," + end + ")");
-        List<Range> mine = ranges.get();
-        for (Range r : mine)
-            if (start < r.end() && r.start() < end)
-                throw new RangeError("range [" + start + "," + end + ") overlaps ["
-                    + r.start() + "," + r.end() + ") registered for " + r.identityId());
-        mine.add(new Range(identityId, start, end));
-    }
+    public static final class Injected {
 
-    /** Drop every registered range. The Sender calls this in a finally, so one
-     *  request's offsets can never be applied to the next one's bytes. */
-    public void clear() {
-        ranges.remove();
+        private final List<Range> ranges = new ArrayList<>();
+
+        /**
+         * Record a half-open byte range [start, end) that this extension
+         * injected into the request bytes on behalf of {@code identityId}.
+         *
+         * Overlaps are rejected here, where the caller that made the mistake
+         * is still on the stack. Abutting ranges -- [10,20) and [20,30) -- are
+         * two adjacent injected headers and are fine.
+         */
+        public synchronized void register(String identityId, int start, int end) {
+            if (identityId == null || identityId.isEmpty())
+                throw new RangeError("a registered range must name an identity");
+            if (start < 0 || end <= start)
+                throw new RangeError("not a range: [" + start + "," + end + ")");
+            for (Range r : ranges)
+                if (start < r.end() && r.start() < end)
+                    throw new RangeError("range [" + start + "," + end + ") overlaps ["
+                        + r.start() + "," + r.end() + ") registered for " + r.identityId());
+            ranges.add(new Range(identityId, start, end));
+        }
+
+        /** A copy, so redactRequest sorts and walks a list nothing else holds. */
+        private synchronized List<Range> snapshot() {
+            return new ArrayList<>(ranges);
+        }
     }
 
     /**
@@ -9976,11 +10025,17 @@ public final class Redactor {
     }
 
     /**
-     * The request bytes with every registered range replaced by that
-     * identity's placeholder. The argument is not modified.
+     * The request bytes with every range in {@code injected} replaced by that
+     * identity's placeholder. Neither argument is modified.
+     *
+     * {@code injected} must be the ranges measured from THESE bytes. It is a
+     * parameter rather than state on this object so that there is no other
+     * kind of call to make: no registry to desync, none to forget to clear.
      */
-    public byte[] redactRequest(byte[] raw) {
-        List<Range> mine = new ArrayList<>(ranges.get());
+    public byte[] redactRequest(byte[] raw, Injected injected) {
+        if (injected == null)
+            throw new RangeError("redactRequest needs the ranges injected into these bytes");
+        List<Range> mine = injected.snapshot();
         // A copy even when there is nothing to do: the returned array must
         // never alias the array that goes on the wire, or a later in-place
         // fix-up to one silently edits the other.
@@ -10160,9 +10215,17 @@ ALL PASS
 
 Seven guards on the previous branch passed with the thing they guarded deleted, so a
 green suite is evidence about the suite until each guard has been watched to fail. Each
-row below is a single edit to `extension/src/hx/send/Redactor.java`. For each one: make
-the edit, run `cd extension && ./test.sh`, confirm **exactly** the named checks print
-`FAIL`, then `git checkout -- extension/src/hx/send/Redactor.java` before the next row.
+row below is a single edit to `extension/src/hx/send/Redactor.java`. For each one:
+copy the file to a snapshot **immediately before** that row's edit, make the edit, run
+`cd extension && ./test.sh`, confirm **exactly** the named checks print `FAIL`, then
+restore from the snapshot and check the sha256 matches. Never `git checkout --`: it
+restores to HEAD, not to pre-edit, so it also discards any legitimate uncommitted edit
+sitting in the same file — which has happened on this branch.
+
+Judge every row by the **summary line**, not by `grep -c FAIL`. A throw before the
+first check prints no FAIL lines at all, and `grep -c FAIL` reads that as zero
+failures. `ALL PASS` is printed only after every method returns with `failures == 0`,
+so it is the one thing truncation cannot manufacture.
 
 Every sabotage here compiles. A compile error would turn the whole run red and prove
 nothing about which check was watching.
@@ -10177,7 +10240,7 @@ nothing about which check was watching.
 | F | `unmanagedCredential`: swap the two `for` lines so the header map is the outer loop | Authorization wins whichever way the map iterates |
 | G | `register`: delete the overlap loop and its `throw` | a range overlapping an earlier one is refused · a range containing an earlier one is refused |
 | H | `redactRequest`: replace the out-of-bounds `throw` with clamping `end` to `raw.length` | a range running past the end of the request is refused |
-| I | `clear`: delete `ranges.remove();` | after clear() the next request is verbatim |
+| I | `Injected`: hold the ranges in a `private static final List<Range> SHARED` so every request's `Injected` sees the same list | the next request, redacted with its own Injected, is verbatim |
 | J | `redactResponse`: insert `if (true) return raw.clone();` as its first line | the cookie value is replaced · the live session cookie is gone · the second Set-Cookie is redacted too · no cookie value survives anywhere in the head · a lower-case set-cookie is redacted · an upper-case SET-COOKIE is redacted · a malformed cookie pair is redacted whole · its bytes do not survive · a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
 | K | `redactResponse`: match the field name with `new String(raw, i, colon - i, US_ASCII).equals("Set-Cookie")` | a lower-case set-cookie is redacted · an upper-case SET-COOKIE is redacted |
 | L | `redactResponse`: after the first redacted line, write the remainder and return | the second Set-Cookie is redacted too · no cookie value survives anywhere in the head · an upper-case SET-COOKIE is redacted · a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
@@ -10186,7 +10249,15 @@ nothing about which check was watching.
 | O | `redactResponse`: in the `eq < 0` branch, write `raw, v, pairEnd - v` instead of the placeholder | a malformed cookie pair is redacted whole · its bytes do not survive |
 | P | `redactResponse`: `if (inSetCookie) {` in the fold branch → `if (false) {` | a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
 | Q | `redactResponse`: last write of the loop → `out.write(raw, content, next - content);` | the cookie value is replaced · attributes survive, so cookie-flag checks still read · the second Set-Cookie is redacted too · a lower-case set-cookie is redacted · a deletion cookie is left alone · a malformed cookie pair is redacted whole |
-| R | the registry: replace the `ThreadLocal` with a plain `List<Range>` field (and `sharedRanges.clear()` in `clear()`) | a range registered on one thread does not rewrite another thread's request |
+| R | `Injected`: make its list a `ThreadLocal<List<Range>>` — the shape this task replaced, still reachable from inside the per-request object | a range registered on the read loop is applied by the worker that redacts |
+
+Rows I and R are the two the review of the first implementation turned up, and they are
+the reason the ranges are a parameter rather than state. Under the shape they attack,
+`redactRequest` answers with a verbatim copy of a request that still carries its
+credential — no exception, no `RangeError`, no signal of any kind — and that is what
+gets content-addressed. Neither row can be caught by `unmanagedCredential`, which runs
+on the `HxRequest` *before* injection and so by construction never sees the header the
+extension is about to add.
 
 Rows A and C are the two that matter most and they are the two to run first. A is the
 redaction itself: with it broken, the bytes a caller hands the blob store are the raw
@@ -11770,7 +11841,8 @@ did not cause.
   - `hx.policy.Policy(Gate gate)` — `Decision decide(HxRequest req, BridgeClient.Authorisation auth)`
   - `hx.policy.Limiter(Clock clock, long ratePerSecond, long maxRequests) implements Gate` — `check(HxRequest)`, `issued()`
   - `hx.policy.Distress(Clock clock, double max5xxRate, double latencyMultiple, int maxConsecutiveErrors)` — `record(String,int,long,boolean)`, `stopReason()`, `stopHost()`, `window()`
-  - `hx.send.Redactor` — `unmanagedCredential(HxRequest)`, `redactResponse(byte[])`, `register`, `redactRequest`, `clear`, and `Redactor.RangeError`
+  - `hx.send.Redactor` — `unmanagedCredential(HxRequest)`, `redactResponse(byte[])`, `redactRequest(byte[], Redactor.Injected)`, `Redactor.Injected` with its `register`, and `Redactor.RangeError`. **There is no `clear()` and this task must not add a `finally` that pretends there is.** The injected ranges belong to the request they were measured from and are passed to `redactRequest` with it, so nothing survives a call — a registry on the `Redactor` is what a `finally` on the wrong thread fails to clear. `Sender` still catches `Redactor.RangeError` (below): Plan 5's injection lands on `issue`, and a bad range is a denial, never an implicit allow.
+  - `Sender.parse` refuses a header name with whitespace around it (`if (!name.equals(name.strip())) throw`), and that refusal is **load-bearing and must not be relaxed**: `unmanagedCredential` is a fail-closed gate answered by name, and a name it cannot match reads as "no credential", which means issue and persist. `Redactor` no longer depends on it — its matcher trims — but the two are independent guards on the same hole and this task keeps its own.
   - `hx.send.HaltSwitch(Clock clock, Path sentinel, long pollIntervalMs)` — `start()`, `stop()`, `halted()`, `reason()`, `haltedByFrame(String)`, `resumedByFrame()`, and `HaltSwitch.DEFAULT_POLL_MS` (500 ms), which is the interval this task passes rather than inventing one
   - `hx.bridge.BridgeClient.Authorisation(long epoch, Map<String,List<String>> scope)`, `BridgeClient.authorisation()`, `BridgeClient.PROTOCOL_VERSION`
   - `hx.bridge.BridgeClient.HaltSink` and `BridgeClient.setHaltSink(HaltSink)` (Task 5) — this task installs the sink, which is the only thing that connects a `halt` frame to the switch `Sender` asks
@@ -11866,6 +11938,21 @@ package hx.send;
  *
  * `raw` is the response exactly as it came off the wire, before redaction.
  * Sender redacts it; nothing else may hold onto it.
+ *
+ * OPEN QUESTION THIS TASK MUST ANSWER BY MEASURING, not by assuming: whether
+ * `raw` can carry an INTERIM response -- a `100 Continue` or a `103 Early
+ * Hints` -- ahead of the final status line. Redactor.redactResponse scans ONE
+ * head and stops at the first blank line, so an interim response in front of
+ * the real one ends the head before any Set-Cookie has been seen, and the
+ * entire real response is copied through as "body" with every Set-Cookie raw
+ * -- a live production session cookie content-addressed verbatim, into every
+ * backup since. Task 4 closed the sibling case (a stray empty line before the
+ * status line no longer ends the head) and left this one here because the
+ * answer depends on what Montoya's `rr.response().toByteArray()` returns, not
+ * on anything Redactor can see. Measure a 103-then-200 exchange. If the
+ * interim head can be present, redactResponse must skip interim heads and
+ * that fix belongs in this task, with its evidence; if it cannot, record the
+ * measurement and the question is closed.
  */
 public record HttpReply(int status, byte[] raw, long ms, boolean connectionError) { }
 ```
@@ -11926,7 +12013,6 @@ public class SenderTest {
             aDeadlineThatExpiresMidFlightIsReportedAsTimeout(sentinel);
             aTransportFailureFeedsDistressAndHaltsTheNextSend(sentinel);
             distressPushesOneUnsolicitedHaltedFrame(sentinel);
-            oneRequestsInjectedRangesNeverSurviveIntoTheNext(sentinel);
             theResultIsStampedWithTheEpochThatAuthorisedIt(sentinel);
             theResponseBodyRidesUnderAKeyJsonRefusesToWrite(sentinel);
             theWireMappingRoundTripsWhatItParsed();
@@ -12323,28 +12409,6 @@ public class SenderTest {
                        authorised());
         check("a second refused send announces nothing further ("
               + r.notifier.frames.size() + ")", r.notifier.frames.size() == 1);
-    }
-
-    /**
-     * s7: the registry holds BYTE OFFSETS into one request. Applied to another
-     * request they do not merely leak, they write a placeholder over whatever
-     * happens to sit at those offsets -- so Sender clears the registry in a
-     * finally, on every path out of issue().
-     *
-     * Nothing registers a range until identity injection ships in Plan 5, so
-     * this test registers one by hand. That is the point: the clear() has to
-     * be in place BEFORE anything depends on it, because the failure it
-     * prevents is silently corrupted evidence rather than an exception.
-     */
-    static void oneRequestsInjectedRangesNeverSurviveIntoTheNext(Path sentinel) {
-        Rig r = new Rig(sentinel);
-        r.redactor.register("ident-admin", 0, 4);
-        r.sender.issue(sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"),
-                       authorised());
-        byte[] next = "0123456789".getBytes(StandardCharsets.ISO_8859_1);
-        check("the registry is empty once issue() has returned",
-              "0123456789".equals(new String(r.redactor.redactRequest(next),
-                                             StandardCharsets.ISO_8859_1)));
     }
 
     /**
@@ -12755,14 +12819,18 @@ public final class Sender {
      * the framer removes and passes to Frame.encode as the body -- a flat JSON
      * header cannot carry them.
      *
-     * The registry is cleared on EVERY path out, including the refusals: a
-     * registered range is a byte offset into one request, and applied to the
-     * next one it does not leak so much as write a placeholder over whatever
-     * happens to sit at those offsets. A RangeError is a denial, never an
-     * allow (s4): nothing registers a range until identity injection ships in
-     * Plan 5, so it cannot be raised today -- but injection lands ON THIS
-     * METHOD, between the credential refusal and the issue, and the two
-     * failure modes it brings are exactly the two handled here.
+     * There is nothing to clear. The ranges this extension injects are a
+     * Redactor.Injected built per request and handed to redactRequest with
+     * the bytes they were measured from, so they cannot outlive the call --
+     * which is the point: a registry kept on the Redactor is one a finally
+     * here would clear on whichever thread happened to run issue(), while a
+     * worker's copy leaked into its next request.
+     *
+     * A RangeError is a denial, never an allow (s4): nothing registers a
+     * range until identity injection ships in Plan 5, so it cannot be raised
+     * today -- but injection lands ON THIS METHOD, between the credential
+     * refusal and the issue, and a range that will not fit the bytes in hand
+     * says the frame describes a request other than this one.
      */
     public Map<String, Object> issue(Map<String, Object> header, byte[] body,
                                      BridgeClient.Authorisation auth) {
@@ -12771,8 +12839,6 @@ public final class Sender {
         } catch (Redactor.RangeError e) {
             return error(header.get("id"), "bad_frame",
                          "redaction range does not fit these bytes: " + e.getMessage());
-        } finally {
-            redactor.clear();
         }
     }
 

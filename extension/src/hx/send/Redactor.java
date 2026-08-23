@@ -19,11 +19,13 @@ import java.util.Map;
  *  1. What WE injected. The extension knows the exact byte range it wrote, so
  *     it replaces that range with {@code {{identity:<id>:authz}}}. Byte ranges,
  *     not header names: the range is known exactly, and a name match is a
- *     guess. Nothing registers a range until identity injection ships; until
- *     then the registry is empty and every request passes through unchanged.
- *     It is built now anyway because §7 calls this the one item that cannot be
- *     retrofitted -- once raw credentials are content-addressed into the blob
- *     store they are in every backup taken since.
+ *     guess. The ranges are handed in as an {@link Injected} alongside the
+ *     bytes they were measured from -- see that class for why they are not
+ *     kept on the Redactor. Nothing registers a range until identity injection
+ *     ships; until then an empty {@code Injected} passes every request through
+ *     unchanged. It is built now anyway because §7 calls this the one item
+ *     that cannot be retrofitted -- once raw credentials are content-addressed
+ *     into the blob store they are in every backup taken since.
  *
  *  2. What we did NOT inject. {@link #unmanagedCredential} names an
  *     Authorization, Cookie or Proxy-Authorization header the harness supplied
@@ -84,42 +86,61 @@ public final class Redactor {
     private record Range(String identityId, int start, int end) { }
 
     /**
-     * Thread-confined, not shared. A range is a byte offset into ONE request;
-     * applied to another it does not merely leak, it substitutes a placeholder
-     * over whatever happens to sit at those offsets in the other request's
-     * body. Today the send path runs on the bridge's single read-loop thread,
-     * so a plain field would be correct -- but `limit.concurrency` is already
-     * in the configure body (§6), and the day it is honoured a shared registry
-     * corrupts evidence silently. clear() calls remove(), so a pooled thread
-     * carries nothing into its next task.
-     */
-    private final ThreadLocal<List<Range>> ranges = ThreadLocal.withInitial(ArrayList::new);
-
-    /**
-     * Record a half-open byte range [start, end) that this extension injected
-     * into the request bytes on behalf of {@code identityId}.
+     * The byte ranges this extension injected into ONE serialised request.
      *
-     * Overlaps are rejected here, where the caller that made the mistake is
-     * still on the stack. Abutting ranges -- [10,20) and [20,30) -- are two
-     * adjacent injected headers and are fine.
+     * The ranges live here, next to the bytes they were measured from, rather
+     * than on the Redactor -- and that is the whole of the design. A range is
+     * a byte offset into ONE request; applied to another it does not merely
+     * leak, it substitutes a placeholder over whatever happens to sit at those
+     * offsets in the other request's body. Making the caller pass this object
+     * to {@link Redactor#redactRequest} MAKES THE COMPILER CARRY THE CONTRACT:
+     * a caller physically cannot redact without naming the ranges for those
+     * bytes, and a range set cannot precede or outlive the array it was
+     * measured from. There is nothing to clear, because nothing survives the
+     * request.
+     *
+     * Every registry kept on the instance -- a plain field or a ThreadLocal --
+     * leaves a silent path to redacting against the WRONG registry, and it
+     * fails OPEN. With a ThreadLocal: register on the read loop, redact on a
+     * pooled worker (the `limit.concurrency` case §6 already has a config key
+     * for) and the worker's registry is empty, so redactRequest hands back a
+     * verbatim copy INCLUDING the credential, with no exception and no signal
+     * of any kind -- and that is what gets content-addressed. §7 calls this
+     * the one item that cannot be retrofitted, so the shape has to be the one
+     * that cannot desync rather than the one that usually does not.
+     *
+     * synchronized because this object legitimately crosses threads -- the
+     * read loop may build it and a worker redact with it. It costs nothing
+     * uncontended and it removes any need to reason about safe publication.
      */
-    public void register(String identityId, int start, int end) {
-        if (identityId == null || identityId.isEmpty())
-            throw new RangeError("a registered range must name an identity");
-        if (start < 0 || end <= start)
-            throw new RangeError("not a range: [" + start + "," + end + ")");
-        List<Range> mine = ranges.get();
-        for (Range r : mine)
-            if (start < r.end() && r.start() < end)
-                throw new RangeError("range [" + start + "," + end + ") overlaps ["
-                    + r.start() + "," + r.end() + ") registered for " + r.identityId());
-        mine.add(new Range(identityId, start, end));
-    }
+    public static final class Injected {
 
-    /** Drop every registered range. The Sender calls this in a finally, so one
-     *  request's offsets can never be applied to the next one's bytes. */
-    public void clear() {
-        ranges.remove();
+        private final List<Range> ranges = new ArrayList<>();
+
+        /**
+         * Record a half-open byte range [start, end) that this extension
+         * injected into the request bytes on behalf of {@code identityId}.
+         *
+         * Overlaps are rejected here, where the caller that made the mistake
+         * is still on the stack. Abutting ranges -- [10,20) and [20,30) -- are
+         * two adjacent injected headers and are fine.
+         */
+        public synchronized void register(String identityId, int start, int end) {
+            if (identityId == null || identityId.isEmpty())
+                throw new RangeError("a registered range must name an identity");
+            if (start < 0 || end <= start)
+                throw new RangeError("not a range: [" + start + "," + end + ")");
+            for (Range r : ranges)
+                if (start < r.end() && r.start() < end)
+                    throw new RangeError("range [" + start + "," + end + ") overlaps ["
+                        + r.start() + "," + r.end() + ") registered for " + r.identityId());
+            ranges.add(new Range(identityId, start, end));
+        }
+
+        /** A copy, so redactRequest sorts and walks a list nothing else holds. */
+        private synchronized List<Range> snapshot() {
+            return new ArrayList<>(ranges);
+        }
     }
 
     /**
@@ -149,11 +170,17 @@ public final class Redactor {
     }
 
     /**
-     * The request bytes with every registered range replaced by that
-     * identity's placeholder. The argument is not modified.
+     * The request bytes with every range in {@code injected} replaced by that
+     * identity's placeholder. Neither argument is modified.
+     *
+     * {@code injected} must be the ranges measured from THESE bytes. It is a
+     * parameter rather than state on this object so that there is no other
+     * kind of call to make: no registry to desync, none to forget to clear.
      */
-    public byte[] redactRequest(byte[] raw) {
-        List<Range> mine = new ArrayList<>(ranges.get());
+    public byte[] redactRequest(byte[] raw, Injected injected) {
+        if (injected == null)
+            throw new RangeError("redactRequest needs the ranges injected into these bytes");
+        List<Range> mine = injected.snapshot();
         // A copy even when there is nothing to do: the returned array must
         // never alias the array that goes on the wire, or a later in-place
         // fix-up to one silently edits the other.
