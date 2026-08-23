@@ -6854,6 +6854,9 @@ git commit -m "feat(policy): the decision core, five rules in one pinned order"
 - Create: `extension/src/hx/policy/Limiter.java`
 - Create: `extension/test/hx/policy/LimiterTest.java`
 - Create: `extension/test/hx/policy/TickClock.java`
+- Create: `extension/test/hx/TestSupport.java` — added in this task's fix round
+  (deterministic lock-guard test); also imported by Plan 2's `BridgeClientTest`
+  (`docs/superpowers/plans/2026-08-21-bridge-transport.md`)
 - Modify: `extension/test.sh` — one line, to run the new class
 - Test: `extension/test/hx/policy/LimiterTest.java`
 
@@ -6914,6 +6917,63 @@ public final class TickClock implements Clock {
     public void set(long us) { this.us = us; }
 
     public void advance(long deltaUs) { this.us += deltaUs; }
+}
+```
+
+This task's fix round also adds `extension/test/hx/TestSupport.java`, shared test
+infrastructure for the deterministic lock-exclusivity guard: the technique of
+taking a `synchronized` object's own monitor from the driving thread, starting
+a helper that contends it, and requiring the helper to be observed `BLOCKED`
+on that *identical* monitor (by lock identity, not bare `Thread.State`) before
+the driving thread lets go. `LimiterTest` uses it below
+(`checkIsExclusiveWithItselfDeterministically`), and so does Plan 2's
+`BridgeClientTest` (`docs/superpowers/plans/2026-08-21-bridge-transport.md`,
+`theCommitIsExclusiveWithClose`) — both import
+`hx.TestSupport.waitUntilBlockedOn` rather than rolling their own copy.
+
+```java
+// extension/test/hx/TestSupport.java
+package hx;
+
+import java.lang.management.LockInfo;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
+
+/**
+ * Shared across the hand-rolled test runners in hx.bridge and hx.policy.
+ * Lives under test/, not src/, so extension/build.sh never compiles it into
+ * the shipped jar.
+ */
+public final class TestSupport {
+
+    private TestSupport() {}
+
+    /**
+     * True once `t` is BLOCKED on `monitor` specifically -- the deterministic
+     * way to prove a thread is parked on a particular lock, as opposed to
+     * merely "blocked on something."
+     *
+     * Thread.State.BLOCKED alone is not enough: a thread stuck on a class-
+     * initialisation monitor, or any other unrelated lock, is also BLOCKED.
+     * Comparing the held lock's identity hash against `monitor`'s is what
+     * makes the wait honest -- and it is why this takes the monitor object
+     * itself rather than a description of it.
+     */
+    public static boolean waitUntilBlockedOn(Thread t, Object monitor) throws Exception {
+        ThreadMXBean mx = ManagementFactory.getThreadMXBean();
+        int want = System.identityHashCode(monitor);
+        long end = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < end) {
+            ThreadInfo info = mx.getThreadInfo(t.threadId());
+            if (info != null && t.getState() == Thread.State.BLOCKED) {
+                LockInfo li = info.getLockInfo();
+                if (li != null && li.getIdentityHashCode() == want) return true;
+            }
+            Thread.sleep(1);
+        }
+        return false;
+    }
 }
 ```
 
@@ -6992,8 +7052,10 @@ public class LimiterTest {
         theLimitIsWholeRunNotPerHost();
         aBackwardsClockCanOnlyOverRestrict();
         theWindowArithmeticDoesNotOverflowNearLongMaxValue();
+        aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow();
         concurrentCallersCannotExceedEitherLimit();
         checkIsExclusiveWithItselfDeterministically();
+        waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState();
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -7265,6 +7327,39 @@ public class LimiterTest {
     }
 
     /**
+     * A narrowing mutation -- `long elapsed = now - oldest;` rewritten as
+     * `long elapsed = (int) (now - oldest);` -- passes every check above
+     * unnoticed: they either stay inside the one-second window (elapsed a few
+     * hundred thousand microseconds, comfortably inside int) or jump straight
+     * to Long.MAX_VALUE-scale gaps (elapsed wraps whether it is a long or an
+     * int, so the outcome looks the same either way). Nothing above exercises
+     * the realistic middle: a slow-paced, budget-conserving engagement sitting
+     * at the rate limit with sparse traffic, where the gap between requests is
+     * minutes to hours. `int` overflows at 2^31 microseconds, ~35.79 minutes,
+     * so a 40-minute idle gap -- entirely ordinary for this tool, not a
+     * contrived edge case -- lands past it: `(int) 2_400_000_000L` wraps
+     * negative, which reads as "still inside the one-second window" and
+     * wrongly REFUSES a request the real long arithmetic must ALLOW.
+     */
+    static void aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 1, 1000);
+
+        check("the sole issuance, at T0", l.check(ACCOUNT).allowed());
+
+        // 40 minutes: past the ~35.79-minute point where now - oldest exceeds
+        // Integer.MAX_VALUE microseconds, and an entirely ordinary gap for an
+        // engagement idling at the rate limit rather than a machine spamming it.
+        clock.advance(2_400_000_000L);
+        Decision d = l.check(ACCOUNT);
+        check("40 minutes later the sole issuance is long outside the "
+              + "one-second window, so the request is allowed -- not "
+              + "misread as still inside it by an elapsed value narrowed to int",
+              d.allowed());
+        check("...and it was actually issued", l.issued() == 2L);
+    }
+
+    /**
      * Deterministic despite being concurrent: the clock does not move, so the
      * window never rolls and the answer is exactly `rate`, whatever order the
      * threads run in. An unsynchronised check() reads `issued`, decides, and
@@ -7340,6 +7435,38 @@ public class LimiterTest {
         helper.join(5000);
         check("...and proceeds once the monitor is released", !helper.isAlive());
         check("...and its issuance was actually counted", limiter.issued() == 1L);
+    }
+
+    /**
+     * The identity comparison inside `TestSupport.waitUntilBlockedOn` is what
+     * makes checkIsExclusiveWithItselfDeterministically() above trustworthy.
+     * Strip it back to bare `Thread.State.BLOCKED` and a helper parked on ANY
+     * monitor -- a class-init lock, or here, an object with nothing to do
+     * with `limiter` -- would satisfy a wait for `limiter`'s monitor, for the
+     * wrong reason. Pinned directly: a helper that is genuinely and
+     * deterministically BLOCKED, just on the wrong lock, must not satisfy
+     * waitUntilBlockedOn for a different one.
+     */
+    static void waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState() throws Exception {
+        TickClock clock = new TickClock(T0);
+        Limiter limiter = new Limiter(clock, 5, 1000);
+        Object unrelated = new Object();
+
+        Thread helper;
+        synchronized (unrelated) {
+            helper = new Thread(() -> {
+                synchronized (unrelated) { }
+            });
+            helper.setDaemon(true);
+            helper.start();
+            check("a helper BLOCKED on an unrelated monitor does not satisfy "
+                  + "waitUntilBlockedOn for limiter's monitor, which it was "
+                  + "never asked to wait on",
+                  !waitUntilBlockedOn(helper, limiter));
+        }
+        helper.join(5000);
+        check("...and the helper proceeds once its real monitor is released",
+              !helper.isAlive());
     }
 
     /** A real request against a loopback-only test target. The limiter reads
@@ -7546,11 +7673,18 @@ public final class Limiter implements Gate {
             // to a clock reading near Long.MAX_VALUE overflows and wraps
             // negative, which would make an issuance that is still inside the
             // window look like it left long ago -- and ALLOW a request that
-            // should be refused. Subtracting two nearby clock readings first
-            // cannot overflow that way. Strictly less-than is what makes
-            // retryAfterUs positive whenever this branch is taken: if the
-            // elapsed time equalled WINDOW_US exactly, the issuance would
-            // already be outside the window and we would not be here.
+            // should be refused. Subtracting two nearby clock readings CAN
+            // still overflow -- oldest = Long.MIN_VALUE, now = Long.MAX_VALUE
+            // wraps to -1 -- but only in the FAIL-CLOSED direction: a wrapped
+            // `elapsed` is always deeply negative, so it always reads as
+            // still inside the window and DENIES. It can never produce a
+            // false ALLOW, because any pair whose true difference is under
+            // WINDOW_US must already be within that same 1,000,000 of each
+            // other, nowhere near the ~9.22e18 magnitude a wrap requires.
+            // Strictly less-than is what makes retryAfterUs positive whenever
+            // this branch is taken: if the elapsed time equalled WINDOW_US
+            // exactly, the issuance would already be outside the window and
+            // we would not be here.
             long elapsed = now - oldest;
             if (elapsed < WINDOW_US) {
                 return Decision.rateLimited(WINDOW_US - elapsed,

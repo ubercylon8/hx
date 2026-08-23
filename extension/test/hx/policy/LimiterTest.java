@@ -55,8 +55,10 @@ public class LimiterTest {
         theLimitIsWholeRunNotPerHost();
         aBackwardsClockCanOnlyOverRestrict();
         theWindowArithmeticDoesNotOverflowNearLongMaxValue();
+        aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow();
         concurrentCallersCannotExceedEitherLimit();
         checkIsExclusiveWithItselfDeterministically();
+        waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState();
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -328,6 +330,39 @@ public class LimiterTest {
     }
 
     /**
+     * A narrowing mutation -- `long elapsed = now - oldest;` rewritten as
+     * `long elapsed = (int) (now - oldest);` -- passes every check above
+     * unnoticed: they either stay inside the one-second window (elapsed a few
+     * hundred thousand microseconds, comfortably inside int) or jump straight
+     * to Long.MAX_VALUE-scale gaps (elapsed wraps whether it is a long or an
+     * int, so the outcome looks the same either way). Nothing above exercises
+     * the realistic middle: a slow-paced, budget-conserving engagement sitting
+     * at the rate limit with sparse traffic, where the gap between requests is
+     * minutes to hours. `int` overflows at 2^31 microseconds, ~35.79 minutes,
+     * so a 40-minute idle gap -- entirely ordinary for this tool, not a
+     * contrived edge case -- lands past it: `(int) 2_400_000_000L` wraps
+     * negative, which reads as "still inside the one-second window" and
+     * wrongly REFUSES a request the real long arithmetic must ALLOW.
+     */
+    static void aRealisticIdleGapPastTheIntRangeIsNotMisreadAsStillInsideTheWindow() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 1, 1000);
+
+        check("the sole issuance, at T0", l.check(ACCOUNT).allowed());
+
+        // 40 minutes: past the ~35.79-minute point where now - oldest exceeds
+        // Integer.MAX_VALUE microseconds, and an entirely ordinary gap for an
+        // engagement idling at the rate limit rather than a machine spamming it.
+        clock.advance(2_400_000_000L);
+        Decision d = l.check(ACCOUNT);
+        check("40 minutes later the sole issuance is long outside the "
+              + "one-second window, so the request is allowed -- not "
+              + "misread as still inside it by an elapsed value narrowed to int",
+              d.allowed());
+        check("...and it was actually issued", l.issued() == 2L);
+    }
+
+    /**
      * Deterministic despite being concurrent: the clock does not move, so the
      * window never rolls and the answer is exactly `rate`, whatever order the
      * threads run in. An unsynchronised check() reads `issued`, decides, and
@@ -403,6 +438,38 @@ public class LimiterTest {
         helper.join(5000);
         check("...and proceeds once the monitor is released", !helper.isAlive());
         check("...and its issuance was actually counted", limiter.issued() == 1L);
+    }
+
+    /**
+     * The identity comparison inside `TestSupport.waitUntilBlockedOn` is what
+     * makes checkIsExclusiveWithItselfDeterministically() above trustworthy.
+     * Strip it back to bare `Thread.State.BLOCKED` and a helper parked on ANY
+     * monitor -- a class-init lock, or here, an object with nothing to do
+     * with `limiter` -- would satisfy a wait for `limiter`'s monitor, for the
+     * wrong reason. Pinned directly: a helper that is genuinely and
+     * deterministically BLOCKED, just on the wrong lock, must not satisfy
+     * waitUntilBlockedOn for a different one.
+     */
+    static void waitUntilBlockedOnRequiresTheSameMonitorNotJustBlockedState() throws Exception {
+        TickClock clock = new TickClock(T0);
+        Limiter limiter = new Limiter(clock, 5, 1000);
+        Object unrelated = new Object();
+
+        Thread helper;
+        synchronized (unrelated) {
+            helper = new Thread(() -> {
+                synchronized (unrelated) { }
+            });
+            helper.setDaemon(true);
+            helper.start();
+            check("a helper BLOCKED on an unrelated monitor does not satisfy "
+                  + "waitUntilBlockedOn for limiter's monitor, which it was "
+                  + "never asked to wait on",
+                  !waitUntilBlockedOn(helper, limiter));
+        }
+        helper.join(5000);
+        check("...and the helper proceeds once its real monitor is released",
+              !helper.isAlive());
     }
 
     /** A real request against a loopback-only test target. The limiter reads

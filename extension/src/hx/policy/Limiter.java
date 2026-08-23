@@ -105,11 +105,18 @@ public final class Limiter implements Gate {
             // to a clock reading near Long.MAX_VALUE overflows and wraps
             // negative, which would make an issuance that is still inside the
             // window look like it left long ago -- and ALLOW a request that
-            // should be refused. Subtracting two nearby clock readings first
-            // cannot overflow that way. Strictly less-than is what makes
-            // retryAfterUs positive whenever this branch is taken: if the
-            // elapsed time equalled WINDOW_US exactly, the issuance would
-            // already be outside the window and we would not be here.
+            // should be refused. Subtracting two nearby clock readings CAN
+            // still overflow -- oldest = Long.MIN_VALUE, now = Long.MAX_VALUE
+            // wraps to -1 -- but only in the FAIL-CLOSED direction: a wrapped
+            // `elapsed` is always deeply negative, so it always reads as
+            // still inside the window and DENIES. It can never produce a
+            // false ALLOW, because any pair whose true difference is under
+            // WINDOW_US must already be within that same 1,000,000 of each
+            // other, nowhere near the ~9.22e18 magnitude a wrap requires.
+            // Strictly less-than is what makes retryAfterUs positive whenever
+            // this branch is taken: if the elapsed time equalled WINDOW_US
+            // exactly, the issuance would already be outside the window and
+            // we would not be here.
             long elapsed = now - oldest;
             if (elapsed < WINDOW_US) {
                 return Decision.rateLimited(WINDOW_US - elapsed,
