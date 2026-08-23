@@ -51,6 +51,7 @@ public class RedactorTest {
         t("credentialDetectionSurvivesATurkishLocale", RedactorTest::credentialDetectionSurvivesATurkishLocale);
         t("theNamedHeaderDoesNotDependOnMapOrder", RedactorTest::theNamedHeaderDoesNotDependOnMapOrder);
         t("aWholeNameMustMatchNotAPrefix", RedactorTest::aWholeNameMustMatchNotAPrefix);
+        t("aCredentialNameIsMatchedThroughSurroundingWhitespace", RedactorTest::aCredentialNameIsMatchedThroughSurroundingWhitespace);
         t("aRequestWithoutACredentialHeaderIsNull", RedactorTest::aRequestWithoutACredentialHeaderIsNull);
 
         t("setCookieValuesAreReplacedAndAttributesKept", RedactorTest::setCookieValuesAreReplacedAndAttributesKept);
@@ -59,6 +60,9 @@ public class RedactorTest {
         t("aDeletionCookieKeepsItsEmptyValue", RedactorTest::aDeletionCookieKeepsItsEmptyValue);
         t("aCookiePairWithNoEqualsIsRedactedWhole", RedactorTest::aCookiePairWithNoEqualsIsRedactedWhole);
         t("aFoldedContinuationOfASetCookieIsRedacted", RedactorTest::aFoldedContinuationOfASetCookieIsRedacted);
+        t("aSecondFoldedContinuationIsRedactedToo", RedactorTest::aSecondFoldedContinuationIsRedactedToo);
+        t("whitespaceBeforeTheColonDoesNotHideACookie", RedactorTest::whitespaceBeforeTheColonDoesNotHideACookie);
+        t("aBlankLineBeforeTheStatusLineDoesNotEndTheHead", RedactorTest::aBlankLineBeforeTheStatusLineDoesNotEndTheHead);
         t("theResponseBodyIsNeverRewritten", RedactorTest::theResponseBodyIsNeverRewritten);
 
         t("redactionHappensBeforeHashing", RedactorTest::redactionHappensBeforeHashing);
@@ -181,6 +185,13 @@ public class RedactorTest {
                      Redactor.RangeError.class, () -> injected.register("ident-admin", 9, 4));
         expectThrows("a range with no identity is refused",
                      Redactor.RangeError.class, () -> injected.register("", 0, 5));
+        // The degenerate ARGUMENT, and the same answer. A caller that has not
+        // said what it injected has not said "nothing"; RangeError is what the
+        // Sender turns into bad_frame, where an NPE would reach BridgeClient's
+        // catch-all and close the connection instead.
+        expectThrows("redacting without naming any ranges at all is refused",
+                     Redactor.RangeError.class,
+                     () -> new Redactor().redactRequest(new byte[4], null));
     }
 
     static void oneRequestsRangesCannotReachTheNext() {
@@ -300,6 +311,27 @@ public class RedactorTest {
               r.unmanagedCredential(req(h)) == null);
     }
 
+    static void aCredentialNameIsMatchedThroughSurroundingWhitespace() {
+        // unmanagedCredential is a FAIL-CLOSED gate, so the cost of a name it
+        // cannot match is not a missed match: it is the answer "no credential",
+        // on which the Sender issues the request and persists it. RFC 9110
+        // forbids whitespace around a field name and Sender.parse refuses one,
+        // but this matcher is the last thing between a live production
+        // credential and a content-addressed store, and it should not depend
+        // on a caller two classes away having normalised its input.
+        Redactor r = new Redactor();
+        String[] spellings = { "Authorization ", " Authorization",
+                               "Authorization\t", "Authorization\r" };
+        String[] labels = { "a trailing space", "a leading space",
+                            "a trailing tab", "a trailing CR" };
+        for (int i = 0; i < spellings.length; i++)
+            // Equality with the UNTRIMMED spelling, because the refusal quotes
+            // what was actually sent rather than what we matched on.
+            check("an Authorization with " + labels[i] + " is still a credential header",
+                  spellings[i].equals(r.unmanagedCredential(
+                      req(Map.of(spellings[i], List.of("Bearer " + TOKEN))))));
+    }
+
     static void aRequestWithoutACredentialHeaderIsNull() {
         Redactor r = new Redactor();
         check("an ordinary request is not refused",
@@ -413,6 +445,81 @@ public class RedactorTest {
               out.contains("\r\n\t{{observed:set-cookie}}\r\n"));
         check("the header after the fold is untouched",
               out.contains("Content-Length: 0\r\n"));
+    }
+
+    static void aSecondFoldedContinuationIsRedactedToo() {
+        // The fold branch does not re-derive inSetCookie, so it stays armed
+        // for as many continuation lines as arrive. Without this fixture,
+        // clearing the flag after the FIRST fold leaves the whole suite green
+        // and the second fold's cookie bytes on disk -- an unfalsified guard,
+        // which on this branch is how seven of them got there.
+        Redactor r = new Redactor();
+        String out = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie: sid=\r\n"
+            + "\t" + SESSION + "\r\n"
+            + " csrf=8f14e45fceea167a5a36dedd4bea2543\r\n"
+            + "Content-Length: 0\r\n"
+            + "\r\n")));
+        check("a value on a SECOND folded continuation does not survive either",
+              !out.contains(SESSION) && !out.contains("8f14e45fceea167a5a36dedd4bea2543"));
+        check("both folds are preserved so the head still parses",
+              out.contains("\r\n\t{{observed:set-cookie}}\r\n {{observed:set-cookie}}\r\n"));
+    }
+
+    static void whitespaceBeforeTheColonDoesNotHideACookie() {
+        // Name matching is ALL job 3 has, so a name it fails to match is a
+        // live cookie copied through verbatim -- and it also leaves
+        // inSetCookie false, which switches off the fold branch for that
+        // header's continuations. RFC 9110 requires a recipient to reject
+        // whitespace before the colon; a redactor that trusts every recipient
+        // to have done so is one that fails open when one has not.
+        Redactor r = new Redactor();
+        String spaced = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie : JSESSIONID=" + SESSION + "; Path=/\r\n"
+            + "\r\n")));
+        check("a space before the colon does not pass the cookie through",
+              !spaced.contains(SESSION)
+              && spaced.contains("Set-Cookie : JSESSIONID={{observed:set-cookie}}; Path=/\r\n"));
+
+        String tabbed = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie\t: sid=" + SESSION + "\r\n"
+            + "\r\n")));
+        check("a tab before the colon does not pass the cookie through",
+              !tabbed.contains(SESSION));
+
+        String folded = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie : sid=\r\n"
+            + "\t" + SESSION + "; Path=/\r\n"
+            + "\r\n")));
+        check("the fold branch stays armed for such a header's continuation",
+              !folded.contains(SESSION));
+    }
+
+    static void aBlankLineBeforeTheStatusLineDoesNotEndTheHead() {
+        // RFC 9112 §2.2 explicitly contemplates a stray empty line ahead of
+        // the status line. Ending the head there copies the ENTIRE response
+        // through as "body" -- every Set-Cookie raw, into a content-addressed
+        // store, with nothing in the evidence to say it happened.
+        Redactor r = new Redactor();
+        String body = "Set-Cookie: sid=not-a-real-header\r\n";
+        String out = text(r.redactResponse(bytes(
+              "\r\n"
+            + "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie: JSESSIONID=" + SESSION + "; Path=/\r\n"
+            + "Content-Length: " + body.length() + "\r\n"
+            + "\r\n" + body)));
+        check("a leading blank line does not disable redaction for the response",
+              !out.contains(SESSION)
+              && out.contains("Set-Cookie: JSESSIONID={{observed:set-cookie}}; Path=/\r\n"));
+        check("the stray line is preserved, so the response reads as it arrived",
+              out.startsWith("\r\nHTTP/1.1 200 OK\r\n"));
+        // The other direction, and the one a fix could break: the blank line
+        // that really does end the head still ends it.
+        check("the head still ends at its own blank line", out.endsWith("\r\n\r\n" + body));
     }
 
     static void theResponseBodyIsNeverRewritten() {

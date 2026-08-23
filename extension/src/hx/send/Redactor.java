@@ -221,11 +221,30 @@ public final class Redactor {
             int next = lineStartAfter(raw, i);      // start of the following line
             int content = contentEnd(raw, i, next); // this line without its CR/LF
 
-            if (content == i) {                     // the blank line: head is over
-                out.write(raw, i, raw.length - i);
+            if (content == i) {                     // an empty line
+                if (first) {
+                    // ...but not the one that ends the head, because the head
+                    // has not started. RFC 9112 2.2 says a recipient MAY
+                    // ignore an empty line before the status line, so one can
+                    // reach us -- and stopping here stops before a single
+                    // field has been read, copying the WHOLE response through
+                    // as "body" with every Set-Cookie raw. Keep it verbatim
+                    // and keep looking for the status line.
+                    out.write(raw, i, next - i);
+                    i = next;
+                    continue;
+                }
+                out.write(raw, i, raw.length - i);  // the head really is over
                 return out.toByteArray();
             }
             if (first) {                            // the status line is not a field
+                // Defensive, not a tested guard: no status line can be
+                // mistaken for a Set-Cookie field -- it has no colon before a
+                // name that could match -- so deleting this branch changes no
+                // output any test here can produce. What it does is stop the
+                // question from arising. The `first` FLAG is load-bearing: it
+                // is what tells an empty line before the status line from the
+                // empty line that ends the head.
                 first = false;
                 inSetCookie = false;
                 out.write(raw, i, next - i);
@@ -251,7 +270,16 @@ public final class Redactor {
                 continue;
             }
             int colon = indexOf(raw, i, content, (byte) ':');
-            inSetCookie = colon > i && asciiEqualsIgnoreCase("set-cookie", raw, i, colon);
+            // Whitespace comes off the NAME before matching. RFC 9110 requires
+            // a recipient to reject `Set-Cookie : v`, but name matching is all
+            // job 3 has, and a name we fail to match does two things at once:
+            // it passes a live cookie through verbatim, and it leaves
+            // inSetCookie false, which switches the fold branch off for that
+            // header's continuations as well. (Leading whitespace never
+            // arrives here -- a line that starts with it is a fold.)
+            int nameEnd = colon;
+            while (nameEnd > i && (raw[nameEnd - 1] == ' ' || raw[nameEnd - 1] == '\t')) nameEnd--;
+            inSetCookie = colon > i && asciiEqualsIgnoreCase("set-cookie", raw, i, nameEnd);
             if (!inSetCookie) {
                 out.write(raw, i, next - i);
                 i = next;
@@ -314,18 +342,42 @@ public final class Redactor {
      * "authorization" -- a credential header missed because of the operator's
      * locale. Burp runs in that locale, and RedactorTest pins the case.
      *
-     * Not {@code equalsIgnoreCase} either, though that one IS locale-
-     * independent and would pass every test here: it folds the whole of
-     * Unicode, so "COOKIE" spelled with U+212A KELVIN SIGN equals "cookie"
-     * -- measured true on JDK 26. Inventing matches errs safe, but RFC 9110
-     * field names are ASCII, and a matcher that answers about bytes the wire
-     * cannot carry is one nobody can reason about.
+     * Not {@code equalsIgnoreCase} either -- and that half is a preference
+     * rather than a guarded behaviour, which is worth saying plainly, because
+     * a reader takes a comment as a premise. What is demonstrable is the
+     * difference: {@code "COOKIE"} spelled with U+212A KELVIN SIGN
+     * {@code equalsIgnoreCase} {@code "cookie"} -- measured true on JDK 26 --
+     * and does not match here. What is NOT demonstrable from this suite is
+     * that the difference matters, because nothing in it distinguishes the two
+     * matchers: RFC 9110 field names are ASCII, so on every name either is ever
+     * asked about they agree, and swapping this for equalsIgnoreCase leaves
+     * every check green. The tr_TR case above is the one that IS pinned, and
+     * it is red under toLowerCase(). Read this paragraph as the reason to
+     * prefer a matcher that answers only about bytes the wire can carry, not
+     * as a claim that a test is watching.
      */
     private static boolean asciiEqualsIgnoreCase(String lower, String actual) {
-        if (actual == null || actual.length() != lower.length()) return false;
+        if (actual == null) return false;
+        // Whitespace around the name comes off first. unmanagedCredential is a
+        // FAIL-CLOSED gate, so "Authorization " failing to match is not a
+        // missed match: it is the answer "no credential", on which the Sender
+        // issues the request and persists it. Widening the match can only
+        // produce extra refusals, which is the safe direction, and it is why
+        // this trims rather than refusing the odd name outright.
+        int from = 0, to = actual.length();
+        while (from < to && isOws(actual.charAt(from))) from++;
+        while (to > from && isOws(actual.charAt(to - 1))) to--;
+        if (to - from != lower.length()) return false;
         for (int i = 0; i < lower.length(); i++)
-            if (asciiLower(actual.charAt(i)) != lower.charAt(i)) return false;
+            if (asciiLower(actual.charAt(from + i)) != lower.charAt(i)) return false;
         return true;
+    }
+
+    /** Space, tab, CR and LF: what can still be wrapped around a field name
+     *  that reached us through a parser which did not reject it. ASCII only,
+     *  and only these four, for the same reason asciiLower is hand-rolled. */
+    private static boolean isOws(char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
     }
 
     private static boolean asciiEqualsIgnoreCase(String lower, byte[] raw, int from, int to) {

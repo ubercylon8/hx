@@ -9329,8 +9329,11 @@ the answer it acts on.
 
 - [ ] **Step 1: Write the failing test**
 
-Forty-eight checks, in the project's hand-rolled runner — `check(String, boolean)` and
-`expectThrows`, no JUnit, because this jar has no dependencies.
+Sixty-one checks, in the project's hand-rolled runner — `check(String, boolean)` and
+`expectThrows`, no JUnit, because this jar has no dependencies. Each method runs under
+`TestSupport.t`, so a throw out of one becomes a named FAIL against this class's counter
+instead of ending `main()` with the methods after it unrun and no summary line printed —
+which under `./test.sh | grep -c FAIL` reads as zero failures.
 
 ```java
 // extension/test/hx/send/RedactorTest.java
@@ -9386,6 +9389,7 @@ public class RedactorTest {
         t("credentialDetectionSurvivesATurkishLocale", RedactorTest::credentialDetectionSurvivesATurkishLocale);
         t("theNamedHeaderDoesNotDependOnMapOrder", RedactorTest::theNamedHeaderDoesNotDependOnMapOrder);
         t("aWholeNameMustMatchNotAPrefix", RedactorTest::aWholeNameMustMatchNotAPrefix);
+        t("aCredentialNameIsMatchedThroughSurroundingWhitespace", RedactorTest::aCredentialNameIsMatchedThroughSurroundingWhitespace);
         t("aRequestWithoutACredentialHeaderIsNull", RedactorTest::aRequestWithoutACredentialHeaderIsNull);
 
         t("setCookieValuesAreReplacedAndAttributesKept", RedactorTest::setCookieValuesAreReplacedAndAttributesKept);
@@ -9394,6 +9398,9 @@ public class RedactorTest {
         t("aDeletionCookieKeepsItsEmptyValue", RedactorTest::aDeletionCookieKeepsItsEmptyValue);
         t("aCookiePairWithNoEqualsIsRedactedWhole", RedactorTest::aCookiePairWithNoEqualsIsRedactedWhole);
         t("aFoldedContinuationOfASetCookieIsRedacted", RedactorTest::aFoldedContinuationOfASetCookieIsRedacted);
+        t("aSecondFoldedContinuationIsRedactedToo", RedactorTest::aSecondFoldedContinuationIsRedactedToo);
+        t("whitespaceBeforeTheColonDoesNotHideACookie", RedactorTest::whitespaceBeforeTheColonDoesNotHideACookie);
+        t("aBlankLineBeforeTheStatusLineDoesNotEndTheHead", RedactorTest::aBlankLineBeforeTheStatusLineDoesNotEndTheHead);
         t("theResponseBodyIsNeverRewritten", RedactorTest::theResponseBodyIsNeverRewritten);
 
         t("redactionHappensBeforeHashing", RedactorTest::redactionHappensBeforeHashing);
@@ -9516,6 +9523,13 @@ public class RedactorTest {
                      Redactor.RangeError.class, () -> injected.register("ident-admin", 9, 4));
         expectThrows("a range with no identity is refused",
                      Redactor.RangeError.class, () -> injected.register("", 0, 5));
+        // The degenerate ARGUMENT, and the same answer. A caller that has not
+        // said what it injected has not said "nothing"; RangeError is what the
+        // Sender turns into bad_frame, where an NPE would reach BridgeClient's
+        // catch-all and close the connection instead.
+        expectThrows("redacting without naming any ranges at all is refused",
+                     Redactor.RangeError.class,
+                     () -> new Redactor().redactRequest(new byte[4], null));
     }
 
     static void oneRequestsRangesCannotReachTheNext() {
@@ -9635,6 +9649,27 @@ public class RedactorTest {
               r.unmanagedCredential(req(h)) == null);
     }
 
+    static void aCredentialNameIsMatchedThroughSurroundingWhitespace() {
+        // unmanagedCredential is a FAIL-CLOSED gate, so the cost of a name it
+        // cannot match is not a missed match: it is the answer "no credential",
+        // on which the Sender issues the request and persists it. RFC 9110
+        // forbids whitespace around a field name and Sender.parse refuses one,
+        // but this matcher is the last thing between a live production
+        // credential and a content-addressed store, and it should not depend
+        // on a caller two classes away having normalised its input.
+        Redactor r = new Redactor();
+        String[] spellings = { "Authorization ", " Authorization",
+                               "Authorization\t", "Authorization\r" };
+        String[] labels = { "a trailing space", "a leading space",
+                            "a trailing tab", "a trailing CR" };
+        for (int i = 0; i < spellings.length; i++)
+            // Equality with the UNTRIMMED spelling, because the refusal quotes
+            // what was actually sent rather than what we matched on.
+            check("an Authorization with " + labels[i] + " is still a credential header",
+                  spellings[i].equals(r.unmanagedCredential(
+                      req(Map.of(spellings[i], List.of("Bearer " + TOKEN))))));
+    }
+
     static void aRequestWithoutACredentialHeaderIsNull() {
         Redactor r = new Redactor();
         check("an ordinary request is not refused",
@@ -9750,6 +9785,81 @@ public class RedactorTest {
               out.contains("Content-Length: 0\r\n"));
     }
 
+    static void aSecondFoldedContinuationIsRedactedToo() {
+        // The fold branch does not re-derive inSetCookie, so it stays armed
+        // for as many continuation lines as arrive. Without this fixture,
+        // clearing the flag after the FIRST fold leaves the whole suite green
+        // and the second fold's cookie bytes on disk -- an unfalsified guard,
+        // which on this branch is how seven of them got there.
+        Redactor r = new Redactor();
+        String out = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie: sid=\r\n"
+            + "\t" + SESSION + "\r\n"
+            + " csrf=8f14e45fceea167a5a36dedd4bea2543\r\n"
+            + "Content-Length: 0\r\n"
+            + "\r\n")));
+        check("a value on a SECOND folded continuation does not survive either",
+              !out.contains(SESSION) && !out.contains("8f14e45fceea167a5a36dedd4bea2543"));
+        check("both folds are preserved so the head still parses",
+              out.contains("\r\n\t{{observed:set-cookie}}\r\n {{observed:set-cookie}}\r\n"));
+    }
+
+    static void whitespaceBeforeTheColonDoesNotHideACookie() {
+        // Name matching is ALL job 3 has, so a name it fails to match is a
+        // live cookie copied through verbatim -- and it also leaves
+        // inSetCookie false, which switches off the fold branch for that
+        // header's continuations. RFC 9110 requires a recipient to reject
+        // whitespace before the colon; a redactor that trusts every recipient
+        // to have done so is one that fails open when one has not.
+        Redactor r = new Redactor();
+        String spaced = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie : JSESSIONID=" + SESSION + "; Path=/\r\n"
+            + "\r\n")));
+        check("a space before the colon does not pass the cookie through",
+              !spaced.contains(SESSION)
+              && spaced.contains("Set-Cookie : JSESSIONID={{observed:set-cookie}}; Path=/\r\n"));
+
+        String tabbed = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie\t: sid=" + SESSION + "\r\n"
+            + "\r\n")));
+        check("a tab before the colon does not pass the cookie through",
+              !tabbed.contains(SESSION));
+
+        String folded = text(r.redactResponse(bytes(
+              "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie : sid=\r\n"
+            + "\t" + SESSION + "; Path=/\r\n"
+            + "\r\n")));
+        check("the fold branch stays armed for such a header's continuation",
+              !folded.contains(SESSION));
+    }
+
+    static void aBlankLineBeforeTheStatusLineDoesNotEndTheHead() {
+        // RFC 9112 §2.2 explicitly contemplates a stray empty line ahead of
+        // the status line. Ending the head there copies the ENTIRE response
+        // through as "body" -- every Set-Cookie raw, into a content-addressed
+        // store, with nothing in the evidence to say it happened.
+        Redactor r = new Redactor();
+        String body = "Set-Cookie: sid=not-a-real-header\r\n";
+        String out = text(r.redactResponse(bytes(
+              "\r\n"
+            + "HTTP/1.1 200 OK\r\n"
+            + "Set-Cookie: JSESSIONID=" + SESSION + "; Path=/\r\n"
+            + "Content-Length: " + body.length() + "\r\n"
+            + "\r\n" + body)));
+        check("a leading blank line does not disable redaction for the response",
+              !out.contains(SESSION)
+              && out.contains("Set-Cookie: JSESSIONID={{observed:set-cookie}}; Path=/\r\n"));
+        check("the stray line is preserved, so the response reads as it arrived",
+              out.startsWith("\r\nHTTP/1.1 200 OK\r\n"));
+        // The other direction, and the one a fix could break: the blank line
+        // that really does end the head still ends it.
+        check("the head still ends at its own blank line", out.endsWith("\r\n\r\n" + body));
+    }
+
     static void theResponseBodyIsNeverRewritten() {
         // A body may legitimately contain the text "Set-Cookie:" -- API error
         // dumps and documentation pages do -- and rewriting it corrupts the
@@ -9837,10 +9947,10 @@ line lands after `exit "$rc"` and never runs.
 
 Run: `cd extension && ./test.sh`
 
-Expected: FAIL — javac stops with **53 errors**, all of them the same missing class:
+Expected: FAIL — javac stops with **77 errors**, all of them the same missing class:
 
 ```
-test/hx/send/RedactorTest.java:81: error: cannot find symbol
+test/hx/send/RedactorTest.java:95: error: cannot find symbol
         Redactor r = new Redactor();
         ^
   symbol:   class Redactor
@@ -10076,11 +10186,30 @@ public final class Redactor {
             int next = lineStartAfter(raw, i);      // start of the following line
             int content = contentEnd(raw, i, next); // this line without its CR/LF
 
-            if (content == i) {                     // the blank line: head is over
-                out.write(raw, i, raw.length - i);
+            if (content == i) {                     // an empty line
+                if (first) {
+                    // ...but not the one that ends the head, because the head
+                    // has not started. RFC 9112 2.2 says a recipient MAY
+                    // ignore an empty line before the status line, so one can
+                    // reach us -- and stopping here stops before a single
+                    // field has been read, copying the WHOLE response through
+                    // as "body" with every Set-Cookie raw. Keep it verbatim
+                    // and keep looking for the status line.
+                    out.write(raw, i, next - i);
+                    i = next;
+                    continue;
+                }
+                out.write(raw, i, raw.length - i);  // the head really is over
                 return out.toByteArray();
             }
             if (first) {                            // the status line is not a field
+                // Defensive, not a tested guard: no status line can be
+                // mistaken for a Set-Cookie field -- it has no colon before a
+                // name that could match -- so deleting this branch changes no
+                // output any test here can produce. What it does is stop the
+                // question from arising. The `first` FLAG is load-bearing: it
+                // is what tells an empty line before the status line from the
+                // empty line that ends the head.
                 first = false;
                 inSetCookie = false;
                 out.write(raw, i, next - i);
@@ -10106,7 +10235,16 @@ public final class Redactor {
                 continue;
             }
             int colon = indexOf(raw, i, content, (byte) ':');
-            inSetCookie = colon > i && asciiEqualsIgnoreCase("set-cookie", raw, i, colon);
+            // Whitespace comes off the NAME before matching. RFC 9110 requires
+            // a recipient to reject `Set-Cookie : v`, but name matching is all
+            // job 3 has, and a name we fail to match does two things at once:
+            // it passes a live cookie through verbatim, and it leaves
+            // inSetCookie false, which switches the fold branch off for that
+            // header's continuations as well. (Leading whitespace never
+            // arrives here -- a line that starts with it is a fold.)
+            int nameEnd = colon;
+            while (nameEnd > i && (raw[nameEnd - 1] == ' ' || raw[nameEnd - 1] == '\t')) nameEnd--;
+            inSetCookie = colon > i && asciiEqualsIgnoreCase("set-cookie", raw, i, nameEnd);
             if (!inSetCookie) {
                 out.write(raw, i, next - i);
                 i = next;
@@ -10169,18 +10307,42 @@ public final class Redactor {
      * "authorization" -- a credential header missed because of the operator's
      * locale. Burp runs in that locale, and RedactorTest pins the case.
      *
-     * Not {@code equalsIgnoreCase} either, though that one IS locale-
-     * independent and would pass every test here: it folds the whole of
-     * Unicode, so "COOKIE" spelled with U+212A KELVIN SIGN equals "cookie"
-     * -- measured true on JDK 26. Inventing matches errs safe, but RFC 9110
-     * field names are ASCII, and a matcher that answers about bytes the wire
-     * cannot carry is one nobody can reason about.
+     * Not {@code equalsIgnoreCase} either -- and that half is a preference
+     * rather than a guarded behaviour, which is worth saying plainly, because
+     * a reader takes a comment as a premise. What is demonstrable is the
+     * difference: {@code "COOKIE"} spelled with U+212A KELVIN SIGN
+     * {@code equalsIgnoreCase} {@code "cookie"} -- measured true on JDK 26 --
+     * and does not match here. What is NOT demonstrable from this suite is
+     * that the difference matters, because nothing in it distinguishes the two
+     * matchers: RFC 9110 field names are ASCII, so on every name either is ever
+     * asked about they agree, and swapping this for equalsIgnoreCase leaves
+     * every check green. The tr_TR case above is the one that IS pinned, and
+     * it is red under toLowerCase(). Read this paragraph as the reason to
+     * prefer a matcher that answers only about bytes the wire can carry, not
+     * as a claim that a test is watching.
      */
     private static boolean asciiEqualsIgnoreCase(String lower, String actual) {
-        if (actual == null || actual.length() != lower.length()) return false;
+        if (actual == null) return false;
+        // Whitespace around the name comes off first. unmanagedCredential is a
+        // FAIL-CLOSED gate, so "Authorization " failing to match is not a
+        // missed match: it is the answer "no credential", on which the Sender
+        // issues the request and persists it. Widening the match can only
+        // produce extra refusals, which is the safe direction, and it is why
+        // this trims rather than refusing the odd name outright.
+        int from = 0, to = actual.length();
+        while (from < to && isOws(actual.charAt(from))) from++;
+        while (to > from && isOws(actual.charAt(to - 1))) to--;
+        if (to - from != lower.length()) return false;
         for (int i = 0; i < lower.length(); i++)
-            if (asciiLower(actual.charAt(i)) != lower.charAt(i)) return false;
+            if (asciiLower(actual.charAt(from + i)) != lower.charAt(i)) return false;
         return true;
+    }
+
+    /** Space, tab, CR and LF: what can still be wrapped around a field name
+     *  that reached us through a parser which did not reject it. ASCII only,
+     *  and only these four, for the same reason asciiLower is hand-rolled. */
+    private static boolean isOws(char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
     }
 
     private static boolean asciiEqualsIgnoreCase(String lower, byte[] raw, int from, int to) {
@@ -10201,7 +10363,7 @@ public final class Redactor {
 Run: `cd extension && ./test.sh`
 
 Expected: PASS — every earlier test class still prints `ALL PASS`, and
-`hx.send.RedactorTest` prints 48 `ok` lines ending:
+`hx.send.RedactorTest` prints 61 `ok` lines ending:
 
 ```
   ok   the raw bytes are not addressable in the store at all
@@ -10228,36 +10390,59 @@ failures. `ALL PASS` is printed only after every method returns with `failures =
 so it is the one thing truncation cannot manufacture.
 
 Every sabotage here compiles. A compile error would turn the whole run red and prove
-nothing about which check was watching.
+nothing about which check was watching. Every row below was measured: each printed all
+six summary lines, so no row's count is a truncation, and `Redactor.java`'s sha256 was
+verified back to pristine after each one.
 
 | # | The edit | Checks that must go red |
 |---|---|---|
-| A | `redactRequest`: insert `if (true) return raw.clone();` as its first line | the injected range is replaced by the identity placeholder · the credential is gone from the copy that crosses the bridge · both ranges are replaced · a range running past the end of the request is refused · the raw bytes are not addressable in the store at all · nothing under the digest a caller computes can be turned back into the credential · redacting changes the digest, so the raw bytes are not addressable |
+| A | `redactRequest`: insert `if (true) return raw.clone();` as its first line | the injected range is replaced by the identity placeholder · the credential is gone from the copy that crosses the bridge · both ranges are replaced · a range running past the end of the request is refused (expected RangeError) · a range registered on the read loop is applied by the worker that redacts · the raw bytes are not addressable in the store at all · nothing under the digest a caller computes can be turned back into the credential · redacting changes the digest, so the raw bytes are not addressable |
 | B | `redactRequest`: `if (mine.isEmpty()) return raw.clone();` → `return raw;` | an empty registry still returns a copy, not the wire array |
-| C | `unmanagedCredential`: insert `if (true) return null;` as its first line | an Authorization the extension did not inject is named · lower-case authorization is caught · mixed-case Cookie is caught · upper-case PROXY-AUTHORIZATION is caught · credential detection survives a Turkish locale · Authorization wins whichever way the map iterates |
-| D | `asciiEqualsIgnoreCase(String, String)`: replace the body with `return actual != null && lower.equals(actual.toLowerCase());` | credential detection survives a Turkish locale |
+| C | `unmanagedCredential`: insert `if (true) return null;` as its first line | an Authorization the extension did not inject is named · lower-case authorization is caught · mixed-case Cookie is caught · upper-case PROXY-AUTHORIZATION is caught · credential detection survives a Turkish locale · Authorization wins whichever way the map iterates · an Authorization with a trailing space is still a credential header · an Authorization with a leading space is still a credential header · an Authorization with a trailing tab is still a credential header · an Authorization with a trailing CR is still a credential header |
+| D | `asciiEqualsIgnoreCase(String, String)`: replace the body with `return lower.equals(actual.trim().toLowerCase());` — `trim()` keeps the whitespace property row U attacks, so this isolates the locale one | credential detection survives a Turkish locale |
 | E | `unmanagedCredential`: match with `e.getKey().toLowerCase(Locale.ROOT).contains(wanted)` | a header merely containing a credential name is not one |
 | F | `unmanagedCredential`: swap the two `for` lines so the header map is the outer loop | Authorization wins whichever way the map iterates |
-| G | `register`: delete the overlap loop and its `throw` | a range overlapping an earlier one is refused · a range containing an earlier one is refused |
-| H | `redactRequest`: replace the out-of-bounds `throw` with clamping `end` to `raw.length` | a range running past the end of the request is refused |
-| I | `Injected`: hold the ranges in a `private static final List<Range> SHARED` so every request's `Injected` sees the same list | the next request, redacted with its own Injected, is verbatim |
-| J | `redactResponse`: insert `if (true) return raw.clone();` as its first line | the cookie value is replaced · the live session cookie is gone · the second Set-Cookie is redacted too · no cookie value survives anywhere in the head · a lower-case set-cookie is redacted · an upper-case SET-COOKIE is redacted · a malformed cookie pair is redacted whole · its bytes do not survive · a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
-| K | `redactResponse`: match the field name with `new String(raw, i, colon - i, US_ASCII).equals("Set-Cookie")` | a lower-case set-cookie is redacted · an upper-case SET-COOKIE is redacted |
-| L | `redactResponse`: after the first redacted line, write the remainder and return | the second Set-Cookie is redacted too · no cookie value survives anywhere in the head · an upper-case SET-COOKIE is redacted · a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
-| M | `redactResponse`: make the blank-line branch `continue` instead of writing the rest and returning | a Set-Cookie inside the body is left verbatim |
-| N | `redactResponse`: `} else if (eq + 1 == pairEnd) {` → `} else if (false) {` | a deletion cookie is left alone |
+| G | `Injected.register`: delete the overlap loop and its `throw` | a range overlapping an earlier one is refused (expected RangeError) · a range containing an earlier one is refused (expected RangeError) |
+| H | `redactRequest`: replace the out-of-bounds `throw` with clamping `end` to `raw.length` | a range running past the end of the request is refused (expected RangeError) |
+| I | `Injected`: hold the ranges in a `private static final List<Range> SHARED`, so every request's `Injected` sees the same list — the closest reachable analogue of a registry outliving its request | `theBytesOnTheWireAreNeverTouched` throws · `twoRangesAreBothReplacedWhateverOrderTheyWereRegisteredIn` throws · `oneRequestsRangesCannotReachTheNext` throws · `theRangesTravelWithTheRequestNotTheThread` throws · `redactionHappensBeforeHashing` throws |
+| J | `redactResponse`: insert `if (true) return raw.clone();` as its first line | the cookie value is replaced · the live session cookie is gone · the second Set-Cookie is redacted too · no cookie value survives anywhere in the head · a lower-case set-cookie is redacted · an upper-case SET-COOKIE is redacted · a malformed cookie pair is redacted whole · its bytes do not survive · a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses · a value on a SECOND folded continuation does not survive either · both folds are preserved so the head still parses · a space before the colon does not pass the cookie through · a tab before the colon does not pass the cookie through · the fold branch stays armed for such a header's continuation · a leading blank line does not disable redaction for the response |
+| K | `redactResponse`: match the field name with `new String(raw, i, nameEnd - i, US_ASCII).equals("Set-Cookie")` | a lower-case set-cookie is redacted · an upper-case SET-COOKIE is redacted |
+| L | `redactResponse`: after the first redacted line, write the remainder and return | the second Set-Cookie is redacted too · no cookie value survives anywhere in the head · an upper-case SET-COOKIE is redacted · a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses · a value on a SECOND folded continuation does not survive either · both folds are preserved so the head still parses · the fold branch stays armed for such a header's continuation |
+| M | `redactResponse`: make the head-over branch write only this line and `continue` instead of writing the rest and returning | the head still ends at its own blank line · a Set-Cookie inside the body is left verbatim |
+| N | `} else if (eq + 1 == pairEnd) {` → `} else if (false) {` | a deletion cookie is left alone |
 | O | `redactResponse`: in the `eq < 0` branch, write `raw, v, pairEnd - v` instead of the placeholder | a malformed cookie pair is redacted whole · its bytes do not survive |
-| P | `redactResponse`: `if (inSetCookie) {` in the fold branch → `if (false) {` | a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses |
-| Q | `redactResponse`: last write of the loop → `out.write(raw, content, next - content);` | the cookie value is replaced · attributes survive, so cookie-flag checks still read · the second Set-Cookie is redacted too · a lower-case set-cookie is redacted · a deletion cookie is left alone · a malformed cookie pair is redacted whole |
-| R | `Injected`: make its list a `ThreadLocal<List<Range>>` — the shape this task replaced, still reachable from inside the per-request object | a range registered on the read loop is applied by the worker that redacts |
+| P | `redactResponse`: `if (inSetCookie) {` in the fold branch → `if (false) {` | a value hidden on a folded continuation line does not survive · the fold itself is preserved so the head still parses · a value on a SECOND folded continuation does not survive either · both folds are preserved so the head still parses · the fold branch stays armed for such a header's continuation |
+| Q | `redactResponse`: last write of the loop → `out.write(raw, content, next - content);` | the cookie value is replaced · attributes survive, so cookie-flag checks still read · the second Set-Cookie is redacted too · a lower-case set-cookie is redacted · a deletion cookie is left alone · a malformed cookie pair is redacted whole · a space before the colon does not pass the cookie through · a leading blank line does not disable redaction for the response |
+| R | `Injected`: put its list back behind a `ThreadLocal<List<Range>>` — the shape this task replaced, still reachable from inside the per-request object | a range registered on the read loop is applied by the worker that redacts |
+| S | `redactResponse`: `if (first) {` inside the empty-line branch → `if (false) {` | a leading blank line does not disable redaction for the response |
+| T | `redactResponse`: match on `colon` rather than the trimmed `nameEnd` | a space before the colon does not pass the cookie through · a tab before the colon does not pass the cookie through · the fold branch stays armed for such a header's continuation |
+| U | `asciiEqualsIgnoreCase(String, String)`: delete the two trimming `while` loops | an Authorization with a trailing space is still a credential header · an Authorization with a leading space is still a credential header · an Authorization with a trailing tab is still a credential header · an Authorization with a trailing CR is still a credential header |
+| V | fold branch: add `inSetCookie = false;` after the first fold's write | a value on a SECOND folded continuation does not survive either · both folds are preserved so the head still parses |
+| W | `redactRequest`: delete the `injected == null` refusal | redacting without naming any ranges at all is refused (expected RangeError) |
 
-Rows I and R are the two the review of the first implementation turned up, and they are
-the reason the ranges are a parameter rather than state. Under the shape they attack,
+Row R is the one the review of the first implementation turned up, and it is the reason
+the ranges are a parameter rather than state. Under the shape it restores,
 `redactRequest` answers with a verbatim copy of a request that still carries its
 credential — no exception, no `RangeError`, no signal of any kind — and that is what
-gets content-addressed. Neither row can be caught by `unmanagedCredential`, which runs
-on the `HxRequest` *before* injection and so by construction never sees the header the
+gets content-addressed. It cannot be caught by `unmanagedCredential`, which runs on the
+`HxRequest` *before* injection and so by construction never sees the header the
 extension is about to add.
+
+Row I is the nearest reachable analogue of the other half — a registry outliving the
+request it was measured for. It is only an analogue, and that is the point: with the
+ranges passed in, "the previous request's ranges are still here" is not a small edit,
+because the shape forbids it. Its five red checks all arrive as `threw ... RangeError`
+FAILs rather than as corrupted bytes, because `register`'s overlap guard fires before
+any substitution is attempted — two guards deep on the same hole. That they are named
+FAILs at all is `TestSupport.t` doing its job: under a bare `main()` the first throw
+would have ended the class with no summary line, and `grep -c FAIL` would have read the
+whole row as zero failures.
+
+Row V is worth its own sentence. The guard it attacks — the fold branch not re-deriving
+`inSetCookie`, so it stays armed for a SECOND consecutive continuation — was completely
+unfalsified: with `aSecondFoldedContinuationIsRedactedToo` unregistered, this exact
+mutation leaves all six classes printing `ALL PASS`, exit 0. Measured, not assumed. The
+fixture is the whole of the fix; the code was already right.
 
 Rows A and C are the two that matter most and they are the two to run first. A is the
 redaction itself: with it broken, the bytes a caller hands the blob store are the raw
