@@ -1,4 +1,3 @@
-<!-- plan-drift: pending -->
 # Enforcement and the Send Path Implementation Plan
 
 <!-- Remove that marker in the commit that finishes this plan. Until then
@@ -12931,24 +12930,35 @@ package hx.send;
  * `raw` is the response exactly as it came off the wire, before redaction.
  * Sender redacts it; nothing else may hold onto it.
  *
- * A MEASUREMENT THIS TASK MUST RECORD, and no longer a hole it has to close:
- * whether `raw` can carry an INTERIM response -- a `100 Continue` or a `103
- * Early Hints` -- ahead of the final status line. Redactor.redactResponse
- * HANDLES one as of Task 4's second fix round: a 1xx is never the final
- * response (RFC 9110 15.2), so its blank line does not end the scan and the
- * real response's Set-Cookie fields are redacted like any other. That fix is
- * ~16 lines and it is safe whether or not interim heads ever arrive, because
- * the branch cannot fire on a final response -- which is why it was taken
- * there rather than held here behind an unanswered question. Task 4's ledger
- * had recorded it as "not fixable from Redactor"; that was wrong, and the
- * correction is what closed the last live credential-to-disk hole in the one
- * item spec s7 says cannot be retrofitted.
+ * THE MEASUREMENT, TAKEN. The question was whether `raw` can carry an INTERIM
+ * response -- a `100 Continue` or a `103 Early Hints` -- ahead of the final
+ * status line, and it was answered by driving a real headless Burp Suite
+ * Community Edition 2026.7.3-52685 at a server that writes `103 Early Hints`
+ * and then `200 OK` on one connection:
  *
- * So: measure a 103-then-200 exchange and RECORD what
- * `rr.response().toByteArray()` returned. The answer decides whether that
- * branch is live code or dead code on this path -- worth knowing, and worth
- * writing down so the next reader does not re-derive it -- but it is no
- * longer the difference between redacted and raw.
+ *   rr.hasResponse()                 true
+ *   rr.response().statusCode()       103        <- the INTERIM head
+ *   rr.response().toByteArray()      275 bytes, BOTH heads:
+ *       "HTTP/1.1 103 Early Hints\r\nLink: ...\r\nSet-Cookie: interim=...\r\n"
+ *       "\r\nHTTP/1.1 200 OK\r\n...Set-Cookie: session=...\r\n\r\n{...}"
+ *
+ * So Montoya parses the interim head as THE response and hands the rest back
+ * as bytes. Two consequences, and both are load-bearing:
+ *
+ *   1. Redactor.redactResponse's 1xx branch is LIVE CODE on this path, not
+ *      the dead branch it was thought to be. Task 4's second fix round -- a
+ *      1xx is never the final response (RFC 9110 15.2), so its blank line
+ *      does not end the scan -- is what keeps the FINAL head's Set-Cookie out
+ *      of a content-addressed blob store. Task 4's ledger had recorded it as
+ *      "not fixable from Redactor"; that was wrong, and the correction closed
+ *      the last live credential-to-disk hole in the one item spec s7 says
+ *      cannot be retrofitted.
+ *   2. `status` cannot be reported as the transport gave it. Sender.finalStatus
+ *      reads the final head out of `raw` when this field is a 1xx, because
+ *      `status` is both the evidence line's status and the number Distress
+ *      counts 5xx from -- and a CDN sending early hints in front of a failing
+ *      origin would otherwise record nothing but 103s and never trip spec
+ *      s4's auto-halt.
  */
 public record HttpReply(int status, byte[] raw, long ms, boolean connectionError) { }
 ```
@@ -12962,6 +12972,7 @@ produce an error map **and** leave `FakeHttp.calls` at zero.
 // extension/test/hx/send/SenderTest.java
 package hx.send;
 
+import hx.TestSupport;
 import hx.bridge.BridgeClient;
 import hx.bridge.Json;
 import hx.policy.Decision;
@@ -12980,6 +12991,8 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 
 /** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
 public class SenderTest {
@@ -12989,6 +13002,20 @@ public class SenderTest {
     static void check(String what, boolean ok) {
         System.out.println((ok ? "  ok   " : "  FAIL ") + what);
         if (!ok) failures++;
+    }
+
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *
+     *  Not decoration. Every sabotage count in this task was read off the FAIL
+     *  lines of a full run, and a mutation that makes a method THROW rather
+     *  than return the wrong value prints no FAIL lines at all: under
+     *  `./test.sh | grep -c FAIL` a truncation and a green run are the same
+     *  number. The other seven classes in this suite already run under it.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(SenderTest::check, name, body);
     }
 
     /** A fixed wall-clock instant in microseconds. Real value, not a round
@@ -13001,18 +13028,33 @@ public class SenderTest {
         Path dir = Files.createTempDirectory("hxsend");
         Path sentinel = dir.resolve("halt");          // deliberately absent
         try {
-            anAllowedRequestIsIssuedOnceAndFramedAsAResult(sentinel);
-            everyDenialClassLeavesTheWireUntouched(sentinel);
-            theRefusalOrderIsPinned(sentinel);
-            rateLimitedCarriesRetryAfterUs(sentinel);
-            anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget(sentinel);
-            aDeadlineThatExpiresMidFlightIsReportedAsTimeout(sentinel);
-            aTransportFailureFeedsDistressAndHaltsTheNextSend(sentinel);
-            distressPushesOneUnsolicitedHaltedFrame(sentinel);
-            theResultIsStampedWithTheEpochThatAuthorisedIt(sentinel);
-            theResponseBodyRidesUnderAKeyJsonRefusesToWrite(sentinel);
-            theWireMappingRoundTripsWhatItParsed();
-            theConfiguredLimitsArmTheGateOnceFromTheAuthorisation();
+            t("anAllowedRequestIsIssuedOnceAndFramedAsAResult",
+              () -> anAllowedRequestIsIssuedOnceAndFramedAsAResult(sentinel));
+            t("everyDenialClassLeavesTheWireUntouched",
+              () -> everyDenialClassLeavesTheWireUntouched(sentinel));
+            t("theRefusalOrderIsPinned", () -> theRefusalOrderIsPinned(sentinel));
+            t("rateLimitedCarriesRetryAfterUs", () -> rateLimitedCarriesRetryAfterUs(sentinel));
+            t("anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget",
+              () -> anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget(sentinel));
+            t("aDeadlineThatExpiresMidFlightIsReportedAsTimeout",
+              () -> aDeadlineThatExpiresMidFlightIsReportedAsTimeout(sentinel));
+            t("aTransportFailureFeedsDistressAndHaltsTheNextSend",
+              () -> aTransportFailureFeedsDistressAndHaltsTheNextSend(sentinel));
+            t("distressPushesOneUnsolicitedHaltedFrame",
+              () -> distressPushesOneUnsolicitedHaltedFrame(sentinel));
+            t("aRedactionFailureIsRefusedRatherThanFramed",
+              () -> aRedactionFailureIsRefusedRatherThanFramed(sentinel));
+            t("anInterimHeadIsNotTheStatusAndDoesNotHideA5xx",
+              () -> anInterimHeadIsNotTheStatusAndDoesNotHideA5xx(sentinel));
+            t("twoSendsTrippingTogetherStillAnnounceOnce",
+              () -> twoSendsTrippingTogetherStillAnnounceOnce(sentinel));
+            t("theResultIsStampedWithTheEpochThatAuthorisedIt",
+              () -> theResultIsStampedWithTheEpochThatAuthorisedIt(sentinel));
+            t("theResponseBodyRidesUnderAKeyJsonRefusesToWrite",
+              () -> theResponseBodyRidesUnderAKeyJsonRefusesToWrite(sentinel));
+            t("theWireMappingRoundTripsWhatItParsed", SenderTest::theWireMappingRoundTripsWhatItParsed);
+            t("theConfiguredLimitsArmTheGateOnceFromTheAuthorisation",
+              SenderTest::theConfiguredLimitsArmTheGateOnceFromTheAuthorisation);
         } finally {
             Files.deleteIfExists(sentinel);
             Files.deleteIfExists(dir);
@@ -13038,11 +13080,26 @@ public class SenderTest {
         IOException boom = null;
         long advanceUsPerCall = 0;
         TickClock clock;
+        /** Holds every caller here until as many have arrived as it was built
+         *  for. The only way to have two sends genuinely IN FLIGHT at once,
+         *  which is the one input that separates the announce-once flag from
+         *  its absence -- see twoSendsTrippingTogetherStillAnnounceOnce. */
+        CyclicBarrier bothInFlight = null;
+        volatile String barrierError = null;
 
         public HttpReply send(HxRequest req, long deadlineUs) throws IOException {
             calls++;
             last = req;
             if (clock != null) clock.advance(advanceUsPerCall);
+            if (bothInFlight != null) {
+                // Recorded rather than thrown: a barrier that timed out means
+                // the sends were NOT concurrent, and an IOException here is
+                // indistinguishable from the transport failure the test wants.
+                // A test that silently stopped testing its own premise is the
+                // failure this field exists to make visible.
+                try { bothInFlight.await(5, TimeUnit.SECONDS); }
+                catch (Exception e) { barrierError = String.valueOf(e); }
+            }
             if (boom != null) throw boom;
             return reply;
         }
@@ -13053,7 +13110,10 @@ public class SenderTest {
      *  anyone -- and how many times it told them. */
     static final class RecordingNotifier implements BridgeClient.HaltNotifier {
         final List<String[]> frames = new ArrayList<>();
-        public void halted(String reason, String host, String window) {
+        // synchronized: twoSendsTrippingTogetherStillAnnounceOnce pushes from
+        // two threads on purpose, and an unsynchronised ArrayList.add can lose
+        // one -- which would report ONE frame from a Sender that sent two.
+        public synchronized void halted(String reason, String host, String window) {
             frames.add(new String[] { reason, host, window });
         }
     }
@@ -13101,6 +13161,26 @@ public class SenderTest {
             + "\r\n"
             + "{\"orders\":[42]}").getBytes(StandardCharsets.ISO_8859_1);
 
+    /**
+     * What Burp actually hands back for an exchange with an interim head, byte
+     * for byte in the shape MEASURED against Burp Suite Community Edition
+     * 2026.7.3-52685: both heads in one array, the interim one first.
+     *
+     * The 5xx here is not decoration. It is the difference between a run that
+     * auto-halts against a failing origin and one that records fifty 103s and
+     * never stops.
+     */
+    static final byte[] INTERIM_THEN_500 = ("HTTP/1.1 103 Early Hints\r\n"
+            + "Link: </style.css>; rel=preload; as=style\r\n"
+            + "Set-Cookie: interim=EARLY_HINTS_COOKIE_9f1c; Path=/\r\n"
+            + "\r\n"
+            + "HTTP/1.1 500 Internal Server Error\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Set-Cookie: session=FINAL_COOKIE_7b3d; Path=/; HttpOnly; Secure\r\n"
+            + "Content-Length: 13\r\n"
+            + "\r\n"
+            + "{\"error\":42}\r\n").getBytes(StandardCharsets.ISO_8859_1);
+
     static Map<String, Object> sendHeader(long deadlineUs) {
         Map<String, Object> h = new LinkedHashMap<>();
         h.put("v", 1L);
@@ -13124,6 +13204,13 @@ public class SenderTest {
             s.append(nameThenValue[i]).append(": ").append(nameThenValue[i + 1]).append("\r\n");
         s.append("\r\n");
         return s.toString().getBytes(StandardCharsets.ISO_8859_1);
+    }
+
+    /** A request nobody would write by hand, byte for byte. `request(...)`
+     *  above can only build well-formed ones, and a guard is only tested by
+     *  the input that separates it from its absence. */
+    static byte[] raw(String text) {
+        return text.getBytes(StandardCharsets.ISO_8859_1);
     }
 
     /** A decided request, for the Gate cases that never go near a Sender.
@@ -13244,6 +13331,33 @@ public class SenderTest {
 
         denied("bad_frame (no request line)", new Rig(sentinel), header,
                new byte[0], authorised(), "bad_frame");
+
+        // The whitespace-before-the-colon refusal, and why it is load-bearing
+        // rather than pedantry. RFC 9112 s5.1 requires a recipient to reject
+        // `Name : value`, and recipients disagree about that in practice. Here
+        // the field name parses as "Authorization " WITH the trailing space,
+        // which unmanagedCredential -- a fail-closed gate answered BY NAME --
+        // cannot match: delete the refusal and this exact request is ISSUED,
+        // carrying a live bearer token, and its bytes are persisted. It is the
+        // same hole as unmanaged_credential, reached through the parser.
+        denied("bad_frame (whitespace before the colon)", new Rig(sentinel), header,
+               raw("GET /api/orders HTTP/1.1\r\nHost: app.example.test\r\n"
+                   + "Authorization : Bearer eyJhbGciOiJIUzI1NiJ9.e30.x\r\n\r\n"),
+               authorised(), "bad_frame");
+
+        // Absolute-form: two answers to "where is this going", and only one of
+        // them was authorised.
+        denied("bad_frame (target is not origin-form)", new Rig(sentinel), header,
+               raw("GET http://other.example.test/api/orders HTTP/1.1\r\n"
+                   + "Host: app.example.test\r\n\r\n"),
+               authorised(), "bad_frame");
+
+        // A header line with no colon at all: a field we would have to guess
+        // the name of is one we refuse to reason about.
+        denied("bad_frame (header line with no colon)", new Rig(sentinel), header,
+               raw("GET /api/orders HTTP/1.1\r\nHost: app.example.test\r\n"
+                   + "X-Not-A-Header\r\n\r\n"),
+               authorised(), "bad_frame");
 
         Map<String, Object> noDeadline = sendHeader(NOW + THIRTY_SECONDS);
         noDeadline.remove("deadline_us");
@@ -13374,6 +13488,34 @@ public class SenderTest {
     }
 
     /**
+     * A Redactor.RangeError is a DENIAL, never an implicit allow (s4).
+     *
+     * Plan 5's identity injection lands on issue(), between the credential
+     * refusal and the issue, and a range that will not fit the bytes in hand
+     * says the frame describes a request other than this one. Nothing
+     * registers a range yet, so the one input that reaches the catch today is
+     * a reply whose bytes the redactor cannot reason about at all -- the same
+     * shape of failure, and the same answer: bytes that were not redacted are
+     * not framed as evidence.
+     *
+     * Without the catch the RangeError leaves issue() as an unhandled
+     * RuntimeException, reaches BridgeClient's send arm, and takes the control
+     * channel down with it -- a stop the operator reads as `bridge_lost`
+     * rather than as a refusal with a class.
+     */
+    static void aRedactionFailureIsRefusedRatherThanFramed(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        r.http.reply = new HttpReply(200, null, 12L, false);
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("a redaction failure is answered as bad_frame (got " + reply.get("class") + ")",
+              "error".equals(reply.get("t")) && "bad_frame".equals(reply.get("class")));
+        check("and nothing unredacted is framed",
+              !reply.containsKey(BridgeClient.BODY_KEY));
+        check("it echoes the frame id", Long.valueOf(41L).equals(reply.get("id")));
+    }
+
+    /**
      * s6: auto-halt is extension-initiated, so there is no outstanding id to
      * answer. Without an unsolicited `halted` frame the stop is invisible
      * until the next send fails, and `run.status = 'aborted'` has no
@@ -13405,6 +13547,103 @@ public class SenderTest {
                        authorised());
         check("a second refused send announces nothing further ("
               + r.notifier.frames.size() + ")", r.notifier.frames.size() == 1);
+    }
+
+    /**
+     * ONCE, and the single-threaded path cannot show it.
+     *
+     * Deleting `announced.compareAndSet(false, true)` leaves all nine classes
+     * green: after the first trip every later send is refused `halted` at the
+     * top of issue(), before it can reach announceDistress, so the notifier is
+     * called exactly once whether or not the flag is there. Measured -- 0 FAIL
+     * lines, 9 x ALL PASS -- which makes the test above a test of the control
+     * flow, not of the flag.
+     *
+     * The input that separates them is two sends ALREADY IN FLIGHT when the
+     * host trips: both read stopReason() as null on the way in, both record a
+     * failure on the way out, and both then have a stop to announce. A barrier
+     * inside the fake Http holds each one there until the other has arrived,
+     * so the interleaving is forced rather than hoped for.
+     *
+     * Not hypothetical: `limit.concurrency` is already a key ConfigBody
+     * accepts, and the day it is honoured this is the ordinary case. A second
+     * frame is a second abort attempt against a run already aborted for the
+     * same reason.
+     */
+    static void twoSendsTrippingTogetherStillAnnounceOnce(Path sentinel) throws Exception {
+        Rig r = new Rig(sentinel, 1);
+        r.http.bothInFlight = new CyclicBarrier(2);
+        r.http.boom = new IOException("Connection refused");
+        // advanceUsPerCall stays 0: TickClock.advance is a read-modify-write
+        // its own javadoc says only the driving thread may make.
+
+        Runnable send = () -> r.sender.issue(sendHeader(NOW + THIRTY_SECONDS),
+                                             request("GET", "/api/orders"), authorised());
+        Thread a = new Thread(send, "hx-send-a");
+        Thread b = new Thread(send, "hx-send-b");
+        a.start(); b.start();
+        a.join(10_000); b.join(10_000);
+
+        check("both sends really were in flight together (" + r.http.barrierError + ")",
+              r.http.barrierError == null);
+        check("neither send is still running", !a.isAlive() && !b.isAlive());
+        check("the host tripped", r.distress.stopReason() != null);
+        check("and the stop was announced exactly once ("
+              + r.notifier.frames.size() + ")", r.notifier.frames.size() == 1);
+    }
+
+    /**
+     * An interim head is not the response, and this is a MEASUREMENT rather
+     * than a reading of the RFC.
+     *
+     * Burp Suite Community Edition 2026.7.3-52685, driven headless against a
+     * server that writes `103 Early Hints` and then `200 OK` on one
+     * connection, answered `rr.response().statusCode()` == 103 and
+     * `rr.response().toByteArray()` == 275 bytes carrying BOTH heads. So the
+     * transport's status is the interim one and the real status is in the
+     * bytes.
+     *
+     * Two things turn on it. The evidence line's `status` would say 103 for a
+     * response that was a 500. And Distress counts 5xx off the same number: a
+     * CDN sending early hints in front of a failing origin would record
+     * nothing but 103s, hold a 0% 5xx rate, and never trip spec s4's auto-halt
+     * -- the failure mode where the run keeps hammering a client's broken
+     * production system because every sample looked fine.
+     *
+     * The third assertion is the one Task 4's second fix round bought:
+     * Redactor.redactResponse's 1xx branch is LIVE CODE on this path, not the
+     * dead branch it was thought to be. Without it the final head's
+     * Set-Cookie is copied through raw into a content-addressed blob store.
+     */
+    static void anInterimHeadIsNotTheStatusAndDoesNotHideA5xx(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        // 103 is what Montoya reported; the bytes are what came off the wire.
+        r.http.reply = new HttpReply(103, INTERIM_THEN_500, 12L, false);
+
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("the evidence line carries the FINAL status, not the interim head's ("
+              + reply.get("status") + ")", Long.valueOf(500L).equals(reply.get("status")));
+
+        String text = new String((byte[]) reply.get(BridgeClient.BODY_KEY),
+                                 StandardCharsets.ISO_8859_1);
+        check("the final response's session cookie value is still redacted",
+              !text.contains("FINAL_COOKIE_7b3d"));
+        check("and so is the interim head's", !text.contains("EARLY_HINTS_COOKIE_9f1c"));
+        check("while both heads and the payload survive",
+              text.contains("HTTP/1.1 103 Early Hints")
+              && text.contains("HTTP/1.1 500 Internal Server Error")
+              && text.contains("{\"error\":42}"));
+
+        // Distress needs its baseline before the 5xx rate has an opinion: §4
+        // takes it from the host's first ten requests. Ten identical answers
+        // is a 100% 5xx rate, and a Sender that fed it 103s would sit at 0%.
+        for (int i = 1; i < 10; i++)
+            r.sender.issue(sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"),
+                           authorised());
+        check("and Distress saw ten 5xx, not ten 103s (" + r.distress.stopReason() + ")",
+              r.distress.stopReason() != null
+              && r.distress.stopReason().startsWith("5xx rate 100.0%"));
     }
 
     /**
@@ -13906,7 +14145,13 @@ public final class Sender {
                          e.getClass().getSimpleName() + ": " + e.getMessage());
         }
 
-        distress.record(req.host(), reply.status(), reply.ms(), reply.connectionError());
+        // MEASURED, not assumed: see finalStatus. The status Distress counts
+        // has to be the FINAL response's, or a host that sends early hints
+        // ahead of its 500s never trips the 20% rule -- one of the three
+        // auto-halt conditions in spec s4 -- because every sample it recorded
+        // was a 103.
+        int status = finalStatus(reply.raw(), reply.status());
+        distress.record(req.host(), status, reply.ms(), reply.connectionError());
         announceDistress();
 
         if (reply.connectionError())
@@ -13931,7 +14176,7 @@ public final class Sender {
         result.put("v", BridgeClient.PROTOCOL_VERSION);
         result.put("t", "result");
         result.put("id", id);
-        result.put("status", (long) reply.status());
+        result.put("status", (long) status);
         result.put("bytes", (long) redacted.length);
         result.put("ms", reply.ms());
         result.put("outcome", "ok");
@@ -14083,6 +14328,78 @@ public final class Sender {
         return out;
     }
 
+    /**
+     * How many heads a peer may put in front of the final one before this
+     * gives up and reports what the transport said. RFC 9110 s15.2 puts no
+     * ceiling on interim responses, and an unbounded scan of a hostile
+     * response is a scan of whatever length that peer chose.
+     */
+    private static final int MAX_INTERIM_HEADS = 8;
+
+    /**
+     * The status of the FINAL response in {@code raw}, which is NOT always the
+     * one the transport reported.
+     *
+     * MEASURED, against Burp Suite Community Edition 2026.7.3-52685 on a
+     * 103-then-200 exchange: {@code rr.response().statusCode()} answered
+     * {@code 103}, and {@code rr.response().toByteArray()} carried BOTH heads
+     * -- 275 bytes, interim head first, the real 200 and its body after it. So
+     * Montoya parses the interim head as the response and hands the rest back
+     * as bytes.
+     *
+     * That is fine for redaction, which reads the bytes and which
+     * Redactor.redactResponse already scans head by head. It is not fine for
+     * the status, which is read twice and matters both times: it is the
+     * `status` on the evidence line, and it is what Distress counts 5xx from.
+     * A host that sends `103 Early Hints` ahead of its 500s -- which is
+     * exactly what a CDN in front of a failing origin does -- would otherwise
+     * record fifty 103s, a 0% 5xx rate, and never trip spec s4's auto-halt.
+     *
+     * A 1xx is never the final response (RFC 9110 s15.2), so a reported 1xx is
+     * the one case where the transport's answer can be improved on; anything
+     * else is returned untouched. Nothing here guesses: if the bytes do not
+     * hold a later status line, the reported value stands.
+     */
+    public static int finalStatus(byte[] raw, int reported) {
+        // A null `raw` reaches redactResponse below, which answers it with a
+        // RangeError and a bad_frame. It must not become an NPE here first.
+        if (raw == null || reported < 100 || reported > 199) return reported;
+        String text = new String(raw, StandardCharsets.ISO_8859_1);
+        int i = 0;
+        for (int head = 0; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
+            int eol = text.indexOf('\n', i);
+            if (eol < 0) return reported;
+            int code = statusCodeOf(text.substring(i, eol));
+            if (code < 100) return reported;        // not a status line: stop guessing
+            if (code >= 200) return code;           // the final response
+            // A 1xx head carries no body (RFC 9110 s15.2), so the next head
+            // starts immediately after this one's blank line.
+            int crlf = text.indexOf("\r\n\r\n", i);
+            int lf = text.indexOf("\n\n", i);
+            if (crlf >= 0 && (lf < 0 || crlf <= lf)) i = crlf + 4;
+            else if (lf >= 0) i = lf + 2;
+            else return reported;
+        }
+        return reported;
+    }
+
+    /** The three-digit code of a status line, or -1 for a line that is not
+     *  one. Deliberately strict: a line this cannot read is a line this must
+     *  not report a status from. */
+    private static int statusCodeOf(String line) {
+        String s = line.strip();
+        if (!s.startsWith("HTTP/")) return -1;
+        int sp = s.indexOf(' ');
+        if (sp < 0 || s.length() < sp + 4) return -1;
+        int code = 0;
+        for (int k = sp + 1; k < sp + 4; k++) {
+            char c = s.charAt(k);
+            if (c < '0' || c > '9') return -1;
+            code = code * 10 + (c - '0');
+        }
+        return code;
+    }
+
     /** True when the url this request was authorised under is https. */
     public static boolean secureOf(HxRequest req) {
         return req.url().startsWith("https://");
@@ -14206,6 +14523,8 @@ Restore: `git checkout -- extension/src/hx/send/Sender.java`
 // extension/test/hx/ChokepointTest.java
 package hx;
 
+import hx.TestSupport;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -14236,6 +14555,16 @@ public class ChokepointTest {
         if (!ok) failures++;
     }
 
+    /** The shared per-method guard, as every other class in this suite runs
+     *  its methods. Each check below reads a file: an IOException out of one
+     *  of them would end main() with the rest unrun and NO summary line, and a
+     *  structural test that silently stopped counting is the one failure this
+     *  class could not survive -- it is the only thing asserting there is no
+     *  second egress path. See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(ChokepointTest::check, name, body);
+    }
+
     static final String ENTRY_POINT = Path.of("src", "hx", "HxExtension.java").toString();
 
     public static void main(String[] args) throws Exception {
@@ -14246,12 +14575,15 @@ public class ChokepointTest {
         check("found the extension sources (" + sources.size() + " files)",
               sources.size() >= 8);
 
-        oneEgressPath(sources);
-        noBatchEgressPath(sources);
-        redirectsAreNotFollowed(sources);
-        montoyaIsConfinedToTheEntryPoint(sources);
-        theDeprecatedAccessorsAreUnusedEverywhere(sources);
-        theAuthorisationSnapshotIsReadInExactlyOnePlace(sources);
+        t("oneEgressPath", () -> oneEgressPath(sources));
+        t("noBatchEgressPath", () -> noBatchEgressPath(sources));
+        t("redirectsAreNotFollowed", () -> redirectsAreNotFollowed(sources));
+        t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
+        t("theDeprecatedAccessorsAreUnusedEverywhere",
+          () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
+        t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
+          () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
+        t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -14348,6 +14680,37 @@ public class ChokepointTest {
         for (Path p : sources) total += count(text(p), ".authorisation()");
         check("the whole extension reads the Authorisation snapshot in exactly one "
               + "place, not " + total, total == 1);
+    }
+
+    /**
+     * The four wires that make the send path and its kill paths real, counted
+     * where they are made.
+     *
+     * Nothing can test HxExtension behaviourally -- it needs Burp -- and every
+     * one of these fails SILENTLY. Without setHaltSink a `halt` frame flips
+     * BridgeClient's own flag and stops nothing, because the flag governs
+     * maySend() while the send path asks HaltSwitch: requests keep going out
+     * with both consoles reading "halted". Without start() the sentinel file
+     * is never read and spec s4's third kill path -- the one that works when
+     * the bridge does not -- is missing. Without setHaltNotifier an auto-halt
+     * is invisible until the next send fails, and run.stop_reason is written
+     * from a frame nobody sent. Without setSendHandler every send is refused
+     * `not_configured`, which is at least loud.
+     *
+     * Counting is all this can do, and it is worth more than nothing: the
+     * failure being guarded against is the line being DELETED or never
+     * written, not the line being wrong.
+     */
+    static void everyKillPathIsWiredBeforeTheDial() throws IOException {
+        String entry = text(Path.of(ENTRY_POINT));
+        check("a halt frame is routed to the switch the send path asks ("
+              + count(entry, "setHaltSink(") + ")", count(entry, "setHaltSink(") == 1);
+        check("the sentinel poller is started (" + count(entry, "haltSwitch.start()") + ")",
+              count(entry, "haltSwitch.start()") == 1);
+        check("an auto-halt has somewhere to announce itself ("
+              + count(entry, "setHaltNotifier(") + ")", count(entry, "setHaltNotifier(") == 1);
+        check("and the send path is installed (" + count(entry, "setSendHandler(") + ")",
+              count(entry, "setSendHandler(") == 1);
     }
 
     static int count(String haystack, String needle) {

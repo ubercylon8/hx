@@ -1,0 +1,203 @@
+// extension/test/hx/ChokepointTest.java
+package hx;
+
+import hx.TestSupport;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Stream;
+
+/**
+ * The enforcement invariant, asserted structurally rather than behaviourally.
+ *
+ * Spec s4: "Every byte that leaves this machine crosses exactly one of two
+ * enforcement points... State it, test it, and never add a third egress path."
+ * A behavioural test can only show that the paths it knows about are enforced.
+ * This one counts, over the whole of extension/src, so a path nobody thought
+ * to test cannot exist quietly.
+ *
+ * It reads RAW TEXT, comments included. That is the fail-safe direction: a
+ * comment that spells the egress call makes the count 2 and this test go RED.
+ * If that happens, rewrite the comment -- do not loosen the needle.
+ */
+public class ChokepointTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    /** The shared per-method guard, as every other class in this suite runs
+     *  its methods. Each check below reads a file: an IOException out of one
+     *  of them would end main() with the rest unrun and NO summary line, and a
+     *  structural test that silently stopped counting is the one failure this
+     *  class could not survive -- it is the only thing asserting there is no
+     *  second egress path. See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(ChokepointTest::check, name, body);
+    }
+
+    static final String ENTRY_POINT = Path.of("src", "hx", "HxExtension.java").toString();
+
+    public static void main(String[] args) throws Exception {
+        List<Path> sources = sources();
+        // A walk that matched nothing would make every count below zero, and
+        // "zero occurrences" is what most of these assertions want. The suite
+        // has to prove it looked at something first.
+        check("found the extension sources (" + sources.size() + " files)",
+              sources.size() >= 8);
+
+        t("oneEgressPath", () -> oneEgressPath(sources));
+        t("noBatchEgressPath", () -> noBatchEgressPath(sources));
+        t("redirectsAreNotFollowed", () -> redirectsAreNotFollowed(sources));
+        t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
+        t("theDeprecatedAccessorsAreUnusedEverywhere",
+          () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
+        t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
+          () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
+        t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    /** test.sh runs from extension/, the same cwd CodecTest reads its golden
+     *  vectors from. */
+    static List<Path> sources() throws IOException {
+        try (Stream<Path> s = Files.walk(Path.of("src"))) {
+            return s.filter(p -> p.toString().endsWith(".java")).sorted().toList();
+        }
+    }
+
+    static void oneEgressPath(List<Path> sources) throws IOException {
+        int total = 0;
+        List<String> hits = new ArrayList<>();
+        for (Path p : sources) {
+            int n = count(text(p), "http().sendRequest");
+            total += n;
+            if (n > 0) hits.add(p + " x" + n);
+        }
+        check("the egress call appears exactly once in extension/src, not " + total
+              + " times " + hits, total == 1);
+        check("and it is in " + ENTRY_POINT + ", not " + hits,
+              hits.size() == 1 && hits.get(0).startsWith(ENTRY_POINT));
+    }
+
+    static void noBatchEgressPath(List<Path> sources) throws IOException {
+        int total = 0;
+        for (Path p : sources) total += count(text(p), "sendRequests(");
+        // Montoya's batch call is a second egress path wearing the first one's
+        // name. It was measured working on Community (spec s2), which is
+        // exactly why it needs saying no to in writing: one request per
+        // decision, or Policy is deciding about a list.
+        check("the batch egress call appears nowhere in extension/src (" + total + ")",
+              total == 0);
+    }
+
+    static void redirectsAreNotFollowed(List<Path> sources) throws IOException {
+        int total = 0;
+        for (Path p : sources) total += count(text(p), "RedirectionMode.NEVER");
+        // Spec s4: each hop is a distinct issuance with its own scope decision
+        // and its own exchange row. A redirect followed inside Burp is a
+        // request that never crossed Policy -- a third egress path that looks
+        // exactly like the first.
+        check("the egress call disables redirect following (" + total + ")", total == 1);
+    }
+
+    static void montoyaIsConfinedToTheEntryPoint(List<Path> sources) throws IOException {
+        List<String> importers = new ArrayList<>();
+        for (Path p : sources)
+            if (count(text(p), "import burp.") > 0) importers.add(p.toString());
+        // Stronger than the plan's global constraint, and deliberately so.
+        // With Http as an interface, hx.send.Sender needs no burp.* type at
+        // all -- which is what makes the refusal tests able to count calls.
+        check("burp.* is imported only by " + ENTRY_POINT + ", not by " + importers,
+              importers.equals(List.of(ENTRY_POINT)));
+    }
+
+    /**
+     * Counted WITH the leading dot, so a declaration (`public long
+     * configEpoch()`) and a javadoc cross-reference (`{@link #configEpoch()}`)
+     * do not match. A javadoc that writes `BridgeClient.configEpoch()` with a
+     * dot instead of a `#` will trip this, and that is the correct outcome:
+     * fix the javadoc, do not widen the needle.
+     */
+    static void theDeprecatedAccessorsAreUnusedEverywhere(List<Path> sources) throws IOException {
+        int epoch = 0, scope = 0;
+        for (Path p : sources) {
+            String t = text(p);
+            epoch += count(t, ".configEpoch()");
+            scope += count(t, ".scopeConfig()");
+        }
+        // Two reads of one record, with a commit landing between them:
+        // measured wrong in 393/400 trials, and wrong in the unsafe direction
+        // -- decide under the superseded wider scope, stamp it with the epoch
+        // that narrowed it.
+        check("nothing in extension/src calls the deprecated configEpoch() (" + epoch + ")",
+              epoch == 0);
+        check("nothing in extension/src calls the deprecated scopeConfig() (" + scope + ")",
+              scope == 0);
+    }
+
+    /**
+     * BridgeClient's send arm writes `this.authorisation()` with an explicit
+     * receiver precisely so this count can be taken. A bare `authorisation()`
+     * there reads as zero here and turns this check red -- which is the
+     * correct failure, not a false alarm to be quietened by loosening the
+     * needle.
+     */
+    static void theAuthorisationSnapshotIsReadInExactlyOnePlace(List<Path> sources)
+            throws IOException {
+        int total = 0;
+        for (Path p : sources) total += count(text(p), ".authorisation()");
+        check("the whole extension reads the Authorisation snapshot in exactly one "
+              + "place, not " + total, total == 1);
+    }
+
+    /**
+     * The four wires that make the send path and its kill paths real, counted
+     * where they are made.
+     *
+     * Nothing can test HxExtension behaviourally -- it needs Burp -- and every
+     * one of these fails SILENTLY. Without setHaltSink a `halt` frame flips
+     * BridgeClient's own flag and stops nothing, because the flag governs
+     * maySend() while the send path asks HaltSwitch: requests keep going out
+     * with both consoles reading "halted". Without start() the sentinel file
+     * is never read and spec s4's third kill path -- the one that works when
+     * the bridge does not -- is missing. Without setHaltNotifier an auto-halt
+     * is invisible until the next send fails, and run.stop_reason is written
+     * from a frame nobody sent. Without setSendHandler every send is refused
+     * `not_configured`, which is at least loud.
+     *
+     * Counting is all this can do, and it is worth more than nothing: the
+     * failure being guarded against is the line being DELETED or never
+     * written, not the line being wrong.
+     */
+    static void everyKillPathIsWiredBeforeTheDial() throws IOException {
+        String entry = text(Path.of(ENTRY_POINT));
+        check("a halt frame is routed to the switch the send path asks ("
+              + count(entry, "setHaltSink(") + ")", count(entry, "setHaltSink(") == 1);
+        check("the sentinel poller is started (" + count(entry, "haltSwitch.start()") + ")",
+              count(entry, "haltSwitch.start()") == 1);
+        check("an auto-halt has somewhere to announce itself ("
+              + count(entry, "setHaltNotifier(") + ")", count(entry, "setHaltNotifier(") == 1);
+        check("and the send path is installed (" + count(entry, "setSendHandler(") + ")",
+              count(entry, "setSendHandler(") == 1);
+    }
+
+    static int count(String haystack, String needle) {
+        int n = 0, i = 0;
+        while ((i = haystack.indexOf(needle, i)) >= 0) { n++; i += needle.length(); }
+        return n;
+    }
+
+    static String text(Path p) throws IOException {
+        return Files.readString(p, StandardCharsets.UTF_8);
+    }
+}

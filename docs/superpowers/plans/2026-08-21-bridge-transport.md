@@ -3570,6 +3570,10 @@ public class BridgeClientTest {
             t("haltFramesReachTheSwitchTheSendPathAsks", BridgeClientTest::haltFramesReachTheSwitchTheSendPathAsks);
             t("aHaltFrameWithNoReasonDoesNotDeliverTheWordNull", BridgeClientTest::aHaltFrameWithNoReasonDoesNotDeliverTheWordNull);
             t("aHaltSinkThatThrowsDropsToDenyAll", BridgeClientTest::aHaltSinkThatThrowsDropsToDenyAll);
+            t("theSendArmHandsTheHandlerOneCoherentAuthorisation", BridgeClientTest::theSendArmHandsTheHandlerOneCoherentAuthorisation);
+            t("aSendForAnotherEngagementNeverReachesTheHandler", BridgeClientTest::aSendForAnotherEngagementNeverReachesTheHandler);
+            t("aSendHandlerThatThrowsDropsToDenyAll", BridgeClientTest::aSendHandlerThatThrowsDropsToDenyAll);
+            t("aSendWithNoHandlerInstalledIsRefused", BridgeClientTest::aSendWithNoHandlerInstalledIsRefused);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -4203,6 +4207,155 @@ public class BridgeClientTest {
         }
     }
 
+    static Map<String, Object> sendFrame(String engagement, long id) {
+        Map<String, Object> s = new LinkedHashMap<>();
+        s.put("v", 1L); s.put("t", "send"); s.put("id", id);
+        s.put("deadline_us", System.currentTimeMillis() * 1000L + 30_000_000L);
+        s.put("engagement_id", engagement);
+        s.put("identity_id", null);
+        s.put("target_host", "app.example.test");
+        s.put("target_port", 443L);
+        s.put("tls", true);
+        return s;
+    }
+
+    static final byte[] GET = ("GET /api/orders HTTP/1.1\r\nHost: app.example.test\r\n\r\n")
+            .getBytes(StandardCharsets.UTF_8);
+
+    /** The send arm reads the Authorisation ONCE and hands the whole snapshot
+     *  down. This is the only place in the extension that reads it at all. */
+    static void theSendArmHandsTheHandlerOneCoherentAuthorisation() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendarm");
+        try (Live l = live(dir, "s.sock")) {
+            final List<BridgeClient.Authorisation> seen = new ArrayList<>();
+            l.client.setSendHandler((h, b, auth) -> {
+                seen.add(auth);
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("v", 1L); r.put("t", "result"); r.put("id", h.get("id"));
+                r.put("status", 200L); r.put("outcome", "ok");
+                r.put(BridgeClient.BODY_KEY,
+                      "HTTP/1.1 200 OK\r\n\r\nhi".getBytes(StandardCharsets.UTF_8));
+                return r;
+            });
+
+            l.out.write(Frame.encode(sendFrame("e-1", 11L), GET));
+            l.out.flush();
+            // Through this class's deadline wrapper, not a bare reader.read():
+            // a send arm that answers nothing parks here forever, and a class
+            // that prints no summary line reads as zero failures.
+            Frame.Decoded result = read(l.reader, l.peer, "the result frame");
+
+            check("the send arm answers with the handler's frame",
+                  "result".equals(result.header.get("t")));
+            check("the handler saw the request body",
+                  Long.valueOf(11L).equals(result.header.get("id")));
+            check("the reserved body key never reaches the wire",
+                  !result.header.containsKey(BridgeClient.BODY_KEY));
+            check("and its bytes became the frame body",
+                  "HTTP/1.1 200 OK\r\n\r\nhi".equals(
+                          new String(result.body, StandardCharsets.UTF_8)));
+            check("the handler was given exactly one Authorisation", seen.size() == 1);
+            check("with the acked epoch", seen.get(0).epoch() == 1L);
+            check("and the scope that epoch authorised",
+                  seen.get(0).scope().toString().contains("WIDE"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("s.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** s6: every send carries engagement_id and the extension refuses a
+     *  mismatch -- before the handler, which would otherwise decide about a
+     *  request belonging to somebody else's engagement. */
+    static void aSendForAnotherEngagementNeverReachesTheHandler() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendmismatch");
+        try (Live l = live(dir, "m.sock")) {
+            final int[] calls = {0};
+            l.client.setSendHandler((h, b, auth) -> { calls[0]++; return new LinkedHashMap<>(); });
+
+            l.out.write(Frame.encode(sendFrame("SOMEONE-ELSE", 12L), GET));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the engagement-mismatch error");
+
+            check("a send for another engagement is answered with an error",
+                  "error".equals(err.header.get("t")));
+            check("the class names the mismatch",
+                  "engagement_mismatch".equals(err.header.get("class")));
+            check("and the handler was never called (" + calls[0] + ")", calls[0] == 0);
+            check("the connection survives a mismatched send", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("m.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** An exception is never an implicit allow. A handler that throws is
+     *  answered, then the client drops to DENY-ALL and closes. */
+    static void aSendHandlerThatThrowsDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendthrow");
+        try (Live l = live(dir, "t.sock")) {
+            check("live before the throw", l.client.maySend());
+            l.client.setSendHandler((h, b, auth) -> {
+                throw new IllegalStateException("policy table was null");
+            });
+
+            l.out.write(Frame.encode(sendFrame("e-1", 13L), GET));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the internal-failure error");
+
+            check("a throwing handler still answers the caller",
+                  "error".equals(err.header.get("t")));
+            check("with a class rather than a silent bridge_lost",
+                  "not_configured".equals(err.header.get("class")));
+            check("and the detail names the failure",
+                  String.valueOf(err.header.get("detail")).contains("policy table was null"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a send path that threw drops to DENY-ALL", !l.client.maySend());
+            check("and the transition is logged",
+                  l.log.sawError("send handler threw"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("t.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** No handler is a state, not an exemption. */
+    static void aSendWithNoHandlerInstalledIsRefused() throws Exception {
+        Path dir = Files.createTempDirectory("hxnohandler");
+        try (Live l = live(dir, "n.sock")) {
+            l.out.write(Frame.encode(sendFrame("e-1", 14L), GET));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the no-handler error");
+            check("a send with no handler is refused",
+                  "error".equals(err.header.get("t"))
+                  && "not_configured".equals(err.header.get("class")));
+
+            // The input that separates the guard from its absence, and the
+            // class alone is not it: delete the null check and h.handle()
+            // NPEs, the send arm's catch answers the SAME not_configured
+            // class, and the two are indistinguishable from the error frame --
+            // measured green across all nine classes. What differs is what
+            // happens next. The catch drops to DENY-ALL and closes; the guard
+            // refuses one send and leaves a live client that a handler can
+            // still be installed on, which is what "a state, not an exemption"
+            // means.
+            l.client.setSendHandler((h, b, auth) -> {
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("v", 1L); r.put("t", "result"); r.put("id", h.get("id"));
+                r.put("status", 200L); r.put("outcome", "ok");
+                return r;
+            });
+            l.out.write(Frame.encode(sendFrame("e-1", 15L), GET));
+            l.out.flush();
+            Frame.Decoded then = read(l.reader, l.peer, "the result once a handler is installed");
+            check("a missing handler is not a bridge failure: the client is still live",
+                  l.client.maySend());
+            check("and the handler installed afterwards answers",
+                  "result".equals(then.header.get("t"))
+                  && Long.valueOf(15L).equals(then.header.get("id")));
+        } finally {
+            Files.deleteIfExists(dir.resolve("n.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
     static final byte[] CFG =
             "scope.include\thttps://RACE/*\n".getBytes(StandardCharsets.UTF_8);
 
@@ -4271,6 +4424,74 @@ public final class BridgeClient {
     public interface Log {
         void info(String s);
         void error(String s);
+    }
+
+    /** The reserved key a SendHandler puts the redacted response body under.
+     *  It cannot travel in a flat JSON header, and Json.write refuses a byte[]
+     *  -- so a framer that forgets the remove() below throws JsonError rather
+     *  than quietly writing a result frame with the evidence missing. */
+    public static final String BODY_KEY = "@body";
+
+    /**
+     * What answers a `send` frame. Sender.issue has this shape; it is a
+     * functional interface so HxExtension can install it as a lambda, which
+     * keeps hx.send.Sender free of any declared dependency on this class
+     * beyond the Authorisation record it is handed.
+     */
+    @FunctionalInterface
+    public interface SendHandler {
+        Map<String, Object> handle(Map<String, Object> header, byte[] body, Authorisation auth);
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile SendHandler sendHandler;
+
+    /** Install the send path. Called before connect(): a client that is live
+     *  with no handler answers every send `not_configured`, which is correct
+     *  but useless. */
+    public void setSendHandler(SendHandler h) { this.sendHandler = h; }
+
+    /**
+     * The unsolicited stop frame, burp -> py.
+     *
+     * Spec s6: auto-halt is extension-initiated, so there is no outstanding id
+     * to answer. This is a push, not a reply, and it is the only way the
+     * harness learns of a stop before the next send fails -- which matters
+     * because `run.status = 'aborted'` needs a stop_reason, and the only place
+     * that reason exists is the extension that decided to stop.
+     */
+    public interface HaltNotifier {
+        void halted(String reason, String host, String window);
+    }
+
+    /**
+     * A notifier that frames {v, t:"halted", reason, host, window} and writes
+     * it down the socket.
+     *
+     * The three fields are what the harness needs to write one row: the
+     * reason, the host that produced it, and the window it was measured over
+     * -- "5xx rate 0.40" is not an explanation without the last of those.
+     */
+    public HaltNotifier haltNotifier() {
+        return (reason, host, window) -> {
+            Map<String, Object> f = new LinkedHashMap<>();
+            f.put("v", PROTOCOL_VERSION);
+            f.put("t", "halted");
+            f.put("reason", reason);
+            f.put("host", host);
+            f.put("window", window);
+            try {
+                send(f, new byte[0]);
+            } catch (IOException e) {
+                // The stop could not be delivered, so nothing on the far side
+                // will record it. A peer that cannot be told we stopped is a
+                // peer we have no authorisation from either: DENY-ALL is where
+                // an undelivered stop lands.
+                log.error("hx: halted frame undeliverable, deny-all: " + e);
+                denyAll();
+            }
+        };
     }
 
     /**
@@ -4555,6 +4776,48 @@ public final class BridgeClient {
                 ack.put("config_epoch", epoch);
                 send(ack, new byte[0]);
             }
+            case "send" -> {
+                if (!engagementId.equals(f.header.get("engagement_id"))) {
+                    // s6: every send carries it and the extension refuses a
+                    // mismatch. Client A's bytes must never reach client B's
+                    // report, and this is the cheapest place to say so.
+                    error(f, "engagement_mismatch",
+                          "send names engagement " + f.header.get("engagement_id")
+                          + " but this extension serves " + engagementId);
+                    return true;
+                }
+                SendHandler h = sendHandler;
+                if (h == null) {
+                    // "Nothing is wired up yet" is a state, not an exemption.
+                    error(f, "not_configured", "no send handler is installed");
+                    return true;
+                }
+                Map<String, Object> reply;
+                try {
+                    // ONE read of the snapshot per decision, carried down as a
+                    // parameter. The explicit receiver below is load-bearing:
+                    // ChokepointTest counts the snapshot read across
+                    // extension/src and expects exactly one, and it counts the
+                    // dotted form -- a bare call here reads as zero. Write it
+                    // with `this.` and leave it that way.
+                    reply = h.handle(f.header, f.body, this.authorisation());
+                } catch (Throwable ex) {
+                    // An exception is never an implicit allow. Answer the
+                    // caller so it gets an error class instead of a silent
+                    // bridge_lost, then drop to DENY-ALL and close: a send path
+                    // that threw is a send path we no longer understand, and
+                    // the terminal state is the only honest place to be.
+                    //
+                    // `ex`, not `t`: handle() already has a String t, the
+                    // frame type it switched on.
+                    log.error("hx: send handler threw, deny-all: " + ex);
+                    error(f, "not_configured", "send path failed internally: " + ex);
+                    denyAll();
+                    return false;
+                }
+                Object raw = reply.remove(BODY_KEY);
+                send(reply, raw instanceof byte[] b ? b : new byte[0]);
+            }
             case "halt" -> {
                 // NOT String.valueOf(): for an absent key that answers the
                 // four-character string "null", which is neither null nor
@@ -4635,67 +4898,16 @@ public final class BridgeClient {
 
 - [ ] **Step 4: Write `HxExtension.java`**
 
-```java
-// extension/src/hx/HxExtension.java
-package hx;
+The Burp entry point: read `-Dhx.socket`, `-Dhx.engagement` and
+`-Dhx.instance` from system properties, build a `BridgeClient`, dial on a
+daemon thread, and close it from an unloading handler.
 
-import burp.api.montoya.BurpExtension;
-import burp.api.montoya.MontoyaApi;
-import hx.bridge.BridgeClient;
-
-import java.nio.file.Path;
-
-/**
- * Burp entry point. Reads its socket path, engagement id and instance id from
- * system properties so the harness controls them at launch, then dials in on a
- * background thread and stays in DENY-ALL until configured.
- */
-public class HxExtension implements BurpExtension {
-
-    // Written on Burp's initialize thread, read by the unloading handler on
-    // another -- the same cross-thread edge the bridge's own fields were fixed
-    // for. Read it ONCE into a local there too: `if (client != null)
-    // client.close()` races itself, NPEs inside the handler, and skips the
-    // close() that was the point of the handler.
-    private volatile BridgeClient client;
-
-    @Override
-    public void initialize(MontoyaApi api) {
-        api.extension().setName("hx bridge");
-
-        String sock = System.getProperty("hx.socket");
-        String engagement = System.getProperty("hx.engagement");
-        String instance = System.getProperty("hx.instance", "unknown");
-
-        if (sock == null || engagement == null) {
-            api.logging().logToError(
-                "hx: -Dhx.socket and -Dhx.engagement are required; extension idle");
-            return;
-        }
-        System.setProperty("hx.burp.version", api.burpSuite().version().toString());
-
-        client = new BridgeClient(Path.of(sock), engagement, instance, new BridgeClient.Log() {
-            public void info(String s)  { api.logging().logToOutput(s); }
-            public void error(String s) { api.logging().logToError(s); }
-        });
-        Thread t = new Thread(() -> {
-            try {
-                client.connect();
-            } catch (Exception e) {
-                api.logging().logToError("hx: bridge connect failed: " + e);
-            }
-        }, "hx-bridge");
-        t.setDaemon(true);
-        t.start();
-
-        api.extension().registerUnloadingHandler(() -> {
-            BridgeClient c = client;
-            if (c != null) c.close();
-        });
-        api.logging().logToOutput("hx: bridge dialling " + sock);
-    }
-}
-```
+The file itself is not reproduced here. Task 6 of
+`2026-08-22-enforcement-send-path.md` rewrites it to construct the send path,
+and that plan carries the full file; `tests/test_plan_matches_repo.py`
+byte-compares every block against the file it names, so a second copy here
+could only ever be a duplicate to keep in step or a lie about what the file
+now contains.
 
 - [ ] **Step 5: Run to verify it passes**
 

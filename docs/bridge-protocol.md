@@ -45,14 +45,38 @@ characters JSON requires are escaped: `"` `\\` and the control characters.
   py -> burp   configure   {v,t,id,deadline_us,engagement_id,scope_sha256,profile}
                            body: config lines (below)
   burp -> py   configured  {v,t,id,config_epoch}
-  py -> burp   send        {v,t,id,deadline_us,identity_id,target_host,target_port,tls}
+  py -> burp   send        {v,t,id,deadline_us,engagement_id,identity_id,target_host,target_port,tls}
                            body: raw HTTP request bytes
-  burp -> py   result      {v,t,id,exchange_id,status,bytes,ms,outcome}
-                           body: raw HTTP response bytes
+  burp -> py   result      {v,t,id,status,bytes,ms,outcome,config_epoch}
+                           body: redacted raw HTTP response bytes
   burp -> py   error       {v,t,id,class,detail}
+  burp -> py   halted      {v,t,reason,host,window}   unsolicited; no id.
   burp -> py   exchange    {v,t,...}   unsolicited; no id. Defined in a later plan.
   py -> burp   halt        {v,t,id,deadline_us,reason}
   py -> burp   resume      {v,t,id,deadline_us}
+
+`send.engagement_id` is required. The extension serves exactly one engagement
+and refuses a send that names another with class `engagement_mismatch`, before
+the request is decided about at all: one client's bytes must never reach
+another client's report, and two harnesses sharing a Burp is the way that
+happens.
+
+`result.config_epoch` is the epoch of the Authorisation the request was
+decided under, read in one shot with the scope that epoch granted. It is the
+answer to "what was in scope when request X was issued", and it has to come
+from the same read as the decision or it is not an answer at all.
+
+`exchange_id` is NOT on this frame. It is a store row id, assigned by
+`record_exchange()` on the Python side; the extension has none to give.
+
+`halted` is UNSOLICITED and carries no `id`. An auto-halt is decided by the
+extension -- a host in distress -- so there is no outstanding request to answer
+with it, and without this frame the stop is invisible until the next `send`
+fails. `reason` and `host` are what tripped and where; `window` is what it was
+measured over, because "5xx rate 40%" is not an explanation without it.
+`run.status = 'aborted'` is written from these three, and they exist nowhere
+else. A halt an operator asked for needs no such frame: that one already had a
+`halt` frame to answer.
 
 ## Config body format
 

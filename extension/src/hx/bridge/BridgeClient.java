@@ -37,6 +37,74 @@ public final class BridgeClient {
         void error(String s);
     }
 
+    /** The reserved key a SendHandler puts the redacted response body under.
+     *  It cannot travel in a flat JSON header, and Json.write refuses a byte[]
+     *  -- so a framer that forgets the remove() below throws JsonError rather
+     *  than quietly writing a result frame with the evidence missing. */
+    public static final String BODY_KEY = "@body";
+
+    /**
+     * What answers a `send` frame. Sender.issue has this shape; it is a
+     * functional interface so HxExtension can install it as a lambda, which
+     * keeps hx.send.Sender free of any declared dependency on this class
+     * beyond the Authorisation record it is handed.
+     */
+    @FunctionalInterface
+    public interface SendHandler {
+        Map<String, Object> handle(Map<String, Object> header, byte[] body, Authorisation auth);
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile SendHandler sendHandler;
+
+    /** Install the send path. Called before connect(): a client that is live
+     *  with no handler answers every send `not_configured`, which is correct
+     *  but useless. */
+    public void setSendHandler(SendHandler h) { this.sendHandler = h; }
+
+    /**
+     * The unsolicited stop frame, burp -> py.
+     *
+     * Spec s6: auto-halt is extension-initiated, so there is no outstanding id
+     * to answer. This is a push, not a reply, and it is the only way the
+     * harness learns of a stop before the next send fails -- which matters
+     * because `run.status = 'aborted'` needs a stop_reason, and the only place
+     * that reason exists is the extension that decided to stop.
+     */
+    public interface HaltNotifier {
+        void halted(String reason, String host, String window);
+    }
+
+    /**
+     * A notifier that frames {v, t:"halted", reason, host, window} and writes
+     * it down the socket.
+     *
+     * The three fields are what the harness needs to write one row: the
+     * reason, the host that produced it, and the window it was measured over
+     * -- "5xx rate 0.40" is not an explanation without the last of those.
+     */
+    public HaltNotifier haltNotifier() {
+        return (reason, host, window) -> {
+            Map<String, Object> f = new LinkedHashMap<>();
+            f.put("v", PROTOCOL_VERSION);
+            f.put("t", "halted");
+            f.put("reason", reason);
+            f.put("host", host);
+            f.put("window", window);
+            try {
+                send(f, new byte[0]);
+            } catch (IOException e) {
+                // The stop could not be delivered, so nothing on the far side
+                // will record it. A peer that cannot be told we stopped is a
+                // peer we have no authorisation from either: DENY-ALL is where
+                // an undelivered stop lands.
+                log.error("hx: halted frame undeliverable, deny-all: " + e);
+                denyAll();
+            }
+        };
+    }
+
     /**
      * Where `halt` and `resume` frames land: the switch the SEND PATH asks.
      *
@@ -318,6 +386,48 @@ public final class BridgeClient {
                 // fact acknowledged under epoch N.
                 ack.put("config_epoch", epoch);
                 send(ack, new byte[0]);
+            }
+            case "send" -> {
+                if (!engagementId.equals(f.header.get("engagement_id"))) {
+                    // s6: every send carries it and the extension refuses a
+                    // mismatch. Client A's bytes must never reach client B's
+                    // report, and this is the cheapest place to say so.
+                    error(f, "engagement_mismatch",
+                          "send names engagement " + f.header.get("engagement_id")
+                          + " but this extension serves " + engagementId);
+                    return true;
+                }
+                SendHandler h = sendHandler;
+                if (h == null) {
+                    // "Nothing is wired up yet" is a state, not an exemption.
+                    error(f, "not_configured", "no send handler is installed");
+                    return true;
+                }
+                Map<String, Object> reply;
+                try {
+                    // ONE read of the snapshot per decision, carried down as a
+                    // parameter. The explicit receiver below is load-bearing:
+                    // ChokepointTest counts the snapshot read across
+                    // extension/src and expects exactly one, and it counts the
+                    // dotted form -- a bare call here reads as zero. Write it
+                    // with `this.` and leave it that way.
+                    reply = h.handle(f.header, f.body, this.authorisation());
+                } catch (Throwable ex) {
+                    // An exception is never an implicit allow. Answer the
+                    // caller so it gets an error class instead of a silent
+                    // bridge_lost, then drop to DENY-ALL and close: a send path
+                    // that threw is a send path we no longer understand, and
+                    // the terminal state is the only honest place to be.
+                    //
+                    // `ex`, not `t`: handle() already has a String t, the
+                    // frame type it switched on.
+                    log.error("hx: send handler threw, deny-all: " + ex);
+                    error(f, "not_configured", "send path failed internally: " + ex);
+                    denyAll();
+                    return false;
+                }
+                Object raw = reply.remove(BODY_KEY);
+                send(reply, raw instanceof byte[] b ? b : new byte[0]);
             }
             case "halt" -> {
                 // NOT String.valueOf(): for an absent key that answers the
