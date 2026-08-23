@@ -20,6 +20,7 @@ CLASSES=(
     hx.policy.PolicyTest
     hx.policy.LimiterTest
     hx.policy.DistressTest
+    hx.send.RedactorTest
 )
 
 # Every class runs, whatever the ones before it did, and the run still exits
