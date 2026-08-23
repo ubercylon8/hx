@@ -377,6 +377,7 @@ public class PolicyTest {
         theRawPathIsAReadingInItsOwnRight();
         aPatternIsReadEveryWayAPathIs();
         aTargetTooBigToDecideAboutIsRefused();
+        aReadingSetOverTheLimitIsRefused();
         aLegitimatelyEncodedPathIsStillAllowed();
         aTrailingSlashIsNotNewlyRefused();
         aPathOfOnlySlashesDoesNotThrow();
@@ -1780,6 +1781,74 @@ public class PolicyTest {
     }
 
     /**
+     * Round 4's report measured a shape whose reading set is 425 members and
+     * costs decide() 406 ms -- bounded by MAX_TARGET_CHARS but only reported,
+     * not refused: "it degrades hx rather than bypassing it ... if you want it
+     * bounded, the honest form is a scope_denied on the reading count." Ruled:
+     * bound it, as a denial, never a truncation. Truncating fails OPEN in both
+     * directions for the same reason the deny-OR/allow-AND split does -- a
+     * deny rule that stops early may never reach the truncated member that
+     * would have matched, an allow rule that stops early may never reach the
+     * one that would have failed coverage -- so refusing the target outright
+     * is the only answer safe regardless of which unchecked reading mattered.
+     *
+     * The two fixtures below were found by local search (a hill-climb over the
+     * same trigger alphabet the closure fuzz test uses, not committed here)
+     * rather than computed from a formula: readings() does not grow by one per
+     * character appended, so landing on an EXACT count at the boundary means
+     * searching for it.
+     */
+    static void aReadingSetOverTheLimitIsRefused() {
+        Policy p = allowingPolicy();
+
+        String atLimit =
+                "/%ef%bc%8e%2eb%3b%2f;%5c%2f%ef%bc%8e ..\\%ef%bc%bcax ;. "
+              + "%2e%ef%bc%9b %ef%bc%8e%3b %c0%ae%5c%ef%bc%bc /";
+        String overLimit =
+                "/%00/x%c0%afabb%bc%9b%c0.a..%ef%bc%8f%2e\\%3b%ef%bc%8e %c0%ef;"
+              + "%ef%bc%bc%5c%2e/%c0%af%bc%20 %ef%bc%8ea%ef%bc%8e%5c%c0%ae%00%c0%af%2e";
+
+        check("the fixture at the limit has exactly MAX_READINGS readings ("
+              + Policy.readings(atLimit).size() + ")",
+              Policy.readings(atLimit).size() == Policy.MAX_READINGS);
+        check("the fixture one over has exactly MAX_READINGS + 1 ("
+              + Policy.readings(overLimit).size() + ")",
+              Policy.readings(overLimit).size() == Policy.MAX_READINGS + 1);
+
+        allows("a path with exactly MAX_READINGS readings is decided, not refused for its size", p,
+               req("GET", "https://app.example.test" + atLimit,
+                   "app.example.test", atLimit, ""),
+               APP);
+
+        Decision d = p.decide(
+                req("GET", "https://app.example.test" + overLimit,
+                    "app.example.test", overLimit, ""), APP);
+        check("one reading over the limit is scope_denied (got "
+              + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
+              !d.allowed() && "scope_denied".equals(d.errorClass()));
+        check("...and the denial names the limit and the count, distinguishable "
+              + "from an ordinary scope miss: " + d.detail(),
+              d.detail() != null
+              && d.detail().contains(String.valueOf(Policy.MAX_READINGS))
+              && d.detail().contains(String.valueOf(Policy.MAX_READINGS + 1))
+              && d.detail().contains("readings"));
+
+        // A realistic path carrying several triggers at once -- every
+        // transform this class knows about, firing in one segment -- has to
+        // stay far below the bound, or the bound starts refusing traffic it
+        // was never aimed at.
+        String realistic = "/a;b\\c. /d";
+        int realisticReadings = Policy.readings(realistic).size();
+        check("a realistic multi-trigger path is far below the bound ("
+              + realisticReadings + " readings, limit " + Policy.MAX_READINGS + ")",
+              realisticReadings * 4 < Policy.MAX_READINGS);
+        allows("and it is decided normally, not refused for its size", p,
+               req("GET", "https://app.example.test" + realistic,
+                   "app.example.test", realistic, ""),
+               APP);
+    }
+
+    /**
      * Canonicalisation must not become a denylist of its own. Percent-encoding
      * is ordinary and legitimate -- a space in a filename is the common case --
      * and an operator whose scope covers the directory has scoped the file.
@@ -2549,6 +2618,17 @@ public final class Policy {
         // outright, so an encoded authority never reaches a comparison.
         Set<String> pathReadings = readings(t.path());
 
+        // MAX_READINGS: refuse rather than pay to match every rule, and every
+        // dangerous.path pattern still to come, against a reading set that has
+        // exploded. See its comment for the measurements the bound is picked
+        // from. Checked here, the moment the count is known and before either
+        // rule loop below or the dangerous.path loop later in decide() runs a
+        // single glob against it.
+        if (pathReadings.size() > MAX_READINGS)
+            return Decision.deny("scope_denied", "request path has "
+                    + pathReadings.size() + " readings, over the " + MAX_READINGS
+                    + " this can decide about");
+
         // Exclude first: an exclusion is the operator naming something they
         // know they must not touch, and it beats every include it overlaps.
         for (Rule r : excludes)
@@ -2599,16 +2679,14 @@ public final class Policy {
      * could find, an 8192-character path whose reading set is 425 members. The
      * ordinary path stays at ~2 us.
      *
-     * That last number is the honest ceiling and it is worth stating plainly:
-     * this bound is what makes it a ceiling at all. The cost is quadratic-ish
-     * in the length -- more characters mean both longer readings and more of
-     * them -- so the length bound is the only thing standing between a send
-     * frame and an arbitrarily long decision. 406 ms of one thread, against a
-     * rate limiter measured in single-digit requests per second, degrades hx
-     * rather than bypassing it; it is not the 143 seconds this bound was
-     * introduced for. Truncating the reading set instead would be worse than
-     * the cost: fewer readings means fewer deny matches AND easier include
-     * coverage, so it fails open in both directions.
+     * That number was, for one round, the honest ceiling rather than an
+     * enforced one -- reported in this comment and left unbounded, on the
+     * argument that it degrades hx rather than bypassing it and that
+     * truncating the reading set would be a worse fix than the cost. Both
+     * halves of that argument still hold; what changed is that "reported but
+     * not enforced" is itself a choice, and the honest one is a denial on the
+     * count, not a shrug at 406 ms. See MAX_READINGS, just below, for the
+     * bound and the reasoning for it.
      *
      * Hardcoded, not a config key: a key means a ConfigBody.KEYS change, which
      * is a change to the wire protocol between the agent and the extension --
@@ -2626,12 +2704,70 @@ public final class Policy {
     static final int MAX_DECODE_ROUNDS = 16;
 
     /**
+     * The most readings a path may have before checkScope refuses it outright,
+     * rather than pay to match every rule against every one of them.
+     *
+     * MEASURED, not guessed, in both directions. Real traffic -- the
+     * before/after fixtures this task's fix rounds accumulated, every escape,
+     * separator, dot-segment and trim trigger this class knows about, several
+     * to a path -- tops out at 12 to 16 readings; `/a;b\c. /d`, one segment
+     * carrying every transform at once, is 7. The pathological end: a
+     * 600,000-sample search over an alphabet that includes the best-fit
+     * homoglyphs found a 128-character shape whose reading set is 425
+     * members, and an independent 300,000-sample search run for this bound
+     * found a 121-character shape reaching 261 on its own. 64 is roughly 4x
+     * the real ceiling and comfortably under a sixth of the smaller of the two
+     * pathological figures -- headroom in both directions, not a number
+     * squeezed between them.
+     *
+     * It is a DENIAL, and it has to be: the alternative anyone reaches for
+     * first is truncating the set at N members, and truncating fails OPEN
+     * both ways a denial cannot. A deny rule that stops looking early may
+     * never reach the one truncated member that would have matched, so an
+     * exclusion silently stops covering a path it used to. An allow rule that
+     * stops early may never reach the one member that would have failed
+     * coverage, so an include silently authorises a request one of its
+     * readings does not actually name. Refusing the target outright has
+     * neither failure: nothing is allowed on a reading nobody checked, and
+     * nothing is denied on one either -- the request is simply refused, which
+     * is the one answer that is safe regardless of which unchecked reading
+     * would have mattered. A target whose readings explode past what real
+     * traffic needs is not a legitimate caller's request in the first place.
+     *
+     * WHY THIS STOPS THE COST rather than merely bounding it: `decide()` was
+     * measured at 406 ms on the worst input the original search found, and the
+     * expense is almost entirely the nested loop that follows -- every
+     * dangerous.path pattern against every reading of the target. Refusing
+     * here, the moment the count is known, means that loop is never reached at
+     * all; the only unavoidable cost is building the set once to learn its
+     * size, which this class already had to pay to decide anything. Measured
+     * end to end, same machine, on the 8192-character tiling of the
+     * independent search's 121-character shape (261 readings): `decide()`
+     * costs 19 ms and returns `scope_denied` naming the count, instead of
+     * 406 ms of dangerous.path matching that never runs. The ordinary paths
+     * this bound must not touch are unaffected: the hot path `/api/orders`
+     * stays at 2.4 us and `/files/annual%20report.pdf` at 3.9 us, both within
+     * measurement noise of their pre-bound numbers.
+     *
+     * Hardcoded for the same reason MAX_TARGET_CHARS is: a config key is a
+     * wire-protocol change, and this number is a property of the matching
+     * algorithm, not of an engagement.
+     */
+    static final int MAX_READINGS = 64;
+
+    /**
      * The denial for a request too long or too deeply encoded to decide about,
      * or null when there is none.
      *
      * `scope_denied` because scope is the first rule about the request itself,
      * so this keeps the pinned order intact, and because it is true: a request
      * whose readings cannot be computed has not been shown to be in scope.
+     *
+     * This is the bound on the INPUT; MAX_READINGS, checked once the reading
+     * set is actually built, is the bound on what that input turned into. The
+     * two catch different things -- a merely long path does not necessarily
+     * read many ways, and the 121-character shape that reaches 261 readings is
+     * nowhere near MAX_TARGET_CHARS.
      */
     private static Decision undecidable(HxRequest req) {
         int size = req.path().length() + req.query().length();

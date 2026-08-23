@@ -62,6 +62,7 @@ public class PolicyTest {
         theRawPathIsAReadingInItsOwnRight();
         aPatternIsReadEveryWayAPathIs();
         aTargetTooBigToDecideAboutIsRefused();
+        aReadingSetOverTheLimitIsRefused();
         aLegitimatelyEncodedPathIsStillAllowed();
         aTrailingSlashIsNotNewlyRefused();
         aPathOfOnlySlashesDoesNotThrow();
@@ -1462,6 +1463,74 @@ public class PolicyTest {
         check("a 20 KB nested path is refused (" + (d.allowed() ? "ALLOWED" : d.errorClass())
               + ") in " + ms + " ms",
               !d.allowed() && "scope_denied".equals(d.errorClass()) && ms < 100);
+    }
+
+    /**
+     * Round 4's report measured a shape whose reading set is 425 members and
+     * costs decide() 406 ms -- bounded by MAX_TARGET_CHARS but only reported,
+     * not refused: "it degrades hx rather than bypassing it ... if you want it
+     * bounded, the honest form is a scope_denied on the reading count." Ruled:
+     * bound it, as a denial, never a truncation. Truncating fails OPEN in both
+     * directions for the same reason the deny-OR/allow-AND split does -- a
+     * deny rule that stops early may never reach the truncated member that
+     * would have matched, an allow rule that stops early may never reach the
+     * one that would have failed coverage -- so refusing the target outright
+     * is the only answer safe regardless of which unchecked reading mattered.
+     *
+     * The two fixtures below were found by local search (a hill-climb over the
+     * same trigger alphabet the closure fuzz test uses, not committed here)
+     * rather than computed from a formula: readings() does not grow by one per
+     * character appended, so landing on an EXACT count at the boundary means
+     * searching for it.
+     */
+    static void aReadingSetOverTheLimitIsRefused() {
+        Policy p = allowingPolicy();
+
+        String atLimit =
+                "/%ef%bc%8e%2eb%3b%2f;%5c%2f%ef%bc%8e ..\\%ef%bc%bcax ;. "
+              + "%2e%ef%bc%9b %ef%bc%8e%3b %c0%ae%5c%ef%bc%bc /";
+        String overLimit =
+                "/%00/x%c0%afabb%bc%9b%c0.a..%ef%bc%8f%2e\\%3b%ef%bc%8e %c0%ef;"
+              + "%ef%bc%bc%5c%2e/%c0%af%bc%20 %ef%bc%8ea%ef%bc%8e%5c%c0%ae%00%c0%af%2e";
+
+        check("the fixture at the limit has exactly MAX_READINGS readings ("
+              + Policy.readings(atLimit).size() + ")",
+              Policy.readings(atLimit).size() == Policy.MAX_READINGS);
+        check("the fixture one over has exactly MAX_READINGS + 1 ("
+              + Policy.readings(overLimit).size() + ")",
+              Policy.readings(overLimit).size() == Policy.MAX_READINGS + 1);
+
+        allows("a path with exactly MAX_READINGS readings is decided, not refused for its size", p,
+               req("GET", "https://app.example.test" + atLimit,
+                   "app.example.test", atLimit, ""),
+               APP);
+
+        Decision d = p.decide(
+                req("GET", "https://app.example.test" + overLimit,
+                    "app.example.test", overLimit, ""), APP);
+        check("one reading over the limit is scope_denied (got "
+              + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
+              !d.allowed() && "scope_denied".equals(d.errorClass()));
+        check("...and the denial names the limit and the count, distinguishable "
+              + "from an ordinary scope miss: " + d.detail(),
+              d.detail() != null
+              && d.detail().contains(String.valueOf(Policy.MAX_READINGS))
+              && d.detail().contains(String.valueOf(Policy.MAX_READINGS + 1))
+              && d.detail().contains("readings"));
+
+        // A realistic path carrying several triggers at once -- every
+        // transform this class knows about, firing in one segment -- has to
+        // stay far below the bound, or the bound starts refusing traffic it
+        // was never aimed at.
+        String realistic = "/a;b\\c. /d";
+        int realisticReadings = Policy.readings(realistic).size();
+        check("a realistic multi-trigger path is far below the bound ("
+              + realisticReadings + " readings, limit " + Policy.MAX_READINGS + ")",
+              realisticReadings * 4 < Policy.MAX_READINGS);
+        allows("and it is decided normally, not refused for its size", p,
+               req("GET", "https://app.example.test" + realistic,
+                   "app.example.test", realistic, ""),
+               APP);
     }
 
     /**
