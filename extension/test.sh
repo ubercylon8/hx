@@ -14,3 +14,4 @@ java -cp "build/test-classes:$MONTOYA" hx.bridge.CodecTest
 java -cp "build/test-classes:$MONTOYA" hx.bridge.BridgeClientTest
 java -cp "build/test-classes:$MONTOYA" hx.policy.PolicyTest
 java -cp "build/test-classes:$MONTOYA" hx.policy.LimiterTest
+java -cp "build/test-classes:$MONTOYA" hx.policy.DistressTest
