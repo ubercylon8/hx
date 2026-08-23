@@ -384,12 +384,37 @@ public final class Sender {
     }
 
     /**
-     * How many heads a peer may put in front of the final one before this
-     * gives up and reports what the transport said. RFC 9110 s15.2 puts no
-     * ceiling on interim responses, and an unbounded scan of a hostile
-     * response is a scan of whatever length that peer chose.
+     * How many heads this will read before it gives up, counting the final one.
+     * RFC 9110 s15.2 puts no ceiling on interim responses, and an unbounded
+     * scan of a hostile response is a scan of whatever length that peer chose.
+     *
+     * So the tolerated number of INTERIM heads is one less than this: seven,
+     * because the eighth iteration is the one that has to read the final head.
+     * An earlier version of this javadoc said "how many heads a peer may put in
+     * front of the final one", which reads as eight and was wrong -- measured,
+     * 7 interim heads then a 500 answers 500 and 8 then a 500 does not.
+     * SenderTest pins both sides, so this number cannot be changed silently in
+     * either direction.
      */
-    private static final int MAX_INTERIM_HEADS = 8;
+    static final int MAX_INTERIM_HEADS = 8;
+
+    /**
+     * What an exhausted scan reports: a status Distress counts as an error.
+     *
+     * 599 is not a status any peer sent, and that is the point -- the
+     * alternative is worse in the one direction this whole function exists to
+     * close. When the scan runs out of budget the reported status is still the
+     * INTERIM 1xx, and returning it would hand Distress a healthy sample for a
+     * response whose real status we could not read: a peer that chooses how
+     * many heads to send would then choose whether spec s4's 20% rule can ever
+     * fire. A bound whose overflow behaviour is "fail open" is not a bound.
+     *
+     * It is inside 500..599, which is the range {@code Distress.tripOn5xxRate}
+     * counts, so an origin hiding behind eight interim heads reads as broken
+     * rather than as fine. On the evidence line it says the same thing to the
+     * operator: this exchange did not produce a status we could stand behind.
+     */
+    public static final int STATUS_UNREADABLE = 599;
 
     /**
      * The status of the FINAL response in {@code raw}, which is NOT always the
@@ -412,8 +437,14 @@ public final class Sender {
      *
      * A 1xx is never the final response (RFC 9110 s15.2), so a reported 1xx is
      * the one case where the transport's answer can be improved on; anything
-     * else is returned untouched. Nothing here guesses: if the bytes do not
-     * hold a later status line, the reported value stands.
+     * else is returned untouched. Nothing here guesses: if the bytes RUN OUT
+     * before a later status line -- truncated mid-status-line, truncated after
+     * a blank line, a line this cannot read at all -- the reported value
+     * stands, because there is nothing there to have hidden anything behind.
+     *
+     * The one case that is NOT "the bytes ran out" is the scan running out of
+     * BUDGET, and that one answers {@link #STATUS_UNREADABLE}: see there for
+     * why the two endings must not give the same answer.
      */
     public static int finalStatus(byte[] raw, int reported) {
         // A null `raw` reaches redactResponse below, which answers it with a
@@ -421,7 +452,8 @@ public final class Sender {
         if (raw == null || reported < 100 || reported > 199) return reported;
         String text = new String(raw, StandardCharsets.ISO_8859_1);
         int i = 0;
-        for (int head = 0; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
+        int head = 0;
+        for (; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
             int eol = text.indexOf('\n', i);
             if (eol < 0) return reported;
             int code = statusCodeOf(text.substring(i, eol));
@@ -435,6 +467,11 @@ public final class Sender {
             else if (lf >= 0) i = lf + 2;
             else return reported;
         }
+        // The scan gave up rather than ran out. Every head it read was a 1xx,
+        // so the response IS still ahead of it somewhere and `reported` is
+        // certainly not it -- the peer chose the head count, and it must not
+        // get to choose the sample Distress records with it.
+        if (head == MAX_INTERIM_HEADS) return STATUS_UNREADABLE;
         return reported;
     }
 
@@ -460,7 +497,26 @@ public final class Sender {
         return req.url().startsWith("https://");
     }
 
-    /** The port the url encodes, or the scheme default. */
+    /**
+     * The port the url encodes, or the scheme default.
+     *
+     * IPv6 TARGETS ARE NOT USABLE TODAY, and the failure is here rather than in
+     * the scope rules. MEASURED: a send frame with {@code target_host:
+     * "2001:db8::1"} and {@code target_port: 443} builds the url
+     * {@code https://2001:db8::1/x} -- parse() omits a default port, so the
+     * authority is a bare IPv6 literal with no brackets -- and this method
+     * takes the text after its LAST colon and answers {@code 1}. The BRACKETED
+     * form ({@code [2001:db8::1]}) answers 443 correctly.
+     *
+     * It fails CLOSED right now only because Policy scope-denies every IPv6 url
+     * tried against it, so nothing reaches this method. That is one accident
+     * away from being a connection to port 1 of an address the operator asked
+     * for on 443. WHOEVER FIXES THE SCOPE SIDE MUST FIX THIS SIDE IN THE SAME
+     * CHANGE: bracket the literal in parse() (and then the lastIndexOf(']')
+     * guard below starts doing the job it was written for), or refuse an
+     * unbracketed literal outright. Parked in the ledger as F9; do not close
+     * half of it.
+     */
     public static int portOf(HxRequest req) {
         boolean tls = secureOf(req);
         String rest = req.url().substring(tls ? 8 : 7);

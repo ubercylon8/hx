@@ -50,6 +50,7 @@ characters JSON requires are escaped: `"` `\\` and the control characters.
   burp -> py   result      {v,t,id,status,bytes,ms,outcome,config_epoch}
                            body: redacted raw HTTP response bytes
   burp -> py   error       {v,t,id,class,detail}
+                           plus retry_after_us, on rate_limited only
   burp -> py   halted      {v,t,reason,host,window}   unsolicited; no id.
   burp -> py   exchange    {v,t,...}   unsolicited; no id. Defined in a later plan.
   py -> burp   halt        {v,t,id,deadline_us,reason}
@@ -68,6 +69,61 @@ from the same read as the decision or it is not an answer at all.
 
 `exchange_id` is NOT on this frame. It is a store row id, assigned by
 `record_exchange()` on the Python side; the extension has none to give.
+
+`result.status` is the status of the FINAL response, which is not always the
+one the transport reported. MEASURED against Burp Suite Community Edition
+2026.7.3-52685 on a 103-then-200 exchange: `statusCode()` answered **103** and
+`toByteArray()` carried BOTH heads. A peer may put interim `1xx` heads in front
+of its real answer, so a second implementation must read the last status line
+out of the response bytes rather than trusting its HTTP client's parse of the
+first. Reporting the interim status puts a wrong number on the evidence line
+and -- much worse -- feeds a healthy sample to the auto-halt, so a CDN sending
+early hints in front of a failing origin would hold a 0% 5xx rate forever. The
+scan is bounded (8 heads, the last of which must be the final one), and a scan
+that runs out of budget reports **599** rather than the interim status: an
+unreadable status must not read as a healthy one.
+
+## Error classes
+
+`class` is one of:
+
+    scope_denied         refused by scope
+    method_denied        refused by the method allow-list
+    dangerous_denied     refused by a dangerous-path rule
+    rate_limited         slow down and retry; carries retry_after_us
+    budget_exhausted     the run's request budget is spent
+    not_configured       no configure has been acknowledged, or the send path
+                         failed internally
+    unmanaged_credential the request carries a credential header the extension
+                         did not inject; refused AND never persisted
+    transport_error      it was issued and no response came back
+    timeout              the deadline passed; the caller has stopped waiting
+    bridge_lost          the control channel went away
+    bad_frame            the frame could not be read as a request at all
+    engagement_mismatch  the frame names another engagement
+    bad_config           the configure body could not be acted on
+    protocol_mismatch    the frame's `v` is not this protocol version
+
+They split on WHAT HAPPENS NEXT, and a second implementation has to get that
+split right or an operator loses a control channel they could have kept:
+
+  * `bad_frame` and `engagement_mismatch` refuse ONE frame and keep the
+    channel. Neither is the peer trying to configure us, and neither says
+    anything about the frames after it.
+  * `bad_config` and `protocol_mismatch` drop to DENY-ALL first. An unusable
+    configure means the operator's intent is unknown, and carrying on under the
+    PREVIOUS scope would send exactly where an operator narrowing it just said
+    not to. `bad_config` keeps the channel, so a corrected configure can
+    follow; `protocol_mismatch` ends it, because there is no version left to
+    speak.
+  * `not_configured` from the send path's internal-failure catch also drops to
+    DENY-ALL and closes: a send path that threw is one we no longer understand.
+
+`limit.rate_rps` and `limit.max_requests` are validated in the `configure` arm,
+not at first use. Accepting an unreadable limit and refusing the first `send`
+is equally fail-closed and much worse to recover from: the extension dials once
+and has no reconnect, so the send-time refusal closes the channel and the
+corrected configure cannot be sent at all.
 
 `halted` is UNSOLICITED and carries no `id`. An auto-halt is decided by the
 extension -- a host in distress -- so there is no outstanding request to answer
@@ -95,10 +151,17 @@ Recognised keys:
     scope.exclude      URL pattern, repeatable
     dangerous.path     path pattern, repeatable
     method.allow       HTTP method, repeatable
-    limit.rate_rps     integer, once
-    limit.concurrency  integer, once
-    limit.max_requests integer, once
+    limit.rate_rps     positive integer, once   -- enforced
+    limit.concurrency  integer, once            -- not yet read by anything
+    limit.max_requests positive integer, once   -- enforced
     render.allow       host pattern, repeatable
 
 An unrecognised key is an error, not a warning: silently ignoring a key the
 sender believed it set is how a scope rule goes missing.
+
+"Positive integer, once" is enforced for the two limit keys the extension
+reads, and a body that breaks it is answered `bad_config`. Falling back to the
+built-in default instead is the one answer that is wrong in both directions: an
+operator who asked for 1 rps would silently get 5, and one who asked for 500
+would silently get 5 as well. `limit.concurrency` is not enforced because
+nothing reads it yet; it joins the rule in the change that honours it.

@@ -1,10 +1,5 @@
 # Enforcement and the Send Path Implementation Plan
 
-<!-- Remove that marker in the commit that finishes this plan. Until then
-     tests/test_plan_matches_repo.py skips this plan's blocks: it modifies
-     extension/src/hx/HxExtension.java, so its block describes the state
-     AFTER Task 6 while the repo still holds the state before it. -->
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the issuance gate — the single point inside the JVM through which every request `hx` sends must pass, enforcing scope, method, dangerous paths, rate and budget, with auto-halt, a durable kill switch, and credential redaction.
@@ -12975,6 +12970,7 @@ package hx.send;
 import hx.TestSupport;
 import hx.bridge.BridgeClient;
 import hx.bridge.Json;
+import hx.policy.Clock;
 import hx.policy.Decision;
 import hx.policy.Distress;
 import hx.policy.Gate;
@@ -13052,6 +13048,16 @@ public class SenderTest {
               () -> theResultIsStampedWithTheEpochThatAuthorisedIt(sentinel));
             t("theResponseBodyRidesUnderAKeyJsonRefusesToWrite",
               () -> theResponseBodyRidesUnderAKeyJsonRefusesToWrite(sentinel));
+            t("aResponselessReplyIsATransportErrorAndFeedsDistress",
+              () -> aResponselessReplyIsATransportErrorAndFeedsDistress(sentinel));
+            t("theDestinationIsTheFrameHeaderEvenWhenTheHostLineDisagrees",
+              () -> theDestinationIsTheFrameHeaderEvenWhenTheHostLineDisagrees(sentinel));
+            t("anInternalFailureIsNotSwallowedIntoAnErrorFrame",
+              () -> anInternalFailureIsNotSwallowedIntoAnErrorFrame(sentinel));
+            t("aHaltWithNoReasonNeverDeliversTheWordNull",
+              () -> aHaltWithNoReasonNeverDeliversTheWordNull(dir));
+            t("theInterimHeadScanIsBoundedAndFailsToward5xx",
+              SenderTest::theInterimHeadScanIsBoundedAndFailsToward5xx);
             t("theWireMappingRoundTripsWhatItParsed", SenderTest::theWireMappingRoundTripsWhatItParsed);
             t("theConfiguredLimitsArmTheGateOnceFromTheAuthorisation",
               SenderTest::theConfiguredLimitsArmTheGateOnceFromTheAuthorisation);
@@ -13078,6 +13084,10 @@ public class SenderTest {
         HxRequest last;
         HttpReply reply = new HttpReply(200, RESPONSE, 12L, false);
         IOException boom = null;
+        /** An UNCHECKED failure from inside issue(), which is a different
+         *  thing from `boom` and must be answered differently: see
+         *  anInternalFailureIsNotSwallowedIntoAnErrorFrame. */
+        RuntimeException crash = null;
         long advanceUsPerCall = 0;
         TickClock clock;
         /** Holds every caller here until as many have arrived as it was built
@@ -13101,6 +13111,7 @@ public class SenderTest {
                 catch (Exception e) { barrierError = String.valueOf(e); }
             }
             if (boom != null) throw boom;
+            if (crash != null) throw crash;
             return reply;
         }
     }
@@ -13116,6 +13127,30 @@ public class SenderTest {
         public synchronized void halted(String reason, String host, String window) {
             frames.add(new String[] { reason, host, window });
         }
+    }
+
+    /**
+     * A clock that answers a SCRIPTED sequence and counts its reads.
+     *
+     * TickClock cannot do this job: it holds one value that only the driving
+     * thread may move, and the input here is a value that CHANGES BETWEEN two
+     * reads made inside one call to issue() -- a wall clock corrected backwards
+     * under a running JVM, which is what HxExtension injects and says so.
+     * Past the end of the script it holds the last value rather than throwing:
+     * HaltSwitch.stale() catches Throwable from an injected clock and answers
+     * "halted", so a clock that threw would make the test pass for the wrong
+     * reason.
+     */
+    static final class SteppingClock implements Clock {
+        private final long[] script;
+        private int read = 0;
+        SteppingClock(long... script) { this.script = script; }
+        public long nowUs() {
+            long v = script[Math.min(read, script.length - 1)];
+            read++;
+            return v;
+        }
+        int reads() { return read; }
     }
 
     /** Counts too. A request refused before the Gate must cost no rate token
@@ -13138,11 +13173,25 @@ public class SenderTest {
         final Sender sender;
 
         Rig(Path sentinel, int maxConsecutiveErrors) {
+            this(null, sentinel, maxConsecutiveErrors);
+        }
+
+        /** The same rig around a HaltSwitch the caller built. One test needs
+         *  one wired to its OWN clock -- see
+         *  aHaltWithNoReasonNeverDeliversTheWordNull -- and HaltSwitch is
+         *  final, so there is nothing to subclass and no other way in. */
+        Rig(HaltSwitch injected, int maxConsecutiveErrors) {
+            this(injected, null, maxConsecutiveErrors);
+        }
+
+        private Rig(HaltSwitch injected, Path sentinel, int maxConsecutiveErrors) {
             http.clock = clock;
-            // start() is deliberately NOT called: the sentinel poller is
-            // HaltSwitch's own test's business, and a background thread in
-            // here would make these assertions time-dependent.
-            halt = new HaltSwitch(clock, sentinel, HaltSwitch.DEFAULT_POLL_MS);
+            // start() is deliberately NOT called on the one built here: the
+            // sentinel poller is HaltSwitch's own test's business, and a
+            // background thread in here would make these assertions
+            // time-dependent.
+            halt = injected != null ? injected
+                 : new HaltSwitch(clock, sentinel, HaltSwitch.DEFAULT_POLL_MS);
             // The spec s4 production defaults: 20% 5xx, 5x baseline latency.
             distress = new Distress(clock, 0.20, 5.0, maxConsecutiveErrors);
             sender = new Sender(new Policy(gate), redactor, halt, distress, http, clock);
@@ -13253,6 +13302,27 @@ public class SenderTest {
         check(label + " echoes the frame id", Long.valueOf(41L).equals(reply.get("id")));
     }
 
+    /**
+     * denied(), plus the half of the ORDER OF REFUSAL comment that had no test
+     * at all.
+     *
+     * Steps 0-4 of that comment -- bad_frame, timeout, not_configured, halted,
+     * unmanaged_credential -- are placed BEFORE the Gate, and the comment gives
+     * the reason: Policy's Gate is Limits, whose check() SPENDS a rate token
+     * and a budget slot, and spending either on a request that is about to be
+     * refused shortens the run for no evidence. denied() asserts what reached
+     * the wire and never what the decision cost, so moving unmanaged_credential
+     * below the Gate was invisible to all 1304 checks. A refused request that
+     * spends budget is a spec s7 problem, not a matter of style.
+     */
+    static void deniedBeforeTheGate(String label, Rig rig, Map<String, Object> header,
+                                    byte[] body, BridgeClient.Authorisation auth,
+                                    String expectedClass) {
+        denied(label, rig, header, body, auth, expectedClass);
+        check(label + " COSTS NO RATE TOKEN OR BUDGET SLOT (gate consulted "
+              + rig.gate.calls + " time(s))", rig.gate.calls == 0);
+    }
+
     // ---- tests ---------------------------------------------------------
 
     static void anAllowedRequestIsIssuedOnceAndFramedAsAResult(Path sentinel) {
@@ -13290,12 +13360,12 @@ public class SenderTest {
     static void everyDenialClassLeavesTheWireUntouched(Path sentinel) {
         Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
 
-        denied("not_configured", new Rig(sentinel), header,
+        deniedBeforeTheGate("not_configured", new Rig(sentinel), header,
                request("GET", "/api/orders"), denyAll(), "not_configured");
 
         Rig halted = new Rig(sentinel);
         halted.halt.haltedByFrame("operator pressed stop");
-        denied("halted", halted, header, request("GET", "/api/orders"),
+        deniedBeforeTheGate("halted", halted, header, request("GET", "/api/orders"),
                authorised(), "halted");
 
         denied("scope_denied", new Rig(sentinel), header,
@@ -13325,11 +13395,11 @@ public class SenderTest {
         // this is the only thing keeping a live client session cookie out of a
         // content-addressed blob store, where it would be in every backup.
         Rig cred = new Rig(sentinel);
-        denied("unmanaged_credential", cred, header,
+        deniedBeforeTheGate("unmanaged_credential", cred, header,
                request("GET", "/api/orders", "Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"),
                authorised(), "unmanaged_credential");
 
-        denied("bad_frame (no request line)", new Rig(sentinel), header,
+        deniedBeforeTheGate("bad_frame (no request line)", new Rig(sentinel), header,
                new byte[0], authorised(), "bad_frame");
 
         // The whitespace-before-the-colon refusal, and why it is load-bearing
@@ -13692,6 +13762,270 @@ public class SenderTest {
     }
 
     /**
+     * A reply that never got a response, which is a DIFFERENT input from an
+     * IOException and had none of its own.
+     *
+     * `new HttpReply(..., connectionError=true)` is constructed in exactly one
+     * place in the extension -- HxExtension's `!rr.hasResponse()` branch, where
+     * a refused connection, a DNS failure and a TLS failure all arrive, because
+     * Montoya answers those with a response-less HttpRequestResponse rather
+     * than by throwing. Until this test, no fixture in the suite set the flag:
+     * every connection-error case went through the IOException catch, which
+     * passes a hard-coded literal `true` and therefore proves nothing about the
+     * field.
+     *
+     * Two one-line mutations were invisible to all 1304 checks because of it:
+     *
+     *   - delete the `if (reply.connectionError())` refusal, and a request that
+     *     never got a response is framed as `{"t":"result","status":0,
+     *     "bytes":0,"outcome":"ok"}` with a zero-length body. A fabricated
+     *     evidence line claiming a successful exchange.
+     *   - pass `false` instead of `reply.connectionError()` to Distress, and
+     *     spec s4's five-consecutive-connection-errors auto-halt never fires on
+     *     this path at all -- status 0 is not a 5xx, so nothing counts it.
+     *
+     * Both have the same failure scenario: a host whose firewall silently drops
+     * the port. Today the run halts after five. After either, it spends its
+     * whole 2000-request budget against a dead host and records 2000 exchanges
+     * as `outcome: ok`.
+     */
+    static void aResponselessReplyIsATransportErrorAndFeedsDistress(Path sentinel) {
+        // maxConsecutiveErrors = 1: one response-less reply is the whole input.
+        Rig r = new Rig(sentinel, 1);
+        r.http.reply = new HttpReply(0, new byte[0], 7L, true);
+
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+
+        check("a response-less reply is an error, not a result (got " + reply.get("t") + ")",
+              "error".equals(reply.get("t")));
+        check("and its class is transport_error (got " + reply.get("class") + ")",
+              "transport_error".equals(reply.get("class")));
+        check("nothing is framed as evidence for an exchange that never happened",
+              !reply.containsKey(BridgeClient.BODY_KEY));
+        check("it echoes the frame id", Long.valueOf(41L).equals(reply.get("id")));
+        // The request DID leave: this is not a refusal, and the difference is
+        // the whole reason Distress has to see it.
+        check("the request was issued (" + r.http.calls + ")", r.http.calls == 1);
+        check("the connection error reached Distress (" + r.distress.stopReason() + ")",
+              r.distress.stopReason() != null);
+        check("and Distress counted it as a CONNECTION error, not a status-0 reply",
+              String.valueOf(r.distress.stopReason()).contains("consecutive connection errors"));
+        check("and Distress names the host", "app.example.test".equals(r.distress.stopHost()));
+        check("the stop was announced exactly once (" + r.notifier.frames.size() + ")",
+              r.notifier.frames.size() == 1);
+    }
+
+    /**
+     * The destination is the FRAME HEADER's, and this is the fixture that can
+     * tell the two apart.
+     *
+     * Every other fixture in this class sets `target_host` and the `Host:` line
+     * to the same string, so the check named "the destination comes from the
+     * frame header, not the Host line" was a tautology under its own inputs:
+     * making parse() prefer the Host header when present left all nine classes
+     * green. One divergent fixture is the whole fix.
+     *
+     * The behaviour under test is also the one we want for its own sake, not
+     * merely for the scope decision. Burp connects to the service we NAME, and
+     * the spoofed `Host` goes out on the wire verbatim -- that is the standard
+     * host-header-injection probe, and it only works if the two are separate.
+     * Deciding scope on the Host line would let a request authorised for
+     * app.example.test open a connection somewhere else entirely.
+     */
+    static void theDestinationIsTheFrameHeaderEvenWhenTheHostLineDisagrees(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        Map<String, Object> reply = r.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS),
+                raw("GET /api/orders HTTP/1.1\r\n"
+                    + "Host: evil.example.com\r\n"
+                    + "User-Agent: hx/0.1\r\n\r\n"),
+                authorised());
+
+        check("a divergent Host line does not stop the request (got "
+              + reply.get("t") + "/" + reply.get("class") + ")", "result".equals(reply.get("t")));
+        check("the request reached Http", r.http.last != null);
+        check("the DESTINATION is the frame header's target_host (" + r.http.last.host() + ")",
+              "app.example.test".equals(r.http.last.host()));
+        check("so is the url Policy decided about (" + r.http.last.url() + ")",
+              "https://app.example.test/api/orders".equals(r.http.last.url()));
+        // And the injected header is still on the wire, untouched: this is a
+        // host-header-injection probe, and rewriting it would delete the check.
+        check("while the spoofed Host header goes out verbatim",
+              new String(Sender.wireBytes(r.http.last), StandardCharsets.ISO_8859_1)
+                      .contains("Host: evil.example.com"));
+    }
+
+    /**
+     * issue() catches Redactor.RangeError -- and nothing else.
+     *
+     * Widening that catch to RuntimeException is invisible to every other
+     * check in this suite, and it would silently delete the behaviour
+     * BridgeClientTest's aSendHandlerThatThrowsDropsToDenyAll exists to
+     * guarantee: an unchecked failure inside the send path is not a refusal
+     * with a class, it is a send path we no longer understand, and spec s4's
+     * terminal state is DENY-ALL with the channel closed. Swallowed into an
+     * error frame, the run carries on issuing requests through code that just
+     * threw.
+     *
+     * The narrow catch is therefore a claim about the ONE failure that is a
+     * decision (a range that does not fit the bytes it is an offset into, which
+     * says the frame describes some other request) as against every failure
+     * that is a bug.
+     */
+    static void anInternalFailureIsNotSwallowedIntoAnErrorFrame(Path sentinel) {
+        Rig r = new Rig(sentinel);
+        r.http.crash = new IllegalStateException("Burp unloaded mid-request");
+
+        RuntimeException escaped = null;
+        Map<String, Object> reply = null;
+        try {
+            reply = r.sender.issue(sendHeader(NOW + THIRTY_SECONDS),
+                                   request("GET", "/api/orders"), authorised());
+        } catch (RuntimeException e) {
+            escaped = e;
+        }
+        check("an unchecked failure inside issue() is NOT answered as a frame (got "
+              + (reply == null ? "a throw" : reply.get("class")) + ")", reply == null);
+        check("it reaches the send arm, which is what drops to DENY-ALL and closes ("
+              + escaped + ")",
+              escaped instanceof IllegalStateException
+              && "Burp unloaded mid-request".equals(escaped.getMessage()));
+
+        // The other half of the same claim: the ONE unchecked failure that IS
+        // a decision still gets its class. aRedactionFailureIsRefusedRather-
+        // ThanFramed asserts the whole shape; this line is here so the two
+        // directions are read together and neither can be "simplified" into
+        // the other.
+        Rig ranged = new Rig(sentinel);
+        ranged.http.reply = new HttpReply(200, null, 12L, false);
+        check("while a RangeError is still a bad_frame",
+              "bad_frame".equals(ranged.sender.issue(sendHeader(NOW + THIRTY_SECONDS),
+                      request("GET", "/api/orders"), authorised()).get("class")));
+    }
+
+    /**
+     * halted() true and reason() null is a real straddle, and the fallback
+     * string is what stands between it and an operator reading `detail: null`.
+     *
+     * HaltSwitch publishes both inputs through one reference, so each ANSWER is
+     * coherent -- but halted() and reason() are two calls, and its own javadoc
+     * names the one gap left: "halted()==true followed by reason()==null".
+     * Sender answers it with an explicit fallback rather than believing it was
+     * never halted, and 07340ab fixed the same shape one layer up a week ago,
+     * on the same operator-facing surface: a halt frame with no reason
+     * delivered the four-character word "null".
+     *
+     * REACHED HERE THROUGH THE STALENESS RULE, on a clock that steps backwards
+     * between the two reads -- which is not a contrivance: HxExtension injects
+     * `Instant.now()` deliberately (deadline_us is absolute wall-clock
+     * microseconds set by the peer, so a monotonic clock answers a different
+     * question), and a wall clock is exactly the kind that an NTP correction
+     * moves backwards under a running JVM.
+     *
+     *   read 1  the first poll, on start()'s own thread: lastPollUs = T0
+     *   read 2  halted()  -> T0 + 400 s, past the 300 s staleness bound -> TRUE
+     *   read 3  reason()  -> T0 again, the clock has been corrected -> not
+     *           stale, no frame halt, no sentinel halt -> NULL
+     */
+    static void aHaltWithNoReasonNeverDeliversTheWordNull(Path dir) throws Exception {
+        // 60 s poll interval: start()'s first poll runs on THIS thread and the
+        // background poller then sleeps for a minute, so the only clock reads
+        // in this test are the three scripted below.
+        long pollMs = 60_000L;
+        long staleUs = pollMs * 1000L * HaltSwitch.STALE_INTERVALS;
+        SteppingClock clock = new SteppingClock(NOW, NOW + staleUs + 1L, NOW);
+        HaltSwitch halt = new HaltSwitch(clock, dir.resolve("absent-halt"), pollMs);
+        halt.start();
+        try {
+            Rig r = new Rig(halt, 5);
+            Map<String, Object> reply = r.sender.issue(
+                    sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"),
+                    authorised());
+
+            // The premise, asserted rather than assumed: exactly the three
+            // reads above happened, so the straddle really was the input.
+            check("the straddle was exercised: three clock reads (" + clock.reads() + ")",
+                  clock.reads() == 3);
+            check("a stalled poller halts issuance", "error".equals(reply.get("t"))
+                  && "halted".equals(reply.get("class")));
+            check("nothing was issued (" + r.http.calls + ")", r.http.calls == 0);
+            Object detail = reply.get("detail");
+            check("the detail is not null (" + detail + ")", detail != null);
+            check("nor the four-character word null (" + detail + ")",
+                  !"null".equals(detail));
+            check("it says a halt was in force with no reason recorded (" + detail + ")",
+                  "halted, no reason recorded".equals(detail));
+        } finally {
+            halt.stop();
+        }
+    }
+
+    /**
+     * The interim-head scan is BOUNDED, the bound is exactly 8 heads, and
+     * running out of budget does not report the interim status.
+     *
+     * MEASURED against the compiled method before this test existed: 7 interim
+     * heads then a 500 answered 500, 8 then a 500 answered 100, and 9 answered
+     * 100. Past the bound it returned the interim 1xx, so Distress recorded a
+     * healthy sample -- the same 0%-5xx blindness finalStatus was written to
+     * prevent, reachable by any peer that chooses its own head count. A bound
+     * whose overflow behaviour is "fail open in exactly the direction this
+     * function exists to close" is a bypass with a parameter.
+     *
+     * The bound is pinned in BOTH directions here. It was pinned in neither:
+     * MAX_INTERIM_HEADS 8 -> 2 was invisible to the whole suite, and only 8 ->
+     * 1 reddened anything, so all that was asserted was ">= 2".
+     */
+    static void theInterimHeadScanIsBoundedAndFailsToward5xx() {
+        check("the bound is 8 heads (" + Sender.MAX_INTERIM_HEADS + ")",
+              Sender.MAX_INTERIM_HEADS == 8);
+
+        // 7 interim heads is the most that can precede a final one, because
+        // the eighth iteration is the one that reads the final head.
+        check("7 interim heads then a 500 still reads the 500 ("
+              + Sender.finalStatus(interimHeads(7, "HTTP/1.1 500 Internal Server Error"), 103)
+              + ")",
+              Sender.finalStatus(interimHeads(7, "HTTP/1.1 500 Internal Server Error"), 103)
+              == 500);
+        check("and 7 interim heads then a 200 reads the 200 ("
+              + Sender.finalStatus(interimHeads(7, "HTTP/1.1 200 OK"), 103) + ")",
+              Sender.finalStatus(interimHeads(7, "HTTP/1.1 200 OK"), 103) == 200);
+
+        // 8 is one too many. The answer is NOT the interim status.
+        int exhausted = Sender.finalStatus(
+                interimHeads(8, "HTTP/1.1 500 Internal Server Error"), 103);
+        check("8 interim heads exhaust the scan (" + exhausted + ")",
+              exhausted == Sender.STATUS_UNREADABLE);
+        check("and an exhausted scan does not report the interim head (" + exhausted + ")",
+              exhausted != 103);
+        check("what it reports is inside the 5xx range Distress counts as an error ("
+              + exhausted + ")", exhausted >= 500 && exhausted <= 599);
+        check("40 heads of it are answered the same way",
+              Sender.finalStatus(interimHeads(40, "HTTP/1.1 200 OK"), 103)
+              == Sender.STATUS_UNREADABLE);
+
+        // Running out of BYTES is a different ending and keeps the old answer:
+        // there is nothing there for a peer to have hidden a status behind.
+        check("truncation after a blank line still reports what the transport said",
+              Sender.finalStatus(interimHeads(1, ""), 103) == 103);
+        check("and a reply that is not 1xx is never touched at all",
+              Sender.finalStatus(interimHeads(8, "HTTP/1.1 500 Internal Server Error"), 204)
+              == 204);
+    }
+
+    /** {@code n} interim heads, then {@code last} -- which may be empty, for
+     *  the response that never arrived. */
+    static byte[] interimHeads(int n, String last) {
+        StringBuilder s = new StringBuilder();
+        for (int i = 0; i < n; i++)
+            s.append("HTTP/1.1 103 Early Hints\r\nLink: </").append(i)
+             .append(".css>; rel=preload\r\n\r\n");
+        s.append(last.isEmpty() ? "" : last + "\r\nContent-Length: 0\r\n\r\n");
+        return s.toString().getBytes(StandardCharsets.ISO_8859_1);
+    }
+
+    /**
      * HxRequest is what Policy decides about; Sender.wireBytes is what Burp
      * issues. They have to agree, or the request that was authorised and the
      * request that goes out are two different requests.
@@ -13778,6 +14112,32 @@ public class SenderTest {
             threw = true;
         }
         check("a limit that is not a positive integer is refused, not defaulted", threw);
+
+        // "integer, ONCE". ConfigBody accumulates repeated keys in order and
+        // an Authorisation can be built without ever crossing it, so the rule
+        // is enforced where the value is USED as well as where it arrives.
+        // Without this, a doubly-set limit.rate_rps silently takes the first
+        // and the operator's second answer is discarded unread -- and the two
+        // orders differ, so which number the run gets depends on which line
+        // they typed first.
+        boolean twiceRefused = false;
+        try {
+            new Limits(clock, 5L, 2000L).arm(new BridgeClient.Authorisation(2L,
+                    Map.of("limit.rate_rps", List.of("5", "99"))));
+        } catch (IllegalArgumentException e) {
+            twiceRefused = String.valueOf(e.getMessage()).contains("integer, once");
+        }
+        check("two answers to \"how fast\" is not a limit: a repeated key is refused",
+              twiceRefused);
+
+        boolean zeroRefused = false;
+        try {
+            new Limits(clock, 5L, 2000L).arm(new BridgeClient.Authorisation(2L,
+                    Map.of("limit.max_requests", List.of("0"))));
+        } catch (IllegalArgumentException e) {
+            zeroRefused = true;
+        }
+        check("and a budget of zero is refused rather than defaulted to 2000", zeroRefused);
 
         check("an unarmed gate denies rather than allowing",
               !new Limits(clock, 5L, 2000L).check(REQ).allowed());
@@ -14329,12 +14689,37 @@ public final class Sender {
     }
 
     /**
-     * How many heads a peer may put in front of the final one before this
-     * gives up and reports what the transport said. RFC 9110 s15.2 puts no
-     * ceiling on interim responses, and an unbounded scan of a hostile
-     * response is a scan of whatever length that peer chose.
+     * How many heads this will read before it gives up, counting the final one.
+     * RFC 9110 s15.2 puts no ceiling on interim responses, and an unbounded
+     * scan of a hostile response is a scan of whatever length that peer chose.
+     *
+     * So the tolerated number of INTERIM heads is one less than this: seven,
+     * because the eighth iteration is the one that has to read the final head.
+     * An earlier version of this javadoc said "how many heads a peer may put in
+     * front of the final one", which reads as eight and was wrong -- measured,
+     * 7 interim heads then a 500 answers 500 and 8 then a 500 does not.
+     * SenderTest pins both sides, so this number cannot be changed silently in
+     * either direction.
      */
-    private static final int MAX_INTERIM_HEADS = 8;
+    static final int MAX_INTERIM_HEADS = 8;
+
+    /**
+     * What an exhausted scan reports: a status Distress counts as an error.
+     *
+     * 599 is not a status any peer sent, and that is the point -- the
+     * alternative is worse in the one direction this whole function exists to
+     * close. When the scan runs out of budget the reported status is still the
+     * INTERIM 1xx, and returning it would hand Distress a healthy sample for a
+     * response whose real status we could not read: a peer that chooses how
+     * many heads to send would then choose whether spec s4's 20% rule can ever
+     * fire. A bound whose overflow behaviour is "fail open" is not a bound.
+     *
+     * It is inside 500..599, which is the range {@code Distress.tripOn5xxRate}
+     * counts, so an origin hiding behind eight interim heads reads as broken
+     * rather than as fine. On the evidence line it says the same thing to the
+     * operator: this exchange did not produce a status we could stand behind.
+     */
+    public static final int STATUS_UNREADABLE = 599;
 
     /**
      * The status of the FINAL response in {@code raw}, which is NOT always the
@@ -14357,8 +14742,14 @@ public final class Sender {
      *
      * A 1xx is never the final response (RFC 9110 s15.2), so a reported 1xx is
      * the one case where the transport's answer can be improved on; anything
-     * else is returned untouched. Nothing here guesses: if the bytes do not
-     * hold a later status line, the reported value stands.
+     * else is returned untouched. Nothing here guesses: if the bytes RUN OUT
+     * before a later status line -- truncated mid-status-line, truncated after
+     * a blank line, a line this cannot read at all -- the reported value
+     * stands, because there is nothing there to have hidden anything behind.
+     *
+     * The one case that is NOT "the bytes ran out" is the scan running out of
+     * BUDGET, and that one answers {@link #STATUS_UNREADABLE}: see there for
+     * why the two endings must not give the same answer.
      */
     public static int finalStatus(byte[] raw, int reported) {
         // A null `raw` reaches redactResponse below, which answers it with a
@@ -14366,7 +14757,8 @@ public final class Sender {
         if (raw == null || reported < 100 || reported > 199) return reported;
         String text = new String(raw, StandardCharsets.ISO_8859_1);
         int i = 0;
-        for (int head = 0; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
+        int head = 0;
+        for (; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
             int eol = text.indexOf('\n', i);
             if (eol < 0) return reported;
             int code = statusCodeOf(text.substring(i, eol));
@@ -14380,6 +14772,11 @@ public final class Sender {
             else if (lf >= 0) i = lf + 2;
             else return reported;
         }
+        // The scan gave up rather than ran out. Every head it read was a 1xx,
+        // so the response IS still ahead of it somewhere and `reported` is
+        // certainly not it -- the peer chose the head count, and it must not
+        // get to choose the sample Distress records with it.
+        if (head == MAX_INTERIM_HEADS) return STATUS_UNREADABLE;
         return reported;
     }
 
@@ -14405,7 +14802,26 @@ public final class Sender {
         return req.url().startsWith("https://");
     }
 
-    /** The port the url encodes, or the scheme default. */
+    /**
+     * The port the url encodes, or the scheme default.
+     *
+     * IPv6 TARGETS ARE NOT USABLE TODAY, and the failure is here rather than in
+     * the scope rules. MEASURED: a send frame with {@code target_host:
+     * "2001:db8::1"} and {@code target_port: 443} builds the url
+     * {@code https://2001:db8::1/x} -- parse() omits a default port, so the
+     * authority is a bare IPv6 literal with no brackets -- and this method
+     * takes the text after its LAST colon and answers {@code 1}. The BRACKETED
+     * form ({@code [2001:db8::1]}) answers 443 correctly.
+     *
+     * It fails CLOSED right now only because Policy scope-denies every IPv6 url
+     * tried against it, so nothing reaches this method. That is one accident
+     * away from being a connection to port 1 of an address the operator asked
+     * for on 443. WHOEVER FIXES THE SCOPE SIDE MUST FIX THIS SIDE IN THE SAME
+     * CHANGE: bracket the literal in parse() (and then the lastIndexOf(']')
+     * guard below starts doing the job it was written for), or refuse an
+     * unbracketed literal outright. Parked in the ledger as F9; do not close
+     * half of it.
+     */
     public static int portOf(HxRequest req) {
         boolean tls = secureOf(req);
         String rest = req.url().substring(tls ? 8 : 7);
@@ -14542,9 +14958,26 @@ import java.util.stream.Stream;
  * This one counts, over the whole of extension/src, so a path nobody thought
  * to test cannot exist quietly.
  *
- * It reads RAW TEXT, comments included. That is the fail-safe direction: a
- * comment that spells the egress call makes the count 2 and this test go RED.
- * If that happens, rewrite the comment -- do not loosen the needle.
+ * It reads RAW TEXT, comments included, and that cuts BOTH ways. This javadoc
+ * used to claim it was "the fail-safe direction"; it was measured, and it is
+ * not.
+ *
+ *   - For a count that must be ZERO (the batch call, the deprecated
+ *     accessors), a comment that spells the needle makes the count 1 and this
+ *     test go RED. That direction is fail-safe: rewrite the comment, do not
+ *     loosen the needle.
+ *   - For a count that must be EXACTLY ONE, a comment ANYWHERE in the tree can
+ *     supply that one. MEASURED: setting RedirectionMode.ALWAYS in the entry
+ *     point and writing `RedirectionMode.NEVER` in a comment in Sender.java
+ *     left all nine classes green -- redirects followed inside Burp, and a
+ *     comment saying they were not. That direction is fail-OPEN.
+ *
+ * So a whole-tree count is used only where zero is the answer or where the
+ * needle is a CALL nobody would write in prose. Where the count must be
+ * exactly one and the text is a constant a comment could carry, take it in
+ * {@link #ENTRY_POINT} alone -- see {@link #redirectsAreNotFollowed} -- and
+ * assert the whole family appears once there, so a second setting cannot hide
+ * behind the first.
  */
 public class ChokepointTest {
 
@@ -14577,13 +15010,15 @@ public class ChokepointTest {
 
         t("oneEgressPath", () -> oneEgressPath(sources));
         t("noBatchEgressPath", () -> noBatchEgressPath(sources));
-        t("redirectsAreNotFollowed", () -> redirectsAreNotFollowed(sources));
+        t("redirectsAreNotFollowed", ChokepointTest::redirectsAreNotFollowed);
         t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
         t("theDeprecatedAccessorsAreUnusedEverywhere",
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
         t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
           () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
+        t("theAdapterBuildsItsRequestInsideTheTry",
+          ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -14597,18 +15032,44 @@ public class ChokepointTest {
         }
     }
 
+    /**
+     * TWO needles, and the second is the one that matters.
+     *
+     * `http().sendRequest` is a SPELLING, and the review broke it without
+     * touching a character of it: `var h2 = api.http(); h2.sendRequest(request,
+     * options);` is a genuine second, ungated issuance that all four counters
+     * here missed -- the batch counter looks for `sendRequests(`, `import burp.`
+     * is unchanged because the sabotage lives in the one file allowed to import
+     * it, and `.authorisation()` is unchanged. Duplicating the call outright is
+     * the shape nobody writes; a local named `h2` is the shape a "convenience
+     * retry" takes.
+     *
+     * So the HANDLE is counted too. Nothing in the extension may reach Montoya's
+     * HTTP API at all except the one adapter in the entry point, whatever it
+     * does with what it gets back -- which also catches the batch call, a
+     * three-iteration loop, and anything else reachable from a second handle.
+     */
     static void oneEgressPath(List<Path> sources) throws IOException {
-        int total = 0;
+        int total = 0, handles = 0;
         List<String> hits = new ArrayList<>();
+        List<String> handleHits = new ArrayList<>();
         for (Path p : sources) {
-            int n = count(text(p), "http().sendRequest");
+            String t = text(p);
+            int n = count(t, "http().sendRequest");
             total += n;
             if (n > 0) hits.add(p + " x" + n);
+            int h = count(t, ".http()");
+            handles += h;
+            if (h > 0) handleHits.add(p + " x" + h);
         }
         check("the egress call appears exactly once in extension/src, not " + total
               + " times " + hits, total == 1);
         check("and it is in " + ENTRY_POINT + ", not " + hits,
               hits.size() == 1 && hits.get(0).startsWith(ENTRY_POINT));
+        check("Montoya's HTTP API is REACHED exactly once in extension/src, not "
+              + handles + " times " + handleHits, handles == 1);
+        check("and that one reach is in " + ENTRY_POINT + ", not " + handleHits,
+              handleHits.size() == 1 && handleHits.get(0).startsWith(ENTRY_POINT));
     }
 
     static void noBatchEgressPath(List<Path> sources) throws IOException {
@@ -14622,14 +15083,33 @@ public class ChokepointTest {
               total == 0);
     }
 
-    static void redirectsAreNotFollowed(List<Path> sources) throws IOException {
-        int total = 0;
-        for (Path p : sources) total += count(text(p), "RedirectionMode.NEVER");
-        // Spec s4: each hop is a distinct issuance with its own scope decision
-        // and its own exchange row. A redirect followed inside Burp is a
-        // request that never crossed Policy -- a third egress path that looks
-        // exactly like the first.
-        check("the egress call disables redirect following (" + total + ")", total == 1);
+    /**
+     * Spec s4: each hop is a distinct issuance with its own scope decision and
+     * its own exchange row. A redirect followed inside Burp is a request that
+     * never crossed Policy -- a third egress path that looks exactly like the
+     * first.
+     *
+     * Counted in {@link #ENTRY_POINT} ONLY, and this is the one check on this
+     * branch that was MEASURED FAIL-OPEN before it was. Taken over all of
+     * extension/src, `.withRedirectionMode(RedirectionMode.ALWAYS)` in the
+     * entry point plus `// see HxExtension: RedirectionMode.NEVER` in a comment
+     * in Sender.java gave the count its 1 and left all nine classes green:
+     * redirects followed inside Burp, and a comment two files away saying they
+     * were not. A whole-tree count of a CONSTANT is a count of prose.
+     *
+     * The second assertion is what makes the first one hold. `NEVER` appearing
+     * once is not "redirects are off" if `ALWAYS` is also there -- the last
+     * call to .withRedirectionMode wins, and either order is one line. So the
+     * whole family is counted: exactly one RedirectionMode is named in the
+     * adapter, and it is NEVER.
+     */
+    static void redirectsAreNotFollowed() throws IOException {
+        String entry = text(Path.of(ENTRY_POINT));
+        int never = count(entry, "RedirectionMode.NEVER");
+        int any = count(entry, "RedirectionMode.");
+        check("the egress call disables redirect following (" + never + ")", never == 1);
+        check("and it names exactly one redirection mode, so a second setting "
+              + "cannot override it (" + any + ")", any == 1);
     }
 
     static void montoyaIsConfinedToTheEntryPoint(List<Path> sources) throws IOException {
@@ -14711,6 +15191,43 @@ public class ChokepointTest {
               + count(entry, "setHaltNotifier(") + ")", count(entry, "setHaltNotifier(") == 1);
         check("and the send path is installed (" + count(entry, "setSendHandler(") + ")",
               count(entry, "setSendHandler(") == 1);
+    }
+
+    /**
+     * Everything the adapter builds is inside the try that turns a
+     * RuntimeException into an IOException.
+     *
+     * The comment on that catch says a RuntimeException escaping it "would
+     * reach BridgeClient's catch-all and close the connection. Sender handles
+     * IOException and feeds it to Distress; give it one." That was true of the
+     * one line the try used to wrap and false of the three above it:
+     * Sender.portOf throws IllegalArgumentException for an authority whose
+     * post-colon text is not an integer, and HttpService.httpService and
+     * HttpRequest.httpRequest are someone else's code called with attacker-
+     * influenced strings. Any of them would have taken the control channel
+     * down instead of costing one request a transport_error.
+     *
+     * A position check, not a behavioural one, and the honest reason is that
+     * HxExtension needs Burp to run at all -- see the class comment on
+     * everyKillPathIsWiredBeforeTheDial. It is anchored at the adapter's own
+     * declaration rather than at the file, so an unrelated try elsewhere in
+     * HxExtension cannot satisfy it.
+     */
+    static void theAdapterBuildsItsRequestInsideTheTry() throws IOException {
+        String entry = text(Path.of(ENTRY_POINT));
+        int adapter = entry.indexOf("private static Http montoyaHttp(");
+        check("the adapter is where it is expected to be (" + adapter + ")", adapter >= 0);
+        int guard = entry.indexOf("try {", adapter);
+        int service = entry.indexOf("HttpService.httpService(", adapter);
+        int request = entry.indexOf("HttpRequest.httpRequest(", adapter);
+        int egress = entry.indexOf("http().sendRequest(", adapter);
+        check("the adapter opens a try (" + guard + ")", guard > adapter);
+        check("the HttpService is built inside it (" + service + " > " + guard + ")",
+              service > guard);
+        check("the HttpRequest is built inside it (" + request + " > " + guard + ")",
+              request > guard);
+        check("and the egress call is inside it too (" + egress + " > " + guard + ")",
+              egress > guard);
     }
 
     static int count(String haystack, String needle) {
@@ -15041,32 +15558,41 @@ public class HxExtension implements BurpExtension {
      */
     private static Http montoyaHttp(MontoyaApi api, Clock clock) {
         return (req, deadlineUs) -> {
-            HttpService service = HttpService.httpService(
-                    req.host(), Sender.portOf(req), Sender.secureOf(req));
-            HttpRequest request = HttpRequest.httpRequest(
-                    service, ByteArray.byteArray(Sender.wireBytes(req)));
-
-            // Burp's own timeout is an optimisation; ours is the enforcement.
-            // Sender re-reads the clock after this returns and answers
-            // `timeout` on its own account, so an overshoot here -- or a unit
-            // that is not what we think it is -- cannot turn into a result
-            // frame for a caller that stopped waiting.
-            long remainingMs = Math.max(1L, (deadlineUs - clock.nowUs()) / 1000L);
-            RequestOptions options = RequestOptions.requestOptions()
-                    // Spec s4: redirects are not auto-followed. Each hop is a
-                    // distinct issuance with its own scope decision. Burp does
-                    // not follow them on sendRequest today; saying so
-                    // explicitly means a future default cannot create an
-                    // egress path that never crossed Policy.
-                    .withRedirectionMode(RedirectionMode.NEVER)
-                    .withResponseTimeout(remainingMs);
-
             // Monotonic, because this one IS a duration. Instant.now() would
             // measure an NTP step as latency and feed it to Distress, whose
-            // latency rule stops the whole run at 5x baseline.
+            // latency rule stops the whole run at 5x baseline. Taken before the
+            // try, so a build that throws still has a t0 to have failed after.
             long t0 = System.nanoTime();
             HttpRequestResponse rr;
+            // EVERYTHING the adapter does is inside this try, not just the
+            // egress call. Sender.portOf throws IllegalArgumentException on an
+            // authority whose post-colon text is not an integer, and
+            // HttpService.httpService / HttpRequest.httpRequest are Montoya's
+            // code handed attacker-influenced strings -- all three used to sit
+            // ABOVE the try doing exactly what the catch below says must not
+            // happen. ChokepointTest pins their position, because nothing can
+            // test this file behaviourally.
             try {
+                HttpService service = HttpService.httpService(
+                        req.host(), Sender.portOf(req), Sender.secureOf(req));
+                HttpRequest request = HttpRequest.httpRequest(
+                        service, ByteArray.byteArray(Sender.wireBytes(req)));
+
+                // Burp's own timeout is an optimisation; ours is the
+                // enforcement. Sender re-reads the clock after this returns
+                // and answers `timeout` on its own account, so an overshoot
+                // here -- or a unit that is not what we think it is -- cannot
+                // turn into a result frame for a caller that stopped waiting.
+                long remainingMs = Math.max(1L, (deadlineUs - clock.nowUs()) / 1000L);
+                RequestOptions options = RequestOptions.requestOptions()
+                        // Spec s4: redirects are not auto-followed. Each hop is
+                        // a distinct issuance with its own scope decision. Burp
+                        // does not follow them on sendRequest today; saying so
+                        // explicitly means a future default cannot create an
+                        // egress path that never crossed Policy.
+                        .withRedirectionMode(RedirectionMode.NEVER)
+                        .withResponseTimeout(remainingMs);
+
                 rr = api.http().sendRequest(request, options);
             } catch (RuntimeException e) {
                 // Montoya answers most transport failures with a response-less
@@ -15074,7 +15600,7 @@ public class HxExtension implements BurpExtension {
                 // "all", and a RuntimeException escaping here would reach
                 // BridgeClient's catch-all and close the connection. Sender
                 // handles IOException and feeds it to Distress; give it one.
-                throw new IOException("sendRequest failed for " + req.url(), e);
+                throw new IOException("could not issue " + req.url(), e);
             }
             long ms = (System.nanoTime() - t0) / 1_000_000L;
 

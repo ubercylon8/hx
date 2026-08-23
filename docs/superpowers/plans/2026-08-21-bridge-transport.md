@@ -1688,6 +1688,33 @@ public final class ConfigBody {
         "limit.rate_rps", "limit.concurrency", "limit.max_requests", "render.allow"
     );
 
+    /**
+     * The keys that are read as numbers, and are therefore checked HERE.
+     *
+     * REPRODUCED END TO END over a unix socket before this existed:
+     * `limit.rate_rps = as fast as possible` parsed fine, the extension acked
+     * `t=configured epoch=1`, and the operator's console said the run was
+     * configured. The FIRST send then threw out of Limits.arm, the send arm
+     * answered `not_configured`, dropped to DENY-ALL and CLOSED -- and
+     * HxExtension has no reconnect (`c.connect()` runs once, on a daemon
+     * thread), so the corrected configure could not be sent at all:
+     * `java.io.IOException: Broken pipe`. Recovery needed an extension reload
+     * inside Burp.
+     *
+     * Refusing it here answers `bad_config` instead: the same DENY-ALL, the
+     * same nothing-issued, but the channel lives and the next configure is
+     * heard. Safety is identical; recoverability is not. An equally malformed
+     * value arriving one frame later already got the survivable answer, and
+     * that asymmetry was the whole argument.
+     *
+     * `limit.concurrency` is deliberately NOT in this list. Nothing reads it
+     * yet -- refusing a config for a value no code consults would be this
+     * parser inventing a rule rather than enforcing one. It joins the list in
+     * the change that honours it.
+     */
+    private static final Set<String> POSITIVE_INTEGER_KEYS =
+        Set.of("limit.rate_rps", "limit.max_requests");
+
     private ConfigBody() { }
 
     public static Map<String, List<String>> parse(byte[] body) {
@@ -1724,9 +1751,45 @@ public final class ConfigBody {
         // because a config's key order is the operator's, and an unordered
         // rendering of someone's scope in a report is a defect no test will
         // catch for you.
+        // Checked after the whole body is read, so a repeated key is seen as
+        // repeated. See POSITIVE_INTEGER_KEYS for why this is worth a frame
+        // the caller can recover from.
+        for (String key : POSITIVE_INTEGER_KEYS) positiveInteger(out.get(key), key);
+
         Map<String, List<String>> frozen = new LinkedHashMap<>();
         out.forEach((k, v) -> frozen.put(k, List.copyOf(v)));
         return Collections.unmodifiableMap(frozen);
+    }
+
+    /**
+     * "integer, once" -- the protocol document's words for these keys -- read
+     * as a refusal rather than as documentation.
+     *
+     * An absent key is fine: it means the operator expressed no opinion and
+     * the jar's built-in default answers. A key that is PRESENT and unreadable
+     * is not, and falling back to the default there is the one answer wrong in
+     * both directions -- an operator who asked for 1 rps would silently get 5,
+     * and one who asked for 500 would silently get 5 as well.
+     *
+     * Limits.positive still makes the same three checks on the value it
+     * actually uses. That is not duplication to be tidied away: this one
+     * guards the WIRE, and an Authorisation can be constructed without ever
+     * crossing it.
+     */
+    private static void positiveInteger(List<String> values, String key) {
+        if (values == null || values.isEmpty()) return;
+        if (values.size() != 1)
+            throw new Frame.FrameError(key + " was set " + values.size()
+                + " times; it is an integer, once -- two answers to \"how fast\" "
+                + "is not a limit");
+        String raw = values.get(0).strip();
+        long n;
+        try {
+            n = Long.parseLong(raw);
+        } catch (NumberFormatException e) {
+            throw new Frame.FrameError(key + " is not an integer: " + raw);
+        }
+        if (n <= 0) throw new Frame.FrameError(key + " must be positive, not " + n);
     }
 }
 ```
@@ -3574,6 +3637,10 @@ public class BridgeClientTest {
             t("aSendForAnotherEngagementNeverReachesTheHandler", BridgeClientTest::aSendForAnotherEngagementNeverReachesTheHandler);
             t("aSendHandlerThatThrowsDropsToDenyAll", BridgeClientTest::aSendHandlerThatThrowsDropsToDenyAll);
             t("aSendWithNoHandlerInstalledIsRefused", BridgeClientTest::aSendWithNoHandlerInstalledIsRefused);
+            t("aThrowingSendArmBothDeniesAndStopsTheLoop",
+              BridgeClientTest::aThrowingSendArmBothDeniesAndStopsTheLoop);
+            t("anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives",
+              BridgeClientTest::anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -4353,6 +4420,127 @@ public class BridgeClientTest {
                   && Long.valueOf(15L).equals(then.header.get("id")));
         } finally {
             Files.deleteIfExists(dir.resolve("n.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * The send arm's catch does TWO things -- `denyAll()` and `return false` --
+     * and each was masking the other.
+     *
+     * Delete `denyAll()` and the read loop's own finally still lands in
+     * DENY-ALL on the way out, so `maySend()` reads false either way. Delete
+     * `return false` and `denyAll()` has already cleared `configured`, so
+     * `maySend()` reads false again. Both mutations were measured at 9 x ALL
+     * PASS, and the pair is not redundant at all: the finally only runs
+     * because the arm asked the loop to leave, and the loop only leaves a
+     * client that is already denying because the arm denied first.
+     *
+     * handle() is called DIRECTLY here, which is what separates them. Nothing
+     * unwinds the read loop, so denyAll()'s absence is visible in maySend(),
+     * and the return value is visible on its own -- the answer to "does the
+     * control channel go on serving a send path that just threw", which spec
+     * s4 answers no.
+     */
+    static void aThrowingSendArmBothDeniesAndStopsTheLoop() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendarmthrow");
+        try (Live l = live(dir, "at.sock")) {
+            check("live before the throw", l.client.maySend());
+            l.client.setSendHandler((h, b, auth) -> {
+                throw new IllegalStateException("the redactor is gone");
+            });
+
+            boolean keepReading = l.client.handle(
+                    Frame.decode(Frame.encode(sendFrame("e-1", 21L), GET)));
+            Frame.Decoded err = read(l.reader, l.peer, "the internal-failure error");
+            check("the caller is answered with a class, not a silent bridge_lost",
+                  "error".equals(err.header.get("t"))
+                  && "not_configured".equals(err.header.get("class")));
+            // Each of the two, separately.
+            check("the arm itself drops to DENY-ALL rather than leaving it to the "
+                  + "read loop's finally", !l.client.maySend());
+            check("and it tells the read loop to stop (" + keepReading + ")", !keepReading);
+        } finally {
+            Files.deleteIfExists(dir.resolve("at.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A limit the extension cannot use is refused WHEN IT ARRIVES, and the
+     * control channel survives the refusal.
+     *
+     * REPRODUCED end to end before this existed, over a real unix socket:
+     *
+     *     configure ack: t=configured  epoch=1     <- the operator is told OK
+     *     first send:    t=error class=not_configured
+     *                    detail=... limit.rate_rps is not an integer: as fast
+     *                    as possible
+     *     after it:      maySend()=false, http calls=0
+     *     a corrected configure: IMPOSSIBLE -- java.io.IOException: Broken pipe
+     *
+     * Fail-closed, and the detail even named the cause -- but the answer came
+     * one frame too late and on the wrong side of a channel close. HxExtension
+     * dials once, on a daemon thread, and has no reconnect, so recovery meant
+     * reloading the extension inside Burp.
+     *
+     * bad_config is the answer that already existed for exactly this shape: an
+     * operator's configure that we could not act on. It drops to DENY-ALL --
+     * identical safety, nothing is issued either way -- and keeps the channel,
+     * so the corrected configure below is heard. The asymmetry with an equally
+     * malformed value arriving one frame later was the whole argument.
+     */
+    static void anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives()
+            throws Exception {
+        Path dir = Files.createTempDirectory("hxbadlimit");
+        try (Live l = live(dir, "bl.sock")) {
+            check("wide scope is in force first",
+                  l.client.authorisation().scope().toString().contains("WIDE"));
+
+            l.out.write(Frame.encode(configureFrame("e-1", 31L),
+                    ("scope.include\thttps://a/*\n"
+                     + "limit.rate_rps\tas fast as possible\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the bad-limit error");
+            check("an unusable limit is answered at CONFIGURE time (got "
+                  + err.header.get("t") + ")", "error".equals(err.header.get("t")));
+            check("with class bad_config (got " + err.header.get("class") + "), not an "
+                  + "ack the first send has to take back",
+                  "bad_config".equals(err.header.get("class")));
+            check("and the detail names the key and the value it could not read",
+                  String.valueOf(err.header.get("detail")).contains("limit.rate_rps")
+                  && String.valueOf(err.header.get("detail")).contains("as fast as possible"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a configure it could not act on drops to DENY-ALL", !l.client.maySend());
+            check("the superseded wider scope is dropped",
+                  l.client.authorisation().scope().isEmpty());
+
+            // The half that the send-time refusal could not deliver.
+            l.out.write(Frame.encode(configureFrame("e-1", 32L),
+                    ("scope.include\thttps://NARROW/*\nlimit.rate_rps\t3\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded ack = read(l.reader, l.peer, "the corrected configured ack");
+            check("the channel survives, so a corrected configure is heard (got "
+                  + ack.header.get("t") + ")", "configured".equals(ack.header.get("t")));
+            waitUntil(l.client::maySend);
+            check("and the run is live again under the corrected config",
+                  l.client.maySend());
+            check("with the corrected scope",
+                  l.client.authorisation().scope().toString().contains("NARROW"));
+
+            // Two answers to "how fast" is not a limit either, and it lands in
+            // the same place rather than at the first send.
+            l.out.write(Frame.encode(configureFrame("e-1", 33L),
+                    ("scope.include\thttps://a/*\nlimit.max_requests\t10\n"
+                     + "limit.max_requests\t2000\n").getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded twice = read(l.reader, l.peer, "the repeated-limit error");
+            check("a repeated limit key is bad_config too (got "
+                  + twice.header.get("class") + ")",
+                  "bad_config".equals(twice.header.get("class")));
+        } finally {
+            Files.deleteIfExists(dir.resolve("bl.sock")); Files.deleteIfExists(dir);
         }
     }
 

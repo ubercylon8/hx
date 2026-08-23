@@ -20,9 +20,26 @@ import java.util.stream.Stream;
  * This one counts, over the whole of extension/src, so a path nobody thought
  * to test cannot exist quietly.
  *
- * It reads RAW TEXT, comments included. That is the fail-safe direction: a
- * comment that spells the egress call makes the count 2 and this test go RED.
- * If that happens, rewrite the comment -- do not loosen the needle.
+ * It reads RAW TEXT, comments included, and that cuts BOTH ways. This javadoc
+ * used to claim it was "the fail-safe direction"; it was measured, and it is
+ * not.
+ *
+ *   - For a count that must be ZERO (the batch call, the deprecated
+ *     accessors), a comment that spells the needle makes the count 1 and this
+ *     test go RED. That direction is fail-safe: rewrite the comment, do not
+ *     loosen the needle.
+ *   - For a count that must be EXACTLY ONE, a comment ANYWHERE in the tree can
+ *     supply that one. MEASURED: setting RedirectionMode.ALWAYS in the entry
+ *     point and writing `RedirectionMode.NEVER` in a comment in Sender.java
+ *     left all nine classes green -- redirects followed inside Burp, and a
+ *     comment saying they were not. That direction is fail-OPEN.
+ *
+ * So a whole-tree count is used only where zero is the answer or where the
+ * needle is a CALL nobody would write in prose. Where the count must be
+ * exactly one and the text is a constant a comment could carry, take it in
+ * {@link #ENTRY_POINT} alone -- see {@link #redirectsAreNotFollowed} -- and
+ * assert the whole family appears once there, so a second setting cannot hide
+ * behind the first.
  */
 public class ChokepointTest {
 
@@ -55,13 +72,15 @@ public class ChokepointTest {
 
         t("oneEgressPath", () -> oneEgressPath(sources));
         t("noBatchEgressPath", () -> noBatchEgressPath(sources));
-        t("redirectsAreNotFollowed", () -> redirectsAreNotFollowed(sources));
+        t("redirectsAreNotFollowed", ChokepointTest::redirectsAreNotFollowed);
         t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
         t("theDeprecatedAccessorsAreUnusedEverywhere",
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
         t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
           () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
+        t("theAdapterBuildsItsRequestInsideTheTry",
+          ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -75,18 +94,44 @@ public class ChokepointTest {
         }
     }
 
+    /**
+     * TWO needles, and the second is the one that matters.
+     *
+     * `http().sendRequest` is a SPELLING, and the review broke it without
+     * touching a character of it: `var h2 = api.http(); h2.sendRequest(request,
+     * options);` is a genuine second, ungated issuance that all four counters
+     * here missed -- the batch counter looks for `sendRequests(`, `import burp.`
+     * is unchanged because the sabotage lives in the one file allowed to import
+     * it, and `.authorisation()` is unchanged. Duplicating the call outright is
+     * the shape nobody writes; a local named `h2` is the shape a "convenience
+     * retry" takes.
+     *
+     * So the HANDLE is counted too. Nothing in the extension may reach Montoya's
+     * HTTP API at all except the one adapter in the entry point, whatever it
+     * does with what it gets back -- which also catches the batch call, a
+     * three-iteration loop, and anything else reachable from a second handle.
+     */
     static void oneEgressPath(List<Path> sources) throws IOException {
-        int total = 0;
+        int total = 0, handles = 0;
         List<String> hits = new ArrayList<>();
+        List<String> handleHits = new ArrayList<>();
         for (Path p : sources) {
-            int n = count(text(p), "http().sendRequest");
+            String t = text(p);
+            int n = count(t, "http().sendRequest");
             total += n;
             if (n > 0) hits.add(p + " x" + n);
+            int h = count(t, ".http()");
+            handles += h;
+            if (h > 0) handleHits.add(p + " x" + h);
         }
         check("the egress call appears exactly once in extension/src, not " + total
               + " times " + hits, total == 1);
         check("and it is in " + ENTRY_POINT + ", not " + hits,
               hits.size() == 1 && hits.get(0).startsWith(ENTRY_POINT));
+        check("Montoya's HTTP API is REACHED exactly once in extension/src, not "
+              + handles + " times " + handleHits, handles == 1);
+        check("and that one reach is in " + ENTRY_POINT + ", not " + handleHits,
+              handleHits.size() == 1 && handleHits.get(0).startsWith(ENTRY_POINT));
     }
 
     static void noBatchEgressPath(List<Path> sources) throws IOException {
@@ -100,14 +145,33 @@ public class ChokepointTest {
               total == 0);
     }
 
-    static void redirectsAreNotFollowed(List<Path> sources) throws IOException {
-        int total = 0;
-        for (Path p : sources) total += count(text(p), "RedirectionMode.NEVER");
-        // Spec s4: each hop is a distinct issuance with its own scope decision
-        // and its own exchange row. A redirect followed inside Burp is a
-        // request that never crossed Policy -- a third egress path that looks
-        // exactly like the first.
-        check("the egress call disables redirect following (" + total + ")", total == 1);
+    /**
+     * Spec s4: each hop is a distinct issuance with its own scope decision and
+     * its own exchange row. A redirect followed inside Burp is a request that
+     * never crossed Policy -- a third egress path that looks exactly like the
+     * first.
+     *
+     * Counted in {@link #ENTRY_POINT} ONLY, and this is the one check on this
+     * branch that was MEASURED FAIL-OPEN before it was. Taken over all of
+     * extension/src, `.withRedirectionMode(RedirectionMode.ALWAYS)` in the
+     * entry point plus `// see HxExtension: RedirectionMode.NEVER` in a comment
+     * in Sender.java gave the count its 1 and left all nine classes green:
+     * redirects followed inside Burp, and a comment two files away saying they
+     * were not. A whole-tree count of a CONSTANT is a count of prose.
+     *
+     * The second assertion is what makes the first one hold. `NEVER` appearing
+     * once is not "redirects are off" if `ALWAYS` is also there -- the last
+     * call to .withRedirectionMode wins, and either order is one line. So the
+     * whole family is counted: exactly one RedirectionMode is named in the
+     * adapter, and it is NEVER.
+     */
+    static void redirectsAreNotFollowed() throws IOException {
+        String entry = text(Path.of(ENTRY_POINT));
+        int never = count(entry, "RedirectionMode.NEVER");
+        int any = count(entry, "RedirectionMode.");
+        check("the egress call disables redirect following (" + never + ")", never == 1);
+        check("and it names exactly one redirection mode, so a second setting "
+              + "cannot override it (" + any + ")", any == 1);
     }
 
     static void montoyaIsConfinedToTheEntryPoint(List<Path> sources) throws IOException {
@@ -189,6 +253,43 @@ public class ChokepointTest {
               + count(entry, "setHaltNotifier(") + ")", count(entry, "setHaltNotifier(") == 1);
         check("and the send path is installed (" + count(entry, "setSendHandler(") + ")",
               count(entry, "setSendHandler(") == 1);
+    }
+
+    /**
+     * Everything the adapter builds is inside the try that turns a
+     * RuntimeException into an IOException.
+     *
+     * The comment on that catch says a RuntimeException escaping it "would
+     * reach BridgeClient's catch-all and close the connection. Sender handles
+     * IOException and feeds it to Distress; give it one." That was true of the
+     * one line the try used to wrap and false of the three above it:
+     * Sender.portOf throws IllegalArgumentException for an authority whose
+     * post-colon text is not an integer, and HttpService.httpService and
+     * HttpRequest.httpRequest are someone else's code called with attacker-
+     * influenced strings. Any of them would have taken the control channel
+     * down instead of costing one request a transport_error.
+     *
+     * A position check, not a behavioural one, and the honest reason is that
+     * HxExtension needs Burp to run at all -- see the class comment on
+     * everyKillPathIsWiredBeforeTheDial. It is anchored at the adapter's own
+     * declaration rather than at the file, so an unrelated try elsewhere in
+     * HxExtension cannot satisfy it.
+     */
+    static void theAdapterBuildsItsRequestInsideTheTry() throws IOException {
+        String entry = text(Path.of(ENTRY_POINT));
+        int adapter = entry.indexOf("private static Http montoyaHttp(");
+        check("the adapter is where it is expected to be (" + adapter + ")", adapter >= 0);
+        int guard = entry.indexOf("try {", adapter);
+        int service = entry.indexOf("HttpService.httpService(", adapter);
+        int request = entry.indexOf("HttpRequest.httpRequest(", adapter);
+        int egress = entry.indexOf("http().sendRequest(", adapter);
+        check("the adapter opens a try (" + guard + ")", guard > adapter);
+        check("the HttpService is built inside it (" + service + " > " + guard + ")",
+              service > guard);
+        check("the HttpRequest is built inside it (" + request + " > " + guard + ")",
+              request > guard);
+        check("and the egress call is inside it too (" + egress + " > " + guard + ")",
+              egress > guard);
     }
 
     static int count(String haystack, String needle) {

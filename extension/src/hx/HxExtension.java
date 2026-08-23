@@ -160,32 +160,41 @@ public class HxExtension implements BurpExtension {
      */
     private static Http montoyaHttp(MontoyaApi api, Clock clock) {
         return (req, deadlineUs) -> {
-            HttpService service = HttpService.httpService(
-                    req.host(), Sender.portOf(req), Sender.secureOf(req));
-            HttpRequest request = HttpRequest.httpRequest(
-                    service, ByteArray.byteArray(Sender.wireBytes(req)));
-
-            // Burp's own timeout is an optimisation; ours is the enforcement.
-            // Sender re-reads the clock after this returns and answers
-            // `timeout` on its own account, so an overshoot here -- or a unit
-            // that is not what we think it is -- cannot turn into a result
-            // frame for a caller that stopped waiting.
-            long remainingMs = Math.max(1L, (deadlineUs - clock.nowUs()) / 1000L);
-            RequestOptions options = RequestOptions.requestOptions()
-                    // Spec s4: redirects are not auto-followed. Each hop is a
-                    // distinct issuance with its own scope decision. Burp does
-                    // not follow them on sendRequest today; saying so
-                    // explicitly means a future default cannot create an
-                    // egress path that never crossed Policy.
-                    .withRedirectionMode(RedirectionMode.NEVER)
-                    .withResponseTimeout(remainingMs);
-
             // Monotonic, because this one IS a duration. Instant.now() would
             // measure an NTP step as latency and feed it to Distress, whose
-            // latency rule stops the whole run at 5x baseline.
+            // latency rule stops the whole run at 5x baseline. Taken before the
+            // try, so a build that throws still has a t0 to have failed after.
             long t0 = System.nanoTime();
             HttpRequestResponse rr;
+            // EVERYTHING the adapter does is inside this try, not just the
+            // egress call. Sender.portOf throws IllegalArgumentException on an
+            // authority whose post-colon text is not an integer, and
+            // HttpService.httpService / HttpRequest.httpRequest are Montoya's
+            // code handed attacker-influenced strings -- all three used to sit
+            // ABOVE the try doing exactly what the catch below says must not
+            // happen. ChokepointTest pins their position, because nothing can
+            // test this file behaviourally.
             try {
+                HttpService service = HttpService.httpService(
+                        req.host(), Sender.portOf(req), Sender.secureOf(req));
+                HttpRequest request = HttpRequest.httpRequest(
+                        service, ByteArray.byteArray(Sender.wireBytes(req)));
+
+                // Burp's own timeout is an optimisation; ours is the
+                // enforcement. Sender re-reads the clock after this returns
+                // and answers `timeout` on its own account, so an overshoot
+                // here -- or a unit that is not what we think it is -- cannot
+                // turn into a result frame for a caller that stopped waiting.
+                long remainingMs = Math.max(1L, (deadlineUs - clock.nowUs()) / 1000L);
+                RequestOptions options = RequestOptions.requestOptions()
+                        // Spec s4: redirects are not auto-followed. Each hop is
+                        // a distinct issuance with its own scope decision. Burp
+                        // does not follow them on sendRequest today; saying so
+                        // explicitly means a future default cannot create an
+                        // egress path that never crossed Policy.
+                        .withRedirectionMode(RedirectionMode.NEVER)
+                        .withResponseTimeout(remainingMs);
+
                 rr = api.http().sendRequest(request, options);
             } catch (RuntimeException e) {
                 // Montoya answers most transport failures with a response-less
@@ -193,7 +202,7 @@ public class HxExtension implements BurpExtension {
                 // "all", and a RuntimeException escaping here would reach
                 // BridgeClient's catch-all and close the connection. Sender
                 // handles IOException and feeds it to Distress; give it one.
-                throw new IOException("sendRequest failed for " + req.url(), e);
+                throw new IOException("could not issue " + req.url(), e);
             }
             long ms = (System.nanoTime() - t0) / 1_000_000L;
 
