@@ -100,10 +100,21 @@ public final class Limits implements Gate {
         List<String> values = auth.scope().get(key);
         if (values == null || values.isEmpty()) return fallback;
         if (values.size() != 1)
-            // The protocol document says "integer, once". ConfigBody
-            // accumulates repeated keys in order and does not enforce that,
-            // so it is enforced where the value is used: two answers to "how
-            // fast" is not a limit.
+            // The protocol document says "integer, once". This comment used to
+            // say ConfigBody accumulates repeated keys and does not enforce
+            // that, so it had to be enforced here; MEASURED FALSE on this
+            // branch -- ConfigBody.parse now refuses a repeated
+            // limit.rate_rps or limit.max_requests as a FrameError, which the
+            // configure arm answers with bad_config and a live channel.
+            //
+            // parse() is the only production producer of the map this reads,
+            // and both keys this is ever called with are in its
+            // POSITIVE_INTEGER_KEYS, so THIS BRANCH IS UNREACHABLE IN
+            // PRODUCTION TODAY. It stays as defence in depth against a
+            // producer that never crossed the wire -- there is none now, and
+            // the only caller that reaches it is this class's own test, which
+            // builds its Authorisation directly. Two answers to "how fast" is
+            // not a limit, wherever the map came from.
             throw new IllegalArgumentException(key + " was set " + values.size()
                 + " times; it is an integer, once");
         String raw = values.get(0).strip();

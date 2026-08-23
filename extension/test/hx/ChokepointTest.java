@@ -110,6 +110,12 @@ public class ChokepointTest {
      * HTTP API at all except the one adapter in the entry point, whatever it
      * does with what it gets back -- which also catches the batch call, a
      * three-iteration loop, and anything else reachable from a second handle.
+     *
+     * WHAT IT DOES NOT SEE: `.http()` is still a SPELLING, so `var h2 = api .
+     * http ();` slips past it. That is a shape nobody writes and the class
+     * javadoc above already scopes these needles as spellings; noted so the
+     * next reader does not have to rediscover it before deciding it is
+     * acceptable.
      */
     static void oneEgressPath(List<Path> sources) throws IOException {
         int total = 0, handles = 0;
@@ -164,6 +170,16 @@ public class ChokepointTest {
      * call to .withRedirectionMode wins, and either order is one line. So the
      * whole family is counted: exactly one RedirectionMode is named in the
      * adapter, and it is NEVER.
+     *
+     * WHAT IT DOES NOT SEE: a DISCARDED BUILDER RETURN. Montoya's options
+     * builder returns a new object rather than mutating, so
+     * `options.withRedirectionMode(RedirectionMode.NEVER);` written as a bare
+     * statement -- return value dropped, the built options never carrying it
+     * -- still counts exactly one `RedirectionMode.` and one `NEVER`, and
+     * passes. This is PRE-EXISTING rather than a regression introduced by
+     * narrowing the count to the entry point: the whole-tree version was
+     * equally blind to it. Only a test that can drive the adapter would catch
+     * it, and HxExtension needs Burp to run at all.
      */
     static void redirectsAreNotFollowed() throws IOException {
         String entry = text(Path.of(ENTRY_POINT));
@@ -274,6 +290,19 @@ public class ChokepointTest {
      * everyKillPathIsWiredBeforeTheDial. It is anchored at the adapter's own
      * declaration rather than at the file, so an unrelated try elsewhere in
      * HxExtension cannot satisfy it.
+     *
+     * WHAT IT DOES NOT SEE. These are FIRST-OCCURRENCE OFFSETS, not brace
+     * nesting. MEASURED: a decoy `try { ... } catch (RuntimeException e) {
+     * throw new IOException(...); }` opened inside montoyaHttp BEFORE an
+     * unprotected HttpService.httpService / HttpRequest.httpRequest pair
+     * satisfies all four checks below and gives 9 x ALL PASS, with the very
+     * calls this was written about sitting outside any guard. So the anchoring
+     * claim above is true of the FILE and false of the ADAPTER'S OWN BODY: it
+     * catches the lines moving back out of the try, which is the regression it
+     * was written for, and it cannot catch a second try opened in front of
+     * them. That was judged acceptable -- the finding was LOW and this is
+     * strictly better than nothing -- and a brace parser is the fix on the day
+     * it stops being.
      */
     static void theAdapterBuildsItsRequestInsideTheTry() throws IOException {
         String entry = text(Path.of(ENTRY_POINT));

@@ -13058,6 +13058,8 @@ public class SenderTest {
               () -> aHaltWithNoReasonNeverDeliversTheWordNull(dir));
             t("theInterimHeadScanIsBoundedAndFailsToward5xx",
               SenderTest::theInterimHeadScanIsBoundedAndFailsToward5xx);
+            t("theEvidenceLineSaysWhichKindOf599ThisIs",
+              () -> theEvidenceLineSaysWhichKindOf599ThisIs(sentinel));
             t("theWireMappingRoundTripsWhatItParsed", SenderTest::theWireMappingRoundTripsWhatItParsed);
             t("theConfiguredLimitsArmTheGateOnceFromTheAuthorisation",
               SenderTest::theConfiguredLimitsArmTheGateOnceFromTheAuthorisation);
@@ -13980,6 +13982,13 @@ public class SenderTest {
     static void theInterimHeadScanIsBoundedAndFailsToward5xx() {
         check("the bound is 8 heads (" + Sender.MAX_INTERIM_HEADS + ")",
               Sender.MAX_INTERIM_HEADS == 8);
+        // The VALUE, not merely "somewhere in 5xx". 599 -> 500 left all nine
+        // classes green before this line existed, and 500 is a status real
+        // origins send constantly: a sentinel that collides with a common
+        // answer is exactly the ambiguity `outcome` had to be added to
+        // resolve. Pinned here for the same reason MAX_INTERIM_HEADS is.
+        check("and the unreadable-status sentinel is 599 ("
+              + Sender.STATUS_UNREADABLE + ")", Sender.STATUS_UNREADABLE == 599);
 
         // 7 interim heads is the most that can precede a final one, because
         // the eighth iteration is the one that reads the final head.
@@ -14012,6 +14021,96 @@ public class SenderTest {
         check("and a reply that is not 1xx is never touched at all",
               Sender.finalStatus(interimHeads(8, "HTTP/1.1 500 Internal Server Error"), 204)
               == 204);
+    }
+
+    /**
+     * `status: 599` is two different statements, and the frame has to say
+     * which.
+     *
+     * STATUS_UNREADABLE is 599, and 599 is not a reserved code -- it is in
+     * unofficial use for connect timeouts, which is precisely the class of
+     * peer (a proxy fronting an origin) that also emits early hints. So the
+     * two frames below were, before `outcome` carried the difference,
+     * identical in every field an operator can act on:
+     *
+     *   8 interim heads then a real 200: {status=599, bytes=360, ms=12, outcome=ok}
+     *   the peer itself answers 599:      {status=599, bytes=101, ms=12, outcome=ok}
+     *
+     * The first is the sharp one. That exchange SUCCEEDED -- the redacted
+     * bytes attached to that very frame contain `HTTP/1.1 200 OK` -- and the
+     * indexed status says 599, so an operator grepping for 5xx finds an
+     * exchange whose own evidence contradicts the index. Reading 599 as
+     * "unknown" instead mislabels the real proxy 599 in the other direction,
+     * so NEITHER reading of the number alone is correct and the distinction
+     * cannot live on `status`.
+     *
+     * What must NOT move to fix it: `status` stays 599 and Distress still
+     * counts it, because an unreadable status has to keep reading as an error
+     * to the auto-halt rather than as a healthy sample. The last check here
+     * asserts exactly that -- the conservative property survived the fix.
+     */
+    static void theEvidenceLineSaysWhichKindOf599ThisIs(Path sentinel) {
+        // (a) the scan ran out of budget. The status we report is ours.
+        Rig unreadable = new Rig(sentinel);
+        unreadable.http.reply =
+                new HttpReply(103, interimHeads(8, "HTTP/1.1 200 OK"), 12L, false);
+        Map<String, Object> u = unreadable.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+
+        check("an unreadable status is still framed as a result (" + u.get("t") + ")",
+              "result".equals(u.get("t")));
+        check("and `status` is still the conservative 599 (" + u.get("status") + ")",
+              Long.valueOf(599L).equals(u.get("status")));
+        check("but `outcome` says the status could not be read (" + u.get("outcome") + ")",
+              "status_unreadable".equals(u.get("outcome")));
+        // The contradiction that made this a finding: the frame's own body.
+        String evidence = new String((byte[]) u.get(BridgeClient.BODY_KEY),
+                                     StandardCharsets.ISO_8859_1);
+        check("the redacted bytes on that very frame carry the 200 the peer sent",
+              evidence.contains("HTTP/1.1 200 OK"));
+
+        // (b) the peer answered 599 itself. Same number, different statement.
+        Rig peer = new Rig(sentinel);
+        peer.http.reply = new HttpReply(
+                599, interimHeads(0, "HTTP/1.1 599 Network Connect Timeout"), 12L, false);
+        Map<String, Object> s = peer.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+
+        check("a peer's own 599 is carried through unchanged (" + s.get("status") + ")",
+              Long.valueOf(599L).equals(s.get("status")));
+        check("and is NOT labelled unreadable (" + s.get("outcome") + ")",
+              "ok".equals(s.get("outcome")));
+
+        // The finding itself: without this field the two frames are the same.
+        check("`outcome` is the ONLY field telling the two 599s apart",
+              s.get("status").equals(u.get("status"))
+              && !String.valueOf(s.get("outcome")).equals(String.valueOf(u.get("outcome"))));
+
+        // A 599 read out of the BYTES behind interim heads is still the
+        // peer's. Only the exhausted-budget ending is ours -- a predicate
+        // written as `status == 599 && reported was 1xx` would get this wrong.
+        Rig behind = new Rig(sentinel);
+        behind.http.reply = new HttpReply(
+                103, interimHeads(3, "HTTP/1.1 599 Network Connect Timeout"), 12L, false);
+        Map<String, Object> b = behind.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("a 599 read from the bytes behind interim heads is the peer's too ("
+              + b.get("outcome") + ")",
+              Long.valueOf(599L).equals(b.get("status")) && "ok".equals(b.get("outcome")));
+
+        // AND THE PART THAT MUST NOT HAVE MOVED. Distress is fed the same 599
+        // it was fed before `outcome` existed: ten identical answers is a 100%
+        // 5xx rate and trips spec s4's auto-halt. If carrying the distinction
+        // had softened the status into something Distress does not count, an
+        // origin behind eight interim heads would hold a 0% 5xx rate forever
+        // -- the exact blindness finalStatus was written to close.
+        for (int i = 1; i < 10; i++)
+            unreadable.sender.issue(sendHeader(NOW + THIRTY_SECONDS),
+                                    request("GET", "/api/orders"), authorised());
+        check("an unreadable status still counts as a 5xx to the auto-halt ("
+              + unreadable.distress.stopReason() + ")",
+              unreadable.distress.stopReason() != null
+              && unreadable.distress.stopReason().startsWith("5xx rate 100.0%"));
     }
 
     /** {@code n} interim heads, then {@code last} -- which may be empty, for
@@ -14280,10 +14379,21 @@ public final class Limits implements Gate {
         List<String> values = auth.scope().get(key);
         if (values == null || values.isEmpty()) return fallback;
         if (values.size() != 1)
-            // The protocol document says "integer, once". ConfigBody
-            // accumulates repeated keys in order and does not enforce that,
-            // so it is enforced where the value is used: two answers to "how
-            // fast" is not a limit.
+            // The protocol document says "integer, once". This comment used to
+            // say ConfigBody accumulates repeated keys and does not enforce
+            // that, so it had to be enforced here; MEASURED FALSE on this
+            // branch -- ConfigBody.parse now refuses a repeated
+            // limit.rate_rps or limit.max_requests as a FrameError, which the
+            // configure arm answers with bad_config and a live channel.
+            //
+            // parse() is the only production producer of the map this reads,
+            // and both keys this is ever called with are in its
+            // POSITIVE_INTEGER_KEYS, so THIS BRANCH IS UNREACHABLE IN
+            // PRODUCTION TODAY. It stays as defence in depth against a
+            // producer that never crossed the wire -- there is none now, and
+            // the only caller that reaches it is this class's own test, which
+            // builds its Authorisation directly. Two answers to "how fast" is
+            // not a limit, wherever the map came from.
             throw new IllegalArgumentException(key + " was set " + values.size()
                 + " times; it is an integer, once");
         String raw = values.get(0).strip();
@@ -14510,7 +14620,13 @@ public final class Sender {
         // ahead of its 500s never trips the 20% rule -- one of the three
         // auto-halt conditions in spec s4 -- because every sample it recorded
         // was a 103.
-        int status = finalStatus(reply.raw(), reply.status());
+        // The scan is asked for its REASON as well as its answer: 599 is a
+        // status a peer may also send for itself, so the number alone cannot
+        // say which of the two this was. What Distress counts and what
+        // `status` reports are unchanged either way -- the distinction goes on
+        // `outcome`, below, and nowhere else.
+        StatusScan scan = scanStatus(reply.raw(), reply.status());
+        int status = scan.code();
         distress.record(req.host(), status, reply.ms(), reply.connectionError());
         announceDistress();
 
@@ -14539,7 +14655,13 @@ public final class Sender {
         result.put("status", (long) status);
         result.put("bytes", (long) redacted.length);
         result.put("ms", reply.ms());
-        result.put("outcome", "ok");
+        // What `status` cannot say on its own. 599 is not reserved -- it is
+        // in unofficial use for connect timeouts, which is exactly the class
+        // of peer that fronts an origin with early hints -- so `status: 599`
+        // alone leaves an operator grepping for 5xx unable to tell a peer's
+        // own 599 from an exchange whose own attached bytes say
+        // `HTTP/1.1 200 OK`. See STATUS_UNREADABLE.
+        result.put("outcome", scan.unreadable() ? "status_unreadable" : "ok");
         // The epoch that authorised the scope this was decided under, from the
         // same reference. An evidence line claiming authorisation from an
         // epoch that never granted it is worse than no evidence line.
@@ -14716,8 +14838,26 @@ public final class Sender {
      *
      * It is inside 500..599, which is the range {@code Distress.tripOn5xxRate}
      * counts, so an origin hiding behind eight interim heads reads as broken
-     * rather than as fine. On the evidence line it says the same thing to the
-     * operator: this exchange did not produce a status we could stand behind.
+     * rather than as fine.
+     *
+     * THE EVIDENCE LINE NEEDS MORE THAN THAT, and gets it from `outcome`
+     * rather than from here. 599 is NOT a reserved code -- it is in unofficial
+     * use for connect timeouts, which is exactly the class of peer that fronts
+     * an origin with early hints -- so a frame carrying `status: 599` alone is
+     * indistinguishable from a peer that answered 599 itself, and the two
+     * readings are wrong in opposite directions: read as unreadable, a real
+     * proxy 599 stops being an error; read as real, an exchange that succeeded
+     * with a 200 is indexed as a 5xx while the redacted bytes attached to that
+     * very frame say `HTTP/1.1 200 OK`. So the result frame says
+     * {@code outcome: "status_unreadable"} for this case and
+     * {@code outcome: "ok"} for the peer's own 599, while `status` stays 599
+     * in BOTH: the conservative-for-auto-halt property is the whole reason
+     * this constant exists, and it must not come to depend on anyone reading a
+     * second field.
+     *
+     * The VALUE is pinned by SenderTest, not merely its range. 500 would sit
+     * on a status real origins send constantly, and a sentinel that collides
+     * with a common answer is the ambiguity above, made worse.
      */
     public static final int STATUS_UNREADABLE = 599;
 
@@ -14752,33 +14892,75 @@ public final class Sender {
      * why the two endings must not give the same answer.
      */
     public static int finalStatus(byte[] raw, int reported) {
+        return scanStatus(raw, reported).code();
+    }
+
+    /**
+     * The status, and whether the exchange actually produced it.
+     *
+     * {@link #finalStatus} is this function with the provenance thrown away.
+     * There is ONE scan and not two on purpose: a separate predicate answering
+     * "was that 599 real?" would be a second copy of this loop, free to drift
+     * from the answer it describes.
+     *
+     * {@code unreadable} is true for the exhausted-budget ending ONLY. Every
+     * other ending reports a status that came from the exchange -- a status
+     * line read out of the bytes, the transport's own answer when the bytes
+     * ran out or could not be parsed, or a reported status that was never 1xx
+     * -- and that INCLUDES a genuine 599, whether the transport reported it or
+     * it was read out of the response bytes behind some interim heads. Those
+     * are `ok`: the peer said 599 and we believe it.
+     */
+    static StatusScan scanStatus(byte[] raw, int reported) {
         // A null `raw` reaches redactResponse below, which answers it with a
         // RangeError and a bad_frame. It must not become an NPE here first.
-        if (raw == null || reported < 100 || reported > 199) return reported;
+        if (raw == null || reported < 100 || reported > 199) return sent(reported);
         String text = new String(raw, StandardCharsets.ISO_8859_1);
         int i = 0;
         int head = 0;
         for (; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
             int eol = text.indexOf('\n', i);
-            if (eol < 0) return reported;
+            if (eol < 0) return sent(reported);
             int code = statusCodeOf(text.substring(i, eol));
-            if (code < 100) return reported;        // not a status line: stop guessing
-            if (code >= 200) return code;           // the final response
+            if (code < 100) return sent(reported);  // not a status line: stop guessing
+            if (code >= 200) return sent(code);     // the final response
             // A 1xx head carries no body (RFC 9110 s15.2), so the next head
             // starts immediately after this one's blank line.
             int crlf = text.indexOf("\r\n\r\n", i);
             int lf = text.indexOf("\n\n", i);
             if (crlf >= 0 && (lf < 0 || crlf <= lf)) i = crlf + 4;
             else if (lf >= 0) i = lf + 2;
-            else return reported;
+            else return sent(reported);
         }
         // The scan gave up rather than ran out. Every head it read was a 1xx,
         // so the response IS still ahead of it somewhere and `reported` is
         // certainly not it -- the peer chose the head count, and it must not
         // get to choose the sample Distress records with it.
-        if (head == MAX_INTERIM_HEADS) return STATUS_UNREADABLE;
-        return reported;
+        if (head == MAX_INTERIM_HEADS) return new StatusScan(STATUS_UNREADABLE, true);
+        return sent(reported);
     }
+
+    /** A status the exchange itself produced. */
+    private static StatusScan sent(int code) { return new StatusScan(code, false); }
+
+    /**
+     * A status and where it came from.
+     *
+     * The accessor is {@code code()} rather than {@code status()} deliberately:
+     * {@link HttpReply#status()} has exactly one reader in this tree -- the
+     * scanStatus call in decideAndIssue -- and a second reader spelled the
+     * same way anywhere in extension/src would make that invariant
+     * unverifiable by the grep that checks it. Written with a `#` rather than
+     * a dot for the same reason: see ChokepointTest's
+     * theDeprecatedAccessorsAreUnusedEverywhere, which makes the rule
+     * explicit -- fix the javadoc, do not widen the needle.
+     *
+     * @param code       what goes on the evidence line and into Distress
+     * @param unreadable true when {@code code} is {@link #STATUS_UNREADABLE}
+     *                   BECAUSE the scan ran out of budget, rather than
+     *                   because anything in the exchange said 599
+     */
+    record StatusScan(int code, boolean unreadable) { }
 
     /** The three-digit code of a status line, or -1 for a line that is not
      *  one. Deliberately strict: a line this cannot read is a line this must
@@ -15048,6 +15230,12 @@ public class ChokepointTest {
      * HTTP API at all except the one adapter in the entry point, whatever it
      * does with what it gets back -- which also catches the batch call, a
      * three-iteration loop, and anything else reachable from a second handle.
+     *
+     * WHAT IT DOES NOT SEE: `.http()` is still a SPELLING, so `var h2 = api .
+     * http ();` slips past it. That is a shape nobody writes and the class
+     * javadoc above already scopes these needles as spellings; noted so the
+     * next reader does not have to rediscover it before deciding it is
+     * acceptable.
      */
     static void oneEgressPath(List<Path> sources) throws IOException {
         int total = 0, handles = 0;
@@ -15102,6 +15290,16 @@ public class ChokepointTest {
      * call to .withRedirectionMode wins, and either order is one line. So the
      * whole family is counted: exactly one RedirectionMode is named in the
      * adapter, and it is NEVER.
+     *
+     * WHAT IT DOES NOT SEE: a DISCARDED BUILDER RETURN. Montoya's options
+     * builder returns a new object rather than mutating, so
+     * `options.withRedirectionMode(RedirectionMode.NEVER);` written as a bare
+     * statement -- return value dropped, the built options never carrying it
+     * -- still counts exactly one `RedirectionMode.` and one `NEVER`, and
+     * passes. This is PRE-EXISTING rather than a regression introduced by
+     * narrowing the count to the entry point: the whole-tree version was
+     * equally blind to it. Only a test that can drive the adapter would catch
+     * it, and HxExtension needs Burp to run at all.
      */
     static void redirectsAreNotFollowed() throws IOException {
         String entry = text(Path.of(ENTRY_POINT));
@@ -15212,6 +15410,19 @@ public class ChokepointTest {
      * everyKillPathIsWiredBeforeTheDial. It is anchored at the adapter's own
      * declaration rather than at the file, so an unrelated try elsewhere in
      * HxExtension cannot satisfy it.
+     *
+     * WHAT IT DOES NOT SEE. These are FIRST-OCCURRENCE OFFSETS, not brace
+     * nesting. MEASURED: a decoy `try { ... } catch (RuntimeException e) {
+     * throw new IOException(...); }` opened inside montoyaHttp BEFORE an
+     * unprotected HttpService.httpService / HttpRequest.httpRequest pair
+     * satisfies all four checks below and gives 9 x ALL PASS, with the very
+     * calls this was written about sitting outside any guard. So the anchoring
+     * claim above is true of the FILE and false of the ADAPTER'S OWN BODY: it
+     * catches the lines moving back out of the try, which is the regression it
+     * was written for, and it cannot catch a second try opened in front of
+     * them. That was judged acceptable -- the finding was LOW and this is
+     * strictly better than nothing -- and a brace parser is the fix on the day
+     * it stops being.
      */
     static void theAdapterBuildsItsRequestInsideTheTry() throws IOException {
         String entry = text(Path.of(ENTRY_POINT));

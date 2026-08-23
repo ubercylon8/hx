@@ -4539,6 +4539,31 @@ public class BridgeClientTest {
             check("a repeated limit key is bad_config too (got "
                   + twice.header.get("class") + ")",
                   "bad_config".equals(twice.header.get("class")));
+
+            // ZERO is the third branch, and the only one of the three that was
+            // unpinned: `limit.rate_rps 0` is a perfectly good integer set
+            // exactly once, so neither refusal above sees it. Deleting
+            // `if (n <= 0) throw ...` from ConfigBody.positiveInteger left
+            // 9 x ALL PASS / 1364 ok / 0 FAIL -- and positiveInteger's own
+            // javadoc invites the deletion by noting that Limits.positive
+            // still makes the same three checks, from which a reader concludes
+            // the line is redundant.
+            //
+            // What it restores is not a tidiness regression. 0 parses, is
+            // acked `configured`, and then throws out of Limits.arm at the
+            // FIRST send -- which answers not_configured, drops to DENY-ALL
+            // and CLOSES the channel, with no reconnect in HxExtension. That
+            // is precisely the unrecoverable failure the rest of this method
+            // was written to close, restored invisibly.
+            l.out.write(Frame.encode(configureFrame("e-1", 34L),
+                    ("scope.include\thttps://a/*\nlimit.rate_rps\t0\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded zero = read(l.reader, l.peer, "the zero-limit error");
+            check("a limit of ZERO is refused at configure time, not at the first "
+                  + "send (got " + zero.header.get("t") + "/"
+                  + zero.header.get("class") + ")",
+                  "bad_config".equals(zero.header.get("class")));
         } finally {
             Files.deleteIfExists(dir.resolve("bl.sock")); Files.deleteIfExists(dir);
         }

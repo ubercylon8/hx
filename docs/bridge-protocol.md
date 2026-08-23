@@ -83,6 +83,26 @@ scan is bounded (8 heads, the last of which must be the final one), and a scan
 that runs out of budget reports **599** rather than the interim status: an
 unreadable status must not read as a healthy one.
 
+`result.outcome` is `ok`, or `status_unreadable` when that 599 is the
+extension's own answer rather than the peer's. The two need telling apart and
+`status` cannot do it: 599 is **not a reserved code** -- it is in unofficial use
+for connect timeouts, which is exactly the class of peer (a proxy in front of an
+origin) that also emits early hints -- so `{status: 599}` alone is the same
+frame whether the exchange succeeded with a 200 behind eight interim heads or
+the peer genuinely answered 599. Read one way it indexes a successful exchange
+as a 5xx while the redacted bytes on that same frame say `HTTP/1.1 200 OK`; read
+the other way it launders a real proxy 599 into "status unknown". `status`
+stays 599 in both cases regardless -- the auto-halt in §4 must keep counting an
+unreadable status as an error, and that property must not come to depend on a
+consumer reading a second field.
+
+Note for a consumer that persists these: the store's `exchange.outcome` is a
+DIFFERENT vocabulary (`ok | timeout | conn_refused | dns_error | tls_error |
+scope_denied | rate_limited | bridge_lost | truncated`) and does not contain
+`status_unreadable`. The wire value is about how the status was obtained; the
+store column is about how the exchange ended. Whoever writes those rows owns
+the mapping.
+
 ## Error classes
 
 `class` is one of:
@@ -119,8 +139,9 @@ split right or an operator loses a control channel they could have kept:
   * `not_configured` from the send path's internal-failure catch also drops to
     DENY-ALL and closes: a send path that threw is one we no longer understand.
 
-`limit.rate_rps` and `limit.max_requests` are validated in the `configure` arm,
-not at first use. Accepting an unreadable limit and refusing the first `send`
+`limit.rate_rps` and `limit.max_requests` must each be a positive integer set
+exactly once -- not repeated, not unparseable, and **not zero**; all three are
+refused in the `configure` arm, not at first use. Accepting an unreadable limit and refusing the first `send`
 is equally fail-closed and much worse to recover from: the extension dials once
 and has no reconnect, so the send-time refusal closes the channel and the
 corrected configure cannot be sent at all.

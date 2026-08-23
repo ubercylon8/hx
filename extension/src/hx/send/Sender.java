@@ -205,7 +205,13 @@ public final class Sender {
         // ahead of its 500s never trips the 20% rule -- one of the three
         // auto-halt conditions in spec s4 -- because every sample it recorded
         // was a 103.
-        int status = finalStatus(reply.raw(), reply.status());
+        // The scan is asked for its REASON as well as its answer: 599 is a
+        // status a peer may also send for itself, so the number alone cannot
+        // say which of the two this was. What Distress counts and what
+        // `status` reports are unchanged either way -- the distinction goes on
+        // `outcome`, below, and nowhere else.
+        StatusScan scan = scanStatus(reply.raw(), reply.status());
+        int status = scan.code();
         distress.record(req.host(), status, reply.ms(), reply.connectionError());
         announceDistress();
 
@@ -234,7 +240,13 @@ public final class Sender {
         result.put("status", (long) status);
         result.put("bytes", (long) redacted.length);
         result.put("ms", reply.ms());
-        result.put("outcome", "ok");
+        // What `status` cannot say on its own. 599 is not reserved -- it is
+        // in unofficial use for connect timeouts, which is exactly the class
+        // of peer that fronts an origin with early hints -- so `status: 599`
+        // alone leaves an operator grepping for 5xx unable to tell a peer's
+        // own 599 from an exchange whose own attached bytes say
+        // `HTTP/1.1 200 OK`. See STATUS_UNREADABLE.
+        result.put("outcome", scan.unreadable() ? "status_unreadable" : "ok");
         // The epoch that authorised the scope this was decided under, from the
         // same reference. An evidence line claiming authorisation from an
         // epoch that never granted it is worse than no evidence line.
@@ -411,8 +423,26 @@ public final class Sender {
      *
      * It is inside 500..599, which is the range {@code Distress.tripOn5xxRate}
      * counts, so an origin hiding behind eight interim heads reads as broken
-     * rather than as fine. On the evidence line it says the same thing to the
-     * operator: this exchange did not produce a status we could stand behind.
+     * rather than as fine.
+     *
+     * THE EVIDENCE LINE NEEDS MORE THAN THAT, and gets it from `outcome`
+     * rather than from here. 599 is NOT a reserved code -- it is in unofficial
+     * use for connect timeouts, which is exactly the class of peer that fronts
+     * an origin with early hints -- so a frame carrying `status: 599` alone is
+     * indistinguishable from a peer that answered 599 itself, and the two
+     * readings are wrong in opposite directions: read as unreadable, a real
+     * proxy 599 stops being an error; read as real, an exchange that succeeded
+     * with a 200 is indexed as a 5xx while the redacted bytes attached to that
+     * very frame say `HTTP/1.1 200 OK`. So the result frame says
+     * {@code outcome: "status_unreadable"} for this case and
+     * {@code outcome: "ok"} for the peer's own 599, while `status` stays 599
+     * in BOTH: the conservative-for-auto-halt property is the whole reason
+     * this constant exists, and it must not come to depend on anyone reading a
+     * second field.
+     *
+     * The VALUE is pinned by SenderTest, not merely its range. 500 would sit
+     * on a status real origins send constantly, and a sentinel that collides
+     * with a common answer is the ambiguity above, made worse.
      */
     public static final int STATUS_UNREADABLE = 599;
 
@@ -447,33 +477,75 @@ public final class Sender {
      * why the two endings must not give the same answer.
      */
     public static int finalStatus(byte[] raw, int reported) {
+        return scanStatus(raw, reported).code();
+    }
+
+    /**
+     * The status, and whether the exchange actually produced it.
+     *
+     * {@link #finalStatus} is this function with the provenance thrown away.
+     * There is ONE scan and not two on purpose: a separate predicate answering
+     * "was that 599 real?" would be a second copy of this loop, free to drift
+     * from the answer it describes.
+     *
+     * {@code unreadable} is true for the exhausted-budget ending ONLY. Every
+     * other ending reports a status that came from the exchange -- a status
+     * line read out of the bytes, the transport's own answer when the bytes
+     * ran out or could not be parsed, or a reported status that was never 1xx
+     * -- and that INCLUDES a genuine 599, whether the transport reported it or
+     * it was read out of the response bytes behind some interim heads. Those
+     * are `ok`: the peer said 599 and we believe it.
+     */
+    static StatusScan scanStatus(byte[] raw, int reported) {
         // A null `raw` reaches redactResponse below, which answers it with a
         // RangeError and a bad_frame. It must not become an NPE here first.
-        if (raw == null || reported < 100 || reported > 199) return reported;
+        if (raw == null || reported < 100 || reported > 199) return sent(reported);
         String text = new String(raw, StandardCharsets.ISO_8859_1);
         int i = 0;
         int head = 0;
         for (; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
             int eol = text.indexOf('\n', i);
-            if (eol < 0) return reported;
+            if (eol < 0) return sent(reported);
             int code = statusCodeOf(text.substring(i, eol));
-            if (code < 100) return reported;        // not a status line: stop guessing
-            if (code >= 200) return code;           // the final response
+            if (code < 100) return sent(reported);  // not a status line: stop guessing
+            if (code >= 200) return sent(code);     // the final response
             // A 1xx head carries no body (RFC 9110 s15.2), so the next head
             // starts immediately after this one's blank line.
             int crlf = text.indexOf("\r\n\r\n", i);
             int lf = text.indexOf("\n\n", i);
             if (crlf >= 0 && (lf < 0 || crlf <= lf)) i = crlf + 4;
             else if (lf >= 0) i = lf + 2;
-            else return reported;
+            else return sent(reported);
         }
         // The scan gave up rather than ran out. Every head it read was a 1xx,
         // so the response IS still ahead of it somewhere and `reported` is
         // certainly not it -- the peer chose the head count, and it must not
         // get to choose the sample Distress records with it.
-        if (head == MAX_INTERIM_HEADS) return STATUS_UNREADABLE;
-        return reported;
+        if (head == MAX_INTERIM_HEADS) return new StatusScan(STATUS_UNREADABLE, true);
+        return sent(reported);
     }
+
+    /** A status the exchange itself produced. */
+    private static StatusScan sent(int code) { return new StatusScan(code, false); }
+
+    /**
+     * A status and where it came from.
+     *
+     * The accessor is {@code code()} rather than {@code status()} deliberately:
+     * {@link HttpReply#status()} has exactly one reader in this tree -- the
+     * scanStatus call in decideAndIssue -- and a second reader spelled the
+     * same way anywhere in extension/src would make that invariant
+     * unverifiable by the grep that checks it. Written with a `#` rather than
+     * a dot for the same reason: see ChokepointTest's
+     * theDeprecatedAccessorsAreUnusedEverywhere, which makes the rule
+     * explicit -- fix the javadoc, do not widen the needle.
+     *
+     * @param code       what goes on the evidence line and into Distress
+     * @param unreadable true when {@code code} is {@link #STATUS_UNREADABLE}
+     *                   BECAUSE the scan ran out of budget, rather than
+     *                   because anything in the exchange said 599
+     */
+    record StatusScan(int code, boolean unreadable) { }
 
     /** The three-digit code of a status line, or -1 for a line that is not
      *  one. Deliberately strict: a line this cannot read is a line this must
