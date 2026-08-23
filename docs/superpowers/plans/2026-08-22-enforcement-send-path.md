@@ -19198,6 +19198,20 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
     return proc
 ```
 
+**The block above is now stale in one respect, deliberately left rather than
+hand-edited.** `sentinel` shipped as `sentinel: Path` — REQUIRED, no default —
+not as the `sentinel: Path | None = None` written here, and `launch_burp`'s
+docstring changed to match. Required is the better call and the same one
+`HxExtension` makes about `-Dhx.halt_sentinel`: a defaulted sentinel lets a
+future caller launch Burp against a path nothing on this side ever writes, and
+the symptom is a halt that silently does not arrive. Nothing catches this
+drift automatically — the marker on this block ends in prose rather than
+`.py`, so `tests/test_plan_matches_repo.py`'s regex never yields it, and
+`scripts/sync_plan_block.py` keys on an exact `# <path>` marker line and so
+cannot reach it either. Read `tests/integration/burp_fixture.py`, not this
+block. Plan 2 carries the same file as a FULL-file block, which IS
+byte-compared and IS current.
+
 Then confirm the two existing integration tests still handshake:
 
 Run: `cd /path/to/hx && python -m pytest -m integration tests/integration/test_real_burp.py -q`
@@ -20249,11 +20263,16 @@ The assertion that matters most in this file is `rig.offside.hits == []`, and
 an empty list is what you also get from a target nobody could reach. Prove the
 instrument.
 
-Two edits, because a widened scope also makes the `pytest.raises` above go red
-first and pytest stops a test at its first failing assertion — the wrong half
-to read.
+ONE edit. An earlier draft of this step needed two, because the scope
+refusal was written as `with pytest.raises(...)` and a widened scope made that
+go red first — pytest stops a test at its first failing assertion, and that
+was the wrong half to read. The test no longer refuses that way: each of the
+four attempts is caught into `refusals` and the target logs are asserted
+first, precisely so that this sabotage reports the delivery rather than the
+missing exception. See the `attempt()` helper's docstring, which was written
+from this measurement.
 
-First, in `tests/integration/conftest.py`, in `Rig.configure`, change:
+In `tests/integration/conftest.py`, in `Rig.configure`, change:
 
 ```python
             "scope.include": [f"{self.target.origin}/*"],
@@ -20265,15 +20284,6 @@ to:
             "scope.include": [f"{self.target.origin}/*", f"{self.offside.origin}/*"],
 ```
 
-Second, in `tests/integration/test_send_path.py`, replace the scope-refusal
-block with a plain send and a placeholder, so the test runs on to the log:
-
-```python
-    rig.send("GET", "/api/orders", to=rig.offside)
-    refusals["scope"] = server.BridgeError("scope_denied")
-    refusals["scope"].error_class = "scope_denied"
-```
-
 Run: `cd /path/to/hx && python -m pytest -m integration -q -k refuses_four_ways`
 
 Expected: FAIL on the log rather than on the error class — the request was
@@ -20282,9 +20292,16 @@ observation the un-sabotaged assertion depends on being able to make:
 
 ```
 E       AssertionError: the out-of-scope target received [('GET', '/api/orders')]
+E       assert [Hit(method='...'}, body=b'')] == []
+E         Left contains one more item: Hit(method='GET', path='/api/orders',
+E           query='', headers={'Host': '127.0.0.2:44243', ...}, body=b'')
 ```
 
-Restore: `cd /path/to/hx && git checkout -- tests/integration/conftest.py tests/integration/test_send_path.py`
+Measured, and that second line is the one worth reading: the request was not
+merely permitted, it was DELIVERED, and a real server on a second loopback
+address wrote down the headers it arrived with.
+
+Restore: `cd /path/to/hx && git checkout -- tests/integration/conftest.py`
 
 - [ ] **Step 11: Sabotage — delete the halt check from `Sender`**
 
@@ -20316,33 +20333,49 @@ Restore: `cd /path/to/hx && git checkout -- extension/src/hx/send/Sender.java &&
 
 - [ ] **Step 12: Sabotage — let the sentinel poller cancel a halt frame**
 
-This one is described rather than quoted, because `HaltSwitch` is Task 5's
-file: in its poll loop, make the sentinel's *absence* clear the halted state
-outright — that is, replace whatever combines the frame flag with the file's
-existence (`framed || sentinelPresent`) by an assignment from the file alone.
+`HaltSwitch` keeps its two inputs apart in a single `State` record, and
+`publishAnswer` is where a completed poll writes the sentinel half while
+carrying the frame half through untouched. Make the poll write BOTH from the
+file — in `extension/src/hx/send/HaltSwitch.java`, change:
+
+```java
+            state = new State(s.frameHalted(), s.frameReason(), present, why, s.armed(), now);
+```
+
+to:
+
+```java
+            state = new State(present, why, present, why, s.armed(), now);
+```
+
 That is the single most tempting simplification in the class and it silently
-collapses the two kill paths this class owns into one.
+collapses the two kill paths it owns into one: the sentinel's absence now
+cancels a halt frame.
 
 Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q -k sentinel`
 
-Expected: FAIL with
-
-```
-E       AssertionError: removing the sentinel re-armed issuance while a halt frame was in force
-```
-
-Nothing on this side can produce that line. It is reached through `rig.get`,
-with `rig.srv.state` still `configured` and the durable halt disarmed, so the
-refusal it was waiting for could only have come from the JVM. Confirm the
-other half of the same claim by deleting the two lines above it — the
-`pytest.raises` block and the error-class assertion — and re-running. The
-target server's own log then fails instead:
+Expected: FAIL on the target server's own log, which is the strongest of the
+two claims and therefore the one asserted first:
 
 ```
 E       AssertionError: removing the sentinel re-armed issuance: the request reached the target
+E       assert 4 == 3
 ```
 
-Restore both: `cd /path/to/hx && git checkout -- extension/src/hx/send/HaltSwitch.java tests/integration/test_send_path.py && extension/build.sh`
+Measured. Nothing on this side can produce that line: it is reached through
+`rig.get`, with `rig.srv.state` still `configured` and the durable halt
+disarmed, so a request that arrives at the target arrived because the JVM let
+it. The error-class sentence — "removing the sentinel re-armed issuance while
+a halt frame was in force" — sits immediately after it and is the same claim
+one step weaker.
+
+An earlier draft asserted the class through `with pytest.raises(...)`, and
+this sabotage is what disproved it: under the collapse the send SUCCEEDS, so
+pytest reported a bare `Failed: DID NOT RAISE BridgeError` and neither
+sentence above was ever reached. Both assertions exist in their present form
+because of that run.
+
+Restore: `cd /path/to/hx && git checkout -- extension/src/hx/send/HaltSwitch.java && extension/build.sh`
 
 - [ ] **Step 13: Sabotage — send the raw response across the bridge**
 
@@ -20368,9 +20401,16 @@ the moment it arrived:
 E       AssertionError: assert b'Set-Cookie: session={{observed:set-cookie}}' in b'HTTP/1.0 200 OK\r\n...Set-Cookie: session=s3cr3t-live-session-2f9a41c0; Path=/...'
 ```
 
-Confirm the second half by deleting the three assertions above the blob write
-and re-running: `_blobs_containing(...) == []` must then fail with a path
-under `blobs/`. Restore both.
+Confirm the second half by deleting the FIVE assertions between the reply and
+the blob-tree walk — the three on `raw` above the blob write, and the two on
+`stored` below it — and re-running. `_blobs_containing(...) == []` then fails
+with a path under `blobs/`, measured as
+
+```
+E       AssertionError: assert [PosixPath('/...engagement/blobs/32/0d/320dc3dbb8c688edd8af98bf32e8145ea5d07f76c83a29e8e097fed8c0f3bd88')] == []
+```
+
+which is the live session cookie, content-addressed, on disk. Restore both.
 
 Restore: `cd /path/to/hx && git checkout -- extension/src/hx/send/Sender.java tests/integration/test_send_path.py && extension/build.sh`
 
@@ -20387,13 +20427,21 @@ In `extension/src/hx/send/Sender.java`, delete:
 
 Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q -k refuses_four_ways`
 
-Expected: FAIL, twice, and the second one is the one that matters — the live
-credential was put on the wire:
+Expected: FAIL on the in-scope target's own request log — the live credential
+was put on the wire:
 
 ```
-E       AssertionError: assert {'credential': 'scope_denied', ...} == {'credential': 'unmanaged_credential', ...}
 E       AssertionError: the in-scope target received [('GET', '/health'), ('GET', '/api/orders')]
+E       assert ['/health', '/api/orders'] == ['/health']
 ```
+
+Measured. An earlier draft wrapped the credential send in
+`with pytest.raises(...)` and expected two failures with the class-dict
+mismatch first; under this sabotage the send raises NOTHING, so pytest
+reported `Failed: DID NOT RAISE BridgeError` at the send and the assertion
+above — the one this test exists for — was never reached at all. That is why
+the four attempts are caught into `refusals` and the logs are asserted before
+the classes.
 
 Restore: `cd /path/to/hx && git checkout -- extension/src/hx/send/Sender.java && extension/build.sh`
 
@@ -20434,7 +20482,7 @@ Then the other half — a limiter that refuses but lies about the wait. Restore
 the line above and instead change, in `extension/src/hx/policy/Limiter.java`:
 
 ```java
-                return Decision.rateLimited(leavesWindowAt - now,
+                return Decision.rateLimited(WINDOW_US - elapsed,
 ```
 
 to:
@@ -20445,11 +20493,12 @@ to:
 
 Re-run the same command. The refusal still arrives and still carries the right
 class; what goes red is the arithmetic, by ~400 ms (an un-sabotaged run of
-the same test measured a hint of 564,647 µs inside its own band):
+the same test measured a hint of 573,050 µs inside a band of
+[564,678, 601,754], 37 ms wide):
 
 ```
 E       AssertionError: retry_after_us is 1000000us; the oldest issuance in
-        the window leaves it between 559377us and 600701us from when this
+        the window leaves it between 548518us and 598971us from when this
         refusal was decided. 1000000us would be the answer for a limiter that
         returns the whole window instead of the wait for its oldest entry
 ```
@@ -20471,12 +20520,17 @@ Add a bare `assert False, "deliberate"` as the first line of
 
 ```bash
 cd /path/to/hx
-python -m pytest -m integration -q -k budget_is_exhausted ; echo "exit=$?"
-pgrep -fa 'burp.StartBurp' || echo "no Burp survived"
-ss -ltn 'src 127.0.0.2' || echo "no target port survived"
+python -m pytest -m integration -q -k budget_is_exhausted
+pgrep -a -x java || echo "no Burp survived"
+ss -ltn | grep 127.0.0.2 || echo "no target port survived"
 ```
 
 Expected: `1 failed`, then `no Burp survived`, then `no target port survived`.
+
+`pgrep -a -x java`, NOT `pgrep -fa 'burp.StartBurp'`. The second matches the
+shell running this very command, because the pattern is on its own command
+line — measured, and it reports a surviving Burp on a machine with no JVM at
+all, which is a false positive in the one direction that matters.
 
 Restore: `cd /path/to/hx && git checkout -- tests/integration/test_send_path.py`
 
