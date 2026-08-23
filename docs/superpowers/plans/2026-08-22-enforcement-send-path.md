@@ -14679,8 +14679,24 @@ are in the files and not in Plan 2's blocks. (Task 5's halt arms are in the
 same two files; if Task 5 has already run, its edits come along in the same
 re-sync.)
 
-Replace the body of each of those two blocks with the current contents of the
-file it names, verbatim, keeping the `// path` first line.
+> **Use `scripts/sync_plan_block.py`, do not hand-roll this.** Five separate
+> incidents on this branch came from ad-hoc versions of this job: two blind syncs
+> that rewrote a *future* task's block from an unfinished file, an unguarded
+> `str.replace` that rewrote another task's prose, a script that pasted the whole
+> file under the marker and so **duplicated that line for every source carrying
+> its own path header** — corrupting blocks that were already byte-correct — and a
+> harness that adopted a polluted tree as its baseline. The script takes an
+> explicit allowlist, follows the *file* rather than a convention (Plan 2's
+> sources open with `package`; Plan 3's open with `// path`, and the drift check
+> re-prepends the marker only in the second case), and verifies by section hash
+> that nothing outside the named blocks moved.
+>
+> ```
+> python3 scripts/sync_plan_block.py <plan.md> <file> [<file> ...]
+> ```
+>
+> Run it twice. The second run must report every file `unchanged`; that is the
+> cheapest evidence the sync converged.
 
 The third file, `extension/src/hx/HxExtension.java`, is a **duplicate block,
 not a stale one**. Step 12 above is now the plan block for that file, and two
@@ -16704,26 +16720,25 @@ The rule the failure prints is the one to follow: **sync the block from the
 file, never the file from the block.** Do it mechanically — a hand-edited
 block is exactly the drift this test exists to catch:
 
-```bash
-python - <<'PY'
-from pathlib import Path
+> **Use `scripts/sync_plan_block.py`, do not hand-roll this.** Five separate
+> incidents on this branch came from ad-hoc versions of this job: two blind syncs
+> that rewrote a *future* task's block from an unfinished file, an unguarded
+> `str.replace` that rewrote another task's prose, a script that pasted the whole
+> file under the marker and so **duplicated that line for every source carrying
+> its own path header** — corrupting blocks that were already byte-correct — and a
+> harness that adopted a polluted tree as its baseline. The script takes an
+> explicit allowlist, follows the *file* rather than a convention (Plan 2's
+> sources open with `package`; Plan 3's open with `// path`, and the drift check
+> re-prepends the marker only in the second case), and verifies by section hash
+> that nothing outside the named blocks moved.
+>
+> ```
+> python3 scripts/sync_plan_block.py <plan.md> <file> [<file> ...]
+> ```
+>
+> Run it twice. The second run must report every file `unchanged`; that is the
+> cheapest evidence the sync converged.
 
-# Built rather than written out, so no run of three backticks appears inside
-# this fenced block for a markdown reader to trip over.
-FENCE = "`" * 3
-
-plan = Path("docs/superpowers/plans/2026-08-21-bridge-transport.md")
-text = plan.read_text()
-for path in ("src/hx/bridge/server.py", "tests/test_bridge_server.py"):
-    marker = f"{FENCE}python\n# {path}\n"
-    n = text.count(marker)
-    assert n == 1, f"{path}: expected one full-file block in the plan, found {n}"
-    start = text.index(marker)
-    end = text.index(f"\n{FENCE}", start + len(marker))
-    text = text[:start] + marker + Path(path).read_text().rstrip("\n") + text[end:]
-plan.write_text(text)
-PY
-```
 
 Run: `.venv/bin/pytest tests/test_plan_matches_repo.py -q`
 Expected: PASS. Running the script a second time must change nothing — it is a
@@ -17489,29 +17504,25 @@ Sync the block **from** the file — never the other way round, and never by
 hand, which is the mistake that put four fixed defects back into a plan on the
 last branch:
 
-```bash
-cd /path/to/hx
-python - <<'PY'
-from pathlib import Path
+> **Use `scripts/sync_plan_block.py`, do not hand-roll this.** Five separate
+> incidents on this branch came from ad-hoc versions of this job: two blind syncs
+> that rewrote a *future* task's block from an unfinished file, an unguarded
+> `str.replace` that rewrote another task's prose, a script that pasted the whole
+> file under the marker and so **duplicated that line for every source carrying
+> its own path header** — corrupting blocks that were already byte-correct — and a
+> harness that adopted a polluted tree as its baseline. The script takes an
+> explicit allowlist, follows the *file* rather than a convention (Plan 2's
+> sources open with `package`; Plan 3's open with `// path`, and the drift check
+> re-prepends the marker only in the second case), and verifies by section hash
+> that nothing outside the named blocks moved.
+>
+> ```
+> python3 scripts/sync_plan_block.py <plan.md> <file> [<file> ...]
+> ```
+>
+> Run it twice. The second run must report every file `unchanged`; that is the
+> cheapest evidence the sync converged.
 
-PLAN = Path("docs/superpowers/plans/2026-08-21-bridge-transport.md")
-SOURCE = Path("tests/integration/burp_fixture.py")
-# The fence is assembled rather than written out. A literal one inside this
-# script would itself look like the start of a code block to the regex in
-# tests/test_plan_matches_repo.py, which would then compare THIS plan's
-# "block" for burp_fixture.py against the file and fail for ever.
-FENCE = "`" * 3
-OPENING = FENCE + "python\n# " + str(SOURCE) + "\n"
-
-text = PLAN.read_text()
-if text.count(OPENING) != 1:
-    raise SystemExit(f"expected exactly 1 block for {SOURCE}, found {text.count(OPENING)}")
-start = text.index(OPENING) + len(OPENING)
-end = text.index("\n" + FENCE + "\n", start) + 1
-PLAN.write_text(text[:start] + SOURCE.read_text().rstrip("\n") + "\n" + text[end:])
-print(f"re-synced {SOURCE} into {PLAN}")
-PY
-```
 
 Run: `python -m pytest tests/test_plan_matches_repo.py -q`
 
