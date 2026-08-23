@@ -366,6 +366,10 @@ public class PolicyTest {
         operatorDangerousPatternsAddToTheDefaults();
         theReadingSetIsSpelledOutCharacterByCharacter();
         bothDotSegmentOrdersAreInTheSet();
+        decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep();
+        everyBestFitEntryIsGuardedByACheckOfItsOwn();
+        anIncludeIsNotWidenedByASegmentTransform();
+        aNulEndsTheStringForAnythingThatReachesACApi();
         theReadingSetIsClosedUnderItsOwnTransforms();
         aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation();
         aDenyRuleSeesEveryReadingOfThePath();
@@ -1128,6 +1132,362 @@ public class PolicyTest {
                       readingsOf(p).containsAll(readingsOf(r)));
     }
 
+
+    /**
+     * Round 6, CRITICAL. Decoding was the one MANDATORY transform in
+     * readings(): every other transform was offered both on and off through
+     * addReadings' `applicable` subsets, while the un-decoded member was in
+     * the set only VERBATIM and UNRESOLVED. So collapseDotSegments(raw) was
+     * never a member -- and that is precisely what RFC 3986 s6.2.2 specifies
+     * and what all three of the libraries the class comment cites as its
+     * authority actually produce:
+     *
+     *   /foo%2fbar/../admin/users
+     *     python urljoin()       -> /admin/users
+     *     node   new URL()       -> /admin/users
+     *     java   URI.normalize() -> /admin/users
+     *     readings()             -> { raw, /foo/admin/users }
+     *
+     * `..` popped `foo/bar` on our reading and `foo%2fbar` on theirs, and the
+     * two land in different places. Five live bypasses on the shipped jar with
+     * all 490 checks green, every one of them a walk past an exclusion by
+     * spelling one separator as %2f.
+     */
+    static void decodingIsOneReadingAmongSeveralAndNotAPreprocessingStep() {
+        Policy p = allowingPolicy();
+
+        // The RFC reading: dot segments resolved over the RAW segments, where
+        // %2f is not a separator and `foo%2fbar` is one segment to pop.
+        reads("/foo%2fbar/../admin/users", "/admin/users");
+        reads("/x%2fy%2fz/../admin/", "/admin/");
+        reads("/api/x%2fy/../payments/charge", "/api/payments/charge");
+
+        // The reading of a server that decodes AFTER it has cut the path into
+        // segments -- Apache with AllowEncodedSlashes off, nginx, Tomcat, and
+        // every framework that unescapes only the segment values it hands on.
+        // It is the ONLY one that resolves this: the %2e%2e becomes a `..`
+        // while `a%2fb` stays one segment for it to pop. Neither decoding
+        // everything nor decoding nothing reaches it.
+        reads("/a%2fb/%2e%2e/admin/users", "/admin/users");
+        check("...and it is not reachable by decoding everything: %2f read as a "
+              + "separator gives /a/admin/users",
+              Policy.readings("/a%2fb/%2e%2e/admin/users").contains("/a/admin/users"));
+        check("nor by decoding nothing: the raw path has no dot segment at all",
+              "/a%2fb/%2e%2e/admin/users".equals(
+                      Policy.collapseDotSegments("/a%2fb/%2e%2e/admin/users")));
+
+        // The decoding reading is still there. It has to be: %2f IS a
+        // separator on a server that unescapes before it routes.
+        reads("/foo%2fbar/../admin/users", "/foo/admin/users");
+        // And the bytes on the wire are still a reading of their own.
+        reads("/foo%2fbar/../admin/users", "/foo%2fbar/../admin/users");
+
+        // Live, past an exclusion. Every one of these was ALLOW.
+        BridgeClient.Authorisation admin =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/admin/*");
+        for (String path : List.of("/foo%2fbar/../admin/users",
+                                   "/a%2fb/%2e%2e/admin/users",
+                                   "/x%2fy%2fz/../admin/"))
+            denies("an encoded separator does not walk past an exclusion: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   admin, "scope_denied");
+
+        denies("nor past a deeper one", p,
+               req("GET", "https://app.example.test/api/x%2fy/../payments/charge",
+                   "app.example.test", "/api/x%2fy/../payments/charge", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "https://app.example.test/api/payments/*"),
+               "scope_denied");
+
+        // The exclusion on a wildcard host, because the host half is a
+        // different branch and an operator's exclude is as often written that
+        // way as it is against one name.
+        denies("nor past a wildcard-host exclusion", p,
+               req("GET", "https://app.example.test/blog%2fposts/../wp-admin/admin-ajax.php",
+                   "app.example.test", "/blog%2fposts/../wp-admin/admin-ajax.php", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "https://*.example.test/wp-admin/*"),
+               "scope_denied");
+
+        // The control the whole table is read against: with no escape in it
+        // the same shape was ALWAYS refused, which is what made the five above
+        // look like a rule that worked.
+        denies("the same shape with no escape in it was never allowed", p,
+               req("GET", "https://app.example.test/foo/bar/../../admin/users",
+                   "app.example.test", "/foo/bar/../../admin/users", ""),
+               admin, "scope_denied");
+
+        // The include side of the same reading.
+        denies("an encoded separator cannot walk out of an include either", p,
+               req("GET", "https://app.example.test/app/x%2fy/../../other",
+                   "app.example.test", "/app/x%2fy/../../other", ""),
+               authorised("scope.include", "https://app.example.test/app/*"),
+               "scope_denied");
+
+        // And the ordinary encoded path is untouched: a reader that refused
+        // everything with a %2f in it would pass every check above.
+        allows("an encoded separator inside the scope is still decided normally", p,
+               req("GET", "https://app.example.test/files/a%2fb.pdf",
+                   "app.example.test", "/files/a%2fb.pdf", ""),
+               authorised("scope.include", "https://app.example.test/files/*"));
+
+        // decodeSeparatorsInert on its own: everything unwrapped except what
+        // would become a separator, however deeply that was nested.
+        check("the inert decode leaves %2f alone and decodes the rest",
+              "/a%2fb/../c d".equals(Policy.decodeSeparatorsInert("/a%2fb/%2e%2e/c%20d")));
+        check("and unwraps %252f exactly one round, to %2f",
+              "/a%2f".equals(Policy.decodeSeparatorsInert("/a%252f")));
+        check("and leaves an encoded backslash alone too",
+              "/a%5cb".equals(Policy.decodeSeparatorsInert("/a%5cb")));
+        check("while the full decode still turns both into separators",
+              "/a/b".equals(Policy.decodeToFixedPoint("/a%2fb"))
+              && "/a\\b".equals(Policy.decodeToFixedPoint("/a%5cb")));
+    }
+
+    /**
+     * Round 6, HIGH. Six of the thirteen best-fit entries could be deleted
+     * with all 490 checks green while flipping a denial to ALLOW -- including
+     * the one that reads U+2215 as a separator, which turns
+     * `/x/..(that character)logout` into a request that ISSUES a real logout.
+     * Every entry in a security table needs a check, or the table gets trimmed
+     * silently, which this task has already shipped twice.
+     *
+     * Table-driven on purpose: thirteen hand-written checks are thirteen
+     * chances to leave one out, and the next entry added to bestFit() gets a
+     * check by being added to the table here.
+     */
+    static void everyBestFitEntryIsGuardedByACheckOfItsOwn() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation cfg =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/admin/*");
+
+        // Every code point bestFit() maps, and the shape whose refusal depends
+        // on THAT entry folding to THAT character. SEP: the homoglyph is where
+        // the separator goes. DOT: two of them are the `..` that pops a
+        // segment. SEMI: it opens a path parameter a servlet container strips.
+        // PCT: it manufactures the escape that decodes to a separator.
+        String[][] table = {
+            {"／", "SEP"},  {"∕", "SEP"},  {"⁄", "SEP"},  {"⧸", "SEP"},
+            {"＼", "SEP"},  {"﹨", "SEP"},
+            {"．", "DOT"},  {"﹒", "DOT"},  {"｡", "DOT"},  {"․", "DOT"},
+            {"；", "SEMI"}, {"﹔", "SEMI"},
+            {"％", "PCT"},
+        };
+        check("the table under test is the whole of bestFit() (13 entries)",
+              table.length == 13);
+        for (String[] row : table) {
+            String path = bestFitProbe(row[0], row[1]);
+            denies(String.format("U+%04X is read as the %s it best-fits to: %s",
+                                 (int) row[0].charAt(0), row[1], path), p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   cfg, "scope_denied");
+        }
+
+        // The controls, one per shape. U+FF10 is FULLWIDTH DIGIT ZERO: a
+        // fullwidth character bestFit() does NOT map, so every shape above is
+        // ALLOW when the homoglyph is not one of the thirteen. Without these
+        // the table would pass with foldBestFit replaced by "map every
+        // non-ASCII character to a slash".
+        for (String shape : List.of("SEP", "DOT", "SEMI", "PCT")) {
+            String path = bestFitProbe("０", shape);
+            allows("a fullwidth character that is NOT in the table is left alone: "
+                   + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   cfg);
+        }
+
+        // The entries that pay for the whole family: these requests ISSUE a
+        // logout, and the denylist is the only thing between an agent working
+        // from a traversal wordlist and the session.
+        for (String cp : List.of("／", "∕", "⁄", "⧸",
+                                 "＼", "﹨"))
+            for (String path : List.of("/x/.." + Policy.percentEncodeUtf8(cp, false) + "logout"))
+                denies("a best-fit separator does not hide a logout: " + path, p,
+                       req("GET", "https://app.example.test" + path,
+                           "app.example.test", path, ""),
+                       APP, "dangerous_denied");
+    }
+
+    /** The path shape whose refusal depends on `cp` best-fitting to its
+     *  character, spelt the way a request carries it. */
+    static String bestFitProbe(String cp, String shape) {
+        String e = Policy.percentEncodeUtf8(cp, false);
+        switch (shape) {
+            case "SEP":  return "/admin" + e + "users";
+            case "DOT":  return "/x/" + e + e + "/admin/users";
+            case "SEMI": return "/admin" + e + "x=1/users";
+            default:     return "/admin" + e + "2fusers";
+        }
+    }
+
+    /**
+     * Round 6, MEDIUM. A single trigger character in an INCLUDE silently
+     * widened the authorised set, because allows() accepts coverage by any
+     * pattern reading and patternReadings() carried the segment transforms:
+     *
+     *   include=/app;v=1/*    ->  /app/secret        ALLOW
+     *   include=/a(backslash)b/*  ->  /a/b/secret    ALLOW
+     *   include=/admin./*     ->  /admin/users       ALLOW
+     *   include=/../*         ->  /anything/at/all   ALLOW -- the whole host
+     *
+     * The distinction that makes this different from round 3's fix: an
+     * ENCODING reading is a different SPELLING of one resource and is right
+     * for both kinds of rule; a SEGMENT reading names a DIFFERENT resource,
+     * and on the one rule that authorises anything that is a live bypass.
+     */
+    static void anIncludeIsNotWidenedByASegmentTransform() {
+        Policy p = allowingPolicy();
+
+        String[][] rows = {
+            {"/app;v=1/*",   "/app/secret"},
+            {"/a\\b/*",      "/a/b/secret"},
+            {"/admin./*",    "/admin/users"},
+            {"/../*",        "/anything/at/all"},
+            {"/app//x/*",    "/app/x/secret"},
+        };
+        for (String[] row : rows)
+            denies("include=" + row[0] + " does not authorise " + row[1], p,
+                   req("GET", "https://app.example.test" + row[1],
+                       "app.example.test", row[1], ""),
+                   authorised("scope.include", "https://app.example.test" + row[0]),
+                   "scope_denied");
+
+        // The COST of the ruling, pinned rather than discovered later. An
+        // include with a segment trigger in it now authorises NOTHING, not
+        // even the path it literally spells: the request still has a reading
+        // the pattern does not name (a servlet container serves
+        // /app;v=1/secret as /app/secret) and allow-AND refuses on it. That is
+        // the fail-closed answer and it is a visible one -- the operator is
+        // told the request matches no scope.include pattern -- but it is a
+        // cost, and an operator who means both resources writes both lines.
+        for (String[] row : new String[][]{
+                {"/app;v=1/*", "/app;v=1/secret"},
+                {"/a\\b/*",    "/a\\b/secret"},
+                {"/admin./*",  "/admin./users"}})
+            denies("include=" + row[0] + " authorises nothing at all, including "
+                   + row[1] + " -- the accepted cost", p,
+                   req("GET", "https://app.example.test" + row[1],
+                       "app.example.test", row[1], ""),
+                   authorised("scope.include", "https://app.example.test" + row[0]),
+                   "scope_denied");
+        // ...and the remedy is ONE pattern covering both readings, not two
+        // patterns covering one each: allows() asks a single rule to cover the
+        // whole set, which is what stops two half-scopes adding up to an
+        // authorisation neither of them granted.
+        allows("an operator writes one include that covers both readings", p,
+               req("GET", "https://app.example.test/app;v=1/secret",
+                   "app.example.test", "/app;v=1/secret", ""),
+               authorised("scope.include", "https://app.example.test/app*"));
+        denies("and two half-scopes do not add up to one", p,
+               req("GET", "https://app.example.test/app;v=1/secret",
+                   "app.example.test", "/app;v=1/secret", ""),
+               authorised("scope.include", "https://app.example.test/app;v=1/*",
+                          "scope.include", "https://app.example.test/app/*"),
+               "scope_denied");
+
+        // The ENCODING axis is untouched, which is round 3's fix and must stay
+        // fixed. An include written with an escape has to authorise both
+        // spellings, and one naming an accented directory has to authorise the
+        // percent-encoded UTF-8 a request actually carries.
+        BridgeClient.Authorisation docs =
+                authorised("scope.include", "https://app.example.test/files/my%20docs/*");
+        for (String path : List.of("/files/my%20docs/a.pdf", "/files/my docs/a.pdf"))
+            allows("an include written with an escape still authorises " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   docs);
+        allows("and one naming an accented directory still authorises its encoded form", p,
+               req("GET", "https://app.example.test/files/caf%c3%a9/a.pdf",
+                   "app.example.test", "/files/caf%c3%a9/a.pdf", ""),
+               authorised("scope.include", "https://app.example.test/files/café/*"));
+
+        // The DENY side keeps everything, which is the other half of the
+        // ruling: the same patterns as exclusions still catch the resource
+        // they name on a server that transforms segments.
+        for (String[] row : new String[][]{
+                {"/admin;v=1/*", "/admin/users"},
+                {"/admin\\x/*",  "/admin/x/users"},
+                {"/admin./*",    "/admin/users"}})
+            denies("exclude=" + row[0] + " still denies " + row[1], p,
+                   req("GET", "https://app.example.test" + row[1],
+                       "app.example.test", row[1], ""),
+                   authorised("scope.include", "https://app.example.test/*",
+                              "scope.exclude", "https://app.example.test" + row[0]),
+                   "scope_denied");
+
+        // And the two reading sets really are different sets, said directly so
+        // that a future "simplification" back to one has to delete a check.
+        check("an allow pattern's readings are its spellings only (got "
+              + Policy.spellingReadings("/../*") + ")",
+              !Policy.spellingReadings("/../*").contains("/*")
+              && Policy.spellingReadings("/../*").contains("/../*"));
+        check("a deny pattern's readings still resolve its dot segments (got "
+              + Policy.patternReadings("/../*") + ")",
+              Policy.patternReadings("/../*").contains("/*"));
+        check("an allow pattern still decodes (got "
+              + Policy.spellingReadings("/my%20docs/*") + ")",
+              Policy.spellingReadings("/my%20docs/*").contains("/my docs/*"));
+    }
+
+    /**
+     * Round 6, MEDIUM. Two comments claimed a reading the code did not build:
+     * "a NUL is where a C string ends, so `/admin%00foo` reaches `/admin`".
+     * trimSegmentTails only ever trimmed a TRAILING NUL, so `/admin%00.html`
+     * was ALLOW past an exclusion naming `/admin` -- and the truncation is
+     * real server behaviour, so building it is the right half of "build it or
+     * delete the claim".
+     */
+    static void aNulEndsTheStringForAnythingThatReachesACApi() {
+        Policy p = allowingPolicy();
+
+        reads("/admin%00foo", "/admin");
+        reads("/admin%00.html", "/admin");
+        reads("/admin%00/users", "/admin");
+        // The tail trim's own reading survives beside it: they are different
+        // servers, and a name that ends in a NUL is not a string that does.
+        reads("/admin%00/users", "/admin/users");
+        readsExactly("/admin%00foo", "/admin%00foo", "/admin\0foo", "/admin");
+
+        check("truncateAtNul cuts at the first NUL and keeps everything before it",
+              "/admin".equals(Policy.truncateAtNul("/admin\0/users/x"))
+              && "/a/b".equals(Policy.truncateAtNul("/a/b")));
+
+        // Live: the exclusion that was walked past by appending six characters
+        // to a path it already caught.
+        BridgeClient.Authorisation exact =
+                authorised("scope.include", "https://app.example.test/*",
+                           "scope.exclude", "https://app.example.test/admin");
+        for (String path : List.of("/admin%00.html", "/admin%00/users", "/admin%00foo"))
+            denies("a NUL does not hide an exclusion naming /admin: " + path, p,
+                   req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
+                   exact, "scope_denied");
+
+        // And the denylist. The verb is at the END of the pattern, so only the
+        // truncation reaches it -- and the verb is one the SHIPPED DEFAULTS do
+        // not carry, because the first version of this check used `*/logout`
+        // and passed with the truncation deleted: the default `*/logout*`
+        // caught it on its own. That is the same vacuous shape round 4 found
+        // in its own new test, and the sabotage run is what said so again.
+        denies("a NUL does not hide an operator's dangerous.path", p,
+               req("GET", "https://app.example.test/data/export%00.png",
+                   "app.example.test", "/data/export%00.png", ""),
+               authorised("scope.include", "https://app.example.test/*",
+                          "dangerous.path", "*/export"),
+               "dangerous_denied");
+        check("...and the shipped defaults do not catch that one on their own",
+              !Policy.DEFAULT_DANGEROUS.stream().anyMatch(
+                      g -> Policy.glob(g, "/data/export\0.png")));
+
+        // A NUL that truncates to something still inside the scope must not
+        // cost an operator their request: the truncation is a reading, not a
+        // denylist of its own.
+        allows("a NUL inside an included prefix is still in scope", p,
+               req("GET", "https://app.example.test/app/a%00b",
+                   "app.example.test", "/app/a%00b", ""),
+               authorised("scope.include", "https://app.example.test/app/*"));
+    }
+
     /**
      * F1, round 4, and it is the round-3 machinery biting itself.
      *
@@ -1191,7 +1551,50 @@ public class PolicyTest {
         // given carried one trigger, so it could not fail. The seed is fixed so
         // a failure is reproducible, and the alphabet is the one an evasion is
         // built from.
-        char[] alphabet = ("ab/./..;\\ %2e2f5c%c0%aeADMIN" + '\0' + "\u00c0\u00ae\uff0f\uff0e").toCharArray();
+        // U+0130 is in the alphabet because of what it did to two different
+        // claims. LATIN CAPITAL LETTER I WITH DOT ABOVE has a FULL lowercase
+        // mapping of TWO characters -- an `i` and a combining dot -- so
+        // String.toLowerCase LENGTHENS on it, and readings()' termination
+        // argument ("every transform shortens or preserves its length") was
+        // false while it was written down. It was not only an argument: a cost
+        // search looking for the most expensive decide() it could build landed
+        // on a path of 8190 of them, which cost 99 ms and was ALLOWED, with a
+        // reading set of TWO members that no bound on the set size could have
+        // caught. lower() is Unicode's SIMPLE mapping now, one code point in
+        // and one out, so the claim is true because the code changed.
+        check("String.toLowerCase lengthens on U+0130, which is what the "
+              + "termination argument rested on being false",
+              "\u0130".toLowerCase(Locale.ROOT).length() == 2);
+        check("Policy.lower does not: one code point in, one code point out",
+              "i".equals(Policy.lower("\u0130")));
+        check("and it folds with no locale at all, so a Turkish default cannot "
+              + "turn an I into a dotless one",
+              "i".equals(Policy.lower("I")) && "abc".equals(Policy.lower("ABC")));
+        check("and it still folds the non-ASCII case an operator might write",
+              "caf\u00e9".equals(Policy.lower("CAF\u00c9")));
+        for (String m : readingsOf("/\u0130\u0130;x/\u0130."))
+            check("no reading of a U+0130 path is longer than the path ("
+                  + m.length() + ")", m.length() <= "/\u0130\u0130;x/\u0130.".length());
+        check("and a path carrying it still terminates and is closed",
+              readingsOf("/\u0130/..;x/\u0130.").containsAll(
+                      readingsOf(Policy.lower("/\u0130/..;x/\u0130."))));
+
+        // The cost, which is the half a comment cannot enforce. This is the
+        // check that goes red if lower() is ever "simplified" back to
+        // String.toLowerCase(Locale.ROOT).
+        String dotted = "/" + "\u0130".repeat(Policy.MAX_TARGET_CHARS - 1);
+        HxRequest dottedReq = req("GET", "https://app.example.test" + dotted,
+                                  "app.example.test", dotted, "");
+        p.decide(dottedReq, APP);
+        long dotStart = System.nanoTime();
+        Decision dotVerdict = p.decide(dottedReq, APP);
+        long dotMs = (System.nanoTime() - dotStart) / 1_000_000;
+        check("a path of " + (Policy.MAX_TARGET_CHARS - 1) + " U+0130 characters is "
+              + "decided in " + dotMs + " ms (was 99 ms, and allowed)",
+              dotMs < 30 && dotVerdict != null);
+
+        char[] alphabet = ("ab/./..;\\ %2e2f5c%c0%aeADMIN" + '\0'
+                + "\u00c0\u00ae\uff0f\uff0e\u0130\u2215\ufe52").toCharArray();
         Random rnd = new Random(20260822L);
         int violations = 0, biggest = 0;
         String firstBad = null;
@@ -1759,6 +2162,25 @@ public class PolicyTest {
                req("GET", "https://app.example.test" + nested,
                    "app.example.test", nested, ""), APP, "scope_denied");
 
+        // The QUERY is bounded by the same round cap, through its own arm of
+        // undecidable(), and that arm had no check at all: deleting
+        // `|| !decodesFully(req.query())` left all 490 checks green while a
+        // 17-deep nested query escape went ALLOW. The denylist reads the
+        // query, so a query still encoded after 16 rounds is a denylist
+        // reading nobody checked.
+        String nestedQuery = "a=%" + "25".repeat(17) + "2e";
+        check("the nested query fixture is inside the length bound and does not decode",
+              nestedQuery.length() < Policy.MAX_TARGET_CHARS
+              && !Policy.decodesFully(nestedQuery));
+        denies("a query still encoded after the round cap is refused", p,
+               req("GET", "https://app.example.test/x?" + nestedQuery,
+                   "app.example.test", "/x", nestedQuery), APP, "scope_denied");
+        check("...and the path arm is not what refused it",
+              Policy.decodesFully("/x"));
+        allows("while an ordinary double-encoded query still decides", p,
+               req("GET", "https://app.example.test/x?a=%2520b",
+                   "app.example.test", "/x", "a=%2520b"), APP);
+
         // And an ordinary double-encoding is nowhere near the cap: the bound
         // must not turn into a denial of the traffic it was meant to survive.
         allows("an ordinary double-encoded path still decodes", p,
@@ -1802,11 +2224,9 @@ public class PolicyTest {
         Policy p = allowingPolicy();
 
         String atLimit =
-                "/%ef%bc%8e%2eb%3b%2f;%5c%2f%ef%bc%8e ..\\%ef%bc%bcax ;. "
-              + "%2e%ef%bc%9b %ef%bc%8e%3b %c0%ae%5c%ef%bc%bc /";
+                "/%e2%\0%ef%bc%9b%95%c0%abb\uff0e%5c%%bc%9bN52.";
         String overLimit =
-                "/%00/x%c0%afabb%bc%9b%c0.a..%ef%bc%8f%2e\\%3b%ef%bc%8e %c0%ef;"
-              + "%ef%bc%bc%5c%2e/%c0%af%bc%20 %ef%bc%8ea%ef%bc%8e%5c%c0%ae%00%c0%af%2e";
+                "/%%e2%\0%ef%bc%9b%c0%abb\uff0e%5c%ef%25%bc%9b%fe%52%2/52.";
 
         check("the fixture at the limit has exactly MAX_READINGS readings ("
               + Policy.readings(atLimit).size() + ")",
@@ -1832,6 +2252,94 @@ public class PolicyTest {
               && d.detail().contains(String.valueOf(Policy.MAX_READINGS))
               && d.detail().contains(String.valueOf(Policy.MAX_READINGS + 1))
               && d.detail().contains("readings"));
+
+        // The bound is on CONSTRUCTION, not only on matching. For one round
+        // checkScope built the whole set and only then compared its size, so
+        // the expensive half of the work happened before the bound could
+        // refuse it. `atLimit` has 64 readings, so asking for fewer must stop
+        // the BUILDING at one member past whatever was asked for; a limit
+        // applied after the fact returns the whole 64 every time, which is
+        // what these catch.
+        for (int limit : new int[]{1, 2, 8, 30, 40}) {
+            int built = Policy.readings(atLimit, limit).size();
+            check("readings() stops building at " + limit + " + 1 members (got "
+                  + built + " of a set of " + Policy.readings(atLimit).size() + ")",
+                  built == limit + 1);
+        }
+        check("...and asking for the whole set still gets the whole set",
+              Policy.readings(atLimit, Policy.MAX_READINGS).size()
+                      == Policy.MAX_READINGS
+              && Policy.readings(atLimit, 1000).size() == Policy.MAX_READINGS);
+
+        String explosive = overLimit + overLimit + overLimit;
+
+        // The count is not the cost. 64 readings of an 8192-character path is
+        // a different amount of work from 64 readings of a short one, and with
+        // only the count bounded a 31-character unit tiled to the length bound
+        // still cost decide() 144 ms. The budget is the PRODUCT.
+        check("a short path may have the whole of MAX_READINGS readings",
+              Policy.readingBudget("/api/orders") == Policy.MAX_READINGS
+              && Policy.readingBudget(atLimit) == Policy.MAX_READINGS);
+        check("and the budget falls as the path grows: 2048 -> "
+              + Policy.readingBudget("x".repeat(2048)) + ", 4096 -> "
+              + Policy.readingBudget("x".repeat(4096)) + ", 8192 -> "
+              + Policy.readingBudget("x".repeat(8192)),
+              Policy.readingBudget("x".repeat(2048)) == 64
+              && Policy.readingBudget("x".repeat(4096)) == 32
+              && Policy.readingBudget("x".repeat(8192)) == 16);
+        check("never below one, so no path is refused for the reading every "
+              + "path has", Policy.readingBudget("") >= 1
+              && Policy.readingBudget("x".repeat(1_000_000)) >= 1);
+
+        // End to end, at the length bound, which is the shape an attacker
+        // actually gets to send: a unit repeated until every reading is still
+        // eight kilobytes long.
+        StringBuilder tiled = new StringBuilder();
+        while (tiled.length() + explosive.length() <= Policy.MAX_TARGET_CHARS)
+            tiled.append(explosive);
+        String worst = tiled.toString();
+        long start = System.nanoTime();
+        Decision big = p.decide(req("GET", "https://app.example.test" + worst,
+                                    "app.example.test", worst, ""), APP);
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        check("a " + worst.length() + "-character target whose readings explode is "
+              + "refused (" + (big.allowed() ? "ALLOWED" : big.errorClass())
+              + ") in " + ms + " ms",
+              !big.allowed() && "scope_denied".equals(big.errorClass()) && ms < 60);
+
+        // The costliest target a hill climb over the trigger alphabet could
+        // build, tiled to the length bound. It is UNDER the reading bound and
+        // so it is DECIDED rather than refused -- which is the point: nothing
+        // refuses it, and the only things keeping it cheap are the size half
+        // of the bound and lower() folding one code point at a time. The same
+        // shape family cost 99 to 165 ms before this round.
+        String costly = "/bİ\\\\%25\\b／/.İ ..．%2f2f／®";
+        StringBuilder costlyTiled = new StringBuilder();
+        while (costlyTiled.length() + costly.length() <= Policy.MAX_TARGET_CHARS)
+            costlyTiled.append(costly);
+        String costlyPath = costlyTiled.toString();
+        HxRequest costlyReq = req("GET", "https://app.example.test" + costlyPath,
+                                  "app.example.test", costlyPath, "");
+        p.decide(costlyReq, APP);
+        long cStart = System.nanoTime();
+        Decision cVerdict = p.decide(costlyReq, APP);
+        long cMs = (System.nanoTime() - cStart) / 1_000_000;
+        check("the costliest target a hill climb could build (" + costlyPath.length()
+              + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath)).size()
+              + " readings) is answered " + (cVerdict.allowed() ? "allow" : cVerdict.errorClass())
+              + " in " + cMs + " ms",
+              cMs < 80 && cVerdict != null);
+
+        // ...while a long BENIGN target is decided rather than refused: the
+        // size bound must not turn into a length bound of its own.
+        String longBenign = "/sso/saml/" + "QUJD".repeat(2000);
+        check("the long benign fixture is near the length bound and reads "
+              + Policy.readings(longBenign).size() + " ways",
+              longBenign.length() > 4096 && Policy.readings(longBenign).size() <= 2);
+        allows("a long benign target is still decided", p,
+               req("GET", "https://app.example.test" + longBenign,
+                   "app.example.test", longBenign, ""),
+               authorised("scope.include", "https://app.example.test/sso/*"));
 
         // A realistic path carrying several triggers at once -- every
         // transform this class knows about, firing in one segment -- has to
@@ -2326,6 +2834,14 @@ import java.util.Set;
  *                      name of nothing but trailing dots trims to nothing
  *   /x/..%ef%bc%8flogout  is /x/../logout wherever a wide string reaches an
  *                      ANSI API, because U+FF0F best-fits to `/`
+ *   /foo%2fbar/../admin/users  is /admin/users in python's urljoin, node's
+ *                      new URL() and java's URI.normalize alike: none of them
+ *                      decodes %2f before resolving the `..`, so the `..`
+ *                      pops one whole segment called `foo%2fbar`
+ *   /a%2fb/%2e%2e/admin/users  is /admin/users on anything that decodes AFTER
+ *                      it has cut the path into segments -- Apache with
+ *                      AllowEncodedSlashes off, nginx, Tomcat -- which reads
+ *                      the `%2e%2e` as a `..` while `a%2fb` stays one segment
  *
  * Worse, mainstream libraries disagree about the SAME path with no attacker
  * involved. For `/a//../admin/users`:
@@ -2356,9 +2872,26 @@ import java.util.Set;
  * bytes while the server serves `/other`, which no include names. Requiring
  * every reading to be included is what closes that.
  *
- * Cost of the set model when it is wrong: a deny rule matches a path some
- * exotic server would route elsewhere, or an include refuses one. Both are
- * denials, which is the direction a tool aimed at production has to err in.
+ * Cost of the set model when it is wrong, on the PATH side: a deny rule
+ * matches a path some exotic server would route elsewhere, or an include
+ * refuses one. Both are denials, which is the direction a tool aimed at
+ * production has to err in.
+ *
+ * That used to be written here as a property of the WHOLE model, and it was
+ * false. A reading of a PATTERN widens the rule it belongs to, and a wider
+ * scope.include -- the one rule that authorises anything -- is an ALLOW, not
+ * a denial. Three characters in an include were enough:
+ *
+ *   include=/app;v=1/*  authorised  /app/secret
+ *   include=/a(backslash)b/*  authorised  /a/b/secret
+ *   include=/admin./*   authorised  /admin/users
+ *   include=/../*       authorised  the entire host
+ *
+ * What makes the sentence above true is the split in Rule: an ALLOW pattern is
+ * read only along the ENCODING axis -- different SPELLINGS of one resource --
+ * while the SEGMENT axis (;params, backslashes, dot resolution, tail
+ * trimming), every one of which names a DIFFERENT resource, belongs to deny
+ * patterns alone. See Rule.forInclude and spellingReadings.
  *
  * Matching a decoded COPY while sending raw bytes -- the obvious fix -- would
  * reintroduce exactly the decision-versus-wire mismatch the authority checks
@@ -2366,18 +2899,26 @@ import java.util.Set;
  * works if the matcher's idea of "the same path" also covers the target
  * server's, which is what the reading set adds.
  *
- * PATTERNS ARE READ THE SAME WAY, AND ONE WAY MORE. An operator's pattern is a
- * string a human typed and it has the same several readings a path does, so
- * Rule.parse builds the same set from it. Matching raw patterns against
- * readings of the path alone fails SILENTLY in both directions:
+ * DENY PATTERNS ARE READ THE SAME WAY, AND ONE WAY MORE. An operator's
+ * pattern is a string a human typed and it has the same several readings a
+ * path does, so Rule.forExclude builds the same set from it. Matching raw
+ * patterns against readings of the path alone fails SILENTLY in both
+ * directions:
  * `scope.exclude .../%61dmin/*` is a DEAD RULE that stops nothing while reading
  * as if it named /admin/*, and `scope.include .../files/my%20docs/*` authorises
  * NOTHING -- neither `/files/my%20docs/a.pdf` nor `/files/my docs/a.pdf` --
  * while the operator is told only that their request "matches no scope.include
  * pattern", which sends them to rewrite a pattern that was right.
  *
- * The one way more is ENCODING, and it exists because readings() only ever
- * decodes. A pattern naming a directory with a non-ASCII character in it --
+ * ALLOW PATTERNS GET THE ENCODING HALF OF THAT AND NOTHING ELSE, because the
+ * two halves push in opposite directions on a rule that authorises. A
+ * different SPELLING of a pattern names the same resource, so an include has
+ * to cover all of them or it authorises nothing. A segment transform names a
+ * DIFFERENT resource, so an include that gained one would authorise something
+ * the operator never wrote. spellingReadings is that half on its own.
+ *
+ * The one way more is ENCODING, and it exists because readings() never
+ * encodes. A pattern naming a directory with a non-ASCII character in it --
  * an accent, a CJK name -- is typed as characters and arrives as
  * percent-escapes, and no decoding of the pattern reaches the escaped spelling
  * the request's raw reading carries. patternReadings() adds it. It is a
@@ -2605,9 +3146,9 @@ public final class Policy {
         List<Rule> includes = new ArrayList<>();
         try {
             for (String p : scope.getOrDefault("scope.exclude", List.of()))
-                excludes.add(Rule.parse(p));
+                excludes.add(Rule.forExclude(p));
             for (String p : include)
-                includes.add(Rule.parse(p));
+                includes.add(Rule.forInclude(p));
         } catch (IllegalArgumentException e) {
             return Decision.deny("scope_denied", "unusable scope pattern: " + e.getMessage());
         }
@@ -2616,17 +3157,23 @@ public final class Policy {
         // differently, but neither should pay for building it per pattern. The
         // host half needs nothing of the sort -- checkHostChars refuses '%'
         // outright, so an encoded authority never reaches a comparison.
-        Set<String> pathReadings = readings(t.path());
+        //
+        // The bound is passed INTO the construction rather than checked after
+        // it. For one round it was checked after, which bounded the matching
+        // and left the building unbounded -- see readings(String,int). What
+        // comes back is at most budget + 1 members, and it is budget + 1
+        // exactly when the real set is bigger.
+        int budget = readingBudget(t.path());
+        Set<String> pathReadings = readings(t.path(), budget);
 
-        // MAX_READINGS: refuse rather than pay to match every rule, and every
-        // dangerous.path pattern still to come, against a reading set that has
-        // exploded. See its comment for the measurements the bound is picked
-        // from. Checked here, the moment the count is known and before either
-        // rule loop below or the dangerous.path loop later in decide() runs a
-        // single glob against it.
-        if (pathReadings.size() > MAX_READINGS)
-            return Decision.deny("scope_denied", "request path has "
-                    + pathReadings.size() + " readings, over the " + MAX_READINGS
+        // Refuse rather than pay to match every rule, and every dangerous.path
+        // pattern still to come, against a reading set that has exploded. See
+        // MAX_READINGS for the measurements the bound is picked from. Checked
+        // the moment the count is known and before either rule loop below or
+        // the dangerous.path loop later in decide() runs a single glob.
+        if (pathReadings.size() > budget)
+            return Decision.deny("scope_denied", "request path has at least "
+                    + pathReadings.size() + " readings, over the " + budget
                     + " this can decide about");
 
         // Exclude first: an exclusion is the operator naming something they
@@ -2672,12 +3219,14 @@ public final class Policy {
      *
      * The cost argument that justified the lower number no longer holds. It was
      * written when decode was unbounded and quadratic; with the round bound in
-     * place decode is linear. Measured at the new bound, in the commit that
-     * raised it: decide() costs 200 us on 8192 benign characters, 3.4 ms on
-     * 8192 characters of `/a;b(backslash)c. ` -- every transform firing in
-     * every segment -- and 406 ms on the worst input a 600,000-sample search
-     * could find, an 8192-character path whose reading set is 425 members. The
-     * ordinary path stays at ~2 us.
+     * place decode is linear. Measured at this bound, on the current code:
+     * decide() costs 414 us on 8192 benign characters, 3.6 ms on 8192
+     * characters of `/a;b(backslash)c. ` -- every transform firing in every
+     * segment -- and 26 ms on the worst input my own hill climb could find.
+     * The ordinary path stays at ~2 us. (The same rows when the bound was
+     * raised, before the reading set grew a decoding axis and before the
+     * bounds below were on the construction: 200 us, 3.4 ms, and 406 ms
+     * reported-but-unbounded.)
      *
      * That number was, for one round, the honest ceiling rather than an
      * enforced one -- reported in this comment and left unbounded, on the
@@ -2734,26 +3283,83 @@ public final class Policy {
      * would have mattered. A target whose readings explode past what real
      * traffic needs is not a legitimate caller's request in the first place.
      *
-     * WHY THIS STOPS THE COST rather than merely bounding it: `decide()` was
-     * measured at 406 ms on the worst input the original search found, and the
-     * expense is almost entirely the nested loop that follows -- every
-     * dangerous.path pattern against every reading of the target. Refusing
-     * here, the moment the count is known, means that loop is never reached at
-     * all; the only unavoidable cost is building the set once to learn its
-     * size, which this class already had to pay to decide anything. Measured
-     * end to end, same machine, on the 8192-character tiling of the
-     * independent search's 121-character shape (261 readings): `decide()`
-     * costs 19 ms and returns `scope_denied` naming the count, instead of
-     * 406 ms of dangerous.path matching that never runs. The ordinary paths
-     * this bound must not touch are unaffected: the hot path `/api/orders`
-     * stays at 2.4 us and `/files/annual%20report.pdf` at 3.9 us, both within
-     * measurement noise of their pre-bound numbers.
+     * WHERE IT IS ENFORCED, and the correction to what this comment used to
+     * claim. It said this "STOPS THE COST rather than merely bounding it",
+     * because the dangerous.path loop -- every pattern against every reading
+     * -- is never reached for an oversized set. That half is true. The half it
+     * left out is that `checkScope` BUILT THE WHOLE SET and only then compared
+     * its size, so the bound never touched construction at all, which is the
+     * larger of the two costs for a set that has exploded. The review that
+     * found it measured a 240-character unit whose set is 1,315 members: tiled
+     * to MAX_TARGET_CHARS, one `decide()` cost 165 ms and roughly 75 MB of
+     * transient heap, against the 19 ms quoted here. Fourth claim on this task
+     * that was plausible, load-bearing and never run.
+     *
+     * The limit is now carried into readings() and every loop in the
+     * construction stops on it, so at most budget + 1 members are ever built
+     * and the matching loops are still never reached. That alone was not
+     * enough, and my own search said so: with the count bounded at 64 an
+     * 8192-character target still cost `decide()` 144 ms, because 64 readings
+     * of an 8192-character path is a different amount of work from 64 readings
+     * of a short one. See MAX_READING_CHARS, which bounds the product, and the
+     * round report for the measurement at both bounds.
      *
      * Hardcoded for the same reason MAX_TARGET_CHARS is: a config key is a
      * wire-protocol change, and this number is a property of the matching
      * algorithm, not of an engagement.
      */
     static final int MAX_READINGS = 64;
+
+    /**
+     * The other half of the same bound: the total SIZE of the reading set, in
+     * characters, that this will build before it refuses the request.
+     *
+     * MAX_READINGS on its own bounds the COUNT, and the count is not the cost.
+     * Building a reading is a pass over a string, and 64 readings of an
+     * 8192-character path is 64 passes over 8192 characters for every one of
+     * the transform combinations -- half a megabyte of live strings and
+     * hundreds of millions of character copies for ONE decision. The cost is
+     * the PRODUCT, and a bound on one factor is not a bound on a product.
+     * Measured, by running the same hill climb against a build of this class
+     * with this bound removed and nothing else changed: it finds targets
+     * costing decide() over 100 ms, against 26 ms for the worst it can find
+     * with the bound in. Both runs had every other bound in place and doing
+     * exactly what it says.
+     *
+     * So the budget is 128 K reading-characters, and the number of readings a
+     * path may have is MAX_READINGS or that budget divided by the path's
+     * length, whichever is smaller. It is one bound expressed in the currency
+     * the cost is actually charged in:
+     *
+     *   path length     readings affordable
+     *   up to 2048      64  (MAX_READINGS -- the count bound is what bites)
+     *   4096            32
+     *   8192            16  (MAX_TARGET_CHARS -- the size bound is what bites)
+     *
+     * 16 at the longest path this will look at is not a squeeze: it is the top
+     * of the range real traffic occupies (12 to 16, and those are SHORT paths
+     * carrying several triggers each), and a long request target in real
+     * traffic is a SAML assertion, an OIDC request JWT or a rison blob -- one
+     * or two readings, never sixteen. The shapes that need more than sixteen
+     * readings of an eight-kilobyte path are constructed, and constructing one
+     * is what this refuses.
+     *
+     * Same class, same reasoning, same failure direction as MAX_READINGS: a
+     * DENIAL naming the count, never a truncation. Hardcoded for the same
+     * reason -- a config key is a change to the wire protocol, and this is a
+     * property of the matching algorithm rather than of an engagement.
+     */
+    static final int MAX_READING_CHARS = 128 * 1024;
+
+    /**
+     * How many readings this path may have before checkScope refuses it: the
+     * count bound and the size bound, whichever is tighter. At least 1, so a
+     * path is never refused for having the one reading every path has.
+     */
+    static int readingBudget(String path) {
+        return Math.max(1, Math.min(MAX_READINGS,
+                                    MAX_READING_CHARS / Math.max(1, path.length())));
+    }
 
     /**
      * The denial for a request too long or too deeply encoded to decide about,
@@ -2763,11 +3369,18 @@ public final class Policy {
      * so this keeps the pinned order intact, and because it is true: a request
      * whose readings cannot be computed has not been shown to be in scope.
      *
-     * This is the bound on the INPUT; MAX_READINGS, checked once the reading
-     * set is actually built, is the bound on what that input turned into. The
-     * two catch different things -- a merely long path does not necessarily
-     * read many ways, and the 121-character shape that reaches 261 readings is
-     * nowhere near MAX_TARGET_CHARS.
+     * This is the bound on the INPUT; MAX_READINGS and MAX_READING_CHARS,
+     * carried into the construction, bound what that input turns into. The
+     * two kinds catch different things -- a merely long path does not
+     * necessarily read many ways, and the short shapes that reach hundreds of
+     * readings are nowhere near MAX_TARGET_CHARS.
+     *
+     * Both arms here are load-bearing and only one of them used to have a
+     * check. Deleting `|| !decodesFully(req.query())` left all 490 checks in
+     * PolicyTest green while a query still percent-encoded after
+     * MAX_DECODE_ROUNDS went through: the dangerous.path denylist reads the
+     * QUERY as well as the path, so a query nobody could finish decoding is a
+     * denylist reading nobody checked.
      */
     private static Decision undecidable(HxRequest req) {
         int size = req.path().length() + req.query().length();
@@ -2861,19 +3474,36 @@ public final class Policy {
 
     /**
      * One scope.include / scope.exclude pattern, pre-parsed -- including its
-     * path half read every way readings() reads a path.
+     * path half read every way its KIND of rule may read it.
      *
-     * The pattern gets the same treatment as the request for the reason given
-     * in the class comment: an operator's pattern is a typed string with the
-     * same several readings, and reading it only one way fails silently in
+     * A deny pattern gets the same treatment as the request, for the reason
+     * given in the class comment: an operator's pattern is a typed string with
+     * the same several readings, and reading it only one way fails silently in
      * both directions -- a dead exclude that stops nothing, an include that
      * authorises nothing.
+     *
+     * An allow pattern gets the ENCODING half of that and nothing else, and
+     * the asymmetry is the whole point. Round 3 gave patterns decoding
+     * readings to fix "an include with an escape authorises nothing"; that is
+     * the encoding axis, different spellings of the SAME resource, and it is
+     * right for both kinds. The segment axis names a DIFFERENT resource, and
+     * on the one rule that authorises anything a different resource is a live
+     * bypass -- `include=/../*` read as `/*` authorised the whole host. So
+     * forExclude() takes patternReadings() and forInclude() takes
+     * spellingReadings(), and the two are different sets on purpose.
      */
     private record Rule(String source, String scheme, String hostPattern,
                         boolean hostSuffix, int port, String pathGlob,
                         Set<String> globReadings) {
 
-        static Rule parse(String pattern) {
+        /** A scope.exclude pattern: read every way a path is read. */
+        static Rule forExclude(String pattern) { return parse(pattern, false); }
+
+        /** A scope.include pattern: read only the ways that SPELL the same
+         *  resource. */
+        static Rule forInclude(String pattern) { return parse(pattern, true); }
+
+        private static Rule parse(String pattern, boolean allowRule) {
             int sep = pattern.indexOf("://");
             if (sep <= 0) throw new IllegalArgumentException(pattern + " has no scheme");
             String scheme = lower(pattern.substring(0, sep));
@@ -2924,7 +3554,8 @@ public final class Policy {
                 checkHostChars(host, pattern);
             }
             return new Rule(pattern, scheme, host, suffix, port, pathGlob,
-                            patternReadings(pathGlob));
+                            allowRule ? spellingReadings(pathGlob)
+                                      : patternReadings(pathGlob));
         }
 
         /** Everything but the path. Shared, because scheme, port and host
@@ -2954,25 +3585,27 @@ public final class Policy {
          *
          * lower() on an already-lowered reading returns the same instance, so
          * the derived readings -- which readings() lowercases by construction
-         * -- cost nothing to fold again. Only the RAW reading of each side is
-         * really being folded here, and BOTH sides are falsifiable.
+         * -- cost nothing to fold again.
          *
-         * A round-3 note here said the pattern side was not, on the ground
-         * that readings() already contributes lower(decode(pattern)), which
-         * equals lower(pattern) whenever the pattern has no escape to decode.
-         * The shape that disproves it is a pattern whose escape is written in
-         * UPPERCASE hex against a path whose escape is lowercase, where the
-         * two decode to DIFFERENT strings: `exclude=.../%2E*` against `/%2e`.
-         * The pattern's decoded reading is `/.*`, the path's is `/`, and those
-         * do not match; the raw readings differ in exactly the two characters
-         * this lower() folds. Without it that request is ALLOWED. PolicyTest
-         * pins it, and the note it replaces is a reminder that "no realistic
-         * input can falsify this" is a claim, not an argument.
+         * BOTH FOLDS ARE NOW SUBSUMED, and saying so is the point of this
+         * paragraph. Round 5 recorded one of them as falsifiable and the other
+         * as defence in depth; round 6 made the un-decoded member a BASE, so
+         * addReadings now contributes lower(raw) on both sides -- the path's
+         * raw reading and the pattern's -- and the two shapes that used to
+         * need this method's lower() arrive folded before it is reached.
+         * Sabotaging either fold is 0 red, where the path side was 1 red and
+         * the pattern side 0 the round before.
          *
-         * The path side is pinned by the mirror shape: a pattern with a
-         * truncated escape decodes to itself while the request's escape decodes
-         * to a separator, so neither derived reading matches and the raw ones
-         * differ only in case.
+         * The calls stay, and the reason is not sentiment: `lower(reading)` is
+         * NOT always a member, because readings() lowercases the COLLAPSED
+         * form and collapse is not the identity on a path with a dot segment.
+         * A pattern that matched only the folded uncollapsed raw reading would
+         * need this. I could not build one -- every pattern I tried had its own
+         * dot segments resolved the same way and matched the collapsed member
+         * instead -- and "no realistic input can falsify this" is a claim, not
+         * an argument, so it is written here as a claim rather than turned into
+         * a test I do not believe in. This is the second guard on this task to
+         * end up in that position, and both are recorded rather than deleted.
          */
         boolean denies(Target t, Set<String> pathReadings) {
             if (!authorityMatches(t)) return false;
@@ -3002,6 +3635,20 @@ public final class Policy {
          * are lowercased on both sides, so an operator who wrote `/API/*` does
          * not have every request under it refused -- which would be fail-closed
          * but would also be just broken.
+         *
+         * That principle was stated here while the code did the opposite one
+         * field along. `globReadings` held the SEGMENT readings of the pattern
+         * too, and coverage by any one of them was coverage, so a single
+         * trigger character in an include widened it to a resource the
+         * operator never named:
+         *
+         *   include=/app;v=1/*  ->  /app/secret        ALLOW
+         *   include=/admin./*   ->  /admin/users       ALLOW
+         *   include=/../*       ->  /anything/at/all   ALLOW, the whole host
+         *
+         * An include's readings are now its SPELLINGS only. Every reading of
+         * the path still has to be covered -- that half is unchanged, and it
+         * is the half that closes the escapes.
          */
         boolean allows(Target t, Set<String> pathReadings) {
             if (!authorityMatches(t)) return false;
@@ -3077,13 +3724,17 @@ public final class Policy {
      *     one that catches a pattern written against the bytes
      *     (`/reports/q1%20final*`) or a dangerous URL that other readings
      *     normalise away (`/account/logout/../profile`).
-     *   - the decoded path with dot segments resolved, in BOTH orders relative
-     *     to merging empty segments, because that is exactly where the
-     *     mainstream libraries part company. Merge-then-resolve is what a
-     *     slash-merging server does (`/a//../admin` is `/admin`);
-     *     resolve-then-merge is RFC 3986's remove_dot_segments, which treats
-     *     the doubled slash as a real empty segment for `..` to pop
-     *     (`/a/admin`). Both ship. Both are here.
+     *   - the path with dot segments resolved, in BOTH orders relative to
+     *     merging empty segments, because that is exactly where the mainstream
+     *     libraries part company. Merge-then-resolve is what a slash-merging
+     *     server does (`/a//../admin` is `/admin`); resolve-then-merge is RFC
+     *     3986's remove_dot_segments, which treats the doubled slash as a real
+     *     empty segment for `..` to pop (`/a/admin`). Both ship. Both are here.
+     *   - the same over EACH of three answers to "what did the server decode
+     *     before it routed": nothing, everything, or everything except the
+     *     separators. Decoding is a reading like the rest and not a step that
+     *     happens first -- see derive() for the five exclusions that were
+     *     walked past while it was mandatory.
      *   - the same, with `;params` stripped from each segment. Every servlet
      *     container -- Tomcat, Jetty, Undertow, WebSphere, so every Spring Boot
      *     application -- strips them BEFORE normalising, which turns the
@@ -3096,14 +3747,22 @@ public final class Policy {
      *     the compiler reads it even inside a comment.)
      *   - the same, with trailing dots, spaces and NULs trimmed from each
      *     segment. Windows trims trailing dots and spaces from a name before
-     *     opening it, so `/admin./users` and `/admin%20/users` reach `/admin`;
-     *     a NUL is where a C string ends, so `/admin%00foo` reaches `/admin`
-     *     on anything that hands the path to a C API.
-     *   - all combinations of those three, because servers implement different
+     *     opening it, so `/admin./users` and `/admin%20/users` reach `/admin`.
+     *     A trailing NUL is trimmed the same way.
+     *   - the same, with everything from the first NUL onwards cut off,
+     *     because a NUL is where a C string ends: `/admin%00foo` and
+     *     `/admin%00.html` are both requests for `/admin` on anything that
+     *     hands the path to a C API. That is a SEPARATE transform from the
+     *     tail trim, which only ever reached a NUL sitting at the end of a
+     *     segment. See truncateAtNul for the exclusion `/admin%00.html`
+     *     walked past while two comments said it could not.
+     *   - all combinations of those four, because servers implement different
      *     SUBSETS of them: Tomcat strips parameters and rejects backslashes,
      *     IIS folds backslashes and trims dots but keeps parameters. A
      *     combination nobody implements only adds a reading, and an extra
-     *     reading can only deny more.
+     *     reading of a PATH can only deny more. (A reading of an allow
+     *     PATTERN is the opposite, which is why patterns are split; see
+     *     spellingReadings.)
      *   - when the decoded bytes are not all ASCII, the same again over the
      *     UTF-8 reading of those bytes, which is what folds the overlong
      *     `%c0%ae%c0%ae` -- the classic IIS traversal -- back to `..`.
@@ -3128,16 +3787,32 @@ public final class Policy {
      *
      * The loop terminates because every transform in it either shortens its
      * input or preserves its length -- decoding replaces three characters with
-     * one, stripping and trimming and collapsing delete, folding and
-     * lowercasing substitute -- so the members are drawn from a shrinking
-     * pool. Encoding, which lengthens, is deliberately NOT in the loop; see
-     * patternReadings.
+     * one, truncating and stripping and trimming and collapsing delete, the
+     * byte folds and the case fold substitute -- so the members are drawn from
+     * a shrinking pool. Encoding, which lengthens, is deliberately NOT in the
+     * loop; see patternReadings.
+     *
+     * That was written here while it was FALSE, and the false clause was the
+     * case fold. `"\u0130".toLowerCase(Locale.ROOT)` is TWO characters, an `i`
+     * and a combining dot above: String.toLowerCase implements Unicode's full
+     * mapping and the full mapping lengthens. The loop still terminated, on an
+     * argument nobody had made -- the expansion is idempotent -- which is a
+     * true conclusion resting on a false reason, and this task has now shipped
+     * four of those. It was not only an argument, either: a cost search found
+     * that a path of 8190 U+0130 characters cost decide() 99 ms and was
+     * ALLOWED, with a reading set of TWO members that no bound on the set
+     * could ever have caught. lower() folds one code point to one code point
+     * now, so the sentence above is true because the CODE changed. See lower(),
+     * and the checks in PolicyTest that pin both halves.
      *
      * ORDER WITHIN ONE PASS is load-bearing, though the fixed point covers the
      * other orders too, as later passes over the members one pass produced.
-     * Decoding comes FIRST, so `%2e%2e`
-     * is already `..` when dot segments are resolved and `%2f` is already a
-     * separator when the path is split into them. Backslash folding comes
+     * Decoding, WHERE IT IS APPLIED AT ALL, comes first, so `%2e%2e` is
+     * already `..` when dot segments are resolved and `%2f` is already a
+     * separator when the path is split into them -- and the base where it is
+     * NOT applied is what gives the RFC reading, in which neither is true.
+     * The NUL truncation comes next, because a C string ends before anything
+     * else gets to look at it. Backslash folding comes
      * before parameter stripping, because folding decides where the SEGMENTS
      * are and stripping is per segment: `/a;b\c` folds to `/a;b/c` and then
      * strips to `/a/c`, whereas stripping first would reach `/a` and the
@@ -3163,29 +3838,118 @@ public final class Policy {
      * folded now -- by foldBestFit, from its percent-encoded UTF-8 spelling.)
      */
     static Set<String> readings(String path) {
+        return readings(path, Integer.MAX_VALUE);
+    }
+
+    /**
+     * The same set, built no further than `limit` members.
+     *
+     * MAX_READINGS used to be a bound on MATCHING and not on CONSTRUCTION:
+     * checkScope built the whole set and only then compared its size, so a
+     * target whose readings explode still paid to have every one of them
+     * built. The review that found this measured a 240-character unit whose
+     * set is 1,315 members, costing one decide() 165 ms and about 75 MB of
+     * transient heap before the count was even looked at. The bound was on the
+     * wrong side of the work.
+     *
+     * So the limit is carried into the construction and every loop stops on
+     * it. The set that comes back has at most limit + 1 members, and it has
+     * exactly limit + 1 if and only if the real set is larger -- which is all
+     * a caller needs to refuse it, and one member more than it needs. Nothing
+     * is TRUNCATED and handed to a matcher: a set built to the cap is only
+     * ever used to produce the denial. See MAX_READINGS for why truncation is
+     * the one answer that is unsafe in both directions.
+     *
+     * The unbounded arm above is what patterns and the tests use. A pattern
+     * comes from the operator's own config rather than from the wire, and the
+     * dangerous.path pass over the target runs only after checkScope has
+     * already refused an oversized path -- so no attacker-controlled string
+     * reaches the unbounded arm.
+     */
+    static Set<String> readings(String path, int limit) {
         Set<String> out = new LinkedHashSet<>();
         out.add(path);
         Deque<String> pending = new ArrayDeque<>();
         pending.add(path);
-        while (!pending.isEmpty()) derive(out, pending, pending.poll());
+        while (!pending.isEmpty() && out.size() <= limit)
+            derive(out, pending, pending.poll(), limit);
         return out;
     }
 
     /**
      * Every reading of one member, added to the set and queued if it is new.
      *
-     * Decoding comes first, then the two byte-level re-readings, then the
-     * segment transforms over each of the three bases. Each base is a
-     * different answer to "what characters does the target server think it
-     * got", and the transforms are what it does with them.
+     * DECODING IS A READING, NOT A PREPROCESSING STEP, and for four rounds it
+     * was the one mandatory transform in this class. Every other transform was
+     * offered both on and off, through the `applicable` subsets in
+     * addReadings; the un-decoded member was in the set only VERBATIM and
+     * UNRESOLVED. So collapseDotSegments(raw) was never a member -- and that
+     * is exactly what RFC 3986 s6.2.2 specifies, and what all three of the
+     * libraries the class comment cites as its authority actually produce:
+     *
+     *   /foo%2fbar/../admin/users
+     *     python urljoin()       -> /admin/users
+     *     node   new URL()       -> /admin/users
+     *     java   URI.normalize() -> /admin/users
+     *     readings()             -> { raw, /foo/admin/users }
+     *
+     * The `..` popped `foo/bar` on our reading and `foo%2fbar` on theirs, and
+     * the two land in different places. exclude=/admin/* was walked past by
+     * spelling one separator as %2f -- and so were exclude=/api/payments/* and
+     * a wildcard-host exclude of /wp-admin/*.
+     *
+     * So the member goes through the pipeline three ways, and each one is a
+     * real answer to "what did the target server route on":
+     *
+     *   - the member ITSELF, undecoded. The server routed on the bytes it was
+     *     sent and unescaped afterwards, if at all. This is the RFC reading,
+     *     and the one urljoin, new URL() and URI.normalize() give.
+     *   - the member DECODED to a fixed point, with the decoded characters
+     *     read as syntax. The server unescaped before it routed, so a %2f is a
+     *     separator and a %2e%2e is a dot segment. This was the only base.
+     *   - the member decoded WITH THE SEPARATORS LEFT INERT: every escape
+     *     unwrapped except the ones that would produce a `/` or a backslash,
+     *     which stay escaped. That is a server which decodes AFTER it has cut
+     *     the path into segments -- Apache with AllowEncodedSlashes off,
+     *     nginx, Tomcat, and every framework that routes on the raw target and
+     *     unescapes only the segment values it hands to a handler. It is the
+     *     one reading that gets `/a%2fb/%2e%2e/admin/users` right: the
+     *     `%2e%2e` becomes a `..` while `a%2fb` stays ONE segment for it to
+     *     pop, which is `/admin/users`. Neither of the other two reaches it.
+     *
+     * Each of the three then gets the byte-level re-readings and the whole
+     * segment pipeline, so the un-decoded member is derived exactly the way
+     * its decoded form is instead of sitting outside the machinery as a
+     * special case. Two of the three collapse into the first whenever the
+     * member carries no escape, and the third into the second whenever it
+     * carries no separator escape -- which is what keeps `/api/orders` at one
+     * base, one member and one glob per rule.
      */
-    private static void derive(Set<String> out, Deque<String> pending, String member) {
+    private static void derive(Set<String> out, Deque<String> pending, String member, int limit) {
+        addBases(out, pending, member, limit);
         String decoded = decodeToFixedPoint(member);
-        addReadings(out, pending, decoded);
-        String utf8 = foldOverlongUtf8(decoded);
-        if (!utf8.equals(decoded)) addReadings(out, pending, utf8);
+        if (!decoded.equals(member)) addBases(out, pending, decoded, limit);
+        String inert = decodeSeparatorsInert(member);
+        if (!inert.equals(member) && !inert.equals(decoded))
+            addBases(out, pending, inert, limit);
+    }
+
+    /**
+     * One base and its two byte-level re-readings, each run through the
+     * segment transforms.
+     *
+     * foldOverlongUtf8 reads the decoded bytes as UTF-8, which is what folds
+     * the overlong %c0%ae traversal back to `..`; foldBestFit reads what a
+     * Windows ANSI API substitutes for a character its code page cannot spell.
+     * Each is skipped when it is the identity, which is every ASCII path and
+     * so the whole of the hot path.
+     */
+    private static void addBases(Set<String> out, Deque<String> pending, String base, int limit) {
+        addReadings(out, pending, base, limit);
+        String utf8 = foldOverlongUtf8(base);
+        if (!utf8.equals(base)) addReadings(out, pending, utf8, limit);
         String bestFit = foldBestFit(utf8);
-        if (!bestFit.equals(utf8)) addReadings(out, pending, bestFit);
+        if (!bestFit.equals(utf8)) addReadings(out, pending, bestFit, limit);
     }
 
     /**
@@ -3227,17 +3991,90 @@ public final class Policy {
         return out;
     }
 
-    private static final int STRIP_PARAMS = 1, FOLD_BACKSLASH = 2, TRIM_TAILS = 4;
+    /**
+     * Every way a pattern SPELLS one resource, and no way it could name a
+     * different one. This is what a scope.include is read by.
+     *
+     * The encoding axis only: percent-decoding (to a fixed point, with the
+     * separators-inert reading beside it), the UTF-8 fold, the encoded
+     * spelling in both hex cases, and the case fold. Every one of those is the
+     * SAME path written differently, which is what an allow rule has to cover
+     * or it authorises nothing -- `include=.../files/my%20docs/*` has to
+     * authorise the request whether it arrives encoded or not, and
+     * `include=.../files/cafe-with-an-acute/*` has to authorise the
+     * percent-encoded UTF-8 a request actually carries.
+     *
+     * What is NOT here is the segment axis: ;params stripped, backslashes
+     * folded, dot segments resolved, empty segments merged, segment tails
+     * trimmed, best-fit homoglyphs substituted. Each of those answers "which
+     * resource does this name on some server", and widening a DENY rule that
+     * way denies more while widening an ALLOW rule authorises more. The
+     * measured cost of not making the distinction: `include=/../*` resolved to
+     * `/*` and authorised every path on the host.
+     *
+     * The best-fit fold is on the excluded side for the same reason even
+     * though it looks like an encoding: it MANUFACTURES separators. U+FF0F
+     * becomes a `/` and U+FF05 becomes a `%`, so an include carrying one would
+     * gain a reading that cuts the path somewhere the operator did not.
+     *
+     * Flat rather than a fixed point, because none of these transforms creates
+     * a trigger for another: decoding already runs to a fixed point, and the
+     * rest substitute characters one for one.
+     *
+     * THE COST, stated rather than left to be found. An include that carries a
+     * segment trigger now authorises nothing at all -- not even the path it
+     * literally spells. `include=/app;v=1/*` refuses `/app;v=1/secret`,
+     * because that request still has the reading `/app/secret`, which a
+     * servlet container serves and the pattern does not name, and allow-AND
+     * refuses on any uncovered reading. It is the fail-closed answer, it is
+     * visible (the operator is told the request matches no scope.include
+     * pattern rather than being quietly allowed), and the remedy is one
+     * pattern wide enough to cover both readings -- `/app*` here -- because
+     * allows() asks a SINGLE rule to cover the whole set and two half-scopes
+     * deliberately do not add up. The alternative was measured:
+     * `include=/../*` authorising every path on the host.
+     */
+    static Set<String> spellingReadings(String pattern) {
+        Set<String> out = new LinkedHashSet<>();
+        addSpellings(out, pattern);
+        String encoded = percentEncodeUtf8(pattern, false);
+        if (!encoded.equals(pattern)) {
+            addSpellings(out, encoded);
+            addSpellings(out, percentEncodeUtf8(pattern, true));
+        }
+        return out;
+    }
+
+    /** One spelling and the readings of it that are still the same resource.
+     *  Verbatim AND case-folded, because the path's raw reading is verbatim
+     *  and its derived readings are lowercased, and an include has to cover
+     *  both. */
+    private static void addSpellings(Set<String> out, String s) {
+        out.add(s);
+        out.add(lower(s));
+        String decoded = decodeToFixedPoint(s);
+        if (decoded.equals(s)) return;
+        out.add(lower(decoded));
+        String utf8 = foldOverlongUtf8(decoded);
+        if (!utf8.equals(decoded)) out.add(lower(utf8));
+        String inert = decodeSeparatorsInert(s);
+        if (!inert.equals(decoded)) out.add(lower(inert));
+    }
+
+    private static final int STRIP_PARAMS = 1, FOLD_BACKSLASH = 2, TRIM_TAILS = 4,
+                             TRUNCATE_NUL = 8;
 
     /**
      * The transform combinations over one base, in both dot-segment orders,
      * with every new member queued for re-derivation.
      *
      * Only combinations of the transforms this base can actually be CHANGED by
-     * are built. Each of the three is the identity on a string without its
-     * trigger character, so the skipped combinations produce nothing this base
-     * has not already produced -- an early-out, and it is what keeps an
-     * ordinary path at one member and one glob per rule.
+     * are built. Each of the four is the identity on a string without its
+     * trigger character -- a `;`, a backslash, a trimmable segment tail, a NUL
+     * -- so the skipped combinations produce nothing this base has not already
+     * produced. That is an early-out about ONE PASS over ONE base, and it is
+     * only that: the claim that the SET is therefore closed does not follow
+     * from it, and used to be made here. See below.
      *
      * It is also where the closure defect lived, and the reason readings()
      * iterates. `applicable` is computed on the BASE, and an earlier version
@@ -3257,18 +4094,22 @@ public final class Policy {
      * the set closed under any SEQUENCE of them, which is what "every reading a
      * server might resolve this to" actually asks for.
      */
-    private static void addReadings(Set<String> out, Deque<String> pending, String base) {
+    private static void addReadings(Set<String> out, Deque<String> pending, String base, int limit) {
         int applicable = 0;
         if (base.indexOf(';') >= 0) applicable |= STRIP_PARAMS;
         if (base.indexOf('\\') >= 0) applicable |= FOLD_BACKSLASH;
         if (hasTrimmableTail(base)) applicable |= TRIM_TAILS;
+        if (base.indexOf('\0') >= 0) applicable |= TRUNCATE_NUL;
         for (int flags = 0; flags <= applicable; flags++) {
             if ((flags & ~applicable) != 0) continue;
+            if (out.size() > limit) return;
             String s = base;
+            if ((flags & TRUNCATE_NUL) != 0) s = truncateAtNul(s);
             if ((flags & FOLD_BACKSLASH) != 0) s = foldBackslashes(s);
             if ((flags & STRIP_PARAMS) != 0) s = stripPathParameters(s);
             if ((flags & TRIM_TAILS) != 0) s = trimSegmentTails(s);
             add(out, pending, lower(collapseDotSegments(collapseEmptySegments(s))));
+            if (out.size() > limit) return;
             add(out, pending, lower(collapseEmptySegments(collapseDotSegments(s))));
         }
     }
@@ -3323,13 +4164,42 @@ public final class Policy {
     }
 
     /**
+     * Everything from the first NUL to the end of the path, cut off.
+     *
+     * A NUL is where a C string ENDS. Anything that hands the path to a C API
+     * -- a filesystem call, a legacy module, an ANSI Windows API -- sees the
+     * path stop there, so `/admin%00.html` is a request for `/admin` and
+     * `/admin%00/users` is one too.
+     *
+     * Two comments in this file asserted exactly that for four rounds and no
+     * transform built it. trimSegmentTails trims a NUL only where it is the
+     * LAST character of a segment, which catches `/admin%00/users` for a
+     * different reason and misses `/admin%00.html` entirely: with an exclusion
+     * on `.../admin`, appending `%00.html` to a path it caught was an ALLOW.
+     * The claim was true of real servers and false of this class, which is the
+     * failure mode this task has now shipped four times.
+     *
+     * Both readings are kept, because they are different servers. The trim is
+     * a NAME that ends in a NUL and a path that carries on past it; the
+     * truncation is a STRING that ends at the NUL and takes the rest of the
+     * path with it.
+     */
+    static String truncateAtNul(String path) {
+        int nul = path.indexOf('\0');
+        return nul < 0 ? path : path.substring(0, nul);
+    }
+
+    /**
      * Trailing dots, spaces and NULs trimmed from each segment.
      *
      * Windows trims trailing dots and spaces from a filename before opening
      * it, and IIS serves what Windows opens, so `/admin./users` and
-     * `/admin%20/users` reach the same resource `/admin/users` does. A NUL is
-     * where a C string ends, so anything that passes the path to a C API sees
-     * `/admin%00foo` as `/admin`.
+     * `/admin%20/users` reach the same resource `/admin/users` does. A NUL at
+     * the end of a name is trimmed with them.
+     *
+     * A NUL in the MIDDLE of a name is a different reading and not this one:
+     * this method only ever trims a tail, so `/admin%00.html` came out
+     * unchanged. truncateAtNul is where the C-string reading lives.
      *
      * `.` and `..` are left ALONE, and NOTHING ELSE IS. They are dot SEGMENTS,
      * resolved a step later; trimming their dots would delete the step rather
@@ -3575,6 +4445,34 @@ public final class Policy {
     }
 
     /**
+     * The same, except that an escape which would produce a path separator is
+     * left alone: `%2f` stays `%2f` and `%5c` stays `%5c`, in any hex case and
+     * however deeply they were nested (`%252f` unwraps once, to `%2f`, and
+     * stops there).
+     *
+     * This is the reading of a server that decodes AFTER it has cut the path
+     * into segments, which is most of them: Apache with the default
+     * AllowEncodedSlashes off, nginx, Tomcat, and every framework that routes
+     * on the raw target and unescapes only the segment values it passes on. An
+     * encoded slash is DATA to such a server, not syntax -- which is the whole
+     * reason `%2f` has its own family of bypasses.
+     *
+     * It is the only base that reads `/a%2fb/%2e%2e/admin/users` the way those
+     * servers do. Decoding nothing leaves `%2e%2e`, which is not a dot
+     * segment, so nothing pops. Decoding everything makes `a%2fb` into two
+     * segments, so `..` pops only `b`. Decoding the dots but not the slash
+     * leaves one segment for `..` to pop, and the answer is `/admin/users`.
+     */
+    static String decodeSeparatorsInert(String s) {
+        for (int round = 0; round < MAX_DECODE_ROUNDS; round++) {
+            String next = decodeOnce(s, true);
+            if (next.equals(s)) return s;
+            s = next;
+        }
+        return s;
+    }
+
+    /**
      * Whether decodeToFixedPoint actually reached a fixed point rather than
      * running out of rounds. One extra decodeOnce, so it costs one pass.
      *
@@ -3608,6 +4506,17 @@ public final class Policy {
      * add a second reading of the path rather than remove one.
      */
     static String decodeOnce(String s) {
+        return decodeOnce(s, false);
+    }
+
+    /**
+     * One round, with the option of leaving the separator-producing escapes
+     * alone. `separatorsInert` is what decodeSeparatorsInert passes; see there
+     * for the servers that reading belongs to. An escape it declines to
+     * decode is copied through exactly the way a malformed one is, so the rest
+     * of the string still decodes.
+     */
+    static String decodeOnce(String s, boolean separatorsInert) {
         int first = s.indexOf('%');
         if (first < 0) return s;
         StringBuilder out = new StringBuilder(s.length());
@@ -3618,7 +4527,12 @@ public final class Policy {
             int hi = hexDigit(s.charAt(i + 1));
             int lo = hexDigit(s.charAt(i + 2));
             if (hi < 0 || lo < 0) { out.append(c); continue; }
-            out.append((char) (hi * 16 + lo));
+            char decoded = (char) (hi * 16 + lo);
+            if (separatorsInert && (decoded == '/' || decoded == '\\')) {
+                out.append(c);
+                continue;
+            }
+            out.append(decoded);
             i += 2;
         }
         return out.toString();
@@ -3712,11 +4626,64 @@ public final class Policy {
         return out;
     }
 
-    // Locale.ROOT, not the default locale: in a Turkish locale "I" lowercases
-    // to a dotless i, so an operator who wrote a dangerous.path in capitals
-    // would have it stop matching "/delete" on their laptop and nowhere else.
-    private static String lower(String s) {
-        return s.toLowerCase(Locale.ROOT);
+    /**
+     * Case folded ONE CODE POINT AT A TIME, which is not what
+     * String.toLowerCase does and is deliberate in both directions.
+     *
+     * Locale is the first reason, and it was the original one: in a Turkish
+     * locale `"I".toLowerCase()` is a DOTLESS i, so an operator who wrote a
+     * dangerous.path in capitals would have it stop matching `/delete` on
+     * their laptop and nowhere else. Character.toLowerCase(int) is Unicode's
+     * SIMPLE mapping and has no locale at all, so there is no default to get
+     * wrong.
+     *
+     * COST is the second, and it is why this is a loop rather than
+     * `s.toLowerCase(Locale.ROOT)`. String.toLowerCase implements Unicode's
+     * FULL mapping, including the conditional and multi-character cases, and
+     * the JDK's implementation of that path is orders of magnitude slower per
+     * character than the simple one. Measured, on this machine, by a cost
+     * search that went looking for the most expensive decide() it could build:
+     * a path of 8190 U+0130 characters (LATIN CAPITAL LETTER I WITH DOT ABOVE,
+     * whose full lowercase is TWO characters, an `i` and a combining dot) cost
+     * `decide()` 99 ms and was ALLOWED -- with a reading set of TWO members,
+     * so neither MAX_READINGS nor MAX_READING_CHARS came anywhere near it and
+     * MAX_TARGET_CHARS was satisfied. It is not a reading-set explosion at all;
+     * it is one string operation being slow. Per code point it is 0.5 ms.
+     *
+     * LENGTH is the third, and it repairs an argument rather than the cost.
+     * readings() terminates because its transforms shorten or preserve length,
+     * and that claim was made in this file while String.toLowerCase quietly
+     * broke it -- `"\u0130"` lowercases to two characters. The simple mapping
+     * is one code point to one code point, and Unicode has no simple case
+     * mapping that crosses out of the plane it starts in, so this cannot
+     * lengthen a string at all. The invariant is true again because the code
+     * changed, not because the comment did.
+     *
+     * WHAT IT COSTS: the conditional mappings, which are the Greek final sigma
+     * and the U+0130 dot. `lower("\u0130")` is `i` here and `i` plus a
+     * combining dot in String.toLowerCase, and a capital sigma folds to the
+     * medial form in every position. Both sides of every comparison in this
+     * class go through this method, so the only shape that could notice is an
+     * operator's pattern spelt with one of those two characters against a
+     * request spelt with the other. PolicyTest pins the U+0130 behaviour so
+     * the difference is a decision on the record rather than a surprise.
+     */
+    static String lower(String s) {
+        int i = 0;
+        while (i < s.length()) {
+            int cp = s.codePointAt(i);
+            if (cp != Character.toLowerCase(cp)) break;
+            i += Character.charCount(cp);
+        }
+        if (i == s.length()) return s;                  // already folded: no copy
+        StringBuilder out = new StringBuilder(s.length());
+        out.append(s, 0, i);
+        while (i < s.length()) {
+            int cp = s.codePointAt(i);
+            out.appendCodePoint(Character.toLowerCase(cp));
+            i += Character.charCount(cp);
+        }
+        return out.toString();
     }
 }
 ```
