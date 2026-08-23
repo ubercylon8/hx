@@ -1230,7 +1230,28 @@ def test_send_refuses_every_key_it_stamps_itself(srv_with_halt, key, value):
 def test_a_halted_frame_stops_issuance_and_aborts_the_run(srv_with_halt):
     """S6's unsolicited `halted` frame, {reason, host, window}, no id. Without
     it an auto-halt is invisible until the next send fails and
-    `run.status = aborted` has no stop_reason to record."""
+    `run.status = aborted` has no stop_reason to record.
+
+    THIS TEST IS THE REFERENCE HARNESS. Plan 4's tool layer copies the shape
+    of the `on_halted` handling below, so the shape has to be the safe one.
+
+    It used to call `abort_run` and stop there, and `abort_run` alone does not
+    survive the connection the frame arrived on. Measured against a live
+    bridge with only that call:
+
+        after the halted frame:  state='halted'   operator_halt.halted=False
+        after _reset():          state='waiting'  operator_halt.halted=False
+        next send refused as 'not_configured' -- DENY-ALL, not the halt
+        run.status='aborted'  <- the only survivor, and nothing on the send
+                                 path consults it
+
+    So a reconnect and a fresh configure re-armed issuance after an auto-halt.
+    That the `halted` arm does not make the stop durable by itself is
+    defensible and is NOT changed here -- S4 scopes durability to an OPERATOR
+    halt, and the arm's own comment defers it. What is fixed is the pattern
+    this test hands to Plan 4: the harness calls `oh.halt()` beside
+    `abort_run`, and the assertions below fail if that line is ever dropped.
+    """
     s, oh, conn = srv_with_halt
     c = _client(s.socket_path)
     try:
@@ -1253,19 +1274,44 @@ def test_a_halted_frame_stops_issuance_and_aborts_the_run(srv_with_halt):
             "a harness with no callback installed still has to be able to see "
             "why issuance stopped"
         )
-        assert records.abort_run(
-            conn, run_id="r-1", at_us=1700000000900000,
-            stop_reason=f"{frame['reason']} on {frame['host']} "
-                        f"({frame['window']})") is True
+        stop_reason = (f"{frame['reason']} on {frame['host']} "
+                       f"({frame['window']})")
+        assert records.abort_run(conn, run_id="r-1", at_us=1700000000900000,
+                                 stop_reason=stop_reason) is True
         row = conn.execute("SELECT status, stop_reason FROM run WHERE id='r-1'"
                            ).fetchone()
         assert row["status"] == "aborted"
         assert row["stop_reason"] == ("5xx rate 0.40 on app.example.test "
                                       "(50 requests / 37s)")
+        # The line that makes the stop outlive this connection. `abort_run`
+        # writes the run's epitaph; only this writes the sentinel and the row
+        # the next Burp start reads. Both, or the auto-halt lasts exactly as
+        # long as the socket it arrived on.
+
+        oh.halt(f"target distress: {stop_reason}")
 
         with pytest.raises(server.BridgeError) as exc:
             s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
         assert exc.value.error_class == "halted"
+
+        # And the same refusal after the connection goes away, which is what
+        # made the missing line matter: `state` is back to DENY-ALL and a
+        # configure would lift that, but the sentinel is what send() consults
+        # first. Without oh.halt() above this is 'not_configured' -- a refusal
+        # the next configure clears.
+        s._reset()
+        assert s.state == "waiting"
+        with pytest.raises(server.BridgeError) as exc:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert exc.value.error_class == "halted", (
+            "an auto-halt the harness recorded must still refuse after the "
+            f"connection it arrived on is gone; this was {exc.value.error_class!r}"
+        )
+        assert oh.sentinel_path.exists()
+        assert halt_mod.OperatorHalt(oh.engagement_dir, conn).halted is True, (
+            "the next Burp start reads the store and the file; run.status="
+            "'aborted' is not something the send path consults"
+        )
     finally:
         c.close()
 
