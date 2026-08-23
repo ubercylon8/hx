@@ -57,6 +57,12 @@ public class PolicyTest {
         aNulEndsTheStringForAnythingThatReachesACApi();
         theReadingSetIsClosedUnderItsOwnTransforms();
         aMalformedEscapeNeitherThrowsNorDisablesCanonicalisation();
+        theQueryHalfGetsTheSameByteFoldsThePathHalfGets();
+        theDangerousDenylistReadsThePathWhenAQueryIsPresent();
+        anEmptyScopePatternIsAnUnusableOneAndDeniesEverything();
+        aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading();
+        lowerFoldsTheWholeStringAndNotAPrefixOfIt();
+        everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt();
         aDenyRuleSeesEveryReadingOfThePath();
         anIncludeMustMatchEveryReadingOfThePath();
         aPathParameterIsStrippedBeforeTheServerNormalises();
@@ -938,9 +944,33 @@ public class PolicyTest {
      * Every entry in a security table needs a check, or the table gets trimmed
      * silently, which this task has already shipped twice.
      *
-     * Table-driven on purpose: thirteen hand-written checks are thirteen
-     * chances to leave one out, and the next entry added to bestFit() gets a
-     * check by being added to the table here.
+     * Round 7, CRITICAL: THE TABLE WAS NOT THE TABLE. thirteen entries were
+     * guarded and the mapping has a hundred and five, because bestfit1252.txt
+     * maps the WHOLE fullwidth block -- all 94 code points of U+FF01..U+FF5E,
+     * onto printable ASCII at a fixed offset. `foldBestFit` said, in a comment,
+     * that "none of the rest changes how a path is READ"; a fullwidth spelling
+     * of `logout` is `logout` to any ANSI API, and the denylist is a list of
+     * words. Three live rows, on the shipped defaults, before the range folded:
+     *
+     *   /account/(fullwidth logout)  ALLOW -- an automated logout
+     *   /account/l(U+FF0F)gout       ALLOW -- one letter is enough
+     *   /(U+FF41)dmin/users          ALLOW past exclude=/admin/*
+     *
+     * ...and the control below asserted the opposite of the truth: it named
+     * U+FF10 FULLWIDTH DIGIT ZERO as "a fullwidth character bestFit() does NOT
+     * map", which the real table maps to `0`. It stayed green because `0` is
+     * not a separator, so a table entry that was missing AND a control that was
+     * wrong agreed with each other. The control is U+3042 HIRAGANA LETTER A
+     * now, verified absent rather than assumed: bestfit1252.txt's WCTABLE has
+     * 698 entries, and neither U+3042 nor any other kana is one of them --
+     * CP1252 has no representation of kana and no Latin character that looks
+     * like one, so WideCharToMultiByte substitutes the code page's default
+     * character rather than a best fit.
+     *
+     * DISCOVERED, not listed. The table below is built by asking foldBestFit
+     * about every code point in the BMP, so an entry cannot be added without a
+     * check or removed without a failure -- which is what "thirteen" was
+     * supposed to buy and did not.
      */
     static void everyBestFitEntryIsGuardedByACheckOfItsOwn() {
         Policy p = allowingPolicy();
@@ -948,37 +978,111 @@ public class PolicyTest {
                 authorised("scope.include", "https://app.example.test/*",
                            "scope.exclude", "https://app.example.test/admin/*");
 
-        // Every code point bestFit() maps, and the shape whose refusal depends
-        // on THAT entry folding to THAT character. SEP: the homoglyph is where
-        // the separator goes. DOT: two of them are the `..` that pops a
-        // segment. SEMI: it opens a path parameter a servlet container strips.
-        // PCT: it manufactures the escape that decodes to a separator.
-        String[][] table = {
-            {"／", "SEP"},  {"∕", "SEP"},  {"⁄", "SEP"},  {"⧸", "SEP"},
-            {"＼", "SEP"},  {"﹨", "SEP"},
-            {"．", "DOT"},  {"﹒", "DOT"},  {"｡", "DOT"},  {"․", "DOT"},
-            {"；", "SEMI"}, {"﹔", "SEMI"},
-            {"％", "PCT"},
-        };
-        check("the table under test is the whole of bestFit() (13 entries)",
-              table.length == 13);
-        for (String[] row : table) {
-            String path = bestFitProbe(row[0], row[1]);
+        // (1) The whole mapping, discovered by asking rather than by listing.
+        List<Character> mapped = new ArrayList<>();
+        for (int c = 0x80; c <= 0xffff; c++) {
+            String one = String.valueOf((char) c);
+            if (!Policy.foldBestFit(one).equals(one)) mapped.add((char) c);
+        }
+        check("foldBestFit maps " + mapped.size() + " code points, every one of "
+              + "them checked below", mapped.size() == 105);
+
+        // (2) The fullwidth block, as one rule rather than 94 entries. Verified
+        // against the real bestfit1252.txt: 94 of its 698 WCTABLE entries are
+        // U+FF01..U+FF5E and every one maps to its code point minus 0xFEE0.
+        int fullwidth = 0;
+        for (char c = 0xff01; c <= 0xff5e; c++)
+            if (Policy.foldBestFit(String.valueOf(c))
+                      .equals(String.valueOf((char) (c - Policy.FULLWIDTH_OFFSET))))
+                fullwidth++;
+        check("all 94 code points U+FF01..U+FF5E fold to their code point minus 0x"
+              + Integer.toHexString(Policy.FULLWIDTH_OFFSET).toUpperCase(Locale.ROOT)
+              + " (" + fullwidth + " of 94)", fullwidth == 94);
+        check("...which is what makes a fullwidth `l` an `l` and a fullwidth "
+              + "`A` an `A`",
+              "l".equals(Policy.foldBestFit("ｌ"))
+              && "A".equals(Policy.foldBestFit("Ａ"))
+              && "0".equals(Policy.foldBestFit("０")));
+
+        // (3) The entries OUTSIDE that block, one check each. Three are
+        // bestfit1252's own (U+037E, U+066A, U+2216); the rest are best fits in
+        // other code pages' tables and are kept because a PATH reading only
+        // ever denies more.
+        Map<Character, Character> outliers = new LinkedHashMap<>();
+        outliers.put('∕', '/');   // DIVISION SLASH
+        outliers.put('⁄', '/');   // FRACTION SLASH
+        outliers.put('⧸', '/');   // BIG SOLIDUS
+        outliers.put('∖', '\\');  // SET MINUS
+        outliers.put('﹨', '\\');  // SMALL REVERSE SOLIDUS
+        outliers.put('﹒', '.');   // SMALL FULL STOP
+        outliers.put('｡', '.');   // HALFWIDTH IDEOGRAPHIC FULL STOP
+        outliers.put('․', '.');   // ONE DOT LEADER
+        outliers.put(';', ';');   // GREEK QUESTION MARK
+        outliers.put('﹔', ';');   // SMALL SEMICOLON
+        outliers.put('٪', '%');   // ARABIC PERCENT SIGN
+        List<Character> outside = new ArrayList<>();
+        for (char c : mapped) if (c < 0xff01 || c > 0xff5e) outside.add(c);
+        check("the entries outside the fullwidth block are exactly the "
+              + outliers.size() + " named here (found " + outside.size() + ")",
+              new LinkedHashSet<>(outside).equals(new LinkedHashSet<>(outliers.keySet())));
+        for (Map.Entry<Character, Character> e : outliers.entrySet())
+            check(String.format("U+%04X best-fits to %s", (int) e.getKey(),
+                                displayable(e.getValue())),
+                  String.valueOf(e.getValue())
+                        .equals(Policy.foldBestFit(String.valueOf(e.getKey()))));
+
+        // (4) Every entry, tied to the reading machinery: the path spelt with
+        // the homoglyph must READ as the path spelt with what it folds to. An
+        // entry deleted from the table fails here even when what it folds to is
+        // an ordinary letter and no separator moves.
+        int reads = 0;
+        for (char c : mapped) {
+            char fit = Policy.foldBestFit(String.valueOf(c)).charAt(0);
+            String spelt = "/admin/" + c + "leaf";
+            String folded = "/admin/" + fit + "leaf";
+            String want = Policy.lower(Policy.collapseDotSegments(
+                    Policy.collapseEmptySegments(folded)));
+            if (Policy.readings(spelt).contains(want)) reads++;
+            else check(String.format("U+%04X: %s has no reading %s",
+                                     (int) c, spelt, want), false);
+        }
+        check("every one of the " + mapped.size() + " entries puts the folded "
+              + "spelling in the homoglyph's reading set (" + reads + ")",
+              reads == mapped.size());
+
+        // (5) The separator-producing entries, end to end, one shape each.
+        // SEP: the homoglyph is where the separator goes. DOT: two of them are
+        // the `..` that pops a segment. SEMI: it opens a path parameter a
+        // servlet container strips. PCT: it manufactures the escape that
+        // decodes to a separator.
+        int separators = 0;
+        for (char c : mapped) {
+            char fit = Policy.foldBestFit(String.valueOf(c)).charAt(0);
+            String shape = fit == '/' || fit == '\\' ? "SEP"
+                         : fit == '.' ? "DOT"
+                         : fit == ';' ? "SEMI"
+                         : fit == '%' ? "PCT" : null;
+            if (shape == null) continue;
+            separators++;
+            String path = bestFitProbe(String.valueOf(c), shape);
             denies(String.format("U+%04X is read as the %s it best-fits to: %s",
-                                 (int) row[0].charAt(0), row[1], path), p,
+                                 (int) c, shape, path), p,
                    req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
                    cfg, "scope_denied");
         }
+        check("the separator-producing entries are the 5 fullwidth ones plus the "
+              + "11 outside the block (" + separators + ")", separators == 16);
 
-        // The controls, one per shape. U+FF10 is FULLWIDTH DIGIT ZERO: a
-        // fullwidth character bestFit() does NOT map, so every shape above is
-        // ALLOW when the homoglyph is not one of the thirteen. Without these
-        // the table would pass with foldBestFit replaced by "map every
-        // non-ASCII character to a slash".
+        // The controls, one per shape, with a character that is genuinely NOT
+        // in the table -- see the header for how that was verified. Without
+        // these the probes above would pass with foldBestFit replaced by "map
+        // every non-ASCII character to a slash".
+        check("U+3042 HIRAGANA LETTER A is not in the table at all",
+              "あ".equals(Policy.foldBestFit("あ"))
+              && Policy.readings("/admin/あleaf").size() == 1);
         for (String shape : List.of("SEP", "DOT", "SEMI", "PCT")) {
-            String path = bestFitProbe("０", shape);
-            allows("a fullwidth character that is NOT in the table is left alone: "
-                   + path, p,
+            String path = bestFitProbe("あ", shape);
+            allows("a character that is NOT in the table is left alone: " + path, p,
                    req("GET", "https://app.example.test" + path, "app.example.test", path, ""),
                    cfg);
         }
@@ -987,12 +1091,59 @@ public class PolicyTest {
         // logout, and the denylist is the only thing between an agent working
         // from a traversal wordlist and the session.
         for (String cp : List.of("／", "∕", "⁄", "⧸",
-                                 "＼", "﹨"))
+                                 "＼", "﹨", "∖"))
             for (String path : List.of("/x/.." + Policy.percentEncodeUtf8(cp, false) + "logout"))
                 denies("a best-fit separator does not hide a logout: " + path, p,
                        req("GET", "https://app.example.test" + path,
                            "app.example.test", path, ""),
                        APP, "dangerous_denied");
+
+        // ...and the rows the fullwidth range was added for, which need no
+        // separator at all: a fullwidth SPELLING of a dangerous word is that
+        // word to an ANSI API, and one substituted letter is enough.
+        String fullLogout = Policy.percentEncodeUtf8("ｌｏｇｏｕｔ", false);
+        denies("a wholly fullwidth logout is still a logout: /account/" + fullLogout, p,
+               req("GET", "https://app.example.test/account/" + fullLogout,
+                   "app.example.test", "/account/" + fullLogout, ""),
+               APP, "dangerous_denied");
+        String oneLetter = "/account/l" + Policy.percentEncodeUtf8("ｏ", false) + "gout";
+        denies("and one fullwidth letter inside it is enough: " + oneLetter, p,
+               req("GET", "https://app.example.test" + oneLetter,
+                   "app.example.test", oneLetter, ""),
+               APP, "dangerous_denied");
+        String fullAdmin = "/" + Policy.percentEncodeUtf8("ａ", false) + "dmin/users";
+        denies("nor does a fullwidth letter walk past an exclusion: " + fullAdmin, p,
+               req("GET", "https://app.example.test" + fullAdmin,
+                   "app.example.test", fullAdmin, ""),
+               cfg, "scope_denied");
+
+        // THE COST OF THE RANGE, pinned rather than found later. A best-fit
+        // reading is a reading of a PATH and of a DENY pattern, never of an
+        // ALLOW pattern (see spellingReadings), so an include that CARRIES a
+        // fullwidth character now authorises nothing -- the request keeps the
+        // folded reading and the pattern does not name it. That is the same
+        // accepted cost a segment trigger in an include already has. An include
+        // spelt in ASCII is untouched, which is the half that matters: the fold
+        // changes a NAME, not the prefix a scope is anchored at.
+        allows("an ASCII include still authorises a fullwidth path under it", p,
+               req("GET", "https://app.example.test/files/ｄｏｃ.pdf",
+                   "app.example.test", "/files/ｄｏｃ.pdf", ""),
+               authorised("scope.include", "https://app.example.test/files/*"));
+        allows("and a non-ASCII name the table does not map is untouched", p,
+               req("GET", "https://app.example.test/files/テスト.pdf",
+                   "app.example.test", "/files/テスト.pdf", ""),
+               authorised("scope.include", "https://app.example.test/files/*"));
+        denies("while an include that carries one authorises nothing -- the "
+               + "accepted cost", p,
+               req("GET", "https://app.example.test/ａpp/x",
+                   "app.example.test", "/ａpp/x", ""),
+               authorised("scope.include", "https://app.example.test/ａpp/*"),
+               "scope_denied");
+    }
+
+    /** A character a check can print. */
+    static String displayable(char c) {
+        return c == '\\' ? "a backslash" : "`" + c + "`";
     }
 
     /** The path shape whose refusal depends on `cp` best-fitting to its
@@ -1963,18 +2114,18 @@ public class PolicyTest {
         // only the count bounded a 31-character unit tiled to the length bound
         // still cost decide() 144 ms. The budget is the PRODUCT.
         check("a short path may have the whole of MAX_READINGS readings",
-              Policy.readingBudget("/api/orders") == Policy.MAX_READINGS
-              && Policy.readingBudget(atLimit) == Policy.MAX_READINGS);
+              Policy.readingBudget("/api/orders".length()) == Policy.MAX_READINGS
+              && Policy.readingBudget(atLimit.length()) == Policy.MAX_READINGS);
         check("and the budget falls as the path grows: 2048 -> "
-              + Policy.readingBudget("x".repeat(2048)) + ", 4096 -> "
-              + Policy.readingBudget("x".repeat(4096)) + ", 8192 -> "
-              + Policy.readingBudget("x".repeat(8192)),
-              Policy.readingBudget("x".repeat(2048)) == 64
-              && Policy.readingBudget("x".repeat(4096)) == 32
-              && Policy.readingBudget("x".repeat(8192)) == 16);
+              + Policy.readingBudget(2048) + ", 4096 -> "
+              + Policy.readingBudget(4096) + ", 8192 -> "
+              + Policy.readingBudget(8192),
+              Policy.readingBudget(2048) == 64
+              && Policy.readingBudget(4096) == 32
+              && Policy.readingBudget(8192) == 16);
         check("never below one, so no path is refused for the reading every "
-              + "path has", Policy.readingBudget("") >= 1
-              && Policy.readingBudget("x".repeat(1_000_000)) >= 1);
+              + "path has", Policy.readingBudget(0) >= 1
+              && Policy.readingBudget(1_000_000) >= 1);
 
         // End to end, at the length bound, which is the shape an attacker
         // actually gets to send: a unit repeated until every reading is still
@@ -1997,8 +2148,20 @@ public class PolicyTest {
         // so it is DECIDED rather than refused -- which is the point: nothing
         // refuses it, and the only things keeping it cheap are the size half
         // of the bound and lower() folding one code point at a time. The same
-        // shape family cost 99 to 165 ms before this round.
-        String costly = "/bİ\\\\%25\\b／/.İ ..．%2f2f／®";
+        // shape family cost 99 to 165 ms before the round that bounded it.
+        //
+        // RE-SEARCHED each round, and each round has found worse with a cheaper
+        // search, so the number here is this round's rather than a quotation.
+        // Round 6's winner is 23 ms on this build; a 20,000-step climb from it,
+        // over an alphabet that now includes the homoglyphs the widened
+        // best-fit table folds, reached 43.1 ms during the climb and
+        // re-measures at 32 ms quiescent. The ceiling moved because the TABLE
+        // grew: a fold that used to fire on thirteen code points now fires on a
+        // hundred and five, so more members of more paths differ from their
+        // base and get derived. That is the cost of closing the fullwidth
+        // range. It is bounded by every bound above, and it degrades one
+        // enforcement thread rather than bypassing anything.
+        String costly = "/\u2216%\ufe52/D\uff0f2\u2216;%c2/.\u066a/\uff05f";
         StringBuilder costlyTiled = new StringBuilder();
         while (costlyTiled.length() + costly.length() <= Policy.MAX_TARGET_CHARS)
             costlyTiled.append(costly);
@@ -2010,7 +2173,7 @@ public class PolicyTest {
         Decision cVerdict = p.decide(costlyReq, APP);
         long cMs = (System.nanoTime() - cStart) / 1_000_000;
         check("the costliest target a hill climb could build (" + costlyPath.length()
-              + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath)).size()
+              + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath.length())).size()
               + " readings) is answered " + (cVerdict.allowed() ? "allow" : cVerdict.errorClass())
               + " in " + cMs + " ms",
               cMs < 80 && cVerdict != null);
@@ -2292,5 +2455,418 @@ public class PolicyTest {
             String text = Files.readString(f, StandardCharsets.UTF_8);
             check(f.getFileName() + " names no burp.* type", !text.contains("burp."));
         }
+    }
+    /**
+     * Round 7, CRITICAL. The query half got NONE of the byte folds the path
+     * half got.
+     *
+     * `targetReadings` read the query as `{raw, lower(decoded)}` -- two members
+     * and no folds -- while the path had grown a decoding axis, an overlong
+     * UTF-8 fold and a best-fit fold over four rounds. The same bytes therefore
+     * got two different answers out of the same denylist:
+     *
+     *   PATH   /account/logo%c1%b5t           dangerous_denied
+     *   QUERY  /i.php?action=logo%c1%b5t      ALLOW
+     *   PATH   /x/..(U+FF05)2flogout          dangerous_denied
+     *   QUERY  /i.php?action=log(U+FF05)6fut  ALLOW
+     *
+     * and `?action=logout` is where a logout LIVES on the legacy applications
+     * the query half of the denylist was written for. The class comment's
+     * reason for reading the halves separately is about `..`, `;` and `%2f`,
+     * which are PATH syntax; a byte fold is not path syntax, and the reason
+     * never covered it.
+     */
+    static void theQueryHalfGetsTheSameByteFoldsThePathHalfGets() {
+        Policy p = allowingPolicy();
+
+        // Each row twice: once with the bytes in the path, once with the same
+        // bytes in the query. Both must refuse, and the pairing is the point --
+        // a check on the query alone would pass against a build that had simply
+        // banned the character.
+        String[][] rows = {
+            {"logo%c1%b5t",       "an overlong UTF-8 `u`"},
+            {"log%ef%bc%856fut",  "a best-fit `%` that manufactures an escape"},
+            {"logo%ef%bd%95t",    "a fullwidth `u`"},
+            {"log%6fut",          "an ordinary escape"},
+        };
+        for (String[] row : rows) {
+            String path = "/account/" + row[0];
+            denies("path: " + path + " (" + row[1] + ")", p,
+                   req("GET", "https://app.example.test" + path,
+                       "app.example.test", path, ""),
+                   APP, "dangerous_denied");
+            String query = "action=" + row[0];
+            denies("query: /i.php?" + query + " (" + row[1] + ")", p,
+                   req("GET", "https://app.example.test/i.php?" + query,
+                       "app.example.test", "/i.php", query),
+                   APP, "dangerous_denied");
+        }
+
+        // The UNDECODED member survives the folds, and the check that pins it
+        // is the `*=arch%6*` one in aDenyRuleSeesEveryReadingOfThePath -- not a
+        // copy of it here. My copy used `*=log%6*` and was VACUOUS: `*=logout*`
+        // is a shipped default and catches the decoded query on its own, so it
+        // passed with the undecoded member deleted. That is the exact trap the
+        // older check's own comment warns about, and I walked into it one
+        // screen further down the same file. The sabotage run is what said so.
+        check("the undecoded member is still a member, and no shipped default "
+              + "catches the query that pins it",
+              Policy.queryReadings("x=arch%69ve").contains("x=arch%69ve")
+              && !Policy.DEFAULT_DANGEROUS.stream().anyMatch(
+                      g -> Policy.glob(g, "/index.php?x=archive")));
+
+        // ...and an ordinary query is still decided rather than refused.
+        allows("a benign query is untouched", p,
+               req("GET", "https://app.example.test/search?q=logs&page=2",
+                   "app.example.test", "/search", "q=logs&page=2"),
+               APP);
+        allows("including one carrying an escape and a non-ASCII value", p,
+               req("GET", "https://app.example.test/search?q=caf%c3%a9",
+                   "app.example.test", "/search", "q=caf%c3%a9"),
+               APP);
+
+        // The set itself: closed, and small. My first comment on queryReadings
+        // said the set "stays in single digits" because the folds are functions
+        // of the whole string rather than the subset choice the path transforms
+        // are. It sounded right and a seeded search falsified it at 17 members
+        // in the first run -- so the number below comes from the search rather
+        // than from the argument, and the check keeps it that way.
+        check("a query with no escape and no non-ASCII byte has exactly one reading",
+              Policy.queryReadings("q=logs&page=2").size() == 1);
+        char[] alphabet = ("%25EFBC85C0AE2f5c=&logut" + '\0'
+                + "％／．ａｌÀ®İ٪;∖").toCharArray();
+        Random rnd = new Random(20260822L);
+        int violations = 0, biggest = 0;
+        String firstBad = null;
+        for (int i = 0; i < 20_000; i++) {
+            StringBuilder b = new StringBuilder();
+            int len = 1 + rnd.nextInt(40);
+            for (int j = 0; j < len; j++) b.append(alphabet[rnd.nextInt(alphabet.length)]);
+            Set<String> set = Policy.queryReadings(b.toString());
+            biggest = Math.max(biggest, set.size());
+            for (String r : new ArrayList<>(set))
+                if (!set.containsAll(Policy.queryReadings(r))) {
+                    violations++;
+                    if (firstBad == null) firstBad = b.toString();
+                    break;
+                }
+        }
+        check("queryReadings is closed on 20,000 random queries (" + violations
+              + " violation(s), largest set " + biggest
+              + (firstBad == null ? "" : ", first " + firstBad) + ")",
+              violations == 0);
+
+        // The bound is on the PRODUCT, because the dangerous.path pass reads
+        // every reading of the path against every reading of the query. A
+        // 14-reading path is decided; the same path with a 6-reading query is
+        // 84 pairs, over the 64 this will decide about, and is refused.
+        String rich = "/%2e;b\\c. /d";
+        int pathSet = Policy.readings(rich).size();
+        String richQuery = "a=%ef%bc%85c0%ae";
+        int querySet = Policy.queryReadings(richQuery).size();
+        check("the fixture is a " + pathSet + "-reading path and a " + querySet
+              + "-reading query, a product of " + (pathSet * querySet),
+              pathSet * querySet > Policy.MAX_READINGS && pathSet <= Policy.MAX_READINGS);
+        allows("the path alone is under the bound and is decided", p,
+               req("GET", "https://app.example.test" + rich + "?x=1",
+                   "app.example.test", rich, "x=1"),
+               APP);
+        Decision product = p.decide(req("GET",
+                "https://app.example.test" + rich + "?" + richQuery,
+                "app.example.test", rich, richQuery), APP);
+        check("the same path with a query whose product is over the bound is "
+              + "refused (got " + (product.allowed() ? "ALLOWED" : product.errorClass())
+              + "): " + product.detail(),
+              !product.allowed() && "scope_denied".equals(product.errorClass())
+              && product.detail() != null && product.detail().contains("target has at least"));
+
+        // Bounded on CONSTRUCTION, not only on matching -- the round-5 lesson,
+        // applied to the new set. A limit applied after the fact returns the
+        // whole set every time.
+        String big = "a=" + richQuery;
+        for (int limit : new int[]{1, 2, 3}) {
+            int built = Policy.queryReadings(big, limit).size();
+            check("queryReadings() stops building at " + limit + " + 1 members (got "
+                  + built + " of a set of " + Policy.queryReadings(big).size() + ")",
+                  built == limit + 1);
+        }
+    }
+
+    /**
+     * Round 7, green sabotage. `dangerous.path` lost the whole path reading set
+     * the moment a query was present.
+     *
+     * Replacing `for (String path : paths)` in targetReadings with
+     * `for (String path : List.of(req.path()))` was 0 red against all 596
+     * checks, and flipped three live rows to ALLOW -- because every
+     * `dangerous.path` fixture in the suite used a query-less target, so the
+     * arm that combines the path's READINGS with the query was never exercised
+     * at all. The raw path is a member of its own reading set, so the
+     * query-less checks pass either way.
+     */
+    static void theDangerousDenylistReadsThePathWhenAQueryIsPresent() {
+        Policy p = allowingPolicy();
+        String[][] rows = {
+            {"/account/log%6fut",           "next=/home", "an escaped letter"},
+            {"/x/..%ef%bc%8flogout",        "x=1",        "a best-fit separator"},
+            {"/x/..%5clogout",              "x=1",        "an encoded backslash"},
+            {"/account/logout/../profile",  "ref=1",      "the RAW reading"},
+            {"/account/logout%00.png",      "v=2",        "the C-string truncation"},
+        };
+        for (String[] row : rows)
+            denies("a query does not hide a dangerous path (" + row[2] + "): "
+                   + row[0] + "?" + row[1], p,
+                   req("GET", "https://app.example.test" + row[0] + "?" + row[1],
+                       "app.example.test", row[0], row[1]),
+                   authorised("scope.include", "https://app.example.test/*",
+                              "dangerous.path", "*/export*"),
+                   "dangerous_denied");
+
+        // ...and the pairing that says the reading set is what did it: the same
+        // targets with no query at all were already refused, so a check on
+        // those alone proves nothing about the arm above.
+        for (String[] row : rows)
+            denies("and the same target with no query: " + row[0], p,
+                   req("GET", "https://app.example.test" + row[0],
+                       "app.example.test", row[0], ""),
+                   APP, "dangerous_denied");
+
+        // The query still cannot be read as a PATH, which is the half of the
+        // split that is correct: a `..` in a query value is a value.
+        allows("a dot segment in a query value is a value, not a traversal", p,
+               req("GET", "https://app.example.test/search?next=/x/../account/profile",
+                   "app.example.test", "/search", "next=/x/../account/profile"),
+               authorised("scope.include", "https://app.example.test/search*"));
+    }
+
+    /**
+     * Round 7, operator-reachable, and the fix is this test rather than a code
+     * change.
+     *
+     * An empty `scope.exclude` entry reaches `Rule.forExclude("")`, which
+     * throws, and checkScope answers `scope_denied` with "unusable scope
+     * pattern". That is CORRECT and it is fail-closed: the operator is told
+     * their config is broken and nothing is issued.
+     *
+     * A one-line `if (!p.isEmpty())` skip before `excludes.add` leaves all 596
+     * checks green and turns that deny-all into ALLOW -- a run proceeding
+     * against a scope the operator believes carries an exclusion. It is
+     * reachable end to end and not a hypothetical: `src/hx/config.py` accepted
+     * `""` in a string list, `codec.build_config_body` emitted
+     * `scope.exclude\t\n`, `parse_config_body` round-tripped `['']` and
+     * `ConfigBody.parse` accepted it -- a real engagement YAML produced
+     * `scope_exclude == ['', 'https://app.example.test/admin/*']`. The Python
+     * end now refuses an empty entry at load time so the operator learns at
+     * `hx new`; this pins what the extension does if one ever arrives anyway.
+     */
+    static void anEmptyScopePatternIsAnUnusableOneAndDeniesEverything() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation withEmpty = authorised(
+                "scope.include", "https://app.example.test/*",
+                "scope.exclude", "",
+                "scope.exclude", "https://app.example.test/admin/*");
+
+        Decision d = p.decide(orders(), withEmpty);
+        check("an empty scope.exclude entry denies a request that breaks nothing "
+              + "else (got " + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
+              !d.allowed() && "scope_denied".equals(d.errorClass()));
+        check("...and the denial says the pattern is unusable rather than that "
+              + "the request is out of scope: " + d.detail(),
+              d.detail() != null && d.detail().contains("unusable scope pattern"));
+
+        // Every shape of blank an operator's YAML can produce, and the same
+        // answer for an empty INCLUDE entry -- which is the more tempting one
+        // to skip, since an include list that is empty AFTER the skip would
+        // fall through to "no scope.include pattern is configured" and look
+        // like a different bug.
+        for (String blank : List.of("", " ", "\t")) {
+            denies("a blank scope.exclude entry " + blank.length()
+                   + " character(s) long is unusable", p, orders(),
+                   authorised("scope.include", "https://app.example.test/*",
+                              "scope.exclude", blank),
+                   "scope_denied");
+            denies("...and so is a blank scope.include entry beside a good one", p,
+                   orders(),
+                   authorised("scope.include", "https://app.example.test/*",
+                              "scope.include", blank),
+                   "scope_denied");
+        }
+
+        // The control: the same config with the empty entry removed allows the
+        // request, so the denial above is the empty entry and not the exclude
+        // beside it.
+        allows("the same config without the empty entry allows the request", p, orders(),
+               authorised("scope.include", "https://app.example.test/*",
+                          "scope.exclude", "https://app.example.test/admin/*"));
+    }
+
+    /**
+     * Round 7. The "unfalsifiable claim" in `denies()` was falsifiable, and the
+     * comment's own reasoning named the shape.
+     *
+     * Round 6 kept the two `lower()` calls in `Rule.denies` after both went
+     * 0-red, and wrote the reason down as a claim it could not falsify:
+     * `lower(reading)` is not always a member, because readings() lowercases
+     * the COLLAPSED form and collapse is not the identity on a path carrying a
+     * dot segment. Carrying UPPER CASE as well is the other half, and the two
+     * together are all it takes:
+     *
+     *   exclude = https://app.example.test/admin*    GET /ADMIN/../x
+     *     readings = { /ADMIN/../x, /x }
+     *     lower(raw) = /admin/../x is NOT one of them
+     *
+     * With the path-side fold removed the raw member is uppercase and no
+     * pattern reading matches it, the collapsed member is `/x` which the
+     * exclude does not name, and the request is ALLOWED past an exclusion.
+     */
+    static void aDenyRuleFoldsTheCaseOfAnUncollapsedRawReading() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation cfg = authorised(
+                "scope.include", "https://app.example.test/*",
+                "scope.exclude", "https://app.example.test/admin*");
+
+        check("the reading set really is missing lower(raw): "
+              + Policy.readings("/ADMIN/../x"),
+              !Policy.readings("/ADMIN/../x").contains("/admin/../x")
+              && Policy.readings("/ADMIN/../x").contains("/ADMIN/../x")
+              && Policy.readings("/ADMIN/../x").contains("/x"));
+        denies("an uppercase path with a dot segment does not walk past "
+               + "exclude=/admin*", p,
+               req("GET", "https://app.example.test/ADMIN/../x",
+                   "app.example.test", "/ADMIN/../x", ""),
+               cfg, "scope_denied");
+        // Same shape one level down, under an exclude anchored deeper, so the
+        // check is not resting on the one spelling: here the collapsed reading
+        // is a real resource rather than the root, and it is still not what the
+        // exclusion names.
+        BridgeClient.Authorisation deeper = authorised(
+                "scope.include", "https://app.example.test/*",
+                "scope.exclude", "https://app.example.test/a/admin*");
+        check("and again: " + Policy.readings("/A/ADMIN/../x"),
+              !Policy.readings("/A/ADMIN/../x").contains("/a/admin/../x")
+              && Policy.readings("/A/ADMIN/../x").contains("/a/x"));
+        denies("nor does /A/ADMIN/../x walk past exclude=/a/admin*", p,
+               req("GET", "https://app.example.test/A/ADMIN/../x",
+                   "app.example.test", "/A/ADMIN/../x", ""),
+               deeper, "scope_denied");
+        // The control: the same exclude, a path whose lowercase form it does
+        // NOT name, is allowed -- so the two above are the case fold rather
+        // than the exclude matching everything.
+        allows("while a path the exclude does not name is still allowed", p,
+               req("GET", "https://app.example.test/PUBLIC/../x",
+                   "app.example.test", "/PUBLIC/../x", ""),
+               cfg);
+    }
+
+    /**
+     * Round 7, green sabotage. Nothing pinned that `lower()` folds the WHOLE
+     * string.
+     *
+     * The check beside the U+0130 closure block pins lower()'s COST -- it goes
+     * red if lower() is "simplified" back to String.toLowerCase -- and nothing
+     * pinned its extent. Capping the fold at the first 4096 characters is 0 red
+     * against 596 checks and flips a `LOGOUT` past that point from
+     * dangerous_denied to ALLOW. Both loops in lower() are covered here: the
+     * scan that looks for the first character needing a fold, and the copy that
+     * folds the rest.
+     */
+    static void lowerFoldsTheWholeStringAndNotAPrefixOfIt() {
+        Policy p = allowingPolicy();
+
+        String tail = "x".repeat(6000) + "ABC";
+        check("lower() folds a character 6000 in, not just a prefix",
+              Policy.lower(tail).endsWith("abc")
+              && Policy.lower(tail).length() == tail.length());
+        String both = "A" + "x".repeat(6000) + "B";
+        check("...and one at each end, so the copy loop is covered as well as "
+              + "the scan that finds the first character needing a fold",
+              Policy.lower(both).equals("a" + "x".repeat(6000) + "b"));
+
+        // End to end, which is what a cap actually costs: the denylist matches
+        // on lower(target), so a dangerous word past the cap stops being one.
+        String path = "/x/" + "a".repeat(6000) + "/LOGOUT";
+        check("the fixture puts LOGOUT " + (path.length() - "/LOGOUT".length())
+              + " characters in, well past any prefix a cap would fold, and "
+              + "stays under MAX_TARGET_CHARS",
+              path.length() < Policy.MAX_TARGET_CHARS && path.length() > 4096);
+        denies("a LOGOUT past 4096 characters is still a logout", p,
+               req("GET", "https://app.example.test" + path,
+                   "app.example.test", path, ""),
+               APP, "dangerous_denied");
+        // The same in the query half, which folds through the same method.
+        String query = "a=" + "b".repeat(6000) + "&action=LOGOUT";
+        denies("and so is one past 4096 characters of query", p,
+               req("GET", "https://app.example.test/i.php?" + query,
+                   "app.example.test", "/i.php", query),
+               APP, "dangerous_denied");
+        // The control: the same length with nothing dangerous in it is allowed,
+        // so the denials above are the word and not the length.
+        allows("while a target that long with nothing dangerous in it is allowed", p,
+               req("GET", "https://app.example.test/x/" + "a".repeat(6000) + "/orders",
+                   "app.example.test", "/x/" + "a".repeat(6000) + "/orders", ""),
+               APP);
+    }
+
+    /**
+     * Round 7. Three of the four spellings an ALLOW pattern is read by had no
+     * input that could falsify them.
+     *
+     * `addSpellings` adds the verbatim pattern, its case fold, its decoded
+     * form, its UTF-8 fold and its separators-inert form. Deleting any of the
+     * last three left every check green, which is the position round 6 recorded
+     * for two guards in `denies()` and refused to dress up. Here an input
+     * exists for each, so each gets one rather than a claim.
+     */
+    static void everySpellingAnIncludeIsReadByHasAnInputThatNeedsIt() {
+        Policy p = allowingPolicy();
+
+        // The case fold. The allows() comment claims an operator who wrote
+        // /API/* does not have every request under it refused; readings()
+        // lowercases the derived member, so /API/orders reads as /api/orders
+        // and only the folded SPELLING of the pattern covers it.
+        allows("include=/API/* authorises /API/orders (the case fold)", p,
+               req("GET", "https://app.example.test/API/orders",
+                   "app.example.test", "/API/orders", ""),
+               authorised("scope.include", "https://app.example.test/API/*"));
+        check("...and the reading that needs it really is there: "
+              + Policy.readings("/API/orders"),
+              Policy.readings("/API/orders").contains("/api/orders")
+              && Policy.spellingReadings("/API/*").contains("/api/*"));
+
+        // The separators-inert spelling. An include carrying an encoded
+        // separator AND an ordinary escape has a reading in which the first is
+        // still escaped and the second is not -- which is exactly the reading
+        // the REQUEST has, on every server that decodes after it has cut the
+        // path into segments. Without it that reading of the path is uncovered
+        // and allow-AND refuses the request.
+        String inertPattern = "https://app.example.test/files/a%2fb%20c/*";
+        String inertPath = "/files/a%2fb%20c/x.pdf";
+        check("the path has a reading that only the inert spelling covers: "
+              + Policy.readings(inertPath),
+              Policy.readings(inertPath).contains("/files/a%2fb c/x.pdf")
+              && Policy.spellingReadings("/files/a%2fb%20c/*")
+                       .contains("/files/a%2fb c/*"));
+        allows("include=/files/a%2fb%20c/* authorises its own request "
+               + "(the separators-inert spelling)", p,
+               req("GET", "https://app.example.test" + inertPath,
+                   "app.example.test", inertPath, ""),
+               authorised("scope.include", inertPattern));
+
+        // The UTF-8 fold. An operator who wrote the accented directory as
+        // percent-escapes has a pattern whose DECODED form is two Latin-1
+        // characters and whose UTF-8 reading is the one character the request
+        // actually names.
+        String utf8Path = "/files/café/a.pdf";
+        check("the pattern's decoded form is not the character the request "
+              + "carries, and only its UTF-8 fold is",
+              Policy.spellingReadings("/files/caf%c3%a9/*")
+                    .contains("/files/café/*")
+              && !Policy.spellingReadings("/files/caf%c3%a9/*")
+                        .contains("/files/cafÃ©/*"));
+        allows("include=/files/caf%c3%a9/* authorises /files/café/a.pdf "
+               + "(the UTF-8 fold)", p,
+               req("GET", "https://app.example.test" + utf8Path,
+                   "app.example.test", utf8Path, ""),
+               authorised("scope.include", "https://app.example.test/files/caf%c3%a9/*"));
     }
 }

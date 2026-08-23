@@ -376,7 +376,7 @@ public final class Policy {
         // and left the building unbounded -- see readings(String,int). What
         // comes back is at most budget + 1 members, and it is budget + 1
         // exactly when the real set is bigger.
-        int budget = readingBudget(t.path());
+        int budget = readingBudget(t.path().length());
         Set<String> pathReadings = readings(t.path(), budget);
 
         // Refuse rather than pay to match every rule, and every dangerous.path
@@ -388,6 +388,30 @@ public final class Policy {
             return Decision.deny("scope_denied", "request path has at least "
                     + pathReadings.size() + " readings, over the " + budget
                     + " this can decide about");
+
+        // The same bound over the TARGET, which is what the dangerous.path pass
+        // reads: every reading of the path against every reading of the query,
+        // so the cost that pass pays is the PRODUCT and a bound on one factor is
+        // not a bound on a product -- the argument MAX_READING_CHARS already
+        // makes about length. It is taken HERE, in scope, because no rule may
+        // run a glob against a set nobody could finish building, and because
+        // scope is the first rule about the request itself: putting the denial
+        // anywhere later would break the pinned order.
+        //
+        // The query half is bounded and not merely counted, for the reason the
+        // path half is: this was measured, not assumed. A hill climb over the
+        // alphabet an evasion is built from reaches 70 query readings from a
+        // 162-character query -- past MAX_READINGS on its own, before it is
+        // multiplied by anything.
+        if (!req.query().isEmpty()) {
+            int targetBudget = readingBudget(req.path().length() + req.query().length() + 1);
+            Set<String> queries = queryReadings(req.query(), targetBudget);
+            long product = (long) pathReadings.size() * queries.size();
+            if (product > targetBudget)
+                return Decision.deny("scope_denied", "request target has at least "
+                        + product + " readings, over the " + targetBudget
+                        + " this can decide about");
+        }
 
         // Exclude first: an exclusion is the operator naming something they
         // know they must not touch, and it beats every include it overlaps.
@@ -482,6 +506,17 @@ public final class Policy {
      * pathological figures -- headroom in both directions, not a number
      * squeezed between them.
      *
+     * RE-MEASURED after the best-fit table grew from thirteen entries to the
+     * whole fullwidth block, because a bound justified by a measurement is only
+     * as good as the build it was measured on. Real traffic is unchanged: an
+     * ordinary path is 1 reading, `/app/orders;jsessionid=1` is 2, and
+     * `/a;b(backslash)c. /d` -- every transform firing in one segment -- is
+     * still 7. The pathological end moved a long way: a hill climb over the
+     * trigger alphabet now reaches 2,229 readings from a THIRTY-TWO character
+     * path, against the 261 and 425 above. The bound is what stands between
+     * that and the enforcement thread, and the gap between 7 and 64 is what
+     * says the bound is not standing in front of anything real.
+     *
      * It is a DENIAL, and it has to be: the alternative anyone reaches for
      * first is truncating the set at N members, and truncating fails OPEN
      * both ways a denial cannot. A deny rule that stops looking early may
@@ -565,13 +600,19 @@ public final class Policy {
     static final int MAX_READING_CHARS = 128 * 1024;
 
     /**
-     * How many readings this path may have before checkScope refuses it: the
-     * count bound and the size bound, whichever is tighter. At least 1, so a
-     * path is never refused for having the one reading every path has.
+     * How many readings a string this long may have before checkScope refuses
+     * it: the count bound and the size bound, whichever is tighter. At least 1,
+     * so a path is never refused for having the one reading every path has.
+     *
+     * Taken over a LENGTH rather than a string because it is asked twice: once
+     * about the path, whose readings the scope rules match, and once about the
+     * whole target, whose readings the dangerous.path pass matches. The second
+     * has no string to be handed -- the target's readings are a product of two
+     * sets and are never built as one string until they are matched.
      */
-    static int readingBudget(String path) {
+    static int readingBudget(int length) {
         return Math.max(1, Math.min(MAX_READINGS,
-                                    MAX_READING_CHARS / Math.max(1, path.length())));
+                                    MAX_READING_CHARS / Math.max(1, length)));
     }
 
     /**
@@ -979,9 +1020,11 @@ public final class Policy {
      *   - when the decoded bytes are not all ASCII, the same again over the
      *     UTF-8 reading of those bytes, which is what folds the overlong
      *     `%c0%ae%c0%ae` -- the classic IIS traversal -- back to `..`.
-     *   - and the same again with the Windows ANSI best-fit mapping applied,
-     *     which turns U+FF0F into `/`, U+FF0E into `.` and U+FF3C into a
-     *     backslash. See foldBestFit.
+     *   - and the same again with the Windows ANSI best-fit mapping applied.
+     *     That is not only the separator homoglyphs -- U+FF0F into `/`, U+FF0E
+     *     into `.`, U+FF3C into a backslash -- but the WHOLE fullwidth block,
+     *     U+FF01 to U+FF5E, onto printable ASCII: a fullwidth spelling of
+     *     `logout` is `logout` to an ANSI API. See foldBestFit.
      *
      * Identical readings collapse, so an ordinary path like `/api/orders`
      * produces exactly ONE member and costs one glob per rule. The set only
@@ -1225,10 +1268,17 @@ public final class Policy {
      * measured cost of not making the distinction: `include=/../*` resolved to
      * `/*` and authorised every path on the host.
      *
-     * The best-fit fold is on the excluded side for the same reason even
-     * though it looks like an encoding: it MANUFACTURES separators. U+FF0F
-     * becomes a `/` and U+FF05 becomes a `%`, so an include carrying one would
-     * gain a reading that cuts the path somewhere the operator did not.
+     * The best-fit fold is on the excluded side even though it looks like an
+     * encoding, and it stays there now that the whole fullwidth block folds
+     * rather than five separators. Two reasons, one per half of the table.
+     * The separator homoglyphs MANUFACTURE separators -- U+FF0F becomes a `/`
+     * and U+FF05 becomes a `%` -- so an include carrying one would gain a
+     * reading that cuts the path somewhere the operator did not. The rest
+     * substitute a LETTER, which is not a different spelling of the operator's
+     * pattern but a different NAME: `include=/(U+FF41)dmin/*` folded would read
+     * as `/admin/*` and authorise the real admin area, which is the
+     * `include=/../*` failure with a homoglyph in place of a dot segment.
+     * Neither half may widen a rule that authorises.
      *
      * Flat rather than a fixed point, because none of these transforms creates
      * a trigger for another: decoding already runs to a fixed point, and the
@@ -1513,8 +1563,8 @@ public final class Policy {
     }
 
     /**
-     * The Windows ANSI best-fit mapping, over the characters that can become a
-     * path separator.
+     * The Windows ANSI best-fit mapping, over the characters that change what
+     * a path SAYS.
      *
      * When a Windows program hands a wide string to an ANSI ("A") API --
      * which the whole compatibility layer under a great deal of shipped
@@ -1537,11 +1587,43 @@ public final class Policy {
      * this tool is an agent working a pentest, which is exactly the party that
      * pastes a wordlist entry.
      *
-     * The map is the separator-producing entries only. The real tables map
-     * hundreds of characters -- quotes, dashes, currency signs -- and none of
-     * the rest changes how a path is READ. U+FF05 (fullwidth percent) is here
-     * because it can create an escape, and readings() re-derives every member,
-     * so the escape it creates is decoded on the next pass.
+     * THE SEPARATORS WERE NOT THE WHOLE TABLE, and for one round this method
+     * said they were: "the separator-producing entries only... none of the rest
+     * changes how a path is READ". That is false, and it was false about the
+     * best-documented part of the table. Microsoft's bestfit1252.txt maps ALL
+     * 94 code points of the fullwidth block, U+FF01 to U+FF5E, onto printable
+     * ASCII at a fixed offset of 0xFEE0 -- so U+FF4C is `l`, U+FF21 is `A`,
+     * U+FF10 is `0`. A fullwidth SPELLING of a word is that word to any ANSI
+     * API, and this tool's denylist is a list of words. Live on the shipped
+     * defaults before the range was added:
+     *
+     *   /account/(fullwidth l-o-g-o-u-t)   ALLOW -- an automated logout
+     *   /account/l(U+FF0F)gout             ALLOW -- one letter is enough
+     *   /(U+FF41)dmin/users                ALLOW past exclude=/admin/*
+     *
+     * (Verified against the real table rather than recalled: the WCTABLE of
+     * unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WindowsBestFit/bestfit1252.txt
+     * holds 698 entries, 94 of them are U+FF01..U+FF5E, and every one of those
+     * 94 maps to its code point minus 0xFEE0 with no exceptions.)
+     *
+     * The named entries below are the ones OUTSIDE that block, and three of
+     * them come from the same file: U+037E GREEK QUESTION MARK is `;`, U+066A
+     * ARABIC PERCENT SIGN is `%`, U+2216 SET MINUS is a backslash. The rest --
+     * the small forms, the halfwidth ideographic stop, the big solidus -- are
+     * best fits in other code pages' tables rather than 1252's, and they are
+     * kept because a PATH reading only ever denies more. U+FF05 and U+066A can
+     * create an ESCAPE, and readings() re-derives every member, so the escape
+     * they create is decoded on the next pass.
+     *
+     * A best-fit reading is a reading of a PATH and of a DENY pattern, never
+     * of an allow pattern -- see spellingReadings. The cost of that split, now
+     * that the whole fullwidth block folds: an operator whose scope.include
+     * carries a fullwidth character authorises nothing, because the request
+     * still has the folded reading and their pattern does not name it. It is
+     * the same accepted cost a segment trigger in an include already has, it
+     * is visible rather than silent, and PolicyTest pins it. An include spelt
+     * in ASCII is unaffected: `/files/*` still authorises a fullwidth filename
+     * under it, because the fold changes the name and not the prefix.
      */
     static String foldBestFit(String s) {
         int i = 0;
@@ -1558,24 +1640,35 @@ public final class Policy {
         return out == null ? s : out.toString();
     }
 
-    /** Hex rather than character literals on purpose: these code points are
-     *  homoglyphs of the separators, and a reader has no way to tell them apart
-     *  in a source file. */
+    /**
+     * The whole fullwidth block, plus the homoglyphs of the separators that
+     * live outside it.
+     *
+     * Hex rather than character literals on purpose: these code points are
+     * homoglyphs, and a reader has no way to tell them apart in a source file.
+     *
+     * FULLWIDTH_OFFSET is not a coincidence to be spelt out entry by entry.
+     * U+FF01..U+FF5E is the fullwidth image of ASCII 0x21..0x7E, in order, and
+     * bestfit1252.txt maps it as exactly that -- 94 entries, one subtraction.
+     * Writing them out would be 94 chances to leave one out, which is how the
+     * table came to have thirteen entries in the first place.
+     */
+    static final int FULLWIDTH_OFFSET = 0xfee0;
+
     private static char bestFit(char c) {
+        if (c >= 0xff01 && c <= 0xff5e) return (char) (c - FULLWIDTH_OFFSET);
         switch (c) {
-            case 0xff0f:            // FULLWIDTH SOLIDUS
             case 0x2215:            // DIVISION SLASH
             case 0x2044:            // FRACTION SLASH
             case 0x29f8: return '/';// BIG SOLIDUS
-            case 0xff3c:            // FULLWIDTH REVERSE SOLIDUS
+            case 0x2216:            // SET MINUS
             case 0xfe68: return '\\';// SMALL REVERSE SOLIDUS
-            case 0xff0e:            // FULLWIDTH FULL STOP
             case 0xfe52:            // SMALL FULL STOP
             case 0xff61:            // HALFWIDTH IDEOGRAPHIC FULL STOP
             case 0x2024: return '.';// ONE DOT LEADER
-            case 0xff1b:            // FULLWIDTH SEMICOLON
+            case 0x037e:            // GREEK QUESTION MARK
             case 0xfe54: return ';';// SMALL SEMICOLON
-            case 0xff05: return '%';// FULLWIDTH PERCENT SIGN
+            case 0x066a: return '%';// ARABIC PERCENT SIGN
             default:     return c;
         }
     }
@@ -1810,18 +1903,11 @@ public final class Policy {
      * which reads path AND query: every reading of the path against every
      * reading of the query.
      *
-     * The query has TWO readings, raw and decoded, and both earn their place.
-     * The decoded one is the obvious half -- on a legacy application the logout
-     * is `?action=log%6fut` at least as often as it is a path. The raw one is
-     * the half that is easy to drop and hard to miss the loss of: a
-     * dangerous.path an operator wrote against the bytes, `*=log%6*`, matches
-     * `action=log%6fut` and matches nothing at all once the query is decoded,
-     * because `%6f` is gone by then and `%6` was never a whole escape.
-     *
-     * The two halves are read separately, and the path transforms are applied
-     * to the path ONLY: a `..` in a query value is a value, a `;` in one is a
-     * separator some frameworks still use, and a `%2f` in one is not a path
-     * separator the server will ever see.
+     * The query is read by queryReadings, which gives it the BYTE folds the
+     * path gets and none of the SEGMENT transforms. The two halves are read
+     * separately, and that half of the split is right: a `..` in a query value
+     * is a value, a `;` in one is a separator some frameworks still use, and a
+     * `%2f` in one is not a path separator the server will ever see.
      *
      * With no query the target IS the path, so the path's readings are the
      * target's -- built once rather than copied.
@@ -1829,14 +1915,115 @@ public final class Policy {
     private static Set<String> targetReadings(HxRequest req) {
         Set<String> paths = readings(req.path());
         if (req.query().isEmpty()) return paths;
-        Set<String> queries = new LinkedHashSet<>();
-        queries.add(req.query());
-        queries.add(lower(decodeToFixedPoint(req.query())));
+        Set<String> queries = queryReadings(req.query());
         Set<String> out = new LinkedHashSet<>();
         for (String path : paths)
             for (String query : queries)
                 out.add(path + "?" + query);
         return out;
+    }
+
+    /**
+     * Every reading of a QUERY string: the byte folds, closed, and not one of
+     * the path transforms.
+     *
+     * For four rounds this was `{raw, lower(decoded)}` -- two members and no
+     * folds at all, while the path half had grown a decoding axis, an overlong
+     * UTF-8 fold and a best-fit fold. The same bytes therefore got two
+     * different answers from the same denylist, and the class comment's reason
+     * for reading the halves separately does not cover it: that reason is about
+     * `..`, `;` and `%2f`, which are PATH syntax. A byte fold is not path
+     * syntax. It is what the target does to the characters before anything
+     * looks at them, and it does it to a query string exactly as readily:
+     *
+     *   PATH   /account/logo%c1%b5t          dangerous_denied
+     *   QUERY  /i.php?action=logo%c1%b5t     ALLOW   <- same overlong `u`
+     *   PATH   /x/..(U+FF05)2flogout         dangerous_denied
+     *   QUERY  /i.php?action=log(U+FF05)6fut ALLOW   <- same best-fit `%`
+     *
+     * and the second row of each pair is an automated logout on a legacy
+     * application, which is where `?action=logout` lives in the first place.
+     *
+     * WHAT IS IN THE SET: the closure of the query under decoding to a fixed
+     * point, the overlong UTF-8 fold, the best-fit fold and the case fold. The
+     * UNDECODED member earns its place for the reason it always did -- a
+     * dangerous.path an operator wrote against the bytes, `*=log%6*`, matches
+     * `action=log%6fut` and matches nothing once the query is decoded, because
+     * `%6f` is gone by then and `%6` was never a whole escape.
+     *
+     * Case folded, and the query is NOT also held verbatim beside its fold.
+     * readings() holds the path verbatim because Rule.allows compares an
+     * include against it WITHOUT folding case, and an allow rule must not be
+     * widened by one. Nothing reads this set but the dangerous.path pass, which
+     * folds both sides itself, so a verbatim member is a member no caller can
+     * tell from its fold: I added one, sabotaged it, and it was 0 red because
+     * it cannot be otherwise. It is not here rather than here-and-unfalsifiable.
+     *
+     * CLOSED for the same reason readings() is: the folds COMPOSE, and the
+     * best-fit fold in particular MANUFACTURES escapes -- U+FF05 becomes a `%`
+     * and the two hex digits after it were already there. One pass of
+     * decode-then-fold reaches `log%6fut` and stops; the fixed point decodes it
+     * again and reaches `logout`. A flat set would have closed the first row
+     * above and left the third open, which is the shape of defect this task has
+     * shipped four times.
+     *
+     * It terminates on the same argument, and the argument is the same shape:
+     * decoding replaces three characters with one, the UTF-8 fold replaces two
+     * or more with one, and the best-fit and case folds substitute one code
+     * point for one -- so every member is drawn from a pool of strings no
+     * longer than the query, and neither substitution can be undone by the
+     * other (best-fit lands in ASCII, which it maps to itself; lower() is
+     * Unicode's simple mapping, which is idempotent).
+     *
+     * BOUNDED, and the bound is a measurement rather than a precaution. My
+     * first version of this comment said the set "stays in single digits"
+     * because the folds are functions of the whole string rather than the
+     * subset choice the path transforms are -- an argument that sounded right
+     * and that a 600,000-sample search immediately falsified at 17 members. A
+     * hill climb then reached 53 at 200 characters and 70 at 162, which is past
+     * MAX_READINGS before it is multiplied by the path's set at all. Fifth
+     * plausible, load-bearing, never-run claim on this task, caught this time
+     * because the number went in the comment only after the search printed it.
+     *
+     * So checkScope bounds the PRODUCT of this set and the path's, and the
+     * limit is carried into the construction here for the reason it is carried
+     * into readings(): a bound checked after the building is a bound on the
+     * wrong side of the work. At most limit + 1 members come back, and exactly
+     * limit + 1 when the real set is larger, which is all a caller needs to
+     * refuse it.
+     */
+    static Set<String> queryReadings(String query) {
+        return queryReadings(query, Integer.MAX_VALUE);
+    }
+
+    static Set<String> queryReadings(String query, int limit) {
+        Set<String> out = new LinkedHashSet<>();
+        Deque<String> pending = new ArrayDeque<>();
+        pending.add(query);
+        while (!pending.isEmpty() && out.size() <= limit)
+            deriveQuery(out, pending, pending.poll(), limit);
+        return out;
+    }
+
+    /** One query member, decoded or not, with the byte folds over each. */
+    private static void deriveQuery(Set<String> out, Deque<String> pending, String member, int limit) {
+        addQueryFolds(out, pending, member, limit);
+        String decoded = decodeToFixedPoint(member);
+        if (!decoded.equals(member)) addQueryFolds(out, pending, decoded, limit);
+    }
+
+    /** The two byte folds and the case fold over one query base. Each is
+     *  skipped when it is the identity, which is every ASCII query and so the
+     *  whole of the hot path. */
+    private static void addQueryFolds(Set<String> out, Deque<String> pending, String base, int limit) {
+        if (out.size() > limit) return;
+        add(out, pending, lower(base));
+        String utf8 = foldOverlongUtf8(base);
+        if (out.size() > limit) return;
+        if (!utf8.equals(base)) add(out, pending, lower(utf8));
+        String bestFit = foldBestFit(utf8);
+        if (out.size() > limit) return;
+        if (!bestFit.equals(utf8)) add(out, pending, lower(bestFit));
     }
 
     /**
