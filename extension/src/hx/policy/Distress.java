@@ -5,6 +5,7 @@ import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Locale;
 import java.util.Map;
 
@@ -73,6 +74,22 @@ public final class Distress {
      */
     public static final long DEFAULT_LATENCY_FLOOR_MS  = 250L;
 
+    /**
+     * Ceiling on {@code windowMs}, in the same spirit as {@code Limiter.MAX_RATE}:
+     * the dangerous config mistake is not a window set too tight (cheap: an
+     * early, spurious stop) but one that disables a rule outright. {@code
+     * windowMs * 1000L} converts to the microseconds {@link #evict} works in,
+     * and {@code Long.MAX_VALUE} -- exactly what an operator reaches for as a
+     * "no time bound, count-only" sentinel -- overflows that multiplication
+     * and wraps negative, which used to push the cutoff into the future and
+     * wipe the window on every {@link #record}: the 5xx-rate and latency
+     * rules went silently dark while {@link #stopReason()} stayed {@code
+     * null} forever. No live engagement runs a rolling distress window longer
+     * than a day; a config that wants "count only" should set {@code
+     * windowRequests} instead and leave {@code windowMs} merely generous.
+     */
+    private static final long MAX_WINDOW_MS = 24L * 60 * 60 * 1000; // 24 h
+
     private record Sample(long atUs, int status, long ms, boolean connectionError) { }
 
     /** Reason and host as one value, written once. See the class comment. */
@@ -136,6 +153,13 @@ public final class Distress {
             throw new IllegalArgumentException("windowRequests must be >= 1, got " + windowRequests);
         if (windowMs < 1)
             throw new IllegalArgumentException("windowMs must be >= 1, got " + windowMs);
+        if (windowMs > MAX_WINDOW_MS)
+            throw new IllegalArgumentException(
+                "windowMs above the " + MAX_WINDOW_MS + " ms (24 h) ceiling: " + windowMs
+                + " -- windowMs * 1000 overflows a long well before Long.MAX_VALUE, which "
+                + "silently disables the 5xx-rate and latency rules while record() keeps "
+                + "returning as if the host were healthy; bound by windowRequests instead "
+                + "if you want the window to be count-only");
         if (baselineRequests < 1)
             throw new IllegalArgumentException("baselineRequests must be >= 1, got " + baselineRequests);
         if (latencyFloorMs < 0)
@@ -168,7 +192,8 @@ public final class Distress {
         Host h = hosts.computeIfAbsent(host, unused -> new Host(baselineRequests));
 
         h.window.addLast(new Sample(nowUs, status, ms, connectionError));
-        evict(h, nowUs);
+        evict(host, h, nowUs);
+        if (stop != null) return;                  // evict() can trip on unrepresentable arithmetic
 
         // Captured BEFORE this sample can complete the baseline. §4 takes the
         // baseline from "that host's first 10 requests", so the tenth request
@@ -206,13 +231,50 @@ public final class Distress {
      * exactly {@code windowMs} old is still inside it; one microsecond older is
      * not, and DistressTest pins both sides of that edge.
      *
+     * {@code cutoffUs} used to be {@code nowUs - windowMs * 1000L}, unsafe on
+     * EITHER operand: {@code windowMs * 1000L} overflows for a {@code windowMs}
+     * an operator reaches for as a "no time bound" sentinel ({@code
+     * Long.MAX_VALUE} -- now refused by the constructor, see {@link
+     * #MAX_WINDOW_MS}), and {@code nowUs - (...)} underflows for a clock
+     * reading near {@code Long.MIN_VALUE}, which no constructor can see coming
+     * because it runs before any clock is ever read. Either overflow used to
+     * silently disable the 5xx-rate and latency rules -- the window got wiped,
+     * or never aged, on every {@link #record} while {@link #stopReason()}
+     * stayed {@code null} forever, which reads as a healthy target. The
+     * arithmetic is now exact ({@link Math#multiplyExact} / {@link
+     * Math#subtractExact}), and on overflow this TRIPS instead of continuing:
+     * if the window bound cannot be computed, {@code Distress} cannot tell
+     * whether the target is healthy, and that is not a state in which to keep
+     * issuing requests. A spurious halt costs an operator a restart; the other
+     * direction costs a client an outage.
+     *
+     * The time loop also no longer stops at the first non-expired element at
+     * the front: a transient forward clock spike followed by a backward
+     * correction leaves a sample with an inflated timestamp sitting at the
+     * front, and breaking there would leave genuinely stale samples stuck
+     * behind it in the deque until the count cap above eventually flushes
+     * them. So every sample is checked and nothing short-circuits the scan --
+     * cheap, since the deque holds at most {@code windowRequests} of them.
+     *
      * Eviction runs on record, so the window a rule sees is the window as of
      * the request that provoked it -- which is the one the stop reason quotes.
      */
-    private void evict(Host h, long nowUs) {
+    private void evict(String host, Host h, long nowUs) {
         while (h.window.size() > windowRequests) h.window.removeFirst();
-        long cutoffUs = nowUs - windowMs * 1000L;
-        while (!h.window.isEmpty() && h.window.peekFirst().atUs() < cutoffUs) h.window.removeFirst();
+
+        long cutoffUs;
+        try {
+            cutoffUs = Math.subtractExact(nowUs, Math.multiplyExact(windowMs, 1000L));
+        } catch (ArithmeticException overflow) {
+            trip(host, "distress window arithmetic overflowed: cannot tell whether "
+                       + host + " is healthy");
+            return;
+        }
+
+        Iterator<Sample> it = h.window.iterator();
+        while (it.hasNext()) {
+            if (it.next().atUs() < cutoffUs) it.remove();
+        }
     }
 
     /** @return true if this tripped the run. */

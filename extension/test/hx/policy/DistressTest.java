@@ -63,6 +63,16 @@ public class DistressTest {
         aWindowThatCannotHoldASampleIsRefused();
         theHaltedFrameCanNameTheWindow();
 
+        // Fix round 1: the cutoff-arithmetic overflow (critical), the
+        // forward-spike/backward-correction eviction freeze (moderate), and
+        // the unguarded zero-baseline clamp (minor).
+        theConstructorRefusesAWindowMsAboveTheOverflowCeiling();
+        anUnrepresentableWindowBoundTripsRatherThanGoingSilentlyDark();
+        theWindowArithmeticDoesNotOverflowNearLongMaxValueEither();
+        aTransientForwardClockSpikeDoesNotFreezeTimeBasedEvictionBehindIt();
+        aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero();
+        anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall();
+
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
     }
@@ -327,7 +337,18 @@ public class DistressTest {
         // recovery to model, so a healthy second host cannot talk the first one
         // down, and the first reason is the one that becomes run.stop_reason.
         for (int i = 0; i < 200; i++) { d.record(API, 200, 20, false); clock.advance(20_000L); }
-        check("a healthy host does not clear a trip", reason.equals(d.stopReason()));
+        // java.util.Objects.equals, not reason.equals(...): a sabotage that
+        // makes stopReason() go null (row 1 of the sabotage table) leaves
+        // `reason` null too, and reason.equals(...) on a null reference threw
+        // an uncaught NullPointerException that crashed the whole harness here
+        // -- silently skipping every check after this one, including both
+        // remaining original cases and every fix-round test appended below.
+        // Fix-round-1 verification is what caught it: the crash reproduces
+        // identically against commit 9a59b1a's own DistressTest.java, so the
+        // original sabotage table's "11/11, matches exactly" for row 1 was
+        // true by accident -- the run never got far enough to check the rest.
+        check("a healthy host does not clear a trip",
+              java.util.Objects.equals(reason, d.stopReason()));
         check("and does not steal the stop from the host that caused it",
               APP.equals(d.stopHost()));
         check("a tripped Distress stops recording altogether", d.windowSize(API) == 0);
@@ -361,5 +382,170 @@ public class DistressTest {
         Distress d = fresh(new TickClock(T0));
         check("the window describes both bounds",
               "last 50 requests or 60000 ms".equals(d.window()));
+    }
+
+    // ------------------------------------------------------------------
+    // Fix round 1. `evict()`'s cutoff was `nowUs - windowMs * 1000L`, unsafe
+    // on either operand: `windowMs * 1000L` overflows for a `windowMs` an
+    // operator reaches for as a "no time bound" sentinel, and the subtraction
+    // underflows for a clock reading near Long.MIN_VALUE. Either wiped the
+    // window (or never aged it) on every record() while stopReason() stayed
+    // null forever -- a distressed host reading as a healthy one. Below also
+    // covers the forward-spike/backward-correction eviction freeze and the
+    // zero-millisecond-baseline clamp flagged in the same review.
+    // ------------------------------------------------------------------
+
+    static void theConstructorRefusesAWindowMsAboveTheOverflowCeiling() {
+        // The 8-arg constructor validated windowMs < 1 but had no ceiling, so
+        // windowMs = Long.MAX_VALUE -- exactly what an operator reaches for as
+        // a "no time bound, count-only" sentinel -- constructed without
+        // complaint. windowMs * 1000L then wrapped to -1000, which pushed
+        // cutoffUs into the future and wiped the window on every record(): the
+        // 5xx-rate and latency rules went silently dark while stopReason()
+        // stayed null forever. The runtime case is now unreachable because the
+        // constructor refuses it -- literal 24-hour-in-ms bound below, not
+        // derived from Distress's own constant, so this test does not agree
+        // with itself no matter what that constant says.
+        TickClock clock = new TickClock(T0);
+        expectThrows("windowMs of Long.MAX_VALUE is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, Long.MAX_VALUE, 10, 250L));
+        expectThrows("one millisecond past the 24-hour ceiling is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 86_400_000L + 1, 10, 250L));
+        Distress atCeiling = new Distress(clock, 0.20, 5.0, 5, 50, 86_400_000L, 10, 250L);
+        check("24 hours itself is accepted: the ceiling is inclusive",
+              atCeiling.stopReason() == null);
+    }
+
+    static void anUnrepresentableWindowBoundTripsRatherThanGoingSilentlyDark() {
+        // No config bound can prevent nowUs - windowMs*1000L from underflowing
+        // when the CLOCK is the extreme operand: the constructor runs before
+        // any clock is ever read. A clock starting at Long.MIN_VALUE
+        // underflows the very first cutoff computation. Before this fix that
+        // silently wiped the window on every record() -- stopReason() stayed
+        // null and windowSize() stayed 0 through 30 requests of 503s, one
+        // second apart, indistinguishable from a healthy target. The
+        // arithmetic must fail closed instead: an overflow trips immediately
+        // rather than continuing with a window it cannot compute.
+        TickClock clock = new TickClock(Long.MIN_VALUE);
+        Distress d = fresh(clock);
+        d.record(APP, 503, 100, false);
+        check("an unrepresentable window bound trips on the very first record",
+              d.stopReason() != null);
+        check("...and names the host", APP.equals(d.stopHost()));
+
+        // The full reproduction: 30 x 503, one second apart. Sticky, so the
+        // first trip is the one that stands for the whole run.
+        TickClock clock2 = new TickClock(Long.MIN_VALUE);
+        Distress d2 = fresh(clock2);
+        String firstReason = null;
+        for (int i = 0; i < 30; i++) {
+            d2.record(APP, 503, 100, false);
+            if (firstReason == null) firstReason = d2.stopReason();
+            clock2.advance(1_000_000L);
+        }
+        check("the reproduction trips on the first request rather than never",
+              firstReason != null);
+        // java.util.Objects.equals: a sabotage that makes stopReason() go null
+        // leaves firstReason null too, and firstReason.equals(...) on a null
+        // reference would throw -- the exact mistake just found and fixed in
+        // aTrippedDistressStaysTripped above, repeated here until this line
+        // was checked against the same sabotage.
+        check("...and does not clear across the full 30-request reproduction",
+              java.util.Objects.equals(firstReason, d2.stopReason()));
+    }
+
+    static void theWindowArithmeticDoesNotOverflowNearLongMaxValueEither() {
+        // The subtraction's other extreme: nowUs itself near Long.MAX_VALUE
+        // does NOT overflow (Long.MAX_VALUE - 60000000 is still comfortably
+        // positive), so this is the sanity check that fixing the overflow did
+        // not turn an already-safe case into a spurious trip.
+        TickClock clock = new TickClock(Long.MAX_VALUE - 5_000_000L);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 5; i++) { d.record(APP, 200, 100, false); clock.advance(1_000_000L); }
+        check("ordinary traffic at the top of the long range does not trip",
+              d.stopReason() == null);
+        check("...and the window holds all five", d.windowSize(APP) == 5);
+    }
+
+    static void aTransientForwardClockSpikeDoesNotFreezeTimeBasedEvictionBehindIt() {
+        // evict()'s time loop used to inspect only the deque's front and stop
+        // as soon as it was not expired. A sample recorded during a transient
+        // forward clock spike keeps an inflated timestamp; once the clock
+        // corrects backward and the samples in front of it age out normally,
+        // the spiked sample becomes the new front -- and its inflated
+        // timestamp never looks expired relative to the (now lower) current
+        // time, so the loop stopped there and left genuinely stale samples
+        // stuck behind it in the deque. Bounded by the count cap, but silent
+        // and untested. The fix scans the whole window instead of breaking at
+        // the first non-expired front element.
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+
+        d.record(APP, 200, 100, false);                  // A, at T0
+
+        clock.set(T0 + 70_000_000L);                      // a transient forward spike: +70s
+        d.record(APP, 200, 100, false);                   // B, at the spike -- evicts A
+
+        clock.set(T0 + 10_000_000L);                       // the clock corrects back to +10s
+        d.record(APP, 200, 100, false);                    // C, at the corrected time
+        check("right after the correction, nothing looks stale yet",
+              d.windowSize(APP) == 2);
+
+        clock.advance(60_000_001L);                        // one microsecond past C's own window
+        d.record(APP, 200, 100, false);                    // D
+        check("C is genuinely stale now and is evicted despite sitting behind "
+              + "the spiked sample B in the deque", d.windowSize(APP) == 2);
+    }
+
+    static void aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero() {
+        // Math.max(h.baselineMs, 1L) in tripOnLatency. Under the default
+        // latencyMultiple (5.0) and floor (250 ms) this line is not
+        // load-bearing in the rest of this suite: a clamped threshold of 5 ms
+        // and an unclamped one of 0 ms are both so far below the 250 ms floor
+        // that the floor is what actually suppresses a trip either way, and
+        // deleting the clamp leaves every other assertion here green. A floor
+        // of 0 and a wide multiple isolate the clamp itself: without it, a
+        // genuinely 0 ms baseline collapses "Nx baseline" to a threshold of 0
+        // no matter how generous N is, and any positive latency then reads as
+        // infinitely over threshold.
+        TickClock clock = new TickClock(T0);
+        Distress d = new Distress(clock, 0.20, 1000.0, 5, 50, 60_000L, 10, 0L);
+        for (int i = 0; i < 10; i++) d.record(APP, 200, 0, false);
+        check("a baseline of genuinely 0 ms is recorded as 0, not bumped up front",
+              d.baselineMs(APP) == 0);
+        for (int i = 0; i < 11; i++) d.record(APP, 200, 500, false);
+        check("500 ms against a clamped-to-1 zero baseline stays under a "
+              + "deliberately generous 1000x threshold and does not trip",
+              d.stopReason() == null);
+    }
+
+    static void anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall() {
+        // record() calls evict() and then keeps going. In every case above
+        // that is harmless because nothing else in the same call ever ALSO
+        // trips. Force it to: build up a 20%-exactly 5xx window normally,
+        // then let the clock jump to a value that underflows the cutoff
+        // computation on the very request that would ALSO tip the 5xx rate
+        // over the threshold. Without the guard right after evict(),
+        // tripOn5xxRate runs anyway on a window whose time-based eviction
+        // never ran, and its trip() call would silently overwrite the correct
+        // "cannot tell whether this host is healthy" reason with a specific
+        // rate figure -- exactly the second write the class comment says a
+        // sticky trip must never allow.
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 8; i++) d.record(APP, 200, 100, false);
+        d.record(APP, 503, 100, false);
+        d.record(APP, 503, 100, false);
+        check("2 of 10 is exactly 20%: not yet tripped", d.stopReason() == null);
+
+        clock.set(Long.MIN_VALUE + 100);          // underflows the cutoff computation
+        d.record(APP, 503, 100, false);           // would ALSO be 3 of 11 = 27.3%, over threshold
+        check("the overflow trip wins: the window could not be evaluated at all",
+              d.stopReason() != null
+                  && d.stopReason().startsWith("distress window arithmetic overflowed"));
+        check("...not the 5xx-rate reason a later rule in the same call would "
+              + "otherwise have computed from a half-evicted window",
+              !"5xx rate 27.3% over the last 11 requests exceeds 20.0%".equals(d.stopReason()));
     }
 }
