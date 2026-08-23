@@ -117,6 +117,15 @@ public final class Redactor {
      * from -- there is no way to build one without it -- and cannot outlive
      * it, because any other array is a {@link RangeError}.
      *
+     * What identity CANNOT see is in-place mutation of the same array after
+     * binding. Moving the credential to a different offset within THIS array
+     * after construction -- or after a range has already been registered for
+     * its old position -- leaves it unprotected with no exception and no
+     * signal, because the identity check still passes: it is still the same
+     * array, just rewritten. That is inherent to checking identity rather
+     * than content, not a gap this class can close. Plan 5, which is the
+     * first caller: do not touch the array after handing it to an Injected.
+     *
      * The list is per INSTANCE, and that is load-bearing separately: two
      * requests can be built, and both range sets registered, before either is
      * redacted, so one list shared between instances leaks whichever request
@@ -140,10 +149,15 @@ public final class Redactor {
      * makes the list safe to touch from two threads; it does NOT order
      * registration before redaction. A range registered after redactRequest
      * has taken its snapshot is simply not in it, and the copy that crosses
-     * the bridge carries the credential with no exception and no signal:
-     * measured over 200 trials, 200 leaked when the registration was merely
-     * started on another thread and 0 when the two were made to rendezvous
-     * first. The lock decides nothing about which of them happens. The
+     * the bridge carries the credential with no exception and no signal.
+     * This is a genuine race, not a hypothetical one -- but no leak rate is
+     * recorded here, because none was reproducible: an unsynchronized race
+     * between register() and redactRequest(), and the same two actions
+     * released together from a barrier, have each now been measured at three
+     * sharply different rates by three separate attempts, in both
+     * directions. Every number was a property of a harness and a scheduler,
+     * never of this class. What holds regardless of the number is that the
+     * lock decides nothing about which of the two happens first. The
      * contract the caller has to keep, and which nothing here can check, is
      * REGISTER EVERYTHING, THEN REDACT.
      *
