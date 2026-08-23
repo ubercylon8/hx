@@ -87,6 +87,44 @@ def test_every_error_class_has_somewhere_to_go():
     assert accounted == ERROR_CLASSES
 
 
+def test_the_two_maps_overlap_exactly_where_the_precedence_note_says(conn):
+    """`scope_denied` and `rate_limited` are in BOTH maps and nothing said
+    which wins -- not a test, not even a true comment.
+
+    Both come out of Policy.decide, which Sender.issue calls BEFORE
+    http.send: S4's pinned order (not_configured -> halted -> scope_denied ->
+    method_denied -> dangerous_denied -> rate_limited -> budget_exhausted) is
+    settled while the request is still inside the JVM. So both are denials,
+    and mapping either through EXCHANGE_OUTCOME writes a `via='send'` row for
+    a request that was never sent -- over-counting requests_issued and every
+    coverage number derived from it.
+
+    A third class landing in both maps has to come here and be decided.
+    """
+    assert set(records.DENIAL_KIND) & set(records.EXCHANGE_OUTCOME) == \
+        records.PRE_ISSUANCE
+    for error_class in sorted(records.PRE_ISSUANCE):
+        records.record_denial(conn, run_id="r-1",
+                              kind=records.DENIAL_KIND[error_class],
+                              method="GET",
+                              url="https://app.example.test/api/orders",
+                              detail=error_class, at_us=1)
+    assert conn.execute("SELECT COUNT(*) FROM denial").fetchone()[0] == \
+        len(records.PRE_ISSUANCE)
+    assert conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0, (
+        "a request refused before issuance has no exchange row; one written "
+        "here is a request the report would claim was sent"
+    )
+
+
+def test_only_the_classes_that_did_leave_the_jvm_are_exchange_only():
+    """The other half of the correction. EXCHANGE_OUTCOME's comment claimed
+    all four of its entries had reached the far side of the bridge and failed
+    there; only these two ever did."""
+    assert set(records.EXCHANGE_OUTCOME) - records.PRE_ISSUANCE == \
+        {"timeout", "bridge_lost"}
+
+
 def test_a_kind_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn):
     with pytest.raises(ValueError, match="not a denial kind"):
         records.record_denial(conn, run_id="r-1", kind="unmanaged_credential",

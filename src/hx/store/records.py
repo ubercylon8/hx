@@ -35,18 +35,48 @@ DENIAL_KIND: dict[str, str] = {
 }
 DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 
-# Error class -> the `outcome` the exchange table accepts, for a request that
-# reached the far side of the bridge and then failed. `transport_error` is
-# deliberately absent: exchange.outcome offers conn_refused, dns_error and
-# tls_error, and the extension reports one class for all three because
-# Montoya's reply does not distinguish them. Recording a guess as one of the
-# three would put a fabricated fact in the evidence store.
+# Error class (spec S6) -> the `outcome` the exchange table accepts. TWO of
+# the four entries are requests that reached the far side of the bridge and
+# then failed. The other two are not, and this comment used to say they were:
+#
+#   timeout, bridge_lost    the request DID leave the JVM. Something answered
+#                           late, or the peer went away with it in flight, and
+#                           `exchange` is where that belongs.
+#   scope_denied,           PRE-ISSUANCE refusals. Both come out of
+#   rate_limited            Policy.decide, which Sender.issue calls BEFORE
+#                           http.send -- S4's pinned decision order is
+#                           not_configured -> halted -> scope_denied ->
+#                           method_denied -> dangerous_denied -> rate_limited
+#                           -> budget_exhausted, and every one of those is
+#                           settled while the request is still in the JVM.
+#                           They appear here only because exchange.outcome's
+#                           vocabulary carries the same two names for the
+#                           proxy and crawler, which are their own egress
+#                           point and their own plan.
+#
+# PRECEDENCE, spelled out rather than left to be inferred: for an error class
+# in BOTH maps -- exactly PRE_ISSUANCE below -- **DENIAL_KIND wins**. A
+# refusal decided before issuance is a `denial` row. Routing one through this
+# map instead writes a `via='send'` exchange row for a request that was never
+# sent, which over-counts `requests_issued` and every coverage number derived
+# from it -- a report claiming reach the run never had.
+#
+# `transport_error` is deliberately absent: exchange.outcome offers
+# conn_refused, dns_error and tls_error, and the extension reports one class
+# for all three because Montoya's reply does not distinguish them. Recording a
+# guess as one of the three would put a fabricated fact in the evidence store.
 EXCHANGE_OUTCOME: dict[str, str] = {
     "timeout": "timeout",
     "bridge_lost": "bridge_lost",
     "rate_limited": "rate_limited",
     "scope_denied": "scope_denied",
 }
+
+# The error classes both maps name, and the answer to "which map owns this
+# one". Both are refused before the request leaves the JVM, so both are
+# denials; see the precedence note above. A test pins this against the real
+# intersection, so a third class landing in both cannot do it silently.
+PRE_ISSUANCE = frozenset({"scope_denied", "rate_limited"})
 # The exchange table's own vocabulary, which is wider than the map above: most
 # of these describe a request that SUCCEEDED, or failed in a way no error
 # class names. `status_unreadable` is one of those -- it arrives on a `result`
