@@ -15562,7 +15562,6 @@ And add this arm to `handle()`, between `case "configure"` and `case "halt"`:
 
 ```java
 // extension/src/hx/bridge/BridgeClient.java -- new arm in handle()
-
             case "send" -> {
                 if (!engagementId.equals(f.header.get("engagement_id"))) {
                     // s6: every send carries it and the extension refuses a
