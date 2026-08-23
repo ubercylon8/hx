@@ -66,8 +66,15 @@ public final class HaltSwitch {
     /**
      * stop() runs on Burp's extension-unloading thread. A poller wedged in a
      * filesystem call cannot be killed from inside the JVM, so the join is
-     * bounded: unloading the extension must not hang Burp. The state stays
-     * whatever it last was, which -- for a wedged poller -- is halted.
+     * bounded: unloading the extension must not hang Burp.
+     *
+     * What survives the stop is the last answer the poller PUBLISHED -- stop()
+     * never clears one. NOT "which, for a wedged poller, is halted", as this
+     * said: stop() also sets armed=false, retiring the staleness rule along
+     * with the thread that fed it, so a poller wedged before it ever saw a
+     * sentinel leaves halted=false, reason=null. Measured. Harmless, because
+     * the extension is on its way out and Sender goes with it -- but a comment
+     * on this branch is a claim, and this one was false.
      */
     private static final long STOP_JOIN_MS = 2_000L;
 

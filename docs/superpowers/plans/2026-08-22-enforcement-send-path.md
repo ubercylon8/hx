@@ -11010,6 +11010,7 @@ about which check was watching.
 package hx.send;
 
 import hx.TestSupport;
+import hx.policy.Clock;
 import hx.policy.TickClock;
 
 import java.nio.charset.StandardCharsets;
@@ -11078,15 +11079,20 @@ public class HaltSwitchTest {
 
         t("anUnreadableSentinelIsHalted", HaltSwitchTest::anUnreadableSentinelIsHalted);
         t("aSentinelOnAClosedFileSystemIsHaltedNotAnEscapedException", HaltSwitchTest::aSentinelOnAClosedFileSystemIsHaltedNotAnEscapedException);
+        t("aFailedPollIsPublishedAsHalted", HaltSwitchTest::aFailedPollIsPublishedAsHalted);
+        t("aClockThatThrowsIsHaltedNotTrusted", HaltSwitchTest::aClockThatThrowsIsHaltedNotTrusted);
         t("thePollerSurvivesAFailedPollAndKeepsPolling", HaltSwitchTest::thePollerSurvivesAFailedPollAndKeepsPolling);
         t("aStalledPollerIsHalted", HaltSwitchTest::aStalledPollerIsHalted);
+        t("aResumeFrameDoesNotRetireTheStalenessRule", HaltSwitchTest::aResumeFrameDoesNotRetireTheStalenessRule);
 
         t("thePollerIsADaemonAndDoesNotOutliveStop", HaltSwitchTest::thePollerIsADaemonAndDoesNotOutliveStop);
         t("nothingPollsAfterStop", HaltSwitchTest::nothingPollsAfterStop);
         t("startIsIdempotent", HaltSwitchTest::startIsIdempotent);
         t("stopIsSafeWhenNeverStartedAndNeverClearsAHalt", HaltSwitchTest::stopIsSafeWhenNeverStartedAndNeverClearsAHalt);
         t("stopThenStartPollsAgain", HaltSwitchTest::stopThenStartPollsAgain);
+        t("stopIsBoundedWhenThePollerCannotBeInterrupted", HaltSwitchTest::stopIsBoundedWhenThePollerCannotBeInterrupted);
         t("aNonPositivePollIntervalIsRefused", HaltSwitchTest::aNonPositivePollIntervalIsRefused);
+        t("theConstantsAreTheNumbersThatWereChosen", HaltSwitchTest::theConstantsAreTheNumbersThatWereChosen);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -11423,6 +11429,66 @@ public class HaltSwitchTest {
         } finally { rmTree(dir); }
     }
 
+    /**
+     * The outer net's POLARITY, which nothing reached before.
+     *
+     * `pollNow`'s catch exists for a poll that blew up in a way pollOnce()'s
+     * own clauses did not name, and the only way in is the injected Clock:
+     * pollOnce() reads it to stamp the poll AFTER it has decided the sentinel's
+     * answer. The closed-filesystem check does not come here -- pollOnce()
+     * catches that itself -- so `publishFailure` publishing `false` inverted
+     * the entire outer net to fail open with the suite fully green.
+     *
+     * The separation is stop(): it retires the staleness rule (armed=false)
+     * and takes the thread with it, which leaves what publishFailure published
+     * as the only thing that can still be holding issuance. Without that, a
+     * throwing clock answers "halted" through stale() and the net's polarity
+     * is invisible again.
+     */
+    static void aFailedPollIsPublishedAsHalted() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltouternet");
+        BreakableClock clock = new BreakableClock(T0);
+        clock.broken = true;
+        // The sentinel is absent and its directory is there, so pollOnce()
+        // reaches the "not halted" answer and then dies publishing it.
+        HaltSwitch hs = new HaltSwitch(clock, dir.resolve("halt"), 60_000L);
+        try {
+            boolean threw = false;
+            try { hs.start(); } catch (Throwable t) { threw = true; }
+            check("a poll that fails outside pollOnce() does not throw out of start()", !threw);
+
+            hs.stop();
+            clock.broken = false;
+            check("a poll that did not complete is published as HALTED", hs.halted());
+            check("and the outer net is what names it, not the sentinel read",
+                  hs.reason() != null && hs.reason().contains("poll failed"));
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    /**
+     * The other guard whose input is "the injected Clock is someone else's
+     * code". A clock that throws is a poll age that cannot be computed, which
+     * is an unknown state, which is stop.
+     *
+     * A minute between polls, so the background poller cannot reach the clock
+     * while it is broken: a poll that failed would answer through
+     * publishFailure and hide which of the two guards was doing the work.
+     */
+    static void aClockThatThrowsIsHaltedNotTrusted() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltclock");
+        BreakableClock clock = new BreakableClock(T0);
+        HaltSwitch hs = new HaltSwitch(clock, dir.resolve("halt"), 60_000L);
+        try {
+            hs.start();
+            check("not halted while the clock answers and the sentinel is absent", !hs.halted());
+
+            clock.broken = true;
+            check("a clock that cannot be read is halted", hs.halted());
+            check("and the staleness rule is what says so",
+                  hs.reason() != null && hs.reason().contains("stalled"));
+        } finally { clock.broken = false; hs.stop(); rmTree(dir); }
+    }
+
     /** A poll that failed must not kill the thread: the next one is how the
      *  halt would ever lift. */
     static void thePollerSurvivesAFailedPollAndKeepsPolling() throws Exception {
@@ -11472,7 +11538,11 @@ public class HaltSwitchTest {
             hs.start();
             check("fresh after start(), with no file", !hs.halted());
 
-            clock.advance(60_000L * 1000L * HaltSwitch.STALE_INTERVALS);
+            // The horizon as a LITERAL: five intervals of one minute, in
+            // microseconds. Computed from HaltSwitch.STALE_INTERVALS -- as it
+            // was -- this check passes for every value of that constant,
+            // including the 500000 that hides a dead poller for 69 hours.
+            clock.advance(300_000_000L);
             check("exactly at the staleness horizon it is still trusted", !hs.halted());
 
             clock.advance(1L);
@@ -11482,6 +11552,31 @@ public class HaltSwitchTest {
 
             hs.pollOnce();
             check("a fresh answer clears the stall", !hs.halted());
+        } finally { hs.stop(); rmTree(dir); }
+    }
+
+    /**
+     * A `resume` frame must not retire the staleness rule.
+     *
+     * `resumedByFrame` publishing `armed=false` leaves the whole suite green,
+     * and what it buys is permanent: one resume, and a poller that dies
+     * afterwards never halts again for the rest of the run. The staleness rule
+     * belongs to the POLLER, and the poller is still running.
+     */
+    static void aResumeFrameDoesNotRetireTheStalenessRule() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltresumearm");
+        TickClock clock = new TickClock(T0);
+        HaltSwitch hs = new HaltSwitch(clock, dir.resolve("halt"), 60_000L);
+        try {
+            hs.start();
+            hs.haltedByFrame("operator pressed stop");
+            hs.resumedByFrame();
+            check("the resume lifted the frame halt", !hs.halted());
+
+            clock.advance(300_000_001L);        // the horizon, plus one microsecond
+            check("and the poller dying after a resume still halts issuance", hs.halted());
+            check("and it is the staleness rule that says so",
+                  hs.reason() != null && hs.reason().contains("stalled"));
         } finally { hs.stop(); rmTree(dir); }
     }
 
@@ -11603,6 +11698,62 @@ public class HaltSwitchTest {
         } finally { rmTree(dir); }
     }
 
+    /**
+     * STOP_JOIN_MS is the one number the file's own comment says prevents
+     * something -- "unloading the extension must not hang Burp" -- and setting
+     * it to 0 left the suite green. `Thread.join(0)` waits FOREVER, so the
+     * bound the comment promises had no check behind it at all.
+     *
+     * A poller wedged in a filesystem call on a hung mount cannot be arranged
+     * in a test; a clock that blocks and swallows interrupts is the same shape
+     * and can. stop() runs on its own thread here so that a stop() which never
+     * returns is a failed check rather than a class with no summary line.
+     */
+    static void stopIsBoundedWhenThePollerCannotBeInterrupted() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltwedge");
+        WedgingClock clock = new WedgingClock(T0);
+        HaltSwitch hs = new HaltSwitch(clock, dir.resolve("halt"), 20L);
+        try {
+            hs.start();                          // start()'s own poll runs first
+            clock.wedge = true;
+            check("the poller is wedged where no interrupt reaches it",
+                  awaitTrue(() -> clock.wedged));
+
+            Thread stopper = new Thread(hs::stop, "hx-halt-stopper");
+            stopper.setDaemon(true);
+            long t0 = System.nanoTime();
+            stopper.start();
+            stopper.join(20_000L);
+            long ms = (System.nanoTime() - t0) / 1_000_000L;
+            check("stop() returns even when the poller cannot be interrupted", !stopper.isAlive());
+            check("and it waits the join budget rather than forever (" + ms + "ms)",
+                  ms >= 1_000L && ms < 10_000L);
+        } finally {
+            // Release before anything else counts threads: a wedged poller
+            // outliving this check is a second hx-halt-sentinel thread for the
+            // checks that count them.
+            clock.release = true;
+            awaitTrue(() -> namedPoller() == null);
+            hs.stop(); rmTree(dir);
+        }
+    }
+
+    /**
+     * Three numbers chosen in §4 that no behaviour check can see.
+     *
+     * DEFAULT_POLL_MS is what Task 6 is told to pass rather than inventing its
+     * own, so its value is an interface. STALE_INTERVALS was pinned by nothing:
+     * the staleness check computed its horizon FROM the constant, so 500000 --
+     * a dead poller invisible for 69 hours at the default interval -- passed
+     * exactly as well as 5. That test now advances a literal, and this names
+     * the numbers.
+     */
+    static void theConstantsAreTheNumbersThatWereChosen() throws Exception {
+        check("DEFAULT_POLL_MS is the half-second the kill switch budgets",
+              HaltSwitch.DEFAULT_POLL_MS == 500L);
+        check("STALE_INTERVALS is five", HaltSwitch.STALE_INTERVALS == 5L);
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     interface Cond { boolean ok(); }
@@ -11647,6 +11798,44 @@ public class HaltSwitchTest {
         for (Thread t : Thread.getAllStackTraces().keySet())
             if ("hx-halt-sentinel".equals(t.getName()) && t.isAlive()) n++;
         return n;
+    }
+
+    /** A clock that throws on demand. The Clock is injected, so it is someone
+     *  else's code, and this is what "someone else's code stopped working"
+     *  looks like from in here. */
+    static final class BreakableClock implements Clock {
+        private final long us;
+        volatile boolean broken;
+        BreakableClock(long us) { this.us = us; }
+        public long nowUs() {
+            if (broken) throw new IllegalStateException("this clock is gone");
+            return us;
+        }
+    }
+
+    /** A clock that blocks on demand and does NOT come back for an interrupt:
+     *  the poller wedged in a call that cannot be cancelled from inside the
+     *  JVM, which is what the bounded join in stop() exists for. */
+    static final class WedgingClock implements Clock {
+        private final long us;
+        volatile boolean wedge;
+        volatile boolean wedged;
+        volatile boolean release;
+        WedgingClock(long us) { this.us = us; }
+        public long nowUs() {
+            if (wedge) {
+                wedged = true;
+                // A backstop, so a check that forgets to release it fails
+                // rather than hanging the class; test.sh's timeout is blunter.
+                long end = System.currentTimeMillis() + 60_000L;
+                while (!release && System.currentTimeMillis() < end) {
+                    // Swallowed on purpose: being interruptible is exactly
+                    // what a wedged poller is not.
+                    try { Thread.sleep(5L); } catch (InterruptedException e) { }
+                }
+            }
+            return us;
+        }
     }
 
     static void rmTree(Path p) throws Exception {
@@ -11763,8 +11952,15 @@ public final class HaltSwitch {
     /**
      * stop() runs on Burp's extension-unloading thread. A poller wedged in a
      * filesystem call cannot be killed from inside the JVM, so the join is
-     * bounded: unloading the extension must not hang Burp. The state stays
-     * whatever it last was, which -- for a wedged poller -- is halted.
+     * bounded: unloading the extension must not hang Burp.
+     *
+     * What survives the stop is the last answer the poller PUBLISHED -- stop()
+     * never clears one. NOT "which, for a wedged poller, is halted", as this
+     * said: stop() also sets armed=false, retiring the staleness rule along
+     * with the thread that fed it, so a poller wedged before it ever saw a
+     * sentinel leaves halted=false, reason=null. Measured. Harmless, because
+     * the extension is on its way out and Sender goes with it -- but a comment
+     * on this branch is a claim, and this one was false.
      */
     private static final long STOP_JOIN_MS = 2_000L;
 
