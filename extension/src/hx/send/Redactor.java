@@ -83,6 +83,9 @@ public final class Redactor {
     private static final byte[] OBSERVED_COOKIE =
         "{{observed:set-cookie}}".getBytes(StandardCharsets.US_ASCII);
 
+    /** RFC 9112 2.3: the HTTP-name is case-SENSITIVE, so this is a byte match. */
+    private static final byte[] HTTP_NAME = "HTTP/".getBytes(StandardCharsets.US_ASCII);
+
     private record Range(String identityId, int start, int end) { }
 
     /**
@@ -93,13 +96,35 @@ public final class Redactor {
      * a byte offset into ONE request; applied to another it does not merely
      * leak, it substitutes a placeholder over whatever happens to sit at those
      * offsets in the other request's body. Making the caller pass this object
-     * to {@link Redactor#redactRequest} MAKES THE COMPILER CARRY THE CONTRACT:
-     * a caller physically cannot redact without naming the ranges for those
-     * bytes, and a range set cannot precede or outlive the array it was
-     * measured from. There is nothing to clear, because nothing survives the
-     * request.
+     * to {@link Redactor#redactRequest} means a caller physically cannot
+     * redact without naming a range set. There is nothing to clear, because
+     * nothing survives the request.
      *
-     * Every registry kept on the instance -- a plain field or a ThreadLocal --
+     * Naming A range set is not naming the RIGHT one, and the difference was
+     * measured rather than argued: with the ranges merely passed in, reusing
+     * one {@code Injected} for a second request threw only when the stale
+     * offsets happened to collide with the new ones. Of the four shapes --
+     * second request shorter, longer with no new registration, longer with an
+     * overlapping registration, longer with a non-overlapping one -- two threw
+     * and two silently rewrote the second request at the first one's offsets,
+     * leaving the second request's own credential verbatim. Fail-closed was
+     * incidental to offset collision.
+     *
+     * So the object is constructed FROM the array and holds it by IDENTITY,
+     * and {@link Redactor#redactRequest} refuses any other array. Identity,
+     * not content: two requests can serialise to equal bytes and still be two
+     * requests. A range set therefore cannot precede the array it was measured
+     * from -- there is no way to build one without it -- and cannot outlive
+     * it, because any other array is a {@link RangeError}.
+     *
+     * The list is per INSTANCE, and that is load-bearing separately: two
+     * requests can be built, and both range sets registered, before either is
+     * redacted, so one list shared between instances leaks whichever request
+     * is redacted with the loser's offsets -- silently, since the bytes are
+     * the right length. RedactorTest's twoRangeSetsAliveAtOnceDoNotShareOneList
+     * is the pin; the sequential fixture next to it cannot reach that shape.
+     *
+     * Every registry kept on the REDACTOR -- a plain field or a ThreadLocal --
      * leaves a silent path to redacting against the WRONG registry, and it
      * fails OPEN. With a ThreadLocal: register on the read loop, redact on a
      * pooled worker (the `limit.concurrency` case §6 already has a config key
@@ -110,12 +135,47 @@ public final class Redactor {
      * that cannot desync rather than the one that usually does not.
      *
      * synchronized because this object legitimately crosses threads -- the
-     * read loop may build it and a worker redact with it. It costs nothing
-     * uncontended and it removes any need to reason about safe publication.
+     * read loop may build it and a worker redact with it. Read that as memory
+     * safety and nothing more, because that is all it was measured to be. It
+     * makes the list safe to touch from two threads; it does NOT order
+     * registration before redaction. A range registered after redactRequest
+     * has taken its snapshot is simply not in it, and the copy that crosses
+     * the bridge carries the credential with no exception and no signal:
+     * measured over 200 trials, 200 leaked when the registration was merely
+     * started on another thread and 0 when the two were made to rendezvous
+     * first. The lock decides nothing about which of them happens. The
+     * contract the caller has to keep, and which nothing here can check, is
+     * REGISTER EVERYTHING, THEN REDACT.
+     *
+     * Deliberately NOT pinned by a test, because the only shape such a test
+     * could take is asserting that a late registration is absent from an
+     * earlier output -- a check that passes if and only if the credential
+     * survives. This suite has already had one of those.
+     *
+     * Two further honesty notes, in the spirit of the matcher paragraph at the
+     * foot of this file: no test here distinguishes {@code snapshot()}'s copy
+     * from the live list (the sort that would race happens in the caller), and
+     * none distinguishes either {@code synchronized} keyword from its absence.
+     * Both are measured green when removed. They are here because this object
+     * crosses threads by design, not because something is watching them.
      */
     public static final class Injected {
 
+        /** The array these offsets were measured from, by identity. */
+        private final byte[] forThese;
+
         private final List<Range> ranges = new ArrayList<>();
+
+        /**
+         * @param forThese the serialised request whose bytes the ranges
+         *                 registered here are offsets into. Held, not copied:
+         *                 the point is to recognise THAT array again.
+         */
+        public Injected(byte[] forThese) {
+            if (forThese == null)
+                throw new RangeError("an Injected must name the bytes its ranges are measured from");
+            this.forThese = forThese;
+        }
 
         /**
          * Record a half-open byte range [start, end) that this extension
@@ -173,13 +233,29 @@ public final class Redactor {
      * The request bytes with every range in {@code injected} replaced by that
      * identity's placeholder. Neither argument is modified.
      *
-     * {@code injected} must be the ranges measured from THESE bytes. It is a
-     * parameter rather than state on this object so that there is no other
-     * kind of call to make: no registry to desync, none to forget to clear.
+     * {@code injected} must be the ranges measured from THESE bytes, and it
+     * is CHECKED rather than assumed: an {@code Injected} built for another
+     * array is refused whatever its offsets are. It is a parameter rather than
+     * state on this object so that there is no other kind of call to make: no
+     * registry to desync, none to forget to clear.
+     *
+     * A null {@code raw} is a {@link RangeError} too, not the
+     * {@code NullPointerException} it would otherwise be. The send path turns
+     * a RangeError into {@code bad_frame}; an NPE reaches BridgeClient's
+     * catch-all and closes the connection.
      */
     public byte[] redactRequest(byte[] raw, Injected injected) {
+        if (raw == null)
+            throw new RangeError("redactRequest needs the request bytes");
         if (injected == null)
             throw new RangeError("redactRequest needs the ranges injected into these bytes");
+        if (injected.forThese != raw)
+            // Not the array these offsets were measured from. Two requests can
+            // serialise to equal bytes, so this is an identity test: reusing
+            // one range set for a second request is the shape that silently
+            // rewrote the second request wherever the offsets missed.
+            throw new RangeError("these ranges were measured from another " + injected.forThese.length
+                + "-byte array, not the " + raw.length + "-byte request being redacted");
         List<Range> mine = injected.snapshot();
         // A copy even when there is nothing to do: the returned array must
         // never alias the array that goes on the wire, or a later in-place
@@ -211,11 +287,23 @@ public final class Redactor {
      * Only the head is scanned. A body may legitimately contain the text
      * "Set-Cookie: sid=..." -- documentation pages and API error dumps do --
      * and rewriting it would corrupt the evidence a check reads.
+     *
+     * "The head" is every head. A 1xx is an INTERIM response: RFC 9110 15.2
+     * says it is never the final one, so its blank line ends a head with the
+     * real response still to come. Treating that blank line as the end of the
+     * scan copies the whole final response through as "body" -- every
+     * Set-Cookie raw, into a content-addressed store. Whether interim heads
+     * reach this class at all is Task 6's measurement of what Montoya's
+     * toByteArray() carries; the branch is safe either way, because it cannot
+     * fire on a final response.
      */
     public byte[] redactResponse(byte[] raw) {
+        if (raw == null)
+            throw new RangeError("redactResponse needs the response bytes");
         ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
         int i = 0;
-        boolean first = true;
+        boolean first = true;       // no line of THIS head has been read yet
+        boolean interim = false;    // ...and what has been read is a 1xx head
         boolean inSetCookie = false;
         while (i < raw.length) {
             int next = lineStartAfter(raw, i);      // start of the following line
@@ -234,23 +322,41 @@ public final class Redactor {
                     i = next;
                     continue;
                 }
+                if (interim) {
+                    // ...and not this one either: it ends an INTERIM head, and
+                    // an interim head is by definition not the final response.
+                    // The real one follows, Set-Cookie and all. Keep the blank
+                    // line verbatim and start the next head.
+                    out.write(raw, i, next - i);
+                    i = next;
+                    first = true;
+                    interim = false;
+                    inSetCookie = false;
+                    continue;
+                }
                 out.write(raw, i, raw.length - i);  // the head really is over
                 return out.toByteArray();
             }
-            if (first) {                            // the status line is not a field
-                // Defensive, not a tested guard: no status line can be
-                // mistaken for a Set-Cookie field -- it has no colon before a
-                // name that could match -- so deleting this branch changes no
-                // output any test here can produce. What it does is stop the
-                // question from arising. The `first` FLAG is load-bearing: it
-                // is what tells an empty line before the status line from the
-                // empty line that ends the head.
+            if (first && startsWithHttpName(raw, i, content)) {
+                // A status line, and it has to LOOK like one. Taking the first
+                // non-empty line for a status line whatever it says means a
+                // head whose first field is Set-Cookie has that cookie
+                // consumed as the status line and copied through raw. The
+                // `first` FLAG is load-bearing three ways: it tells an empty
+                // line before the status line from the empty line that ends
+                // the head, it is what a 1xx head resets, and it is what stops
+                // a body line reading "HTTP/1.1 200 OK" from re-arming the
+                // scan -- that line is past the return above.
+                interim = isInterim(raw, i, content);
                 first = false;
                 inSetCookie = false;
                 out.write(raw, i, next - i);
                 i = next;
                 continue;
             }
+            // A field, so the head has started even if no status line ever
+            // arrived. Fall through and match it like any other.
+            first = false;
             if (raw[i] == ' ' || raw[i] == '\t') {
                 // obs-fold. RFC 9110 says a recipient must reject it and no
                 // real server emits it, but if one does, the folded remainder
@@ -277,8 +383,14 @@ public final class Redactor {
             // inSetCookie false, which switches the fold branch off for that
             // header's continuations as well. (Leading whitespace never
             // arrives here -- a line that starts with it is a fold.)
+            // The SAME whitespace the String-side matcher trims, through the
+            // same predicate, so the two cannot drift: a name this side let
+            // through is a live cookie stored verbatim. A bare LF cannot occur
+            // inside a line here -- lineStartAfter splits on it -- so that arm
+            // is unreachable from these bytes and is shared for the drift, not
+            // for the case.
             int nameEnd = colon;
-            while (nameEnd > i && (raw[nameEnd - 1] == ' ' || raw[nameEnd - 1] == '\t')) nameEnd--;
+            while (nameEnd > i && isOws((char) (raw[nameEnd - 1] & 0xff))) nameEnd--;
             inSetCookie = colon > i && asciiEqualsIgnoreCase("set-cookie", raw, i, nameEnd);
             if (!inSetCookie) {
                 out.write(raw, i, next - i);
@@ -327,6 +439,42 @@ public final class Redactor {
         if (e > from && raw[e - 1] == '\n') e--;
         if (e > from && raw[e - 1] == '\r') e--;
         return e;
+    }
+
+    /**
+     * Does this line start a status line? RFC 9112 2.3 defines the HTTP-name
+     * case-sensitively as %s"HTTP", so this match is deliberately not folded.
+     *
+     * The cost of answering NO to a real status line is that it is matched as
+     * a field, finds no colon before a name that matches, and is copied
+     * verbatim -- the same bytes out. The cost of answering YES to a field is
+     * that field skipping the Set-Cookie match entirely.
+     */
+    private static boolean startsWithHttpName(byte[] raw, int from, int to) {
+        if (to - from < HTTP_NAME.length) return false;
+        for (int k = 0; k < HTTP_NAME.length; k++)
+            if (raw[from + k] != HTTP_NAME[k]) return false;
+        return true;
+    }
+
+    /**
+     * Does this status line carry a 1xx code -- an interim response?
+     *
+     * Exactly three digits after the first space, per RFC 9112 4: "HTTP/1.1
+     * 1000 x" is not a 1xx and neither is "HTTP/1.1 1". Being strict here is
+     * the cautious direction in the one way that matters: a final response
+     * wrongly read as interim would have its BODY scanned as a head, which
+     * rewrites evidence, while an interim head wrongly read as final loses the
+     * whole real response to the store raw.
+     */
+    private static boolean isInterim(byte[] raw, int from, int to) {
+        int sp = indexOf(raw, from, to, (byte) ' ');
+        if (sp < 0) return false;
+        int c = sp + 1;
+        if (c + 3 > to || raw[c] != '1') return false;
+        for (int k = c; k < c + 3; k++)
+            if (raw[k] < '0' || raw[k] > '9') return false;
+        return c + 3 == to || raw[c + 3] == ' ' || raw[c + 3] == '\t';
     }
 
     private static int indexOf(byte[] raw, int from, int to, byte b) {
