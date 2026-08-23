@@ -94,7 +94,16 @@ CREATE TABLE IF NOT EXISTS exchange (
   outcome             TEXT NOT NULL
                       CHECK (outcome IN ('ok','timeout','conn_refused','dns_error',
                                          'tls_error','scope_denied','rate_limited',
-                                         'bridge_lost','truncated')),
+                                         'bridge_lost','truncated',
+                                         -- The exchange COMPLETED but its final
+                                         -- status could not be read: a peer put
+                                         -- more interim 1xx heads in front of the
+                                         -- response than the scan tolerates.
+                                         -- `status` then holds the conservative
+                                         -- sentinel 599, so this value is the only
+                                         -- thing separating that sentinel from a
+                                         -- peer that genuinely answered 599.
+                                         'status_unreadable')),
   sent_us             INTEGER NOT NULL,
   recv_us             INTEGER,
   method              TEXT NOT NULL,

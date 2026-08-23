@@ -807,7 +807,7 @@ from pathlib import Path
 
 from hx.store.paths import secure_mkdir
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 TABLES: tuple[str, ...] = (
     "engagement",
