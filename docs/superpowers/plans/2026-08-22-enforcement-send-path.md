@@ -8064,6 +8064,13 @@ public class DistressTest {
         t("aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero", DistressTest::aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero);
         t("anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall", DistressTest::anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall);
 
+        // Fix round 2: four of the five thresholds could be set to values that
+        // leave Distress looking configured and never tripping.
+        t("aThresholdNoTrafficCanCrossIsRefused", DistressTest::aThresholdNoTrafficCanCrossIsRefused);
+        t("anUnboundedWindowIsAnUnboundedAllocationPerHost", DistressTest::anUnboundedWindowIsAnUnboundedAllocationPerHost);
+        t("theWindowMsCeilingSaysWhyItIsThereAndDoesNotSendTheOperatorSomewhereUnbounded", DistressTest::theWindowMsCeilingSaysWhyItIsThereAndDoesNotSendTheOperatorSomewhereUnbounded);
+        t("aNegativeDurationIsClampedRatherThanPoisoningTheBaseline", DistressTest::aNegativeDurationIsClampedRatherThanPoisoningTheBaseline);
+
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
     }
@@ -8546,6 +8553,147 @@ public class DistressTest {
               + "otherwise have computed from a half-evicted window",
               !"5xx rate 27.3% over the last 11 requests exceeds 20.0%".equals(d.stopReason()));
     }
+    // ------------------------------------------------------------------
+    // Fix round 2. The validation above covered ONE of the five thresholds
+    // against the failure it exists to prevent -- a value that leaves Distress
+    // looking configured and never tripping. Four did not, and all three rules
+    // could be disarmed at once through the public constructors while every
+    // check in this file stayed green:
+    //
+    //   rule 1   maxConsecutiveErrors = Integer.MAX_VALUE   (no upper bound)
+    //   rule 2   max5xxRate = 1.0                           (rate <= 1.0 always)
+    //   rule 2   baselineRequests = 1_000_000               (answered < it forever)
+    //   rule 3   latencyFloorMs = Long.MAX_VALUE            (no upper bound)
+    //   rule 3   latencyMultiple = +Infinity                (threshold = Infinity)
+    //
+    // Reproduced: all three disarmed, then 20 consecutive refusals, 30 x 503
+    // and 30 one-hour responses -- 90 requests of unambiguous distress --
+    // yielded stopReason() == null.
+    // ------------------------------------------------------------------
+
+    static void aThresholdNoTrafficCanCrossIsRefused() {
+        TickClock clock = new TickClock(T0);
+
+        // rule 1. The streak is NOT bounded by the window -- it is a running
+        // count -- so nothing else caps it and 2.1 billion consecutive refused
+        // connections is a rule that never fires.
+        expectThrows("a consecutive-error threshold of Integer.MAX_VALUE is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, Integer.MAX_VALUE));
+        expectThrows("one past the 1000 streak ceiling is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 1001));
+        check("the ceiling itself is accepted",
+              new Distress(clock, 0.20, 5.0, 1000) != null);
+
+        // rule 2. The rate is 5xx/answered, so it can never EXCEED 1.0 and a
+        // threshold of exactly 1.0 is one no traffic can be above -- including
+        // a host answering 100% 5xx.
+        expectThrows("a 5xx threshold of exactly 1.0 is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 1.0, 5.0, 5));
+        check("just below it is accepted",
+              new Distress(clock, 0.999, 5.0, 5) != null);
+
+        // rule 2 again, through the other knob. The window holds at most
+        // windowRequests samples, so `answered` can never reach a baseline
+        // larger than the window and the rate is never computed at all.
+        expectThrows("a baseline larger than the window is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 1_000_000, 250L));
+        expectThrows("...even one sample larger", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 51, 250L));
+        check("a baseline exactly the size of the window is accepted",
+              new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 50, 250L) != null);
+
+        // rule 3. Infinity passed the old `>= 1.0` test, and
+        // Math.max(baselineMs, 1L) * latencyMultiple is a MEASUREMENT times a
+        // CONFIG VALUE -- the same shape as windowMs * 1000L, overflowing to a
+        // threshold no long p50 can rise above.
+        expectThrows("a latency multiple of +Infinity is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, Double.POSITIVE_INFINITY, 5));
+        expectThrows("and NaN with it", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, Double.NaN, 5));
+        expectThrows("one past the 1000x ceiling is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 1000.001, 5));
+        check("the ceiling itself is accepted",
+              new Distress(clock, 0.20, 1000.0, 5) != null);
+        expectThrows("a NaN 5xx rate is refused too", IllegalArgumentException.class,
+                     () -> new Distress(clock, Double.NaN, 5.0, 5));
+
+        // rule 3 again, through the floor, which SUPPRESSES the rule while the
+        // host answers faster than it -- so a floor nothing can exceed
+        // suppresses it always.
+        expectThrows("a latency floor of Long.MAX_VALUE is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 10, Long.MAX_VALUE));
+        expectThrows("one millisecond past the 60 s floor ceiling is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 10, 60_001L));
+        check("the ceiling itself is accepted",
+              new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 10, 60_000L) != null);
+    }
+
+    static void anUnboundedWindowIsAnUnboundedAllocationPerHost() {
+        // Host allocates long[baselineRequests] and its deque holds up to
+        // windowRequests samples, PER HOST, and the number of hosts is bounded
+        // only by the scope. windowRequests = 200_000_000 constructed fine and
+        // allocated 1.6 GB inside Burp's JVM for the first host it saw.
+        TickClock clock = new TickClock(T0);
+        expectThrows("a 200-million-request window is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 200_000_000, 60_000L, 10, 250L));
+        expectThrows("one past the 10000 ceiling is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 10_001, 60_000L, 10, 250L));
+        check("the ceiling itself is accepted",
+              new Distress(clock, 0.20, 5.0, 5, 10_000, 60_000L, 10, 250L) != null);
+    }
+
+    static void theWindowMsCeilingSaysWhyItIsThereAndDoesNotSendTheOperatorSomewhereUnbounded() {
+        // The message used to claim windowMs * 1000 "overflows a long well
+        // before Long.MAX_VALUE". It overflows above Long.MAX_VALUE / 1000 --
+        // about 292,271 years -- so that was wrong by eleven orders of
+        // magnitude, and it redirected the operator to windowRequests, which
+        // at the time had no upper bound at all.
+        TickClock clock = new TickClock(T0);
+        String message = "";
+        try { new Distress(clock, 0.20, 5.0, 5, 50, 86_400_001L, 10, 250L); }
+        catch (IllegalArgumentException e) { message = String.valueOf(e.getMessage()); }
+        check("the ceiling message no longer claims an overflow that is not there",
+              !message.contains("overflow"));
+        check("it gives the reason the class comment gives: the shorter of the two bounds wins ("
+              + message + ")", message.contains("SHORTER"));
+        check("and the windowRequests it redirects to is itself bounded",
+              message.contains("itself bounded at 10000"));
+    }
+
+    static void aNegativeDurationIsClampedRatherThanPoisoningTheBaseline() {
+        // record() accepted a negative ms, which went straight into
+        // firstLatencies and out again as the baseline -- and then into the
+        // report text, as "exceeds 5.0x the -1 ms baseline". It is a caller
+        // bug, but the request has already gone out by the time record() sees
+        // it: dropping the sample would shrink the window the rules decide
+        // from, which is the disarming direction. So it is clamped to 0, which
+        // moves the baseline DOWN and can only make rule 3 more eager.
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 10; i++) { d.record(APP, 200, -1, false); clock.advance(1_000L); }
+        check("a negative duration does not become a negative baseline ("
+              + d.baselineMs(APP) + ")", d.baselineMs(APP) == 0);
+
+        // ...and the clamped value is what the report quotes. Enough 300 ms
+        // samples to carry the median past the ten clamped zeroes: the
+        // threshold is 5x max(0, 1) = 5 ms, and 300 ms is also past the 250 ms
+        // floor, so the rule fires as soon as the median moves.
+        for (int i = 0; i < 20; i++) { d.record(APP, 200, 300, false); clock.advance(1_000L); }
+        String reason = d.stopReason();
+        check("300 ms against a clamped 0 ms baseline is above the floor and trips",
+              reason != null);
+        check("and the reason quotes the clamped value, never a negative one ("
+              + reason + ")", reason != null && reason.contains("the 0 ms baseline"));
+    }
 }
 ```
 
@@ -8656,20 +8804,88 @@ public final class Distress {
     public static final long DEFAULT_LATENCY_FLOOR_MS  = 250L;
 
     /**
-     * Ceiling on {@code windowMs}, in the same spirit as {@code Limiter.MAX_RATE}:
-     * the dangerous config mistake is not a window set too tight (cheap: an
-     * early, spurious stop) but one that disables a rule outright. {@code
-     * windowMs * 1000L} converts to the microseconds {@link #evict} works in,
-     * and {@code Long.MAX_VALUE} -- exactly what an operator reaches for as a
-     * "no time bound, count-only" sentinel -- overflows that multiplication
-     * and wraps negative, which used to push the cutoff into the future and
-     * wipe the window on every {@link #record}: the 5xx-rate and latency
-     * rules went silently dark while {@link #stopReason()} stayed {@code
-     * null} forever. No live engagement runs a rolling distress window longer
-     * than a day; a config that wants "count only" should set {@code
-     * windowRequests} instead and leave {@code windowMs} merely generous.
+     * The ceilings. Every one of them exists for the reason the eight-argument
+     * constructor gives: the dangerous direction of a mistyped engagement
+     * config is the one that DISABLES a rule, leaving an object that looks
+     * configured and never trips, and a distress detector that never trips is
+     * indistinguishable from a healthy target right up until a client's
+     * application falls over. A value set too tight only costs an early stop.
+     *
+     * Each ceiling is a value ABOVE which the rule it belongs to can no longer
+     * fire on any input -- not a taste judgement about tuning. They are stated
+     * one per constant below, with the arithmetic that makes them so.
+     *
+     * A ceiling on {@code windowMs} is the one that is policy rather than
+     * arithmetic, and it is worth saying so plainly. {@code windowMs * 1000L}
+     * does overflow a long, but only above {@code Long.MAX_VALUE / 1000}, which
+     * is about 292,271 YEARS -- so overflow is not what a 24-hour ceiling is
+     * for, and an earlier version of this message that said the multiplication
+     * "overflows well before Long.MAX_VALUE" was wrong by eleven orders of
+     * magnitude. The real reason is the one the class comment gives: the
+     * effective window is whichever of {@code windowRequests} and {@code
+     * windowMs} is SHORTER, so with §4's 50-request default anything past a
+     * few minutes is already count-only, and no live engagement runs a rolling
+     * distress window longer than a day. {@link Math#multiplyExact} in {@link
+     * #evict} keeps guarding the multiplication anyway -- unreachable under
+     * this ceiling, and the first thing that matters if the ceiling is raised.
      */
     private static final long MAX_WINDOW_MS = 24L * 60 * 60 * 1000; // 24 h
+
+    /**
+     * Ceiling on {@code windowRequests}, in the same spirit as {@code
+     * Limiter.MAX_RATE} and for the same reason: one long per permitted sample.
+     * It bounds {@code baselineRequests} (which may not exceed it, see below),
+     * so the {@code long[]} each {@link Host} allocates is at most 80 KB and
+     * its deque at most this many {@link Sample}s -- PER HOST, and the number
+     * of hosts is bounded only by the scope. Unbounded, {@code
+     * windowRequests = 200_000_000} constructed fine and allocated 1.6 GB
+     * inside Burp's JVM for the first host it saw.
+     *
+     * Ten thousand is already five times hx's default per-run budget of 2000
+     * requests, so a window this size cannot roll even once in a default run.
+     */
+    private static final int MAX_WINDOW_REQUESTS = 10_000;
+
+    /**
+     * Ceiling on {@code maxConsecutiveErrors}. Rule 1 fires at {@code
+     * consecutiveErrors >= maxConsecutiveErrors}, and that counter is NOT
+     * bounded by the window -- it is a running streak -- so nothing else caps
+     * it. {@code Integer.MAX_VALUE} is 2.1 billion consecutive refused
+     * connections: rule 1 is off. Even a thousand is 200 seconds of nothing
+     * but refusals at §4's single-digit production rate, and half the default
+     * per-run budget, so a streak threshold above it cannot be reached in a
+     * default run at all.
+     */
+    private static final int MAX_CONSECUTIVE_ERRORS = 1_000;
+
+    /**
+     * Ceiling on {@code latencyMultiple}, and the reason it is not merely
+     * tidiness: {@code Math.max(baselineMs, 1L) * latencyMultiple} is a
+     * MEASUREMENT times a CONFIG VALUE, exactly the shape of {@code windowMs *
+     * 1000L}, and {@code Double.POSITIVE_INFINITY} passed the old {@code >= 1.0}
+     * check and made the threshold {@code Infinity} -- above which no {@code
+     * long} p50 can ever rise. Rule 3 was off, with {@link #stopReason()}
+     * answering {@code null} forever.
+     *
+     * A finite bound is the load-bearing half: anything past about 9.2e18
+     * puts the threshold beyond {@code Long.MAX_VALUE} milliseconds whatever
+     * the baseline turns out to be. A thousand is the "this is a typo" line,
+     * against §4's default of 5.0: a host answering a thousand times slower
+     * than its own baseline has been in distress by every other rule for a
+     * long time.
+     */
+    private static final double MAX_LATENCY_MULTIPLE = 1_000.0;
+
+    /**
+     * Ceiling on {@code latencyFloorMs}. The floor SUPPRESSES rule 3 while the
+     * host is still answering faster than it, so a floor nothing can exceed
+     * suppresses it always: {@code Long.MAX_VALUE} is 292 million years and
+     * rule 3 is off. A minute is past the point where an HTTP client has
+     * usually given up and the sample has been recorded as a connection error
+     * with a time-to-failure rather than as a latency at all -- so a floor
+     * above it only ever suppresses stops it could never permit.
+     */
+    private static final long MAX_LATENCY_FLOOR_MS = 60_000L;
 
     private record Sample(long atUs, int status, long ms, boolean connectionError) { }
 
@@ -8724,27 +8940,57 @@ public final class Distress {
                     int maxConsecutiveErrors, int windowRequests, long windowMs,
                     int baselineRequests, long latencyFloorMs) {
         if (clock == null) throw new IllegalArgumentException("clock is required");
-        if (!(max5xxRate >= 0.0 && max5xxRate <= 1.0))
-            throw new IllegalArgumentException("max5xxRate must be within 0.0..1.0, got " + max5xxRate);
-        if (!(latencyMultiple >= 1.0))
-            throw new IllegalArgumentException("latencyMultiple must be >= 1.0, got " + latencyMultiple);
-        if (maxConsecutiveErrors < 1)
-            throw new IllegalArgumentException("maxConsecutiveErrors must be >= 1, got " + maxConsecutiveErrors);
-        if (windowRequests < 1)
-            throw new IllegalArgumentException("windowRequests must be >= 1, got " + windowRequests);
+        // Strictly BELOW 1.0, not at it. The rate is fivexx/answered, so it
+        // can never exceed 1.0, and "above the threshold" at a threshold of
+        // 1.0 is a condition no traffic can meet: a host answering 100% 5xx
+        // would not trip. NaN fails this test too, as it must.
+        if (!(max5xxRate >= 0.0 && max5xxRate < 1.0))
+            throw new IllegalArgumentException(
+                "max5xxRate must be within 0.0..1.0 exclusive of 1.0, got " + max5xxRate
+                + " -- the rate is 5xx/answered and cannot exceed 1.0, so a threshold "
+                + "of 1.0 is one no traffic can be above and rule 2 never fires");
+        if (!(latencyMultiple >= 1.0 && latencyMultiple <= MAX_LATENCY_MULTIPLE))
+            throw new IllegalArgumentException(
+                "latencyMultiple must be within 1.0.." + MAX_LATENCY_MULTIPLE + ", got "
+                + latencyMultiple + " -- the threshold is baselineMs * latencyMultiple, so "
+                + "an infinite or absurd multiple is one no p50 can exceed and rule 3 "
+                + "never fires");
+        if (maxConsecutiveErrors < 1 || maxConsecutiveErrors > MAX_CONSECUTIVE_ERRORS)
+            throw new IllegalArgumentException(
+                "maxConsecutiveErrors must be within 1.." + MAX_CONSECUTIVE_ERRORS + ", got "
+                + maxConsecutiveErrors + " -- the streak is not bounded by the window, so a "
+                + "threshold above the requests a run will issue is one rule 1 never reaches");
+        if (windowRequests < 1 || windowRequests > MAX_WINDOW_REQUESTS)
+            throw new IllegalArgumentException(
+                "windowRequests must be within 1.." + MAX_WINDOW_REQUESTS + ", got "
+                + windowRequests + " -- each host allocates a long[] of the baseline size and "
+                + "holds this many samples, so an unbounded window is an unbounded allocation "
+                + "inside Burp's JVM");
         if (windowMs < 1)
             throw new IllegalArgumentException("windowMs must be >= 1, got " + windowMs);
         if (windowMs > MAX_WINDOW_MS)
             throw new IllegalArgumentException(
                 "windowMs above the " + MAX_WINDOW_MS + " ms (24 h) ceiling: " + windowMs
-                + " -- windowMs * 1000 overflows a long well before Long.MAX_VALUE, which "
-                + "silently disables the 5xx-rate and latency rules while record() keeps "
-                + "returning as if the host were healthy; bound by windowRequests instead "
-                + "if you want the window to be count-only");
-        if (baselineRequests < 1)
-            throw new IllegalArgumentException("baselineRequests must be >= 1, got " + baselineRequests);
-        if (latencyFloorMs < 0)
-            throw new IllegalArgumentException("latencyFloorMs must be >= 0, got " + latencyFloorMs);
+                + " -- the effective window is whichever of windowRequests and windowMs is "
+                + "SHORTER, so past a few minutes a 50-request window is already count-only "
+                + "and no live engagement runs a rolling distress window longer than a day; "
+                + "set windowRequests (itself bounded at " + MAX_WINDOW_REQUESTS + ") if you "
+                + "want the window bounded by count");
+        // Not merely >= 1: the window holds at most windowRequests samples, so
+        // a baseline larger than the window is one that `answered` can never
+        // reach -- rule 2's gate stays shut for the life of the run and the
+        // rate is never computed at all. It also bounds the per-host long[].
+        if (baselineRequests < 1 || baselineRequests > windowRequests)
+            throw new IllegalArgumentException(
+                "baselineRequests must be within 1..windowRequests (" + windowRequests
+                + "), got " + baselineRequests + " -- the window holds at most windowRequests "
+                + "samples, so a larger baseline is one the 5xx-rate gate never reaches and "
+                + "rule 2 never fires");
+        if (latencyFloorMs < 0 || latencyFloorMs > MAX_LATENCY_FLOOR_MS)
+            throw new IllegalArgumentException(
+                "latencyFloorMs must be within 0.." + MAX_LATENCY_FLOOR_MS + ", got "
+                + latencyFloorMs + " -- the floor suppresses rule 3 while the host answers "
+                + "faster than it, so a floor no response can exceed suppresses it always");
 
         this.clock = clock;
         this.max5xxRate = max5xxRate;
@@ -8763,6 +9009,16 @@ public final class Distress {
      * true -- a refused, reset or timed-out connection has no status, and
      * {@code ms} is then time-to-failure rather than service latency.
      *
+     * A NEGATIVE {@code ms} is clamped to zero rather than refused. It should
+     * not happen -- it means the caller's own start and end readings went
+     * backwards -- but the request has already gone out by the time record()
+     * sees it, and dropping the sample would shrink the window the rules
+     * decide from, which is the disarming direction. Clamping keeps the sample
+     * and moves the baseline DOWN, which can only make rule 3 more eager; and
+     * it keeps the figure out of the report, where a single {@code -1} used to
+     * establish a {@code -1 ms} baseline and print "exceeds 5.0x the -1 ms
+     * baseline" into {@code run.stop_reason}.
+     *
      * Synchronised because the send path can be driven from more than one Burp
      * thread. These are microsecond operations over a 50-element deque, and an
      * auto-halt computed from a torn window is worse than a slow one.
@@ -8770,9 +9026,10 @@ public final class Distress {
     public synchronized void record(String host, int status, long ms, boolean connectionError) {
         if (stop != null) return;                 // sticky: see the class comment
         long nowUs = clock.nowUs();
+        long observedMs = Math.max(ms, 0L);      // see the javadoc: never below zero
         Host h = hosts.computeIfAbsent(host, unused -> new Host(baselineRequests));
 
-        h.window.addLast(new Sample(nowUs, status, ms, connectionError));
+        h.window.addLast(new Sample(nowUs, status, observedMs, connectionError));
         evict(host, h, nowUs);
         if (stop != null) return;                  // evict() can trip on unrepresentable arithmetic
 
@@ -8792,7 +9049,7 @@ public final class Distress {
             // and the streak is broken. It still counts against the rate below.
             h.consecutiveErrors = 0;
             if (!h.baselineReady) {
-                h.firstLatencies[h.latencyCount++] = ms;
+                h.firstLatencies[h.latencyCount++] = observedMs;
                 if (h.latencyCount == baselineRequests) {
                     h.baselineMs = p50(Arrays.copyOf(h.firstLatencies, h.latencyCount));
                     h.baselineReady = true;
@@ -8823,7 +9080,13 @@ public final class Distress {
      * or never aged, on every {@link #record} while {@link #stopReason()}
      * stayed {@code null} forever, which reads as a healthy target. The
      * arithmetic is now exact ({@link Math#multiplyExact} / {@link
-     * Math#subtractExact}), and on overflow this TRIPS instead of continuing:
+     * Math#subtractExact}). Only the SUBTRACTION can still throw: {@link
+     * #MAX_WINDOW_MS} caps {@code windowMs} at 86,400,000, so {@code
+     * multiplyExact(windowMs, 1000L)} tops out at 8.64e10 and is unreachable
+     * dead code today. It is kept because it makes this expression safe on its
+     * own terms rather than by a constant declared two hundred lines away --
+     * exactly the coupling that would break the day somebody raises that
+     * ceiling. On overflow this TRIPS instead of continuing:
      * if the window bound cannot be computed, {@code Distress} cannot tell
      * whether the target is healthy, and that is not a state in which to keep
      * issuing requests. A spurious halt costs an operator a restart; the other

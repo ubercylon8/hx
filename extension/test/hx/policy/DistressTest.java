@@ -83,6 +83,13 @@ public class DistressTest {
         t("aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero", DistressTest::aZeroMillisecondBaselineDoesNotCollapseTheLatencyThresholdToZero);
         t("anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall", DistressTest::anOverflowTripIsNotOverwrittenByALaterRuleInTheSameCall);
 
+        // Fix round 2: four of the five thresholds could be set to values that
+        // leave Distress looking configured and never tripping.
+        t("aThresholdNoTrafficCanCrossIsRefused", DistressTest::aThresholdNoTrafficCanCrossIsRefused);
+        t("anUnboundedWindowIsAnUnboundedAllocationPerHost", DistressTest::anUnboundedWindowIsAnUnboundedAllocationPerHost);
+        t("theWindowMsCeilingSaysWhyItIsThereAndDoesNotSendTheOperatorSomewhereUnbounded", DistressTest::theWindowMsCeilingSaysWhyItIsThereAndDoesNotSendTheOperatorSomewhereUnbounded);
+        t("aNegativeDurationIsClampedRatherThanPoisoningTheBaseline", DistressTest::aNegativeDurationIsClampedRatherThanPoisoningTheBaseline);
+
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
     }
@@ -564,5 +571,146 @@ public class DistressTest {
         check("...not the 5xx-rate reason a later rule in the same call would "
               + "otherwise have computed from a half-evicted window",
               !"5xx rate 27.3% over the last 11 requests exceeds 20.0%".equals(d.stopReason()));
+    }
+    // ------------------------------------------------------------------
+    // Fix round 2. The validation above covered ONE of the five thresholds
+    // against the failure it exists to prevent -- a value that leaves Distress
+    // looking configured and never tripping. Four did not, and all three rules
+    // could be disarmed at once through the public constructors while every
+    // check in this file stayed green:
+    //
+    //   rule 1   maxConsecutiveErrors = Integer.MAX_VALUE   (no upper bound)
+    //   rule 2   max5xxRate = 1.0                           (rate <= 1.0 always)
+    //   rule 2   baselineRequests = 1_000_000               (answered < it forever)
+    //   rule 3   latencyFloorMs = Long.MAX_VALUE            (no upper bound)
+    //   rule 3   latencyMultiple = +Infinity                (threshold = Infinity)
+    //
+    // Reproduced: all three disarmed, then 20 consecutive refusals, 30 x 503
+    // and 30 one-hour responses -- 90 requests of unambiguous distress --
+    // yielded stopReason() == null.
+    // ------------------------------------------------------------------
+
+    static void aThresholdNoTrafficCanCrossIsRefused() {
+        TickClock clock = new TickClock(T0);
+
+        // rule 1. The streak is NOT bounded by the window -- it is a running
+        // count -- so nothing else caps it and 2.1 billion consecutive refused
+        // connections is a rule that never fires.
+        expectThrows("a consecutive-error threshold of Integer.MAX_VALUE is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, Integer.MAX_VALUE));
+        expectThrows("one past the 1000 streak ceiling is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 1001));
+        check("the ceiling itself is accepted",
+              new Distress(clock, 0.20, 5.0, 1000) != null);
+
+        // rule 2. The rate is 5xx/answered, so it can never EXCEED 1.0 and a
+        // threshold of exactly 1.0 is one no traffic can be above -- including
+        // a host answering 100% 5xx.
+        expectThrows("a 5xx threshold of exactly 1.0 is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 1.0, 5.0, 5));
+        check("just below it is accepted",
+              new Distress(clock, 0.999, 5.0, 5) != null);
+
+        // rule 2 again, through the other knob. The window holds at most
+        // windowRequests samples, so `answered` can never reach a baseline
+        // larger than the window and the rate is never computed at all.
+        expectThrows("a baseline larger than the window is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 1_000_000, 250L));
+        expectThrows("...even one sample larger", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 51, 250L));
+        check("a baseline exactly the size of the window is accepted",
+              new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 50, 250L) != null);
+
+        // rule 3. Infinity passed the old `>= 1.0` test, and
+        // Math.max(baselineMs, 1L) * latencyMultiple is a MEASUREMENT times a
+        // CONFIG VALUE -- the same shape as windowMs * 1000L, overflowing to a
+        // threshold no long p50 can rise above.
+        expectThrows("a latency multiple of +Infinity is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, Double.POSITIVE_INFINITY, 5));
+        expectThrows("and NaN with it", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, Double.NaN, 5));
+        expectThrows("one past the 1000x ceiling is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 1000.001, 5));
+        check("the ceiling itself is accepted",
+              new Distress(clock, 0.20, 1000.0, 5) != null);
+        expectThrows("a NaN 5xx rate is refused too", IllegalArgumentException.class,
+                     () -> new Distress(clock, Double.NaN, 5.0, 5));
+
+        // rule 3 again, through the floor, which SUPPRESSES the rule while the
+        // host answers faster than it -- so a floor nothing can exceed
+        // suppresses it always.
+        expectThrows("a latency floor of Long.MAX_VALUE is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 10, Long.MAX_VALUE));
+        expectThrows("one millisecond past the 60 s floor ceiling is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 10, 60_001L));
+        check("the ceiling itself is accepted",
+              new Distress(clock, 0.20, 5.0, 5, 50, 60_000L, 10, 60_000L) != null);
+    }
+
+    static void anUnboundedWindowIsAnUnboundedAllocationPerHost() {
+        // Host allocates long[baselineRequests] and its deque holds up to
+        // windowRequests samples, PER HOST, and the number of hosts is bounded
+        // only by the scope. windowRequests = 200_000_000 constructed fine and
+        // allocated 1.6 GB inside Burp's JVM for the first host it saw.
+        TickClock clock = new TickClock(T0);
+        expectThrows("a 200-million-request window is refused",
+                     IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 200_000_000, 60_000L, 10, 250L));
+        expectThrows("one past the 10000 ceiling is refused", IllegalArgumentException.class,
+                     () -> new Distress(clock, 0.20, 5.0, 5, 10_001, 60_000L, 10, 250L));
+        check("the ceiling itself is accepted",
+              new Distress(clock, 0.20, 5.0, 5, 10_000, 60_000L, 10, 250L) != null);
+    }
+
+    static void theWindowMsCeilingSaysWhyItIsThereAndDoesNotSendTheOperatorSomewhereUnbounded() {
+        // The message used to claim windowMs * 1000 "overflows a long well
+        // before Long.MAX_VALUE". It overflows above Long.MAX_VALUE / 1000 --
+        // about 292,271 years -- so that was wrong by eleven orders of
+        // magnitude, and it redirected the operator to windowRequests, which
+        // at the time had no upper bound at all.
+        TickClock clock = new TickClock(T0);
+        String message = "";
+        try { new Distress(clock, 0.20, 5.0, 5, 50, 86_400_001L, 10, 250L); }
+        catch (IllegalArgumentException e) { message = String.valueOf(e.getMessage()); }
+        check("the ceiling message no longer claims an overflow that is not there",
+              !message.contains("overflow"));
+        check("it gives the reason the class comment gives: the shorter of the two bounds wins ("
+              + message + ")", message.contains("SHORTER"));
+        check("and the windowRequests it redirects to is itself bounded",
+              message.contains("itself bounded at 10000"));
+    }
+
+    static void aNegativeDurationIsClampedRatherThanPoisoningTheBaseline() {
+        // record() accepted a negative ms, which went straight into
+        // firstLatencies and out again as the baseline -- and then into the
+        // report text, as "exceeds 5.0x the -1 ms baseline". It is a caller
+        // bug, but the request has already gone out by the time record() sees
+        // it: dropping the sample would shrink the window the rules decide
+        // from, which is the disarming direction. So it is clamped to 0, which
+        // moves the baseline DOWN and can only make rule 3 more eager.
+        TickClock clock = new TickClock(T0);
+        Distress d = fresh(clock);
+        for (int i = 0; i < 10; i++) { d.record(APP, 200, -1, false); clock.advance(1_000L); }
+        check("a negative duration does not become a negative baseline ("
+              + d.baselineMs(APP) + ")", d.baselineMs(APP) == 0);
+
+        // ...and the clamped value is what the report quotes. Enough 300 ms
+        // samples to carry the median past the ten clamped zeroes: the
+        // threshold is 5x max(0, 1) = 5 ms, and 300 ms is also past the 250 ms
+        // floor, so the rule fires as soon as the median moves.
+        for (int i = 0; i < 20; i++) { d.record(APP, 200, 300, false); clock.advance(1_000L); }
+        String reason = d.stopReason();
+        check("300 ms against a clamped 0 ms baseline is above the floor and trips",
+              reason != null);
+        check("and the reason quotes the clamped value, never a negative one ("
+              + reason + ")", reason != null && reason.contains("the 0 ms baseline"));
     }
 }
