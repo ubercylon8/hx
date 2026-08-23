@@ -1866,8 +1866,43 @@ from hx.store.paths import secure_mkdir
 
 
 @pytest.fixture
-def srv(tmp_path):
-    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1")
+def store(tmp_path):
+    """A real engagement database. Every BridgeServer in this file drives one:
+    `operator_halt` is required, and a stub would hide the guarantee these
+    tests exist for -- the bridge reads `halted` and `reason` from its READ
+    thread, and the store connection they would otherwise touch belongs to
+    another thread entirely."""
+    root = tmp_path / "engagement"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+                 " VALUES('e-1','Example','Example Ltd',1,'active')")
+    conn.execute("INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                 " started_us, status)"
+                 " VALUES('r-1','e-1','manual','production',1700000000000000,"
+                 "'running')")
+    yield root, conn
+    conn.close()
+
+
+@pytest.fixture
+def halt(store):
+    """The sentinel every server here is built over.
+
+    `BridgeServer` refuses to construct without one, deliberately -- the same
+    call HxExtension makes about `-Dhx.halt_sentinel`, for the same field and
+    the same reason. A test with no engagement of its own supplies one in
+    tmp_path, which is exactly the discipline that requirement imposes.
+    """
+    root, conn = store
+    return halt_mod.OperatorHalt(root, conn)
+
+
+@pytest.fixture
+def srv(tmp_path, halt):
+    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
+                            operator_halt=halt)
     s.start()
     yield s
     s.stop()
@@ -1899,8 +1934,40 @@ def _connected(srv):
     return c
 
 
-def test_socket_and_directory_permissions(tmp_path):
-    s = server.BridgeServer(tmp_path / "sub" / "b.sock", engagement_id="e-1")
+def test_a_bridge_cannot_be_built_without_a_sentinel(tmp_path):
+    """S4 promises three kill paths, and an opt-in third path is not a promise.
+
+    Optional, `operator_halt` made the whole durable halt opt-in. Measured
+    with the argument simply left off:
+
+        sentinel on disk: True   operator_halt attr: None
+        SEND REACHED THE WIRE with a HALTED sentinel present
+        after server.halt(): agent_action rows = 0
+
+    A HALTED file placed by hand -- S4's named "the socket is dead, stop by
+    hand" path -- did not stop send(), and halt() wrote neither sentinel nor
+    audit row. The extension still refused via its own poller, so S4's
+    ENFORCEMENT invariant held; what was lost was durability and the
+    harness-side refusal.
+
+    The Java side made the opposite call for the same field and said why:
+    HxExtension refuses to initialise without `-Dhx.halt_sentinel` because an
+    extension that went live without one "would have two of the three paths
+    spec s4 promises, silently". This is that refusal, on this side.
+    """
+    with pytest.raises(TypeError, match="operator_halt"):
+        server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1")
+    # And an explicit None, which is the same fail-open with a keystroke in
+    # front of it. The signature cannot catch that one; the constructor does,
+    # and it does it before start() rather than at the first send.
+    with pytest.raises(server.BridgeError, match="operator_halt is required"):
+        server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
+                            operator_halt=None)
+
+
+def test_socket_and_directory_permissions(tmp_path, halt):
+    s = server.BridgeServer(tmp_path / "sub" / "b.sock", engagement_id="e-1",
+                            operator_halt=halt)
     s.start()
     try:
         assert stat.S_IMODE(s.socket_path.stat().st_mode) == 0o600
@@ -1909,8 +1976,9 @@ def test_socket_and_directory_permissions(tmp_path):
         s.stop()
 
 
-def test_stop_unlinks_the_socket(tmp_path):
-    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1")
+def test_stop_unlinks_the_socket(tmp_path, halt):
+    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
+                            operator_halt=halt)
     s.start()
     path = s.socket_path
     assert path.exists()
@@ -1918,10 +1986,10 @@ def test_stop_unlinks_the_socket(tmp_path):
     assert not path.exists()
 
 
-def test_refuses_to_start_if_the_path_already_exists(tmp_path):
+def test_refuses_to_start_if_the_path_already_exists(tmp_path, halt):
     p = tmp_path / "b.sock"
     p.write_text("squatter")
-    s = server.BridgeServer(p, engagement_id="e-1")
+    s = server.BridgeServer(p, engagement_id="e-1", operator_halt=halt)
     with pytest.raises(server.BridgeError, match="exists"):
         s.start()
 
@@ -2342,6 +2410,15 @@ def test_halt_and_resume_refuse_to_commit_after_a_reset_in_the_gap(srv):
         finally:
             del srv._send          # fall back to the real bound method
             c.close()
+            # The first pass really arms the durable halt -- operator_halt is
+            # required now, so `srv` has a live one and halt() arms it before
+            # the send it is about to fail on. The second pass would then be
+            # met by _reassert_halt on its hello and never see "connected",
+            # which is the halt working as designed and not what THIS test is
+            # about: the subject here is the send-then-mutate guard on the
+            # bridge. Durability has its own tests, two of them directly
+            # below the send path section.
+            srv.operator_halt.resume()
 
 
 def test_halt_and_resume_commit_on_the_happy_path(srv):
@@ -2731,38 +2808,18 @@ def test_a_non_denying_configure_error_leaves_state_alone(srv):
 
 
 # ---- the send path, the halted frame, and the durable halt ----------------
-#
-# Everything below drives a REAL OperatorHalt against a real engagement
-# database. A stub would hide the guarantee these tests exist for: the bridge
-# reads `halted` and `reason` from its read thread, and the store connection
-# they would otherwise touch belongs to another thread entirely.
 
 
 @pytest.fixture
-def store(tmp_path):
-    root = tmp_path / "engagement"
-    secure_mkdir(root)
-    conn = db_mod.connect(root / "hx.db")
-    db_mod.init_schema(conn)
-    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
-                 " VALUES('e-1','Example','Example Ltd',1,'active')")
-    conn.execute("INSERT INTO run(id, engagement_id, kind, safety_profile,"
-                 " started_us, status)"
-                 " VALUES('r-1','e-1','manual','production',1700000000000000,"
-                 "'running')")
-    yield root, conn
-    conn.close()
+def srv_with_halt(srv, halt, store):
+    """The `srv` fixture, plus the halt and the store it was built over.
 
-
-@pytest.fixture
-def srv_with_halt(tmp_path, store):
-    root, conn = store
-    oh = halt_mod.OperatorHalt(root, conn)
-    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
-                            operator_halt=oh)
-    s.start()
-    yield s, oh, conn
-    s.stop()
+    These used to be a second server built by hand, from the days when
+    `operator_halt` was optional and only this half of the file passed one.
+    It is required now, so `srv` already has a real one and this is just the
+    unpacking the twenty tests below read.
+    """
+    return srv, halt, store[1]
 
 
 def _hello(c, engagement_id="e-1"):
@@ -3548,21 +3605,54 @@ class BridgeServer:
     _RESERVED_SEND_KEYS = frozenset({"v", "t", "id", "deadline_us",
                                      "engagement_id"})
 
-    def __init__(self, socket_path: Path, engagement_id: str, on_hello=None,
-                 on_halted=None, operator_halt=None):
+    def __init__(self, socket_path: Path, engagement_id: str, operator_halt,
+                 on_hello=None, on_halted=None):
         """
+        `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
+        module keeps no dependency on the store, and tests can attach anything
+        with `.halted`, `.reason`, `.halt()` and `.resume()`. `.halted` and
+        `.reason` are read on the read thread, which is why OperatorHalt
+        answers them from memory and a stat() rather than from the database.
+
+        IT IS REQUIRED, and the Java side made the same call for the same
+        field: HxExtension.initialize() refuses to come up without
+        `-Dhx.halt_sentinel` because "an extension that went live without one
+        would have two of the three paths spec s4 promises, silently". The
+        same is true here. Optional, it made the whole durable halt opt-in: a
+        HALTED file placed by hand -- S4's named "the socket is dead, stop by
+        hand" path -- did not stop send(), and halt() wrote neither sentinel
+        nor audit row. Measured with the argument omitted:
+
+            sentinel on disk: True   operator_halt attr: None
+            SEND REACHED THE WIRE with a HALTED sentinel present
+            after server.halt(): agent_action rows = 0
+
+        The extension still refused via its own poller, so S4's enforcement
+        invariant held; what was lost was durability and the harness-side
+        refusal. S4 promises three paths, and an opt-in third path is not a
+        promise. A caller with no engagement -- a test harness -- supplies a
+        sentinel in a directory of its own, which is exactly the discipline
+        the Java side imposes on itself.
+
         `on_hello` and `on_halted` are both called ON THE READ THREAD, so
         neither may touch a sqlite3 connection opened elsewhere: it belongs to
         the thread that created it and raises ProgrammingError anywhere else
         (tests/test_halt.py demonstrates it). Hand the work to the thread that
         owns the store instead.
-
-        `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
-        module keeps no dependency on the store, and tests can attach anything
-        with `.halted` and `.reason`. Both are read on the read thread, which
-        is why OperatorHalt answers them from memory and a stat() rather than
-        from the database.
         """
+        if operator_halt is None:
+            # The signature already refuses an OMITTED argument. This refuses
+            # an explicit None, which is the same fail-open with a keystroke
+            # in front of it, and refuses it at construction rather than at
+            # the first send -- the Java side's `extension idle` shape.
+            raise BridgeError(
+                "operator_halt is required and may not be None. It is S4's "
+                "third kill path: the sentinel file that works when the "
+                "bridge does not. A caller with no engagement supplies an "
+                "hx.halt.OperatorHalt over a directory of its own, the same "
+                "way HxExtension refuses to initialise without "
+                "-Dhx.halt_sentinel."
+            )
         self.socket_path = Path(socket_path)
         self.engagement_id = engagement_id
         self.on_hello = on_hello
@@ -3784,7 +3874,7 @@ class BridgeServer:
         someone has already hit stop. `_reset()` cannot clear it either: the
         state lives in OperatorHalt, on disk, not in this object.
         """
-        if self.operator_halt is None or not self.operator_halt.halted:
+        if not self.operator_halt.halted:
             return True
         reason = self.operator_halt.reason or "halted, no reason recorded"
         try:
@@ -3979,7 +4069,7 @@ class BridgeServer:
         # is dead or the agent has stopped responding -- S4 names that as the
         # reason the file exists -- and that halt has to work with no frame
         # ever arriving.
-        if self.operator_halt is not None and self.operator_halt.halted:
+        if self.operator_halt.halted:
             raise BridgeError(f"halted: {self.operator_halt.reason}",
                               error_class="halted")
         state = self.state
@@ -4013,8 +4103,7 @@ class BridgeServer:
         # the halt still stands and the next hello re-asserts it. Arming
         # afterwards would make a dead socket -- the likeliest thing to be
         # wrong when someone hits stop -- the one path that loses the halt.
-        if self.operator_halt is not None:
-            self.operator_halt.halt(reason)
+        self.operator_halt.halt(reason)
         # Same send-then-mutate shape as configure(), so the same guard: a
         # peer that disconnects between the send and this commit must not
         # leave state looking like anything other than what _reset() wrote.
@@ -4036,8 +4125,7 @@ class BridgeServer:
         # stood. Every failure before this point leaves the durable halt armed,
         # which is the direction S4 asks for: unknown state is stop. Only
         # resume re-arms issuance, and only a resume that actually got there.
-        if self.operator_halt is not None:
-            self.operator_halt.resume()
+        self.operator_halt.resume()
 ```
 
 - [ ] **Step 3b: Test the commit guard so that removing it fails a test**
@@ -6522,10 +6610,45 @@ import hashlib
 
 import pytest
 
+from hx import halt as halt_mod
 from hx.bridge import server
+from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 from tests.integration import burp_fixture as bf
 
 pytestmark = pytest.mark.integration
+
+
+def _operator_halt(workdir, engagement_id):
+    """`BridgeServer` requires one -- the same call HxExtension makes about
+    `-Dhx.halt_sentinel`, for the same field. A harness with no engagement of
+    its own supplies a sentinel in a directory of its own, which is what this
+    builds.
+
+    NOTE for the integration task, from measuring these two against the real
+    container on 2026-08-23. Both fail today, for two separate reasons, and
+    both failures predate this function -- the pristine tree fails the same
+    way:
+
+      1. Burp 2026.7.3 dies during startup under this machine's JRE 26 with
+         `java.lang.Error: no ComponentUI class for: burp.Zc7w`, before the
+         extension is loaded at all. That is what the current failure is.
+      2. Behind it, `bf.launch_burp` does not pass `-Dhx.halt_sentinel`, and
+         HxExtension.initialize() refuses to come up without it ("extension
+         idle"). Even with a working JVM the handshake could not complete
+         until the fixture hands the JVM `oh.sentinel_path`.
+
+    Neither is this fix round's to repair. This function exists so the Python
+    half is already correct when they are.
+    """
+    root = workdir / "engagement"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+                 " VALUES(?,'Integration','Integration',1,'active')",
+                 (engagement_id,))
+    return halt_mod.OperatorHalt(root, conn)
 
 
 @pytest.mark.skipif(not bf.burp_available(),
@@ -6536,7 +6659,9 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
     Fakes prove the logic; only this proves Burp actually loads the extension
     and that the socket handshake works end to end.
     """
-    srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-integration")
+    srv = server.BridgeServer(
+        tmp_path / "hx.sock", engagement_id="e-integration",
+        operator_halt=_operator_halt(tmp_path, "e-integration"))
     srv.start()
     proc = None
     try:
@@ -6587,7 +6712,9 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     "reconnect, not an outage" half, which is this plan's headline claim and
     was otherwise exercised against fakes alone.
     """
-    srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-restart")
+    srv = server.BridgeServer(
+        tmp_path / "hx.sock", engagement_id="e-restart",
+        operator_halt=_operator_halt(tmp_path, "e-restart"))
     srv.start()
     proc = proc2 = None
     try:

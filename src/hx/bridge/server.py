@@ -78,21 +78,54 @@ class BridgeServer:
     _RESERVED_SEND_KEYS = frozenset({"v", "t", "id", "deadline_us",
                                      "engagement_id"})
 
-    def __init__(self, socket_path: Path, engagement_id: str, on_hello=None,
-                 on_halted=None, operator_halt=None):
+    def __init__(self, socket_path: Path, engagement_id: str, operator_halt,
+                 on_hello=None, on_halted=None):
         """
+        `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
+        module keeps no dependency on the store, and tests can attach anything
+        with `.halted`, `.reason`, `.halt()` and `.resume()`. `.halted` and
+        `.reason` are read on the read thread, which is why OperatorHalt
+        answers them from memory and a stat() rather than from the database.
+
+        IT IS REQUIRED, and the Java side made the same call for the same
+        field: HxExtension.initialize() refuses to come up without
+        `-Dhx.halt_sentinel` because "an extension that went live without one
+        would have two of the three paths spec s4 promises, silently". The
+        same is true here. Optional, it made the whole durable halt opt-in: a
+        HALTED file placed by hand -- S4's named "the socket is dead, stop by
+        hand" path -- did not stop send(), and halt() wrote neither sentinel
+        nor audit row. Measured with the argument omitted:
+
+            sentinel on disk: True   operator_halt attr: None
+            SEND REACHED THE WIRE with a HALTED sentinel present
+            after server.halt(): agent_action rows = 0
+
+        The extension still refused via its own poller, so S4's enforcement
+        invariant held; what was lost was durability and the harness-side
+        refusal. S4 promises three paths, and an opt-in third path is not a
+        promise. A caller with no engagement -- a test harness -- supplies a
+        sentinel in a directory of its own, which is exactly the discipline
+        the Java side imposes on itself.
+
         `on_hello` and `on_halted` are both called ON THE READ THREAD, so
         neither may touch a sqlite3 connection opened elsewhere: it belongs to
         the thread that created it and raises ProgrammingError anywhere else
         (tests/test_halt.py demonstrates it). Hand the work to the thread that
         owns the store instead.
-
-        `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
-        module keeps no dependency on the store, and tests can attach anything
-        with `.halted` and `.reason`. Both are read on the read thread, which
-        is why OperatorHalt answers them from memory and a stat() rather than
-        from the database.
         """
+        if operator_halt is None:
+            # The signature already refuses an OMITTED argument. This refuses
+            # an explicit None, which is the same fail-open with a keystroke
+            # in front of it, and refuses it at construction rather than at
+            # the first send -- the Java side's `extension idle` shape.
+            raise BridgeError(
+                "operator_halt is required and may not be None. It is S4's "
+                "third kill path: the sentinel file that works when the "
+                "bridge does not. A caller with no engagement supplies an "
+                "hx.halt.OperatorHalt over a directory of its own, the same "
+                "way HxExtension refuses to initialise without "
+                "-Dhx.halt_sentinel."
+            )
         self.socket_path = Path(socket_path)
         self.engagement_id = engagement_id
         self.on_hello = on_hello
@@ -314,7 +347,7 @@ class BridgeServer:
         someone has already hit stop. `_reset()` cannot clear it either: the
         state lives in OperatorHalt, on disk, not in this object.
         """
-        if self.operator_halt is None or not self.operator_halt.halted:
+        if not self.operator_halt.halted:
             return True
         reason = self.operator_halt.reason or "halted, no reason recorded"
         try:
@@ -509,7 +542,7 @@ class BridgeServer:
         # is dead or the agent has stopped responding -- S4 names that as the
         # reason the file exists -- and that halt has to work with no frame
         # ever arriving.
-        if self.operator_halt is not None and self.operator_halt.halted:
+        if self.operator_halt.halted:
             raise BridgeError(f"halted: {self.operator_halt.reason}",
                               error_class="halted")
         state = self.state
@@ -543,8 +576,7 @@ class BridgeServer:
         # the halt still stands and the next hello re-asserts it. Arming
         # afterwards would make a dead socket -- the likeliest thing to be
         # wrong when someone hits stop -- the one path that loses the halt.
-        if self.operator_halt is not None:
-            self.operator_halt.halt(reason)
+        self.operator_halt.halt(reason)
         # Same send-then-mutate shape as configure(), so the same guard: a
         # peer that disconnects between the send and this commit must not
         # leave state looking like anything other than what _reset() wrote.
@@ -566,5 +598,4 @@ class BridgeServer:
         # stood. Every failure before this point leaves the durable halt armed,
         # which is the direction S4 asks for: unknown state is stop. Only
         # resume re-arms issuance, and only a resume that actually got there.
-        if self.operator_halt is not None:
-            self.operator_halt.resume()
+        self.operator_halt.resume()

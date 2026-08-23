@@ -16,8 +16,43 @@ from hx.store.paths import secure_mkdir
 
 
 @pytest.fixture
-def srv(tmp_path):
-    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1")
+def store(tmp_path):
+    """A real engagement database. Every BridgeServer in this file drives one:
+    `operator_halt` is required, and a stub would hide the guarantee these
+    tests exist for -- the bridge reads `halted` and `reason` from its READ
+    thread, and the store connection they would otherwise touch belongs to
+    another thread entirely."""
+    root = tmp_path / "engagement"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+                 " VALUES('e-1','Example','Example Ltd',1,'active')")
+    conn.execute("INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                 " started_us, status)"
+                 " VALUES('r-1','e-1','manual','production',1700000000000000,"
+                 "'running')")
+    yield root, conn
+    conn.close()
+
+
+@pytest.fixture
+def halt(store):
+    """The sentinel every server here is built over.
+
+    `BridgeServer` refuses to construct without one, deliberately -- the same
+    call HxExtension makes about `-Dhx.halt_sentinel`, for the same field and
+    the same reason. A test with no engagement of its own supplies one in
+    tmp_path, which is exactly the discipline that requirement imposes.
+    """
+    root, conn = store
+    return halt_mod.OperatorHalt(root, conn)
+
+
+@pytest.fixture
+def srv(tmp_path, halt):
+    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
+                            operator_halt=halt)
     s.start()
     yield s
     s.stop()
@@ -49,8 +84,40 @@ def _connected(srv):
     return c
 
 
-def test_socket_and_directory_permissions(tmp_path):
-    s = server.BridgeServer(tmp_path / "sub" / "b.sock", engagement_id="e-1")
+def test_a_bridge_cannot_be_built_without_a_sentinel(tmp_path):
+    """S4 promises three kill paths, and an opt-in third path is not a promise.
+
+    Optional, `operator_halt` made the whole durable halt opt-in. Measured
+    with the argument simply left off:
+
+        sentinel on disk: True   operator_halt attr: None
+        SEND REACHED THE WIRE with a HALTED sentinel present
+        after server.halt(): agent_action rows = 0
+
+    A HALTED file placed by hand -- S4's named "the socket is dead, stop by
+    hand" path -- did not stop send(), and halt() wrote neither sentinel nor
+    audit row. The extension still refused via its own poller, so S4's
+    ENFORCEMENT invariant held; what was lost was durability and the
+    harness-side refusal.
+
+    The Java side made the opposite call for the same field and said why:
+    HxExtension refuses to initialise without `-Dhx.halt_sentinel` because an
+    extension that went live without one "would have two of the three paths
+    spec s4 promises, silently". This is that refusal, on this side.
+    """
+    with pytest.raises(TypeError, match="operator_halt"):
+        server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1")
+    # And an explicit None, which is the same fail-open with a keystroke in
+    # front of it. The signature cannot catch that one; the constructor does,
+    # and it does it before start() rather than at the first send.
+    with pytest.raises(server.BridgeError, match="operator_halt is required"):
+        server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
+                            operator_halt=None)
+
+
+def test_socket_and_directory_permissions(tmp_path, halt):
+    s = server.BridgeServer(tmp_path / "sub" / "b.sock", engagement_id="e-1",
+                            operator_halt=halt)
     s.start()
     try:
         assert stat.S_IMODE(s.socket_path.stat().st_mode) == 0o600
@@ -59,8 +126,9 @@ def test_socket_and_directory_permissions(tmp_path):
         s.stop()
 
 
-def test_stop_unlinks_the_socket(tmp_path):
-    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1")
+def test_stop_unlinks_the_socket(tmp_path, halt):
+    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
+                            operator_halt=halt)
     s.start()
     path = s.socket_path
     assert path.exists()
@@ -68,10 +136,10 @@ def test_stop_unlinks_the_socket(tmp_path):
     assert not path.exists()
 
 
-def test_refuses_to_start_if_the_path_already_exists(tmp_path):
+def test_refuses_to_start_if_the_path_already_exists(tmp_path, halt):
     p = tmp_path / "b.sock"
     p.write_text("squatter")
-    s = server.BridgeServer(p, engagement_id="e-1")
+    s = server.BridgeServer(p, engagement_id="e-1", operator_halt=halt)
     with pytest.raises(server.BridgeError, match="exists"):
         s.start()
 
@@ -492,6 +560,15 @@ def test_halt_and_resume_refuse_to_commit_after_a_reset_in_the_gap(srv):
         finally:
             del srv._send          # fall back to the real bound method
             c.close()
+            # The first pass really arms the durable halt -- operator_halt is
+            # required now, so `srv` has a live one and halt() arms it before
+            # the send it is about to fail on. The second pass would then be
+            # met by _reassert_halt on its hello and never see "connected",
+            # which is the halt working as designed and not what THIS test is
+            # about: the subject here is the send-then-mutate guard on the
+            # bridge. Durability has its own tests, two of them directly
+            # below the send path section.
+            srv.operator_halt.resume()
 
 
 def test_halt_and_resume_commit_on_the_happy_path(srv):
@@ -881,38 +958,18 @@ def test_a_non_denying_configure_error_leaves_state_alone(srv):
 
 
 # ---- the send path, the halted frame, and the durable halt ----------------
-#
-# Everything below drives a REAL OperatorHalt against a real engagement
-# database. A stub would hide the guarantee these tests exist for: the bridge
-# reads `halted` and `reason` from its read thread, and the store connection
-# they would otherwise touch belongs to another thread entirely.
 
 
 @pytest.fixture
-def store(tmp_path):
-    root = tmp_path / "engagement"
-    secure_mkdir(root)
-    conn = db_mod.connect(root / "hx.db")
-    db_mod.init_schema(conn)
-    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
-                 " VALUES('e-1','Example','Example Ltd',1,'active')")
-    conn.execute("INSERT INTO run(id, engagement_id, kind, safety_profile,"
-                 " started_us, status)"
-                 " VALUES('r-1','e-1','manual','production',1700000000000000,"
-                 "'running')")
-    yield root, conn
-    conn.close()
+def srv_with_halt(srv, halt, store):
+    """The `srv` fixture, plus the halt and the store it was built over.
 
-
-@pytest.fixture
-def srv_with_halt(tmp_path, store):
-    root, conn = store
-    oh = halt_mod.OperatorHalt(root, conn)
-    s = server.BridgeServer(tmp_path / "b.sock", engagement_id="e-1",
-                            operator_halt=oh)
-    s.start()
-    yield s, oh, conn
-    s.stop()
+    These used to be a second server built by hand, from the days when
+    `operator_halt` was optional and only this half of the file passed one.
+    It is required now, so `srv` already has a real one and this is just the
+    unpacking the twenty tests below read.
+    """
+    return srv, halt, store[1]
 
 
 def _hello(c, engagement_id="e-1"):

@@ -2,10 +2,45 @@ import hashlib
 
 import pytest
 
+from hx import halt as halt_mod
 from hx.bridge import server
+from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 from tests.integration import burp_fixture as bf
 
 pytestmark = pytest.mark.integration
+
+
+def _operator_halt(workdir, engagement_id):
+    """`BridgeServer` requires one -- the same call HxExtension makes about
+    `-Dhx.halt_sentinel`, for the same field. A harness with no engagement of
+    its own supplies a sentinel in a directory of its own, which is what this
+    builds.
+
+    NOTE for the integration task, from measuring these two against the real
+    container on 2026-08-23. Both fail today, for two separate reasons, and
+    both failures predate this function -- the pristine tree fails the same
+    way:
+
+      1. Burp 2026.7.3 dies during startup under this machine's JRE 26 with
+         `java.lang.Error: no ComponentUI class for: burp.Zc7w`, before the
+         extension is loaded at all. That is what the current failure is.
+      2. Behind it, `bf.launch_burp` does not pass `-Dhx.halt_sentinel`, and
+         HxExtension.initialize() refuses to come up without it ("extension
+         idle"). Even with a working JVM the handshake could not complete
+         until the fixture hands the JVM `oh.sentinel_path`.
+
+    Neither is this fix round's to repair. This function exists so the Python
+    half is already correct when they are.
+    """
+    root = workdir / "engagement"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+                 " VALUES(?,'Integration','Integration',1,'active')",
+                 (engagement_id,))
+    return halt_mod.OperatorHalt(root, conn)
 
 
 @pytest.mark.skipif(not bf.burp_available(),
@@ -16,7 +51,9 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
     Fakes prove the logic; only this proves Burp actually loads the extension
     and that the socket handshake works end to end.
     """
-    srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-integration")
+    srv = server.BridgeServer(
+        tmp_path / "hx.sock", engagement_id="e-integration",
+        operator_halt=_operator_halt(tmp_path, "e-integration"))
     srv.start()
     proc = None
     try:
@@ -67,7 +104,9 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     "reconnect, not an outage" half, which is this plan's headline claim and
     was otherwise exercised against fakes alone.
     """
-    srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-restart")
+    srv = server.BridgeServer(
+        tmp_path / "hx.sock", engagement_id="e-restart",
+        operator_halt=_operator_halt(tmp_path, "e-restart"))
     srv.start()
     proc = proc2 = None
     try:
