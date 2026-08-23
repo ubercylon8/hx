@@ -9337,6 +9337,7 @@ Forty-eight checks, in the project's hand-rolled runner — `check(String, boole
 // extension/test/hx/send/RedactorTest.java
 package hx.send;
 
+import hx.TestSupport;
 import hx.policy.HxRequest;
 
 import java.nio.charset.StandardCharsets;
@@ -9353,6 +9354,14 @@ public class RedactorTest {
         if (!ok) failures++;
     }
 
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(RedactorTest::check, name, body);
+    }
+
     static void expectThrows(String what, Class<?> type, Runnable body) {
         try {
             body.run();
@@ -9362,33 +9371,33 @@ public class RedactorTest {
         }
     }
 
-    public static void main(String[] args) throws Exception {
-        anEmptyRegistryLeavesTheRequestVerbatim();
-        aRegisteredRangeBecomesTheIdentityPlaceholder();
-        theBytesOnTheWireAreNeverTouched();
-        twoRangesAreBothReplacedWhateverOrderTheyWereRegisteredIn();
-        overlappingRangesAreRefusedAndAbuttingOnesAreNot();
-        aRangePastTheEndIsRefusedNotTruncated();
-        degenerateRangesAreRefused();
-        clearDropsTheRegistry();
-        rangesAreNotSharedAcrossThreads();
+    public static void main(String[] args) {
+        t("anEmptyRegistryLeavesTheRequestVerbatim", RedactorTest::anEmptyRegistryLeavesTheRequestVerbatim);
+        t("aRegisteredRangeBecomesTheIdentityPlaceholder", RedactorTest::aRegisteredRangeBecomesTheIdentityPlaceholder);
+        t("theBytesOnTheWireAreNeverTouched", RedactorTest::theBytesOnTheWireAreNeverTouched);
+        t("twoRangesAreBothReplacedWhateverOrderTheyWereRegisteredIn", RedactorTest::twoRangesAreBothReplacedWhateverOrderTheyWereRegisteredIn);
+        t("overlappingRangesAreRefusedAndAbuttingOnesAreNot", RedactorTest::overlappingRangesAreRefusedAndAbuttingOnesAreNot);
+        t("aRangePastTheEndIsRefusedNotTruncated", RedactorTest::aRangePastTheEndIsRefusedNotTruncated);
+        t("degenerateRangesAreRefused", RedactorTest::degenerateRangesAreRefused);
+        t("clearDropsTheRegistry", RedactorTest::clearDropsTheRegistry);
+        t("rangesAreNotSharedAcrossThreads", RedactorTest::rangesAreNotSharedAcrossThreads);
 
-        anUnmanagedAuthorizationIsNamed();
-        credentialHeaderMatchingIsCaseInsensitive();
-        credentialDetectionSurvivesATurkishLocale();
-        theNamedHeaderDoesNotDependOnMapOrder();
-        aWholeNameMustMatchNotAPrefix();
-        aRequestWithoutACredentialHeaderIsNull();
+        t("anUnmanagedAuthorizationIsNamed", RedactorTest::anUnmanagedAuthorizationIsNamed);
+        t("credentialHeaderMatchingIsCaseInsensitive", RedactorTest::credentialHeaderMatchingIsCaseInsensitive);
+        t("credentialDetectionSurvivesATurkishLocale", RedactorTest::credentialDetectionSurvivesATurkishLocale);
+        t("theNamedHeaderDoesNotDependOnMapOrder", RedactorTest::theNamedHeaderDoesNotDependOnMapOrder);
+        t("aWholeNameMustMatchNotAPrefix", RedactorTest::aWholeNameMustMatchNotAPrefix);
+        t("aRequestWithoutACredentialHeaderIsNull", RedactorTest::aRequestWithoutACredentialHeaderIsNull);
 
-        setCookieValuesAreReplacedAndAttributesKept();
-        everySetCookieHeaderIsRedacted();
-        setCookieMatchingIsCaseInsensitive();
-        aDeletionCookieKeepsItsEmptyValue();
-        aCookiePairWithNoEqualsIsRedactedWhole();
-        aFoldedContinuationOfASetCookieIsRedacted();
-        theResponseBodyIsNeverRewritten();
+        t("setCookieValuesAreReplacedAndAttributesKept", RedactorTest::setCookieValuesAreReplacedAndAttributesKept);
+        t("everySetCookieHeaderIsRedacted", RedactorTest::everySetCookieHeaderIsRedacted);
+        t("setCookieMatchingIsCaseInsensitive", RedactorTest::setCookieMatchingIsCaseInsensitive);
+        t("aDeletionCookieKeepsItsEmptyValue", RedactorTest::aDeletionCookieKeepsItsEmptyValue);
+        t("aCookiePairWithNoEqualsIsRedactedWhole", RedactorTest::aCookiePairWithNoEqualsIsRedactedWhole);
+        t("aFoldedContinuationOfASetCookieIsRedacted", RedactorTest::aFoldedContinuationOfASetCookieIsRedacted);
+        t("theResponseBodyIsNeverRewritten", RedactorTest::theResponseBodyIsNeverRewritten);
 
-        redactionHappensBeforeHashing();
+        t("redactionHappensBeforeHashing", RedactorTest::redactionHappensBeforeHashing);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
