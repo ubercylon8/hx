@@ -1505,6 +1505,41 @@ def test_direct_config_construction_round_trips_through_dumps_and_load(tmp_path:
     p = tmp_path / "config.yaml"
     p.write_text(config.dumps(cfg), encoding="utf-8")
     assert config.load(p) == cfg
+
+
+def test_a_blank_entry_in_a_string_list_is_refused(tmp_path: Path):
+    """A stray blank line in scope.exclude takes the engagement to deny-all.
+
+    The extension already fails closed on it -- an empty pattern makes
+    Rule.forExclude throw and the whole decision becomes scope_denied -- so the
+    run stops rather than proceeding unprotected. That is the right direction
+    and it is pinned on the Java side. The cost is that the operator learns
+    mid-run, from a refusal, that a config written hours ago has a blank line
+    in it. Catching it at load time is the same answer, delivered when it is
+    cheap to act on.
+    """
+    head = 'name: a\nclient: b\n'
+    for body in (
+        'scope:\n  include:\n    - ""\n',
+        'scope:\n  include: ["https://a/*"]\n  exclude:\n    - ""\n',
+        'scope:\n  include: ["https://a/*"]\ndangerous_paths:\n  - "   "\n',
+        'scope:\n  include: ["https://a/*"]\nrender_allow:\n  - ""\n',
+    ):
+        p = _write(tmp_path, head + body)
+        with pytest.raises(config.ConfigError, match=r"\[0\] is blank"):
+            config.load(p)
+
+
+def test_a_deliberately_empty_list_is_still_allowed(tmp_path: Path):
+    """The blank-ENTRY guard must not become a no-empty-LISTS guard.
+
+    An explicitly written empty list is the operator saying so in the file,
+    which the spec requires to stay possible and reviewable. Only a blank entry
+    inside a list is meaningless.
+    """
+    p = _write(tmp_path, 'name: a\nclient: b\nscope:\n  include: ["https://a/*"]\n  exclude: []\n')
+    cfg = config.load(p)
+    assert cfg.scope_exclude == []
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1600,6 +1635,18 @@ def _string_list(raw: dict, key: str, default: list[str]) -> list[str]:
         raise ConfigError(f"{key} must be a list, got {type(v).__name__}")
     if not all(isinstance(x, str) for x in v):
         raise ConfigError(f"every entry in {key} must be a string")
+    for i, x in enumerate(v):
+        if not x.strip():
+            # A blank entry means nothing to any consumer, and in a scope list
+            # it is actively dangerous: the extension refuses an empty pattern
+            # outright -- Rule.forExclude("") throws and the whole decision
+            # becomes scope_denied -- so one stray blank line in scope.exclude
+            # takes the engagement to deny-all mid-run. Failing closed there is
+            # right; failing HERE is better, because the operator finds out at
+            # `hx new` instead of after the first refusal.
+            raise ConfigError(
+                f"{key}[{i}] is blank; remove the entry or give it a value"
+            )
     return list(v)
 
 

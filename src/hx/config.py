@@ -82,6 +82,18 @@ def _string_list(raw: dict, key: str, default: list[str]) -> list[str]:
         raise ConfigError(f"{key} must be a list, got {type(v).__name__}")
     if not all(isinstance(x, str) for x in v):
         raise ConfigError(f"every entry in {key} must be a string")
+    for i, x in enumerate(v):
+        if not x.strip():
+            # A blank entry means nothing to any consumer, and in a scope list
+            # it is actively dangerous: the extension refuses an empty pattern
+            # outright -- Rule.forExclude("") throws and the whole decision
+            # becomes scope_denied -- so one stray blank line in scope.exclude
+            # takes the engagement to deny-all mid-run. Failing closed there is
+            # right; failing HERE is better, because the operator finds out at
+            # `hx new` instead of after the first refusal.
+            raise ConfigError(
+                f"{key}[{i}] is blank; remove the entry or give it a value"
+            )
     return list(v)
 
 
