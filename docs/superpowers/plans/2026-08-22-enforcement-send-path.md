@@ -19079,11 +19079,19 @@ suite, with no JVM anywhere near it.
 # tests/test_target_server.py
 """The instrument, checked before anything is measured with it.
 
-Six assertions in tests/integration/test_send_path.py are of the form "the
-target server never received this request". Every one of them passes forever
-if the request log records nothing -- which is the failure this file exists to
-make impossible. It is in the FAST suite on purpose: it needs a loopback
-socket and a few milliseconds, not a 900 MB JVM.
+Assertion after assertion in tests/integration/test_send_path.py is of the
+form "the target server never received this request" -- deliberately, because
+that and "an error came back" are different claims and only the first is S4's
+invariant. Every one of them passes forever if the request log records
+nothing, or if the method never reached a handler, or if `hits_for` selects
+nothing: those are the failures this file exists to make impossible. It is in
+the FAST suite on purpose: it needs a loopback socket and a few milliseconds,
+not a 900 MB JVM.
+
+Deliberately NOT a count of those assertions. This file used to open with one
+and it was wrong by three; a number that has to be re-counted by hand every
+time a test is added is the same claim-that-nobody-checks the whole branch has
+been removing.
 
 One test here is not about the log at all. This server CLOSES every
 connection, and that is the only reason a send through Burp costs 0.27 ms
@@ -19192,6 +19200,140 @@ def test_the_routes_the_gate_should_refuse_are_recorded_too(target):
         ("POST", "/api/orders"),
     ]
     assert target.hits[1].body == b'{"total":"1.00"}'
+
+
+def _request(server: ts.TargetServer, method: str, path: str):
+    """One request by an arbitrary method, read to EOF.
+
+    http.client refuses to read a body for HEAD, so this speaks the protocol
+    directly: the point of several of the tests below is exactly what the
+    server does or does not put on the wire.
+    """
+    sock = socket.create_connection((server.host, server.port), timeout=5)
+    chunks = []
+    try:
+        sock.sendall(f"{method} {path} HTTP/1.1\r\nHost: {server.host}\r\n\r\n"
+                     .encode("iso-8859-1"))
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        sock.close()
+    return b"".join(chunks)
+
+
+def test_every_method_the_gate_can_be_asked_for_is_recorded(target):
+    """The allowlist names GET, HEAD and OPTIONS; POST and DELETE are what it
+    refuses. All five have to land in this log, because a request the gate
+    LET THROUGH by mistake is exactly the one nobody would think to add a
+    handler for -- and see the test below for what happens without one."""
+    for method in ("GET", "HEAD", "OPTIONS", "POST", "DELETE"):
+        _request(target, method, "/api/orders")
+
+    assert [(h.method, h.path) for h in target.hits] == [
+        (m, "/api/orders")
+        for m in ("GET", "HEAD", "OPTIONS", "POST", "DELETE")
+    ]
+
+
+def test_a_method_with_no_handler_answers_501_and_leaves_no_trace(target):
+    """The instrument's one blind spot, pinned rather than discovered later.
+
+    BaseHTTPRequestHandler answers a method it has no `do_*` for from
+    handle_one_request, which never reaches `_dispatch` -- so the request is
+    answered and NOT recorded. That is the whole reason _Handler carries a
+    do_* per method this suite can encounter rather than only the ones it
+    expects to succeed. A method added to `method.allow` without a handler
+    here would make "the target never received it" true by construction.
+    """
+    raw = _request(target, "PUT", "/api/orders")
+    assert b" 501 " in raw, raw
+    assert target.hits == [], (
+        "if this ever starts recording, delete this test and the comment on "
+        "_Handler.do_GET -- the blind spot it warns about would be closed")
+
+
+def test_head_is_answered_without_a_body(target):
+    """RFC 9110 s9.3.2, and `_reply`'s one conditional. A HEAD that carried a
+    body would desynchronise any client reading by Content-Length."""
+    raw = _request(target, "HEAD", "/api/orders")
+    head, sep, body = raw.partition(b"\r\n\r\n")
+    assert sep, raw
+    assert body == b"", raw
+    # The length is still ANNOUNCED, which is what makes the absence of the
+    # body a protocol property rather than an empty resource.
+    assert b"Content-Length: 41" in head, head
+
+
+def test_hits_for_selects_by_path_and_ignores_the_query(target):
+    """Six counts in the integration suite are taken from this. A hits_for
+    that answered [] would make every one of them pass forever."""
+    _get(target, "/health")
+    _get(target, "/slow?ms=1&status=200")
+    _get(target, "/slow?ms=1&status=500")
+
+    assert [h.path for h in target.hits_for("/slow")] == ["/slow", "/slow"]
+    assert [h.query for h in target.hits_for("/slow")] == \
+        ["ms=1&status=200", "ms=1&status=500"]
+    assert len(target.hits_for("/health")) == 1
+    assert target.hits_for("/api/orders") == []
+    # Not a prefix match and not a substring match: `/slow` must not collect
+    # a hit on `/slowest`, or a count taken from it silently includes traffic
+    # from another route.
+    assert target.hits_for("/slo") == []
+    assert target.hits_for("/health?x=1") == []
+
+
+def test_the_hints_route_puts_interim_heads_in_front_of_the_real_answer(target):
+    """The exchange spec s4's 20% rule has to survive.
+
+    A CDN in front of a failing origin sends `103 Early Hints` and then the
+    origin's 500. Montoya parses the FIRST head as the response, so a status
+    read off the transport is 103 and every one of the origin's 500s records
+    as healthy -- which is what Sender.finalStatus exists to correct and what
+    the integration suite proves end to end. This is the instrument that
+    produces the exchange, checked here where it costs milliseconds.
+    """
+    raw = _request(target, "GET", "/hints?n=1&status=500")
+    assert raw.startswith(ts.INTERIM_HEAD), raw
+    after = raw[len(ts.INTERIM_HEAD):]
+    assert after.startswith(b"HTTP/1.0 500 "), after
+    assert after.endswith(b'{"hinted": true}'), after
+    assert [(h.method, h.path) for h in target.hits] == [("GET", "/hints")]
+
+
+def test_the_hints_route_emits_the_number_asked_for_and_no_more(target):
+    """`n` is what makes both sides of Sender.MAX_INTERIM_HEADS reachable: a
+    scan that reads the final head, and one that runs out of budget and must
+    answer STATUS_UNREADABLE rather than the peer's chosen 1xx.
+
+    The clamp is the same guard as MAX_DELAY_S -- a typo must cost a failure,
+    not a wedged run -- and it is asserted rather than assumed, because a
+    route that silently emitted `n` heads for any n is a route a hostile
+    number controls.
+    """
+    for n in (0, 1, 9):
+        server = ts.TargetServer("127.0.0.1")
+        server.start()
+        try:
+            raw = _request(server, "GET", f"/hints?n={n}&status=200")
+        finally:
+            server.stop()
+        assert raw.count(ts.INTERIM_HEAD) == n, (n, raw)
+        assert raw.count(b"HTTP/1.0 200 ") == 1, raw
+
+    server = ts.TargetServer("127.0.0.1")
+    server.start()
+    try:
+        raw = _request(server, "GET", "/hints?n=100000")
+    finally:
+        server.stop()
+    assert raw.count(ts.INTERIM_HEAD) == ts.MAX_HINT_HEADS, raw
+    assert ts.MAX_HINT_HEADS > 8, (
+        "MAX_HINT_HEADS must stay clear of Sender.MAX_INTERIM_HEADS (8) or "
+        "the exhausted-scan case stops being reachable from this route")
 
 
 def test_a_request_header_is_recorded_verbatim(target):
@@ -19342,6 +19484,28 @@ SESSION_COOKIE_VALUE = "s3cr3t-live-session-2f9a41c0"
 # seconds of every fast run.
 MAX_DELAY_S = 5.0
 
+# The most interim `103 Early Hints` heads /hints will emit, whatever `n`
+# says. Same reason as MAX_DELAY_S: a typo in a query string must cost a
+# failure rather than a wedged run.
+#
+# 16, and deliberately NOT read from Sender.MAX_INTERIM_HEADS, which is 8. The
+# number under test and the number a test computes its input from must be two
+# numbers -- a route that clamped to the extension's own constant would emit
+# exactly as many heads as the scan tolerates however that constant moved, and
+# the exhaustion case would stop being reachable without a word. 16 is enough
+# for the far side of 8 with room to spare, and small enough that an absurd
+# `n` is bounded well short of anything that could look like a response body.
+MAX_HINT_HEADS = 16
+
+# One interim head, byte for byte. HTTP/1.1 because a 1xx is a 1.1 feature;
+# the FINAL head that follows it is HTTP/1.0, which is what makes this server
+# close (see _Handler.protocol_version), and the two versions differing is
+# the point rather than an oversight -- Sender.statusCodeOf reads the code out
+# of any line beginning `HTTP/`, and the response a real CDN puts in front of
+# a failing origin is assembled from two hops that need not agree either.
+INTERIM_HEAD = (b"HTTP/1.1 103 Early Hints\r\n"
+                b"Link: </static/app.css>; rel=preload; as=style\r\n\r\n")
+
 
 @dataclass(frozen=True)
 class Hit:
@@ -19413,6 +19577,16 @@ class _Handler(BaseHTTPRequestHandler):
         is how a failure gets diagnosed.
         """
 
+    # One do_* per method this suite can encounter, and they are NOT
+    # ceremony. BaseHTTPRequestHandler answers a method it has no do_* for
+    # with a 501 from handle_one_request, which never reaches _dispatch and
+    # therefore leaves NO HIT -- so the log would be blind precisely where it
+    # matters most, on a method the gate was supposed to refuse. GET, HEAD and
+    # OPTIONS are what `method.allow` permits; POST and DELETE are what it
+    # forbids, and the forbidden ones are the reason this list is not just
+    # GET. tests/test_target_server.py exercises all five and pins the 501
+    # blind spot, so a method added to the allowlist without a handler here
+    # goes red in the fast suite.
     def do_GET(self):
         self._dispatch("GET")
 
@@ -19465,6 +19639,20 @@ class _Handler(BaseHTTPRequestHandler):
             ])
         elif parts.path == "/flaky":
             self._reply(_int_param(params, "status", 500), {"error": "upstream"})
+        elif parts.path == "/hints":
+            # `n` interim heads, then the real answer. This is a CDN in front
+            # of a failing origin, which is the exchange spec s4's 20% rule
+            # has to survive: Montoya parses the FIRST head as the response
+            # and reports its 103, so a status read off the transport records
+            # a healthy sample for every one of the origin's 500s and the
+            # auto-halt never fires. Sender.finalStatus reads the bytes
+            # instead. Written straight to the wire because
+            # BaseHTTPRequestHandler has no notion of an interim response;
+            # `wfile` is unbuffered (socketserver's wbufsize is 0), so these
+            # heads are on the socket before _reply's are.
+            for _ in range(min(_int_param(params, "n", 1), MAX_HINT_HEADS)):
+                self.wfile.write(INTERIM_HEAD)
+            self._reply(_int_param(params, "status", 500), {"hinted": True})
         elif parts.path == "/slow":
             time.sleep(min(_int_param(params, "ms", 250) / 1000.0,
                            self.server.target.max_delay_s))
@@ -19561,11 +19749,19 @@ class TargetServer:
             return list(self._hits)
 
     def hits_for(self, path: str) -> list[Hit]:
+        """Every hit on `path`, ignoring the query string.
+
+        Six assertions in the integration suite are counts taken from this,
+        so a version of it that answered `[]` would make all six vacuous --
+        which is why tests/test_target_server.py covers it in the FAST suite,
+        where it costs milliseconds rather than a JVM.
+        """
         return [hit for hit in self.hits if hit.path == path]
 
-    def clear(self) -> None:
-        with self._lock:
-            self._hits.clear()
+    # There is deliberately no clear(). The log is the one witness this
+    # project's denial assertions cannot fake, every test gets a server of its
+    # own, and nothing has ever needed to erase it -- so a method whose only
+    # possible effect is to empty it is a loaded gun pointed at the evidence.
 ```
 
 - [ ] **Step 4: Run it and watch it pass**
@@ -19745,6 +19941,48 @@ from hx.bridge import codec, server
 from hx.halt import OperatorHalt
 from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    """Say out loud that the only real-Burp tests in this repo did not run.
+
+    They stay deselected, and that is a decision rather than an oversight:
+    they cost 53 s and a 900 MB JVM, so putting them in the default run makes
+    every fast iteration five times slower.
+
+    What is NOT acceptable is the way that decision reads. These two files
+    were dark for a full day -- Task 6 made `-Dhx.halt_sentinel` mandatory
+    without updating the launch fixture, both real-Burp tests timed out after
+    90 s each, and every suite run in between reported green. The failure was
+    never that they did not run; it was that `9 deselected` reads as somebody
+    having scoped a run deliberately, and gives a reader no reason to suspect
+    that the only tests in this repository which touch a real Burp, a real
+    socket and a real target server are among them.
+
+    So the default run says which ones, and how to run them. Cost if this is
+    ever wrong: one line of output.
+
+    This hook fires because a conftest is imported during COLLECTION even on a
+    run that then deselects everything in its directory -- the same property
+    the module docstring above warns about, used deliberately for once.
+    """
+    # Selected by MARKER, not by a substring of the node id. The drift check
+    # is parametrised with plan-block markers, five of which are paths under
+    # tests/integration/, so a node-id match counted seven of those as
+    # real-Burp tests and announced them on a run that had just executed all
+    # ten. A line that miscounts what is not running is the same defect this
+    # line exists to fix, one level up.
+    deselected = [
+        item for item in terminalreporter.stats.get("deselected", [])
+        if getattr(item, "get_closest_marker", None)
+        and item.get_closest_marker("integration") is not None
+    ]
+    if not deselected:
+        return
+    terminalreporter.write_line(
+        f"NOT RUN: {len(deselected)} integration tests -- the only tests here "
+        "that drive a real Burp. Run them with: pytest -m integration",
+        yellow=True)
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -20721,25 +20959,113 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
     assert after_resume is not None and after_resume.error_class == "halted", (
         "a resume frame un-did an auto-halt; distress has no reset by design. "
         f"The send answered {_classes([after_resume])[0]!r}")
+
+
+def test_early_hints_do_not_hide_a_failing_origin_from_the_auto_halt(rig):
+    """The two spec amendments, against a real Burp rather than a fake.
+
+    `dfc2080` (finalStatus) and `a188d0d` (the `status_unreadable`
+    discriminator) were both written from a MEASUREMENT of Montoya's
+    behaviour: on a 103-then-200 exchange `response().statusCode()` answers
+    103 while `toByteArray()` carries BOTH heads. Everything downstream of
+    that measurement was proved against fakes in SenderTest. This is the one
+    place the measurement itself is re-confirmed, and it matters because the
+    exchange it describes is not exotic -- it is a CDN in front of a failing
+    origin, and the failure mode is that spec S4's 20% rule NEVER FIRES
+    because every sample it counted was a 103.
+
+    Three claims, in the order they have to hold:
+
+      1. one interim head, then a 500: the frame says 500 and `outcome: ok`,
+         and the bytes attached to it carry both heads. The status was read
+         out of the RESPONSE, not off the transport.
+      2. nine interim heads -- one past Sender.MAX_INTERIM_HEADS: 599 with
+         `outcome: status_unreadable`. The scan ran out of budget rather than
+         out of bytes, and it says which, because 599 is not reserved and a
+         peer may send it for itself.
+      3. the consequence. Distress counts the CORRECTED 500, so a run against
+         this host aborts. That is the whole reason (1) is not merely
+         cosmetic.
+    """
+    rig.configure()
+
+    frames: list[dict] = []
+    # Appended, not acted on -- same reason as the /slow test next door: this
+    # callback runs on the bridge's read-loop thread and the store connection
+    # belongs to the thread that owns the run.
+    rig.srv.on_halted = frames.append
+
+    # 1. The transport reports the interim head; the frame reports the origin.
+    reply = rig.get("/hints?n=1&status=500")
+    assert (reply["status"], reply["outcome"]) == (500, "ok"), (
+        "the status on the evidence line came off the TRANSPORT, which parsed "
+        f"the 103 as the response: {reply['status']} / {reply['outcome']!r}")
+    raw = reply[server.BridgeServer.BODY_KEY]
+    assert raw.startswith(b"HTTP/1.1 103 Early Hints"), raw[:64]
+    assert b"HTTP/1.0 500 " in raw, raw[:256]
+
+    # 2. Past the budget, and the discriminator that keeps this 599 apart
+    #    from a peer's own. `status` stays 599 in both, by design -- the
+    #    conservative-for-auto-halt property must not come to depend on
+    #    anyone reading a second field -- so `outcome` is what carries it.
+    reply = rig.get("/hints?n=9&status=500")
+    assert (reply["status"], reply["outcome"]) == (599, "status_unreadable"), (
+        "a scan that ran out of BUDGET must not report the peer's chosen 1xx, "
+        "and must say that is what happened: "
+        f"{reply['status']} / {reply['outcome']!r}")
+    assert records.STATUS_UNREADABLE == reply["status"], (
+        "the harness and the extension disagree about the sentinel status")
+    # It is still recordable, which is the other half of the amendment: this
+    # pair is the ONE that record_exchange cross-checks.
+    req_blob, _ = rig.eng.blobs.put(rig.last_request)
+    resp_blob, _ = rig.eng.blobs.put(reply[server.BridgeServer.BODY_KEY])
+    assert records.record_exchange(
+        rig.eng.db, run_id=rig.run_id, method="GET",
+        url=f"{rig.target.origin}/hints", status=reply["status"],
+        outcome=reply["outcome"], req_blob=req_blob, resp_blob=resp_blob,
+        ms=reply["ms"], at_us=engagement.now_us()).startswith("x-")
+
+    # 3. The consequence, and the reason any of this is worth a test. Every
+    #    sample below is a 103 on the wire; Distress counts them as the 500s
+    #    they really are, and the run is aborted.
+    seen = _issue_until(rig, "/hints?n=1&status=500", want="halted")
+    assert seen[-1] == "halted", seen
+    assert set(seen[:-1]) == {500}, (
+        "a sample that was not the origin's 500 reached Distress: "
+        f"{sorted(set(seen[:-1]), key=str)}")
+    # Ten ANSWERED samples on the host is the earliest the 5xx rule may fire,
+    # and the two probes above are two of them, so the count is taken from
+    # the target's own log rather than from this loop's length.
+    answered = len(rig.target.hits_for("/hints"))
+    assert answered >= 10, \
+        f"the 5xx rule needs ten answered samples before it may trip; got {answered}"
+
+    assert bf.wait_for(lambda: bool(frames), timeout=10), (
+        "early hints in front of a failing origin did not trip the auto-halt "
+        "-- which is the exact failure Sender.finalStatus exists to prevent")
+    assert "5xx rate" in frames[0]["reason"], frames[0]
+    assert frames[0]["host"] == rig.target.host, frames[0]
 ```
 
 - [ ] **Step 9: Run the integration suite and watch it pass**
 
 Run: `cd /path/to/hx && extension/build.sh && python -m pytest -m integration -q`
 
-Expected: PASS — `9 passed`, in about a minute: 55 s measured, of which 39 s
-is this file's seven tests and the rest is the two handshake tests in
-`tests/integration/test_real_burp.py`. Almost all of it is Burp: every test
-pays its own ~4.5 s of startup, and only three wait on anything else -- the
-rate-limit test on ~1 s of real window, the sentinel test on a real 500 ms
-poller (1.9 s), and the auto-halt test on a real rolling window plus the rate
-limit it trips five times on the way to ten samples (3.1 s). The sends
-themselves are not the cost: 0.57 ms p50 end to end against a target that
-closes its connections, where the first draft of this task measured ~1.003 s
-each and put "three to five minutes" here. (The budget test waits on nothing
-at all -- its limit has no clock in it.)
+Expected: PASS — `10 passed`, in about a minute: 62 s measured, of which ~53 s
+is this file's eight tests and the rest is the two handshake tests in
+`tests/integration/test_real_burp.py`. (It was `9 passed` in 55 s until fix
+wave 2 added the early-hints test; that one pays a Burp start plus a real
+rolling distress window.) Almost all of it is Burp: every test pays its own
+~4.5 s of startup, and only four wait on anything else -- the rate-limit test
+on ~1 s of real window, the sentinel test on a real 500 ms poller (1.9 s), and
+the two auto-halt tests on a real rolling window plus the rate limit they trip
+several times on the way to ten samples (3.1 s each). The sends themselves are
+not the cost: 0.57 ms p50 end to end against a target that closes its
+connections, where the first draft of this task measured ~1.003 s each and put
+"three to five minutes" here. (The budget test waits on nothing at all -- its
+limit has no clock in it.)
 
-`9 skipped` is not a pass. Read the reason it prints and fix that first.
+`10 skipped` is not a pass. Read the reason it prints and fix that first.
 
 - [ ] **Step 10: Sabotage — widen the scope so the out-of-scope target is in it**
 

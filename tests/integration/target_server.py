@@ -44,6 +44,28 @@ SESSION_COOKIE_VALUE = "s3cr3t-live-session-2f9a41c0"
 # seconds of every fast run.
 MAX_DELAY_S = 5.0
 
+# The most interim `103 Early Hints` heads /hints will emit, whatever `n`
+# says. Same reason as MAX_DELAY_S: a typo in a query string must cost a
+# failure rather than a wedged run.
+#
+# 16, and deliberately NOT read from Sender.MAX_INTERIM_HEADS, which is 8. The
+# number under test and the number a test computes its input from must be two
+# numbers -- a route that clamped to the extension's own constant would emit
+# exactly as many heads as the scan tolerates however that constant moved, and
+# the exhaustion case would stop being reachable without a word. 16 is enough
+# for the far side of 8 with room to spare, and small enough that an absurd
+# `n` is bounded well short of anything that could look like a response body.
+MAX_HINT_HEADS = 16
+
+# One interim head, byte for byte. HTTP/1.1 because a 1xx is a 1.1 feature;
+# the FINAL head that follows it is HTTP/1.0, which is what makes this server
+# close (see _Handler.protocol_version), and the two versions differing is
+# the point rather than an oversight -- Sender.statusCodeOf reads the code out
+# of any line beginning `HTTP/`, and the response a real CDN puts in front of
+# a failing origin is assembled from two hops that need not agree either.
+INTERIM_HEAD = (b"HTTP/1.1 103 Early Hints\r\n"
+                b"Link: </static/app.css>; rel=preload; as=style\r\n\r\n")
+
 
 @dataclass(frozen=True)
 class Hit:
@@ -115,6 +137,16 @@ class _Handler(BaseHTTPRequestHandler):
         is how a failure gets diagnosed.
         """
 
+    # One do_* per method this suite can encounter, and they are NOT
+    # ceremony. BaseHTTPRequestHandler answers a method it has no do_* for
+    # with a 501 from handle_one_request, which never reaches _dispatch and
+    # therefore leaves NO HIT -- so the log would be blind precisely where it
+    # matters most, on a method the gate was supposed to refuse. GET, HEAD and
+    # OPTIONS are what `method.allow` permits; POST and DELETE are what it
+    # forbids, and the forbidden ones are the reason this list is not just
+    # GET. tests/test_target_server.py exercises all five and pins the 501
+    # blind spot, so a method added to the allowlist without a handler here
+    # goes red in the fast suite.
     def do_GET(self):
         self._dispatch("GET")
 
@@ -167,6 +199,20 @@ class _Handler(BaseHTTPRequestHandler):
             ])
         elif parts.path == "/flaky":
             self._reply(_int_param(params, "status", 500), {"error": "upstream"})
+        elif parts.path == "/hints":
+            # `n` interim heads, then the real answer. This is a CDN in front
+            # of a failing origin, which is the exchange spec s4's 20% rule
+            # has to survive: Montoya parses the FIRST head as the response
+            # and reports its 103, so a status read off the transport records
+            # a healthy sample for every one of the origin's 500s and the
+            # auto-halt never fires. Sender.finalStatus reads the bytes
+            # instead. Written straight to the wire because
+            # BaseHTTPRequestHandler has no notion of an interim response;
+            # `wfile` is unbuffered (socketserver's wbufsize is 0), so these
+            # heads are on the socket before _reply's are.
+            for _ in range(min(_int_param(params, "n", 1), MAX_HINT_HEADS)):
+                self.wfile.write(INTERIM_HEAD)
+            self._reply(_int_param(params, "status", 500), {"hinted": True})
         elif parts.path == "/slow":
             time.sleep(min(_int_param(params, "ms", 250) / 1000.0,
                            self.server.target.max_delay_s))
@@ -263,8 +309,16 @@ class TargetServer:
             return list(self._hits)
 
     def hits_for(self, path: str) -> list[Hit]:
+        """Every hit on `path`, ignoring the query string.
+
+        Six assertions in the integration suite are counts taken from this,
+        so a version of it that answered `[]` would make all six vacuous --
+        which is why tests/test_target_server.py covers it in the FAST suite,
+        where it costs milliseconds rather than a JVM.
+        """
         return [hit for hit in self.hits if hit.path == path]
 
-    def clear(self) -> None:
-        with self._lock:
-            self._hits.clear()
+    # There is deliberately no clear(). The log is the one witness this
+    # project's denial assertions cannot fake, every test gets a server of its
+    # own, and nothing has ever needed to erase it -- so a method whose only
+    # possible effect is to empty it is a loaded gun pointed at the evidence.

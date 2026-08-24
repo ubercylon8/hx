@@ -36,6 +36,48 @@ from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer
 
 
+def pytest_terminal_summary(terminalreporter) -> None:
+    """Say out loud that the only real-Burp tests in this repo did not run.
+
+    They stay deselected, and that is a decision rather than an oversight:
+    they cost 53 s and a 900 MB JVM, so putting them in the default run makes
+    every fast iteration five times slower.
+
+    What is NOT acceptable is the way that decision reads. These two files
+    were dark for a full day -- Task 6 made `-Dhx.halt_sentinel` mandatory
+    without updating the launch fixture, both real-Burp tests timed out after
+    90 s each, and every suite run in between reported green. The failure was
+    never that they did not run; it was that `9 deselected` reads as somebody
+    having scoped a run deliberately, and gives a reader no reason to suspect
+    that the only tests in this repository which touch a real Burp, a real
+    socket and a real target server are among them.
+
+    So the default run says which ones, and how to run them. Cost if this is
+    ever wrong: one line of output.
+
+    This hook fires because a conftest is imported during COLLECTION even on a
+    run that then deselects everything in its directory -- the same property
+    the module docstring above warns about, used deliberately for once.
+    """
+    # Selected by MARKER, not by a substring of the node id. The drift check
+    # is parametrised with plan-block markers, five of which are paths under
+    # tests/integration/, so a node-id match counted seven of those as
+    # real-Burp tests and announced them on a run that had just executed all
+    # ten. A line that miscounts what is not running is the same defect this
+    # line exists to fix, one level up.
+    deselected = [
+        item for item in terminalreporter.stats.get("deselected", [])
+        if getattr(item, "get_closest_marker", None)
+        and item.get_closest_marker("integration") is not None
+    ]
+    if not deselected:
+        return
+    terminalreporter.write_line(
+        f"NOT RUN: {len(deselected)} integration tests -- the only tests here "
+        "that drive a real Burp. Run them with: pytest -m integration",
+        yellow=True)
+
+
 def _reap(proc: subprocess.Popen) -> None:
     proc.kill()
     try:

@@ -771,3 +771,88 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
         "a resume frame un-did an auto-halt; distress has no reset by design. "
         f"The send answered {_classes([after_resume])[0]!r}")
 
+
+def test_early_hints_do_not_hide_a_failing_origin_from_the_auto_halt(rig):
+    """The two spec amendments, against a real Burp rather than a fake.
+
+    `dfc2080` (finalStatus) and `a188d0d` (the `status_unreadable`
+    discriminator) were both written from a MEASUREMENT of Montoya's
+    behaviour: on a 103-then-200 exchange `response().statusCode()` answers
+    103 while `toByteArray()` carries BOTH heads. Everything downstream of
+    that measurement was proved against fakes in SenderTest. This is the one
+    place the measurement itself is re-confirmed, and it matters because the
+    exchange it describes is not exotic -- it is a CDN in front of a failing
+    origin, and the failure mode is that spec S4's 20% rule NEVER FIRES
+    because every sample it counted was a 103.
+
+    Three claims, in the order they have to hold:
+
+      1. one interim head, then a 500: the frame says 500 and `outcome: ok`,
+         and the bytes attached to it carry both heads. The status was read
+         out of the RESPONSE, not off the transport.
+      2. nine interim heads -- one past Sender.MAX_INTERIM_HEADS: 599 with
+         `outcome: status_unreadable`. The scan ran out of budget rather than
+         out of bytes, and it says which, because 599 is not reserved and a
+         peer may send it for itself.
+      3. the consequence. Distress counts the CORRECTED 500, so a run against
+         this host aborts. That is the whole reason (1) is not merely
+         cosmetic.
+    """
+    rig.configure()
+
+    frames: list[dict] = []
+    # Appended, not acted on -- same reason as the /slow test next door: this
+    # callback runs on the bridge's read-loop thread and the store connection
+    # belongs to the thread that owns the run.
+    rig.srv.on_halted = frames.append
+
+    # 1. The transport reports the interim head; the frame reports the origin.
+    reply = rig.get("/hints?n=1&status=500")
+    assert (reply["status"], reply["outcome"]) == (500, "ok"), (
+        "the status on the evidence line came off the TRANSPORT, which parsed "
+        f"the 103 as the response: {reply['status']} / {reply['outcome']!r}")
+    raw = reply[server.BridgeServer.BODY_KEY]
+    assert raw.startswith(b"HTTP/1.1 103 Early Hints"), raw[:64]
+    assert b"HTTP/1.0 500 " in raw, raw[:256]
+
+    # 2. Past the budget, and the discriminator that keeps this 599 apart
+    #    from a peer's own. `status` stays 599 in both, by design -- the
+    #    conservative-for-auto-halt property must not come to depend on
+    #    anyone reading a second field -- so `outcome` is what carries it.
+    reply = rig.get("/hints?n=9&status=500")
+    assert (reply["status"], reply["outcome"]) == (599, "status_unreadable"), (
+        "a scan that ran out of BUDGET must not report the peer's chosen 1xx, "
+        "and must say that is what happened: "
+        f"{reply['status']} / {reply['outcome']!r}")
+    assert records.STATUS_UNREADABLE == reply["status"], (
+        "the harness and the extension disagree about the sentinel status")
+    # It is still recordable, which is the other half of the amendment: this
+    # pair is the ONE that record_exchange cross-checks.
+    req_blob, _ = rig.eng.blobs.put(rig.last_request)
+    resp_blob, _ = rig.eng.blobs.put(reply[server.BridgeServer.BODY_KEY])
+    assert records.record_exchange(
+        rig.eng.db, run_id=rig.run_id, method="GET",
+        url=f"{rig.target.origin}/hints", status=reply["status"],
+        outcome=reply["outcome"], req_blob=req_blob, resp_blob=resp_blob,
+        ms=reply["ms"], at_us=engagement.now_us()).startswith("x-")
+
+    # 3. The consequence, and the reason any of this is worth a test. Every
+    #    sample below is a 103 on the wire; Distress counts them as the 500s
+    #    they really are, and the run is aborted.
+    seen = _issue_until(rig, "/hints?n=1&status=500", want="halted")
+    assert seen[-1] == "halted", seen
+    assert set(seen[:-1]) == {500}, (
+        "a sample that was not the origin's 500 reached Distress: "
+        f"{sorted(set(seen[:-1]), key=str)}")
+    # Ten ANSWERED samples on the host is the earliest the 5xx rule may fire,
+    # and the two probes above are two of them, so the count is taken from
+    # the target's own log rather than from this loop's length.
+    answered = len(rig.target.hits_for("/hints"))
+    assert answered >= 10, \
+        f"the 5xx rule needs ten answered samples before it may trip; got {answered}"
+
+    assert bf.wait_for(lambda: bool(frames), timeout=10), (
+        "early hints in front of a failing origin did not trip the auto-halt "
+        "-- which is the exact failure Sender.finalStatus exists to prevent")
+    assert "5xx rate" in frames[0]["reason"], frames[0]
+    assert frames[0]["host"] == rig.target.host, frames[0]
