@@ -4901,6 +4901,16 @@ public class BridgeClientTest {
             boolean threw = false;
             try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { threw = true; }
             check("checkMaySend throws NotConfigured before configure", threw);
+            // ...and the other side of the overload: an operator who has not
+            // configured is not an extension fault, so the prefix must NOT be
+            // there. A marker every not_configured carries marks nothing.
+            String beforeConfigure = null;
+            try { client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { beforeConfigure = e.getMessage(); }
+            check("and an unconfigured operator is not marked an extension fault ("
+                  + beforeConfigure + ")",
+                  beforeConfigure != null
+                  && !beforeConfigure.contains(BridgeClient.EXTENSION_FAULT));
 
             // 3. configure -> configured, with an epoch
             Map<String, Object> cfg = new LinkedHashMap<>();
@@ -5739,6 +5749,16 @@ public class BridgeClientTest {
                   "not_configured".equals(err.header.get("class")));
             check("and the detail names the failure",
                   String.valueOf(err.header.get("detail")).contains("policy table was null"));
+            // The class is OVERLOADED: `not_configured` is also what an
+            // operator who has not configured gets, and records.DENIAL_KIND
+            // files both under kind='not_configured'. So a store query
+            // grouping by kind reads a crashed send path as an unauthorised
+            // run unless the DETAIL says otherwise, in a form a consumer can
+            // test for rather than parse prose out of.
+            check("and it is marked as the EXTENSION's fault, not the operator's ("
+                  + err.header.get("detail") + ")",
+                  String.valueOf(err.header.get("detail"))
+                          .startsWith(BridgeClient.EXTENSION_FAULT));
 
             waitUntil(() -> !l.client.maySend());
             check("a send path that threw drops to DENY-ALL", !l.client.maySend());
@@ -5759,6 +5779,10 @@ public class BridgeClientTest {
             check("a send with no handler is refused",
                   "error".equals(err.header.get("t"))
                   && "not_configured".equals(err.header.get("class")));
+            check("and marked as the extension's fault rather than the operator's ("
+                  + err.header.get("detail") + ")",
+                  String.valueOf(err.header.get("detail"))
+                          .startsWith(BridgeClient.EXTENSION_FAULT));
 
             // The input that separates the guard from its absence, and the
             // class alone is not it: delete the null check and h.handle()
@@ -5987,6 +6011,28 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class BridgeClient {
 
     public static final long PROTOCOL_VERSION = 1L;
+
+    /**
+     * What a `not_configured` detail says when the extension is at fault
+     * rather than the operator.
+     *
+     * `not_configured` is OVERLOADED, and spec s6 and docs/bridge-protocol.md
+     * both record the overload: it is the class for "no configure has been
+     * acknowledged" AND for a send path that threw or was never installed.
+     * The two readings are opposite instructions. The first says an operator
+     * has not authorised the run yet and the second says this jar is broken,
+     * and only the second is a reason to look at a stack trace.
+     *
+     * That matters at the store, not just at the console. `records.DENIAL_KIND`
+     * maps this class to `kind='not_configured'`, so both file the same row
+     * and `SELECT kind, COUNT(*) FROM denial GROUP BY kind` reads a crash as
+     * an unauthorised run. The class cannot be split without amending s6's
+     * enumeration, which is a protocol change; the DETAIL can carry it today,
+     * and a prefix carries it in a form a consumer can test for rather than
+     * one it has to parse prose out of. `records.EXTENSION_FAULT` is the same
+     * string on the Python side.
+     */
+    public static final String EXTENSION_FAULT = "extension fault: ";
 
     public static class NotConfigured extends RuntimeException {
         public NotConfigured(String m) { super(m); }
@@ -6457,7 +6503,10 @@ public final class BridgeClient {
                 SendHandler h = sendHandler;
                 if (h == null) {
                     // "Nothing is wired up yet" is a state, not an exemption.
-                    error(f, "not_configured", "no send handler is installed");
+                    // EXTENSION_FAULT: this is not the operator failing to
+                    // configure -- see the constant.
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "no send handler is installed");
                     return true;
                 }
                 Map<String, Object> reply;
@@ -6479,7 +6528,8 @@ public final class BridgeClient {
                     // `ex`, not `t`: handle() already has a String t, the
                     // frame type it switched on.
                     log.error("hx: send handler threw, deny-all: " + ex);
-                    error(f, "not_configured", "send path failed internally: " + ex);
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "the send path threw: " + ex);
                     denyAll();
                     return false;
                 }

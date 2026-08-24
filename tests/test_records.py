@@ -1,3 +1,4 @@
+import pathlib
 import re
 import sqlite3
 from importlib import resources
@@ -117,12 +118,96 @@ def test_the_two_maps_overlap_exactly_where_the_precedence_note_says(conn):
     )
 
 
-def test_only_the_classes_that_did_leave_the_jvm_are_exchange_only():
-    """The other half of the correction. EXCHANGE_OUTCOME's comment claimed
-    all four of its entries had reached the far side of the bridge and failed
-    there; only these two ever did."""
+def test_the_two_classes_that_are_not_pre_issuance_are_not_post_issuance_either():
+    """This test used to say "only these two ever did [leave the JVM]", and
+    that was the false half of the same comment a second time.
+
+    Neither `timeout` nor `bridge_lost` says whether the request was issued.
+    MEASURED, driving the real Sender with an Http that counts its calls:
+
+        E1  past-deadline AND out-of-scope  ->  class=timeout  http.calls=0
+            detail: deadline passed 1000us before this frame was decided;
+                    not issued
+        E2  deadline expired MID-FLIGHT     ->  class=timeout  http.calls=1
+            detail: response arrived 1000us after the deadline
+
+    and `server._send` raises `bridge_lost` when `self._conn is None`, with
+    nothing written to any socket because there is no socket. So the two
+    classes EXCHANGE_OUTCOME names beyond PRE_ISSUANCE are exactly the two
+    that cannot be routed from their class -- which is what row_for() is for.
+    """
     assert set(records.EXCHANGE_OUTCOME) - records.PRE_ISSUANCE == \
-        {"timeout", "bridge_lost"}
+        records.AMBIGUOUS_ISSUANCE
+    assert records.AMBIGUOUS_ISSUANCE == {"timeout", "bridge_lost"}
+    assert not (records.AMBIGUOUS_ISSUANCE & records.PRE_ISSUANCE), (
+        "a class cannot be both settled-before-issuance and unknowable")
+
+
+def test_an_ambiguous_class_will_not_be_routed_without_being_told():
+    """The refusal itself. A default here is the module guessing, and the
+    guess a caller who had not thought about it would get is the one that
+    inflates requests_issued."""
+    for error_class in sorted(records.AMBIGUOUS_ISSUANCE):
+        with pytest.raises(ValueError, match="cannot be routed from the class"):
+            records.row_for(error_class)
+
+
+def test_a_never_issued_request_gets_no_exchange_row():
+    """S4's harm, closed. Plan 4 following EXCHANGE_OUTCOME writes a
+    `via='send'` exchange row for a request that never left the JVM;
+    `requests_issued` and every coverage number derived from it are then
+    inflated -- a report claiming reach the run never had."""
+    assert records.row_for("timeout", issued=False) is None
+    assert records.row_for("bridge_lost", issued=False) is None
+    # ...and the legitimate row is not lost with it. A response that arrived
+    # after the deadline is an exchange; something answered.
+    assert records.row_for("timeout", issued=True) == ("exchange", "timeout")
+    assert records.row_for("bridge_lost", issued=True) == \
+        ("exchange", "bridge_lost")
+
+
+def test_row_for_gets_the_precedence_right_where_reading_a_map_would_not():
+    """The two classes in BOTH maps are denials. Reading EXCHANGE_OUTCOME
+    directly answers "exchange" for them, which is the harm above by a
+    different route."""
+    for error_class in sorted(records.PRE_ISSUANCE):
+        assert records.row_for(error_class) == \
+            ("denial", records.DENIAL_KIND[error_class])
+        assert error_class in records.EXCHANGE_OUTCOME, (
+            "the premise of this test is that the map would say otherwise")
+
+
+def test_row_for_has_an_answer_for_every_error_class():
+    """The same guarantee test_every_error_class_has_somewhere_to_go makes
+    about the three sets, made about the function callers actually use."""
+    for error_class in sorted(ERROR_CLASSES):
+        kwargs = {"issued": True} if error_class in records.AMBIGUOUS_ISSUANCE else {}
+        records.row_for(error_class, **kwargs)     # must not raise
+    with pytest.raises(ValueError, match="not an error class"):
+        records.row_for("no_such_class")
+
+
+def test_the_extension_fault_marker_is_the_same_string_on_both_sides():
+    """`not_configured` is overloaded and only the detail separates the two
+    readings, so the marker is a wire contract between two languages.
+
+    A prefix each side spells for itself is a prefix that drifts, and the
+    failure is silent in the worst direction: a Python side testing for
+    "extension fault: " against a Java side emitting "extension-fault: " sees
+    every crashed send path as an unauthorised run, which is precisely the
+    confusion the marker was added to end.
+    """
+    java = (pathlib.Path(__file__).resolve().parents[1]
+            / "extension" / "src" / "hx" / "bridge" / "BridgeClient.java")
+    assert java.is_file(), java
+    declarations = re.findall(
+        r'public static final String EXTENSION_FAULT = "([^"]*)";', java.read_text())
+    assert declarations == [records.EXTENSION_FAULT], (
+        f"BridgeClient.java declares {declarations!r}; "
+        f"records.EXTENSION_FAULT is {records.EXTENSION_FAULT!r}")
+    # ...and it is actually USED at the two sites that mean "this jar is
+    # broken", rather than declared and forgotten.
+    assert java.read_text().count("EXTENSION_FAULT +") == 2
 
 
 def test_a_kind_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn):

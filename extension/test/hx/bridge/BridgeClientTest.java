@@ -191,6 +191,16 @@ public class BridgeClientTest {
             boolean threw = false;
             try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { threw = true; }
             check("checkMaySend throws NotConfigured before configure", threw);
+            // ...and the other side of the overload: an operator who has not
+            // configured is not an extension fault, so the prefix must NOT be
+            // there. A marker every not_configured carries marks nothing.
+            String beforeConfigure = null;
+            try { client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { beforeConfigure = e.getMessage(); }
+            check("and an unconfigured operator is not marked an extension fault ("
+                  + beforeConfigure + ")",
+                  beforeConfigure != null
+                  && !beforeConfigure.contains(BridgeClient.EXTENSION_FAULT));
 
             // 3. configure -> configured, with an epoch
             Map<String, Object> cfg = new LinkedHashMap<>();
@@ -1029,6 +1039,16 @@ public class BridgeClientTest {
                   "not_configured".equals(err.header.get("class")));
             check("and the detail names the failure",
                   String.valueOf(err.header.get("detail")).contains("policy table was null"));
+            // The class is OVERLOADED: `not_configured` is also what an
+            // operator who has not configured gets, and records.DENIAL_KIND
+            // files both under kind='not_configured'. So a store query
+            // grouping by kind reads a crashed send path as an unauthorised
+            // run unless the DETAIL says otherwise, in a form a consumer can
+            // test for rather than parse prose out of.
+            check("and it is marked as the EXTENSION's fault, not the operator's ("
+                  + err.header.get("detail") + ")",
+                  String.valueOf(err.header.get("detail"))
+                          .startsWith(BridgeClient.EXTENSION_FAULT));
 
             waitUntil(() -> !l.client.maySend());
             check("a send path that threw drops to DENY-ALL", !l.client.maySend());
@@ -1049,6 +1069,10 @@ public class BridgeClientTest {
             check("a send with no handler is refused",
                   "error".equals(err.header.get("t"))
                   && "not_configured".equals(err.header.get("class")));
+            check("and marked as the extension's fault rather than the operator's ("
+                  + err.header.get("detail") + ")",
+                  String.valueOf(err.header.get("detail"))
+                          .startsWith(BridgeClient.EXTENSION_FAULT));
 
             // The input that separates the guard from its absence, and the
             // class alone is not it: delete the null check and h.handle()

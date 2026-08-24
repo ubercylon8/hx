@@ -126,7 +126,12 @@ build the mapping the spec forbids.)
     rate_limited         slow down and retry; carries retry_after_us
     budget_exhausted     the run's request budget is spent
     not_configured       no configure has been acknowledged, or the send path
-                         failed internally
+                         threw or was never installed. OVERLOADED, and the
+                         `detail` is what separates the two: the extension's
+                         own faults prefix it with `extension fault: `, because
+                         "the operator has not authorised this run" and "this
+                         jar is broken" are opposite instructions and both land
+                         under the same `denial.kind`
     unmanaged_credential the request carries a credential header the extension
                          did not inject; refused AND never persisted
     transport_error      it was issued and no response came back

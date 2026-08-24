@@ -16417,7 +16417,10 @@ And add this arm to `handle()`, between `case "configure"` and `case "halt"`:
                 SendHandler h = sendHandler;
                 if (h == null) {
                     // "Nothing is wired up yet" is a state, not an exemption.
-                    error(f, "not_configured", "no send handler is installed");
+                    // EXTENSION_FAULT: this is not the operator failing to
+                    // configure -- see the constant.
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "no send handler is installed");
                     return true;
                 }
                 Map<String, Object> reply;
@@ -16439,7 +16442,8 @@ And add this arm to `handle()`, between `case "configure"` and `case "halt"`:
                     // `ex`, not `t`: handle() already has a String t, the
                     // frame type it switched on.
                     log.error("hx: send handler threw, deny-all: " + ex);
-                    error(f, "not_configured", "send path failed internally: " + ex);
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "the send path threw: " + ex);
                     denyAll();
                     return false;
                 }
@@ -16897,6 +16901,16 @@ existing `check`, `live`, `waitUntil` and `Live` helpers:
                   "not_configured".equals(err.header.get("class")));
             check("and the detail names the failure",
                   String.valueOf(err.header.get("detail")).contains("policy table was null"));
+            // The class is OVERLOADED: `not_configured` is also what an
+            // operator who has not configured gets, and records.DENIAL_KIND
+            // files both under kind='not_configured'. So a store query
+            // grouping by kind reads a crashed send path as an unauthorised
+            // run unless the DETAIL says otherwise, in a form a consumer can
+            // test for rather than parse prose out of.
+            check("and it is marked as the EXTENSION's fault, not the operator's ("
+                  + err.header.get("detail") + ")",
+                  String.valueOf(err.header.get("detail"))
+                          .startsWith(BridgeClient.EXTENSION_FAULT));
 
             waitUntil(() -> !l.client.maySend());
             check("a send path that threw drops to DENY-ALL", !l.client.maySend());
@@ -16917,6 +16931,10 @@ existing `check`, `live`, `waitUntil` and `Live` helpers:
             check("a send with no handler is refused",
                   "error".equals(err.header.get("t"))
                   && "not_configured".equals(err.header.get("class")));
+            check("and marked as the extension's fault rather than the operator's ("
+                  + err.header.get("detail") + ")",
+                  String.valueOf(err.header.get("detail"))
+                          .startsWith(BridgeClient.EXTENSION_FAULT));
 
             // The input that separates the guard from its absence, and the
             // class alone is not it: delete the null check and h.handle()
@@ -17222,6 +17240,7 @@ to correlate and no work to abandon.
 
 ```python
 # tests/test_records.py
+import pathlib
 import re
 import sqlite3
 from importlib import resources
@@ -17341,12 +17360,96 @@ def test_the_two_maps_overlap_exactly_where_the_precedence_note_says(conn):
     )
 
 
-def test_only_the_classes_that_did_leave_the_jvm_are_exchange_only():
-    """The other half of the correction. EXCHANGE_OUTCOME's comment claimed
-    all four of its entries had reached the far side of the bridge and failed
-    there; only these two ever did."""
+def test_the_two_classes_that_are_not_pre_issuance_are_not_post_issuance_either():
+    """This test used to say "only these two ever did [leave the JVM]", and
+    that was the false half of the same comment a second time.
+
+    Neither `timeout` nor `bridge_lost` says whether the request was issued.
+    MEASURED, driving the real Sender with an Http that counts its calls:
+
+        E1  past-deadline AND out-of-scope  ->  class=timeout  http.calls=0
+            detail: deadline passed 1000us before this frame was decided;
+                    not issued
+        E2  deadline expired MID-FLIGHT     ->  class=timeout  http.calls=1
+            detail: response arrived 1000us after the deadline
+
+    and `server._send` raises `bridge_lost` when `self._conn is None`, with
+    nothing written to any socket because there is no socket. So the two
+    classes EXCHANGE_OUTCOME names beyond PRE_ISSUANCE are exactly the two
+    that cannot be routed from their class -- which is what row_for() is for.
+    """
     assert set(records.EXCHANGE_OUTCOME) - records.PRE_ISSUANCE == \
-        {"timeout", "bridge_lost"}
+        records.AMBIGUOUS_ISSUANCE
+    assert records.AMBIGUOUS_ISSUANCE == {"timeout", "bridge_lost"}
+    assert not (records.AMBIGUOUS_ISSUANCE & records.PRE_ISSUANCE), (
+        "a class cannot be both settled-before-issuance and unknowable")
+
+
+def test_an_ambiguous_class_will_not_be_routed_without_being_told():
+    """The refusal itself. A default here is the module guessing, and the
+    guess a caller who had not thought about it would get is the one that
+    inflates requests_issued."""
+    for error_class in sorted(records.AMBIGUOUS_ISSUANCE):
+        with pytest.raises(ValueError, match="cannot be routed from the class"):
+            records.row_for(error_class)
+
+
+def test_a_never_issued_request_gets_no_exchange_row():
+    """S4's harm, closed. Plan 4 following EXCHANGE_OUTCOME writes a
+    `via='send'` exchange row for a request that never left the JVM;
+    `requests_issued` and every coverage number derived from it are then
+    inflated -- a report claiming reach the run never had."""
+    assert records.row_for("timeout", issued=False) is None
+    assert records.row_for("bridge_lost", issued=False) is None
+    # ...and the legitimate row is not lost with it. A response that arrived
+    # after the deadline is an exchange; something answered.
+    assert records.row_for("timeout", issued=True) == ("exchange", "timeout")
+    assert records.row_for("bridge_lost", issued=True) == \
+        ("exchange", "bridge_lost")
+
+
+def test_row_for_gets_the_precedence_right_where_reading_a_map_would_not():
+    """The two classes in BOTH maps are denials. Reading EXCHANGE_OUTCOME
+    directly answers "exchange" for them, which is the harm above by a
+    different route."""
+    for error_class in sorted(records.PRE_ISSUANCE):
+        assert records.row_for(error_class) == \
+            ("denial", records.DENIAL_KIND[error_class])
+        assert error_class in records.EXCHANGE_OUTCOME, (
+            "the premise of this test is that the map would say otherwise")
+
+
+def test_row_for_has_an_answer_for_every_error_class():
+    """The same guarantee test_every_error_class_has_somewhere_to_go makes
+    about the three sets, made about the function callers actually use."""
+    for error_class in sorted(ERROR_CLASSES):
+        kwargs = {"issued": True} if error_class in records.AMBIGUOUS_ISSUANCE else {}
+        records.row_for(error_class, **kwargs)     # must not raise
+    with pytest.raises(ValueError, match="not an error class"):
+        records.row_for("no_such_class")
+
+
+def test_the_extension_fault_marker_is_the_same_string_on_both_sides():
+    """`not_configured` is overloaded and only the detail separates the two
+    readings, so the marker is a wire contract between two languages.
+
+    A prefix each side spells for itself is a prefix that drifts, and the
+    failure is silent in the worst direction: a Python side testing for
+    "extension fault: " against a Java side emitting "extension-fault: " sees
+    every crashed send path as an unauthorised run, which is precisely the
+    confusion the marker was added to end.
+    """
+    java = (pathlib.Path(__file__).resolve().parents[1]
+            / "extension" / "src" / "hx" / "bridge" / "BridgeClient.java")
+    assert java.is_file(), java
+    declarations = re.findall(
+        r'public static final String EXTENSION_FAULT = "([^"]*)";', java.read_text())
+    assert declarations == [records.EXTENSION_FAULT], (
+        f"BridgeClient.java declares {declarations!r}; "
+        f"records.EXTENSION_FAULT is {records.EXTENSION_FAULT!r}")
+    # ...and it is actually USED at the two sites that mean "this jar is
+    # broken", rather than declared and forgotten.
+    assert java.read_text().count("EXTENSION_FAULT +") == 2
 
 
 def test_a_kind_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn):
@@ -17644,13 +17747,34 @@ DENIAL_KIND: dict[str, str] = {
 }
 DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 
-# Error class (spec S6) -> the `outcome` the exchange table accepts. TWO of
-# the four entries are requests that reached the far side of the bridge and
-# then failed. The other two are not, and this comment used to say they were:
+# The prefix a `not_configured` detail carries when the EXTENSION is at fault
+# rather than the operator.
 #
-#   timeout, bridge_lost    the request DID leave the JVM. Something answered
-#                           late, or the peer went away with it in flight, and
-#                           `exchange` is where that belongs.
+# `not_configured` is overloaded -- S6 and docs/bridge-protocol.md both record
+# it -- and the two readings are opposite instructions: "an operator has not
+# authorised this run yet" and "this jar is broken". Both map to
+# kind='not_configured' above, so without this
+#
+#     SELECT kind, COUNT(*) FROM denial GROUP BY kind
+#
+# reads a crashed send path as an unauthorised run. Splitting the CLASS needs
+# an S6 amendment; the detail carries it today, and a prefix carries it in a
+# form a consumer can test for. `BridgeClient.EXTENSION_FAULT` is the same
+# string on the Java side, and a test pins the pair.
+EXTENSION_FAULT = "extension fault: "
+
+# Error class (spec S6) -> the `outcome` the exchange table accepts WHEN THE
+# REQUEST WAS ISSUED. Two of the four entries are never issued; the other two
+# are sometimes, and the class alone does not say which. This comment has now
+# been wrong twice, in the same direction both times:
+#
+#   timeout, bridge_lost    "the request DID leave the JVM. Something answered
+#                           late, or the peer went away with it in flight."
+#                           TRUE of some of their emit sites and false of
+#                           others -- see AMBIGUOUS_ISSUANCE below, which is
+#                           where the measurements are and which is why
+#                           row_for() will not answer for either of these
+#                           without being told.
 #   scope_denied,           PRE-ISSUANCE refusals. Both come out of
 #   rate_limited            Policy.decide, which Sender.issue calls BEFORE
 #                           http.send -- S4's pinned decision order is
@@ -17686,6 +17810,43 @@ EXCHANGE_OUTCOME: dict[str, str] = {
 # denials; see the precedence note above. A test pins this against the real
 # intersection, so a third class landing in both cannot do it silently.
 PRE_ISSUANCE = frozenset({"scope_denied", "rate_limited"})
+
+# Error classes whose ONE name covers a request that left the JVM and a
+# request that never did. Nothing on the `error` frame separates them -- it
+# carries `{id, class, detail}` and nothing else -- so this module refuses to
+# route them from the class alone. See row_for().
+#
+# MEASURED, driving the real Sender with an Http that counts its calls:
+#
+#   E1  past-deadline AND out-of-scope   ->  class=timeout  http.calls=0
+#       detail: deadline passed 1000us before this frame was decided;
+#               not issued
+#   E2  deadline expired MID-FLIGHT      ->  class=timeout  http.calls=1
+#       detail: response arrived 1000us after the deadline
+#
+# E1 is `Sender.decideAndIssue`'s FIRST check, ahead of the Gate and ahead of
+# scope: the caller has already given up, and spending a rate token and a
+# budget slot on a request nothing is waiting for shortens the run for no
+# evidence. So it refuses before the JVM has done anything at all -- the same
+# family as `not_configured`, and an exchange row for it is a request the
+# report would claim was sent.
+#
+# `bridge_lost` straddles on the Python side and in three directions:
+#
+#   server._send, self._conn is None   nothing was written; there is no socket
+#                                      to have written to. VERIFIED: raises
+#                                      BridgeError(class='bridge_lost') with
+#                                      zero bytes on any wire.
+#   server._send, sendall() raised     a partial write is possible, so this
+#                                      one is genuinely unknown.
+#   the outstanding-send sweep on      the frame WAS written and the peer went
+#   disconnect                         away holding it.
+#
+# The harm is one-directional, which is why the refusal is worth its awkward
+# call site: filing a never-issued request as an exchange inflates
+# requests_issued and every coverage number derived from it, and a report
+# claiming reach the run never had is the failure this store exists to avoid.
+AMBIGUOUS_ISSUANCE = frozenset({"timeout", "bridge_lost"})
 # The exchange table's own vocabulary, which is wider than the map above: most
 # of these describe a request that SUCCEEDED, or failed in a way no error
 # class names. `status_unreadable` is one of those -- it arrives on a `result`
@@ -17767,6 +17928,56 @@ NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
 UNRECORDABLE = frozenset({"unmanaged_credential", "transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
                           "protocol_mismatch", "bad_config"})
+
+
+def row_for(error_class: str, *,
+            issued: bool | None = None) -> tuple[str, str] | None:
+    """Where one `error` frame's row goes, or None when it goes nowhere.
+
+    Returns ``("denial", kind)`` or ``("exchange", outcome)`` -- the value
+    ready for `record_denial(kind=...)` or `record_exchange(outcome=...)`.
+
+    THIS IS THE SUPPORTED WAY IN. Reading DENIAL_KIND or EXCHANGE_OUTCOME
+    directly gets the precedence wrong for the two classes in both, and gets
+    ISSUANCE wrong for the two in AMBIGUOUS_ISSUANCE -- and both mistakes fail
+    in the same direction, an exchange row for a request that was never sent.
+
+    `issued` says whether the request reached the wire. It is REQUIRED for a
+    class in AMBIGUOUS_ISSUANCE and ignored for every other, because for every
+    other the class already answers it. Raising rather than defaulting is the
+    point: a default here is this module guessing on the caller's behalf, and
+    the guess that inflates `requests_issued` is the one a caller who had not
+    thought about it would get.
+
+    An `issued=False` ambiguous class routes NOWHERE. `denial.kind`'s
+    vocabulary is Plan 1's and has no value for "the caller's deadline had
+    already passed", so the honest answer today is no row rather than a row
+    filed under a reason that is not the reason -- the same position
+    `unmanaged_credential` is in, and it belongs in the same schema migration.
+    """
+    if error_class in DENIAL_KIND:
+        # Precedence, and it is the whole reason this is a function: the two
+        # classes in PRE_ISSUANCE are in both maps.
+        return ("denial", DENIAL_KIND[error_class])
+    if error_class in AMBIGUOUS_ISSUANCE:
+        if issued is None:
+            raise ValueError(
+                f"{error_class!r} names both a request that left the JVM and "
+                "one that never did, so it cannot be routed from the class "
+                "alone; pass issued=True/False. See "
+                "records.AMBIGUOUS_ISSUANCE for the measured emit sites."
+            )
+        return ("exchange", EXCHANGE_OUTCOME[error_class]) if issued else None
+    if error_class in EXCHANGE_OUTCOME:
+        return ("exchange", EXCHANGE_OUTCOME[error_class])
+    if error_class in UNRECORDABLE:
+        return None
+    raise ValueError(
+        f"{error_class!r} is not an error class this module knows where to "
+        "put. Every class spec S6 lists is in exactly one of DENIAL_KIND, "
+        "EXCHANGE_OUTCOME and UNRECORDABLE; a new one has to be decided "
+        "about here rather than discarded."
+    )
 
 
 def new_id(prefix: str) -> str:
