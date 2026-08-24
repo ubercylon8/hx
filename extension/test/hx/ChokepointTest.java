@@ -20,9 +20,14 @@ import java.util.stream.Stream;
  * This one counts, over the whole of extension/src, so a path nobody thought
  * to test cannot exist quietly.
  *
- * WHETHER A NEEDLE READS COMMENTS IS PER-NEEDLE, AND EVERY ONE BELOW SAYS
- * WHICH KIND IT IS. There is no globally right answer -- both directions were
- * measured on this branch and both were wrong somewhere:
+ * WHETHER A NEEDLE READS PROSE IS PER-NEEDLE, AND EVERY ONE BELOW SAYS WHICH
+ * KIND IT IS. PROSE HERE IS COMMENTS AND STRING LITERALS BOTH: a needle blind
+ * to `// c.setHaltSource(x);` but satisfied by `"c.setHaltSource(x)"` is one
+ * syntax character from being supplied by prose either way, and that is what
+ * the six wire needles were for the few hours between the comment fix and the
+ * literal one -- see {@link #stripCommentsAndLiterals} for the measurement.
+ * There is no globally right answer, and both directions were measured on this
+ * branch and both were wrong somewhere:
  *
  *   - For a count that must be ZERO (the batch call, the deprecated
  *     accessors), a comment that spells the needle makes the count 1 and this
@@ -38,8 +43,9 @@ import java.util.stream.Stream;
  * opposite ways:
  *
  *   - A needle proving A WIRE EXISTS -- a call, a handler installation, a
- *     seam being connected -- must IGNORE comments, because prose cannot
- *     install anything. MEASURED, on this branch and against these very
+ *     seam being connected -- must IGNORE COMMENTS AND STRING LITERALS ALIKE,
+ *     because prose cannot install anything and quoting it does not change
+ *     that. MEASURED, on this branch and against these very
  *     checks: prefixing `//` to `c.setHaltSource(...)` and
  *     `c.setConfigGuard(...)` in HxExtension -- the commonest way a wire is
  *     lost -- left java at 9 x ALL PASS / 1592 ok / 0 FAIL (the count before
@@ -58,8 +64,9 @@ import java.util.stream.Stream;
  *     goes green the moment you follow the normal procedure is not what holds
  *     a wire in place. These read {@link #code}.
  *   - A needle proving AN OPTION IS SET -- a constant, an enum member, a
- *     flag -- must NOT be satisfiable by prose, so a comment naming it has to
- *     COUNT. Blinding {@link #redirectsAreNotFollowed} to comments would make
+ *     flag -- must NOT be satisfiable by prose, so a comment or a literal
+ *     naming it has to COUNT. Blinding {@link #redirectsAreNotFollowed} to
+ *     comments would make
  *     `// RedirectionMode.ALWAYS` invisible to the "exactly one mode is
  *     named" arm, and that arm is the entire reason the first one holds.
  *     These read {@link #text}, and narrowing the file they read is the other
@@ -109,8 +116,8 @@ public class ChokepointTest {
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
         t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
           () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
-        t("theCommentStripperIsNotVacuousAndDoesNotOverreach",
-          ChokepointTest::theCommentStripperIsNotVacuousAndDoesNotOverreach);
+        t("theStripperIsNotVacuousAndDoesNotOverreach",
+          ChokepointTest::theStripperIsNotVacuousAndDoesNotOverreach);
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
         t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
           () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
@@ -418,10 +425,10 @@ public class ChokepointTest {
      * failure being guarded against is the line being DELETED or never
      * written, not the line being wrong.
      *
-     * ALL SIX ARE WIRE-EXISTS NEEDLES, so they read {@link #code} and a
-     * comment cannot supply any of them. Until 2026-08-24 they read
-     * {@link #text}, and this test was the ONLY thing binding these lines to
-     * production: prefixing `//` to `c.setHaltSource(...)` and
+     * ALL SIX ARE WIRE-EXISTS NEEDLES, so they read {@link #code} and NEITHER
+     * A COMMENT NOR A STRING LITERAL can supply any of them. Until 2026-08-24
+     * they read {@link #text}, and this test was the ONLY thing binding these
+     * lines to production: prefixing `//` to `c.setHaltSource(...)` and
      * `c.setConfigGuard(...)` -- the commonest way a wire is lost -- left java
      * at 9 x ALL PASS / 1592 ok / 0 FAIL (the count before the stripper's own
      * test was added), integration at 13 passed and python at 376 passed once
@@ -429,7 +436,13 @@ public class ChokepointTest {
      * any file. F2 and F8, the two defects the round before last was held to
      * fix, were both silently back. Deleting the line and leaving
      * `// TODO(plan-6): re-enable c.setHaltSource(...)` behind was measured
-     * separately and was equally green.
+     * separately and was equally green. BLINDING THESE SIX TO COMMENTS ALONE
+     * WAS NOT ENOUGH, and the gap outlived that fix by a few hours: the same
+     * deletion with the TODO written as a STRING LITERAL -- `String todo =
+     * "re-enable c.setHaltSource(sender::issuanceHeldReason); later";` -- was
+     * still 9 x ALL PASS / 1602 ok / 0 FAIL here, this check printing (1). It
+     * is the same deleted wire, so it is the same F2. That is why
+     * {@link #code} blanks literal bodies as well.
      *
      * `setConfigGuard(` is the sharpest of the six because {@code ConfigGuard}
      * FAILS OPEN when uninstalled -- see BridgeClient.setConfigGuard for why
@@ -456,20 +469,31 @@ public class ChokepointTest {
     /**
      * The instrument, before anything is measured with it.
      *
-     * {@link #stripComments} is the whole of the fix above, and a stripper
-     * that quietly returned its input would leave every needle exactly as
-     * fail-open as it was, with six green checks saying otherwise. So it is
-     * driven directly, on a fixture that carries each needle shape rather than
-     * on a real file -- a real file that happened to contain no commented-out
-     * wire would satisfy a vacuous stripper too.
+     * {@link #stripCommentsAndLiterals} is the whole of the fix above, and a
+     * stripper that quietly returned its input would leave every needle
+     * exactly as fail-open as it was, with six green checks saying otherwise.
+     * So it is driven directly, on a fixture that carries each needle shape
+     * rather than on a real file -- a real file that happened to contain no
+     * commented-out wire would satisfy a vacuous stripper too.
      *
-     * BOTH failure directions are here. Under-stripping is the fail-open this
-     * exists to close. Over-running a string literal is the other one: `"//"`
-     * is a string, and a stripper that read it as a comment would blank
-     * everything after it -- turning the counts to zero and reddening this
-     * class for a reason with nothing to do with the wires.
+     * BOTH failure directions are here, and UNDER-STRIPPING HAS TWO SHAPES:
+     * a comment naming a wire, and a STRING LITERAL naming one. The literal
+     * is the shape this test asserted the WRONG WAY round until 2026-08-24 --
+     * it proved non-over-reach with `count(stripped, "setHaltSink(real)") ==
+     * 1`, a wire needle read out of a string literal, so the suite positively
+     * asserted that prose in quotes installs a wire. Every survivor that stands
+     * for non-over-reach below is now deliberately NOT a needle. The one needle
+     * still counted as a survivor -- `setHaltNotifier(` -- is REAL CODE, which
+     * is the count that has to stay 1 whatever else changes.
+     *
+     * Over-running a literal is the opposite failure: `"//"` is a string, and
+     * a stripper that read it as a comment would blank everything AFTER it --
+     * turning the counts to zero and reddening this class for a reason with
+     * nothing to do with the wires. That direction is now proved by the code
+     * that FOLLOWS each literal surviving, since the literal's own body no
+     * longer does.
      */
-    static void theCommentStripperIsNotVacuousAndDoesNotOverreach() {
+    static void theStripperIsNotVacuousAndDoesNotOverreach() {
         String src = String.join("\n",
             "class X {",
             "    // c.setHaltSource(gone);",
@@ -478,15 +502,16 @@ public class ChokepointTest {
             "     * TODO(plan-6): re-enable c.setSendHandler(gone);",
             "     */",
             "    void f() {",
+            "        String todo = \"re-enable c.setHaltSink(gone); later\";",
             "        String url = \"https://x/*y*/z\";",
             "        char slash = '/';",
-            "        String kept = \"setHaltSink(real)\";",
+            "        int afterTheLiterals = 42;",
             "        c.setHaltNotifier(real);   // and a trailing comment",
             "    }",
             "}");
-        String stripped = stripComments(src);
+        String stripped = stripCommentsAndLiterals(src);
 
-        // Not vacuous: every commented needle is gone.
+        // Not vacuous: every commented needle is gone...
         check("a // comment cannot supply a wire (" + count(stripped, "setHaltSource(") + ")",
               count(stripped, "setHaltSource(") == 0);
         check("nor can a /* */ comment (" + count(stripped, "setConfigGuard(") + ")",
@@ -496,19 +521,31 @@ public class ChokepointTest {
         check("nor can a comment trailing real code ("
               + count(stripped, "and a trailing comment") + ")",
               count(stripped, "and a trailing comment") == 0);
+        // ...and neither is a string literal, which is the half of "prose
+        // cannot install anything" this class was missing.
+        check("nor can a string literal naming a wire ("
+              + count(stripped, "setHaltSink(") + ")",
+              count(stripped, "setHaltSink(") == 0);
+        check("and the rest of that literal's body is gone with it ("
+              + count(stripped, "https://x") + ")", count(stripped, "https://x") == 0);
 
-        // ...and not over-reaching: the code is all still there.
+        // ...and not over-reaching: every line AFTER a literal is still there,
+        // literals carrying `//`, `/*` and a lone `/` included, and so are the
+        // delimiters that say where each literal was.
+        // Each of these three is the line AFTER one of the literals above,
+        // in order, so each says that literal was closed rather than run past.
+        check("a literal naming a wire is closed, not run past ("
+              + count(stripped, "String url = \"") + ")",
+              count(stripped, "String url = \"") == 1);
+        check("a `//` and a `/*` inside a string literal start no comment ("
+              + count(stripped, "char slash = '") + ")",
+              count(stripped, "char slash = '") == 1);
+        check("and a '/' character literal is not a comment either ("
+              + count(stripped, "int afterTheLiterals = 42;") + ")",
+              count(stripped, "int afterTheLiterals = 42;") == 1);
         check("the call before that trailing comment survives ("
               + count(stripped, "setHaltNotifier(") + ")",
               count(stripped, "setHaltNotifier(") == 1);
-        check("a `//` inside a string literal does not start a comment ("
-              + count(stripped, "https://x/*y*/z") + ")",
-              count(stripped, "https://x/*y*/z") == 1);
-        check("nor does a `/*` inside one, so what follows it survives ("
-              + count(stripped, "setHaltSink(real)") + ")",
-              count(stripped, "setHaltSink(real)") == 1);
-        check("and a '/' character literal is not a comment either ("
-              + count(stripped, "char slash") + ")", count(stripped, "char slash") == 1);
 
         // Offsets are preserved, which is what lets a position check read
         // this string and still be talking about the file.
@@ -540,18 +577,24 @@ public class ChokepointTest {
      * HxExtension cannot satisfy it.
      *
      * Offsets are taken in {@link #code} rather than {@link #text}, and
-     * {@link #stripComments} preserves length so they still point at the same
-     * places in the file. That closes one shape this used to miss, MEASURED
-     * with `// try { a decoy` inserted into montoyaHttp ahead of the real one:
+     * {@link #stripCommentsAndLiterals} preserves length so they still point
+     * at the same places in the file. That closes one shape this used to miss,
+     * MEASURED with `// try { a decoy` inserted into montoyaHttp ahead of the
+     * real one:
      *
      *     text()  the adapter opens a try (9214)   <- the COMMENT's
      *     code()  the adapter opens a try (9236)   <- the real one
      *
-     * 22 characters earlier, and every comparison below is `> guard`, so the
-     * lower number makes all four EASIER to satisfy -- prose deciding a
-     * position check, which is the same fail-open as prose supplying a wire.
-     * Both runs were green here, because the real try is still where it should
-     * be; the point is which `try {` the check was talking about.
+     * 22 characters earlier. There are FIVE checks below and the lower number
+     * does not move them all one way: THREE of them -- the HttpService, the
+     * HttpRequest and the egress call -- compare `> guard`, and a guard 22
+     * characters earlier makes those three EASIER to satisfy, which is prose
+     * deciding a position check and the same fail-open as prose supplying a
+     * wire. The fourth, `guard > adapter`, gets HARDER, and the fifth,
+     * `adapter >= 0`, does not involve the guard at all. Three EASIER is the
+     * whole of the concern: they are the ones asserting the calls are inside
+     * the try. Both runs were green here, because the real try is still where
+     * it should be; the point is which `try {` the check was talking about.
      *
      * WHAT IT DOES NOT SEE. These are FIRST-OCCURRENCE OFFSETS, not brace
      * nesting. MEASURED: a decoy `try { ... } catch (RuntimeException e) {
@@ -596,15 +639,17 @@ public class ChokepointTest {
         return Files.readString(p, StandardCharsets.UTF_8);
     }
 
-    /** The file's CODE: {@link #text} with every comment blanked out. For
-     *  needles proving a WIRE EXISTS, which a comment must not be able to
+    /** The file's CODE: {@link #text} with every comment, and the BODY of
+     *  every string and character literal, blanked out. For needles proving a
+     *  WIRE EXISTS, which neither a comment nor a literal must be able to
      *  supply. */
     static String code(Path p) throws IOException {
-        return stripComments(text(p));
+        return stripCommentsAndLiterals(text(p));
     }
 
     /**
-     * Java comments replaced by spaces, CHARACTER FOR CHARACTER.
+     * Java comments AND THE BODIES of string and character literals replaced
+     * by spaces, CHARACTER FOR CHARACTER.
      *
      * Blanked rather than deleted so every offset in the file survives: an
      * index taken in this string is an index into the original, which keeps
@@ -612,28 +657,57 @@ public class ChokepointTest {
      * meaningful and stops "which string was this offset from" ever being a
      * question. Newlines are kept for the same reason.
      *
-     * STRING AND CHARACTER LITERALS ARE CODE and are stepped over, escapes and
-     * text blocks included. `"https://x"` is not a comment, and a stripper that
-     * read it as one would blank the rest of the file and turn every count
-     * below to zero -- red, but red for a reason that has nothing to do with
-     * the wires, which is its own kind of broken instrument.
+     * THE LITERAL BODIES GO FOR THE SAME REASON THE COMMENTS DO: prose cannot
+     * install anything, and a string literal is prose. Blanking only comments
+     * left that principle one syntax character short. MEASURED against this
+     * class on 2026-08-24, with the real wire DELETED from HxExtension and a
+     * diagnostic naming it left behind:
+     *
+     *     String todo = "re-enable c.setHaltSource(sender::issuanceHeldReason); later";
+     *     api.logging().logToOutput(todo);
+     *
+     * ...java was 9 x ALL PASS / 1602 ok / 0 FAIL, with
+     * {@link #everyKillPathIsWiredBeforeTheDial} printing `and maySend() asks
+     * that same authority back (1)` -- the 1 supplied entirely by the literal.
+     * It is the same wire deleted the same way as the `//` measurement in that
+     * method, so it restores the same F2: maySend()/checkMaySend() fail-open
+     * against the sentinel file, the stalled poller and the auto-halt. A
+     * refactor that drops a wire and leaves a diagnostic naming it is not an
+     * exotic shape.
+     *
+     * THE DELIMITERS STAY and only what is between them goes, so `"x"` becomes
+     * `" "`. Nothing this class counts is spelled inside a literal in
+     * extension/src: measured across all 18 sources, every needle's count --
+     * whole-tree and entry-point -- is identical with the bodies blanked and
+     * without, and so is every offset, because the length does not move.
      *
      * It is a lexer, not a parser: it knows nothing of the code between the
      * literals and does not need to. What it must never do is under-strip (the
-     * fail-open this exists to close) or run past a literal (the noise above),
-     * and {@link #theCommentStripperIsNotVacuousAndDoesNotOverreach} drives
-     * both.
+     * fail-open this exists to close) or run PAST a literal's close, which
+     * would blank the real code after it -- red, but red for a reason that has
+     * nothing to do with the wires, which is its own kind of broken
+     * instrument. {@link #theStripperIsNotVacuousAndDoesNotOverreach} drives
+     * both directions.
      */
-    static String stripComments(String src) {
+    static String stripCommentsAndLiterals(String src) {
         char[] out = src.toCharArray();
         int n = out.length, i = 0;
         while (i < n) {
             char c = out[i];
             if (c == '"' || c == '\'') {
                 boolean block = c == '"' && i + 2 < n && out[i + 1] == '"' && out[i + 2] == '"';
-                i += block ? 3 : 1;
+                i += block ? 3 : 1;              // the opening delimiter is kept
                 while (i < n) {
-                    if (out[i] == '\\') { i += 2; continue; }
+                    if (out[i] == '\\') {
+                        // The escape and the character it escapes are ONE
+                        // unit. Blanking the backslash alone would leave a
+                        // bare `"` behind it that reads as the close, and
+                        // everything after the literal would be scanned as
+                        // if it were inside one.
+                        i = blank(out, i, n);
+                        i = blank(out, i, n);
+                        continue;
+                    }
                     if (block) {
                         if (out[i] == '"' && i + 2 < n && out[i + 1] == '"'
                                 && out[i + 2] == '"') { i += 3; break; }
@@ -642,10 +716,10 @@ public class ChokepointTest {
                         // An unterminated literal is not this class's problem
                         // to diagnose -- javac has already refused the file --
                         // but running to EOF looking for its close would blank
-                        // nothing after it. Stop at the line end.
+                        // the rest of the file. Stop at the line end.
                         if (out[i] == '\n') break;
                     }
-                    i++;
+                    i = blank(out, i, n);
                 }
                 continue;
             }
@@ -667,5 +741,13 @@ public class ChokepointTest {
             i++;
         }
         return new String(out);
+    }
+
+    /** One character blanked, and the next index. A NEWLINE IS NEVER BLANKED:
+     *  the line-count and length invariants this stripper is used under are
+     *  what keep an offset taken in its output an offset into the file. */
+    private static int blank(char[] out, int i, int n) {
+        if (i < n && out[i] != '\n') out[i] = ' ';
+        return i + 1;
     }
 }
