@@ -6825,28 +6825,43 @@ Restore the original order and re-run: `ALL PASS`.
 
 - [ ] **Step 9: Sabotage — the host is matched exactly**
 
-In `Policy.Rule.matches`, replace the exact host comparison
+In `Policy.Rule.authorityMatches`, replace the last line — the exact host comparison,
+the one the wildcard-suffix branch above it falls through to:
 
 ```java
-            } else if (!hostPattern.equals(t.host())) {
+            return hostPattern.equals(t.host());
 ```
 
-with the matcher someone writes when they are tired:
+with the matcher someone writes when they are tired, which is the wildcard branch's
+`endsWith` applied to a pattern that never asked for one:
 
 ```java
-            } else if (!t.host().endsWith(hostPattern)) {
+            return t.host().endsWith(hostPattern);
 ```
 
-Rebuild and run. This must go red:
+Rebuild and run. Exactly one check must go red, and it must be this one:
 
 ```
   FAIL nor a host that merely ends with the pattern -> scope_denied (got ALLOWED)
 ```
 
+Re-measured 2026-08-23 against the current file: `8 x ALL PASS`, `1466 ok`, that one FAIL
+and no other. (This step was written when the comparison lived in a method called
+`matches` and read `} else if (!hostPattern.equals(t.host())) {`. That method is gone —
+the authority half was split out into `authorityMatches` so the scheme, port and host
+comparisons are shared between the include and exclude paths — and the step quoted the old
+shape for long enough that it could no longer be performed as written. The sabotage itself
+was always the right one; only the line to change moved.)
+
 `ALLOWED`, not a different error class: `notapp.example.test` is a domain anyone can
 register, and under `endsWith` a scope of `https://app.example.test/*` authorises `hx` to
 send to it. The `contains` spelling of the same mistake is caught by the check above it,
 `a host with the pattern appended to another domain is out of scope`.
+
+Note what the wildcard branch does NOT let you skip. `hostSuffix` patterns keep their
+leading dot (`.example.test`), so their `endsWith` cannot match `notexample.test`; this
+sabotage is the same call applied to a pattern with no dot in front of it, which is
+exactly the difference the branch exists to hold.
 
 Restore and re-run: `ALL PASS`.
 
@@ -12604,8 +12619,7 @@ Add these two methods to `extension/test/hx/bridge/BridgeClientTest.java`, using
 existing `check`, `live`, `waitUntil` and `Live` helpers:
 
 ```java
-// added to extension/test/hx/bridge/BridgeClientTest.java, called from main()
-
+// extension/test/hx/bridge/BridgeClientTest.java -- haltFramesReachTheSwitchTheSendPathAsks(), added and called from main()
     /**
      * A `halt` frame has to reach the switch the SEND PATH asks.
      *
@@ -12646,7 +12660,15 @@ existing `check`, `live`, `waitUntil` and `Live` helpers:
             Files.deleteIfExists(dir.resolve("hs.sock")); Files.deleteIfExists(dir);
         }
     }
+```
 
+The second method does NOT sit next to the first in the finished file: Task 8 adds
+`aHaltFrameWithNoReasonDoesNotDeliverTheWordNull` between them. That is why these are
+two blocks rather than one -- an excerpt is compared as a contiguous run of the file,
+and one block spanning both would be comparable to nothing.
+
+```java
+// extension/test/hx/bridge/BridgeClientTest.java -- aHaltSinkThatThrowsDropsToDenyAll(), added and called from main()
     /** A halt that could not be delivered is an unknown state, and unknown is
      *  stop. Not "log it and carry on": the frame that was meant to stop
      *  issuance went nowhere. */
@@ -16421,8 +16443,7 @@ Add these to `extension/test/hx/bridge/BridgeClientTest.java`, using its
 existing `check`, `live`, `waitUntil` and `Live` helpers:
 
 ```java
-// added to extension/test/hx/bridge/BridgeClientTest.java, called from main()
-
+// extension/test/hx/bridge/BridgeClientTest.java -- the send arm's tests and the sendFrame/GET fixtures they share, added and called from main()
     static Map<String, Object> sendFrame(String engagement, long id) {
         Map<String, Object> s = new LinkedHashMap<>();
         s.put("v", 1L); s.put("t", "send"); s.put("id", id);
@@ -16456,7 +16477,10 @@ existing `check`, `live`, `waitUntil` and `Live` helpers:
 
             l.out.write(Frame.encode(sendFrame("e-1", 11L), GET));
             l.out.flush();
-            Frame.Decoded result = l.reader.read();
+            // Through this class's deadline wrapper, not a bare reader.read():
+            // a send arm that answers nothing parks here forever, and a class
+            // that prints no summary line reads as zero failures.
+            Frame.Decoded result = read(l.reader, l.peer, "the result frame");
 
             check("the send arm answers with the handler's frame",
                   "result".equals(result.header.get("t")));
@@ -16487,7 +16511,7 @@ existing `check`, `live`, `waitUntil` and `Live` helpers:
 
             l.out.write(Frame.encode(sendFrame("SOMEONE-ELSE", 12L), GET));
             l.out.flush();
-            Frame.Decoded err = l.reader.read();
+            Frame.Decoded err = read(l.reader, l.peer, "the engagement-mismatch error");
 
             check("a send for another engagement is answered with an error",
                   "error".equals(err.header.get("t")));
@@ -16495,6 +16519,31 @@ existing `check`, `live`, `waitUntil` and `Live` helpers:
                   "engagement_mismatch".equals(err.header.get("class")));
             check("and the handler was never called (" + calls[0] + ")", calls[0] == 0);
             check("the connection survives a mismatched send", l.client.maySend());
+
+            // A frame with NO engagement_id at all, which is a different input
+            // from a frame naming somebody else's. MEASURED before this block
+            // existed: teaching the check to skip an ABSENT key -- the shape a
+            // "tolerate an optional field" change produces -- left the whole
+            // Java suite at 9 x ALL PASS / 1407 ok / 0 FAIL, because every
+            // test here supplied the key.
+            //
+            // `engagementId.equals(null)` is false, so absent already refuses.
+            // That is the fail-closed direction and it is worth an input:
+            // s6 says EVERY send carries it, so a frame without one is not
+            // speaking this protocol and cannot be decided about at all.
+            Map<String, Object> noEngagement = sendFrame("e-1", 14L);
+            noEngagement.remove("engagement_id");
+            l.out.write(Frame.encode(noEngagement, GET));
+            l.out.flush();
+            Frame.Decoded absent = read(l.reader, l.peer, "the absent-engagement error");
+
+            check("a send with NO engagement_id is answered with an error",
+                  "error".equals(absent.header.get("t")));
+            check("the class names the mismatch for an absent id too (got "
+                  + absent.header.get("class") + ")",
+                  "engagement_mismatch".equals(absent.header.get("class")));
+            check("and the handler was still never called (" + calls[0] + ")", calls[0] == 0);
+            check("the connection survives that too", l.client.maySend());
         } finally {
             Files.deleteIfExists(dir.resolve("m.sock")); Files.deleteIfExists(dir);
         }
@@ -16512,7 +16561,7 @@ existing `check`, `live`, `waitUntil` and `Live` helpers:
 
             l.out.write(Frame.encode(sendFrame("e-1", 13L), GET));
             l.out.flush();
-            Frame.Decoded err = l.reader.read();
+            Frame.Decoded err = read(l.reader, l.peer, "the internal-failure error");
 
             check("a throwing handler still answers the caller",
                   "error".equals(err.header.get("t")));
@@ -16536,10 +16585,34 @@ existing `check`, `live`, `waitUntil` and `Live` helpers:
         try (Live l = live(dir, "n.sock")) {
             l.out.write(Frame.encode(sendFrame("e-1", 14L), GET));
             l.out.flush();
-            Frame.Decoded err = l.reader.read();
+            Frame.Decoded err = read(l.reader, l.peer, "the no-handler error");
             check("a send with no handler is refused",
                   "error".equals(err.header.get("t"))
                   && "not_configured".equals(err.header.get("class")));
+
+            // The input that separates the guard from its absence, and the
+            // class alone is not it: delete the null check and h.handle()
+            // NPEs, the send arm's catch answers the SAME not_configured
+            // class, and the two are indistinguishable from the error frame --
+            // measured green across all nine classes. What differs is what
+            // happens next. The catch drops to DENY-ALL and closes; the guard
+            // refuses one send and leaves a live client that a handler can
+            // still be installed on, which is what "a state, not an exemption"
+            // means.
+            l.client.setSendHandler((h, b, auth) -> {
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("v", 1L); r.put("t", "result"); r.put("id", h.get("id"));
+                r.put("status", 200L); r.put("outcome", "ok");
+                return r;
+            });
+            l.out.write(Frame.encode(sendFrame("e-1", 15L), GET));
+            l.out.flush();
+            Frame.Decoded then = read(l.reader, l.peer, "the result once a handler is installed");
+            check("a missing handler is not a bridge failure: the client is still live",
+                  l.client.maySend());
+            check("and the handler installed afterwards answers",
+                  "result".equals(then.header.get("t"))
+                  && Long.valueOf(15L).equals(then.header.get("id")));
         } finally {
             Files.deleteIfExists(dir.resolve("n.sock")); Files.deleteIfExists(dir);
         }

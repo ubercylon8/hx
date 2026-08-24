@@ -32,6 +32,16 @@ several classes -- is a NAMED exception in NOT_A_FILE below, and a test asserts
 that set is exactly what the plans contain. Silence is what this file exists to
 remove, so an unlisted one fails rather than being skipped.
 
+One entry left that list on 2026-08-23 by being FIXED rather than re-argued.
+Two blocks in Plan 3 were marked `added to ...BridgeClientTest.java, called from
+main()`, and the exception said no contiguous run of the file equalled either.
+That was true of one of them and not the other. Step 7's block holds two methods
+with a later task's test now between them in the repo, so it is two excerpts, and
+it is now two blocks with a sentence between them saying why. Step 16's block is
+one contiguous run of 173 lines and always was -- it was merely stale, four
+`l.reader.read()` calls that have since been given a deadline -- so it is one
+excerpt. All three are compared here now.
+
 A plan still being authored is a special case, and an honest one: it describes
 files it has not written yet. For a file it CREATES that is handled already --
 the block is skipped until the file exists. For a file it MODIFIES, the block
@@ -50,9 +60,13 @@ to delete or replace. Some of those quote the file and some are the state AFTER
 the mutation and are SUPPOSED to differ from it, and telling the two apart means
 reading the step's prose -- a different design than this file. All 17 were
 checked by hand on 2026-08-23: two were stale. One is now a marked block and is
-compared above; the other is Task 3's Step 9, which quotes a `Policy.Rule.matches`
-shape the file no longer has, and needs its sabotage rewritten rather than
-synced. It is still there.
+compared above. The other was Task 3's Step 9, which quoted a `Policy.Rule.matches`
+shape the file no longer had -- the authority comparison was split out into
+`authorityMatches`, so the step could not be performed as written. A sync could not
+have fixed that: the sabotage names a line to change, and the line had moved. It was
+rewritten against the current file and re-measured the same day -- one FAIL, the one
+the step names -- and it stays outside this check, because a sabotage block is the
+state AFTER a mutation and byte-comparing it to the file is exactly backwards.
 
 Deliberately NOT covered: bash blocks (`extension/build.sh`, `extension/test.sh`).
 `test.sh` is legitimately staged across tasks -- Task 2 shows it running one
@@ -89,15 +103,6 @@ NOT_A_FILE = {
     "contract sketch for src/hx/halt.py -- NOT the file, and deliberately":
         "says so in the marker: a contract, written before the file, and the "
         "file is compared by its own block a few steps later",
-    "added to extension/test/hx/bridge/BridgeClientTest.java, called from main()":
-        "a COMPOSITE excerpt -- several methods added to one file, with methods "
-        "added by later tasks now sitting between them in the repo. No contiguous "
-        "run of the file equals it, and re-syncing it as one run would pull a "
-        "later task's test into an earlier task's block, which is incident 1. "
-        "Measured 2026-08-23: the second of the two is stale -- four lines call "
-        "`l.reader.read()`, which has since been given a deadline, and a 26-line "
-        "check the repo has is absent. Splitting it into its contiguous pieces "
-        "would bring it under this check; nobody has.",
 }
 
 
