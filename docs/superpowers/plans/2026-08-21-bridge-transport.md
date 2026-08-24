@@ -6331,7 +6331,13 @@ public final class BridgeClient {
      * about stopping unanswered, where a config guard that is missing leaves
      * the pre-existing silent-ignore. Failing closed here would mean an
      * extension that cannot be configured at all, which is worse than the
-     * thing being fixed. ChokepointTest counts the wire instead.
+     * thing being fixed. ChokepointTest counts the wire instead -- and as of
+     * 2026-08-24 it counts it in CODE rather than raw text, which is the
+     * condition this default was accepted on. While that count read comments,
+     * `//c.setConfigGuard(...)` in HxExtension kept it at 1 and this guard's
+     * fail-open default meant the silent-ignore came back with the whole
+     * branch green: the weakest default and the weakest binding on the same
+     * seam. The default is fine BECAUSE the binding is not.
      *
      * A guard that THROWS is a refusal. It is asked about an operator's
      * intent, and an answer it could not produce is not permission.

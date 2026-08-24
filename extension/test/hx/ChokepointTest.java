@@ -20,19 +20,50 @@ import java.util.stream.Stream;
  * This one counts, over the whole of extension/src, so a path nobody thought
  * to test cannot exist quietly.
  *
- * It reads RAW TEXT, comments included, and that cuts BOTH ways. This javadoc
- * used to claim it was "the fail-safe direction"; it was measured, and it is
- * not.
+ * WHETHER A NEEDLE READS COMMENTS IS PER-NEEDLE, AND EVERY ONE BELOW SAYS
+ * WHICH KIND IT IS. There is no globally right answer -- both directions were
+ * measured on this branch and both were wrong somewhere:
  *
  *   - For a count that must be ZERO (the batch call, the deprecated
  *     accessors), a comment that spells the needle makes the count 1 and this
  *     test go RED. That direction is fail-safe: rewrite the comment, do not
- *     loosen the needle.
+ *     loosen the needle. These read RAW TEXT, via {@link #text}.
  *   - For a count that must be EXACTLY ONE, a comment ANYWHERE in the tree can
  *     supply that one. MEASURED: setting RedirectionMode.ALWAYS in the entry
  *     point and writing `RedirectionMode.NEVER` in a comment in Sender.java
  *     left all nine classes green -- redirects followed inside Burp, and a
  *     comment saying they were not. That direction is fail-OPEN.
+ *
+ * So the rule is about what the needle is PROVING, and the two kinds pull
+ * opposite ways:
+ *
+ *   - A needle proving A WIRE EXISTS -- a call, a handler installation, a
+ *     seam being connected -- must IGNORE comments, because prose cannot
+ *     install anything. MEASURED, on this branch and against these very
+ *     checks: prefixing `//` to `c.setHaltSource(...)` and
+ *     `c.setConfigGuard(...)` in HxExtension -- the commonest way a wire is
+ *     lost -- left java at 9 x ALL PASS / 1592 ok / 0 FAIL (the count before
+ *     this class gained the stripper's own test), integration at 13 passed and
+ *     python at 376 passed, with F2 (maySend()/checkMaySend() fail-open
+ *     against the sentinel file, the stalled poller and the auto-halt) and F8
+ *     (a mid-run configure lowering the rate, silently ignored) both silently
+ *     restored. `TODO(plan-6): re-enable c.setHaltSource(...)` with the line
+ *     itself deleted was measured the same way, and was GREEN here.
+ *
+ *     ONE THING DID GO RED, and it is not a binding: `tests/
+ *     test_plan_matches_repo.py` compares HxExtension.java to a byte-identical
+ *     copy inside the plan, so it noticed the edited file -- until
+ *     `scripts/sync_plan_block.py` was run, which is the documented workflow
+ *     after editing any file, and then python was 376 passed too. A check that
+ *     goes green the moment you follow the normal procedure is not what holds
+ *     a wire in place. These read {@link #code}.
+ *   - A needle proving AN OPTION IS SET -- a constant, an enum member, a
+ *     flag -- must NOT be satisfiable by prose, so a comment naming it has to
+ *     COUNT. Blinding {@link #redirectsAreNotFollowed} to comments would make
+ *     `// RedirectionMode.ALWAYS` invisible to the "exactly one mode is
+ *     named" arm, and that arm is the entire reason the first one holds.
+ *     These read {@link #text}, and narrowing the file they read is the other
+ *     half of their defence.
  *
  * So a whole-tree count is used only where zero is the answer or where the
  * needle is a CALL nobody would write in prose. Where the count must be
@@ -78,6 +109,8 @@ public class ChokepointTest {
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
         t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
           () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
+        t("theCommentStripperIsNotVacuousAndDoesNotOverreach",
+          ChokepointTest::theCommentStripperIsNotVacuousAndDoesNotOverreach);
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
         t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
           () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
@@ -114,6 +147,12 @@ public class ChokepointTest {
      * does with what it gets back -- which also catches the batch call, a
      * three-iteration loop, and anything else reachable from a second handle.
      *
+     * WIRE-EXISTS needles, both of them, so they read {@link #code}: a
+     * comment cannot issue a request, and the failure being guarded against is
+     * the real call being commented out while a commented one keeps the count
+     * at 1. Counts are unchanged by the switch (measured: 9 x ALL PASS either
+     * way), so this closes a hole rather than moving a number.
+     *
      * WHAT IT DOES NOT SEE: `.http()` is still a SPELLING, so `var h2 = api .
      * http ();` slips past it. That is a shape nobody writes and the class
      * javadoc above already scopes these needles as spellings; noted so the
@@ -125,7 +164,7 @@ public class ChokepointTest {
         List<String> hits = new ArrayList<>();
         List<String> handleHits = new ArrayList<>();
         for (Path p : sources) {
-            String t = text(p);
+            String t = code(p);
             int n = count(t, "http().sendRequest");
             total += n;
             if (n > 0) hits.add(p + " x" + n);
@@ -143,6 +182,9 @@ public class ChokepointTest {
               handleHits.size() == 1 && handleHits.get(0).startsWith(ENTRY_POINT));
     }
 
+    /** A MUST-BE-ZERO needle, so it reads {@link #text} and comments COUNT:
+     *  a comment that spells the batch call turns this red, which is the
+     *  fail-safe direction. Rewrite the comment, do not loosen the needle. */
     static void noBatchEgressPath(List<Path> sources) throws IOException {
         int total = 0;
         for (Path p : sources) total += count(text(p), "sendRequests(");
@@ -167,6 +209,14 @@ public class ChokepointTest {
      * in Sender.java gave the count its 1 and left all nine classes green:
      * redirects followed inside Burp, and a comment two files away saying they
      * were not. A whole-tree count of a CONSTANT is a count of prose.
+     *
+     * AN OPTION-IS-SET needle, and the one that fixes the kind of every other
+     * needle in this class by contrast. It reads {@link #text} and it MUST:
+     * blinding it to comments would make `// RedirectionMode.ALWAYS` invisible
+     * to the second assertion below, which is the whole of the first one's
+     * defence. An option cannot be proved set by prose, so prose has to count
+     * against it -- the opposite of a wire-exists needle, where prose must not
+     * count for it. Narrowing the file it reads is what makes that affordable.
      *
      * The second assertion is what makes the first one hold. `NEVER` appearing
      * once is not "redirects are off" if `ALWAYS` is also there -- the last
@@ -193,6 +243,9 @@ public class ChokepointTest {
               + "cannot override it (" + any + ")", any == 1);
     }
 
+    /** A MUST-BE-ZERO-ELSEWHERE needle: it reads {@link #text}, so a comment
+     *  spelling `import burp.` in another file turns this red rather than
+     *  passing. Fail-safe, and deliberately so. */
     static void montoyaIsConfinedToTheEntryPoint(List<Path> sources) throws IOException {
         List<String> importers = new ArrayList<>();
         for (Path p : sources)
@@ -205,6 +258,8 @@ public class ChokepointTest {
     }
 
     /**
+     * MUST-BE-ZERO needles, so they read {@link #text} and a comment counts.
+     *
      * Counted WITH the leading dot, so a declaration (`public long
      * configEpoch()`) and a javadoc cross-reference (`{@link #configEpoch()}`)
      * do not match. A javadoc that writes `BridgeClient.configEpoch()` with a
@@ -229,6 +284,10 @@ public class ChokepointTest {
     }
 
     /**
+     * A WIRE-EXISTS needle -- it proves a READ happens -- so it reads
+     * {@link #code} and a commented-out `this.authorisation()` cannot supply
+     * the one it is looking for.
+     *
      * BridgeClient's send arm writes `this.authorisation()` with an explicit
      * receiver precisely so this count can be taken. A bare `authorisation()`
      * there reads as zero here and turns this check red -- which is the
@@ -238,7 +297,7 @@ public class ChokepointTest {
     static void theAuthorisationSnapshotIsReadInExactlyOnePlace(List<Path> sources)
             throws IOException {
         int total = 0;
-        for (Path p : sources) total += count(text(p), ".authorisation()");
+        for (Path p : sources) total += count(code(p), ".authorisation()");
         check("the whole extension reads the Authorisation snapshot in exactly one "
               + "place, not " + total, total == 1);
     }
@@ -258,6 +317,10 @@ public class ChokepointTest {
      * carries `import java.net.*` for its unix socket, so `new Socket(host,
      * port)` compiles in that file today. Grepping for a new import would
      * have found nothing.
+     *
+     * MUST-BE-ZERO needles, so they read {@link #text}: a comment naming
+     * `new Socket(` turns this red, and that is the answer wanted -- a second
+     * egress family being DISCUSSED in this tree is worth a human look.
      *
      * Clean at the time of writing -- every needle below is 0 -- so this is a
      * tripwire rather than a fix. The needles are chosen NOT to collide with
@@ -301,6 +364,11 @@ public class ChokepointTest {
      * the run's budget, with every behavioural test green, because every one
      * of them drives the path that does call both.
      *
+     * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
+     * `.checkGate(` beside a live `.decideBeforeGate(` would otherwise keep
+     * both counts at 1 and the pair assertion below satisfied, with the Gate
+     * never asked.
+     *
      * Counting is all this can do, and one of each is what the send path
      * needs. `decide(` is not counted: it remains correct for a caller with
      * nothing to interleave, and PolicyTest drives every rule through it.
@@ -309,7 +377,7 @@ public class ChokepointTest {
             throws IOException {
         int before = 0, gate = 0;
         for (Path p : sources) {
-            String t = text(p);
+            String t = code(p);
             before += count(t, ".decideBeforeGate(");
             gate += count(t, ".checkGate(");
         }
@@ -349,9 +417,27 @@ public class ChokepointTest {
      * Counting is all this can do, and it is worth more than nothing: the
      * failure being guarded against is the line being DELETED or never
      * written, not the line being wrong.
+     *
+     * ALL SIX ARE WIRE-EXISTS NEEDLES, so they read {@link #code} and a
+     * comment cannot supply any of them. Until 2026-08-24 they read
+     * {@link #text}, and this test was the ONLY thing binding these lines to
+     * production: prefixing `//` to `c.setHaltSource(...)` and
+     * `c.setConfigGuard(...)` -- the commonest way a wire is lost -- left java
+     * at 9 x ALL PASS / 1592 ok / 0 FAIL (the count before the stripper's own
+     * test was added), integration at 13 passed and python at 376 passed once
+     * the plan block was re-synced, which is the documented step after editing
+     * any file. F2 and F8, the two defects the round before last was held to
+     * fix, were both silently back. Deleting the line and leaving
+     * `// TODO(plan-6): re-enable c.setHaltSource(...)` behind was measured
+     * separately and was equally green.
+     *
+     * `setConfigGuard(` is the sharpest of the six because {@code ConfigGuard}
+     * FAILS OPEN when uninstalled -- see BridgeClient.setConfigGuard for why
+     * that asymmetry is deliberate -- so this line existing is the whole of
+     * F8's binding. `HaltSource` at least denies when it is missing.
      */
     static void everyKillPathIsWiredBeforeTheDial() throws IOException {
-        String entry = text(Path.of(ENTRY_POINT));
+        String entry = code(Path.of(ENTRY_POINT));
         check("a halt frame is routed to the switch the send path asks ("
               + count(entry, "setHaltSink(") + ")", count(entry, "setHaltSink(") == 1);
         check("and maySend() asks that same authority back ("
@@ -365,6 +451,72 @@ public class ChokepointTest {
         check("and a configure that would move an armed limit is refused ("
               + count(entry, "setConfigGuard(") + ")",
               count(entry, "setConfigGuard(") == 1);
+    }
+
+    /**
+     * The instrument, before anything is measured with it.
+     *
+     * {@link #stripComments} is the whole of the fix above, and a stripper
+     * that quietly returned its input would leave every needle exactly as
+     * fail-open as it was, with six green checks saying otherwise. So it is
+     * driven directly, on a fixture that carries each needle shape rather than
+     * on a real file -- a real file that happened to contain no commented-out
+     * wire would satisfy a vacuous stripper too.
+     *
+     * BOTH failure directions are here. Under-stripping is the fail-open this
+     * exists to close. Over-running a string literal is the other one: `"//"`
+     * is a string, and a stripper that read it as a comment would blank
+     * everything after it -- turning the counts to zero and reddening this
+     * class for a reason with nothing to do with the wires.
+     */
+    static void theCommentStripperIsNotVacuousAndDoesNotOverreach() {
+        String src = String.join("\n",
+            "class X {",
+            "    // c.setHaltSource(gone);",
+            "    /* c.setConfigGuard(gone); */",
+            "    /**",
+            "     * TODO(plan-6): re-enable c.setSendHandler(gone);",
+            "     */",
+            "    void f() {",
+            "        String url = \"https://x/*y*/z\";",
+            "        char slash = '/';",
+            "        String kept = \"setHaltSink(real)\";",
+            "        c.setHaltNotifier(real);   // and a trailing comment",
+            "    }",
+            "}");
+        String stripped = stripComments(src);
+
+        // Not vacuous: every commented needle is gone.
+        check("a // comment cannot supply a wire (" + count(stripped, "setHaltSource(") + ")",
+              count(stripped, "setHaltSource(") == 0);
+        check("nor can a /* */ comment (" + count(stripped, "setConfigGuard(") + ")",
+              count(stripped, "setConfigGuard(") == 0);
+        check("nor can a TODO inside a javadoc (" + count(stripped, "setSendHandler(") + ")",
+              count(stripped, "setSendHandler(") == 0);
+        check("nor can a comment trailing real code ("
+              + count(stripped, "and a trailing comment") + ")",
+              count(stripped, "and a trailing comment") == 0);
+
+        // ...and not over-reaching: the code is all still there.
+        check("the call before that trailing comment survives ("
+              + count(stripped, "setHaltNotifier(") + ")",
+              count(stripped, "setHaltNotifier(") == 1);
+        check("a `//` inside a string literal does not start a comment ("
+              + count(stripped, "https://x/*y*/z") + ")",
+              count(stripped, "https://x/*y*/z") == 1);
+        check("nor does a `/*` inside one, so what follows it survives ("
+              + count(stripped, "setHaltSink(real)") + ")",
+              count(stripped, "setHaltSink(real)") == 1);
+        check("and a '/' character literal is not a comment either ("
+              + count(stripped, "char slash") + ")", count(stripped, "char slash") == 1);
+
+        // Offsets are preserved, which is what lets a position check read
+        // this string and still be talking about the file.
+        check("the stripped text is the same length as the source ("
+              + stripped.length() + " vs " + src.length() + ")",
+              stripped.length() == src.length());
+        check("and has the same line count (" + count(stripped, "\n") + ")",
+              count(stripped, "\n") == count(src, "\n"));
     }
 
     /**
@@ -387,6 +539,20 @@ public class ChokepointTest {
      * declaration rather than at the file, so an unrelated try elsewhere in
      * HxExtension cannot satisfy it.
      *
+     * Offsets are taken in {@link #code} rather than {@link #text}, and
+     * {@link #stripComments} preserves length so they still point at the same
+     * places in the file. That closes one shape this used to miss, MEASURED
+     * with `// try { a decoy` inserted into montoyaHttp ahead of the real one:
+     *
+     *     text()  the adapter opens a try (9214)   <- the COMMENT's
+     *     code()  the adapter opens a try (9236)   <- the real one
+     *
+     * 22 characters earlier, and every comparison below is `> guard`, so the
+     * lower number makes all four EASIER to satisfy -- prose deciding a
+     * position check, which is the same fail-open as prose supplying a wire.
+     * Both runs were green here, because the real try is still where it should
+     * be; the point is which `try {` the check was talking about.
+     *
      * WHAT IT DOES NOT SEE. These are FIRST-OCCURRENCE OFFSETS, not brace
      * nesting. MEASURED: a decoy `try { ... } catch (RuntimeException e) {
      * throw new IOException(...); }` opened inside montoyaHttp BEFORE an
@@ -401,7 +567,7 @@ public class ChokepointTest {
      * it stops being.
      */
     static void theAdapterBuildsItsRequestInsideTheTry() throws IOException {
-        String entry = text(Path.of(ENTRY_POINT));
+        String entry = code(Path.of(ENTRY_POINT));
         int adapter = entry.indexOf("private static Http montoyaHttp(");
         check("the adapter is where it is expected to be (" + adapter + ")", adapter >= 0);
         int guard = entry.indexOf("try {", adapter);
@@ -423,7 +589,83 @@ public class ChokepointTest {
         return n;
     }
 
+    /** The file, comments and all. For needles that must count PROSE -- see
+     *  the class javadoc, and {@link #redirectsAreNotFollowed} for the one
+     *  that was measured fail-open when it did not. */
     static String text(Path p) throws IOException {
         return Files.readString(p, StandardCharsets.UTF_8);
+    }
+
+    /** The file's CODE: {@link #text} with every comment blanked out. For
+     *  needles proving a WIRE EXISTS, which a comment must not be able to
+     *  supply. */
+    static String code(Path p) throws IOException {
+        return stripComments(text(p));
+    }
+
+    /**
+     * Java comments replaced by spaces, CHARACTER FOR CHARACTER.
+     *
+     * Blanked rather than deleted so every offset in the file survives: an
+     * index taken in this string is an index into the original, which keeps
+     * {@link #theAdapterBuildsItsRequestInsideTheTry}'s position arithmetic
+     * meaningful and stops "which string was this offset from" ever being a
+     * question. Newlines are kept for the same reason.
+     *
+     * STRING AND CHARACTER LITERALS ARE CODE and are stepped over, escapes and
+     * text blocks included. `"https://x"` is not a comment, and a stripper that
+     * read it as one would blank the rest of the file and turn every count
+     * below to zero -- red, but red for a reason that has nothing to do with
+     * the wires, which is its own kind of broken instrument.
+     *
+     * It is a lexer, not a parser: it knows nothing of the code between the
+     * literals and does not need to. What it must never do is under-strip (the
+     * fail-open this exists to close) or run past a literal (the noise above),
+     * and {@link #theCommentStripperIsNotVacuousAndDoesNotOverreach} drives
+     * both.
+     */
+    static String stripComments(String src) {
+        char[] out = src.toCharArray();
+        int n = out.length, i = 0;
+        while (i < n) {
+            char c = out[i];
+            if (c == '"' || c == '\'') {
+                boolean block = c == '"' && i + 2 < n && out[i + 1] == '"' && out[i + 2] == '"';
+                i += block ? 3 : 1;
+                while (i < n) {
+                    if (out[i] == '\\') { i += 2; continue; }
+                    if (block) {
+                        if (out[i] == '"' && i + 2 < n && out[i + 1] == '"'
+                                && out[i + 2] == '"') { i += 3; break; }
+                    } else {
+                        if (out[i] == c) { i++; break; }
+                        // An unterminated literal is not this class's problem
+                        // to diagnose -- javac has already refused the file --
+                        // but running to EOF looking for its close would blank
+                        // nothing after it. Stop at the line end.
+                        if (out[i] == '\n') break;
+                    }
+                    i++;
+                }
+                continue;
+            }
+            if (c == '/' && i + 1 < n && out[i + 1] == '/') {
+                while (i < n && out[i] != '\n') out[i++] = ' ';
+                continue;
+            }
+            if (c == '/' && i + 1 < n && out[i + 1] == '*') {
+                out[i++] = ' ';
+                out[i++] = ' ';
+                while (i < n && !(out[i] == '*' && i + 1 < n && out[i + 1] == '/')) {
+                    if (out[i] != '\n') out[i] = ' ';
+                    i++;
+                }
+                if (i < n) out[i++] = ' ';
+                if (i < n) out[i++] = ' ';
+                continue;
+            }
+            i++;
+        }
+        return new String(out);
     }
 }

@@ -1806,9 +1806,10 @@ public class SenderTest {
      *
      * ...and the same thing end to end against a real Burp and a real target,
      * which `test_a_successful_upgrade_reports_101_and_halts_nothing` drives:
-     * send 1 filed 599 / status_unreadable, send 11 came back
-     * `halted: target distress: 5xx rate 100.0% ... on 127.0.0.1`, and the
-     * target server saw 10 of the 30 requests.
+     * the first answered send filed 599 / status_unreadable, the ELEVENTH
+     * answered send came back `halted: target distress: 5xx rate 100.0% ...
+     * on 127.0.0.1`, one halted frame was pushed, and the target server had
+     * recorded 10 requests when the loop stopped.
      *
      * hx places no restriction on `Upgrade` requests, so assessing a WebSocket
      * endpoint is routine web-app work: every upgrade succeeds, every one is

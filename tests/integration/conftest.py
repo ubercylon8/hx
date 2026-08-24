@@ -104,7 +104,8 @@ class Rig:
     def sentinel(self) -> Path:
         return self.halt.sentinel_path
 
-    def configure(self, *, max_requests: int = 2000) -> int:
+    def configure(self, *, max_requests: int = 2000,
+                  rate_rps: int | None = None) -> int:
         """Push the scope, the method allowlist and the limits this rig tests.
 
         `limit.rate_rps` is taken from the engagement config rather than
@@ -127,6 +128,16 @@ class Rig:
         different value is silently ignored, by design, so that a scope push
         mid-run can never hand a run more requests than it started with.
 
+        `rate_rps` overrides the rate for ONE configure and exists for exactly
+        one caller: the test that pushes a SECOND configure naming a different
+        `limit.rate_rps` mid-run and expects `bad_config`. That body has to be
+        built here rather than in the test -- a config body spelled anywhere
+        else is a second spelling free to drift from this one, and a test
+        asserting a refusal against a body the rig would never send proves
+        nothing about the rig. Default None means "the engagement's rate",
+        which is what every other caller wants and what the first configure of
+        that test uses.
+
         The distress thresholds are deliberately NOT here. Plan 2's config-key
         vocabulary (`codec.CONFIG_KEYS`) has no key for them and
         `build_config_body` refuses an unrecognised key outright, so the
@@ -138,7 +149,8 @@ class Rig:
             "scope.include": [f"{self.target.origin}/*"],
             "method.allow": ["GET", "HEAD", "OPTIONS"],
             "dangerous.path": ["*/logout*", "*/password*"],
-            "limit.rate_rps": [str(self.eng.config.rate_limit_rps)],
+            "limit.rate_rps": [str(self.eng.config.rate_limit_rps
+                                   if rate_rps is None else rate_rps)],
             "limit.max_requests": [str(max_requests)],
         }
         scope_sha256 = hashlib.sha256(

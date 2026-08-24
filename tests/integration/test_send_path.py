@@ -635,6 +635,93 @@ def test_the_run_budget_is_exhausted_and_stays_exhausted(rig):
     assert row["kind"] == "budget"
 
 
+def test_a_mid_run_configure_that_moves_the_rate_is_refused_by_the_jvm(rig):
+    """F8, driven end to end for the first time.
+
+    S4: the rate and the budget are armed ONCE and held for the run. A later
+    `configure` naming a different one must be REFUSED, not silently ignored --
+    an operator who believes they slowed a run down and did not is the failure
+    that rule exists to prevent, and it is silent by construction: the second
+    configure returns a fresh `config_epoch` and the old rate keeps running.
+
+    UNTIL THIS TEST, NOTHING DROVE IT AGAINST THE REAL EXTENSION. The Java
+    test installs `Limits.refuseIfLimitsMoved` directly, so it never exercised
+    `HxExtension`'s `c.setConfigGuard(...)` line -- and `ConfigGuard` FAILS
+    OPEN when uninstalled (BridgeClient.refuseConfigure returns null for a null
+    guard, deliberately: an unwired guard restores a silent-ignore and breaches
+    no scope, where an unwired HaltSource would leave a run unstoppable). So
+    the wire was held by one raw-text needle in ChokepointTest that a `//`
+    could satisfy, and by nothing else in the repository.
+
+    THE REFUSAL IS PROVED TO HAVE COME FROM THE JVM, twice over, because this
+    side has its own bookkeeping and a test satisfied by that would pass with
+    the guard gone:
+
+      * the detail text. `limit.rate_rps cannot change mid-run: this run armed
+        at N and this configure asks for M` is written in `Limits.movedFrom`
+        and exists nowhere on the Python side to be fabricated.
+      * the consequence. `bad_config` calls `denyAll()` in the extension BEFORE
+        answering, so the next send is refused from inside the JVM and the
+        target server records nothing -- which is the claim S4 actually makes,
+        and the only one asserted on the target's own log.
+
+    THE CLASS OF THAT SECOND REFUSAL IS `not_configured`, NOT `scope_denied`,
+    and it was measured rather than assumed -- this test asserted
+    `scope_denied` first and the JVM answered `not_configured`. `denyAll()`
+    does not narrow the scope to nothing; it puts the extension back to having
+    no acknowledged configure at all, at epoch 0, which is the first half of
+    what the protocol doc says that class means. The doc also says the class is
+    OVERLOADED -- the send path throwing or never being installed lands there
+    too, prefixed `extension fault: ` -- so the absence of that prefix is
+    asserted as well. "The operator has not authorised this run" and "this jar
+    is broken" are opposite instructions, and a test that accepted either would
+    be green against a send path that had crashed.
+
+    The second configure is built by `rig.configure(rate_rps=...)` rather than
+    in this test, so the body that is refused is the body the rig would really
+    send.
+    """
+    armed = rig.eng.config.rate_limit_rps
+    rig.configure()
+
+    # The limits arm on the first SEND, not on the configure: `Limits.arm` runs
+    # inside the send handler. A test that pushed the second configure straight
+    # after the first would find `limiter == null`, be answered null by
+    # `refuseIfLimitsMoved`, and pass with the guard wired or not.
+    first = rig.get("/api/orders")
+    assert first["status"] == 200, first
+    assert len(rig.target.hits_for("/api/orders")) == 1
+
+    moved = armed + 1
+    refusal = _refusal_from(rig.configure, rate_rps=moved)
+    assert refusal is not None, (
+        f"a mid-run configure moving limit.rate_rps from {armed} to {moved} "
+        "was ACCEPTED. It returns a fresh config_epoch and goes on issuing at "
+        f"{armed}/s, which is S4's silent-ignore -- the operator believes the "
+        "run was slowed and it was not")
+    detail = str(refusal)
+    assert "bad_config" in detail, detail
+    # The extension's own words. Nothing on this side can write these.
+    assert "limit.rate_rps cannot change mid-run" in detail, detail
+    assert f"armed at {armed}" in detail, detail
+    assert f"asks for {moved}" in detail, detail
+
+    # THE CONSEQUENCE, on the target server's own log: `bad_config` denies all
+    # first, so the next send is refused inside the JVM and nothing is issued.
+    after = _refusal_from(rig.send_unguarded, "GET", "/api/orders")
+    assert _classes([after]) == ["not_configured"], _classes([after])
+    assert "extension fault: " not in str(after), (
+        "the send after the refused configure was refused because the send "
+        f"path itself broke, not because DENY-ALL held: {after}")
+    assert len(rig.target.hits_for("/api/orders")) == 1, (
+        "a send was issued after a refused configure dropped the extension to "
+        f"DENY-ALL: the target served "
+        f"{len(rig.target.hits_for('/api/orders'))}")
+    # ...and no epoch was left behind for it. An operator told `bad_config`
+    # must not find a fresh config_epoch on the next result frame.
+    assert rig.srv.config_epoch == 0, rig.srv.config_epoch
+
+
 def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
     """Two of S4's three kill paths, and the rule that they are independent.
 
@@ -1021,13 +1108,15 @@ def test_a_successful_upgrade_reports_101_and_halts_nothing(rig, route, shape):
     answer to what Burp itself does with a 101, which nothing before this
     measured:
 
-        before:  send  1: {status: 599, outcome: 'status_unreadable'}
-                 send 11: refused `halted: target distress: 5xx rate 100.0%
-                          over the last 10 requests exceeds 20.0% on 127.0.0.1`
-                 one halted frame, and the target server saw 10 of the 30
-                 requests the loop tried to make
+        before:  the 1st answered send:  {status: 599,
+                                          outcome: 'status_unreadable'}
+                 the 11th answered send: refused `halted: target distress:
+                                          5xx rate 100.0% over the last 10
+                                          requests exceeds 20.0% on 127.0.0.1`
+                 one halted frame, and the target had recorded 10 requests
+                 when the loop stopped
         after:   {status: 101, outcome: 'ok'} thirteen times, no halted frame,
-                 and the target saw all thirteen
+                 and the target recorded all thirteen
 
     Twelve is not arbitrary. S4's 5xx rule needs ten answered samples on a host
     before it may trip and trips ON the tenth, so a test that stopped at nine

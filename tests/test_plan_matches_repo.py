@@ -306,9 +306,35 @@ def test_a_stale_excerpt_is_caught_where_a_whole_file_compare_never_looked(tmp_p
         _contains(file_lines, [])
 
 
+# The real number, not a floor.
+#
+# This assertion was `>= 10` until 2026-08-24, against 81 blocks actually
+# found. Seventy-one of them could have stopped being compared -- a regex that
+# matched one plan instead of three, a marker convention that moved,
+# `_names_a_file` getting stricter, a ````java` fence becoming ```` ```jav ````
+# -- and this test, whose entire job is to notice that the check stopped
+# looking, would have gone on passing with 8x margin to spare. A floor that far
+# below the truth is the same silence the rest of this file exists to remove.
+#
+# UPDATE THIS NUMBER in the commit that adds or removes a marked block, and say
+# which block in the message. Marking a plan `<!-- plan-drift: pending -->`
+# drops its blocks from the count and will also turn this red: that is
+# intended, not collateral. A pending plan is a plan whose blocks are NOT being
+# compared, and how many stopped being compared should be a decision somebody
+# wrote down rather than a number that quietly moved.
+EXPECTED_BLOCKS = 81
+
+
 def test_the_check_actually_found_some_blocks():
     """A regex that silently matches nothing would make every test above vacuous."""
-    assert len(_cases()) >= 10, f"only {len(_cases())} code blocks found across {PLANS}"
+    found = len(_cases())
+    assert found == EXPECTED_BLOCKS, (
+        f"{found} code blocks found across {[p.name for p in PLANS]}, "
+        f"expected {EXPECTED_BLOCKS}. If a block was deliberately added or "
+        "removed, update EXPECTED_BLOCKS in the same commit and name the block "
+        "in the message. If it was not, the check has stopped looking at "
+        f"{EXPECTED_BLOCKS - found} of them."
+    )
 
 
 def test_at_most_one_plan_is_pending():
