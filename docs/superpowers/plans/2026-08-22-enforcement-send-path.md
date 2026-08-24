@@ -19994,10 +19994,11 @@ pytestmark = pytest.mark.integration
 # 500 ms, so the extension needs at most two polls -- one second -- to notice
 # a sentinel that has just appeared. The loop that spends this budget is paced
 # by its own 0.2 s sleep and almost nothing else: a send against a target that
-# closes its connections costs 0.59 ms p50 of it (see
-# target_server._Handler.protocol_version), and a send the extension has
-# already halted never leaves the JVM at all. So 5 s buys roughly 25 probes
-# for a wait that needs about five.
+# closes its connections costs 0.57 ms p50 of it (see
+# target_server._Handler.protocol_version, which is the source this number is
+# quoted FROM and which it disagreed with -- 0.59 against 0.57 -- for the life
+# of Task 8), and a send the extension has already halted never leaves the JVM
+# at all. So 5 s buys roughly 25 probes for a wait that needs about five.
 #
 # The one thing that can eat into it is the rate limit -- probing at 5/s
 # against a configured rate_rps of 3 trips it -- which the loop sleeps out
@@ -20057,6 +20058,48 @@ def _blobs_containing(eng, needle: bytes) -> list[Path]:
     """
     return [p for p in sorted(eng.blobs.root.rglob("*"))
             if p.is_file() and needle in p.read_bytes()]
+
+
+def _refusal_from(call, *args, **kwargs) -> server.BridgeError | None:
+    """Run `call`; hand back the BridgeError it raised, or None if it did not.
+
+    THE REPLACEMENT FOR `with pytest.raises(server.BridgeError):` EVERYWHERE
+    IN THIS FILE, and the reason is this file's own first rule: a denial is
+    asserted on the TARGET SERVER'S OWN LOG, not on the error class.
+
+    `pytest.raises` inverts that. When a guard is deleted the send SUCCEEDS,
+    the context manager fails the test at the `with` block with a bare
+    "DID NOT RAISE BridgeError", and every assertion after it -- including
+    the one saying a request reached a live server -- is never reached.
+    "No error came back" and "a request was issued" are different claims and
+    only the second is what S4 forbids; a report that makes only the first
+    sends whoever reads it to the wrong end of the stack.
+
+    It is also what keeps ONE broken guard from hiding the others: a refusal
+    checked this way does not abort the refusals after it, so a loop of three
+    reports three answers rather than the first.
+
+    MEASURED both ways -- see the sabotage evidence in the wave-2 report and
+    the two comments below that record their own.
+    """
+    try:
+        call(*args, **kwargs)
+    except server.BridgeError as exc:
+        return exc
+    return None
+
+
+def _classes(refusals) -> list | dict:
+    """Error classes, with "ALLOWED" standing in for a send nobody refused.
+
+    Never an AttributeError on None: a send that was not refused at all has to
+    NAME ITSELF in the assertion diff, not crash the assertion that is trying
+    to describe it.
+    """
+    if isinstance(refusals, dict):
+        return {name: (e.error_class if e else "ALLOWED")
+                for name, e in refusals.items()}
+    return [e.error_class if e else "ALLOWED" for e in refusals]
 
 
 def _span_us(began: float, ended: float) -> int:
@@ -20134,12 +20177,23 @@ def test_deny_all_holds_then_an_in_scope_get_becomes_an_exchange_row(rig):
     second of those is evidence about the JVM. The guarded refusal is
     asserted too, immediately after, because both gates are meant to be there.
     """
-    with pytest.raises(server.BridgeError) as unconfigured:
-        rig.send_unguarded("GET", "/api/orders")
-    assert unconfigured.value.error_class == "not_configured"
-    assert rig.target.hits == [], \
-        f"an unconfigured extension issued {rig.target.hits}"
+    # NOT `with pytest.raises(...)`, and this is the site where that matters
+    # most in the file. Delete the unconfigured guard from Sender and this
+    # send SUCCEEDS: an extension that has been told nothing at all delivers a
+    # request to a live server. pytest.raises reports that as
+    # "DID NOT RAISE BridgeError" -- true, and it never mentions the delivery.
+    # So the target's own log is asserted FIRST and the class second.
+    unconfigured = _refusal_from(rig.send_unguarded, "GET", "/api/orders")
+    assert rig.target.hits == [], (
+        "DENY-ALL was not held: an unconfigured extension issued "
+        f"{[(h.method, h.path) for h in rig.target.hits]} to a live server")
+    assert unconfigured is not None and \
+        unconfigured.error_class == "not_configured", \
+        f"the JVM answered {_classes([unconfigured])[0]!r}"
 
+    # The guarded refusal, which this side owns. No target assertion belongs
+    # here: BridgeServer.send refuses before the wire, so there is no send to
+    # have been issued and "DID NOT RAISE" is the whole of the diagnosis.
     with pytest.raises(server.BridgeError) as locally:
         rig.get("/api/orders")
     assert locally.value.error_class == "not_configured"
@@ -20210,13 +20264,13 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
         ones this test exists for, including the live cookie now sitting in
         the in-scope target's request log -- are never reached at all. A
         guard that cannot report what it caught is half a guard.
+
+        Four attempts, and each one is answered whatever the ones before it
+        did. Under pytest.raises the FIRST failing guard would abort the
+        other three, so one sabotage would be reported as one broken guard
+        when it is the only one that got to speak.
         """
-        try:
-            rig.send(method, target_path, **kwargs)
-        except server.BridgeError as exc:
-            refusals[name] = exc
-        else:
-            refusals[name] = None
+        refusals[name] = _refusal_from(rig.send, method, target_path, **kwargs)
 
     # Scope. 127.0.0.2 is a live server on a second loopback address, so a
     # request that escaped the gate would be DELIVERED there -- not refused
@@ -20245,11 +20299,7 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
         f"the in-scope target received {[(h.method, h.path) for h in rig.target.hits]}"
     assert _blobs_containing(rig.eng, target_server.SESSION_COOKIE_VALUE.encode()) == []
 
-    # "ALLOWED" rather than an AttributeError on None: a send that was not
-    # refused at all has to name itself in the diff, not crash the assertion
-    # that is trying to describe it.
-    assert {name: (e.error_class if e else "ALLOWED")
-            for name, e in refusals.items()} == {
+    assert _classes(refusals) == {
         "scope": "scope_denied",
         "method": "method_denied",
         "dangerous": "dangerous_denied",
@@ -20371,11 +20421,7 @@ def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
 
     hits_before = len(rig.target.hits_for("/health"))
     refusal_start = time.monotonic()
-    refusal = None
-    try:
-        rig.get("/health")
-    except server.BridgeError as exc:
-        refusal = exc
+    refusal = _refusal_from(rig.get, "/health")
     refusal_done = time.monotonic()
 
     assert refusal is not None, (
@@ -20414,12 +20460,19 @@ def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
 
     # Still limited, and the target's own request log -- the one witness this
     # side cannot fake -- says so.
-    for _ in range(3):
-        with pytest.raises(server.BridgeError) as again:
-            rig.get("/health")
-        assert again.value.error_class == "rate_limited"
-    assert len(rig.target.hits_for("/health")) == hits_before, \
-        "a rate-limited extension issued a request anyway"
+    #
+    # All three are ISSUED before any of them is judged. Under
+    # `with pytest.raises(...)` the first one that came back allowed would end
+    # the test inside the loop: the other two would never be attempted, and
+    # the log assertion below -- the one that says requests REACHED the target
+    # -- would never run. One sabotage would then be reported as one broken
+    # guard, having silenced the two after it.
+    still_limited = [_refusal_from(rig.get, "/health") for _ in range(3)]
+    assert len(rig.target.hits_for("/health")) == hits_before, (
+        "a rate-limited extension issued a request anyway: "
+        f"{len(rig.target.hits_for('/health')) - hits_before} of the three "
+        "reached the target")
+    assert _classes(still_limited) == ["rate_limited"] * 3, still_limited
 
     # The promise itself. Waiting exactly what the refusal asked for -- plus
     # whatever the three refusals above cost, which can only overshoot -- and
@@ -20467,32 +20520,39 @@ def test_the_run_budget_is_exhausted_and_stays_exhausted(rig):
     assert rig.get("/health")["status"] == 200
     assert rig.get("/health")["status"] == 200
 
-    with pytest.raises(server.BridgeError) as exc:
-        rig.get("/health")
-    assert exc.value.error_class == "budget_exhausted"
-    assert str(exc.value) == \
-        "budget_exhausted: run budget spent: 2 of 2 requests issued"
+    exhausted = _refusal_from(rig.get, "/health")
 
     # The refusal never reached the target -- the budget is enforced before
     # issuance, not after -- and the target's own request log is the witness
-    # this side cannot fake.
-    assert len(rig.target.hits_for("/health")) == 2
+    # this side cannot fake. Asserted FIRST: a budget that has stopped
+    # counting spends a third request against a limit of two, and "the target
+    # served 3" is the finding, not "no exception was raised".
+    assert len(rig.target.hits_for("/health")) == 2, (
+        "a spent run budget issued anyway: the target served "
+        f"{len(rig.target.hits_for('/health'))} against max_requests=2")
+    assert exhausted is not None and \
+        exhausted.error_class == "budget_exhausted", \
+        f"the JVM answered {_classes([exhausted])[0]!r}"
+    assert str(exhausted) == \
+        "budget_exhausted: run budget spent: 2 of 2 requests issued"
 
     # Monotonic by construction, and there is deliberately no way to refill it
     # (Limiter.check's own comment): a further attempt spends nothing and is
     # refused exactly the same way, for ever. A `configure` re-authorises
     # scope, not issuance.
-    with pytest.raises(server.BridgeError) as again:
-        rig.get("/health")
-    assert again.value.error_class == "budget_exhausted"
-    assert len(rig.target.hits_for("/health")) == 2
+    again = _refusal_from(rig.get, "/health")
+    assert len(rig.target.hits_for("/health")) == 2, (
+        "the budget refilled: a later send past an exhausted budget reached "
+        f"the target, which has now served {len(rig.target.hits_for('/health'))}")
+    assert again is not None and again.error_class == "budget_exhausted", \
+        f"the JVM answered {_classes([again])[0]!r}"
 
     # Denials are never silent (S4), same as the four-ways test above.
     assert records.record_denial(
         rig.eng.db, run_id=rig.run_id,
         kind=records.DENIAL_KIND["budget_exhausted"],
         method="GET", url=f"{rig.target.origin}/health",
-        detail=str(exc.value), at_us=engagement.now_us()).startswith("d-")
+        detail=str(exhausted), at_us=engagement.now_us()).startswith("d-")
     row = rig.eng.db.execute(
         "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us, rowid",
         (rig.run_id,)).fetchone()
@@ -20553,11 +20613,13 @@ def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
     # over the wire from a JVM that read the sentinel file, and the target's
     # log did not move.
     before = len(rig.target.hits)
-    with pytest.raises(server.BridgeError) as exc:
-        rig.send_unguarded("GET", "/api/orders")
-    assert exc.value.error_class == "halted"
-    assert len(rig.target.hits) == before, \
-        "a halted extension issued a request anyway"
+    halted = _refusal_from(rig.send_unguarded, "GET", "/api/orders")
+    assert len(rig.target.hits) == before, (
+        "a halted extension issued a request anyway; the target received "
+        f"{[(h.method, h.path) for h in rig.target.hits[before:]]} after the "
+        "sentinel was written")
+    assert halted is not None and halted.error_class == "halted", \
+        f"the JVM answered {_classes([halted])[0]!r}"
 
     # Now a halt FRAME joins the sentinel. Two paths, one state.
     #
@@ -20587,11 +20649,7 @@ def test_the_sentinel_halts_issuance_and_a_frame_outlives_its_removal(rig):
     # rule is that the target server's log is the claim -- so the log is
     # asserted FIRST, and the error class after it.
     before = len(rig.target.hits)
-    refusal = None
-    try:
-        rig.get("/api/orders")
-    except server.BridgeError as exc:
-        refusal = exc
+    refusal = _refusal_from(rig.get, "/api/orders")
     assert len(rig.target.hits) == before, \
         "removing the sentinel re-armed issuance: the request reached the target"
     assert refusal is not None and refusal.error_class == "halted", \
@@ -20648,11 +20706,21 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
 
     # One distressed host aborts the WHOLE run, and a human decides when it
     # restarts. `resume` lifts an operator halt; it does not undo distress.
+    #
+    # The consequence of getting this wrong is not an exception that failed to
+    # arrive -- it is a run that an auto-halt stopped and a resume frame
+    # started again. So the target's log is what says so, and it is asserted
+    # first: `/health` has been untouched for the whole test, so any hit at
+    # all on it is issuance that distress was supposed to have ended.
+    before = len(rig.target.hits_for("/health"))
     rig.srv.resume()
-    with pytest.raises(server.BridgeError) as exc:
-        rig.get("/health")
-    assert exc.value.error_class == "halted", \
-        "a resume frame un-did an auto-halt; distress has no reset by design"
+    after_resume = _refusal_from(rig.get, "/health")
+    assert len(rig.target.hits_for("/health")) == before, (
+        "a resume frame un-did an auto-halt: the request was ISSUED and "
+        "reached the target. Distress has no reset by design")
+    assert after_resume is not None and after_resume.error_class == "halted", (
+        "a resume frame un-did an auto-halt; distress has no reset by design. "
+        f"The send answered {_classes([after_resume])[0]!r}")
 ```
 
 - [ ] **Step 9: Run the integration suite and watch it pass**
@@ -20666,7 +20734,7 @@ pays its own ~4.5 s of startup, and only three wait on anything else -- the
 rate-limit test on ~1 s of real window, the sentinel test on a real 500 ms
 poller (1.9 s), and the auto-halt test on a real rolling window plus the rate
 limit it trips five times on the way to ten samples (3.1 s). The sends
-themselves are not the cost: 0.59 ms p50 end to end against a target that
+themselves are not the cost: 0.57 ms p50 end to end against a target that
 closes its connections, where the first draft of this task measured ~1.003 s
 each and put "three to five minutes" here. (The budget test waits on nothing
 at all -- its limit has no clock in it.)
