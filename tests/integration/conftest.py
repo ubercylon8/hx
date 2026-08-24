@@ -30,7 +30,7 @@ from typing import Sequence
 import pytest
 
 from hx import config, engagement
-from hx.bridge import codec, server
+from hx.bridge import server
 from hx.halt import OperatorHalt
 from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer

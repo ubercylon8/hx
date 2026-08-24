@@ -311,10 +311,14 @@ class TargetServer:
     def hits_for(self, path: str) -> list[Hit]:
         """Every hit on `path`, ignoring the query string.
 
-        Six assertions in the integration suite are counts taken from this,
-        so a version of it that answered `[]` would make all six vacuous --
-        which is why tests/test_target_server.py covers it in the FAST suite,
-        where it costs milliseconds rather than a JVM.
+        The integration suite takes COUNTS off this -- "the target served
+        exactly two", "the log did not move" -- so a version answering `[]`
+        would make every one of them pass forever. That is why
+        tests/test_target_server.py covers it in the FAST suite, where it
+        costs milliseconds rather than a JVM.
+
+        Deliberately not a count of those call sites. This file has already
+        carried one such number that was wrong by three.
         """
         return [hit for hit in self.hits if hit.path == path]
 
