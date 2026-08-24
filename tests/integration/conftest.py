@@ -70,12 +70,39 @@ def pytest_terminal_summary(terminalreporter) -> None:
         if getattr(item, "get_closest_marker", None)
         and item.get_closest_marker("integration") is not None
     ]
+    _announce_skipped(terminalreporter)
     if not deselected:
         return
     terminalreporter.write_line(
         f"NOT RUN: {len(deselected)} integration tests -- the only tests here "
         "that drive a real Burp. Run them with: pytest -m integration",
         yellow=True)
+
+
+def _announce_skipped(terminalreporter) -> None:
+    """Announce integration tests that RAN and SKIPPED, not only deselected ones.
+
+    The hook above exists because `9 deselected` reads as somebody having
+    scoped a run deliberately. `3 skipped` reads the same way and is worse: a
+    deselected test was never asked to run, while a skipped one was asked,
+    declined, and reported green.
+
+    Both halves of that have now bitten this project. The real-Burp tests were
+    dark for a day behind a deselect. Task 1's measurements were one renamed
+    directory away from being dark behind a skip, and the extension jar going
+    stale skipped all 17 integration tests while the commit that did it
+    recorded them as passing.
+    """
+    skipped = [
+        item for item in terminalreporter.stats.get("skipped", [])
+        if getattr(item, "get_closest_marker", None)
+        and item.get_closest_marker("integration") is not None
+    ]
+    if skipped:
+        terminalreporter.write_line(
+            f"SKIPPED: {len(skipped)} integration tests declined to run. A "
+            "skipped test reported green; read the reason above before "
+            "trusting this suite.", yellow=True)
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -224,6 +251,10 @@ class Rig:
 
 @pytest.fixture
 def rig(tmp_path):
+    # Order matters: an unbuilt jar is a FAILURE and a missing Burp is a skip,
+    # and asking the skip question first turns the former into the latter.
+    if bf.unbuilt():
+        pytest.fail("unbuilt: " + ", ".join(bf.unbuilt()))
     if bf.missing():
         pytest.skip("missing: " + ", ".join(bf.missing()))
 

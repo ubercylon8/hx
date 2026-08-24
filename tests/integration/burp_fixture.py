@@ -72,6 +72,56 @@ def missing() -> list[str]:
         return [f"prerequisites under {LAB} could not be checked: {exc}"]
 
 
+def unbuilt() -> list[str]:
+    """Build products of THIS repo that are absent or stale. These must FAIL.
+
+    `missing()` answers "can this machine run Burp at all" -- a question whose
+    honest answer on someone else's laptop is no, and a skip. This one answers
+    "did you run build.sh", whose answer is always yes-or-you-forgot, and a
+    skip there is the failure mode this project keeps finding: a missing
+    artefact turns into a silent green.
+
+    It is not hypothetical. Task 1's fix round inherited a tree whose jar was
+    stale, `-m integration` reported all 17 tests SKIPPED, and the baseline
+    recorded one commit earlier as "integration 17 passed" was not
+    reproducible as committed. The same shape had just been fixed one level
+    down for the probe source; it was still open here.
+
+    Kept separate from `missing()` rather than merged into it because the two
+    have opposite correct behaviours, and a single list forces one of them to
+    be wrong.
+    """
+    problems = []
+    if not EXT_JAR.exists():
+        problems.append(f"extension jar is missing (run extension/build.sh): {EXT_JAR}")
+    elif _jar_is_stale():
+        problems.append("extension jar is older than its sources (run extension/build.sh)")
+    return problems
+
+
+def _environment_missing() -> list[str]:
+    """Prerequisites this MACHINE may legitimately not have. Never the jar.
+
+    Split out so a caller can take the subset it actually depends on.
+    `probe_missing()` is the reason: the probe compiles its own class and
+    launches with `--developer-extension-class-name=hx.proxy.Probe`, so it
+    never loads the extension jar -- yet it inherited the jar's rows through
+    missing() and a STALE JAR silenced all three of Task 1's measurements.
+    A prerequisite that is not one is still a skip, and a skip still reports
+    green.
+    """
+    absent = []
+    if not BURP_JAR.exists():
+        absent.append(f"burp jar: {BURP_JAR}")
+    if not (SEED_HOME / ".java").is_dir():
+        absent.append(f"seed burp home: {SEED_HOME / '.java'}")
+    elif not _eula_accepted():
+        absent.append(f"burp.eula not accepted in {SEED_HOME / '.java'}")
+    if not (SEED_HOME / ".BurpSuite").is_dir():
+        absent.append(f"seed burp home: {SEED_HOME / '.BurpSuite'}")
+    return absent
+
+
 def _missing() -> list[str]:
     absent = []
     if not BURP_JAR.exists():
@@ -285,7 +335,7 @@ def probe_missing() -> list[str]:
     the whole repository and its contract is that nothing escapes it; this one
     is called by a single fixture and may be as ordinary as it likes.
     """
-    absent = missing()
+    absent = _environment_missing()
     if shutil.which("javac") is None:
         absent.append("javac (a JDK, not just a JRE) to compile the probe")
     return absent

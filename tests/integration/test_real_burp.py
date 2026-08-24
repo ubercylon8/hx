@@ -8,6 +8,21 @@ from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
 from tests.integration import burp_fixture as bf
 
+
+@pytest.fixture(autouse=True)
+def _built():
+    """An unbuilt or stale extension jar is a FAILURE here, not a skip.
+
+    These two tests exist to certify the bridge against a real JVM. Run
+    against a jar older than its sources they certify an artefact that no
+    longer matches the code -- and the skip that used to hide that reported
+    green. Measured: a stale jar skipped all 17 integration tests while the
+    commit that caused it recorded them as passing.
+    """
+    problems = bf.unbuilt()
+    if problems:
+        pytest.fail("unbuilt: " + ", ".join(problems))
+
 pytestmark = pytest.mark.integration
 
 
@@ -51,8 +66,8 @@ def _operator_halt(workdir, engagement_id):
     return halt_mod.OperatorHalt(root, conn)
 
 
-@pytest.mark.skipif(not bf.burp_available(),
-                    reason=f"missing: {', '.join(bf.missing())}")
+@pytest.mark.skipif(bool(bf._environment_missing()) and not bf.unbuilt(),
+                    reason=f"missing: {', '.join(bf._environment_missing())}")
 def test_real_burp_dials_in_and_handshakes(tmp_path):
     """The whole point of this plan, proved against the real container.
 
@@ -102,8 +117,8 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
         srv.stop()
 
 
-@pytest.mark.skipif(not bf.burp_available(),
-                    reason=f"missing: {', '.join(bf.missing())}")
+@pytest.mark.skipif(bool(bf._environment_missing()) and not bf.unbuilt(),
+                    reason=f"missing: {', '.join(bf._environment_missing())}")
 def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     """A Burp restart is a reconnect, not an outage -- and the reconnected
     extension knows nothing, because extensionData does not survive.
