@@ -2,10 +2,53 @@ import hashlib
 
 import pytest
 
+from hx import halt as halt_mod
 from hx.bridge import server
+from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 from tests.integration import burp_fixture as bf
 
 pytestmark = pytest.mark.integration
+
+
+def _operator_halt(workdir, engagement_id):
+    """`BridgeServer` requires one -- the same call HxExtension makes about
+    `-Dhx.halt_sentinel`, for the same field. A harness with no engagement of
+    its own supplies a sentinel in a directory of its own, which is what this
+    builds.
+
+    These two tests failed for one day, and the reason is worth keeping.
+
+    Task 6 made `-Dhx.halt_sentinel` mandatory -- HxExtension.initialize()
+    returns early with "extension idle" without it -- and did not update
+    `bf.launch_burp`. The integration tests are deselected from the default
+    run, so nothing said so. The extension never dialled, `srv.state` never
+    reached "connected", and both tests timed out after 90s.
+
+    The first diagnosis was that Burp 2026.7.3 dies at startup under this
+    machine's JRE 26, because burp.log ends in `java.lang.Error: no ComponentUI
+    class for: burp.Zc7w` on the EventDispatchThread. THAT DIAGNOSIS WAS WRONG,
+    and the thing that disproved it is worth copying: burp-lab's
+    `harness-burp.log`, written by a run that demonstrably worked, is BYTE-FOR-
+    BYTE the same 6423 bytes with the same two ComponentUI errors and the same
+    tail. That log is what healthy headless Burp looks like -- Burp catches the
+    Swing failure and carries on, and nothing else writes to stdout afterwards.
+
+    Two lessons, both general. A log that ENDS at an error has not necessarily
+    FAILED at that error. And `api.logging().logToError` goes to Burp's own
+    extension log, not to stdout, so "no hx lines in burp.log" is not evidence
+    the extension did not run.
+
+    With the sentinel passed, both tests pass in ~14s.
+    """
+    root = workdir / "engagement"
+    secure_mkdir(root)
+    conn = db_mod.connect(root / "hx.db")
+    db_mod.init_schema(conn)
+    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
+                 " VALUES(?,'Integration','Integration',1,'active')",
+                 (engagement_id,))
+    return halt_mod.OperatorHalt(root, conn)
 
 
 @pytest.mark.skipif(not bf.burp_available(),
@@ -16,11 +59,14 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
     Fakes prove the logic; only this proves Burp actually loads the extension
     and that the socket handshake works end to end.
     """
-    srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-integration")
+    srv = server.BridgeServer(
+        tmp_path / "hx.sock", engagement_id="e-integration",
+        operator_halt=(oh := _operator_halt(tmp_path, "e-integration")))
     srv.start()
     proc = None
     try:
-        proc = bf.launch_burp(srv.socket_path, "e-integration", tmp_path)
+        proc = bf.launch_burp(srv.socket_path, "e-integration", tmp_path,
+                              oh.sentinel_path)
 
         assert bf.wait_for(lambda: srv.state == "connected"), \
             "Burp never completed the hello handshake"
@@ -67,11 +113,14 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     "reconnect, not an outage" half, which is this plan's headline claim and
     was otherwise exercised against fakes alone.
     """
-    srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id="e-restart")
+    srv = server.BridgeServer(
+        tmp_path / "hx.sock", engagement_id="e-restart",
+        operator_halt=(oh := _operator_halt(tmp_path, "e-restart")))
     srv.start()
     proc = proc2 = None
     try:
-        proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "first")
+        proc = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "first",
+                              oh.sentinel_path)
         assert bf.wait_for(lambda: srv.state == "connected")
         srv.configure({"scope.include": ["https://a/*"]},
                       scope_sha256="abc", profile="production")
@@ -84,7 +133,8 @@ def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
         assert srv.config_epoch == 0
 
         # The restart. Same socket, same server object, never stopped.
-        proc2 = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "second")
+        proc2 = bf.launch_burp(srv.socket_path, "e-restart", tmp_path / "second",
+                               oh.sentinel_path)
         assert bf.wait_for(lambda: srv.state == "connected"), \
             "a restarted Burp must reconnect to the still-listening bridge"
         assert srv.peer_pid == proc2.pid, "the bridge is talking to the old JVM"

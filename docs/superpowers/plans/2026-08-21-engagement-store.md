@@ -564,6 +564,18 @@ CREATE TABLE IF NOT EXISTS engagement (
   config_path  TEXT
 );
 
+-- Exactly one engagement per database: the engagement is the unit of
+-- isolation (spec S3), and `quarantine` and every unqualified `open_()`
+-- lookup presume a single authoritative row. Without this, a second INSERT
+-- is accepted silently and which client the store believes it holds becomes
+-- arbitrary.
+CREATE TRIGGER IF NOT EXISTS trg_engagement_singleton
+BEFORE INSERT ON engagement
+WHEN (SELECT COUNT(*) FROM engagement) > 0
+BEGIN
+  SELECT RAISE(ABORT, 'only one engagement row is permitted per database');
+END;
+
 -- Append-only. Never UPDATE a row here: "what was in scope when request X was
 -- issued" is the query that matters under dispute.
 CREATE TABLE IF NOT EXISTS scope_version (
@@ -582,8 +594,8 @@ CREATE TABLE IF NOT EXISTS authorization (
   doc_blob      TEXT,
   doc_sha256    TEXT,
   signatory     TEXT,
-  valid_from    INTEGER,
-  valid_to      INTEGER,
+  valid_from_us INTEGER,
+  valid_to_us   INTEGER,
   scope_sha256  TEXT
 );
 
@@ -591,7 +603,7 @@ CREATE TABLE IF NOT EXISTS run (
   id               TEXT PRIMARY KEY,
   engagement_id    TEXT NOT NULL REFERENCES engagement(id),
   kind             TEXT NOT NULL CHECK (kind IN ('manual','scheduled','retest')),
-  safety_profile   TEXT NOT NULL,
+  safety_profile   TEXT NOT NULL CHECK (safety_profile IN ('production','staging')),
   scope_version_id TEXT REFERENCES scope_version(id),
   started_us       INTEGER NOT NULL,
   ended_us         INTEGER,
@@ -618,9 +630,9 @@ CREATE TABLE IF NOT EXISTS surface (
   discovered_by       TEXT NOT NULL DEFAULT 'proxy'
                       CHECK (discovered_by IN ('proxy','crawl','import','agent')),
   normaliser_version  INTEGER NOT NULL DEFAULT 1,
-  first_seen_run      TEXT,
-  last_seen_run       TEXT,
-  exemplar_exchange_id TEXT,
+  first_seen_run      TEXT REFERENCES run(id),
+  last_seen_run       TEXT REFERENCES run(id),
+  exemplar_exchange_id TEXT REFERENCES exchange(id),
   UNIQUE (engagement_id, method, scheme, host, port, path_template, query_key_set)
 );
 
@@ -636,7 +648,16 @@ CREATE TABLE IF NOT EXISTS exchange (
   outcome             TEXT NOT NULL
                       CHECK (outcome IN ('ok','timeout','conn_refused','dns_error',
                                          'tls_error','scope_denied','rate_limited',
-                                         'bridge_lost','truncated')),
+                                         'bridge_lost','truncated',
+                                         -- The exchange COMPLETED but its final
+                                         -- status could not be read: a peer put
+                                         -- more interim 1xx heads in front of the
+                                         -- response than the scan tolerates.
+                                         -- `status` then holds the conservative
+                                         -- sentinel 599, so this value is the only
+                                         -- thing separating that sentinel from a
+                                         -- peer that genuinely answered 599.
+                                         'status_unreadable')),
   sent_us             INTEGER NOT NULL,
   recv_us             INTEGER,
   method              TEXT NOT NULL,
@@ -688,6 +709,10 @@ CREATE TABLE IF NOT EXISTS finding (
   severity_source    TEXT,
   confidence         TEXT NOT NULL CHECK (confidence IN ('Certain','Firm','Tentative')),
   created_by         TEXT NOT NULL CHECK (created_by IN ('agent','human','check')),
+  -- Cached projection of finding_status_event, the source of truth. Direct
+  -- `UPDATE finding SET status=...` is deliberately left unguarded here --
+  -- unlike the event log, this column is a read-optimisation, not the
+  -- record of who changed what and when.
   status             TEXT NOT NULL
                      CHECK (status IN ('new','triaged','confirmed','false_positive','reported')),
   surface_id         TEXT REFERENCES surface(id),
@@ -698,8 +723,8 @@ CREATE TABLE IF NOT EXISTS finding (
                      CHECK (scope_level IN ('engagement','host','surface','insertion')),
   payload            TEXT,
   normaliser_version INTEGER NOT NULL DEFAULT 1,
-  first_seen_run     TEXT,
-  last_seen_run      TEXT,
+  first_seen_run     TEXT REFERENCES run(id),
+  last_seen_run      TEXT REFERENCES run(id),
   UNIQUE (engagement_id, dedupe_key)
 );
 
@@ -720,19 +745,59 @@ CREATE TABLE IF NOT EXISTS finding_status_event (
   id          TEXT PRIMARY KEY,
   finding_id  TEXT NOT NULL REFERENCES finding(id),
   from_status TEXT,
-  to_status   TEXT NOT NULL,
+  to_status   TEXT NOT NULL
+               CHECK (to_status IN ('new','triaged','confirmed','false_positive','reported')),
   actor       TEXT NOT NULL CHECK (actor IN ('agent','human','check')),
   note        TEXT,
   ts_us       INTEGER NOT NULL
 );
 
 -- The agent may never confirm its own finding. Enforced by the database,
--- not by discipline.
+-- not by discipline. Covers both the initial INSERT and any later UPDATE
+-- that tries to rewrite an existing event row into a confirmed/reported one
+-- -- an UPDATE bypassed the INSERT-only version of this trigger entirely.
 CREATE TRIGGER IF NOT EXISTS trg_agent_cannot_confirm
 BEFORE INSERT ON finding_status_event
 WHEN NEW.actor = 'agent' AND NEW.to_status IN ('confirmed','reported')
 BEGIN
   SELECT RAISE(ABORT, 'agent may not set status confirmed or reported');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_cannot_confirm_update
+BEFORE UPDATE ON finding_status_event
+WHEN NEW.actor = 'agent' AND NEW.to_status IN ('confirmed','reported')
+BEGIN
+  SELECT RAISE(ABORT, 'agent may not set status confirmed or reported');
+END;
+
+-- scope_version is append-only: tamper-evidence for contract disputes.
+CREATE TRIGGER IF NOT EXISTS trg_scope_version_no_update
+BEFORE UPDATE ON scope_version
+BEGIN
+  SELECT RAISE(ABORT, 'scope_version is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_scope_version_no_delete
+BEFORE DELETE ON scope_version
+BEGIN
+  SELECT RAISE(ABORT, 'scope_version is append-only');
+END;
+
+-- finding_status_event is append-only, same rationale as scope_version: it
+-- is the audit trail of who changed a finding's status and when. An UPDATE
+-- or DELETE here would let a status transition be silently rewritten after
+-- the fact, including one that used to launder an agent-confirmed status
+-- through a legitimate human INSERT and then UPDATE it back.
+CREATE TRIGGER IF NOT EXISTS trg_finding_status_event_no_update
+BEFORE UPDATE ON finding_status_event
+BEGIN
+  SELECT RAISE(ABORT, 'finding_status_event is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_finding_status_event_no_delete
+BEFORE DELETE ON finding_status_event
+BEGIN
+  SELECT RAISE(ABORT, 'finding_status_event is append-only');
 END;
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -746,6 +811,21 @@ CREATE TABLE IF NOT EXISTS evidence (
   note        TEXT,
   captured_us INTEGER NOT NULL
 );
+
+-- Immutable, same rationale as finding_status_event: evidence is what a
+-- disputed finding is proven with, and it must not be alterable after
+-- capture.
+CREATE TRIGGER IF NOT EXISTS trg_evidence_no_update
+BEFORE UPDATE ON evidence
+BEGIN
+  SELECT RAISE(ABORT, 'evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_evidence_no_delete
+BEFORE DELETE ON evidence
+BEGIN
+  SELECT RAISE(ABORT, 'evidence is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS agent_action (
   id             TEXT PRIMARY KEY,
@@ -807,7 +887,7 @@ from pathlib import Path
 
 from hx.store.paths import secure_mkdir
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 TABLES: tuple[str, ...] = (
     "engagement",
@@ -1505,6 +1585,41 @@ def test_direct_config_construction_round_trips_through_dumps_and_load(tmp_path:
     p = tmp_path / "config.yaml"
     p.write_text(config.dumps(cfg), encoding="utf-8")
     assert config.load(p) == cfg
+
+
+def test_a_blank_entry_in_a_string_list_is_refused(tmp_path: Path):
+    """A stray blank line in scope.exclude takes the engagement to deny-all.
+
+    The extension already fails closed on it -- an empty pattern makes
+    Rule.forExclude throw and the whole decision becomes scope_denied -- so the
+    run stops rather than proceeding unprotected. That is the right direction
+    and it is pinned on the Java side. The cost is that the operator learns
+    mid-run, from a refusal, that a config written hours ago has a blank line
+    in it. Catching it at load time is the same answer, delivered when it is
+    cheap to act on.
+    """
+    head = 'name: a\nclient: b\n'
+    for body in (
+        'scope:\n  include:\n    - ""\n',
+        'scope:\n  include: ["https://a/*"]\n  exclude:\n    - ""\n',
+        'scope:\n  include: ["https://a/*"]\ndangerous_paths:\n  - "   "\n',
+        'scope:\n  include: ["https://a/*"]\nrender_allow:\n  - ""\n',
+    ):
+        p = _write(tmp_path, head + body)
+        with pytest.raises(config.ConfigError, match=r"\[0\] is blank"):
+            config.load(p)
+
+
+def test_a_deliberately_empty_list_is_still_allowed(tmp_path: Path):
+    """The blank-ENTRY guard must not become a no-empty-LISTS guard.
+
+    An explicitly written empty list is the operator saying so in the file,
+    which the spec requires to stay possible and reviewable. Only a blank entry
+    inside a list is meaningless.
+    """
+    p = _write(tmp_path, 'name: a\nclient: b\nscope:\n  include: ["https://a/*"]\n  exclude: []\n')
+    cfg = config.load(p)
+    assert cfg.scope_exclude == []
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1600,7 +1715,39 @@ def _string_list(raw: dict, key: str, default: list[str]) -> list[str]:
         raise ConfigError(f"{key} must be a list, got {type(v).__name__}")
     if not all(isinstance(x, str) for x in v):
         raise ConfigError(f"every entry in {key} must be a string")
+    check_entries(key, v)
     return list(v)
+
+
+def check_entries(key: str, values: list[str]) -> None:
+    """Refuse a blank entry in a list of patterns.
+
+    A blank entry means nothing to any consumer, and in a scope list it is
+    actively dangerous: the extension refuses an empty pattern outright --
+    Rule.forExclude("") throws and the whole decision becomes scope_denied --
+    so one stray blank line in scope.exclude takes the engagement to deny-all
+    mid-run. Failing closed there is right; failing HERE is better, because the
+    operator finds out before the run rather than after the first refusal.
+
+    A PUBLIC function rather than a branch inside _string_list, because
+    _string_list only ever runs in load(), and load() is not the only way a
+    Config is built. `hx new` constructs one directly from its options and
+    dumps() it, so `hx new --exclude ''` wrote `exclude: ['', ...]` to
+    config.yaml AND to the scope_version row while every check in this module
+    passed -- the guard fired on the next `load()`, which is to say after the
+    engagement existed. Not a bypass (the extension still fails closed), but
+    the whole point of the guard was that the operator learns at `hx new`, and
+    on that path they did not. cli.new() calls this before it builds anything.
+
+    Narrow on purpose, and unchanged from where the check used to live: a blank
+    ENTRY is refused, an explicitly empty LIST is not. The spec requires
+    `exclude: []` to stay writable and reviewable.
+    """
+    for i, x in enumerate(values):
+        if not x.strip():
+            raise ConfigError(
+                f"{key}[{i}] is blank; remove the entry or give it a value"
+            )
 
 
 def _positive_int(raw: dict, key: str, default: int) -> int:
@@ -2229,17 +2376,36 @@ def _write_config_secure(path: Path, text: str) -> None:
     # os.replace stays on one filesystem and is atomic).
     tmp = path.parent / f".{uuid.uuid4().hex}.{path.name}"
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # OWNERSHIP OF `fd` TRANSFERS AT THE os.fdopen BELOW, and the two
+    # guards exist because it does: os.fdopen wraps the descriptor in a file
+    # object that closes it -- so once this succeeds, `fd` is the file
+    # object's to close and closing it here as well closes whatever number
+    # the OS has handed out since.
+    #
+    # It used to be one `try` around both, with `os.close(fd)` in the
+    # except arm. DEMONSTRATED: raise inside the `with` body and that arm
+    # runs `os.close` on an already-closed descriptor -- OSError 9 (EBADF),
+    # caught and shrugged off. Harmless only while nothing else opens
+    # anything in that window. Demonstrated too: with one intervening
+    # open() the kernel hands back THE SAME NUMBER, `os.close` then
+    # succeeds, and an `fstat` on the new owner's descriptor answers EBADF.
+    # The bridge's accept loop opens sockets continuously.
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        # It did NOT take ownership, so `fd` is still ours to close.
+        os.close(fd)
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
     except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        # No os.close here: `fh` owns the descriptor and the `with` has
+        # already closed it on the way out.
         Path(tmp).unlink(missing_ok=True)
         raise
 
@@ -2538,6 +2704,48 @@ def test_new_rejects_empty_client(tmp_path: Path):
     assert len(list(tmp_path.iterdir())) == 0
 
 
+@pytest.mark.parametrize("option", ["--scope", "--exclude"])
+def test_new_rejects_a_blank_scope_entry(tmp_path: Path, option):
+    """A blank pattern is refused at `hx new`, not at the next `load()`.
+
+    config.load() has refused a blank entry since the guard landed, but `hx new`
+    does not go through load(): it builds a Config from its options and dumps()
+    it. So `hx new --exclude ''` wrote `exclude: ['']` into config.yaml and into
+    the scope_version row, and the operator learned about it on the next open --
+    which is the one thing the guard was added to prevent. The extension still
+    fails closed on an empty pattern, so this was never a bypass; it was the
+    guard firing one step too late to be the guard.
+    """
+    runner = CliRunner()
+    args = ["new", "acme", "--client", "Acme", "--scope", "https://a/*",
+            "--root", str(tmp_path)]
+    if option == "--scope":
+        args = ["new", "acme", "--client", "Acme", "--scope", "",
+                "--root", str(tmp_path)]
+    else:
+        args += ["--exclude", ""]
+    result = runner.invoke(cli.main, args)
+    assert result.exit_code != 0, result.output
+    assert "blank" in result.output.lower(), result.output
+    # And nothing was created: the refusal comes before any directory is made.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_new_still_accepts_no_exclude_at_all(tmp_path: Path):
+    """The control. The guard refuses a blank ENTRY, never an empty LIST --
+    `exclude: []` has to stay writable, and an operator who passes no
+    `--exclude` at all is writing exactly that."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["new", "acme", "--client", "Acme", "--scope", "https://a/*",
+         "--root", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    text = (tmp_path / "acme" / "config.yaml").read_text(encoding="utf-8")
+    assert "exclude: []" in text
+
+
 def test_info_missing_config_yaml(tmp_path: Path):
     """Test that info handles missing config.yaml gracefully."""
     runner = CliRunner()
@@ -2761,6 +2969,18 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
     for field, value in (("NAME", name), ("--client", client)):
         if not value.strip():
             raise click.ClickException(f"{field} must not be empty")
+    # The same refusal one field along, and it has to be HERE rather than only
+    # in config.load(): this command builds a Config directly and dumps() it,
+    # so the load-time guard does not run until the engagement already exists.
+    # `hx new --exclude ""` wrote `exclude: ['']` to config.yaml and to the
+    # scope_version row, and the operator found out on the next open. The
+    # extension still fails closed on an empty pattern -- it is not a bypass --
+    # but the guard exists so that the operator learns at `hx new`.
+    for option, values in (("scope.include", scope), ("scope.exclude", exclude)):
+        try:
+            config_mod.check_entries(option, list(values))
+        except config_mod.ConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
     # NAME becomes a path segment under the engagements root (`base / name`).
     # Without this check, "." makes the engagements root ITSELF an
     # engagement (so `rm -rf` of it destroys every client), ".." or

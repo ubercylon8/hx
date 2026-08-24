@@ -82,7 +82,39 @@ def _string_list(raw: dict, key: str, default: list[str]) -> list[str]:
         raise ConfigError(f"{key} must be a list, got {type(v).__name__}")
     if not all(isinstance(x, str) for x in v):
         raise ConfigError(f"every entry in {key} must be a string")
+    check_entries(key, v)
     return list(v)
+
+
+def check_entries(key: str, values: list[str]) -> None:
+    """Refuse a blank entry in a list of patterns.
+
+    A blank entry means nothing to any consumer, and in a scope list it is
+    actively dangerous: the extension refuses an empty pattern outright --
+    Rule.forExclude("") throws and the whole decision becomes scope_denied --
+    so one stray blank line in scope.exclude takes the engagement to deny-all
+    mid-run. Failing closed there is right; failing HERE is better, because the
+    operator finds out before the run rather than after the first refusal.
+
+    A PUBLIC function rather than a branch inside _string_list, because
+    _string_list only ever runs in load(), and load() is not the only way a
+    Config is built. `hx new` constructs one directly from its options and
+    dumps() it, so `hx new --exclude ''` wrote `exclude: ['', ...]` to
+    config.yaml AND to the scope_version row while every check in this module
+    passed -- the guard fired on the next `load()`, which is to say after the
+    engagement existed. Not a bypass (the extension still fails closed), but
+    the whole point of the guard was that the operator learns at `hx new`, and
+    on that path they did not. cli.new() calls this before it builds anything.
+
+    Narrow on purpose, and unchanged from where the check used to live: a blank
+    ENTRY is refused, an explicitly empty LIST is not. The spec requires
+    `exclude: []` to stay writable and reviewable.
+    """
+    for i, x in enumerate(values):
+        if not x.strip():
+            raise ConfigError(
+                f"{key}[{i}] is blank; remove the entry or give it a value"
+            )
 
 
 def _positive_int(raw: dict, key: str, default: int) -> int:

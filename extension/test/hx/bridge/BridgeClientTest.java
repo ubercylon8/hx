@@ -1,12 +1,19 @@
 package hx.bridge;
 
+import static hx.TestSupport.waitUntilBlockedOn;
+
+import hx.TestSupport;
+import hx.send.HaltSwitch;
+
 import java.io.*;
 import java.net.*;
+import java.nio.channels.Channel;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Drives BridgeClient against a fake Python server on a real unix socket. */
 public class BridgeClientTest {
@@ -18,6 +25,92 @@ public class BridgeClientTest {
         if (!ok) failures++;
     }
 
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(BridgeClientTest::check, name, body);
+    }
+
+    /**
+     * Every blocking socket operation in this file carries a deadline.
+     *
+     * This is the third way a hand-rolled runner truncates, and the worst of
+     * them. A sabotage that stops BridgeClient sending its hello used to park
+     * the first {@code reader.read()} on the socket FOREVER: zero lines of
+     * output, no summary line, and no exit code at all -- a result that under
+     * {@code ./test.sh | grep -c FAIL} reads as zero failures, and a runner
+     * that has to be killed from outside. `timeout` in test.sh bounds the
+     * damage; it does not make the test report anything. A guard that can only
+     * be stopped by an outside stopwatch is not guarding.
+     *
+     * Ten seconds is twenty-five times the whole class's measured runtime
+     * (381 ms), and twice the 5 s bound {@link #waitUntil} already carries, so
+     * it can only fire on a genuine wedge. It also has to leave room for the
+     * WORST case rather than the typical one: every method wedging in turn
+     * costs one deadline each, and that total must stay inside test.sh's 300 s
+     * backstop -- 10 s buys thirty methods, against nine today.
+     */
+    static final long READ_DEADLINE_MS = 10_000L;
+
+    /**
+     * A unix-domain {@link SocketChannel} has no SO_TIMEOUT, so the deadline is
+     * a watchdog that CLOSES the channel out from under the parked call. The
+     * blocked read or accept then throws, which the per-method guard turns into
+     * a named FAIL. Whether the watchdog fired is recorded rather than inferred
+     * from the exception type: an ordinary IOException from a test that is
+     * doing its job must keep its own message.
+     */
+    static final class Deadline implements AutoCloseable {
+        private final AtomicBoolean expired = new AtomicBoolean(false);
+        private final Thread watchdog;
+
+        Deadline(Channel ch) {
+            watchdog = new Thread(() -> {
+                try { Thread.sleep(READ_DEADLINE_MS); }
+                catch (InterruptedException arrivedInTime) { return; }
+                expired.set(true);
+                try { ch.close(); } catch (IOException ignored) { }
+            });
+            watchdog.setDaemon(true);
+            watchdog.start();
+        }
+
+        boolean expired() { return expired.get(); }
+
+        public void close() { watchdog.interrupt(); }
+    }
+
+    /** {@code reader.read()} with a deadline on it. */
+    static Frame.Decoded read(Frame.Reader reader, Channel ch, String what) throws Exception {
+        try (Deadline d = new Deadline(ch)) {
+            try {
+                return reader.read();
+            } catch (IOException e) {
+                if (d.expired())
+                    throw new IOException(what + " did not arrive within "
+                                          + READ_DEADLINE_MS + " ms", e);
+                throw e;
+            }
+        }
+    }
+
+    /** {@code server.accept()} with a deadline on it: a client that never
+     *  dials wedges here exactly as a frame that never arrives wedges above. */
+    static SocketChannel accept(ServerSocketChannel server) throws Exception {
+        try (Deadline d = new Deadline(server)) {
+            try {
+                return server.accept();
+            } catch (IOException e) {
+                if (d.expired())
+                    throw new IOException("the client did not dial within "
+                                          + READ_DEADLINE_MS + " ms", e);
+                throw e;
+            }
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("hxbridge");
         Path sock = dir.resolve("t.sock");
@@ -27,123 +120,41 @@ public class BridgeClientTest {
 
             FakeMontoya.Logger log = new FakeMontoya.Logger();
             BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
+            client.setHaltSource(NOTHING_HELD);
 
-            Thread t = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
-            t.start();
+            // Daemon, for the same reason live()'s dial thread is one: a read
+            // loop that outlives its assertions must not keep the JVM up after
+            // main() has printed its summary.
+            Thread dial = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
+            dial.setDaemon(true);
+            dial.start();
 
-            try (SocketChannel peer = server.accept()) {
-                InputStream in = java.nio.channels.Channels.newInputStream(peer);
-                OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
-                // One Reader for the whole connection: frames coalesce, and a
-                // fresh reader per call would drop whatever followed the one
-                // it returned.
-                Frame.Reader reader = new Frame.Reader(in);
-
-                // 1. hello arrives with the right identity
-                Frame.Decoded hello = reader.read();
-                check("sends hello", "hello".equals(hello.header.get("t")));
-                check("hello carries engagement_id", "e-1".equals(hello.header.get("engagement_id")));
-                check("hello carries instance_id", "i-1".equals(hello.header.get("instance_id")));
-                check("hello carries protocol version", Long.valueOf(1L).equals(hello.header.get("v")));
-
-                // 2. DENY-ALL before configure
-                check("unconfigured after hello", !client.isConfigured());
-                boolean threw = false;
-                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { threw = true; }
-                check("checkMaySend throws NotConfigured before configure", threw);
-
-                // 3. configure -> configured, with an epoch
-                Map<String, Object> cfg = new LinkedHashMap<>();
-                cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", 1L);
-                cfg.put("engagement_id", "e-1"); cfg.put("scope_sha256", "abc");
-                cfg.put("profile", "production");
-                // configure is the one request frame, and BridgeServer._request
-                // stamps id and deadline_us onto every one of them. A fake that
-                // omits it is not the peer: the client answers bad_frame.
-                cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
-                out.write(Frame.encode(cfg, "scope.include\thttps://a/*\nlimit.rate_rps\t5\n"
-                        .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-                out.flush();
-
-                Frame.Decoded ack = reader.read();
-                check("acks with configured", "configured".equals(ack.header.get("t")));
-                check("ack echoes the request id", Long.valueOf(1L).equals(ack.header.get("id")));
-                check("ack carries a non-zero epoch",
-                      ((Long) ack.header.get("config_epoch")) > 0);
-
-                waitUntil(() -> client.isConfigured());
-                check("configured after ack", client.isConfigured());
-                check("scope config parsed",
-                      client.scopeConfig().get("scope.include").equals(List.of("https://a/*")));
-                // The coherent read. configEpoch() then scopeConfig() is two
-                // volatile reads and a commit can land between them; this is
-                // the one an evidence line has to use.
-                BridgeClient.Authorisation au = client.authorisation();
-                check("authorisation() carries the epoch and the scope together",
-                      au.epoch() == client.configEpoch()
-                      && au.scope().equals(client.scopeConfig()));
-                client.checkMaySend();   // must not throw now
-
-                // 4. halt / resume
-                Map<String, Object> halt = Map.of("v", 1L, "t", "halt", "reason", "operator");
-                out.write(Frame.encode(halt, new byte[0])); out.flush();
-                waitUntil(() -> !client.maySend());
-                boolean haltedThrew = false;
-                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { haltedThrew = true; }
-                check("halt blocks sending", haltedThrew);
-
-                out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0])); out.flush();
-                waitUntil(() -> client.maySend());
-                boolean resumed = client.maySend();
-                try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { resumed = false; }
-                check("resume unblocks sending", resumed);
-
-                // 5. an engagement_id mismatch on configure is refused
-                Map<String, Object> wrong = new LinkedHashMap<>(cfg);
-                wrong.put("id", 2L); wrong.put("engagement_id", "SOMEONE-ELSE");
-                out.write(Frame.encode(wrong, new byte[0])); out.flush();
-                Frame.Decoded err = reader.read();
-                check("engagement mismatch answered with error",
-                      "error".equals(err.header.get("t")));
-                check("error class names the mismatch",
-                      String.valueOf(err.header.get("class")).contains("engagement"));
-
-                // 6. a protocol-mismatch frame while configured must trip
-                // DENY-ALL through readLoop's OTHER exit path. handle()
-                // returns false here, and the bare `return` that used to
-                // follow skipped both catch blocks entirely: configured
-                // stayed true, configEpoch kept its value, and maySend()
-                // would answer true forever with a dead read loop and no
-                // control channel behind it. This is the exact leak the
-                // finally block in readLoop() exists to close.
-                check("configured before the protocol-mismatch frame", client.maySend());
-                Map<String, Object> badVersion = new LinkedHashMap<>();
-                badVersion.put("v", 2L); badVersion.put("t", "halt"); badVersion.put("reason", "operator");
-                out.write(Frame.encode(badVersion, new byte[0])); out.flush();
-                Frame.Decoded mismatch = reader.read();
-                check("protocol mismatch answered with error",
-                      "error".equals(mismatch.header.get("t")));
-                check("error class names the protocol mismatch",
-                      "protocol_mismatch".equals(mismatch.header.get("class")));
-                waitUntil(() -> !client.maySend());
-                check("protocol mismatch trips DENY-ALL via readLoop's return path",
-                      !client.maySend());
-                boolean deniedAfterMismatch = false;
-                try { client.checkMaySend(); }
-                catch (BridgeClient.NotConfigured e) { deniedAfterMismatch = true; }
-                check("checkMaySend throws after the protocol-mismatch DENY-ALL",
-                      deniedAfterMismatch);
-            }
+            t("theControlChannelHandshake", () -> theControlChannelHandshake(server, client));
             client.close();
 
-            closedIsSticky();
-            aClosedClientDoesNotGoLive();
-            aRefusedConfigureDropsToDenyAll();
-            closeIsTerminalAgainstTheReadLoop();
-            losingThePeerDropsToDenyAll();
-            aFailedHelloLeavesNoChannelBehind();
-            theCommitIsExclusiveWithClose();
-            aConfigureDoesNotLiftAHalt();
+            t("closedIsSticky", BridgeClientTest::closedIsSticky);
+            t("aClosedClientDoesNotGoLive", BridgeClientTest::aClosedClientDoesNotGoLive);
+            t("aRefusedConfigureDropsToDenyAll", BridgeClientTest::aRefusedConfigureDropsToDenyAll);
+            t("closeIsTerminalAgainstTheReadLoop", BridgeClientTest::closeIsTerminalAgainstTheReadLoop);
+            t("losingThePeerDropsToDenyAll", BridgeClientTest::losingThePeerDropsToDenyAll);
+            t("aFailedHelloLeavesNoChannelBehind", BridgeClientTest::aFailedHelloLeavesNoChannelBehind);
+            t("theCommitIsExclusiveWithClose", BridgeClientTest::theCommitIsExclusiveWithClose);
+            t("aConfigureDoesNotLiftAHalt", BridgeClientTest::aConfigureDoesNotLiftAHalt);
+            t("haltFramesReachTheSwitchTheSendPathAsks", BridgeClientTest::haltFramesReachTheSwitchTheSendPathAsks);
+            t("theKillPathsThatNeverTouchTheLocalFlagStillDenySending",
+              BridgeClientTest::theKillPathsThatNeverTouchTheLocalFlagStillDenySending);
+            t("aConfigureTheGuardRefusesIsBadConfigAndKeepsTheChannel",
+              BridgeClientTest::aConfigureTheGuardRefusesIsBadConfigAndKeepsTheChannel);
+            t("aHaltFrameWithNoReasonDoesNotDeliverTheWordNull", BridgeClientTest::aHaltFrameWithNoReasonDoesNotDeliverTheWordNull);
+            t("aHaltSinkThatThrowsDropsToDenyAll", BridgeClientTest::aHaltSinkThatThrowsDropsToDenyAll);
+            t("theSendArmHandsTheHandlerOneCoherentAuthorisation", BridgeClientTest::theSendArmHandsTheHandlerOneCoherentAuthorisation);
+            t("aSendForAnotherEngagementNeverReachesTheHandler", BridgeClientTest::aSendForAnotherEngagementNeverReachesTheHandler);
+            t("aSendHandlerThatThrowsDropsToDenyAll", BridgeClientTest::aSendHandlerThatThrowsDropsToDenyAll);
+            t("aSendWithNoHandlerInstalledIsRefused", BridgeClientTest::aSendWithNoHandlerInstalledIsRefused);
+            t("aThrowingSendArmBothDeniesAndStopsTheLoop",
+              BridgeClientTest::aThrowingSendArmBothDeniesAndStopsTheLoop);
+            t("anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives",
+              BridgeClientTest::anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -151,6 +162,130 @@ public class BridgeClientTest {
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
+    }
+
+    /**
+     * The first connection, end to end: hello, the DENY-ALL that precedes any
+     * configure, the configure itself, halt/resume, and the two frames that
+     * must be refused. A method rather than an inline block in main() so that
+     * the per-method guard covers it -- inline, a single throw in here (an
+     * unanswered read, a null header) took the other eight methods with it.
+     */
+    static void theControlChannelHandshake(ServerSocketChannel server, BridgeClient client)
+            throws Exception {
+        try (SocketChannel peer = accept(server)) {
+            InputStream in = java.nio.channels.Channels.newInputStream(peer);
+            OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
+            // One Reader for the whole connection: frames coalesce, and a
+            // fresh reader per call would drop whatever followed the one
+            // it returned.
+            Frame.Reader reader = new Frame.Reader(in);
+
+            // 1. hello arrives with the right identity
+            Frame.Decoded hello = read(reader, peer, "the hello");
+            check("sends hello", "hello".equals(hello.header.get("t")));
+            check("hello carries engagement_id", "e-1".equals(hello.header.get("engagement_id")));
+            check("hello carries instance_id", "i-1".equals(hello.header.get("instance_id")));
+            check("hello carries protocol version", Long.valueOf(1L).equals(hello.header.get("v")));
+
+            // 2. DENY-ALL before configure
+            check("unconfigured after hello", !client.isConfigured());
+            boolean threw = false;
+            try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { threw = true; }
+            check("checkMaySend throws NotConfigured before configure", threw);
+            // ...and the other side of the overload: an operator who has not
+            // configured is not an extension fault, so the prefix must NOT be
+            // there. A marker every not_configured carries marks nothing.
+            String beforeConfigure = null;
+            try { client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { beforeConfigure = e.getMessage(); }
+            check("and an unconfigured operator is not marked an extension fault ("
+                  + beforeConfigure + ")",
+                  beforeConfigure != null
+                  && !beforeConfigure.contains(BridgeClient.EXTENSION_FAULT));
+
+            // 3. configure -> configured, with an epoch
+            Map<String, Object> cfg = new LinkedHashMap<>();
+            cfg.put("v", 1L); cfg.put("t", "configure"); cfg.put("id", 1L);
+            cfg.put("engagement_id", "e-1"); cfg.put("scope_sha256", "abc");
+            cfg.put("profile", "production");
+            // configure is the one request frame, and BridgeServer._request
+            // stamps id and deadline_us onto every one of them. A fake that
+            // omits it is not the peer: the client answers bad_frame.
+            cfg.put("deadline_us", System.currentTimeMillis() * 1000L + 10_000_000L);
+            out.write(Frame.encode(cfg, "scope.include\thttps://a/*\nlimit.rate_rps\t5\n"
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            out.flush();
+
+            Frame.Decoded ack = read(reader, peer, "the configured ack");
+            check("acks with configured", "configured".equals(ack.header.get("t")));
+            check("ack echoes the request id", Long.valueOf(1L).equals(ack.header.get("id")));
+            check("ack carries a non-zero epoch",
+                  ((Long) ack.header.get("config_epoch")) > 0);
+
+            waitUntil(() -> client.isConfigured());
+            check("configured after ack", client.isConfigured());
+            check("scope config parsed",
+                  client.scopeConfig().get("scope.include").equals(List.of("https://a/*")));
+            // The coherent read. configEpoch() then scopeConfig() is two
+            // volatile reads and a commit can land between them; this is
+            // the one an evidence line has to use.
+            BridgeClient.Authorisation au = client.authorisation();
+            check("authorisation() carries the epoch and the scope together",
+                  au.epoch() == client.configEpoch()
+                  && au.scope().equals(client.scopeConfig()));
+            client.checkMaySend();   // must not throw now
+
+            // 4. halt / resume
+            Map<String, Object> halt = Map.of("v", 1L, "t", "halt", "reason", "operator");
+            out.write(Frame.encode(halt, new byte[0])); out.flush();
+            waitUntil(() -> !client.maySend());
+            boolean haltedThrew = false;
+            try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { haltedThrew = true; }
+            check("halt blocks sending", haltedThrew);
+
+            out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0])); out.flush();
+            waitUntil(() -> client.maySend());
+            boolean resumed = client.maySend();
+            try { client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { resumed = false; }
+            check("resume unblocks sending", resumed);
+
+            // 5. an engagement_id mismatch on configure is refused
+            Map<String, Object> wrong = new LinkedHashMap<>(cfg);
+            wrong.put("id", 2L); wrong.put("engagement_id", "SOMEONE-ELSE");
+            out.write(Frame.encode(wrong, new byte[0])); out.flush();
+            Frame.Decoded err = read(reader, peer, "the engagement-mismatch error");
+            check("engagement mismatch answered with error",
+                  "error".equals(err.header.get("t")));
+            check("error class names the mismatch",
+                  String.valueOf(err.header.get("class")).contains("engagement"));
+
+            // 6. a protocol-mismatch frame while configured must trip
+            // DENY-ALL through readLoop's OTHER exit path. handle()
+            // returns false here, and the bare `return` that used to
+            // follow skipped both catch blocks entirely: configured
+            // stayed true, configEpoch kept its value, and maySend()
+            // would answer true forever with a dead read loop and no
+            // control channel behind it. This is the exact leak the
+            // finally block in readLoop() exists to close.
+            check("configured before the protocol-mismatch frame", client.maySend());
+            Map<String, Object> badVersion = new LinkedHashMap<>();
+            badVersion.put("v", 2L); badVersion.put("t", "halt"); badVersion.put("reason", "operator");
+            out.write(Frame.encode(badVersion, new byte[0])); out.flush();
+            Frame.Decoded mismatch = read(reader, peer, "the protocol-mismatch error");
+            check("protocol mismatch answered with error",
+                  "error".equals(mismatch.header.get("t")));
+            check("error class names the protocol mismatch",
+                  "protocol_mismatch".equals(mismatch.header.get("class")));
+            waitUntil(() -> !client.maySend());
+            check("protocol mismatch trips DENY-ALL via readLoop's return path",
+                  !client.maySend());
+            boolean deniedAfterMismatch = false;
+            try { client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { deniedAfterMismatch = true; }
+            check("checkMaySend throws after the protocol-mismatch DENY-ALL",
+                  deniedAfterMismatch);
+        }
     }
 
     /** Drive a fresh client to "configured" and hand back the pieces. */
@@ -183,22 +318,34 @@ public class BridgeClientTest {
         server.bind(UnixDomainSocketAddress.of(sock));
         FakeMontoya.Logger log = new FakeMontoya.Logger();
         BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
+        client.setHaltSource(NOTHING_HELD);
         // Daemon: a read loop that leaks past the end of a test must fail the
         // suite by way of its assertions, not outlive main() and hang the JVM.
         Thread dial = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
         dial.setDaemon(true);
         dial.start();
-        SocketChannel peer = server.accept();
+        SocketChannel peer = accept(server);
         OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
         Frame.Reader reader = new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
-        reader.read();                                   // the hello
+        read(reader, peer, "the hello");
         out.write(Frame.encode(configureFrame("e-1", 1L),
                   "scope.include\thttps://WIDE/*\n".getBytes(StandardCharsets.UTF_8)));
         out.flush();
-        reader.read();                                   // the ack
+        read(reader, peer, "the configured ack");
         waitUntil(client::isConfigured);
         return new Live(server, client, peer, out, reader, log);
     }
+
+    /**
+     * A halt source that never holds issuance.
+     *
+     * BridgeClient fails CLOSED without one -- see setHaltSource -- so every
+     * client built here installs this, and the checks below are then about
+     * THIS class's own two flags with the send path's authority held constant.
+     * The tests that vary the authority instead install their own; see
+     * theKillPathsThatNeverTouchTheLocalFlagStillDenySending.
+     */
+    static final BridgeClient.HaltSource NOTHING_HELD = () -> null;
 
     /** close() must be sticky: a client closed before its dial completes must
      *  never go on to hello, configure and live sending. Reproduced by the
@@ -209,6 +356,7 @@ public class BridgeClientTest {
         try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
             server.bind(UnixDomainSocketAddress.of(sock));
             BridgeClient client = new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+            client.setHaltSource(NOTHING_HELD);
             client.close();
 
             // On a thread with a join timeout: an unfixed client's connect()
@@ -289,7 +437,7 @@ public class BridgeClientTest {
             l.out.write(Frame.encode(configureFrame("e-1", 3L),
                     "this-is-not-a-config-body\n".getBytes(StandardCharsets.UTF_8)));
             l.out.flush();
-            Frame.Decoded err = l.reader.read();
+            Frame.Decoded err = read(l.reader, l.peer, "the config error");
             check("unparseable configure is answered with an error",
                   "error".equals(err.header.get("t")));
             check("error class names the config",
@@ -361,19 +509,20 @@ public class BridgeClientTest {
                     server.bind(UnixDomainSocketAddress.of(sock));
                     BridgeClient client =
                             new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+                    client.setHaltSource(NOTHING_HELD);
                     Thread t = new Thread(() -> {
                         try { client.connect(); } catch (Exception ignored) { } });
                     t.setDaemon(true);
                     t.start();
-                    try (SocketChannel peer = server.accept()) {
+                    try (SocketChannel peer = accept(server)) {
                         OutputStream out = java.nio.channels.Channels.newOutputStream(peer);
                         Frame.Reader reader =
                                 new Frame.Reader(java.nio.channels.Channels.newInputStream(peer));
-                        reader.read();                                   // hello
+                        read(reader, peer, "the hello");
 
                         out.write(Frame.encode(configureFrame("e-1", 0L), CFG));
                         out.flush();
-                        reader.read();                                   // the ack
+                        read(reader, peer, "the configured ack");
                         waitUntil(client::isConfigured);
 
                         ByteArrayOutputStream backlog = new ByteArrayOutputStream();
@@ -385,7 +534,7 @@ public class BridgeClientTest {
                         // whole backlog in its Reader and is committing frames
                         // out of it, so close() lands mid-backlog rather than
                         // before the bytes have even arrived.
-                        reader.read();
+                        read(reader, peer, "the first backlog ack");
 
                         client.close();
 
@@ -427,6 +576,7 @@ public class BridgeClientTest {
             server.bind(UnixDomainSocketAddress.of(sock));
             BridgeClient client = new BridgeClient(
                     sock, "e-1", "i-".repeat(4 << 20), new FakeMontoya.Logger());
+            client.setHaltSource(NOTHING_HELD);
 
             Thread killer = new Thread(() -> {
                 try (SocketChannel peer = server.accept()) {
@@ -520,7 +670,8 @@ public class BridgeClientTest {
             l.out.write(Frame.encode(configureFrame("e-1", 4L),
                     "scope.include\thttps://NARROW/*\n".getBytes(StandardCharsets.UTF_8)));
             l.out.flush();
-            Frame.Decoded ack = l.reader.read();
+            Frame.Decoded ack = read(l.reader, l.peer,
+                                     "the ack for the configure sent while halted");
             // Reading the ack is the happens-before edge: the commit completes
             // before the ack is written, so nothing below has to poll.
             check("the configure while halted is acknowledged",
@@ -555,20 +706,648 @@ public class BridgeClientTest {
         }
     }
 
-    /** True once `t` is BLOCKED on `monitor` specifically. */
-    static boolean waitUntilBlockedOn(Thread t, Object monitor) throws Exception {
-        java.lang.management.ThreadMXBean mx = java.lang.management.ManagementFactory.getThreadMXBean();
-        int want = System.identityHashCode(monitor);
-        long end = System.currentTimeMillis() + 5000;
-        while (System.currentTimeMillis() < end) {
-            java.lang.management.ThreadInfo info = mx.getThreadInfo(t.threadId());
-            if (info != null && t.getState() == Thread.State.BLOCKED) {
-                java.lang.management.LockInfo li = info.getLockInfo();
-                if (li != null && li.getIdentityHashCode() == want) return true;
-            }
-            Thread.sleep(1);
+    /**
+     * A `halt` frame has to reach the switch the SEND PATH asks.
+     *
+     * BridgeClient's own `halted` flag guards maySend() and checkMaySend(),
+     * and Sender calls neither: it asks HaltSwitch. Wired up wrongly -- or not
+     * at all -- a halt frame would flip a flag nothing on the send path reads,
+     * both consoles would say "halted", and requests would keep going out. The
+     * failure has no other observable: maySend() answers false either way.
+     */
+    static void haltFramesReachTheSwitchTheSendPathAsks() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsink");
+        // Unstarted, so this test runs no poller thread: the sentinel half is
+        // HaltSwitchTest's business, and the frame half needs no clock -- an
+        // unarmed switch never reads one.
+        HaltSwitch hs = new HaltSwitch(() -> 0L, dir.resolve("halt"), 500L);
+        try (Live l = live(dir, "hs.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { hs.haltedByFrame(reason); }
+                public void resumed()             { hs.resumedByFrame(); }
+            });
+            check("the send path is not halted before the frame", !hs.halted());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "operator pressed stop"), new byte[0]));
+            l.out.flush();
+            waitUntil(hs::halted);
+            check("a halt frame halts the switch the send path asks", hs.halted());
+            check("and the operator's words arrive with it",
+                  "operator pressed stop".equals(hs.reason()));
+            check("and the client's own flag agrees", !l.client.maySend());
+
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "resume"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !hs.halted());
+            check("a resume frame lifts it on the send path too", !hs.halted());
+            check("and the client is sending again", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("hs.sock")); Files.deleteIfExists(dir);
         }
-        return false;
+    }
+
+    /**
+     * A configure the guard refuses is `bad_config`, leaves no epoch behind,
+     * and keeps the channel.
+     *
+     * Spec s4, amended 2026-08-23: `Limits` takes the rate and budget from the
+     * FIRST authorisation with an epoch and holds them, because the budget
+     * must be monotonic -- a scope push must not resupply a run that has spent
+     * its requests. So an operator pushing `limit.rate_rps: 1` mid-run because
+     * the target is wobbling got a fresh `config_epoch`, no error, no log line
+     * and the OLD RATE. Lowering a rate is the one change that is always safe;
+     * believing you have made it when you have not is the failure to avoid.
+     *
+     * The guard installed here is a stand-in for
+     * `Limits.refuseIfLimitsMoved`, so this file needs no hx.send import to
+     * say what it has to say: that this client ASKS, that a refusal is
+     * bad_config rather than an ack, and that the refusal happens BEFORE the
+     * commit. The real predicate -- which configures move an armed limit and
+     * which do not -- is SenderTest's, where Limits is.
+     *
+     * The epoch assertion is the one that pins the placement. Refusing after
+     * the commit would still answer bad_config, and the operator would still
+     * be told; what they would ALSO have is a fresh `config_epoch` stamped on
+     * every later evidence line, granted by a configure that was refused.
+     */
+    static void aConfigureTheGuardRefusesIsBadConfigAndKeepsTheChannel() throws Exception {
+        Path dir = Files.createTempDirectory("hxconfigguard");
+        try (Live l = live(dir, "cg.sock")) {
+            long armed = l.client.authorisation().epoch();
+            check("the run is configured before any of this (epoch " + armed + ")",
+                  armed == 1L && l.client.maySend());
+
+            l.client.setConfigGuard(scope -> scope.containsKey("limit.rate_rps")
+                    ? "limit.rate_rps cannot change mid-run: this run armed at 5"
+                    : null);
+
+            l.out.write(Frame.encode(configureFrame("e-1", 41L),
+                    ("scope.include\thttps://a/*\nlimit.rate_rps\t1\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the refused configure");
+            check("a configure that would move an armed limit is refused, not acked (got "
+                  + err.header.get("t") + ")", "error".equals(err.header.get("t")));
+            check("with class bad_config (got " + err.header.get("class") + ")",
+                  "bad_config".equals(err.header.get("class")));
+            check("and the detail is the guard's own words",
+                  String.valueOf(err.header.get("detail"))
+                          .contains("cannot change mid-run"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a configure it could not act on drops to DENY-ALL", !l.client.maySend());
+
+            // A configure the guard allows still works, and the epoch it gets
+            // is the NEXT one -- not the next but one.
+            l.out.write(Frame.encode(configureFrame("e-1", 42L),
+                    ("scope.include\thttps://NARROW/*\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded ack = read(l.reader, l.peer, "the corrected configured ack");
+            check("the channel survives, so a corrected configure is heard (got "
+                  + ack.header.get("t") + ")", "configured".equals(ack.header.get("t")));
+            check("and the refused configure consumed NO epoch (got "
+                  + ack.header.get("config_epoch") + ")",
+                  Long.valueOf(armed + 1).equals(ack.header.get("config_epoch")));
+            waitUntil(l.client::maySend);
+            check("with the corrected scope",
+                  l.client.authorisation().scope().toString().contains("NARROW"));
+
+            // A guard that THROWS is a refusal. It is asked about an
+            // operator's intent, and an answer it could not produce is not
+            // permission.
+            l.client.setConfigGuard(scope -> { throw new IllegalStateException("boom"); });
+            l.out.write(Frame.encode(configureFrame("e-1", 43L),
+                    ("scope.include\thttps://b/*\n").getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded threw = read(l.reader, l.peer, "the throwing-guard error");
+            check("a guard that throws refuses rather than letting the configure through ("
+                  + threw.header.get("class") + ")",
+                  "error".equals(threw.header.get("t"))
+                  && "bad_config".equals(threw.header.get("class")));
+            check("and says so rather than escaping",
+                  String.valueOf(threw.header.get("detail")).contains("boom"));
+
+            // ...and NO guard accepts. The asymmetry with setHaltSource is
+            // deliberate and setConfigGuard says why: a missing halt source
+            // leaves a question about stopping unanswered, where a missing
+            // config guard leaves the pre-existing silent-ignore. Failing
+            // closed here would mean an extension that cannot be configured.
+            l.client.setConfigGuard(null);
+            l.out.write(Frame.encode(configureFrame("e-1", 44L),
+                    ("scope.include\thttps://c/*\nlimit.rate_rps\t1\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded none = read(l.reader, l.peer, "the unguarded configured ack");
+            check("an uninstalled guard accepts (got " + none.header.get("t") + ")",
+                  "configured".equals(none.header.get("t")));
+        } finally {
+            Files.deleteIfExists(dir.resolve("cg.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * The kill paths that never touch this client's own flag still deny.
+     *
+     * BridgeClient writes its own `halted` flag in exactly two places -- the
+     * `halt` and `resume` frame arms -- and spec s4 names THREE kill paths.
+     * The sentinel file ("the socket is dead, stop by hand"), its stalled-
+     * poller rule, and the auto-halt on target distress all reach HaltSwitch
+     * or Distress and none of them reach that flag. MEASURED on a configured
+     * live client before setHaltSource existed:
+     *
+     *   sentinel file present   HaltSwitch.halted()=true    maySend()=true
+     *   poller stalled          HaltSwitch.halted()=true    maySend()=true
+     *   auto-halt tripped       stopReason() non-null       maySend()=true
+     *
+     * and checkMaySend() threw nothing in all three. COUNTED on the reviewed
+     * tree: zero calls anywhere in extension/src -- the only occurrences there
+     * were the two declarations themselves -- against 53 lines of
+     * extension/test, 60 occurrences of them in this file alone. So the whole
+     * suite kept the pair green while it was fail-open against two thirds of
+     * s4's promise, which is how it survived eight task reviews.
+     *
+     * WHAT THIS TEST OWNS and what it does not. The sentinel leg is driven
+     * here through a REAL HaltSwitch, because that is the leg that proves
+     * this client asks something other than its own flag. The auto-halt leg
+     * lives in SenderTest.theHeldReasonIsTheSameAnswerTheSendPathActsOn --
+     * that is where Distress is -- and the wiring that installs the real
+     * authority in production is counted by ChokepointTest. The source
+     * installed here is HaltSwitch::reason rather than the Sender method
+     * HxExtension installs, so that this file needs no Policy, Redactor or
+     * Http to say what it has to say.
+     */
+    static void theKillPathsThatNeverTouchTheLocalFlagStillDenySending() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsource");
+        Path sentinel = dir.resolve("halt");
+        // A constant clock: unstarted the switch never reads one, and once
+        // started the staleness rule reads 0 - 0, which is never stale. This
+        // test is about the SENTINEL, not about time.
+        HaltSwitch hs = new HaltSwitch(() -> 0L, sentinel, 500L);
+        try (Live l = live(dir, "src.sock")) {
+            l.client.setHaltSource(hs::reason);
+            check("configured, nothing halted, and the source says so",
+                  l.client.maySend());
+
+            // The operator stops the run by hand. Nothing goes near a frame:
+            // this path exists for when the bridge itself is gone.
+            Files.writeString(sentinel, "stopped by hand\n");
+            hs.start();
+            try {
+                check("the authority the send path asks is halted", hs.halted());
+                check("and so is maySend(), which used to answer true here",
+                      !l.client.maySend());
+                String message = null;
+                try { l.client.checkMaySend(); }
+                catch (BridgeClient.NotConfigured e) { message = e.getMessage(); }
+                check("checkMaySend throws, and says which halt (" + message + ")",
+                      message != null && message.contains("halt sentinel present"));
+                // The local flag is untouched throughout, and the message is
+                // how that is visible: the flag's own branch answers
+                // "halted: no reason given" for a client no frame has halted,
+                // so a message naming the SENTINEL is proof the refusal came
+                // from the source and not from a flag somebody quietly wired.
+                check("...and the refusal came from the source, not the local flag ("
+                      + message + ")",
+                      message != null && !message.contains("no reason given"));
+            } finally {
+                hs.stop();
+            }
+        } finally {
+            Files.deleteIfExists(sentinel);
+            Files.deleteIfExists(dir.resolve("src.sock"));
+            Files.deleteIfExists(dir);
+        }
+
+        // ---- and the two ways the source itself can fail ------------------
+        //
+        // Both answer DENY. A client that cannot find out whether the run is
+        // stopped has not found out that it is running, which is the whole of
+        // this branch.
+        Path d2 = Files.createTempDirectory("hxhaltsource2");
+        try (Live l = live(d2, "n.sock")) {
+            // live() installs NOTHING_HELD; take it away again.
+            l.client.setHaltSource(null);
+            check("an uninstalled halt source denies rather than permits",
+                  !l.client.maySend());
+            String uninstalled = null;
+            try { l.client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { uninstalled = e.getMessage(); }
+            check("and says so (" + uninstalled + ")",
+                  uninstalled != null && uninstalled.contains("no halt source installed"));
+
+            l.client.setHaltSource(() -> { throw new IllegalStateException("boom"); });
+            check("a halt source that THROWS denies too", !l.client.maySend());
+            String threw = null;
+            try { l.client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { threw = e.getMessage(); }
+            check("and that is a refusal, not the throw escaping (" + threw + ")",
+                  threw != null && threw.contains("boom"));
+        } finally {
+            Files.deleteIfExists(d2.resolve("n.sock"));
+            Files.deleteIfExists(d2);
+        }
+    }
+
+    /**
+     * A `halt` frame carrying no `reason` key must not deliver the WORD
+     * "null".
+     *
+     * `String.valueOf(f.header.get("reason"))` answers the four-character
+     * string "null" for an absent key, and "null" is neither null nor blank,
+     * so HaltSwitch's "halted by frame, no reason given" fallback could never
+     * fire for a bridge-delivered halt -- the only production caller. Measured
+     * end to end, through a real socket: reason() was the literal "null" and
+     * checkMaySend() threw `NotConfigured: halted: null`. Both places an
+     * operator reads showed them the word null where the reason belongs.
+     */
+    static void aHaltFrameWithNoReasonDoesNotDeliverTheWordNull() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltnoreasonframe");
+        HaltSwitch hs = new HaltSwitch(() -> 0L, dir.resolve("halt"), 500L);
+        try (Live l = live(dir, "hn.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { hs.haltedByFrame(reason); }
+                public void resumed()             { hs.resumedByFrame(); }
+            });
+
+            l.out.write(Frame.encode(Map.of("v", 1L, "t", "halt"), new byte[0]));
+            l.out.flush();
+            waitUntil(hs::halted);
+            check("a halt frame with no reason still halts the send path", hs.halted());
+            check("and the switch's own fallback is what the send path reports ("
+                  + hs.reason() + ")",
+                  "halted by frame, no reason given".equals(hs.reason()));
+
+            String message = "";
+            try { l.client.checkMaySend(); } catch (BridgeClient.NotConfigured e) { message = e.getMessage(); }
+            check("and the client's refusal does not read `halted: null` (" + message + ")",
+                  message.startsWith("halted:") && !message.contains("null"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("hn.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** A halt that could not be delivered is an unknown state, and unknown is
+     *  stop. Not "log it and carry on": the frame that was meant to stop
+     *  issuance went nowhere. */
+    static void aHaltSinkThatThrowsDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsinkthrows");
+        try (Live l = live(dir, "ht.sock")) {
+            l.client.setHaltSink(new BridgeClient.HaltSink() {
+                public void halted(String reason) { throw new IllegalStateException("switch is gone"); }
+                public void resumed()             { }
+            });
+            check("configured before the undeliverable halt", l.client.maySend());
+
+            l.out.write(Frame.encode(
+                    Map.of("v", 1L, "t", "halt", "reason", "operator pressed stop"), new byte[0]));
+            l.out.flush();
+            waitUntil(() -> !l.client.isConfigured());
+            // isConfigured(), not maySend(): the local halt flag would answer
+            // maySend() false on its own, so a client that had merely logged
+            // the failure and carried on under the standing scope would pass a
+            // maySend() check. DENY-ALL means the scope went too.
+            check("a halt that could not be delivered drops to DENY-ALL",
+                  !l.client.isConfigured());
+            check("and the transition is logged", l.log.sawError("halt sink threw, deny-all"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("ht.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    static Map<String, Object> sendFrame(String engagement, long id) {
+        Map<String, Object> s = new LinkedHashMap<>();
+        s.put("v", 1L); s.put("t", "send"); s.put("id", id);
+        s.put("deadline_us", System.currentTimeMillis() * 1000L + 30_000_000L);
+        s.put("engagement_id", engagement);
+        s.put("identity_id", null);
+        s.put("target_host", "app.example.test");
+        s.put("target_port", 443L);
+        s.put("tls", true);
+        return s;
+    }
+
+    static final byte[] GET = ("GET /api/orders HTTP/1.1\r\nHost: app.example.test\r\n\r\n")
+            .getBytes(StandardCharsets.UTF_8);
+
+    /** The send arm reads the Authorisation ONCE and hands the whole snapshot
+     *  down. This is the only place in the extension that reads it at all. */
+    static void theSendArmHandsTheHandlerOneCoherentAuthorisation() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendarm");
+        try (Live l = live(dir, "s.sock")) {
+            final List<BridgeClient.Authorisation> seen = new ArrayList<>();
+            l.client.setSendHandler((h, b, auth) -> {
+                seen.add(auth);
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("v", 1L); r.put("t", "result"); r.put("id", h.get("id"));
+                r.put("status", 200L); r.put("outcome", "ok");
+                r.put(BridgeClient.BODY_KEY,
+                      "HTTP/1.1 200 OK\r\n\r\nhi".getBytes(StandardCharsets.UTF_8));
+                return r;
+            });
+
+            l.out.write(Frame.encode(sendFrame("e-1", 11L), GET));
+            l.out.flush();
+            // Through this class's deadline wrapper, not a bare reader.read():
+            // a send arm that answers nothing parks here forever, and a class
+            // that prints no summary line reads as zero failures.
+            Frame.Decoded result = read(l.reader, l.peer, "the result frame");
+
+            check("the send arm answers with the handler's frame",
+                  "result".equals(result.header.get("t")));
+            check("the handler saw the request body",
+                  Long.valueOf(11L).equals(result.header.get("id")));
+            check("the reserved body key never reaches the wire",
+                  !result.header.containsKey(BridgeClient.BODY_KEY));
+            check("and its bytes became the frame body",
+                  "HTTP/1.1 200 OK\r\n\r\nhi".equals(
+                          new String(result.body, StandardCharsets.UTF_8)));
+            check("the handler was given exactly one Authorisation", seen.size() == 1);
+            check("with the acked epoch", seen.get(0).epoch() == 1L);
+            check("and the scope that epoch authorised",
+                  seen.get(0).scope().toString().contains("WIDE"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("s.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** s6: every send carries engagement_id and the extension refuses a
+     *  mismatch -- before the handler, which would otherwise decide about a
+     *  request belonging to somebody else's engagement. */
+    static void aSendForAnotherEngagementNeverReachesTheHandler() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendmismatch");
+        try (Live l = live(dir, "m.sock")) {
+            final int[] calls = {0};
+            l.client.setSendHandler((h, b, auth) -> { calls[0]++; return new LinkedHashMap<>(); });
+
+            l.out.write(Frame.encode(sendFrame("SOMEONE-ELSE", 12L), GET));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the engagement-mismatch error");
+
+            check("a send for another engagement is answered with an error",
+                  "error".equals(err.header.get("t")));
+            check("the class names the mismatch",
+                  "engagement_mismatch".equals(err.header.get("class")));
+            check("and the handler was never called (" + calls[0] + ")", calls[0] == 0);
+            check("the connection survives a mismatched send", l.client.maySend());
+
+            // A frame with NO engagement_id at all, which is a different input
+            // from a frame naming somebody else's. MEASURED before this block
+            // existed: teaching the check to skip an ABSENT key -- the shape a
+            // "tolerate an optional field" change produces -- left the whole
+            // Java suite at 9 x ALL PASS / 1407 ok / 0 FAIL, because every
+            // test here supplied the key.
+            //
+            // `engagementId.equals(null)` is false, so absent already refuses.
+            // That is the fail-closed direction and it is worth an input:
+            // s6 says EVERY send carries it, so a frame without one is not
+            // speaking this protocol and cannot be decided about at all.
+            Map<String, Object> noEngagement = sendFrame("e-1", 14L);
+            noEngagement.remove("engagement_id");
+            l.out.write(Frame.encode(noEngagement, GET));
+            l.out.flush();
+            Frame.Decoded absent = read(l.reader, l.peer, "the absent-engagement error");
+
+            check("a send with NO engagement_id is answered with an error",
+                  "error".equals(absent.header.get("t")));
+            check("the class names the mismatch for an absent id too (got "
+                  + absent.header.get("class") + ")",
+                  "engagement_mismatch".equals(absent.header.get("class")));
+            check("and the handler was still never called (" + calls[0] + ")", calls[0] == 0);
+            check("the connection survives that too", l.client.maySend());
+        } finally {
+            Files.deleteIfExists(dir.resolve("m.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** An exception is never an implicit allow. A handler that throws is
+     *  answered, then the client drops to DENY-ALL and closes. */
+    static void aSendHandlerThatThrowsDropsToDenyAll() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendthrow");
+        try (Live l = live(dir, "t.sock")) {
+            check("live before the throw", l.client.maySend());
+            l.client.setSendHandler((h, b, auth) -> {
+                throw new IllegalStateException("policy table was null");
+            });
+
+            l.out.write(Frame.encode(sendFrame("e-1", 13L), GET));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the internal-failure error");
+
+            check("a throwing handler still answers the caller",
+                  "error".equals(err.header.get("t")));
+            check("with a class rather than a silent bridge_lost",
+                  "not_configured".equals(err.header.get("class")));
+            check("and the detail names the failure",
+                  String.valueOf(err.header.get("detail")).contains("policy table was null"));
+            // The class is OVERLOADED: `not_configured` is also what an
+            // operator who has not configured gets, and records.DENIAL_KIND
+            // files both under kind='not_configured'. So a store query
+            // grouping by kind reads a crashed send path as an unauthorised
+            // run unless the DETAIL says otherwise, in a form a consumer can
+            // test for rather than parse prose out of.
+            check("and it is marked as the EXTENSION's fault, not the operator's ("
+                  + err.header.get("detail") + ")",
+                  String.valueOf(err.header.get("detail"))
+                          .startsWith(BridgeClient.EXTENSION_FAULT));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a send path that threw drops to DENY-ALL", !l.client.maySend());
+            check("and the transition is logged",
+                  l.log.sawError("send handler threw"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("t.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /** No handler is a state, not an exemption. */
+    static void aSendWithNoHandlerInstalledIsRefused() throws Exception {
+        Path dir = Files.createTempDirectory("hxnohandler");
+        try (Live l = live(dir, "n.sock")) {
+            l.out.write(Frame.encode(sendFrame("e-1", 14L), GET));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the no-handler error");
+            check("a send with no handler is refused",
+                  "error".equals(err.header.get("t"))
+                  && "not_configured".equals(err.header.get("class")));
+            check("and marked as the extension's fault rather than the operator's ("
+                  + err.header.get("detail") + ")",
+                  String.valueOf(err.header.get("detail"))
+                          .startsWith(BridgeClient.EXTENSION_FAULT));
+
+            // The input that separates the guard from its absence, and the
+            // class alone is not it: delete the null check and h.handle()
+            // NPEs, the send arm's catch answers the SAME not_configured
+            // class, and the two are indistinguishable from the error frame --
+            // measured green across all nine classes. What differs is what
+            // happens next. The catch drops to DENY-ALL and closes; the guard
+            // refuses one send and leaves a live client that a handler can
+            // still be installed on, which is what "a state, not an exemption"
+            // means.
+            l.client.setSendHandler((h, b, auth) -> {
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("v", 1L); r.put("t", "result"); r.put("id", h.get("id"));
+                r.put("status", 200L); r.put("outcome", "ok");
+                return r;
+            });
+            l.out.write(Frame.encode(sendFrame("e-1", 15L), GET));
+            l.out.flush();
+            Frame.Decoded then = read(l.reader, l.peer, "the result once a handler is installed");
+            check("a missing handler is not a bridge failure: the client is still live",
+                  l.client.maySend());
+            check("and the handler installed afterwards answers",
+                  "result".equals(then.header.get("t"))
+                  && Long.valueOf(15L).equals(then.header.get("id")));
+        } finally {
+            Files.deleteIfExists(dir.resolve("n.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * The send arm's catch does TWO things -- `denyAll()` and `return false` --
+     * and each was masking the other.
+     *
+     * Delete `denyAll()` and the read loop's own finally still lands in
+     * DENY-ALL on the way out, so `maySend()` reads false either way. Delete
+     * `return false` and `denyAll()` has already cleared `configured`, so
+     * `maySend()` reads false again. Both mutations were measured at 9 x ALL
+     * PASS, and the pair is not redundant at all: the finally only runs
+     * because the arm asked the loop to leave, and the loop only leaves a
+     * client that is already denying because the arm denied first.
+     *
+     * handle() is called DIRECTLY here, which is what separates them. Nothing
+     * unwinds the read loop, so denyAll()'s absence is visible in maySend(),
+     * and the return value is visible on its own -- the answer to "does the
+     * control channel go on serving a send path that just threw", which spec
+     * s4 answers no.
+     */
+    static void aThrowingSendArmBothDeniesAndStopsTheLoop() throws Exception {
+        Path dir = Files.createTempDirectory("hxsendarmthrow");
+        try (Live l = live(dir, "at.sock")) {
+            check("live before the throw", l.client.maySend());
+            l.client.setSendHandler((h, b, auth) -> {
+                throw new IllegalStateException("the redactor is gone");
+            });
+
+            boolean keepReading = l.client.handle(
+                    Frame.decode(Frame.encode(sendFrame("e-1", 21L), GET)));
+            Frame.Decoded err = read(l.reader, l.peer, "the internal-failure error");
+            check("the caller is answered with a class, not a silent bridge_lost",
+                  "error".equals(err.header.get("t"))
+                  && "not_configured".equals(err.header.get("class")));
+            // Each of the two, separately.
+            check("the arm itself drops to DENY-ALL rather than leaving it to the "
+                  + "read loop's finally", !l.client.maySend());
+            check("and it tells the read loop to stop (" + keepReading + ")", !keepReading);
+        } finally {
+            Files.deleteIfExists(dir.resolve("at.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A limit the extension cannot use is refused WHEN IT ARRIVES, and the
+     * control channel survives the refusal.
+     *
+     * REPRODUCED end to end before this existed, over a real unix socket:
+     *
+     *     configure ack: t=configured  epoch=1     <- the operator is told OK
+     *     first send:    t=error class=not_configured
+     *                    detail=... limit.rate_rps is not an integer: as fast
+     *                    as possible
+     *     after it:      maySend()=false, http calls=0
+     *     a corrected configure: IMPOSSIBLE -- java.io.IOException: Broken pipe
+     *
+     * Fail-closed, and the detail even named the cause -- but the answer came
+     * one frame too late and on the wrong side of a channel close. HxExtension
+     * dials once, on a daemon thread, and has no reconnect, so recovery meant
+     * reloading the extension inside Burp.
+     *
+     * bad_config is the answer that already existed for exactly this shape: an
+     * operator's configure that we could not act on. It drops to DENY-ALL --
+     * identical safety, nothing is issued either way -- and keeps the channel,
+     * so the corrected configure below is heard. The asymmetry with an equally
+     * malformed value arriving one frame later was the whole argument.
+     */
+    static void anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives()
+            throws Exception {
+        Path dir = Files.createTempDirectory("hxbadlimit");
+        try (Live l = live(dir, "bl.sock")) {
+            check("wide scope is in force first",
+                  l.client.authorisation().scope().toString().contains("WIDE"));
+
+            l.out.write(Frame.encode(configureFrame("e-1", 31L),
+                    ("scope.include\thttps://a/*\n"
+                     + "limit.rate_rps\tas fast as possible\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the bad-limit error");
+            check("an unusable limit is answered at CONFIGURE time (got "
+                  + err.header.get("t") + ")", "error".equals(err.header.get("t")));
+            check("with class bad_config (got " + err.header.get("class") + "), not an "
+                  + "ack the first send has to take back",
+                  "bad_config".equals(err.header.get("class")));
+            check("and the detail names the key and the value it could not read",
+                  String.valueOf(err.header.get("detail")).contains("limit.rate_rps")
+                  && String.valueOf(err.header.get("detail")).contains("as fast as possible"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a configure it could not act on drops to DENY-ALL", !l.client.maySend());
+            check("the superseded wider scope is dropped",
+                  l.client.authorisation().scope().isEmpty());
+
+            // The half that the send-time refusal could not deliver.
+            l.out.write(Frame.encode(configureFrame("e-1", 32L),
+                    ("scope.include\thttps://NARROW/*\nlimit.rate_rps\t3\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded ack = read(l.reader, l.peer, "the corrected configured ack");
+            check("the channel survives, so a corrected configure is heard (got "
+                  + ack.header.get("t") + ")", "configured".equals(ack.header.get("t")));
+            waitUntil(l.client::maySend);
+            check("and the run is live again under the corrected config",
+                  l.client.maySend());
+            check("with the corrected scope",
+                  l.client.authorisation().scope().toString().contains("NARROW"));
+
+            // Two answers to "how fast" is not a limit either, and it lands in
+            // the same place rather than at the first send.
+            l.out.write(Frame.encode(configureFrame("e-1", 33L),
+                    ("scope.include\thttps://a/*\nlimit.max_requests\t10\n"
+                     + "limit.max_requests\t2000\n").getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded twice = read(l.reader, l.peer, "the repeated-limit error");
+            check("a repeated limit key is bad_config too (got "
+                  + twice.header.get("class") + ")",
+                  "bad_config".equals(twice.header.get("class")));
+
+            // ZERO is the third branch, and the only one of the three that was
+            // unpinned: `limit.rate_rps 0` is a perfectly good integer set
+            // exactly once, so neither refusal above sees it. Deleting
+            // `if (n <= 0) throw ...` from ConfigBody.positiveInteger left
+            // 9 x ALL PASS / 1364 ok / 0 FAIL -- and positiveInteger's own
+            // javadoc invites the deletion by noting that Limits.positive
+            // still makes the same three checks, from which a reader concludes
+            // the line is redundant.
+            //
+            // What it restores is not a tidiness regression. 0 parses, is
+            // acked `configured`, and then throws out of Limits.arm at the
+            // FIRST send -- which answers not_configured, drops to DENY-ALL
+            // and CLOSES the channel, with no reconnect in HxExtension. That
+            // is precisely the unrecoverable failure the rest of this method
+            // was written to close, restored invisibly.
+            l.out.write(Frame.encode(configureFrame("e-1", 34L),
+                    ("scope.include\thttps://a/*\nlimit.rate_rps\t0\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded zero = read(l.reader, l.peer, "the zero-limit error");
+            check("a limit of ZERO is refused at configure time, not at the first "
+                  + "send (got " + zero.header.get("t") + "/"
+                  + zero.header.get("class") + ")",
+                  "bad_config".equals(zero.header.get("class")));
+        } finally {
+            Files.deleteIfExists(dir.resolve("bl.sock")); Files.deleteIfExists(dir);
+        }
     }
 
     static final byte[] CFG =

@@ -192,7 +192,8 @@ def make_home(workdir: Path) -> Path:
     return home
 
 
-def launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subprocess.Popen:
+def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
+                sentinel: Path) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
@@ -208,6 +209,12 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path) -> subproc
         f"-Dhx.socket={socket_path}",
         f"-Dhx.engagement={engagement_id}",
         "-Dhx.instance=integration",
+        # Required, not optional: HxExtension.initialize() returns early
+        # ("extension idle") without it, so the extension never dials and the
+        # handshake never happens. Task 6 made it mandatory and this fixture
+        # was not updated -- the integration tests are deselected from the
+        # default run, so nothing said so for a day.
+        f"-Dhx.halt_sentinel={sentinel}",
         *ADD_OPENS,
         "-cp", f"{BURP_JAR}:{EXT_JAR}",
         "burp.StartBurp",

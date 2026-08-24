@@ -21,6 +21,30 @@ public final class BridgeClient {
 
     public static final long PROTOCOL_VERSION = 1L;
 
+    /**
+     * What a `not_configured` detail says when the extension is at fault
+     * rather than the operator.
+     *
+     * `not_configured` is OVERLOADED: it is the class for "no configure has
+     * been acknowledged" AND for a send path that threw or was never
+     * installed. docs/bridge-protocol.md's class list records that;
+     * spec s6's does not -- it names the class and nothing more, and widening
+     * s6's own enumeration was not this round's licence.
+     * The two readings are opposite instructions. The first says an operator
+     * has not authorised the run yet and the second says this jar is broken,
+     * and only the second is a reason to look at a stack trace.
+     *
+     * That matters at the store, not just at the console. `records.DENIAL_KIND`
+     * maps this class to `kind='not_configured'`, so both file the same row
+     * and `SELECT kind, COUNT(*) FROM denial GROUP BY kind` reads a crash as
+     * an unauthorised run. The class cannot be split without amending s6's
+     * enumeration, which is a protocol change; the DETAIL can carry it today,
+     * and a prefix carries it in a form a consumer can test for rather than
+     * one it has to parse prose out of. `records.EXTENSION_FAULT` is the same
+     * string on the Python side.
+     */
+    public static final String EXTENSION_FAULT = "extension fault: ";
+
     public static class NotConfigured extends RuntimeException {
         public NotConfigured(String m) { super(m); }
     }
@@ -36,6 +60,187 @@ public final class BridgeClient {
         void info(String s);
         void error(String s);
     }
+
+    /** The reserved key a SendHandler puts the redacted response body under.
+     *  It cannot travel in a flat JSON header, and Json.write refuses a byte[]
+     *  -- so a framer that forgets the remove() below throws JsonError rather
+     *  than quietly writing a result frame with the evidence missing. */
+    public static final String BODY_KEY = "@body";
+
+    /**
+     * What answers a `send` frame. Sender.issue has this shape; it is a
+     * functional interface so HxExtension can install it as a lambda, which
+     * keeps hx.send.Sender free of any declared dependency on this class
+     * beyond the Authorisation record it is handed.
+     */
+    @FunctionalInterface
+    public interface SendHandler {
+        Map<String, Object> handle(Map<String, Object> header, byte[] body, Authorisation auth);
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile SendHandler sendHandler;
+
+    /** Install the send path. Called before connect(): a client that is live
+     *  with no handler answers every send `not_configured`, which is correct
+     *  but useless. */
+    public void setSendHandler(SendHandler h) { this.sendHandler = h; }
+
+    /**
+     * The unsolicited stop frame, burp -> py.
+     *
+     * Spec s6: auto-halt is extension-initiated, so there is no outstanding id
+     * to answer. This is a push, not a reply, and it is the only way the
+     * harness learns of a stop before the next send fails -- which matters
+     * because `run.status = 'aborted'` needs a stop_reason, and the only place
+     * that reason exists is the extension that decided to stop.
+     */
+    public interface HaltNotifier {
+        void halted(String reason, String host, String window);
+    }
+
+    /**
+     * A notifier that frames {v, t:"halted", reason, host, window} and writes
+     * it down the socket.
+     *
+     * The three fields are what the harness needs to write one row: the
+     * reason, the host that produced it, and the window it was measured over
+     * -- "5xx rate 0.40" is not an explanation without the last of those.
+     */
+    public HaltNotifier haltNotifier() {
+        return (reason, host, window) -> {
+            Map<String, Object> f = new LinkedHashMap<>();
+            f.put("v", PROTOCOL_VERSION);
+            f.put("t", "halted");
+            f.put("reason", reason);
+            f.put("host", host);
+            f.put("window", window);
+            try {
+                send(f, new byte[0]);
+            } catch (IOException e) {
+                // The stop could not be delivered, so nothing on the far side
+                // will record it. A peer that cannot be told we stopped is a
+                // peer we have no authorisation from either: DENY-ALL is where
+                // an undelivered stop lands.
+                log.error("hx: halted frame undeliverable, deny-all: " + e);
+                denyAll();
+            }
+        };
+    }
+
+    /**
+     * Where `halt` and `resume` frames land: the switch the SEND PATH asks.
+     *
+     * HaltSwitch has the matching pair of methods but does not implement this
+     * interface -- hx.send must not take a compile-time dependency on the
+     * bridge for a two-method callback -- so HxExtension installs a delegating
+     * instance, in one place, before it dials.
+     */
+    public interface HaltSink {
+        void halted(String reason);
+        void resumed();
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile HaltSink haltSink;
+
+    /** Install the halt switch. Called before connect(): a client that goes
+     *  live with no sink routes halt frames to its own flag alone, and that
+     *  flag is not what Sender asks. */
+    public void setHaltSink(HaltSink s) { this.haltSink = s; }
+
+    /**
+     * The other direction: what the SEND PATH would refuse for, asked.
+     *
+     * {@link HaltSink} is one-way, and that asymmetry was a fail-open hole.
+     * This client keeps a {@code halted} flag written by the `halt` and
+     * `resume` frame arms and by nothing else -- there are exactly TWO writes
+     * to it in this file, one in each arm -- while spec s4 names THREE kill
+     * paths. The sentinel file (with its stalled-poller rule) and the
+     * auto-halt on target distress never reach that flag; the send path asks
+     * {@code Sender.issuanceHeldReason()} instead.
+     *
+     * MEASURED against this client before this interface existed, with the
+     * client configured and live:
+     *
+     *   sentinel file present   HaltSwitch.halted()=true   maySend()=true
+     *   poller stalled          HaltSwitch.halted()=true   maySend()=true
+     *   auto-halt tripped       stopReason() non-null      maySend()=true
+     *
+     * and {@link #checkMaySend()} threw nothing in all three. So a second
+     * enforcement point written against the obvious gate on the class the
+     * bridge already routes through -- {@code if (client.maySend())} -- would
+     * keep issuing through an operator halt raised by hand.
+     *
+     * ONE method, and it returns the REASON rather than a boolean, so the
+     * implementation HxExtension installs is {@code sender::issuanceHeldReason}
+     * -- the same code the send path runs, not a second opinion assembled here
+     * from the same two objects.
+     */
+    public interface HaltSource {
+        /** Why issuance is held, or null while nothing is holding it. */
+        String heldReason();
+    }
+
+    // Written on Burp's initialize thread before connect(), read wherever
+    // maySend() is. Volatile for the same reason haltSink is.
+    private volatile HaltSource haltSource;
+
+    /** Install the send path's halt authority. Called before connect(), for
+     *  the same reason setHaltSink is: until it is installed, maySend()
+     *  answers false -- a client that cannot ask whether the run is stopped
+     *  does not get to say it is not. */
+    public void setHaltSource(HaltSource s) { this.haltSource = s; }
+
+    /**
+     * Whether a `configure` can be acted on, asked before it is committed.
+     *
+     * There is exactly one thing this answers today and spec s4 names it:
+     * `Limits` takes the rate and budget from the FIRST authorisation with an
+     * epoch and holds them for the run, because the budget must be monotonic
+     * -- a scope push must not resupply a run that has spent its requests. So
+     * an operator pushing `limit.rate_rps: 1` mid-run got a fresh
+     * `config_epoch`, no error, no log line, and the OLD RATE. Lowering a rate
+     * is the one change that is always safe, and believing you have slowed a
+     * run down when you have not is the failure to avoid.
+     *
+     * A refusal here is `bad_config`: DENY-ALL first, channel kept, so a
+     * corrected configure can follow. Same answer as an unparseable configure
+     * and for the same reason -- carrying on under the PREVIOUS intent is
+     * exactly the harm when the new intent was tighter.
+     *
+     * This is NOT re-arming, which is a later plan's work. It is the refusal
+     * that makes the absence of re-arming visible.
+     */
+    public interface ConfigGuard {
+        /** Why this configure cannot be acted on, or null when it can. */
+        String refuse(Map<String, List<String>> scope);
+    }
+
+    private volatile ConfigGuard configGuard;
+
+    /**
+     * Install it. Called before connect(), with the others.
+     *
+     * An UNINSTALLED guard accepts, unlike {@link #setHaltSource}, and the
+     * asymmetry is deliberate: a halt source that is missing leaves a question
+     * about stopping unanswered, where a config guard that is missing leaves
+     * the pre-existing silent-ignore. Failing closed here would mean an
+     * extension that cannot be configured at all, which is worse than the
+     * thing being fixed. ChokepointTest counts the wire instead -- and as of
+     * 2026-08-24 it counts it in CODE rather than raw text, which is the
+     * condition this default was accepted on. While that count read comments,
+     * `//c.setConfigGuard(...)` in HxExtension kept it at 1 and this guard's
+     * fail-open default meant the silent-ignore came back with the whole
+     * branch green: the weakest default and the weakest binding on the same
+     * seam. The default is fine BECAUSE the binding is not.
+     *
+     * A guard that THROWS is a refusal. It is asked about an operator's
+     * intent, and an answer it could not produce is not permission.
+     */
+    public void setConfigGuard(ConfigGuard g) { this.configGuard = g; }
 
     private final Path socketPath;
     private final String engagementId;
@@ -129,7 +334,49 @@ public final class BridgeClient {
      */
     public Authorisation authorisation() { return committed; }
 
-    public boolean maySend() { return configured.get() && !halted.get(); }
+    /**
+     * Is anything stopping issuance right now?
+     *
+     * THREE authorities, not one: this client's own two flags, plus the
+     * {@link HaltSource} the send path enforces. It used to be the two flags
+     * alone -- see HaltSource for the measurement -- and the flag it calls
+     * `halted` is the `halt` FRAME and nothing else.
+     *
+     * WHAT A TRUE ANSWER DOES NOT MEAN. Every refusal that needs a request in
+     * hand is still ahead: scope, method, dangerous path, unmanaged
+     * credential, rate, budget, deadline. This answers "is the run stopped",
+     * which is a necessary condition for issuing and not a sufficient one.
+     * The only thing that decides a REQUEST is {@code Sender.issue}.
+     *
+     * Keeping the local `halted` flag as well as asking the source is not
+     * redundancy for its own sake. The `halt` arm tells the switch FIRST and
+     * sets this flag second, and `resume` clears this flag first and tells the
+     * switch last; the AND is what leaves no window on either transition in
+     * which this answers true while one of the two authorities is holding.
+     */
+    public boolean maySend() {
+        return configured.get() && !halted.get() && heldReason() == null;
+    }
+
+    /**
+     * The send path's halt authority, asked safely.
+     *
+     * FAIL CLOSED on an uninstalled source, and on one that throws. A client
+     * that cannot find out whether the run is stopped has not found out that
+     * it is running, and DENY-ALL is what this branch is. HxExtension installs
+     * it before the dial, alongside the sink, so the null case is a wiring
+     * failure rather than a state -- and a wiring failure that denies is one
+     * somebody notices.
+     */
+    private String heldReason() {
+        HaltSource s = haltSource;
+        if (s == null) return "no halt source installed";
+        try {
+            return s.heldReason();
+        } catch (Throwable t) {
+            return "halt source threw: " + t;
+        }
+    }
 
     /** Drop to DENY-ALL. Returns whether the client had been configured.
      *  `configured` is cleared FIRST: maySend() reads only that and `halted`,
@@ -140,12 +387,17 @@ public final class BridgeClient {
         return was;
     }
 
-    /** Throws unless the extension is configured and not halted. */
+    /** Throws unless {@link #maySend()} would answer true, and says which of
+     *  the three authorities refused. Same caveat as maySend(): not throwing
+     *  means the RUN is not stopped, not that a given request may go out. */
     public void checkMaySend() {
         if (!configured.get())
             throw new NotConfigured("not_configured: no configure frame acknowledged yet");
         if (halted.get())
-            throw new NotConfigured("halted: " + haltReason);
+            throw new NotConfigured("halted: " + (haltReason == null ? "no reason given" : haltReason));
+        String held = heldReason();
+        if (held != null)
+            throw new NotConfigured("halted: " + held);
     }
 
     public void connect() throws IOException {
@@ -266,6 +518,16 @@ public final class BridgeClient {
                     error(f, "bad_config", e.getMessage());
                     return true;
                 }
+                // BEFORE the commit, so a refused configure leaves no epoch
+                // behind. An operator who was told `bad_config` must not find
+                // a fresh config_epoch on the next result frame.
+                String unusable = refuseConfigure(scope);
+                if (unusable != null) {
+                    denyAll();
+                    error(f, "bad_config", unusable);
+                    return true;
+                }
+
                 long epoch;
                 synchronized (commitLock) {
                     // Either close() got here first -- and we must not undo it
@@ -297,16 +559,116 @@ public final class BridgeClient {
                 ack.put("config_epoch", epoch);
                 send(ack, new byte[0]);
             }
-            case "halt" -> {
-                halted.set(true);
-                haltReason = String.valueOf(f.header.get("reason"));
+            case "send" -> {
+                if (!engagementId.equals(f.header.get("engagement_id"))) {
+                    // s6: every send carries it and the extension refuses a
+                    // mismatch. Client A's bytes must never reach client B's
+                    // report, and this is the cheapest place to say so.
+                    error(f, "engagement_mismatch",
+                          "send names engagement " + f.header.get("engagement_id")
+                          + " but this extension serves " + engagementId);
+                    return true;
+                }
+                SendHandler h = sendHandler;
+                if (h == null) {
+                    // "Nothing is wired up yet" is a state, not an exemption.
+                    // EXTENSION_FAULT: this is not the operator failing to
+                    // configure -- see the constant.
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "no send handler is installed");
+                    return true;
+                }
+                Map<String, Object> reply;
+                try {
+                    // ONE read of the snapshot per decision, carried down as a
+                    // parameter. The explicit receiver below is load-bearing:
+                    // ChokepointTest counts the snapshot read across
+                    // extension/src and expects exactly one, and it counts the
+                    // dotted form -- a bare call here reads as zero. Write it
+                    // with `this.` and leave it that way.
+                    reply = h.handle(f.header, f.body, this.authorisation());
+                } catch (Throwable ex) {
+                    // An exception is never an implicit allow. Answer the
+                    // caller so it gets an error class instead of a silent
+                    // bridge_lost, then drop to DENY-ALL and close: a send path
+                    // that threw is a send path we no longer understand, and
+                    // the terminal state is the only honest place to be.
+                    //
+                    // `ex`, not `t`: handle() already has a String t, the
+                    // frame type it switched on.
+                    log.error("hx: send handler threw, deny-all: " + ex);
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "the send path threw: " + ex);
+                    denyAll();
+                    return false;
+                }
+                Object raw = reply.remove(BODY_KEY);
+                send(reply, raw instanceof byte[] b ? b : new byte[0]);
             }
-            case "resume" -> halted.set(false);
+            case "halt" -> {
+                // NOT String.valueOf(): for an absent key that answers the
+                // four-character string "null", which is neither null nor
+                // blank, so HaltSwitch's "no reason given" fallback could
+                // never fire for the only production caller and both
+                // consoles showed the operator the word null.
+                String why = f.header.get("reason") instanceof String r ? r : null;
+                // The switch FIRST, this flag second. `halted` here governs
+                // maySend()/checkMaySend(); the send path asks HaltSwitch, and
+                // on the way DOWN the stricter authority is told first.
+                if (!notifyHalt(true, why)) return false;
+                halted.set(true);
+                haltReason = why;
+            }
+            case "resume" -> {
+                halted.set(false);
+                // ...and on the way back UP it is told last, so no window
+                // exists in which issuance is armed and the flag behind it is
+                // not. Only a `resume` frame reaches here: a `configure` does
+                // not lift a halt.
+                if (!notifyHalt(false, null)) return false;
+            }
             default -> {
                 error(f, "unknown_frame", "unrecognised frame type " + t);
             }
         }
         return true;
+    }
+
+    /** Ask the {@link ConfigGuard}, safely. A guard that throws refuses: it
+     *  is asked about an operator's intent, and an answer it could not
+     *  produce is not permission. */
+    private String refuseConfigure(Map<String, List<String>> scope) {
+        ConfigGuard g = configGuard;
+        if (g == null) return null;
+        try {
+            return g.refuse(scope);
+        } catch (Throwable t) {
+            return "the configure guard could not decide about this body: " + t;
+        }
+    }
+
+    /**
+     * Hand a halt or a resume to the switch. Returns false when the read loop
+     * must drop to DENY-ALL and close.
+     *
+     * A sink that throws is the one case that cannot be shrugged off: the
+     * frame that was supposed to stop issuance did not arrive anywhere, and an
+     * exception is never an implicit allow. With no sink installed at all --
+     * the state before HxExtension wires one up -- the local flag is the whole
+     * answer, and nothing can be issued through a client that has no
+     * SendHandler either.
+     */
+    private boolean notifyHalt(boolean halt, String reason) {
+        HaltSink s = haltSink;
+        if (s == null) return true;
+        try {
+            if (halt) s.halted(reason); else s.resumed();
+            return true;
+        } catch (Throwable t) {
+            log.error("hx: halt sink threw, deny-all: " + t);
+            denyAll();
+            return false;
+        }
     }
 
     private void error(Frame.Decoded f, String cls, String detail) throws IOException {
