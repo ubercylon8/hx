@@ -2743,6 +2743,31 @@ public class PolicyTest {
         // round and the fold did not move it. The measurement below is a MEDIAN
         // of five rather than a single sample, so the check answers "is this
         // code slow" rather than "was the machine busy for one sample".
+        // MEASURED AGAINST THE MACHINE, NOT AGAINST A STOPWATCH -- amended
+        // 2026-08-24, and the reason is in the paragraph above rather than in
+        // this one. That paragraph already recorded that a saturated machine
+        // fails an absolute ceiling ("24 busy threads 89 ms -- over the
+        // ceiling"), and shipped the absolute ceiling anyway. It duly went red
+        // at 105 ms on a machine running a Windows VM at 158% CPU, with no
+        // code change, at the start of the next plan.
+        //
+        // A permanently-red check is worse than a missing one. Rule 1 of this
+        // project is to judge a run by its summary line, and a check that is
+        // red for reasons unrelated to the code trains every reader to look
+        // past exactly the line they must not look past.
+        //
+        // So the bound is now a RATIO against the same function on the same
+        // byte volume with a cheap reading count, measured microseconds apart
+        // in the same loop. Load hits both halves equally, so the ratio does
+        // not move with it: measured 54 on two consecutive runs at load 3-4.6,
+        // where the absolute figures were 108 ms and 109 ms against a
+        // quiescent 40 ms. The ceiling of 100 is roughly 2x the measured
+        // ratio, and the defect this check exists for -- the unbounded 406 ms
+        // reading blow-up found in Plan 3's Task 1 -- sits near 200-400 on the
+        // same scale. Still caught, no longer load-dependent.
+        //
+        // The absolute figures are still PRINTED, because a reader chasing a
+        // slow suite wants the milliseconds even when the ratio is fine.
         String costly = "/\u2215\u2170\ufe52/D\uff0f2\u2216;%c2/.\u2170\u29f89\u0269/\uff05";
         StringBuilder costlyTiled = new StringBuilder();
         while (costlyTiled.length() + costly.length() <= Policy.MAX_TARGET_CHARS)
@@ -2750,22 +2775,37 @@ public class PolicyTest {
         String costlyPath = costlyTiled.toString();
         HxRequest costlyReq = req("GET", "https://app.example.test" + costlyPath,
                                   "app.example.test", costlyPath, "");
+        // Same byte volume, cheap to read: this is the reference, and it is
+        // the SAME fixture the benign check below uses, so a change to one
+        // cannot silently diverge from the other.
+        String refPath = "/sso/saml/" + "QUJD".repeat(2000);
+        HxRequest refReq = req("GET", "https://app.example.test" + refPath,
+                               "app.example.test", refPath, "");
         p.decide(costlyReq, APP);
-        long[] samples = new long[5];
+        p.decide(refReq, APP);
+        long[] samples = new long[9];
+        long[] refSamples = new long[9];
         Decision cVerdict = null;
         for (int i = 0; i < samples.length; i++) {
+            // Interleaved, so a load spike lands on both rather than on one.
             long cStart = System.nanoTime();
             cVerdict = p.decide(costlyReq, APP);
-            samples[i] = (System.nanoTime() - cStart) / 1_000_000;
+            samples[i] = System.nanoTime() - cStart;
+            long rStart = System.nanoTime();
+            p.decide(refReq, APP);
+            refSamples[i] = System.nanoTime() - rStart;
         }
         Arrays.sort(samples);
-        long cMs = samples[samples.length / 2];
+        Arrays.sort(refSamples);
+        long cNs = samples[samples.length / 2];
+        long rNs = Math.max(1L, refSamples[refSamples.length / 2]);
+        long ratio = cNs / rNs;
         check("the costliest target a hill climb could build (" + costlyPath.length()
               + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath.length())).size()
               + " readings) is answered " + (cVerdict.allowed() ? "allow" : cVerdict.errorClass())
-              + " in " + cMs + " ms (median of " + samples.length + ", "
-              + Arrays.toString(samples) + ")",
-              cMs < 80 && cVerdict != null);
+              + " at " + ratio + "x the cost of the same volume read cheaply ("
+              + (cNs / 1_000_000) + " ms vs " + (rNs / 1_000_000) + " ms)",
+              ratio < 100 && cVerdict != null);
 
         // ...while a long BENIGN target is decided rather than refused: the
         // size bound must not turn into a length bound of its own.
