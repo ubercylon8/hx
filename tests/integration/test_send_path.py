@@ -128,8 +128,17 @@ def _refusal_from(call, *args, **kwargs) -> server.BridgeError | None:
     checked this way does not abort the refusals after it, so a loop of three
     reports three answers rather than the first.
 
-    MEASURED both ways -- see the sabotage evidence in the wave-2 report and
-    the two comments below that record their own.
+    MEASURED both ways, real Burp, one sabotage (Limiter's per-run budget
+    guard deleted), the two shapes run back to back:
+
+        before   E  Failed: DID NOT RAISE BridgeError
+        after    E  AssertionError: a spent run budget issued anyway: the
+                    target served 3 against max_requests=2
+
+    Quoted here rather than referenced, because the report it came from is
+    not in this repository and a comment pointing somewhere a reader cannot
+    follow is the thing this branch keeps finding. The two comments below
+    record their own sabotages the same way.
     """
     try:
         call(*args, **kwargs)
