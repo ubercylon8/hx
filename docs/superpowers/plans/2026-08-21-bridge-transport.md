@@ -6127,9 +6127,11 @@ public final class BridgeClient {
      * What a `not_configured` detail says when the extension is at fault
      * rather than the operator.
      *
-     * `not_configured` is OVERLOADED, and spec s6 and docs/bridge-protocol.md
-     * both record the overload: it is the class for "no configure has been
-     * acknowledged" AND for a send path that threw or was never installed.
+     * `not_configured` is OVERLOADED: it is the class for "no configure has
+     * been acknowledged" AND for a send path that threw or was never
+     * installed. docs/bridge-protocol.md's class list records that;
+     * spec s6's does not -- it names the class and nothing more, and widening
+     * s6's own enumeration was not this round's licence.
      * The two readings are opposite instructions. The first says an operator
      * has not authorised the run yet and the second says this jar is broken,
      * and only the second is a reason to look at a stack trace.

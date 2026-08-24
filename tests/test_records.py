@@ -13,10 +13,12 @@ from hx.store import records
 # Every class the extension may put on an `error` frame -- DERIVED from the
 # emit sites, not transcribed from S6.
 #
-# It was transcribed, and it drifted twice in the same direction. `halted` was
-# emitted by three sites and named in no list at all, and was pinned here with
-# a comment saying so -- a spec fix recorded as a test comment, which is the
-# thing dfc2080 was written to stop. `unknown_frame` was worse: emitted by
+# It was transcribed, and it drifted twice in the same direction. `halted` is
+# emitted as an error class by three sites today -- one in Sender, two in
+# `server.send`'s local refusals; it was two in Sender until the halt checks
+# were factored into `issuanceHeldReason` -- and it was named in no list at
+# all. It was pinned here with a comment saying so, which is a spec fix
+# recorded as a test comment: the thing dfc2080 was written to stop. `unknown_frame` was worse: emitted by
 # BridgeClient's `default ->` arm, in neither S6 nor
 # docs/bridge-protocol.md, and in NONE of DENIAL_KIND, EXCHANGE_OUTCOME or
 # UNRECORDABLE -- so test_every_error_class_has_somewhere_to_go passed while an

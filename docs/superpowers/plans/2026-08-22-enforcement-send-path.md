@@ -15612,9 +15612,13 @@ public final class Sender {
      * is how the consoles come to disagree with the wire.
      *
      * The ORDER is HaltSwitch first, then Distress, and it is pinned by
-     * SenderTest.theRefusalOrderIsPinned rather than left to this comment: an
-     * operator halt and an auto-halt can both be in force, and the reason a
-     * frame carries has to be stable when they are.
+     * SenderTest.theHeldReasonIsTheSameAnswerTheSendPathActsOn rather than
+     * left to this comment -- an operator halt and an auto-halt can both be in
+     * force, and the reason a frame carries has to be stable when they are.
+     * MEASURED: swapped, the whole Java suite was 9 x ALL PASS / 1484 ok / 0
+     * FAIL, and an operator who pressed stop was told about a 5xx rate.
+     * (theRefusalOrderIsPinned pins where `halted` sits among the other
+     * CLASSES, which is a different question and does not see this swap.)
      *
      * HaltSwitch.halted() and .reason() are two calls and a change can land
      * between them -- see the note on HaltSwitch's own state record. The only
@@ -15701,8 +15705,11 @@ public final class Sender {
         if (auth.epoch() == 0)
             return error(id, "not_configured", "no configure frame acknowledged yet");
 
-        // Both halt checks, from the one method that owns them. Kept in this
-        // position, and in this order, by theRefusalOrderIsPinned.
+        // Both halt checks, from the one method that owns them. This
+        // POSITION -- after epoch 0, before scope -- is pinned by
+        // theRefusalOrderIsPinned; the order of the two checks INSIDE
+        // issuanceHeldReason is pinned there, and see its javadoc for why
+        // that needed saying separately.
         String held = issuanceHeldReason();
         if (held != null) return error(id, "halted", held);
 
@@ -17702,10 +17709,12 @@ from hx.store import records
 # Every class the extension may put on an `error` frame -- DERIVED from the
 # emit sites, not transcribed from S6.
 #
-# It was transcribed, and it drifted twice in the same direction. `halted` was
-# emitted by three sites and named in no list at all, and was pinned here with
-# a comment saying so -- a spec fix recorded as a test comment, which is the
-# thing dfc2080 was written to stop. `unknown_frame` was worse: emitted by
+# It was transcribed, and it drifted twice in the same direction. `halted` is
+# emitted as an error class by three sites today -- one in Sender, two in
+# `server.send`'s local refusals; it was two in Sender until the halt checks
+# were factored into `issuanceHeldReason` -- and it was named in no list at
+# all. It was pinned here with a comment saying so, which is a spec fix
+# recorded as a test comment: the thing dfc2080 was written to stop. `unknown_frame` was worse: emitted by
 # BridgeClient's `default ->` arm, in neither S6 nor
 # docs/bridge-protocol.md, and in NONE of DENIAL_KIND, EXCHANGE_OUTCOME or
 # UNRECORDABLE -- so test_every_error_class_has_somewhere_to_go passed while an
@@ -18333,9 +18342,10 @@ DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 # The prefix a `not_configured` detail carries when the EXTENSION is at fault
 # rather than the operator.
 #
-# `not_configured` is overloaded -- S6 and docs/bridge-protocol.md both record
-# it -- and the two readings are opposite instructions: "an operator has not
-# authorised this run yet" and "this jar is broken". Both map to
+# `not_configured` is overloaded: "an operator has not authorised this run
+# yet" and "this jar is broken" are opposite instructions and share one class.
+# docs/bridge-protocol.md's class list records the overload; S6's names the
+# class and nothing more. Both map to
 # kind='not_configured' above, so without this
 #
 #     SELECT kind, COUNT(*) FROM denial GROUP BY kind
@@ -18407,8 +18417,8 @@ PRE_ISSUANCE = frozenset({"scope_denied", "rate_limited"})
 #   E2  deadline expired MID-FLIGHT      ->  class=timeout  http.calls=1
 #       detail: response arrived 1000us after the deadline
 #
-# E1 is `Sender.decideAndIssue`'s FIRST check, ahead of the Gate and ahead of
-# scope: the caller has already given up, and spending a rate token and a
+# E1 is step 1 of `Sender.decideAndIssue`'s ORDER OF REFUSAL -- ahead of the
+# Gate and ahead of scope, behind only the frame-readability checks: the caller has already given up, and spending a rate token and a
 # budget slot on a request nothing is waiting for shortens the run for no
 # evidence. So it refuses before the JVM has done anything at all -- the same
 # family as `not_configured`, and an exchange row for it is a request the

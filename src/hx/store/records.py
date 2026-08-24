@@ -49,9 +49,10 @@ DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 # The prefix a `not_configured` detail carries when the EXTENSION is at fault
 # rather than the operator.
 #
-# `not_configured` is overloaded -- S6 and docs/bridge-protocol.md both record
-# it -- and the two readings are opposite instructions: "an operator has not
-# authorised this run yet" and "this jar is broken". Both map to
+# `not_configured` is overloaded: "an operator has not authorised this run
+# yet" and "this jar is broken" are opposite instructions and share one class.
+# docs/bridge-protocol.md's class list records the overload; S6's names the
+# class and nothing more. Both map to
 # kind='not_configured' above, so without this
 #
 #     SELECT kind, COUNT(*) FROM denial GROUP BY kind
@@ -123,8 +124,8 @@ PRE_ISSUANCE = frozenset({"scope_denied", "rate_limited"})
 #   E2  deadline expired MID-FLIGHT      ->  class=timeout  http.calls=1
 #       detail: response arrived 1000us after the deadline
 #
-# E1 is `Sender.decideAndIssue`'s FIRST check, ahead of the Gate and ahead of
-# scope: the caller has already given up, and spending a rate token and a
+# E1 is step 1 of `Sender.decideAndIssue`'s ORDER OF REFUSAL -- ahead of the
+# Gate and ahead of scope, behind only the frame-readability checks: the caller has already given up, and spending a rate token and a
 # budget slot on a request nothing is waiting for shortens the run for no
 # evidence. So it refuses before the JVM has done anything at all -- the same
 # family as `not_configured`, and an exchange row for it is a request the

@@ -130,9 +130,13 @@ public final class Sender {
      * is how the consoles come to disagree with the wire.
      *
      * The ORDER is HaltSwitch first, then Distress, and it is pinned by
-     * SenderTest.theRefusalOrderIsPinned rather than left to this comment: an
-     * operator halt and an auto-halt can both be in force, and the reason a
-     * frame carries has to be stable when they are.
+     * SenderTest.theHeldReasonIsTheSameAnswerTheSendPathActsOn rather than
+     * left to this comment -- an operator halt and an auto-halt can both be in
+     * force, and the reason a frame carries has to be stable when they are.
+     * MEASURED: swapped, the whole Java suite was 9 x ALL PASS / 1484 ok / 0
+     * FAIL, and an operator who pressed stop was told about a 5xx rate.
+     * (theRefusalOrderIsPinned pins where `halted` sits among the other
+     * CLASSES, which is a different question and does not see this swap.)
      *
      * HaltSwitch.halted() and .reason() are two calls and a change can land
      * between them -- see the note on HaltSwitch's own state record. The only
@@ -219,8 +223,11 @@ public final class Sender {
         if (auth.epoch() == 0)
             return error(id, "not_configured", "no configure frame acknowledged yet");
 
-        // Both halt checks, from the one method that owns them. Kept in this
-        // position, and in this order, by theRefusalOrderIsPinned.
+        // Both halt checks, from the one method that owns them. This
+        // POSITION -- after epoch 0, before scope -- is pinned by
+        // theRefusalOrderIsPinned; the order of the two checks INSIDE
+        // issuanceHeldReason is pinned there, and see its javadoc for why
+        // that needed saying separately.
         String held = issuanceHeldReason();
         if (held != null) return error(id, "halted", held);
 
