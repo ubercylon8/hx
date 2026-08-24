@@ -108,6 +108,8 @@ public class SenderTest {
               () -> theEvidenceLineSaysWhichKindOf599ThisIs(sentinel));
             t("theAutoHaltFiresOnAnOriginThatDiedBehindItsEarlyHints",
               () -> theAutoHaltFiresOnAnOriginThatDiedBehindItsEarlyHints(sentinel));
+            t("aSuccessfulUpgradeIsNeitherUnreadableNorDistress",
+              () -> aSuccessfulUpgradeIsNeitherUnreadableNorDistress(sentinel));
             t("theWireMappingRoundTripsWhatItParsed", SenderTest::theWireMappingRoundTripsWhatItParsed);
             t("theConfiguredLimitsArmTheGateOnceFromTheAuthorisation",
               SenderTest::theConfiguredLimitsArmTheGateOnceFromTheAuthorisation);
@@ -1779,6 +1781,155 @@ public class SenderTest {
         check("and 30 of them trip nothing (" + live.distress.stopReason() + ")",
               live.distress.stopReason() == null);
         check("so all 30 were issued (" + live.http.calls + ")", live.http.calls == 30);
+    }
+
+    /**
+     * A successful WebSocket upgrade is not distress, and 30 of them do not
+     * halt a run against a healthy host.
+     *
+     * THE MIRROR OF THE TEST ABOVE. That one closes "a peer can DISARM the
+     * auto-halt by putting an interim head in front of a dead origin". The fix
+     * for it -- classify any 1xx head with nothing parseable behind it as
+     * unreadable -- opened the opposite hole on the same rail: for `101
+     * Switching Protocols` that is exactly what a CORRECT, SUCCESSFUL response
+     * looks like (RFC 9110 s15.2.2 -- the empty line after the 101 head ends
+     * HTTP on that connection and no further status line follows), so a
+     * HEALTHY peer trips the halt. Same rail, same severity, opposite
+     * direction, and a fix that closed one and opened the other is not a fix.
+     *
+     * MEASURED against the shipped Sender before the 101 exception existed,
+     * driving exactly the rig below:
+     *
+     *   send  1: {t=result, status=599, outcome=status_unreadable}
+     *   stopReason(): 5xx rate 100.0% over the last 10 requests exceeds 20.0%
+     *   halted frames: 1   first refused: 11   http.calls: 10 of 30
+     *
+     * ...and the same thing end to end against a real Burp and a real target,
+     * which `test_a_successful_upgrade_reports_101_and_halts_nothing` drives:
+     * send 1 filed 599 / status_unreadable, send 11 came back
+     * `halted: target distress: 5xx rate 100.0% ... on 127.0.0.1`, and the
+     * target server saw 10 of the 30 requests.
+     *
+     * hx places no restriction on `Upgrade` requests, so assessing a WebSocket
+     * endpoint is routine web-app work: every upgrade succeeds, every one is
+     * filed as false evidence about a client production system, and the run
+     * stops at request ten blaming a host that answered all ten correctly.
+     *
+     * The last two blocks are the OTHER 1xx codes, which must keep failing the
+     * way the test above requires: 100 and 102 head-only ARE truncations.
+     */
+    static void aSuccessfulUpgradeIsNeitherUnreadableNorDistress(Path sentinel) {
+        check("the exception is named, and it is 101 (" + Sender.SWITCHING_PROTOCOLS + ")",
+              Sender.SWITCHING_PROTOCOLS == 101);
+
+        // What Burp hands back for an upgrade it completed: the 101 head, its
+        // blank line, and then bytes that are NOT HTTP.
+        byte[] upgradeOnly = ("HTTP/1.1 101 Switching Protocols\r\n"
+                + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                + "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+                .getBytes(StandardCharsets.ISO_8859_1);
+        // ...and the same with the first frame of the new protocol behind it,
+        // which is the shape that makes "read the next status line" wrong
+        // rather than merely unavailable.
+        byte[] upgradeThenFrame = new byte[upgradeOnly.length + 7];
+        System.arraycopy(upgradeOnly, 0, upgradeThenFrame, 0, upgradeOnly.length);
+        System.arraycopy(new byte[] {(byte) 0x81, 0x05, 'h', 'e', 'l', 'l', 'o'}, 0,
+                         upgradeThenFrame, upgradeOnly.length, 7);
+
+        check("a 101 with nothing behind it reports 101, not the sentinel ("
+              + Sender.finalStatus(upgradeOnly, 101) + ")",
+              Sender.finalStatus(upgradeOnly, 101) == 101);
+        check("and says the exchange stated it (" + Sender.scanStatus(upgradeOnly, 101) + ")",
+              !Sender.scanStatus(upgradeOnly, 101).unreadable());
+        check("a 101 with a WebSocket frame behind it reports 101 too ("
+              + Sender.finalStatus(upgradeThenFrame, 101) + ")",
+              Sender.finalStatus(upgradeThenFrame, 101) == 101);
+        check("and is not unreadable either ("
+              + Sender.scanStatus(upgradeThenFrame, 101) + ")",
+              !Sender.scanStatus(upgradeThenFrame, 101).unreadable());
+
+        // The SECOND place a 101 arrives, and the one a `reported == 101`
+        // guard alone would miss: a CDN sends `103 Early Hints`, Montoya
+        // reports the 103, and the 101 is behind it in the bytes. Without the
+        // in-loop exception the scan walks past the 101's blank line into the
+        // frames and answers 599 for an upgrade that succeeded.
+        byte[] hintsThenUpgrade = ("HTTP/1.1 103 Early Hints\r\nLink: </0.css>; rel=preload"
+                + "\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1);
+        byte[] both = new byte[hintsThenUpgrade.length + upgradeThenFrame.length];
+        System.arraycopy(hintsThenUpgrade, 0, both, 0, hintsThenUpgrade.length);
+        System.arraycopy(upgradeThenFrame, 0, both, hintsThenUpgrade.length,
+                         upgradeThenFrame.length);
+        check("a 103 with a 101 behind it reports the 101 ("
+              + Sender.finalStatus(both, 103) + ")", Sender.finalStatus(both, 103) == 101);
+        check("and is `ok`, not unreadable (" + Sender.scanStatus(both, 103) + ")",
+              !Sender.scanStatus(both, 103).unreadable());
+
+        // A null `raw` under a reported 101 is answered the same way, and
+        // deliberately: `redactResponse` still refuses the frame with a
+        // bad_frame, so the only thing this decides is the sample Distress
+        // records -- and a completed upgrade is not a 5xx. Answering 599 here
+        // would leave the healthy-peer halt reachable through the one shape
+        // the guard did not cover.
+        int nullUpgrade = -1;
+        String nullThrew = null;
+        try { nullUpgrade = Sender.finalStatus(null, 101); }
+        catch (Throwable t) { nullThrew = String.valueOf(t); }
+        check("a null `raw` under a reported 101 is still 101, and not an NPE ("
+              + (nullThrew == null ? String.valueOf(nullUpgrade) : nullThrew) + ")",
+              nullThrew == null && nullUpgrade == 101);
+
+        // ---- the controls: the rest of the 1xx range is UNCHANGED ------
+        //
+        // 100 and 102 head-only are genuine truncations -- a final head was
+        // promised and never came -- so the exception must be 101 and nothing
+        // wider. If these two ever go green as 100/102 the fix above has been
+        // generalised into the bug the test before this one closes.
+        byte[] continueOnly = "HTTP/1.1 100 Continue\r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        byte[] processingOnly = "HTTP/1.1 102 Processing\r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        check("a 100 head with nothing behind it is still unreadable ("
+              + Sender.finalStatus(continueOnly, 100) + ")",
+              Sender.finalStatus(continueOnly, 100) == Sender.STATUS_UNREADABLE);
+        check("and a 102 head with nothing behind it is too ("
+              + Sender.finalStatus(processingOnly, 102) + ")",
+              Sender.finalStatus(processingOnly, 102) == Sender.STATUS_UNREADABLE);
+        // 101 is not a licence to trust the bytes AFTER a non-final 1xx
+        // either: a 100 whose bytes hold no readable head stays 599 even when
+        // the transport reported 101 nowhere near it.
+        check("a reported 100 with an unreadable body is unchanged ("
+              + Sender.finalStatus(interimHeads(1, ""), 100) + ")",
+              Sender.finalStatus(interimHeads(1, ""), 100) == Sender.STATUS_UNREADABLE);
+
+        // ---- THE LIVE CONSEQUENCE, through the real Sender --------------
+        //
+        // Not "101 came back": 30 upgrades against a healthy host, and the run
+        // is still running. This is the block that was red before the fix.
+        Rig up = new Rig(sentinel);
+        up.http.reply = new HttpReply(101, upgradeThenFrame, 7L, false);
+        Map<String, Object> first = null;
+        int firstRefused = -1;
+        for (int i = 1; i <= 30; i++) {
+            Map<String, Object> h = sendHeader(NOW + THIRTY_SECONDS);
+            h.put("id", (long) i);
+            Map<String, Object> r = up.sender.issue(h, request("GET", "/ws"), authorised());
+            if (i == 1) first = r;
+            if (firstRefused < 0 && "error".equals(r.get("t"))) firstRefused = i;
+        }
+        check("a successful upgrade is framed as a result (" + first.get("t") + ")",
+              "result".equals(first.get("t")));
+        check("and reports 101, not the 599 sentinel (" + first.get("status") + ")",
+              Long.valueOf(101L).equals(first.get("status")));
+        check("and says `ok`, not status_unreadable (" + first.get("outcome") + ")",
+              "ok".equals(first.get("outcome")));
+        check("30 successful upgrades trip nothing (" + up.distress.stopReason() + ")",
+              up.distress.stopReason() == null);
+        check("nothing is announced as a halt (" + up.notifier.frames.size() + ")",
+              up.notifier.frames.size() == 0);
+        check("no send is refused (first refused: " + firstRefused + ")",
+              firstRefused == -1);
+        check("so all 30 reached the wire, not 10 (" + up.http.calls + ")",
+              up.http.calls == 30);
     }
 
     /** {@code n} interim heads, then {@code last} -- which may be empty, for

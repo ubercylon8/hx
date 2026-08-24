@@ -502,6 +502,24 @@ public final class Sender {
     static final int MAX_INTERIM_HEADS = 8;
 
     /**
+     * The one 1xx that IS a final response.
+     *
+     * RFC 9110 s15.2.2: a `101 Switching Protocols` head ends HTTP on that
+     * connection -- what follows the empty line is the negotiated protocol,
+     * not another status line -- so 101 is the last HTTP status the exchange
+     * will ever state. Every other 1xx promises a final head that is still to
+     * come, which is the whole licence {@link #finalStatus} has to overrule
+     * what the transport reported.
+     *
+     * Named rather than written twice: {@link #scanStatus} has to make this
+     * exception at BOTH places a 101 can arrive -- reported by the transport,
+     * and read out of the bytes behind an earlier interim head -- and two
+     * bare 101s are two places for one of them to be changed alone. Pinned by
+     * SenderTest, which drives both arrivals.
+     */
+    static final int SWITCHING_PROTOCOLS = 101;
+
+    /**
      * What a scan that never found a final head reports: a status Distress
      * counts as an error.
      *
@@ -560,9 +578,32 @@ public final class Sender {
      * exactly what a CDN in front of a failing origin does -- would otherwise
      * record fifty 103s, a 0% 5xx rate, and never trip spec s4's auto-halt.
      *
-     * A 1xx is never the final response (RFC 9110 s15.2), so a reported 1xx is
-     * the one case where the transport's answer can be improved on; anything
-     * else is returned untouched.
+     * A 1xx is never the final response (RFC 9110 s15.2) WITH ONE EXCEPTION,
+     * so a reported 1xx is the one case where the transport's answer can be
+     * improved on; anything else is returned untouched.
+     *
+     * THE EXCEPTION IS 101, and it is not a corner. RFC 9110 s15.2.2: after
+     * the empty line that terminates a `101 Switching Protocols` head, the
+     * connection changes protocol and NO FURTHER HTTP STATUS LINE EVER
+     * FOLLOWS. So "a 1xx head with nothing parseable behind it" is not a
+     * truncation for a 101 -- it is what a CORRECT, SUCCESSFUL 101 looks like,
+     * and the bytes after it are the new protocol's frames, which statusCodeOf
+     * reads as "not a status line". 100 and 102 head-only ARE genuine
+     * truncations and stay unreadable; 101 head-only is the answer itself.
+     *
+     * Getting this wrong is the MIRROR of the bug the paragraph below
+     * describes -- same rail, same severity, opposite direction -- so it is
+     * measured to the same standard. Against the shipped method before this
+     * exception existed, a WebSocket upgrade (`101` + `Upgrade: websocket`,
+     * nothing after) answered {@code 599 / unreadable=true}. Driven 30 times
+     * against a perfectly healthy host, the first TEN each recorded
+     * {@code status=599, outcome=status_unreadable} -- ten 5xx samples, which
+     * is exactly what spec s4's 20% rule needs -- the run auto-halted on the
+     * tenth with `5xx rate 100.0%`, and the remaining twenty were refused
+     * `halted` and never reached the wire. The host had answered every request
+     * correctly. hx places no restriction on `Upgrade` requests, so that is
+     * routine web-app work producing false evidence about a client production
+     * system and stopping the assessment for a distress that never happened.
      *
      * THE SPLIT IS "a final head was read" vs "one was not", and NOT
      * "the scan ran out of budget" vs "everything else". An earlier version of
@@ -578,12 +619,13 @@ public final class Sender {
      * {@code distress.stopReason() == null} -- the auto-halt disarmed by
      * exactly the failure it exists to catch.
      *
-     * So every ending that falls out with {@code reported} still 1xx answers
-     * {@link #STATUS_UNREADABLE}: the scan running out of budget, the bytes
-     * running out mid-line or after a blank line, a line this cannot read at
-     * all, and a null {@code raw}. Only a final status line READ OUT OF THE
-     * BYTES overrules it, and only a {@code reported} that was never 1xx is
-     * returned untouched.
+     * So every ending that falls out with {@code reported} still a NON-101 1xx
+     * answers {@link #STATUS_UNREADABLE}: the scan running out of budget, the
+     * bytes running out mid-line or after a blank line, a line this cannot
+     * read at all, and a null {@code raw}. THREE things overrule it, not two:
+     * a final status line READ OUT OF THE BYTES, a {@code reported} that was
+     * never 1xx, and a {@link #SWITCHING_PROTOCOLS} -- reported or read out of
+     * the bytes -- which is itself the final HTTP status of its exchange.
      */
     public static int finalStatus(byte[] raw, int reported) {
         return scanStatus(raw, reported).code();
@@ -598,16 +640,19 @@ public final class Sender {
      * from the answer it describes.
      *
      * {@code unreadable} is true for every ending that did NOT read a final
-     * status line while {@code reported} was a 1xx. The `ok` endings are the
-     * two that produced a status the EXCHANGE actually stated: a status line
-     * read out of the bytes, and a reported status that was never 1xx. Those
-     * two INCLUDE a genuine 599, whether the transport reported it or it was
-     * read out of the response bytes behind some interim heads -- the peer
-     * said 599 and we believe it.
+     * status line while {@code reported} was a 1xx OTHER THAN 101. The `ok`
+     * endings are the THREE that produced a status the EXCHANGE actually
+     * stated: a status line read out of the bytes, a reported status that was
+     * never 1xx, and a {@link #SWITCHING_PROTOCOLS} from either place, which
+     * is final where the rest of the 1xx range is not. Those three INCLUDE a
+     * genuine 599, whether the transport reported it or it was read out of the
+     * response bytes behind some interim heads -- the peer said 599 and we
+     * believe it.
      *
-     * A reported 1xx with no readable final head is NOT one of them, however
-     * the bytes ended. See {@link #finalStatus} for why "the bytes ran out"
-     * is not a licence to report the interim head.
+     * A reported NON-101 1xx with no readable final head is NOT one of them,
+     * however the bytes ended. See {@link #finalStatus} for why "the bytes ran
+     * out" is not a licence to report the interim head, and for why 101 is the
+     * one 1xx where there was never a later head to run out of.
      */
     static StatusScan scanStatus(byte[] raw, int reported) {
         // Not an interim status: the transport's answer IS the final one, and
@@ -615,9 +660,22 @@ public final class Sender {
         // overrule a status the exchange really produced.
         if (reported < 100 || reported > 199) return sent(reported);
 
-        // From here `reported` is a 1xx, so it is not the final response and
-        // there are exactly two answers left: a final status line read out of
-        // `raw`, or STATUS_UNREADABLE.
+        // 101 IS final (see SWITCHING_PROTOCOLS), so it is answered before
+        // everything else here -- INCLUDING the null-`raw` guard below.
+        // "Nothing parseable behind the head" is the NORMAL shape of a
+        // successful upgrade, not a truncation, and it must not read as
+        // distress in ANY of its forms: a null `raw` under a reported 101
+        // answering 599 would put the auto-halt back exactly where a healthy
+        // peer can trip it, which is the failure this exception exists to
+        // close. The frame is still refused -- redactResponse answers a null
+        // `raw` with a RangeError and a bad_frame -- so nothing is being
+        // waved through here; only the sample Distress records is at stake,
+        // and a completed upgrade is not a 5xx.
+        if (reported == SWITCHING_PROTOCOLS) return sent(reported);
+
+        // From here `reported` is a 1xx that is NOT final, so there are
+        // exactly two answers left: a final status line read out of `raw`
+        // (a 101 among them), or STATUS_UNREADABLE.
         //
         // A null `raw` is a real reply shape -- HttpReply carries whatever
         // Montoya gave us -- and it goes on to reach redactResponse, which
@@ -634,6 +692,15 @@ public final class Sender {
             if (eol < 0) return unreadable();        // truncated mid-line
             int code = statusCodeOf(text.substring(i, eol));
             if (code < 100) return unreadable();     // not a status line: stop guessing
+            // A 101 READ OUT OF THE BYTES ends the scan exactly as a reported
+            // one does, and this arm is reachable: `103 Early Hints` in front
+            // of an upgrade is one line of CDN config away, and Montoya then
+            // reports the 103 and hands both heads back. Without this the loop
+            // would step over the 101's blank line into the WebSocket frames
+            // behind it, read them as "not a status line", and answer 599 for
+            // an upgrade that succeeded. Tested before the `>= 200` arm
+            // because 101 sorts below it, not as a special case of it.
+            if (code == SWITCHING_PROTOCOLS) return sent(code);
             if (code >= 200) return sent(code);      // the final response
             // A 1xx head carries no body (RFC 9110 s15.2), so the next head
             // starts immediately after this one's blank line.

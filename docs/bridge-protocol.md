@@ -93,6 +93,23 @@ answers the interim **103**, and `toByteArray()` carries the interim head and
 nothing else. A second implementation that reports that 103 hands its own
 auto-halt a healthy sample for every request against a dead origin.
 
+**`101 Switching Protocols` is the one 1xx that is exempt, and a second
+implementation must exempt it too.** RFC 9110 §15.2.2: the empty line that
+terminates a 101 head ends HTTP on that connection, and no further status line
+ever follows -- the bytes after it belong to the negotiated protocol. So "a 1xx
+head with nothing parseable behind it" is not a truncation for a 101; it is what
+a **correct, successful** upgrade looks like, and 101 is reported as itself with
+`outcome: ok` however those bytes end, including no bytes at all. The exemption
+applies wherever the 101 arrives -- reported by the transport, or read out of the
+bytes behind an earlier interim head such as a CDN's `103`. Measured without it:
+a WebSocket upgrade answered `599 / status_unreadable`, and driving 30 of them
+against a healthy host filed the first ten that way, tripped the auto-halt on the
+tenth with `5xx rate 100.0%`, and had the remaining twenty refused `halted` --
+naming a host that had answered every request it was given, correctly. That is the paragraph above in reverse -- a peer DISARMING the
+auto-halt versus a healthy peer TRIPPING it -- and a rule that closes only one of
+the two directions has not closed the rail. `100 Continue` and `102 Processing`
+head-only remain genuine truncations and remain **599**.
+
 `result.outcome` is `ok`, or `status_unreadable` when that 599 is the
 extension's own answer rather than the peer's. The two need telling apart and
 `status` cannot do it: 599 is **not a reserved code** -- it is in unofficial use

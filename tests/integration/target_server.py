@@ -66,6 +66,29 @@ MAX_HINT_HEADS = 16
 INTERIM_HEAD = (b"HTTP/1.1 103 Early Hints\r\n"
                 b"Link: </static/app.css>; rel=preload; as=style\r\n\r\n")
 
+# A SUCCESSFUL protocol switch, byte for byte. `101` is the one 1xx that is
+# FINAL: RFC 9110 s15.2.2 -- the empty line below ends HTTP on this connection
+# and no further status line ever follows -- so this is a complete, correct
+# response with nothing missing from it, and a scan that calls "a 1xx head with
+# nothing parseable behind it" unreadable calls THIS unreadable. The route
+# exists so that claim can be checked against a real Burp rather than against a
+# fake reply: what `statusCode()` and `toByteArray()` do with a 101 is Burp's
+# behaviour, not ours to assume.
+#
+# The accept value is the RFC 6455 s1.3 worked example, and it is the correct
+# accept for the `Sec-WebSocket-Key` the integration test sends -- a real
+# handshake rather than a 101 pasted in front of a plain GET.
+UPGRADE_HEAD = (b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+
+# One unmasked WebSocket text frame carrying `hello` (RFC 6455 s5.2), which is
+# what a server sends first on a connection it has just taken over. These bytes
+# are NOT HTTP and must not be read as a status line: the byte after the head is
+# 0x81, and a scan that keeps looking for a final head after a 101 finds this.
+UPGRADE_FRAME = b"\x81\x05hello"
+
 
 @dataclass(frozen=True)
 class Hit:
@@ -227,6 +250,24 @@ class _Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
             self._reply(_int_param(params, "status", 500), {"hinted": True})
+        elif parts.path == "/upgrade":
+            # A protocol switch that SUCCEEDS. Written straight to the wire
+            # for the same reason /hints is -- BaseHTTPRequestHandler has no
+            # notion of a response that ends HTTP -- and then the connection
+            # is done: there is no final head to follow, and its absence is
+            # not a truncation.
+            #
+            # `frame=0` drops the WebSocket frame, leaving the head and
+            # nothing else. Both shapes matter and they fail differently: with
+            # no frame a scan runs out of BYTES behind the 101, and with one it
+            # reads 0x81 as "not a status line". A fix that only covered the
+            # first would still report 599 for every real upgrade.
+            self.wfile.write(UPGRADE_HEAD)
+            if _int_param(params, "frame", 1):
+                self.wfile.write(UPGRADE_FRAME)
+            self.wfile.flush()
+            self.close_connection = True
+            return
         elif parts.path == "/slow":
             time.sleep(min(_int_param(params, "ms", 250) / 1000.0,
                            self.server.target.max_delay_s))

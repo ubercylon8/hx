@@ -284,6 +284,44 @@ def test_the_hints_route_can_close_without_ever_sending_a_final_head(target):
     assert [(h.method, h.path) for h in target.hits] == [("GET", "/hints")]
 
 
+def test_the_upgrade_route_completes_a_protocol_switch_and_stops(target):
+    """The instrument for the MIRROR of the early-hints finding.
+
+    `/hints?n=1&close=1` above is a 1xx head with nothing behind it because the
+    origin died. This is a 1xx head with nothing behind it because there is
+    NOTHING TO PUT THERE: RFC 9110 s15.2.2 ends HTTP at the empty line after a
+    `101 Switching Protocols`, so a correct, successful upgrade and a truncated
+    early hint are the same shape on the wire and only the code tells them
+    apart. A scan that reads the shape rather than the code reports 599 for
+    every WebSocket upgrade hx makes -- and ten of those auto-halt a run
+    against a host that answered all ten correctly.
+
+    So the byte after the head is asserted, not just the head. `0x81` is a
+    WebSocket text frame, and it is what a scan that keeps hunting for a final
+    status line behind the 101 would find and fail to read.
+    """
+    raw = _request(target, "GET", "/upgrade")
+    assert raw == ts.UPGRADE_HEAD + ts.UPGRADE_FRAME, raw
+    assert raw.startswith(b"HTTP/1.1 101 Switching Protocols\r\n"), raw
+    assert raw.count(b"HTTP/") == 1, (
+        "a second head behind the 101 would make this the early-hints case "
+        f"again rather than a completed switch: {raw!r}")
+    assert raw[len(ts.UPGRADE_HEAD)] == 0x81, raw[len(ts.UPGRADE_HEAD):]
+    assert [(h.method, h.path) for h in target.hits] == [("GET", "/upgrade")]
+
+
+def test_the_upgrade_route_can_leave_the_head_with_nothing_at_all_behind_it(target):
+    """`frame=0`: the head, and then EOF.
+
+    The two shapes fail differently -- out of BYTES versus a byte that is not
+    a status line -- so a fix measured against only one of them is measured
+    against half the route.
+    """
+    raw = _request(target, "GET", "/upgrade?frame=0")
+    assert raw == ts.UPGRADE_HEAD, raw
+    assert raw.endswith(b"\r\n\r\n"), raw
+
+
 def test_a_request_header_is_recorded_verbatim(target):
     """The unmanaged-credential assertion reads Cookie back off this log."""
     _get(target, "/api/orders", {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"})

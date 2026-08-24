@@ -13354,6 +13354,8 @@ public class SenderTest {
               () -> theEvidenceLineSaysWhichKindOf599ThisIs(sentinel));
             t("theAutoHaltFiresOnAnOriginThatDiedBehindItsEarlyHints",
               () -> theAutoHaltFiresOnAnOriginThatDiedBehindItsEarlyHints(sentinel));
+            t("aSuccessfulUpgradeIsNeitherUnreadableNorDistress",
+              () -> aSuccessfulUpgradeIsNeitherUnreadableNorDistress(sentinel));
             t("theWireMappingRoundTripsWhatItParsed", SenderTest::theWireMappingRoundTripsWhatItParsed);
             t("theConfiguredLimitsArmTheGateOnceFromTheAuthorisation",
               SenderTest::theConfiguredLimitsArmTheGateOnceFromTheAuthorisation);
@@ -15027,6 +15029,155 @@ public class SenderTest {
         check("so all 30 were issued (" + live.http.calls + ")", live.http.calls == 30);
     }
 
+    /**
+     * A successful WebSocket upgrade is not distress, and 30 of them do not
+     * halt a run against a healthy host.
+     *
+     * THE MIRROR OF THE TEST ABOVE. That one closes "a peer can DISARM the
+     * auto-halt by putting an interim head in front of a dead origin". The fix
+     * for it -- classify any 1xx head with nothing parseable behind it as
+     * unreadable -- opened the opposite hole on the same rail: for `101
+     * Switching Protocols` that is exactly what a CORRECT, SUCCESSFUL response
+     * looks like (RFC 9110 s15.2.2 -- the empty line after the 101 head ends
+     * HTTP on that connection and no further status line follows), so a
+     * HEALTHY peer trips the halt. Same rail, same severity, opposite
+     * direction, and a fix that closed one and opened the other is not a fix.
+     *
+     * MEASURED against the shipped Sender before the 101 exception existed,
+     * driving exactly the rig below:
+     *
+     *   send  1: {t=result, status=599, outcome=status_unreadable}
+     *   stopReason(): 5xx rate 100.0% over the last 10 requests exceeds 20.0%
+     *   halted frames: 1   first refused: 11   http.calls: 10 of 30
+     *
+     * ...and the same thing end to end against a real Burp and a real target,
+     * which `test_a_successful_upgrade_reports_101_and_halts_nothing` drives:
+     * send 1 filed 599 / status_unreadable, send 11 came back
+     * `halted: target distress: 5xx rate 100.0% ... on 127.0.0.1`, and the
+     * target server saw 10 of the 30 requests.
+     *
+     * hx places no restriction on `Upgrade` requests, so assessing a WebSocket
+     * endpoint is routine web-app work: every upgrade succeeds, every one is
+     * filed as false evidence about a client production system, and the run
+     * stops at request ten blaming a host that answered all ten correctly.
+     *
+     * The last two blocks are the OTHER 1xx codes, which must keep failing the
+     * way the test above requires: 100 and 102 head-only ARE truncations.
+     */
+    static void aSuccessfulUpgradeIsNeitherUnreadableNorDistress(Path sentinel) {
+        check("the exception is named, and it is 101 (" + Sender.SWITCHING_PROTOCOLS + ")",
+              Sender.SWITCHING_PROTOCOLS == 101);
+
+        // What Burp hands back for an upgrade it completed: the 101 head, its
+        // blank line, and then bytes that are NOT HTTP.
+        byte[] upgradeOnly = ("HTTP/1.1 101 Switching Protocols\r\n"
+                + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                + "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+                .getBytes(StandardCharsets.ISO_8859_1);
+        // ...and the same with the first frame of the new protocol behind it,
+        // which is the shape that makes "read the next status line" wrong
+        // rather than merely unavailable.
+        byte[] upgradeThenFrame = new byte[upgradeOnly.length + 7];
+        System.arraycopy(upgradeOnly, 0, upgradeThenFrame, 0, upgradeOnly.length);
+        System.arraycopy(new byte[] {(byte) 0x81, 0x05, 'h', 'e', 'l', 'l', 'o'}, 0,
+                         upgradeThenFrame, upgradeOnly.length, 7);
+
+        check("a 101 with nothing behind it reports 101, not the sentinel ("
+              + Sender.finalStatus(upgradeOnly, 101) + ")",
+              Sender.finalStatus(upgradeOnly, 101) == 101);
+        check("and says the exchange stated it (" + Sender.scanStatus(upgradeOnly, 101) + ")",
+              !Sender.scanStatus(upgradeOnly, 101).unreadable());
+        check("a 101 with a WebSocket frame behind it reports 101 too ("
+              + Sender.finalStatus(upgradeThenFrame, 101) + ")",
+              Sender.finalStatus(upgradeThenFrame, 101) == 101);
+        check("and is not unreadable either ("
+              + Sender.scanStatus(upgradeThenFrame, 101) + ")",
+              !Sender.scanStatus(upgradeThenFrame, 101).unreadable());
+
+        // The SECOND place a 101 arrives, and the one a `reported == 101`
+        // guard alone would miss: a CDN sends `103 Early Hints`, Montoya
+        // reports the 103, and the 101 is behind it in the bytes. Without the
+        // in-loop exception the scan walks past the 101's blank line into the
+        // frames and answers 599 for an upgrade that succeeded.
+        byte[] hintsThenUpgrade = ("HTTP/1.1 103 Early Hints\r\nLink: </0.css>; rel=preload"
+                + "\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1);
+        byte[] both = new byte[hintsThenUpgrade.length + upgradeThenFrame.length];
+        System.arraycopy(hintsThenUpgrade, 0, both, 0, hintsThenUpgrade.length);
+        System.arraycopy(upgradeThenFrame, 0, both, hintsThenUpgrade.length,
+                         upgradeThenFrame.length);
+        check("a 103 with a 101 behind it reports the 101 ("
+              + Sender.finalStatus(both, 103) + ")", Sender.finalStatus(both, 103) == 101);
+        check("and is `ok`, not unreadable (" + Sender.scanStatus(both, 103) + ")",
+              !Sender.scanStatus(both, 103).unreadable());
+
+        // A null `raw` under a reported 101 is answered the same way, and
+        // deliberately: `redactResponse` still refuses the frame with a
+        // bad_frame, so the only thing this decides is the sample Distress
+        // records -- and a completed upgrade is not a 5xx. Answering 599 here
+        // would leave the healthy-peer halt reachable through the one shape
+        // the guard did not cover.
+        int nullUpgrade = -1;
+        String nullThrew = null;
+        try { nullUpgrade = Sender.finalStatus(null, 101); }
+        catch (Throwable t) { nullThrew = String.valueOf(t); }
+        check("a null `raw` under a reported 101 is still 101, and not an NPE ("
+              + (nullThrew == null ? String.valueOf(nullUpgrade) : nullThrew) + ")",
+              nullThrew == null && nullUpgrade == 101);
+
+        // ---- the controls: the rest of the 1xx range is UNCHANGED ------
+        //
+        // 100 and 102 head-only are genuine truncations -- a final head was
+        // promised and never came -- so the exception must be 101 and nothing
+        // wider. If these two ever go green as 100/102 the fix above has been
+        // generalised into the bug the test before this one closes.
+        byte[] continueOnly = "HTTP/1.1 100 Continue\r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        byte[] processingOnly = "HTTP/1.1 102 Processing\r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        check("a 100 head with nothing behind it is still unreadable ("
+              + Sender.finalStatus(continueOnly, 100) + ")",
+              Sender.finalStatus(continueOnly, 100) == Sender.STATUS_UNREADABLE);
+        check("and a 102 head with nothing behind it is too ("
+              + Sender.finalStatus(processingOnly, 102) + ")",
+              Sender.finalStatus(processingOnly, 102) == Sender.STATUS_UNREADABLE);
+        // 101 is not a licence to trust the bytes AFTER a non-final 1xx
+        // either: a 100 whose bytes hold no readable head stays 599 even when
+        // the transport reported 101 nowhere near it.
+        check("a reported 100 with an unreadable body is unchanged ("
+              + Sender.finalStatus(interimHeads(1, ""), 100) + ")",
+              Sender.finalStatus(interimHeads(1, ""), 100) == Sender.STATUS_UNREADABLE);
+
+        // ---- THE LIVE CONSEQUENCE, through the real Sender --------------
+        //
+        // Not "101 came back": 30 upgrades against a healthy host, and the run
+        // is still running. This is the block that was red before the fix.
+        Rig up = new Rig(sentinel);
+        up.http.reply = new HttpReply(101, upgradeThenFrame, 7L, false);
+        Map<String, Object> first = null;
+        int firstRefused = -1;
+        for (int i = 1; i <= 30; i++) {
+            Map<String, Object> h = sendHeader(NOW + THIRTY_SECONDS);
+            h.put("id", (long) i);
+            Map<String, Object> r = up.sender.issue(h, request("GET", "/ws"), authorised());
+            if (i == 1) first = r;
+            if (firstRefused < 0 && "error".equals(r.get("t"))) firstRefused = i;
+        }
+        check("a successful upgrade is framed as a result (" + first.get("t") + ")",
+              "result".equals(first.get("t")));
+        check("and reports 101, not the 599 sentinel (" + first.get("status") + ")",
+              Long.valueOf(101L).equals(first.get("status")));
+        check("and says `ok`, not status_unreadable (" + first.get("outcome") + ")",
+              "ok".equals(first.get("outcome")));
+        check("30 successful upgrades trip nothing (" + up.distress.stopReason() + ")",
+              up.distress.stopReason() == null);
+        check("nothing is announced as a halt (" + up.notifier.frames.size() + ")",
+              up.notifier.frames.size() == 0);
+        check("no send is refused (first refused: " + firstRefused + ")",
+              firstRefused == -1);
+        check("so all 30 reached the wire, not 10 (" + up.http.calls + ")",
+              up.http.calls == 30);
+    }
+
     /** {@code n} interim heads, then {@code last} -- which may be empty, for
      *  the response that never arrived. */
     static byte[] interimHeads(int n, String last) {
@@ -15984,6 +16135,24 @@ public final class Sender {
     static final int MAX_INTERIM_HEADS = 8;
 
     /**
+     * The one 1xx that IS a final response.
+     *
+     * RFC 9110 s15.2.2: a `101 Switching Protocols` head ends HTTP on that
+     * connection -- what follows the empty line is the negotiated protocol,
+     * not another status line -- so 101 is the last HTTP status the exchange
+     * will ever state. Every other 1xx promises a final head that is still to
+     * come, which is the whole licence {@link #finalStatus} has to overrule
+     * what the transport reported.
+     *
+     * Named rather than written twice: {@link #scanStatus} has to make this
+     * exception at BOTH places a 101 can arrive -- reported by the transport,
+     * and read out of the bytes behind an earlier interim head -- and two
+     * bare 101s are two places for one of them to be changed alone. Pinned by
+     * SenderTest, which drives both arrivals.
+     */
+    static final int SWITCHING_PROTOCOLS = 101;
+
+    /**
      * What a scan that never found a final head reports: a status Distress
      * counts as an error.
      *
@@ -16042,9 +16211,32 @@ public final class Sender {
      * exactly what a CDN in front of a failing origin does -- would otherwise
      * record fifty 103s, a 0% 5xx rate, and never trip spec s4's auto-halt.
      *
-     * A 1xx is never the final response (RFC 9110 s15.2), so a reported 1xx is
-     * the one case where the transport's answer can be improved on; anything
-     * else is returned untouched.
+     * A 1xx is never the final response (RFC 9110 s15.2) WITH ONE EXCEPTION,
+     * so a reported 1xx is the one case where the transport's answer can be
+     * improved on; anything else is returned untouched.
+     *
+     * THE EXCEPTION IS 101, and it is not a corner. RFC 9110 s15.2.2: after
+     * the empty line that terminates a `101 Switching Protocols` head, the
+     * connection changes protocol and NO FURTHER HTTP STATUS LINE EVER
+     * FOLLOWS. So "a 1xx head with nothing parseable behind it" is not a
+     * truncation for a 101 -- it is what a CORRECT, SUCCESSFUL 101 looks like,
+     * and the bytes after it are the new protocol's frames, which statusCodeOf
+     * reads as "not a status line". 100 and 102 head-only ARE genuine
+     * truncations and stay unreadable; 101 head-only is the answer itself.
+     *
+     * Getting this wrong is the MIRROR of the bug the paragraph below
+     * describes -- same rail, same severity, opposite direction -- so it is
+     * measured to the same standard. Against the shipped method before this
+     * exception existed, a WebSocket upgrade (`101` + `Upgrade: websocket`,
+     * nothing after) answered {@code 599 / unreadable=true}. Driven 30 times
+     * against a perfectly healthy host, the first TEN each recorded
+     * {@code status=599, outcome=status_unreadable} -- ten 5xx samples, which
+     * is exactly what spec s4's 20% rule needs -- the run auto-halted on the
+     * tenth with `5xx rate 100.0%`, and the remaining twenty were refused
+     * `halted` and never reached the wire. The host had answered every request
+     * correctly. hx places no restriction on `Upgrade` requests, so that is
+     * routine web-app work producing false evidence about a client production
+     * system and stopping the assessment for a distress that never happened.
      *
      * THE SPLIT IS "a final head was read" vs "one was not", and NOT
      * "the scan ran out of budget" vs "everything else". An earlier version of
@@ -16060,12 +16252,13 @@ public final class Sender {
      * {@code distress.stopReason() == null} -- the auto-halt disarmed by
      * exactly the failure it exists to catch.
      *
-     * So every ending that falls out with {@code reported} still 1xx answers
-     * {@link #STATUS_UNREADABLE}: the scan running out of budget, the bytes
-     * running out mid-line or after a blank line, a line this cannot read at
-     * all, and a null {@code raw}. Only a final status line READ OUT OF THE
-     * BYTES overrules it, and only a {@code reported} that was never 1xx is
-     * returned untouched.
+     * So every ending that falls out with {@code reported} still a NON-101 1xx
+     * answers {@link #STATUS_UNREADABLE}: the scan running out of budget, the
+     * bytes running out mid-line or after a blank line, a line this cannot
+     * read at all, and a null {@code raw}. THREE things overrule it, not two:
+     * a final status line READ OUT OF THE BYTES, a {@code reported} that was
+     * never 1xx, and a {@link #SWITCHING_PROTOCOLS} -- reported or read out of
+     * the bytes -- which is itself the final HTTP status of its exchange.
      */
     public static int finalStatus(byte[] raw, int reported) {
         return scanStatus(raw, reported).code();
@@ -16080,16 +16273,19 @@ public final class Sender {
      * from the answer it describes.
      *
      * {@code unreadable} is true for every ending that did NOT read a final
-     * status line while {@code reported} was a 1xx. The `ok` endings are the
-     * two that produced a status the EXCHANGE actually stated: a status line
-     * read out of the bytes, and a reported status that was never 1xx. Those
-     * two INCLUDE a genuine 599, whether the transport reported it or it was
-     * read out of the response bytes behind some interim heads -- the peer
-     * said 599 and we believe it.
+     * status line while {@code reported} was a 1xx OTHER THAN 101. The `ok`
+     * endings are the THREE that produced a status the EXCHANGE actually
+     * stated: a status line read out of the bytes, a reported status that was
+     * never 1xx, and a {@link #SWITCHING_PROTOCOLS} from either place, which
+     * is final where the rest of the 1xx range is not. Those three INCLUDE a
+     * genuine 599, whether the transport reported it or it was read out of the
+     * response bytes behind some interim heads -- the peer said 599 and we
+     * believe it.
      *
-     * A reported 1xx with no readable final head is NOT one of them, however
-     * the bytes ended. See {@link #finalStatus} for why "the bytes ran out"
-     * is not a licence to report the interim head.
+     * A reported NON-101 1xx with no readable final head is NOT one of them,
+     * however the bytes ended. See {@link #finalStatus} for why "the bytes ran
+     * out" is not a licence to report the interim head, and for why 101 is the
+     * one 1xx where there was never a later head to run out of.
      */
     static StatusScan scanStatus(byte[] raw, int reported) {
         // Not an interim status: the transport's answer IS the final one, and
@@ -16097,9 +16293,22 @@ public final class Sender {
         // overrule a status the exchange really produced.
         if (reported < 100 || reported > 199) return sent(reported);
 
-        // From here `reported` is a 1xx, so it is not the final response and
-        // there are exactly two answers left: a final status line read out of
-        // `raw`, or STATUS_UNREADABLE.
+        // 101 IS final (see SWITCHING_PROTOCOLS), so it is answered before
+        // everything else here -- INCLUDING the null-`raw` guard below.
+        // "Nothing parseable behind the head" is the NORMAL shape of a
+        // successful upgrade, not a truncation, and it must not read as
+        // distress in ANY of its forms: a null `raw` under a reported 101
+        // answering 599 would put the auto-halt back exactly where a healthy
+        // peer can trip it, which is the failure this exception exists to
+        // close. The frame is still refused -- redactResponse answers a null
+        // `raw` with a RangeError and a bad_frame -- so nothing is being
+        // waved through here; only the sample Distress records is at stake,
+        // and a completed upgrade is not a 5xx.
+        if (reported == SWITCHING_PROTOCOLS) return sent(reported);
+
+        // From here `reported` is a 1xx that is NOT final, so there are
+        // exactly two answers left: a final status line read out of `raw`
+        // (a 101 among them), or STATUS_UNREADABLE.
         //
         // A null `raw` is a real reply shape -- HttpReply carries whatever
         // Montoya gave us -- and it goes on to reach redactResponse, which
@@ -16116,6 +16325,15 @@ public final class Sender {
             if (eol < 0) return unreadable();        // truncated mid-line
             int code = statusCodeOf(text.substring(i, eol));
             if (code < 100) return unreadable();     // not a status line: stop guessing
+            // A 101 READ OUT OF THE BYTES ends the scan exactly as a reported
+            // one does, and this arm is reachable: `103 Early Hints` in front
+            // of an upgrade is one line of CDN config away, and Montoya then
+            // reports the 103 and hands both heads back. Without this the loop
+            // would step over the 101's blank line into the WebSocket frames
+            // behind it, read them as "not a status line", and answer 599 for
+            // an upgrade that succeeded. Tested before the `>= 200` arm
+            // because 101 sorts below it, not as a special case of it.
+            if (code == SWITCHING_PROTOCOLS) return sent(code);
             if (code >= 200) return sent(code);      // the final response
             // A 1xx head carries no body (RFC 9110 s15.2), so the next head
             // starts immediately after this one's blank line.
@@ -21198,6 +21416,44 @@ def test_the_hints_route_can_close_without_ever_sending_a_final_head(target):
     assert [(h.method, h.path) for h in target.hits] == [("GET", "/hints")]
 
 
+def test_the_upgrade_route_completes_a_protocol_switch_and_stops(target):
+    """The instrument for the MIRROR of the early-hints finding.
+
+    `/hints?n=1&close=1` above is a 1xx head with nothing behind it because the
+    origin died. This is a 1xx head with nothing behind it because there is
+    NOTHING TO PUT THERE: RFC 9110 s15.2.2 ends HTTP at the empty line after a
+    `101 Switching Protocols`, so a correct, successful upgrade and a truncated
+    early hint are the same shape on the wire and only the code tells them
+    apart. A scan that reads the shape rather than the code reports 599 for
+    every WebSocket upgrade hx makes -- and ten of those auto-halt a run
+    against a host that answered all ten correctly.
+
+    So the byte after the head is asserted, not just the head. `0x81` is a
+    WebSocket text frame, and it is what a scan that keeps hunting for a final
+    status line behind the 101 would find and fail to read.
+    """
+    raw = _request(target, "GET", "/upgrade")
+    assert raw == ts.UPGRADE_HEAD + ts.UPGRADE_FRAME, raw
+    assert raw.startswith(b"HTTP/1.1 101 Switching Protocols\r\n"), raw
+    assert raw.count(b"HTTP/") == 1, (
+        "a second head behind the 101 would make this the early-hints case "
+        f"again rather than a completed switch: {raw!r}")
+    assert raw[len(ts.UPGRADE_HEAD)] == 0x81, raw[len(ts.UPGRADE_HEAD):]
+    assert [(h.method, h.path) for h in target.hits] == [("GET", "/upgrade")]
+
+
+def test_the_upgrade_route_can_leave_the_head_with_nothing_at_all_behind_it(target):
+    """`frame=0`: the head, and then EOF.
+
+    The two shapes fail differently -- out of BYTES versus a byte that is not
+    a status line -- so a fix measured against only one of them is measured
+    against half the route.
+    """
+    raw = _request(target, "GET", "/upgrade?frame=0")
+    assert raw == ts.UPGRADE_HEAD, raw
+    assert raw.endswith(b"\r\n\r\n"), raw
+
+
 def test_a_request_header_is_recorded_verbatim(target):
     """The unmanaged-credential assertion reads Cookie back off this log."""
     _get(target, "/api/orders", {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"})
@@ -21368,6 +21624,29 @@ MAX_HINT_HEADS = 16
 INTERIM_HEAD = (b"HTTP/1.1 103 Early Hints\r\n"
                 b"Link: </static/app.css>; rel=preload; as=style\r\n\r\n")
 
+# A SUCCESSFUL protocol switch, byte for byte. `101` is the one 1xx that is
+# FINAL: RFC 9110 s15.2.2 -- the empty line below ends HTTP on this connection
+# and no further status line ever follows -- so this is a complete, correct
+# response with nothing missing from it, and a scan that calls "a 1xx head with
+# nothing parseable behind it" unreadable calls THIS unreadable. The route
+# exists so that claim can be checked against a real Burp rather than against a
+# fake reply: what `statusCode()` and `toByteArray()` do with a 101 is Burp's
+# behaviour, not ours to assume.
+#
+# The accept value is the RFC 6455 s1.3 worked example, and it is the correct
+# accept for the `Sec-WebSocket-Key` the integration test sends -- a real
+# handshake rather than a 101 pasted in front of a plain GET.
+UPGRADE_HEAD = (b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+
+# One unmasked WebSocket text frame carrying `hello` (RFC 6455 s5.2), which is
+# what a server sends first on a connection it has just taken over. These bytes
+# are NOT HTTP and must not be read as a status line: the byte after the head is
+# 0x81, and a scan that keeps looking for a final head after a 101 finds this.
+UPGRADE_FRAME = b"\x81\x05hello"
+
 
 @dataclass(frozen=True)
 class Hit:
@@ -21529,6 +21808,24 @@ class _Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
             self._reply(_int_param(params, "status", 500), {"hinted": True})
+        elif parts.path == "/upgrade":
+            # A protocol switch that SUCCEEDS. Written straight to the wire
+            # for the same reason /hints is -- BaseHTTPRequestHandler has no
+            # notion of a response that ends HTTP -- and then the connection
+            # is done: there is no final head to follow, and its absence is
+            # not a truncation.
+            #
+            # `frame=0` drops the WebSocket frame, leaving the head and
+            # nothing else. Both shapes matter and they fail differently: with
+            # no frame a scan runs out of BYTES behind the 101, and with one it
+            # reads 0x81 as "not a status line". A fix that only covered the
+            # first would still report 599 for every real upgrade.
+            self.wfile.write(UPGRADE_HEAD)
+            if _int_param(params, "frame", 1):
+                self.wfile.write(UPGRADE_FRAME)
+            self.wfile.flush()
+            self.close_connection = True
+            return
         elif parts.path == "/slow":
             time.sleep(min(_int_param(params, "ms", 250) / 1000.0,
                            self.server.target.max_delay_s))
@@ -23016,6 +23313,127 @@ def test_an_early_hint_with_a_dead_origin_behind_it_still_trips_the_auto_halt(ri
         "auto-halt: every exchange it saw looked healthy")
     assert "5xx rate" in frames[0]["reason"], frames[0]
     assert frames[0]["host"] == rig.target.host, frames[0]
+
+
+# The handshake headers a real WebSocket upgrade carries. The key is RFC 6455
+# s1.3's worked example and `target_server.UPGRADE_HEAD` answers with the accept
+# that belongs to it, so what goes out is a genuine handshake rather than a 101
+# pasted in front of a plain GET -- which matters here, because how Burp treats
+# a 101 is the thing being measured.
+UPGRADE_REQUEST_HEADERS = (
+    ("Connection", "Upgrade"),
+    ("Upgrade", "websocket"),
+    ("Sec-WebSocket-Version", "13"),
+    ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+)
+
+
+def _issue_exactly(rig, target_path: str, *, n: int, attempts: int = 80) -> list:
+    """Send `target_path` until `n` of them have been ANSWERED.
+
+    The mirror of `_issue_until`, and it exists because the thing being proved
+    here is an ABSENCE: no halt, no refusal, every send answered. `_issue_until`
+    stops at the first refusal it was asked for, so it cannot express "none of
+    them was refused" -- the loop that proves that has to keep going.
+
+    Rate limits are slept out, exactly as they are there and for the same
+    reason. Any OTHER refusal ends the test loudly, naming the class: a
+    `halted` here is the failure this test was written to catch, not an
+    inconvenience to retry through.
+    """
+    seen: list = []
+    for _ in range(attempts):
+        if len(seen) == n:
+            return seen
+        try:
+            reply = rig.send_unguarded("GET", target_path,
+                                       headers=UPGRADE_REQUEST_HEADERS)
+        except server.BridgeError as exc:
+            if exc.error_class == "rate_limited":
+                time.sleep(exc.retry_after_us / 1_000_000 + 0.02)
+                continue
+            raise AssertionError(
+                f"send {len(seen) + 1} of {n} was refused {exc.error_class!r}: "
+                f"{exc} (answered so far: {seen})"
+            ) from exc
+        seen.append((reply["status"], reply["outcome"]))
+    raise AssertionError(f"{attempts} attempts and only {len(seen)} of {n} "
+                         f"answered: {seen}")
+
+
+@pytest.mark.parametrize("route,shape", [
+    ("/upgrade", "a WebSocket frame"),
+    ("/upgrade?frame=0", "nothing at all"),
+])
+def test_a_successful_upgrade_reports_101_and_halts_nothing(rig, route, shape):
+    """The MIRROR of the two tests above, against the same real Burp.
+
+    Those two close "a peer can DISARM the auto-halt by putting an interim head
+    in front of a dead origin". The fix for them classifies any 1xx head with
+    nothing parseable behind it as unreadable -- and for `101 Switching
+    Protocols` that is what a CORRECT, SUCCESSFUL response looks like (RFC 9110
+    s15.2.2: the empty line after the 101 head ends HTTP on that connection and
+    no further status line ever follows). So the fix for "a peer can stop the
+    auto-halt firing" created "a healthy peer makes it fire": same rail, same
+    severity, opposite direction, and a branch that shipped only the first half
+    would file every WebSocket upgrade as false evidence about a client
+    production system.
+
+    hx places no restriction on `Upgrade` requests, so this is routine
+    web-app work rather than an exotic input.
+
+    MEASURED HERE, against Burp Suite Community Edition and this rig, with only
+    `Sender.scanStatus` differing between the two runs -- and this is also the
+    answer to what Burp itself does with a 101, which nothing before this
+    measured:
+
+        before:  send  1: {status: 599, outcome: 'status_unreadable'}
+                 send 11: refused `halted: target distress: 5xx rate 100.0%
+                          over the last 10 requests exceeds 20.0% on 127.0.0.1`
+                 one halted frame, and the target server saw 10 of the 30
+                 requests the loop tried to make
+        after:   {status: 101, outcome: 'ok'} thirteen times, no halted frame,
+                 and the target saw all thirteen
+
+    Twelve is not arbitrary. S4's 5xx rule needs ten answered samples on a host
+    before it may trip and trips ON the tenth, so a test that stopped at nine
+    would pass with the bug still in place.
+
+    Both shapes of the route are driven. With the WebSocket frame, a scan that
+    keeps hunting for a final head reads `0x81` and calls it unreadable; with
+    `frame=0` it runs out of bytes instead. They are different endings in
+    `scanStatus` and a fix covering one need not cover the other.
+    """
+    rig.configure()
+
+    frames: list[dict] = []
+    # Appended, not acted on: this callback runs on the bridge's read-loop
+    # thread. Same reason as the two tests above.
+    rig.srv.on_halted = frames.append
+
+    reply = rig.send_unguarded("GET", route, headers=UPGRADE_REQUEST_HEADERS)
+    assert (reply["status"], reply["outcome"]) == (101, "ok"), (
+        f"a completed protocol switch with {shape} behind the head was filed "
+        f"as {reply['status']} / {reply['outcome']!r} -- 101 is FINAL "
+        "(RFC 9110 s15.2.2), so there was never a later head to be missing")
+    raw = reply[server.BridgeServer.BODY_KEY]
+    assert raw.startswith(b"HTTP/1.1 101 Switching Protocols"), raw[:64]
+    # The evidence that this really is the "nothing parseable behind it" shape
+    # and not a 101 with a second head hiding behind it, which would be a
+    # different case answered by a different arm of the scan.
+    assert raw.count(b"HTTP/") == 1, raw[:256]
+
+    # THE CONSEQUENCE, which is the only reason the number above matters: the
+    # run is still running, and every request reached the target.
+    answered = _issue_exactly(rig, route, n=12)
+    assert set(answered) == {(101, "ok")}, answered
+    assert len(rig.target.hits_for("/upgrade")) == 13, (
+        "sends were refused before they reached the target: "
+        f"{len(rig.target.hits_for('/upgrade'))} arrived, 13 were issued")
+    assert rig.srv.state != "halted", rig.srv.state
+    assert frames == [], (
+        "thirteen SUCCESSFUL upgrades against a healthy host tripped the "
+        f"auto-halt: {frames}")
 ```
 
 - [ ] **Step 9: Run the integration suite and watch it pass**

@@ -947,3 +947,124 @@ def test_an_early_hint_with_a_dead_origin_behind_it_still_trips_the_auto_halt(ri
         "auto-halt: every exchange it saw looked healthy")
     assert "5xx rate" in frames[0]["reason"], frames[0]
     assert frames[0]["host"] == rig.target.host, frames[0]
+
+
+# The handshake headers a real WebSocket upgrade carries. The key is RFC 6455
+# s1.3's worked example and `target_server.UPGRADE_HEAD` answers with the accept
+# that belongs to it, so what goes out is a genuine handshake rather than a 101
+# pasted in front of a plain GET -- which matters here, because how Burp treats
+# a 101 is the thing being measured.
+UPGRADE_REQUEST_HEADERS = (
+    ("Connection", "Upgrade"),
+    ("Upgrade", "websocket"),
+    ("Sec-WebSocket-Version", "13"),
+    ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+)
+
+
+def _issue_exactly(rig, target_path: str, *, n: int, attempts: int = 80) -> list:
+    """Send `target_path` until `n` of them have been ANSWERED.
+
+    The mirror of `_issue_until`, and it exists because the thing being proved
+    here is an ABSENCE: no halt, no refusal, every send answered. `_issue_until`
+    stops at the first refusal it was asked for, so it cannot express "none of
+    them was refused" -- the loop that proves that has to keep going.
+
+    Rate limits are slept out, exactly as they are there and for the same
+    reason. Any OTHER refusal ends the test loudly, naming the class: a
+    `halted` here is the failure this test was written to catch, not an
+    inconvenience to retry through.
+    """
+    seen: list = []
+    for _ in range(attempts):
+        if len(seen) == n:
+            return seen
+        try:
+            reply = rig.send_unguarded("GET", target_path,
+                                       headers=UPGRADE_REQUEST_HEADERS)
+        except server.BridgeError as exc:
+            if exc.error_class == "rate_limited":
+                time.sleep(exc.retry_after_us / 1_000_000 + 0.02)
+                continue
+            raise AssertionError(
+                f"send {len(seen) + 1} of {n} was refused {exc.error_class!r}: "
+                f"{exc} (answered so far: {seen})"
+            ) from exc
+        seen.append((reply["status"], reply["outcome"]))
+    raise AssertionError(f"{attempts} attempts and only {len(seen)} of {n} "
+                         f"answered: {seen}")
+
+
+@pytest.mark.parametrize("route,shape", [
+    ("/upgrade", "a WebSocket frame"),
+    ("/upgrade?frame=0", "nothing at all"),
+])
+def test_a_successful_upgrade_reports_101_and_halts_nothing(rig, route, shape):
+    """The MIRROR of the two tests above, against the same real Burp.
+
+    Those two close "a peer can DISARM the auto-halt by putting an interim head
+    in front of a dead origin". The fix for them classifies any 1xx head with
+    nothing parseable behind it as unreadable -- and for `101 Switching
+    Protocols` that is what a CORRECT, SUCCESSFUL response looks like (RFC 9110
+    s15.2.2: the empty line after the 101 head ends HTTP on that connection and
+    no further status line ever follows). So the fix for "a peer can stop the
+    auto-halt firing" created "a healthy peer makes it fire": same rail, same
+    severity, opposite direction, and a branch that shipped only the first half
+    would file every WebSocket upgrade as false evidence about a client
+    production system.
+
+    hx places no restriction on `Upgrade` requests, so this is routine
+    web-app work rather than an exotic input.
+
+    MEASURED HERE, against Burp Suite Community Edition and this rig, with only
+    `Sender.scanStatus` differing between the two runs -- and this is also the
+    answer to what Burp itself does with a 101, which nothing before this
+    measured:
+
+        before:  send  1: {status: 599, outcome: 'status_unreadable'}
+                 send 11: refused `halted: target distress: 5xx rate 100.0%
+                          over the last 10 requests exceeds 20.0% on 127.0.0.1`
+                 one halted frame, and the target server saw 10 of the 30
+                 requests the loop tried to make
+        after:   {status: 101, outcome: 'ok'} thirteen times, no halted frame,
+                 and the target saw all thirteen
+
+    Twelve is not arbitrary. S4's 5xx rule needs ten answered samples on a host
+    before it may trip and trips ON the tenth, so a test that stopped at nine
+    would pass with the bug still in place.
+
+    Both shapes of the route are driven. With the WebSocket frame, a scan that
+    keeps hunting for a final head reads `0x81` and calls it unreadable; with
+    `frame=0` it runs out of bytes instead. They are different endings in
+    `scanStatus` and a fix covering one need not cover the other.
+    """
+    rig.configure()
+
+    frames: list[dict] = []
+    # Appended, not acted on: this callback runs on the bridge's read-loop
+    # thread. Same reason as the two tests above.
+    rig.srv.on_halted = frames.append
+
+    reply = rig.send_unguarded("GET", route, headers=UPGRADE_REQUEST_HEADERS)
+    assert (reply["status"], reply["outcome"]) == (101, "ok"), (
+        f"a completed protocol switch with {shape} behind the head was filed "
+        f"as {reply['status']} / {reply['outcome']!r} -- 101 is FINAL "
+        "(RFC 9110 s15.2.2), so there was never a later head to be missing")
+    raw = reply[server.BridgeServer.BODY_KEY]
+    assert raw.startswith(b"HTTP/1.1 101 Switching Protocols"), raw[:64]
+    # The evidence that this really is the "nothing parseable behind it" shape
+    # and not a 101 with a second head hiding behind it, which would be a
+    # different case answered by a different arm of the scan.
+    assert raw.count(b"HTTP/") == 1, raw[:256]
+
+    # THE CONSEQUENCE, which is the only reason the number above matters: the
+    # run is still running, and every request reached the target.
+    answered = _issue_exactly(rig, route, n=12)
+    assert set(answered) == {(101, "ok")}, answered
+    assert len(rig.target.hits_for("/upgrade")) == 13, (
+        "sends were refused before they reached the target: "
+        f"{len(rig.target.hits_for('/upgrade'))} arrived, 13 were issued")
+    assert rig.srv.state != "halted", rig.srv.state
+    assert frames == [], (
+        "thirteen SUCCESSFUL upgrades against a healthy host tripped the "
+        f"auto-halt: {frames}")
