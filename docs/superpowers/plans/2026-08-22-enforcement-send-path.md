@@ -13205,6 +13205,12 @@ public class SenderTest {
               () -> theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks(sentinel));
             t("theRefusalOrderIsPinned", () -> theRefusalOrderIsPinned(sentinel));
             t("rateLimitedCarriesRetryAfterUs", () -> rateLimitedCarriesRetryAfterUs(sentinel));
+            t("theDestinationPortAndSchemeAreReadFromTheFrameAndBounded",
+              () -> theDestinationPortAndSchemeAreReadFromTheFrameAndBounded(sentinel));
+            t("ipv6IsRefusedByScopeAndThatIsTheOnlyThingHoldingTheLine",
+              () -> ipv6IsRefusedByScopeAndThatIsTheOnlyThingHoldingTheLine(sentinel));
+            t("theDeadlineIsRefusedAtTheMicrosecondItPasses",
+              () -> theDeadlineIsRefusedAtTheMicrosecondItPasses(sentinel));
             t("anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget",
               () -> anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget(sentinel));
             t("aDeadlineThatExpiresMidFlightIsReportedAsTimeout",
@@ -13717,6 +13723,215 @@ public class SenderTest {
      * presence without ever comparing it to a clock. This is where it starts
      * meaning something.
      */
+    /** An HxRequest at a url whose authority this test chose, for the two
+     *  helpers that read a url and nothing else. */
+    static HxRequest at(String url, String host) {
+        return new HxRequest("GET", url, host, "/api/orders", "", Map.of(), new byte[0]);
+    }
+
+    /**
+     * The destination fields of the frame header, and the port the url
+     * encodes, each separated from its absence.
+     *
+     * MEASURED before this test existed, whole Java suite at 9 x ALL PASS /
+     * 1407 ok / 0 FAIL for every one of these:
+     *
+     *   the target_port range check deleted outright     0 FAIL
+     *   its low bound  1     -> 0                        0 FAIL
+     *   its high bound 65535 -> 65536                    0 FAIL
+     *   tls defaulting false -> defaulting true          0 FAIL
+     *   portOf's IPv6 bracket rule deleted               0 FAIL
+     *
+     * Every one of them decides where Burp opens a connection, which is the
+     * one thing on this path that is not recoverable by a later refusal.
+     */
+    static void theDestinationPortAndSchemeAreReadFromTheFrameAndBounded(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+
+        // ---- target_port, outside the range ----------------------------
+        // A frame this side cannot read a port from is a bad_frame, refused
+        // before the Gate: it is step 0 of the ORDER OF REFUSAL, and a port
+        // of 0 or 65536 is not a port on any stack that would carry it.
+        for (long bad : new long[] {0L, -1L, 65536L, 70000L}) {
+            Map<String, Object> h = sendHeader(NOW + THIRTY_SECONDS);
+            h.put("target_port", bad);
+            deniedBeforeTheGate("target_port " + bad + " is not a port",
+                   new Rig(sentinel), h, request("GET", "/api/orders"),
+                   authorised(), "bad_frame");
+        }
+
+        // ---- target_port, ON the range ---------------------------------
+        // The other direction, so a bound cannot be narrowed either: 1 and
+        // 65535 are ports, and the url has to carry them.
+        Map<String, Object> lo = sendHeader(NOW + THIRTY_SECONDS);
+        lo.put("target_port", 1L);
+        HxRequest atOne = Sender.parse(lo, request("GET", "/api/orders"));
+        check("port 1 is a port and the url carries it (" + atOne.url() + ")",
+              "https://app.example.test:1/api/orders".equals(atOne.url()));
+        Map<String, Object> hi = sendHeader(NOW + THIRTY_SECONDS);
+        hi.put("target_port", 65535L);
+        HxRequest atMax = Sender.parse(hi, request("GET", "/api/orders"));
+        check("and 65535 is one too (" + atMax.url() + ")",
+              "https://app.example.test:65535/api/orders".equals(atMax.url()));
+
+        // ---- tls, and why FALSE is the fail-closed default -------------
+        Map<String, Object> noTls = sendHeader(NOW + THIRTY_SECONDS);
+        noTls.remove("tls");
+        noTls.remove("target_port");
+        HxRequest plain = Sender.parse(noTls, request("GET", "/api/orders"));
+        check("a frame with no tls key is http, not https (" + plain.url() + ")",
+              "http://app.example.test/api/orders".equals(plain.url()));
+        check("secureOf agrees with the url it built", !Sender.secureOf(plain));
+        check("and the scheme default it gets is 80 (" + Sender.portOf(plain) + ")",
+              Sender.portOf(plain) == 80);
+
+        // `Boolean.TRUE.equals`, not a truthiness test. A JSON string is not a
+        // boolean, and a field this side cannot read must not be read as the
+        // permissive answer.
+        Map<String, Object> stringTls = sendHeader(NOW + THIRTY_SECONDS);
+        stringTls.put("tls", "true");
+        stringTls.remove("target_port");
+        HxRequest notABoolean = Sender.parse(stringTls, request("GET", "/api/orders"));
+        check("tls: \"true\" is a string, not a boolean, and does not build an https url ("
+              + notABoolean.url() + ")",
+              "http://app.example.test/api/orders".equals(notABoolean.url()));
+
+        // Defaulting to false is fail-CLOSED and this is why, end to end
+        // rather than by argument: scope patterns are scheme-exact, so the
+        // http url an omitted tls produces is refused by an https-only
+        // scope.include. Defaulting the other way would manufacture an https
+        // url from a frame that never said https.
+        Map<String, Object> noTlsAgain = sendHeader(NOW + THIRTY_SECONDS);
+        noTlsAgain.remove("tls");
+        noTlsAgain.remove("target_port");
+        denied("a frame that omits tls is refused by an https-only scope",
+               new Rig(sentinel), noTlsAgain, request("GET", "/api/orders"),
+               authorised(), "scope_denied");
+
+        // ---- portOf's bracket rule -------------------------------------
+        // An IPv6 authority is full of colons and only ONE of them is a port
+        // separator: the one after the closing bracket. Delete the rule and
+        // the last colon INSIDE the literal is read as the separator, so
+        // parseInt("1]") throws and a url with no port at all becomes an
+        // exception instead of the scheme default.
+        HxRequest bracketed = at("https://[2001:db8::1]/api/orders", "[2001:db8::1]");
+        int port = -1;
+        String threw = null;
+        try { port = Sender.portOf(bracketed); }
+        catch (Throwable t) { threw = String.valueOf(t); }
+        check("a bracketed IPv6 authority with no port answers the scheme default ("
+              + (threw == null ? String.valueOf(port) : threw) + ")",
+              threw == null && port == 443);
+        check("and a bracketed IPv6 authority WITH a port answers that port ("
+              + Sender.portOf(at("https://[2001:db8::1]:8443/api/orders", "[2001:db8::1]")) + ")",
+              Sender.portOf(at("https://[2001:db8::1]:8443/api/orders", "[2001:db8::1]")) == 8443);
+    }
+
+    /**
+     * F9, as a tripwire rather than a note in a report.
+     *
+     * IPv6 TARGETS ARE UNUSABLE and the failure is in portOf, not in the scope
+     * rules. MEASURED: a send frame with target_host "2001:db8::1" and
+     * target_port 443 builds the url https://2001:db8::1/api/orders -- parse()
+     * omits a default port, so the authority is a bare literal with no
+     * brackets -- and portOf takes the text after its LAST colon and answers
+     * 1. Burp would open a connection to port 1 of an address the operator
+     * asked for on 443.
+     *
+     * The ONLY reason that is not a live defect today is the first check
+     * below: Policy refuses every IPv6 url before portOf is ever consulted,
+     * EVEN WHEN THE OPERATOR NAMED THAT EXACT ADDRESS in scope.include,
+     * because Target.parse cannot read the authority. Both halves are asserted
+     * here so neither can move alone. IF THE FIRST CHECK EVER GOES RED BECAUSE
+     * SOMEBODY TAUGHT Target.parse ABOUT IPv6, THE SECOND ONE IS THE LIVE BUG
+     * THEY JUST EXPOSED: bracket the literal in parse() -- and then portOf's
+     * lastIndexOf(']') guard starts doing the job it was written for -- or
+     * refuse an unbracketed literal outright. Do not close half of it.
+     */
+    static void ipv6IsRefusedByScopeAndThatIsTheOnlyThingHoldingTheLine(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        header.put("target_host", "2001:db8::1");
+
+        // The operator explicitly authorised this address, so this is not
+        // "an address nobody asked for": it is the configured one, refused.
+        BridgeClient.Authorisation named = new BridgeClient.Authorisation(7L, Map.of(
+                "scope.include", List.of("https://2001:db8::1/*"),
+                "method.allow", List.of("GET")));
+        denied("an IPv6 target its own scope.include names is STILL scope_denied",
+               new Rig(sentinel), header, request("GET", "/api/orders"), named,
+               "scope_denied");
+
+        // The hazard the check above is holding back, stated so it cannot rot
+        // in silence. This assertion is deliberately on the WRONG answer.
+        HxRequest bare = at("https://2001:db8::1/api/orders", "2001:db8::1");
+        check("an unbracketed IPv6 authority answers port " + Sender.portOf(bare)
+              + " for a frame that asked for 443 -- see this method's javadoc "
+              + "before changing either half", Sender.portOf(bare) == 1);
+    }
+
+    /**
+     * Both deadline comparisons, AT the microsecond.
+     *
+     * MEASURED before this test existed: relaxing either `>=` to `>` left the
+     * whole Java suite at 9 x ALL PASS / 1407 ok / 0 FAIL. The existing two
+     * deadline tests approach the boundary from 1.5 s and 31 s away, which
+     * every off-by-one survives.
+     *
+     * `>=` is the correct side of both. A deadline is the instant the caller
+     * stops waiting, not the last instant it waits: the harness's _request()
+     * has popped the id by then and _deliver() drops a reply nobody holds.
+     * Issuing AT it spends a rate token and a budget slot on evidence that
+     * cannot be delivered.
+     *
+     * THE TWO GUARDS MASK EACH OTHER ON THE CLASS, which is why the first case
+     * asserts the WIRE and not just the answer. Relax the pre-flight `>=` and
+     * a deadline equal to now still comes back `timeout` -- the request goes
+     * out, the clock has not moved, and the POST-flight check answers with the
+     * same class. What changed is that a request nothing was waiting for was
+     * issued to the client's estate and a budget slot was spent on it.
+     */
+    static void theDeadlineIsRefusedAtTheMicrosecondItPasses(Path sentinel) {
+        // ---- before the flight -----------------------------------------
+        Rig at = new Rig(sentinel);
+        Map<String, Object> exactly = sendHeader(NOW);           // deadline == now
+        Map<String, Object> reply = at.sender.issue(
+                exactly, request("GET", "/api/orders"), authorised());
+        check("a deadline equal to now is already gone (" + reply.get("class") + ")",
+              "error".equals(reply.get("t")) && "timeout".equals(reply.get("class")));
+        check("and it never reached the wire (" + at.http.calls + ")", at.http.calls == 0);
+        check("nor cost a rate token (" + at.gate.calls + ")", at.gate.calls == 0);
+
+        // One microsecond of budget left is still budget.
+        Rig justInside = new Rig(sentinel);
+        Map<String, Object> ok = justInside.sender.issue(
+                sendHeader(NOW + 1L), request("GET", "/api/orders"), authorised());
+        check("one microsecond before it is not (" + ok.get("t") + ")",
+              "result".equals(ok.get("t")));
+
+        // ---- after the flight ------------------------------------------
+        // The send itself consumes exactly the whole budget, so the response
+        // lands ON the deadline rather than past it.
+        Rig landsOnIt = new Rig(sentinel);
+        landsOnIt.http.advanceUsPerCall = THIRTY_SECONDS;
+        Map<String, Object> late = landsOnIt.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("a response that lands ON the deadline is a timeout (" + late.get("class") + ")",
+              "error".equals(late.get("t")) && "timeout".equals(late.get("class")));
+        check("the request did go out, and this is not a refusal (" + landsOnIt.http.calls + ")",
+              landsOnIt.http.calls == 1);
+        check("no evidence is framed for a caller that stopped waiting",
+              !late.containsKey(BridgeClient.BODY_KEY));
+
+        // And one microsecond inside it is a result, so the check above is a
+        // boundary rather than a blanket refusal of a slow response.
+        Rig justMade = new Rig(sentinel);
+        justMade.http.advanceUsPerCall = THIRTY_SECONDS - 1L;
+        Map<String, Object> made = justMade.sender.issue(
+                sendHeader(NOW + THIRTY_SECONDS), request("GET", "/api/orders"), authorised());
+        check("a response one microsecond inside it is framed (" + made.get("t") + ")",
+              "result".equals(made.get("t")));
+    }
+
     static void anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget(Path sentinel) {
         Rig r = new Rig(sentinel);
         // The caller gave up 1.5 s ago: its _request() has already popped this
@@ -14239,6 +14454,49 @@ public class SenderTest {
         check("and a reply that is not 1xx is never touched at all",
               Sender.finalStatus(interimHeads(8, "HTTP/1.1 500 Internal Server Error"), 204)
               == 204);
+
+        // ---- the two guards on the way IN to the scan ------------------
+        //
+        // MEASURED before these lines existed: dropping the `raw == null`
+        // term, moving the low bound 100 -> 101, and moving the high bound
+        // 199 -> 200 each left the whole Java suite at 9 x ALL PASS / 1407 ok
+        // / 0 FAIL. The bounds are the RFC 9110 s15.2 definition of "1xx", and
+        // 1xx-is-never-final is the entire licence this function has to
+        // improve on what the transport reported.
+
+        // A null `raw` is a real reply shape -- HttpReply carries whatever
+        // Montoya gave us -- and it reaches redactResponse, which answers it
+        // with a RangeError and a bad_frame. It must not become an NPE HERE
+        // first, three frames earlier, where nothing would say which field
+        // was missing.
+        int nullRaw = -1;
+        String nullThrew = null;
+        try { nullRaw = Sender.finalStatus(null, 103); }
+        catch (Throwable t) { nullThrew = String.valueOf(t); }
+        check("a null response body reports the transport's status, not an NPE ("
+              + (nullThrew == null ? String.valueOf(nullRaw) : nullThrew) + ")",
+              nullThrew == null && nullRaw == 103);
+
+        // BOTH ends of the 1xx range are inside it. 100 Continue is the one a
+        // real client meets most often; 199 is the top of the range.
+        check("a reported 100 is scanned like any other 1xx ("
+              + Sender.finalStatus(interimHeads(1, "HTTP/1.1 200 OK"), 100) + ")",
+              Sender.finalStatus(interimHeads(1, "HTTP/1.1 200 OK"), 100) == 200);
+        check("and so is a reported 199 ("
+              + Sender.finalStatus(interimHeads(1, "HTTP/1.1 200 OK"), 199) + ")",
+              Sender.finalStatus(interimHeads(1, "HTTP/1.1 200 OK"), 199) == 200);
+
+        // And both ends of what is NOT 1xx stay untouched. 200 is the case
+        // that matters: a final response is final, and re-reading the bytes
+        // behind one would let a peer's leading head overrule the status the
+        // transport actually produced.
+        byte[] fiveHundredFirst = interimHeads(0, "HTTP/1.1 500 Internal Server Error");
+        check("a reported 200 is never re-read from the bytes ("
+              + Sender.finalStatus(fiveHundredFirst, 200) + ")",
+              Sender.finalStatus(fiveHundredFirst, 200) == 200);
+        check("and a reported 99 is not a 1xx either ("
+              + Sender.finalStatus(fiveHundredFirst, 99) + ")",
+              Sender.finalStatus(fiveHundredFirst, 99) == 99);
     }
 
     /**

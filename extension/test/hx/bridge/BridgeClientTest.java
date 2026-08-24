@@ -858,6 +858,31 @@ public class BridgeClientTest {
                   "engagement_mismatch".equals(err.header.get("class")));
             check("and the handler was never called (" + calls[0] + ")", calls[0] == 0);
             check("the connection survives a mismatched send", l.client.maySend());
+
+            // A frame with NO engagement_id at all, which is a different input
+            // from a frame naming somebody else's. MEASURED before this block
+            // existed: teaching the check to skip an ABSENT key -- the shape a
+            // "tolerate an optional field" change produces -- left the whole
+            // Java suite at 9 x ALL PASS / 1407 ok / 0 FAIL, because every
+            // test here supplied the key.
+            //
+            // `engagementId.equals(null)` is false, so absent already refuses.
+            // That is the fail-closed direction and it is worth an input:
+            // s6 says EVERY send carries it, so a frame without one is not
+            // speaking this protocol and cannot be decided about at all.
+            Map<String, Object> noEngagement = sendFrame("e-1", 14L);
+            noEngagement.remove("engagement_id");
+            l.out.write(Frame.encode(noEngagement, GET));
+            l.out.flush();
+            Frame.Decoded absent = read(l.reader, l.peer, "the absent-engagement error");
+
+            check("a send with NO engagement_id is answered with an error",
+                  "error".equals(absent.header.get("t")));
+            check("the class names the mismatch for an absent id too (got "
+                  + absent.header.get("class") + ")",
+                  "engagement_mismatch".equals(absent.header.get("class")));
+            check("and the handler was still never called (" + calls[0] + ")", calls[0] == 0);
+            check("the connection survives that too", l.client.maySend());
         } finally {
             Files.deleteIfExists(dir.resolve("m.sock")); Files.deleteIfExists(dir);
         }
