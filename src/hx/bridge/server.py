@@ -538,8 +538,8 @@ class BridgeServer:
         It is a KEYWORD on this method rather than a second code path in the
         rig because the rig used to own a copy of the error translation below,
         and a copy is what drifts: a new frame type or a renamed hint field
-        would have been handled here and not there, silently, with the three
-        tests that use it still asserting the old shape.
+        would have been handled here and not there, silently, with every test
+        that uses it still asserting the old shape.
 
         The reserved-key guard above is NOT part of it. That one catches a
         malformed call -- a bug, not a denial -- and there is no test worth

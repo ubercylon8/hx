@@ -189,8 +189,12 @@ def test_head_is_answered_without_a_body(target):
 
 
 def test_hits_for_selects_by_path_and_ignores_the_query(target):
-    """Six counts in the integration suite are taken from this. A hits_for
-    that answered [] would make every one of them pass forever."""
+    """The integration suite takes counts off this, and a hits_for that
+    answered [] would make every one of them pass forever.
+
+    No number here on purpose: this wave wrote "six" into three separate
+    comments about this one function and it was thirteen call sites each
+    time."""
     _get(target, "/health")
     _get(target, "/slow?ms=1&status=200")
     _get(target, "/slow?ms=1&status=500")

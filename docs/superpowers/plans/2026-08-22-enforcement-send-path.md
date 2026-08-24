@@ -18110,14 +18110,14 @@ def test_enforce_locally_false_reaches_the_wire_and_answers_the_same_way(srv_wit
     frames against one -- and is the reason the rig can prove anything about
     a JVM's kill switch at all.
 
-    THE LAST TWO ASSERTIONS ARE THE POINT. The rig used to reach past send()
+    THE COMPARISON AT THE END IS THE POINT. The rig used to reach past send()
     into `_request` and translate the peer's `error` frame itself: a second
     copy of the five lines at the bottom of send(), which nothing compared
     with the original. A new frame type, a renamed `retry_after_us`, a changed
     message shape -- any of them would have been handled on one path and not
-    the other, silently, with the three tests that use the unguarded path
+    the other, silently, with every test that goes through the unguarded path
     still asserting the old shape. There is one translation now, and this is
-    what says the two callers get it.
+    what says both callers get it.
     """
     s, oh, conn = srv_with_halt
     c = _client(s.socket_path)
@@ -18684,8 +18684,8 @@ Insert `send()` immediately above `halt()`:
         It is a KEYWORD on this method rather than a second code path in the
         rig because the rig used to own a copy of the error translation below,
         and a copy is what drifts: a new frame type or a renamed hint field
-        would have been handled here and not there, silently, with the three
-        tests that use it still asserting the old shape.
+        would have been handled here and not there, silently, with every test
+        that uses it still asserting the old shape.
 
         The reserved-key guard above is NOT part of it. That one catches a
         malformed call -- a bug, not a denial -- and there is no test worth
@@ -19268,8 +19268,12 @@ def test_head_is_answered_without_a_body(target):
 
 
 def test_hits_for_selects_by_path_and_ignores_the_query(target):
-    """Six counts in the integration suite are taken from this. A hits_for
-    that answered [] would make every one of them pass forever."""
+    """The integration suite takes counts off this, and a hits_for that
+    answered [] would make every one of them pass forever.
+
+    No number here on purpose: this wave wrote "six" into three separate
+    comments about this one function and it was thirteen call sites each
+    time."""
     _get(target, "/health")
     _get(target, "/slow?ms=1&status=200")
     _get(target, "/slow?ms=1&status=500")
@@ -20114,9 +20118,9 @@ class Rig:
 
         This rig USED to reach past `send()` into `srv._request` and translate
         the reply itself. That copy is gone: it was a second spelling of the
-        five lines at the bottom of `send()`, free to drift from them, and the
-        three tests that depend on it would have gone on asserting the old
-        shape after any change to either.
+        five lines at the bottom of `send()`, free to drift from them, and
+        every test reached through this method would have gone on asserting
+        the old shape after any change to either.
         """
         return self.send(method, target_path, guarded=False, **kwargs)
 

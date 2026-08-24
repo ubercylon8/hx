@@ -203,9 +203,9 @@ class Rig:
 
         This rig USED to reach past `send()` into `srv._request` and translate
         the reply itself. That copy is gone: it was a second spelling of the
-        five lines at the bottom of `send()`, free to drift from them, and the
-        three tests that depend on it would have gone on asserting the old
-        shape after any change to either.
+        five lines at the bottom of `send()`, free to drift from them, and
+        every test reached through this method would have gone on asserting
+        the old shape after any change to either.
         """
         return self.send(method, target_path, guarded=False, **kwargs)
 
