@@ -127,6 +127,49 @@ public final class BridgeClient {
      *  flag is not what Sender asks. */
     public void setHaltSink(HaltSink s) { this.haltSink = s; }
 
+    /**
+     * The other direction: what the SEND PATH would refuse for, asked.
+     *
+     * {@link HaltSink} is one-way, and that asymmetry was a fail-open hole.
+     * This client keeps a {@code halted} flag written by the `halt` and
+     * `resume` frame arms and by nothing else -- there are exactly TWO writes
+     * to it in this file, one in each arm -- while spec s4 names THREE kill
+     * paths. The sentinel file (with its stalled-poller rule) and the
+     * auto-halt on target distress never reach that flag; the send path asks
+     * {@code Sender.issuanceHeldReason()} instead.
+     *
+     * MEASURED against this client before this interface existed, with the
+     * client configured and live:
+     *
+     *   sentinel file present   HaltSwitch.halted()=true   maySend()=true
+     *   poller stalled          HaltSwitch.halted()=true   maySend()=true
+     *   auto-halt tripped       stopReason() non-null      maySend()=true
+     *
+     * and {@link #checkMaySend()} threw nothing in all three. So a second
+     * enforcement point written against the obvious gate on the class the
+     * bridge already routes through -- {@code if (client.maySend())} -- would
+     * keep issuing through an operator halt raised by hand.
+     *
+     * ONE method, and it returns the REASON rather than a boolean, so the
+     * implementation HxExtension installs is {@code sender::issuanceHeldReason}
+     * -- the same code the send path runs, not a second opinion assembled here
+     * from the same two objects.
+     */
+    public interface HaltSource {
+        /** Why issuance is held, or null while nothing is holding it. */
+        String heldReason();
+    }
+
+    // Written on Burp's initialize thread before connect(), read wherever
+    // maySend() is. Volatile for the same reason haltSink is.
+    private volatile HaltSource haltSource;
+
+    /** Install the send path's halt authority. Called before connect(), for
+     *  the same reason setHaltSink is: until it is installed, maySend()
+     *  answers false -- a client that cannot ask whether the run is stopped
+     *  does not get to say it is not. */
+    public void setHaltSource(HaltSource s) { this.haltSource = s; }
+
     private final Path socketPath;
     private final String engagementId;
     private final String instanceId;
@@ -219,7 +262,49 @@ public final class BridgeClient {
      */
     public Authorisation authorisation() { return committed; }
 
-    public boolean maySend() { return configured.get() && !halted.get(); }
+    /**
+     * Is anything stopping issuance right now?
+     *
+     * THREE authorities, not one: this client's own two flags, plus the
+     * {@link HaltSource} the send path enforces. It used to be the two flags
+     * alone -- see HaltSource for the measurement -- and the flag it calls
+     * `halted` is the `halt` FRAME and nothing else.
+     *
+     * WHAT A TRUE ANSWER DOES NOT MEAN. Every refusal that needs a request in
+     * hand is still ahead: scope, method, dangerous path, unmanaged
+     * credential, rate, budget, deadline. This answers "is the run stopped",
+     * which is a necessary condition for issuing and not a sufficient one.
+     * The only thing that decides a REQUEST is {@code Sender.issue}.
+     *
+     * Keeping the local `halted` flag as well as asking the source is not
+     * redundancy for its own sake. The `halt` arm tells the switch FIRST and
+     * sets this flag second, and `resume` clears this flag first and tells the
+     * switch last; the AND is what leaves no window on either transition in
+     * which this answers true while one of the two authorities is holding.
+     */
+    public boolean maySend() {
+        return configured.get() && !halted.get() && heldReason() == null;
+    }
+
+    /**
+     * The send path's halt authority, asked safely.
+     *
+     * FAIL CLOSED on an uninstalled source, and on one that throws. A client
+     * that cannot find out whether the run is stopped has not found out that
+     * it is running, and DENY-ALL is what this branch is. HxExtension installs
+     * it before the dial, alongside the sink, so the null case is a wiring
+     * failure rather than a state -- and a wiring failure that denies is one
+     * somebody notices.
+     */
+    private String heldReason() {
+        HaltSource s = haltSource;
+        if (s == null) return "no halt source installed";
+        try {
+            return s.heldReason();
+        } catch (Throwable t) {
+            return "halt source threw: " + t;
+        }
+    }
 
     /** Drop to DENY-ALL. Returns whether the client had been configured.
      *  `configured` is cleared FIRST: maySend() reads only that and `halted`,
@@ -230,12 +315,17 @@ public final class BridgeClient {
         return was;
     }
 
-    /** Throws unless the extension is configured and not halted. */
+    /** Throws unless {@link #maySend()} would answer true, and says which of
+     *  the three authorities refused. Same caveat as maySend(): not throwing
+     *  means the RUN is not stopped, not that a given request may go out. */
     public void checkMaySend() {
         if (!configured.get())
             throw new NotConfigured("not_configured: no configure frame acknowledged yet");
         if (halted.get())
             throw new NotConfigured("halted: " + (haltReason == null ? "no reason given" : haltReason));
+        String held = heldReason();
+        if (held != null)
+            throw new NotConfigured("halted: " + held);
     }
 
     public void connect() throws IOException {

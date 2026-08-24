@@ -128,6 +128,12 @@ public class HxExtension implements BurpExtension {
             public void halted(String reason) { haltSwitch.haltedByFrame(reason); }
             public void resumed()             { haltSwitch.resumedByFrame(); }
         });
+        // ...and the way back. Without this, maySend() and checkMaySend() see
+        // the `halt` FRAME and nothing else: a sentinel-file halt, a stalled
+        // poller and an auto-halt all leave them answering true, measured.
+        // A method reference and not a lambda body, so there is one answer to
+        // "is the run stopped" and the send path runs it too.
+        c.setHaltSource(sender::issuanceHeldReason);
         haltSwitch.start();
         this.halt = haltSwitch;
         this.client = c;

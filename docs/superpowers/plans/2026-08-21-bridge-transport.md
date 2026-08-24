@@ -4830,6 +4830,7 @@ public class BridgeClientTest {
 
             FakeMontoya.Logger log = new FakeMontoya.Logger();
             BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
+            client.setHaltSource(NOTHING_HELD);
 
             // Daemon, for the same reason live()'s dial thread is one: a read
             // loop that outlives its assertions must not keep the JVM up after
@@ -4850,6 +4851,8 @@ public class BridgeClientTest {
             t("theCommitIsExclusiveWithClose", BridgeClientTest::theCommitIsExclusiveWithClose);
             t("aConfigureDoesNotLiftAHalt", BridgeClientTest::aConfigureDoesNotLiftAHalt);
             t("haltFramesReachTheSwitchTheSendPathAsks", BridgeClientTest::haltFramesReachTheSwitchTheSendPathAsks);
+            t("theKillPathsThatNeverTouchTheLocalFlagStillDenySending",
+              BridgeClientTest::theKillPathsThatNeverTouchTheLocalFlagStillDenySending);
             t("aHaltFrameWithNoReasonDoesNotDeliverTheWordNull", BridgeClientTest::aHaltFrameWithNoReasonDoesNotDeliverTheWordNull);
             t("aHaltSinkThatThrowsDropsToDenyAll", BridgeClientTest::aHaltSinkThatThrowsDropsToDenyAll);
             t("theSendArmHandsTheHandlerOneCoherentAuthorisation", BridgeClientTest::theSendArmHandsTheHandlerOneCoherentAuthorisation);
@@ -5013,6 +5016,7 @@ public class BridgeClientTest {
         server.bind(UnixDomainSocketAddress.of(sock));
         FakeMontoya.Logger log = new FakeMontoya.Logger();
         BridgeClient client = new BridgeClient(sock, "e-1", "i-1", log);
+        client.setHaltSource(NOTHING_HELD);
         // Daemon: a read loop that leaks past the end of a test must fail the
         // suite by way of its assertions, not outlive main() and hang the JVM.
         Thread dial = new Thread(() -> { try { client.connect(); } catch (Exception ignored) { } });
@@ -5030,6 +5034,17 @@ public class BridgeClientTest {
         return new Live(server, client, peer, out, reader, log);
     }
 
+    /**
+     * A halt source that never holds issuance.
+     *
+     * BridgeClient fails CLOSED without one -- see setHaltSource -- so every
+     * client built here installs this, and the checks below are then about
+     * THIS class's own two flags with the send path's authority held constant.
+     * The tests that vary the authority instead install their own; see
+     * theKillPathsThatNeverTouchTheLocalFlagStillDenySending.
+     */
+    static final BridgeClient.HaltSource NOTHING_HELD = () -> null;
+
     /** close() must be sticky: a client closed before its dial completes must
      *  never go on to hello, configure and live sending. Reproduced by the
      *  review as an UNLOADED extension holding a control channel. */
@@ -5039,6 +5054,7 @@ public class BridgeClientTest {
         try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
             server.bind(UnixDomainSocketAddress.of(sock));
             BridgeClient client = new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+            client.setHaltSource(NOTHING_HELD);
             client.close();
 
             // On a thread with a join timeout: an unfixed client's connect()
@@ -5191,6 +5207,7 @@ public class BridgeClientTest {
                     server.bind(UnixDomainSocketAddress.of(sock));
                     BridgeClient client =
                             new BridgeClient(sock, "e-1", "i-1", new FakeMontoya.Logger());
+                    client.setHaltSource(NOTHING_HELD);
                     Thread t = new Thread(() -> {
                         try { client.connect(); } catch (Exception ignored) { } });
                     t.setDaemon(true);
@@ -5257,6 +5274,7 @@ public class BridgeClientTest {
             server.bind(UnixDomainSocketAddress.of(sock));
             BridgeClient client = new BridgeClient(
                     sock, "e-1", "i-".repeat(4 << 20), new FakeMontoya.Logger());
+            client.setHaltSource(NOTHING_HELD);
 
             Thread killer = new Thread(() -> {
                 try (SocketChannel peer = server.accept()) {
@@ -5424,6 +5442,109 @@ public class BridgeClientTest {
             check("and the client is sending again", l.client.maySend());
         } finally {
             Files.deleteIfExists(dir.resolve("hs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * The kill paths that never touch this client's own flag still deny.
+     *
+     * BridgeClient writes its own `halted` flag in exactly two places -- the
+     * `halt` and `resume` frame arms -- and spec s4 names THREE kill paths.
+     * The sentinel file ("the socket is dead, stop by hand"), its stalled-
+     * poller rule, and the auto-halt on target distress all reach HaltSwitch
+     * or Distress and none of them reach that flag. MEASURED on a configured
+     * live client before setHaltSource existed:
+     *
+     *   sentinel file present   HaltSwitch.halted()=true    maySend()=true
+     *   poller stalled          HaltSwitch.halted()=true    maySend()=true
+     *   auto-halt tripped       stopReason() non-null       maySend()=true
+     *
+     * and checkMaySend() threw nothing in all three. COUNTED on the reviewed
+     * tree: zero calls anywhere in extension/src -- the only occurrences there
+     * were the two declarations themselves -- against 53 lines of
+     * extension/test, 60 occurrences of them in this file alone. So the whole
+     * suite kept the pair green while it was fail-open against two thirds of
+     * s4's promise, which is how it survived eight task reviews.
+     *
+     * WHAT THIS TEST OWNS and what it does not. The sentinel leg is driven
+     * here through a REAL HaltSwitch, because that is the leg that proves
+     * this client asks something other than its own flag. The auto-halt leg
+     * lives in SenderTest.theHeldReasonIsTheSameAnswerTheSendPathActsOn --
+     * that is where Distress is -- and the wiring that installs the real
+     * authority in production is counted by ChokepointTest. The source
+     * installed here is HaltSwitch::reason rather than the Sender method
+     * HxExtension installs, so that this file needs no Policy, Redactor or
+     * Http to say what it has to say.
+     */
+    static void theKillPathsThatNeverTouchTheLocalFlagStillDenySending() throws Exception {
+        Path dir = Files.createTempDirectory("hxhaltsource");
+        Path sentinel = dir.resolve("halt");
+        // A constant clock: unstarted the switch never reads one, and once
+        // started the staleness rule reads 0 - 0, which is never stale. This
+        // test is about the SENTINEL, not about time.
+        HaltSwitch hs = new HaltSwitch(() -> 0L, sentinel, 500L);
+        try (Live l = live(dir, "src.sock")) {
+            l.client.setHaltSource(hs::reason);
+            check("configured, nothing halted, and the source says so",
+                  l.client.maySend());
+
+            // The operator stops the run by hand. Nothing goes near a frame:
+            // this path exists for when the bridge itself is gone.
+            Files.writeString(sentinel, "stopped by hand\n");
+            hs.start();
+            try {
+                check("the authority the send path asks is halted", hs.halted());
+                check("and so is maySend(), which used to answer true here",
+                      !l.client.maySend());
+                String message = null;
+                try { l.client.checkMaySend(); }
+                catch (BridgeClient.NotConfigured e) { message = e.getMessage(); }
+                check("checkMaySend throws, and says which halt (" + message + ")",
+                      message != null && message.contains("halt sentinel present"));
+                // The local flag is untouched throughout, and the message is
+                // how that is visible: the flag's own branch answers
+                // "halted: no reason given" for a client no frame has halted,
+                // so a message naming the SENTINEL is proof the refusal came
+                // from the source and not from a flag somebody quietly wired.
+                check("...and the refusal came from the source, not the local flag ("
+                      + message + ")",
+                      message != null && !message.contains("no reason given"));
+            } finally {
+                hs.stop();
+            }
+        } finally {
+            Files.deleteIfExists(sentinel);
+            Files.deleteIfExists(dir.resolve("src.sock"));
+            Files.deleteIfExists(dir);
+        }
+
+        // ---- and the two ways the source itself can fail ------------------
+        //
+        // Both answer DENY. A client that cannot find out whether the run is
+        // stopped has not found out that it is running, which is the whole of
+        // this branch.
+        Path d2 = Files.createTempDirectory("hxhaltsource2");
+        try (Live l = live(d2, "n.sock")) {
+            // live() installs NOTHING_HELD; take it away again.
+            l.client.setHaltSource(null);
+            check("an uninstalled halt source denies rather than permits",
+                  !l.client.maySend());
+            String uninstalled = null;
+            try { l.client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { uninstalled = e.getMessage(); }
+            check("and says so (" + uninstalled + ")",
+                  uninstalled != null && uninstalled.contains("no halt source installed"));
+
+            l.client.setHaltSource(() -> { throw new IllegalStateException("boom"); });
+            check("a halt source that THROWS denies too", !l.client.maySend());
+            String threw = null;
+            try { l.client.checkMaySend(); }
+            catch (BridgeClient.NotConfigured e) { threw = e.getMessage(); }
+            check("and that is a refusal, not the throw escaping (" + threw + ")",
+                  threw != null && threw.contains("boom"));
+        } finally {
+            Files.deleteIfExists(d2.resolve("n.sock"));
+            Files.deleteIfExists(d2);
         }
     }
 
@@ -5973,6 +6094,49 @@ public final class BridgeClient {
      *  flag is not what Sender asks. */
     public void setHaltSink(HaltSink s) { this.haltSink = s; }
 
+    /**
+     * The other direction: what the SEND PATH would refuse for, asked.
+     *
+     * {@link HaltSink} is one-way, and that asymmetry was a fail-open hole.
+     * This client keeps a {@code halted} flag written by the `halt` and
+     * `resume` frame arms and by nothing else -- there are exactly TWO writes
+     * to it in this file, one in each arm -- while spec s4 names THREE kill
+     * paths. The sentinel file (with its stalled-poller rule) and the
+     * auto-halt on target distress never reach that flag; the send path asks
+     * {@code Sender.issuanceHeldReason()} instead.
+     *
+     * MEASURED against this client before this interface existed, with the
+     * client configured and live:
+     *
+     *   sentinel file present   HaltSwitch.halted()=true   maySend()=true
+     *   poller stalled          HaltSwitch.halted()=true   maySend()=true
+     *   auto-halt tripped       stopReason() non-null      maySend()=true
+     *
+     * and {@link #checkMaySend()} threw nothing in all three. So a second
+     * enforcement point written against the obvious gate on the class the
+     * bridge already routes through -- {@code if (client.maySend())} -- would
+     * keep issuing through an operator halt raised by hand.
+     *
+     * ONE method, and it returns the REASON rather than a boolean, so the
+     * implementation HxExtension installs is {@code sender::issuanceHeldReason}
+     * -- the same code the send path runs, not a second opinion assembled here
+     * from the same two objects.
+     */
+    public interface HaltSource {
+        /** Why issuance is held, or null while nothing is holding it. */
+        String heldReason();
+    }
+
+    // Written on Burp's initialize thread before connect(), read wherever
+    // maySend() is. Volatile for the same reason haltSink is.
+    private volatile HaltSource haltSource;
+
+    /** Install the send path's halt authority. Called before connect(), for
+     *  the same reason setHaltSink is: until it is installed, maySend()
+     *  answers false -- a client that cannot ask whether the run is stopped
+     *  does not get to say it is not. */
+    public void setHaltSource(HaltSource s) { this.haltSource = s; }
+
     private final Path socketPath;
     private final String engagementId;
     private final String instanceId;
@@ -6065,7 +6229,49 @@ public final class BridgeClient {
      */
     public Authorisation authorisation() { return committed; }
 
-    public boolean maySend() { return configured.get() && !halted.get(); }
+    /**
+     * Is anything stopping issuance right now?
+     *
+     * THREE authorities, not one: this client's own two flags, plus the
+     * {@link HaltSource} the send path enforces. It used to be the two flags
+     * alone -- see HaltSource for the measurement -- and the flag it calls
+     * `halted` is the `halt` FRAME and nothing else.
+     *
+     * WHAT A TRUE ANSWER DOES NOT MEAN. Every refusal that needs a request in
+     * hand is still ahead: scope, method, dangerous path, unmanaged
+     * credential, rate, budget, deadline. This answers "is the run stopped",
+     * which is a necessary condition for issuing and not a sufficient one.
+     * The only thing that decides a REQUEST is {@code Sender.issue}.
+     *
+     * Keeping the local `halted` flag as well as asking the source is not
+     * redundancy for its own sake. The `halt` arm tells the switch FIRST and
+     * sets this flag second, and `resume` clears this flag first and tells the
+     * switch last; the AND is what leaves no window on either transition in
+     * which this answers true while one of the two authorities is holding.
+     */
+    public boolean maySend() {
+        return configured.get() && !halted.get() && heldReason() == null;
+    }
+
+    /**
+     * The send path's halt authority, asked safely.
+     *
+     * FAIL CLOSED on an uninstalled source, and on one that throws. A client
+     * that cannot find out whether the run is stopped has not found out that
+     * it is running, and DENY-ALL is what this branch is. HxExtension installs
+     * it before the dial, alongside the sink, so the null case is a wiring
+     * failure rather than a state -- and a wiring failure that denies is one
+     * somebody notices.
+     */
+    private String heldReason() {
+        HaltSource s = haltSource;
+        if (s == null) return "no halt source installed";
+        try {
+            return s.heldReason();
+        } catch (Throwable t) {
+            return "halt source threw: " + t;
+        }
+    }
 
     /** Drop to DENY-ALL. Returns whether the client had been configured.
      *  `configured` is cleared FIRST: maySend() reads only that and `halted`,
@@ -6076,12 +6282,17 @@ public final class BridgeClient {
         return was;
     }
 
-    /** Throws unless the extension is configured and not halted. */
+    /** Throws unless {@link #maySend()} would answer true, and says which of
+     *  the three authorities refused. Same caveat as maySend(): not throwing
+     *  means the RUN is not stopped, not that a given request may go out. */
     public void checkMaySend() {
         if (!configured.get())
             throw new NotConfigured("not_configured: no configure frame acknowledged yet");
         if (halted.get())
             throw new NotConfigured("halted: " + (haltReason == null ? "no reason given" : haltReason));
+        String held = heldReason();
+        if (held != null)
+            throw new NotConfigured("halted: " + held);
     }
 
     public void connect() throws IOException {

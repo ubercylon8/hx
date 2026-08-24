@@ -13226,6 +13226,8 @@ public class SenderTest {
             t("theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks",
               () -> theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks(sentinel));
             t("theRefusalOrderIsPinned", () -> theRefusalOrderIsPinned(sentinel));
+            t("theHeldReasonIsTheSameAnswerTheSendPathActsOn",
+              () -> theHeldReasonIsTheSameAnswerTheSendPathActsOn(sentinel));
             t("rateLimitedCarriesRetryAfterUs", () -> rateLimitedCarriesRetryAfterUs(sentinel));
             t("theDestinationPortAndSchemeAreReadFromTheFrameAndBounded",
               () -> theDestinationPortAndSchemeAreReadFromTheFrameAndBounded(sentinel));
@@ -13724,6 +13726,81 @@ public class SenderTest {
         d.gate.verdict = Decision.deny("budget_exhausted", "spent");
         denied("method beats dangerous and budget", d, header, worst,
                authorised(), "method_denied");
+    }
+
+    /**
+     * `issuanceHeldReason()` is the SAME answer the send path acts on, and
+     * that identity is the whole reason it may be published.
+     *
+     * It exists because BridgeClient.maySend() had to ask something. That
+     * method reads a flag written by the `halt` and `resume` frame arms and by
+     * nothing else, so the other two of spec s4's three kill paths -- the
+     * sentinel file (with its stalled-poller rule) and the auto-halt -- left
+     * it answering TRUE while the send path refused. MEASURED, on a configured
+     * live client: sentinel present, HaltSwitch.halted()=true, maySend()=true;
+     * poller stalled, same; auto-halt tripped, same.
+     *
+     * The DANGER in fixing it that way is a second implementation of "is the
+     * run stopped", assembled somewhere else out of the same two objects and
+     * free to disagree with this one. So the assertion below is not "both
+     * answer non-null" -- it is that the string this returns is CHARACTER FOR
+     * CHARACTER the `detail` on the error frame issue() produces for the same
+     * state. Change one and this goes red.
+     */
+    static void theHeldReasonIsTheSameAnswerTheSendPathActsOn(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        byte[] req = request("GET", "/api/orders");
+
+        // Nothing holding: the frame goes out and there is no reason to give.
+        Rig clear = new Rig(sentinel);
+        check("nothing is held on a clear rig (" + clear.sender.issuanceHeldReason() + ")",
+              clear.sender.issuanceHeldReason() == null);
+        check("and the send is issued (" + clear.http.calls + ")",
+              "result".equals(clear.sender.issue(header, req, authorised()).get("t"))
+              && clear.http.calls == 1);
+
+        // 1. the halt FRAME.
+        Rig framed = new Rig(sentinel);
+        framed.halt.haltedByFrame("operator pressed stop");
+        check("a halt frame is held (" + framed.sender.issuanceHeldReason() + ")",
+              "operator pressed stop".equals(framed.sender.issuanceHeldReason()));
+        Map<String, Object> f = framed.sender.issue(header, req, authorised());
+        check("and the frame's detail is that same string, verbatim",
+              "halted".equals(f.get("class"))
+              && framed.sender.issuanceHeldReason().equals(f.get("detail")));
+        check("and nothing was issued (" + framed.http.calls + ")", framed.http.calls == 0);
+
+        // 2. the AUTO-HALT. Distress has no reset, so this rig is spent after.
+        Rig tripped = new Rig(sentinel);
+        tripped.http.reply = new HttpReply(
+                500, interimHeads(0, "HTTP/1.1 500 Internal Server Error"), 7L, false);
+        for (int i = 0; i < 10; i++) tripped.sender.issue(header, req, authorised());
+        String autoHalt = tripped.sender.issuanceHeldReason();
+        check("an auto-halt is held (" + autoHalt + ")",
+              autoHalt != null && autoHalt.startsWith("target distress: 5xx rate 100.0%")
+              && autoHalt.endsWith(" on app.example.test"));
+        int issuedBefore = tripped.http.calls;
+        Map<String, Object> a = tripped.sender.issue(header, req, authorised());
+        check("and its frame's detail is that same string, verbatim",
+              "halted".equals(a.get("class")) && autoHalt.equals(a.get("detail")));
+        check("and nothing more was issued (" + tripped.http.calls + ")",
+              tripped.http.calls == issuedBefore);
+
+        // 3. BOTH at once. The order is HaltSwitch first, so the reason a
+        //    frame carries is stable when an operator halt and an auto-halt
+        //    are both in force -- and an operator who pressed stop is told
+        //    that, not told about a rate.
+        Rig both = new Rig(sentinel);
+        both.http.reply = new HttpReply(
+                500, interimHeads(0, "HTTP/1.1 500 Internal Server Error"), 7L, false);
+        for (int i = 0; i < 10; i++) both.sender.issue(header, req, authorised());
+        both.halt.haltedByFrame("operator pressed stop");
+        check("the operator's halt is the reason given when both hold ("
+              + both.sender.issuanceHeldReason() + ")",
+              "operator pressed stop".equals(both.sender.issuanceHeldReason()));
+        check("and the frame agrees",
+              "operator pressed stop".equals(
+                      both.sender.issue(header, req, authorised()).get("detail")));
     }
 
     static void rateLimitedCarriesRetryAfterUs(Path sentinel) {
@@ -15193,6 +15270,51 @@ public final class Sender {
     public void setHaltNotifier(BridgeClient.HaltNotifier n) { this.haltNotifier = n; }
 
     /**
+     * Why issuance is held right now, or null while nothing is holding it.
+     *
+     * The REQUEST-INDEPENDENT half of decideAndIssue's refusals: the two that
+     * can be answered without a request in hand, which is what makes them the
+     * only two anything outside this class can usefully ask about. Everything
+     * else below -- scope, method, dangerous path, unmanaged credential, rate,
+     * budget, deadline -- is a question about ONE request and has no answer
+     * without it. A caller who reads a null here has learned that the run is
+     * not stopped, and NOT that any particular request may go out.
+     *
+     * It exists because it had to be asked from somewhere else. BridgeClient
+     * keeps a `halted` flag of its own, written by the `halt` and `resume`
+     * frame arms and by nothing else; spec s4 names three kill paths, and the
+     * other two -- the sentinel file (including its stalled-poller rule) and
+     * this auto-halt -- never touch it. Measured, with a sentinel file present
+     * and HaltSwitch.halted() answering true, BridgeClient.maySend() answered
+     * TRUE; likewise after Distress had tripped. So maySend() asks this, and
+     * this is the same code decideAndIssue runs rather than a second opinion
+     * about the same two objects: two implementations of "is the run stopped"
+     * is how the consoles come to disagree with the wire.
+     *
+     * The ORDER is HaltSwitch first, then Distress, and it is pinned by
+     * SenderTest.theRefusalOrderIsPinned rather than left to this comment: an
+     * operator halt and an auto-halt can both be in force, and the reason a
+     * frame carries has to be stable when they are.
+     *
+     * HaltSwitch.halted() and .reason() are two calls and a change can land
+     * between them -- see the note on HaltSwitch's own state record. The only
+     * straddle that reaches here is halted()==true then reason()==null, which
+     * is why there is a fallback string and not a null return.
+     */
+    public String issuanceHeldReason() {
+        if (halt.halted()) {
+            String why = halt.reason();
+            return why == null ? "halted, no reason recorded" : why;
+        }
+        // Auto-halt. Distress is extension-initiated and has no reset: one
+        // distressed host aborts the whole run (spec s4), and a human decides
+        // when it restarts.
+        String stop = distress.stopReason();
+        if (stop != null) return "target distress: " + stop + " on " + distress.stopHost();
+        return null;
+    }
+
+    /**
      * Decide, issue, time, redact, answer.
      *
      * The Authorisation is a PARAMETER, not something read in here. It is read
@@ -15259,18 +15381,10 @@ public final class Sender {
         if (auth.epoch() == 0)
             return error(id, "not_configured", "no configure frame acknowledged yet");
 
-        if (halt.halted()) {
-            String why = halt.reason();
-            return error(id, "halted", why == null ? "halted, no reason recorded" : why);
-        }
-
-        // Auto-halt. Distress is extension-initiated and has no reset: one
-        // distressed host aborts the whole run (spec s4), and a human decides
-        // when it restarts.
-        String stop = distress.stopReason();
-        if (stop != null)
-            return error(id, "halted",
-                         "target distress: " + stop + " on " + distress.stopHost());
+        // Both halt checks, from the one method that owns them. Kept in this
+        // position, and in this order, by theRefusalOrderIsPinned.
+        String held = issuanceHeldReason();
+        if (held != null) return error(id, "halted", held);
 
         // s7: refused AND NEVER PERSISTED. Until identity injection registers
         // byte ranges, this is the only thing keeping a live client session
@@ -16086,14 +16200,19 @@ public class ChokepointTest {
     }
 
     /**
-     * The four wires that make the send path and its kill paths real, counted
+     * The five wires that make the send path and its kill paths real, counted
      * where they are made.
      *
      * Nothing can test HxExtension behaviourally -- it needs Burp -- and every
      * one of these fails SILENTLY. Without setHaltSink a `halt` frame flips
      * BridgeClient's own flag and stops nothing, because the flag governs
      * maySend() while the send path asks HaltSwitch: requests keep going out
-     * with both consoles reading "halted". Without start() the sentinel file
+     * with both consoles reading "halted". Without setHaltSource the same gap
+     * runs the other way: maySend() falls back to that local flag, which the
+     * sentinel file, the stalled-poller rule and the auto-halt never touch --
+     * measured, all three left it answering TRUE. It fails CLOSED rather than
+     * silently now (an uninstalled source denies), which is why this check is
+     * about the line existing at all. Without start() the sentinel file
      * is never read and spec s4's third kill path -- the one that works when
      * the bridge does not -- is missing. Without setHaltNotifier an auto-halt
      * is invisible until the next send fails, and run.stop_reason is written
@@ -16108,6 +16227,8 @@ public class ChokepointTest {
         String entry = text(Path.of(ENTRY_POINT));
         check("a halt frame is routed to the switch the send path asks ("
               + count(entry, "setHaltSink(") + ")", count(entry, "setHaltSink(") == 1);
+        check("and maySend() asks that same authority back ("
+              + count(entry, "setHaltSource(") + ")", count(entry, "setHaltSource(") == 1);
         check("the sentinel poller is started (" + count(entry, "haltSwitch.start()") + ")",
               count(entry, "haltSwitch.start()") == 1);
         check("an auto-halt has somewhere to announce itself ("
@@ -16461,6 +16582,12 @@ public class HxExtension implements BurpExtension {
             public void halted(String reason) { haltSwitch.haltedByFrame(reason); }
             public void resumed()             { haltSwitch.resumedByFrame(); }
         });
+        // ...and the way back. Without this, maySend() and checkMaySend() see
+        // the `halt` FRAME and nothing else: a sentinel-file halt, a stalled
+        // poller and an auto-halt all leave them answering true, measured.
+        // A method reference and not a lambda body, so there is one answer to
+        // "is the run stopped" and the send path runs it too.
+        c.setHaltSource(sender::issuanceHeldReason);
         haltSwitch.start();
         this.halt = haltSwitch;
         this.client = c;

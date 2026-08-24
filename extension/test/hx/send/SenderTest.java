@@ -65,6 +65,8 @@ public class SenderTest {
             t("theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks",
               () -> theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks(sentinel));
             t("theRefusalOrderIsPinned", () -> theRefusalOrderIsPinned(sentinel));
+            t("theHeldReasonIsTheSameAnswerTheSendPathActsOn",
+              () -> theHeldReasonIsTheSameAnswerTheSendPathActsOn(sentinel));
             t("rateLimitedCarriesRetryAfterUs", () -> rateLimitedCarriesRetryAfterUs(sentinel));
             t("theDestinationPortAndSchemeAreReadFromTheFrameAndBounded",
               () -> theDestinationPortAndSchemeAreReadFromTheFrameAndBounded(sentinel));
@@ -563,6 +565,81 @@ public class SenderTest {
         d.gate.verdict = Decision.deny("budget_exhausted", "spent");
         denied("method beats dangerous and budget", d, header, worst,
                authorised(), "method_denied");
+    }
+
+    /**
+     * `issuanceHeldReason()` is the SAME answer the send path acts on, and
+     * that identity is the whole reason it may be published.
+     *
+     * It exists because BridgeClient.maySend() had to ask something. That
+     * method reads a flag written by the `halt` and `resume` frame arms and by
+     * nothing else, so the other two of spec s4's three kill paths -- the
+     * sentinel file (with its stalled-poller rule) and the auto-halt -- left
+     * it answering TRUE while the send path refused. MEASURED, on a configured
+     * live client: sentinel present, HaltSwitch.halted()=true, maySend()=true;
+     * poller stalled, same; auto-halt tripped, same.
+     *
+     * The DANGER in fixing it that way is a second implementation of "is the
+     * run stopped", assembled somewhere else out of the same two objects and
+     * free to disagree with this one. So the assertion below is not "both
+     * answer non-null" -- it is that the string this returns is CHARACTER FOR
+     * CHARACTER the `detail` on the error frame issue() produces for the same
+     * state. Change one and this goes red.
+     */
+    static void theHeldReasonIsTheSameAnswerTheSendPathActsOn(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        byte[] req = request("GET", "/api/orders");
+
+        // Nothing holding: the frame goes out and there is no reason to give.
+        Rig clear = new Rig(sentinel);
+        check("nothing is held on a clear rig (" + clear.sender.issuanceHeldReason() + ")",
+              clear.sender.issuanceHeldReason() == null);
+        check("and the send is issued (" + clear.http.calls + ")",
+              "result".equals(clear.sender.issue(header, req, authorised()).get("t"))
+              && clear.http.calls == 1);
+
+        // 1. the halt FRAME.
+        Rig framed = new Rig(sentinel);
+        framed.halt.haltedByFrame("operator pressed stop");
+        check("a halt frame is held (" + framed.sender.issuanceHeldReason() + ")",
+              "operator pressed stop".equals(framed.sender.issuanceHeldReason()));
+        Map<String, Object> f = framed.sender.issue(header, req, authorised());
+        check("and the frame's detail is that same string, verbatim",
+              "halted".equals(f.get("class"))
+              && framed.sender.issuanceHeldReason().equals(f.get("detail")));
+        check("and nothing was issued (" + framed.http.calls + ")", framed.http.calls == 0);
+
+        // 2. the AUTO-HALT. Distress has no reset, so this rig is spent after.
+        Rig tripped = new Rig(sentinel);
+        tripped.http.reply = new HttpReply(
+                500, interimHeads(0, "HTTP/1.1 500 Internal Server Error"), 7L, false);
+        for (int i = 0; i < 10; i++) tripped.sender.issue(header, req, authorised());
+        String autoHalt = tripped.sender.issuanceHeldReason();
+        check("an auto-halt is held (" + autoHalt + ")",
+              autoHalt != null && autoHalt.startsWith("target distress: 5xx rate 100.0%")
+              && autoHalt.endsWith(" on app.example.test"));
+        int issuedBefore = tripped.http.calls;
+        Map<String, Object> a = tripped.sender.issue(header, req, authorised());
+        check("and its frame's detail is that same string, verbatim",
+              "halted".equals(a.get("class")) && autoHalt.equals(a.get("detail")));
+        check("and nothing more was issued (" + tripped.http.calls + ")",
+              tripped.http.calls == issuedBefore);
+
+        // 3. BOTH at once. The order is HaltSwitch first, so the reason a
+        //    frame carries is stable when an operator halt and an auto-halt
+        //    are both in force -- and an operator who pressed stop is told
+        //    that, not told about a rate.
+        Rig both = new Rig(sentinel);
+        both.http.reply = new HttpReply(
+                500, interimHeads(0, "HTTP/1.1 500 Internal Server Error"), 7L, false);
+        for (int i = 0; i < 10; i++) both.sender.issue(header, req, authorised());
+        both.halt.haltedByFrame("operator pressed stop");
+        check("the operator's halt is the reason given when both hold ("
+              + both.sender.issuanceHeldReason() + ")",
+              "operator pressed stop".equals(both.sender.issuanceHeldReason()));
+        check("and the frame agrees",
+              "operator pressed stop".equals(
+                      both.sender.issue(header, req, authorised()).get("detail")));
     }
 
     static void rateLimitedCarriesRetryAfterUs(Path sentinel) {

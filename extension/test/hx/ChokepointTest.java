@@ -241,14 +241,19 @@ public class ChokepointTest {
     }
 
     /**
-     * The four wires that make the send path and its kill paths real, counted
+     * The five wires that make the send path and its kill paths real, counted
      * where they are made.
      *
      * Nothing can test HxExtension behaviourally -- it needs Burp -- and every
      * one of these fails SILENTLY. Without setHaltSink a `halt` frame flips
      * BridgeClient's own flag and stops nothing, because the flag governs
      * maySend() while the send path asks HaltSwitch: requests keep going out
-     * with both consoles reading "halted". Without start() the sentinel file
+     * with both consoles reading "halted". Without setHaltSource the same gap
+     * runs the other way: maySend() falls back to that local flag, which the
+     * sentinel file, the stalled-poller rule and the auto-halt never touch --
+     * measured, all three left it answering TRUE. It fails CLOSED rather than
+     * silently now (an uninstalled source denies), which is why this check is
+     * about the line existing at all. Without start() the sentinel file
      * is never read and spec s4's third kill path -- the one that works when
      * the bridge does not -- is missing. Without setHaltNotifier an auto-halt
      * is invisible until the next send fails, and run.stop_reason is written
@@ -263,6 +268,8 @@ public class ChokepointTest {
         String entry = text(Path.of(ENTRY_POINT));
         check("a halt frame is routed to the switch the send path asks ("
               + count(entry, "setHaltSink(") + ")", count(entry, "setHaltSink(") == 1);
+        check("and maySend() asks that same authority back ("
+              + count(entry, "setHaltSource(") + ")", count(entry, "setHaltSource(") == 1);
         check("the sentinel poller is started (" + count(entry, "haltSwitch.start()") + ")",
               count(entry, "haltSwitch.start()") == 1);
         check("an auto-halt has somewhere to announce itself ("

@@ -94,6 +94,51 @@ public final class Sender {
     public void setHaltNotifier(BridgeClient.HaltNotifier n) { this.haltNotifier = n; }
 
     /**
+     * Why issuance is held right now, or null while nothing is holding it.
+     *
+     * The REQUEST-INDEPENDENT half of decideAndIssue's refusals: the two that
+     * can be answered without a request in hand, which is what makes them the
+     * only two anything outside this class can usefully ask about. Everything
+     * else below -- scope, method, dangerous path, unmanaged credential, rate,
+     * budget, deadline -- is a question about ONE request and has no answer
+     * without it. A caller who reads a null here has learned that the run is
+     * not stopped, and NOT that any particular request may go out.
+     *
+     * It exists because it had to be asked from somewhere else. BridgeClient
+     * keeps a `halted` flag of its own, written by the `halt` and `resume`
+     * frame arms and by nothing else; spec s4 names three kill paths, and the
+     * other two -- the sentinel file (including its stalled-poller rule) and
+     * this auto-halt -- never touch it. Measured, with a sentinel file present
+     * and HaltSwitch.halted() answering true, BridgeClient.maySend() answered
+     * TRUE; likewise after Distress had tripped. So maySend() asks this, and
+     * this is the same code decideAndIssue runs rather than a second opinion
+     * about the same two objects: two implementations of "is the run stopped"
+     * is how the consoles come to disagree with the wire.
+     *
+     * The ORDER is HaltSwitch first, then Distress, and it is pinned by
+     * SenderTest.theRefusalOrderIsPinned rather than left to this comment: an
+     * operator halt and an auto-halt can both be in force, and the reason a
+     * frame carries has to be stable when they are.
+     *
+     * HaltSwitch.halted() and .reason() are two calls and a change can land
+     * between them -- see the note on HaltSwitch's own state record. The only
+     * straddle that reaches here is halted()==true then reason()==null, which
+     * is why there is a fallback string and not a null return.
+     */
+    public String issuanceHeldReason() {
+        if (halt.halted()) {
+            String why = halt.reason();
+            return why == null ? "halted, no reason recorded" : why;
+        }
+        // Auto-halt. Distress is extension-initiated and has no reset: one
+        // distressed host aborts the whole run (spec s4), and a human decides
+        // when it restarts.
+        String stop = distress.stopReason();
+        if (stop != null) return "target distress: " + stop + " on " + distress.stopHost();
+        return null;
+    }
+
+    /**
      * Decide, issue, time, redact, answer.
      *
      * The Authorisation is a PARAMETER, not something read in here. It is read
@@ -160,18 +205,10 @@ public final class Sender {
         if (auth.epoch() == 0)
             return error(id, "not_configured", "no configure frame acknowledged yet");
 
-        if (halt.halted()) {
-            String why = halt.reason();
-            return error(id, "halted", why == null ? "halted, no reason recorded" : why);
-        }
-
-        // Auto-halt. Distress is extension-initiated and has no reset: one
-        // distressed host aborts the whole run (spec s4), and a human decides
-        // when it restarts.
-        String stop = distress.stopReason();
-        if (stop != null)
-            return error(id, "halted",
-                         "target distress: " + stop + " on " + distress.stopHost());
+        // Both halt checks, from the one method that owns them. Kept in this
+        // position, and in this order, by theRefusalOrderIsPinned.
+        String held = issuanceHeldReason();
+        if (held != null) return error(id, "halted", held);
 
         // s7: refused AND NEVER PERSISTED. Until identity injection registers
         // byte ranges, this is the only thing keeping a live client session
