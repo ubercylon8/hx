@@ -67,6 +67,8 @@ public class HaltSwitchTest {
         t("aVanishedEngagementDirectoryDoesNotLiftAHalt", HaltSwitchTest::aVanishedEngagementDirectoryDoesNotLiftAHalt);
         t("aSentinelWhoseParentIsNotADirectoryIsHalted", HaltSwitchTest::aSentinelWhoseParentIsNotADirectoryIsHalted);
 
+        t("aParentThatFailsInAWayJavaNioNeverDoesIsHalted", HaltSwitchTest::aParentThatFailsInAWayJavaNioNeverDoesIsHalted);
+
         t("theTwoInputsAreIndependent", HaltSwitchTest::theTwoInputsAreIndependent);
 
         t("anUnreadableSentinelIsHalted", HaltSwitchTest::anUnreadableSentinelIsHalted);
@@ -311,6 +313,95 @@ public class HaltSwitchTest {
      * hand -- and the operator would have no way to know, since the file they
      * are looking at is still on disk.
      */
+    /**
+     * Both catch clauses inside `parentIsNotADirectory()`, reached with a
+     * failure java.nio never raises there.
+     *
+     * The file's own javadoc says every filesystem call here is treated as
+     * able to throw something it does not name, and that this exact class of
+     * defect has opened three guards on this project. These two clauses were
+     * the ones no input reached: the method is entered only from pollOnce()'s
+     * NoSuchFileException clause, and on every real parent shape -- absent,
+     * dangling symlink, regular file, unreadable directory -- the parent read
+     * that follows either succeeds or throws an IOException too. On real
+     * filesystems the only way in is a TOCTOU race, and a race is not a test.
+     *
+     * MEASURED before this test existed: narrowing the first clause to
+     * `RuntimeException`, narrowing the second to `IOException`, and making
+     * the first RETURN NULL -- the fail-open direction -- each left the whole
+     * Java suite at 9 x ALL PASS / 1396 ok / 0 FAIL. The second clause's
+     * polarity was already pinned by aVanishedEngagementDirectoryDoesNotLiftAHalt;
+     * its breadth was not, and neither half of the first clause was.
+     *
+     * See HostilePath for why a double is the only way in and why every
+     * question it is not asked throws.
+     */
+    static void aParentThatFailsInAWayJavaNioNeverDoesIsHalted() throws Exception {
+        // The control FIRST, so the two halting cases below cannot be passing
+        // merely because the double is hostile about everything. Sentinel
+        // ENOENT, parent a real directory: not halted, exactly as a deleted
+        // sentinel under a live engagement directory must be.
+        HostilePath liveParent = new HostilePath("/engagement", HostilePath.OnRead.DIRECTORY, null);
+        HostilePath deleted = new HostilePath("/engagement/HALTED",
+                                              HostilePath.OnRead.ENOENT, liveParent);
+        HaltSwitch control = new HaltSwitch(new TickClock(T0), deleted, 60_000L);
+        control.pollOnce();
+        check("a sentinel absent from a live parent is NOT halted, on the double too",
+              !control.halted());
+        check("and it reports no reason", control.reason() == null);
+
+        // getParent() throws: the FIRST clause. Nothing in java.nio throws
+        // from getParent(), which is why nothing reached this.
+        HostilePath cannotResolve = new HostilePath("/engagement/HALTED",
+                                                    HostilePath.OnRead.ENOENT, liveParent);
+        cannotResolve.parentThrow = HostilePath.unchecked();
+        HaltSwitch first = new HaltSwitch(new TickClock(T0), cannotResolve, 60_000L);
+        boolean threw = false;
+        try { first.pollOnce(); } catch (Throwable t) { threw = true; }
+        check("a parent that cannot be resolved does not throw out of pollOnce()", !threw);
+        check("a parent that cannot be resolved is HALTED", first.halted());
+        check("and the reason says the parent could not be resolved (got "
+              + first.reason() + ")",
+              first.reason() != null && first.reason().contains("cannot be resolved"));
+
+        // getParent() answers null and toAbsolutePath() throws an ERROR: the
+        // first clause again, at the breadth only an Error reaches. The two
+        // spellings of that clause differ ONLY here -- ClosedFileSystemException
+        // above is a RuntimeException, so `catch (RuntimeException)` still
+        // holds the line for it, and MEASURED: narrowing to RuntimeException
+        // with only the case above in place left the suite green. IOError is
+        // what Path.toAbsolutePath() is documented to throw, so this is the
+        // real shape rather than an invented one.
+        HostilePath noParent = new HostilePath("HALTED", HostilePath.OnRead.ENOENT, null);
+        noParent.absoluteThrow = HostilePath.ioError();
+        HaltSwitch anError = new HaltSwitch(new TickClock(T0), noParent, 60_000L);
+        threw = false;
+        try { anError.pollOnce(); } catch (Throwable t) { threw = true; }
+        check("an Error from resolving the parent does not escape pollOnce()", !threw);
+        check("an Error from resolving the parent is HALTED", anError.halted());
+        check("and the sentinel read is what names it, not the outer net (got "
+              + anError.reason() + ")",
+              anError.reason() != null && anError.reason().contains("cannot be resolved"));
+
+        // The parent stat throws an unchecked exception: the SECOND clause.
+        // ClosedFileSystemException is one of the three HaltSwitch's own
+        // comment names, and it is not an IOException.
+        HostilePath goneParent = new HostilePath("/engagement",
+                                                 HostilePath.OnRead.THROW_UNCHECKED, null);
+        HostilePath under = new HostilePath("/engagement/HALTED",
+                                            HostilePath.OnRead.ENOENT, goneParent);
+        HaltSwitch second = new HaltSwitch(new TickClock(T0), under, 60_000L);
+        threw = false;
+        try { second.pollOnce(); } catch (Throwable t) { threw = true; }
+        check("a parent whose stat throws unchecked does not throw out of pollOnce()", !threw);
+        check("a parent whose stat throws unchecked is HALTED", second.halted());
+        check("and the reason names the parent, not the outer net (got "
+              + second.reason() + ")",
+              second.reason() != null
+              && second.reason().contains("gone or unreadable")
+              && second.reason().contains("/engagement"));
+    }
+
     static void theTwoInputsAreIndependent() throws Exception {
         Path dir = Files.createTempDirectory("hxhaltboth");
         Path sentinel = dir.resolve("halt");
