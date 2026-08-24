@@ -411,19 +411,23 @@ public final class Sender {
     static final int MAX_INTERIM_HEADS = 8;
 
     /**
-     * What an exhausted scan reports: a status Distress counts as an error.
+     * What a scan that never found a final head reports: a status Distress
+     * counts as an error.
      *
      * 599 is not a status any peer sent, and that is the point -- the
      * alternative is worse in the one direction this whole function exists to
-     * close. When the scan runs out of budget the reported status is still the
-     * INTERIM 1xx, and returning it would hand Distress a healthy sample for a
-     * response whose real status we could not read: a peer that chooses how
-     * many heads to send would then choose whether spec s4's 20% rule can ever
-     * fire. A bound whose overflow behaviour is "fail open" is not a bound.
+     * close. When the scan does not reach a final status line the reported
+     * status is still the INTERIM 1xx, and returning it would hand Distress a
+     * healthy sample for a response whose real status we could not read: a
+     * peer that chooses how many heads to send, or how far to truncate, would
+     * then choose whether spec s4's 20% rule can ever fire. A bound whose
+     * overflow behaviour is "fail open" is not a bound, and neither is a scan
+     * whose truncation behaviour is.
      *
      * It is inside 500..599, which is the range {@code Distress.tripOn5xxRate}
-     * counts, so an origin hiding behind eight interim heads reads as broken
-     * rather than as fine.
+     * counts, so an origin hiding behind eight interim heads -- or a dead
+     * origin behind a CDN that already sent its `103 Early Hints` -- reads as
+     * broken rather than as fine.
      *
      * THE EVIDENCE LINE NEEDS MORE THAN THAT, and gets it from `outcome`
      * rather than from here. 599 is NOT a reserved code -- it is in unofficial
@@ -467,14 +471,28 @@ public final class Sender {
      *
      * A 1xx is never the final response (RFC 9110 s15.2), so a reported 1xx is
      * the one case where the transport's answer can be improved on; anything
-     * else is returned untouched. Nothing here guesses: if the bytes RUN OUT
-     * before a later status line -- truncated mid-status-line, truncated after
-     * a blank line, a line this cannot read at all -- the reported value
-     * stands, because there is nothing there to have hidden anything behind.
+     * else is returned untouched.
      *
-     * The one case that is NOT "the bytes ran out" is the scan running out of
-     * BUDGET, and that one answers {@link #STATUS_UNREADABLE}: see there for
-     * why the two endings must not give the same answer.
+     * THE SPLIT IS "a final head was read" vs "one was not", and NOT
+     * "the scan ran out of budget" vs "everything else". An earlier version of
+     * this javadoc drew it the second way -- if the bytes RUN OUT before a
+     * later status line, "the reported value stands, because there is nothing
+     * there to have hidden anything behind" -- and that premise is about the
+     * BYTES while its conclusion is about the STATUS. It does not follow.
+     * Nothing was hidden, and the 1xx is still not the final response: RFC
+     * 9110 s15.2 does not stop applying because the connection died. Measured
+     * against the shipped method before this was corrected, 30 sends against
+     * a CDN answering `103 Early Hints` with a dead origin behind it recorded
+     * thirty {@code status=103, outcome=ok} exchanges, a 0% 5xx rate and
+     * {@code distress.stopReason() == null} -- the auto-halt disarmed by
+     * exactly the failure it exists to catch.
+     *
+     * So every ending that falls out with {@code reported} still 1xx answers
+     * {@link #STATUS_UNREADABLE}: the scan running out of budget, the bytes
+     * running out mid-line or after a blank line, a line this cannot read at
+     * all, and a null {@code raw}. Only a final status line READ OUT OF THE
+     * BYTES overrules it, and only a {@code reported} that was never 1xx is
+     * returned untouched.
      */
     public static int finalStatus(byte[] raw, int reported) {
         return scanStatus(raw, reported).code();
@@ -488,45 +506,67 @@ public final class Sender {
      * "was that 599 real?" would be a second copy of this loop, free to drift
      * from the answer it describes.
      *
-     * {@code unreadable} is true for the exhausted-budget ending ONLY. Every
-     * other ending reports a status that came from the exchange -- a status
-     * line read out of the bytes, the transport's own answer when the bytes
-     * ran out or could not be parsed, or a reported status that was never 1xx
-     * -- and that INCLUDES a genuine 599, whether the transport reported it or
-     * it was read out of the response bytes behind some interim heads. Those
-     * are `ok`: the peer said 599 and we believe it.
+     * {@code unreadable} is true for every ending that did NOT read a final
+     * status line while {@code reported} was a 1xx. The `ok` endings are the
+     * two that produced a status the EXCHANGE actually stated: a status line
+     * read out of the bytes, and a reported status that was never 1xx. Those
+     * two INCLUDE a genuine 599, whether the transport reported it or it was
+     * read out of the response bytes behind some interim heads -- the peer
+     * said 599 and we believe it.
+     *
+     * A reported 1xx with no readable final head is NOT one of them, however
+     * the bytes ended. See {@link #finalStatus} for why "the bytes ran out"
+     * is not a licence to report the interim head.
      */
     static StatusScan scanStatus(byte[] raw, int reported) {
-        // A null `raw` reaches redactResponse below, which answers it with a
-        // RangeError and a bad_frame. It must not become an NPE here first.
-        if (raw == null || reported < 100 || reported > 199) return sent(reported);
+        // Not an interim status: the transport's answer IS the final one, and
+        // re-reading the bytes behind it would let a peer's leading head
+        // overrule a status the exchange really produced.
+        if (reported < 100 || reported > 199) return sent(reported);
+
+        // From here `reported` is a 1xx, so it is not the final response and
+        // there are exactly two answers left: a final status line read out of
+        // `raw`, or STATUS_UNREADABLE.
+        //
+        // A null `raw` is a real reply shape -- HttpReply carries whatever
+        // Montoya gave us -- and it goes on to reach redactResponse, which
+        // answers it with a RangeError and a bad_frame, so it must not become
+        // an NPE here first. It must not answer `sent(103)` either: Distress
+        // is fed BEFORE that RangeError is raised, so the interim head would
+        // still land in the window as a healthy sample.
+        if (raw == null) return unreadable();
+
         String text = new String(raw, StandardCharsets.ISO_8859_1);
         int i = 0;
-        int head = 0;
-        for (; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
+        for (int head = 0; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
             int eol = text.indexOf('\n', i);
-            if (eol < 0) return sent(reported);
+            if (eol < 0) return unreadable();        // truncated mid-line
             int code = statusCodeOf(text.substring(i, eol));
-            if (code < 100) return sent(reported);  // not a status line: stop guessing
-            if (code >= 200) return sent(code);     // the final response
+            if (code < 100) return unreadable();     // not a status line: stop guessing
+            if (code >= 200) return sent(code);      // the final response
             // A 1xx head carries no body (RFC 9110 s15.2), so the next head
             // starts immediately after this one's blank line.
             int crlf = text.indexOf("\r\n\r\n", i);
             int lf = text.indexOf("\n\n", i);
             if (crlf >= 0 && (lf < 0 || crlf <= lf)) i = crlf + 4;
             else if (lf >= 0) i = lf + 2;
-            else return sent(reported);
+            else return unreadable();                // no blank line ends this 1xx head
         }
-        // The scan gave up rather than ran out. Every head it read was a 1xx,
-        // so the response IS still ahead of it somewhere and `reported` is
-        // certainly not it -- the peer chose the head count, and it must not
-        // get to choose the sample Distress records with it.
-        if (head == MAX_INTERIM_HEADS) return new StatusScan(STATUS_UNREADABLE, true);
-        return sent(reported);
+        // Out of budget, or out of bytes with every head read so far a 1xx.
+        // Either way the final response is still ahead of this scan and
+        // `reported` is certainly not it -- the peer chose the head count and
+        // chose where to stop writing, and it must not get to choose the
+        // sample Distress records either way.
+        return unreadable();
     }
 
     /** A status the exchange itself produced. */
     private static StatusScan sent(int code) { return new StatusScan(code, false); }
+
+    /** A reported 1xx and no final head to replace it with. */
+    private static StatusScan unreadable() {
+        return new StatusScan(STATUS_UNREADABLE, true);
+    }
 
     /**
      * A status and where it came from.
@@ -542,8 +582,9 @@ public final class Sender {
      *
      * @param code       what goes on the evidence line and into Distress
      * @param unreadable true when {@code code} is {@link #STATUS_UNREADABLE}
-     *                   BECAUSE the scan ran out of budget, rather than
-     *                   because anything in the exchange said 599
+     *                   BECAUSE no final status line could be read behind a
+     *                   reported 1xx, rather than because anything in the
+     *                   exchange said 599
      */
     record StatusScan(int code, boolean unreadable) { }
 

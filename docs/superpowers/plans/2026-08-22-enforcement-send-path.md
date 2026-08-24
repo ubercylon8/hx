@@ -13263,6 +13263,8 @@ public class SenderTest {
               SenderTest::theInterimHeadScanIsBoundedAndFailsToward5xx);
             t("theEvidenceLineSaysWhichKindOf599ThisIs",
               () -> theEvidenceLineSaysWhichKindOf599ThisIs(sentinel));
+            t("theAutoHaltFiresOnAnOriginThatDiedBehindItsEarlyHints",
+              () -> theAutoHaltFiresOnAnOriginThatDiedBehindItsEarlyHints(sentinel));
             t("theWireMappingRoundTripsWhatItParsed", SenderTest::theWireMappingRoundTripsWhatItParsed);
             t("theConfiguredLimitsArmTheGateOnceFromTheAuthorisation",
               SenderTest::theConfiguredLimitsArmTheGateOnceFromTheAuthorisation);
@@ -14472,10 +14474,36 @@ public class SenderTest {
               Sender.finalStatus(interimHeads(40, "HTTP/1.1 200 OK"), 103)
               == Sender.STATUS_UNREADABLE);
 
-        // Running out of BYTES is a different ending and keeps the old answer:
-        // there is nothing there for a peer to have hidden a status behind.
-        check("truncation after a blank line still reports what the transport said",
-              Sender.finalStatus(interimHeads(1, ""), 103) == 103);
+        // Running out of BYTES is the SAME ending, and it used not to be.
+        //
+        // MEASURED against the shipped method before this block was written:
+        // each of these four answered 103, and the whole Java suite was green
+        // -- so a dead origin behind a CDN's `103 Early Hints` recorded
+        // `status=103, outcome=ok` for every request and the auto-halt never
+        // fired. See theAutoHaltFiresOnAnOriginThatDiedBehindItsEarlyHints,
+        // which drives that through the real Sender. The premise "the bytes
+        // ran out, so nothing was hidden" is about the BYTES; the conclusion
+        // "the reported value stands" is about the STATUS, and a 1xx is still
+        // not the final response (RFC 9110 s15.2) when the connection dies.
+        check("truncation after a blank line does NOT report the interim head ("
+              + Sender.finalStatus(interimHeads(1, ""), 103) + ")",
+              Sender.finalStatus(interimHeads(1, ""), 103) == Sender.STATUS_UNREADABLE);
+        byte[] midStatusLine = "HTTP/1.1 103 X\r\n\r\nHTTP/1.1 2"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        check("nor does truncation mid-status-line ("
+              + Sender.finalStatus(midStatusLine, 103) + ")",
+              Sender.finalStatus(midStatusLine, 103) == Sender.STATUS_UNREADABLE);
+        byte[] notAStatusLine = "HTTP/1.1 103 X\r\n\r\nnot-a-status-line\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        check("nor does a line the scan cannot read ("
+              + Sender.finalStatus(notAStatusLine, 103) + ")",
+              Sender.finalStatus(notAStatusLine, 103) == Sender.STATUS_UNREADABLE);
+        byte[] noBlankLine = "HTTP/1.1 103 X\r\nLink: </a.css>; rel=preload"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        check("nor does a 1xx head with no blank line to end it ("
+              + Sender.finalStatus(noBlankLine, 103) + ")",
+              Sender.finalStatus(noBlankLine, 103) == Sender.STATUS_UNREADABLE);
+
         check("and a reply that is not 1xx is never touched at all",
               Sender.finalStatus(interimHeads(8, "HTTP/1.1 500 Internal Server Error"), 204)
               == 204);
@@ -14490,17 +14518,32 @@ public class SenderTest {
         // improve on what the transport reported.
 
         // A null `raw` is a real reply shape -- HttpReply carries whatever
-        // Montoya gave us -- and it reaches redactResponse, which answers it
-        // with a RangeError and a bad_frame. It must not become an NPE HERE
-        // first, three frames earlier, where nothing would say which field
-        // was missing.
+        // Montoya gave us -- and it goes on to reach redactResponse, which
+        // answers it with a RangeError and a bad_frame. It must not become an
+        // NPE HERE first, three frames earlier, where nothing would say which
+        // field was missing.
+        //
+        // Nor may it report the interim head. No `result` frame is ever built
+        // for these bytes, but Distress is fed BEFORE redactResponse raises,
+        // so answering 103 would still put a healthy sample in the window for
+        // an exchange that produced no readable response at all.
         int nullRaw = -1;
         String nullThrew = null;
         try { nullRaw = Sender.finalStatus(null, 103); }
         catch (Throwable t) { nullThrew = String.valueOf(t); }
-        check("a null response body reports the transport's status, not an NPE ("
+        check("a null response body is unreadable, not an NPE and not the 1xx ("
               + (nullThrew == null ? String.valueOf(nullRaw) : nullThrew) + ")",
-              nullThrew == null && nullRaw == 103);
+              nullThrew == null && nullRaw == Sender.STATUS_UNREADABLE);
+        // ...and a null `raw` under a NON-1xx transport status is still the
+        // transport's own answer: there was never anything to improve on.
+        int nullRawNot1xx = -1;
+        String nullNot1xxThrew = null;
+        try { nullRawNot1xx = Sender.finalStatus(null, 502); }
+        catch (Throwable t) { nullNot1xxThrew = String.valueOf(t); }
+        check("a null response body under a 502 still reports the 502 ("
+              + (nullNot1xxThrew == null ? String.valueOf(nullRawNot1xx) : nullNot1xxThrew)
+              + ")",
+              nullNot1xxThrew == null && nullRawNot1xx == 502);
 
         // BOTH ends of the 1xx range are inside it. 100 Continue is the one a
         // real client meets most often; 199 is the top of the range.
@@ -14612,6 +14655,117 @@ public class SenderTest {
               + unreadable.distress.stopReason() + ")",
               unreadable.distress.stopReason() != null
               && unreadable.distress.stopReason().startsWith("5xx rate 100.0%"));
+    }
+
+    /**
+     * The auto-halt fires against an origin that died behind its own early
+     * hints -- and this is the whole of spec s4's second kill path, so a rig
+     * that only proves `finalStatus` returns 599 proves the wrong half.
+     *
+     * THE SHAPE. A CDN answers `103 Early Hints`; the origin behind it is dead
+     * or the response is truncated. Montoya parses the interim head, so
+     * hasResponse() is true, statusCode() is 103, and toByteArray() carries no
+     * parseable final head. That reply is the input below, byte for byte.
+     *
+     * MEASURED against the shipped Sender before the fix, driving exactly this
+     * rig -- 30 sends, in-scope, the same fake Http:
+     *
+     *   send  1: {t=result, id=1,  status=103, bytes=57, ms=7, outcome=ok}
+     *   send 30: {t=result, id=30, status=103, bytes=57, ms=7, outcome=ok}
+     *   distress.stopReason() after 30 origin-dead exchanges: null
+     *   halted frames pushed: 0
+     *
+     * Thirty healthy samples, a 0% 5xx rate, a consecutive-error streak of
+     * zero (something DID answer), and hx issuing at the configured rate into
+     * a client system that is already failing. The control on the SAME rig --
+     * the same failing origin answering a bare 500 with no early-hints head --
+     * stopped at "5xx rate 100.0% over the last 10 requests exceeds 20.0%", so
+     * the auto-halt was not broken in general: it was disarmed by the interim
+     * head specifically, which is the one thing a peer chooses for itself.
+     *
+     * The last block is the other direction, and it is why the fix is not
+     * "call every 1xx unreadable": a GENUINE 103-then-200 still reports 200,
+     * still says `ok`, and still trips nothing.
+     */
+    static void theAutoHaltFiresOnAnOriginThatDiedBehindItsEarlyHints(Path sentinel) {
+        // Exactly what Burp hands back for an interim head with nothing behind
+        // it: one 103 head, its blank line, and the end of the bytes.
+        byte[] earlyHintsOnly = interimHeads(1, "");
+        check("the reply carries the 103 head and nothing after it ("
+              + earlyHintsOnly.length + " bytes)",
+              new String(earlyHintsOnly, StandardCharsets.ISO_8859_1)
+                      .startsWith("HTTP/1.1 103 Early Hints\r\n")
+              && !new String(earlyHintsOnly, StandardCharsets.ISO_8859_1)
+                      .contains("HTTP/1.1 2"));
+
+        Rig dead = new Rig(sentinel);
+        dead.http.reply = new HttpReply(103, earlyHintsOnly, 7L, false);
+
+        Map<String, Object> first = null;
+        int firstRefused = -1;
+        for (int i = 1; i <= 30; i++) {
+            Map<String, Object> h = sendHeader(NOW + THIRTY_SECONDS);
+            h.put("id", (long) i);
+            Map<String, Object> r = dead.sender.issue(h, request("GET", "/api/orders"),
+                                                      authorised());
+            if (i == 1) first = r;
+            if (firstRefused < 0 && "error".equals(r.get("t"))) firstRefused = i;
+        }
+
+        check("the first exchange does NOT report the interim head as its status ("
+              + first.get("status") + ")",
+              Long.valueOf((long) Sender.STATUS_UNREADABLE).equals(first.get("status")));
+        check("and says so on `outcome` rather than passing as healthy ("
+              + first.get("outcome") + ")",
+              "status_unreadable".equals(first.get("outcome")));
+
+        // THE LIVE CONSEQUENCE. Not "599 came back" -- the run stopped.
+        check("30 origin-dead exchanges trip the auto-halt ("
+              + dead.distress.stopReason() + ")",
+              dead.distress.stopReason() != null
+              && dead.distress.stopReason().startsWith("5xx rate 100.0%"));
+        check("against the host the frame header named (" + dead.distress.stopHost() + ")",
+              "app.example.test".equals(dead.distress.stopHost()));
+        check("it is announced once, unsolicited (" + dead.notifier.frames.size() + ")",
+              dead.notifier.frames.size() == 1);
+        // And the point of a halt: the wire goes quiet. Distress needs
+        // baselineRequests answered samples before a rate exists, so the tenth
+        // send is the one that trips and the eleventh is the first refused.
+        check("and the sends after it are refused rather than issued (first refused: "
+              + firstRefused + ")", firstRefused == 11);
+        check("so the fake Http was called 10 times, not 30 (" + dead.http.calls + ")",
+              dead.http.calls == 10);
+
+        // ---- the control, on the same rig ------------------------------
+        //
+        // The auto-halt was never broken in general. Before the fix THIS
+        // stopped and the block above did not, and the only difference
+        // between them is a head the peer chose to send.
+        Rig bare = new Rig(sentinel);
+        bare.http.reply = new HttpReply(
+                500, interimHeads(0, "HTTP/1.1 500 Internal Server Error"), 7L, false);
+        for (int i = 1; i <= 30; i++)
+            bare.sender.issue(sendHeader(NOW + THIRTY_SECONDS),
+                              request("GET", "/api/orders"), authorised());
+        check("the same failing origin with a bare 500 stops too ("
+              + bare.distress.stopReason() + ")",
+              bare.distress.stopReason() != null
+              && bare.distress.stopReason().startsWith("5xx rate 100.0%"));
+
+        // ---- and the exchange that must NOT be caught by any of it ------
+        Rig live = new Rig(sentinel);
+        live.http.reply = new HttpReply(103, interimHeads(1, "HTTP/1.1 200 OK"), 7L, false);
+        Map<String, Object> good = null;
+        for (int i = 1; i <= 30; i++)
+            good = live.sender.issue(sendHeader(NOW + THIRTY_SECONDS),
+                                     request("GET", "/api/orders"), authorised());
+        check("a genuine 103-then-200 still reports 200 (" + good.get("status") + ")",
+              Long.valueOf(200L).equals(good.get("status")));
+        check("and is still `ok` (" + good.get("outcome") + ")",
+              "ok".equals(good.get("outcome")));
+        check("and 30 of them trip nothing (" + live.distress.stopReason() + ")",
+              live.distress.stopReason() == null);
+        check("so all 30 were issued (" + live.http.calls + ")", live.http.calls == 30);
     }
 
     /** {@code n} interim heads, then {@code last} -- which may be empty, for
@@ -15356,19 +15510,23 @@ public final class Sender {
     static final int MAX_INTERIM_HEADS = 8;
 
     /**
-     * What an exhausted scan reports: a status Distress counts as an error.
+     * What a scan that never found a final head reports: a status Distress
+     * counts as an error.
      *
      * 599 is not a status any peer sent, and that is the point -- the
      * alternative is worse in the one direction this whole function exists to
-     * close. When the scan runs out of budget the reported status is still the
-     * INTERIM 1xx, and returning it would hand Distress a healthy sample for a
-     * response whose real status we could not read: a peer that chooses how
-     * many heads to send would then choose whether spec s4's 20% rule can ever
-     * fire. A bound whose overflow behaviour is "fail open" is not a bound.
+     * close. When the scan does not reach a final status line the reported
+     * status is still the INTERIM 1xx, and returning it would hand Distress a
+     * healthy sample for a response whose real status we could not read: a
+     * peer that chooses how many heads to send, or how far to truncate, would
+     * then choose whether spec s4's 20% rule can ever fire. A bound whose
+     * overflow behaviour is "fail open" is not a bound, and neither is a scan
+     * whose truncation behaviour is.
      *
      * It is inside 500..599, which is the range {@code Distress.tripOn5xxRate}
-     * counts, so an origin hiding behind eight interim heads reads as broken
-     * rather than as fine.
+     * counts, so an origin hiding behind eight interim heads -- or a dead
+     * origin behind a CDN that already sent its `103 Early Hints` -- reads as
+     * broken rather than as fine.
      *
      * THE EVIDENCE LINE NEEDS MORE THAN THAT, and gets it from `outcome`
      * rather than from here. 599 is NOT a reserved code -- it is in unofficial
@@ -15412,14 +15570,28 @@ public final class Sender {
      *
      * A 1xx is never the final response (RFC 9110 s15.2), so a reported 1xx is
      * the one case where the transport's answer can be improved on; anything
-     * else is returned untouched. Nothing here guesses: if the bytes RUN OUT
-     * before a later status line -- truncated mid-status-line, truncated after
-     * a blank line, a line this cannot read at all -- the reported value
-     * stands, because there is nothing there to have hidden anything behind.
+     * else is returned untouched.
      *
-     * The one case that is NOT "the bytes ran out" is the scan running out of
-     * BUDGET, and that one answers {@link #STATUS_UNREADABLE}: see there for
-     * why the two endings must not give the same answer.
+     * THE SPLIT IS "a final head was read" vs "one was not", and NOT
+     * "the scan ran out of budget" vs "everything else". An earlier version of
+     * this javadoc drew it the second way -- if the bytes RUN OUT before a
+     * later status line, "the reported value stands, because there is nothing
+     * there to have hidden anything behind" -- and that premise is about the
+     * BYTES while its conclusion is about the STATUS. It does not follow.
+     * Nothing was hidden, and the 1xx is still not the final response: RFC
+     * 9110 s15.2 does not stop applying because the connection died. Measured
+     * against the shipped method before this was corrected, 30 sends against
+     * a CDN answering `103 Early Hints` with a dead origin behind it recorded
+     * thirty {@code status=103, outcome=ok} exchanges, a 0% 5xx rate and
+     * {@code distress.stopReason() == null} -- the auto-halt disarmed by
+     * exactly the failure it exists to catch.
+     *
+     * So every ending that falls out with {@code reported} still 1xx answers
+     * {@link #STATUS_UNREADABLE}: the scan running out of budget, the bytes
+     * running out mid-line or after a blank line, a line this cannot read at
+     * all, and a null {@code raw}. Only a final status line READ OUT OF THE
+     * BYTES overrules it, and only a {@code reported} that was never 1xx is
+     * returned untouched.
      */
     public static int finalStatus(byte[] raw, int reported) {
         return scanStatus(raw, reported).code();
@@ -15433,45 +15605,67 @@ public final class Sender {
      * "was that 599 real?" would be a second copy of this loop, free to drift
      * from the answer it describes.
      *
-     * {@code unreadable} is true for the exhausted-budget ending ONLY. Every
-     * other ending reports a status that came from the exchange -- a status
-     * line read out of the bytes, the transport's own answer when the bytes
-     * ran out or could not be parsed, or a reported status that was never 1xx
-     * -- and that INCLUDES a genuine 599, whether the transport reported it or
-     * it was read out of the response bytes behind some interim heads. Those
-     * are `ok`: the peer said 599 and we believe it.
+     * {@code unreadable} is true for every ending that did NOT read a final
+     * status line while {@code reported} was a 1xx. The `ok` endings are the
+     * two that produced a status the EXCHANGE actually stated: a status line
+     * read out of the bytes, and a reported status that was never 1xx. Those
+     * two INCLUDE a genuine 599, whether the transport reported it or it was
+     * read out of the response bytes behind some interim heads -- the peer
+     * said 599 and we believe it.
+     *
+     * A reported 1xx with no readable final head is NOT one of them, however
+     * the bytes ended. See {@link #finalStatus} for why "the bytes ran out"
+     * is not a licence to report the interim head.
      */
     static StatusScan scanStatus(byte[] raw, int reported) {
-        // A null `raw` reaches redactResponse below, which answers it with a
-        // RangeError and a bad_frame. It must not become an NPE here first.
-        if (raw == null || reported < 100 || reported > 199) return sent(reported);
+        // Not an interim status: the transport's answer IS the final one, and
+        // re-reading the bytes behind it would let a peer's leading head
+        // overrule a status the exchange really produced.
+        if (reported < 100 || reported > 199) return sent(reported);
+
+        // From here `reported` is a 1xx, so it is not the final response and
+        // there are exactly two answers left: a final status line read out of
+        // `raw`, or STATUS_UNREADABLE.
+        //
+        // A null `raw` is a real reply shape -- HttpReply carries whatever
+        // Montoya gave us -- and it goes on to reach redactResponse, which
+        // answers it with a RangeError and a bad_frame, so it must not become
+        // an NPE here first. It must not answer `sent(103)` either: Distress
+        // is fed BEFORE that RangeError is raised, so the interim head would
+        // still land in the window as a healthy sample.
+        if (raw == null) return unreadable();
+
         String text = new String(raw, StandardCharsets.ISO_8859_1);
         int i = 0;
-        int head = 0;
-        for (; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
+        for (int head = 0; head < MAX_INTERIM_HEADS && i < text.length(); head++) {
             int eol = text.indexOf('\n', i);
-            if (eol < 0) return sent(reported);
+            if (eol < 0) return unreadable();        // truncated mid-line
             int code = statusCodeOf(text.substring(i, eol));
-            if (code < 100) return sent(reported);  // not a status line: stop guessing
-            if (code >= 200) return sent(code);     // the final response
+            if (code < 100) return unreadable();     // not a status line: stop guessing
+            if (code >= 200) return sent(code);      // the final response
             // A 1xx head carries no body (RFC 9110 s15.2), so the next head
             // starts immediately after this one's blank line.
             int crlf = text.indexOf("\r\n\r\n", i);
             int lf = text.indexOf("\n\n", i);
             if (crlf >= 0 && (lf < 0 || crlf <= lf)) i = crlf + 4;
             else if (lf >= 0) i = lf + 2;
-            else return sent(reported);
+            else return unreadable();                // no blank line ends this 1xx head
         }
-        // The scan gave up rather than ran out. Every head it read was a 1xx,
-        // so the response IS still ahead of it somewhere and `reported` is
-        // certainly not it -- the peer chose the head count, and it must not
-        // get to choose the sample Distress records with it.
-        if (head == MAX_INTERIM_HEADS) return new StatusScan(STATUS_UNREADABLE, true);
-        return sent(reported);
+        // Out of budget, or out of bytes with every head read so far a 1xx.
+        // Either way the final response is still ahead of this scan and
+        // `reported` is certainly not it -- the peer chose the head count and
+        // chose where to stop writing, and it must not get to choose the
+        // sample Distress records either way.
+        return unreadable();
     }
 
     /** A status the exchange itself produced. */
     private static StatusScan sent(int code) { return new StatusScan(code, false); }
+
+    /** A reported 1xx and no final head to replace it with. */
+    private static StatusScan unreadable() {
+        return new StatusScan(STATUS_UNREADABLE, true);
+    }
 
     /**
      * A status and where it came from.
@@ -15487,8 +15681,9 @@ public final class Sender {
      *
      * @param code       what goes on the evidence line and into Distress
      * @param unreadable true when {@code code} is {@link #STATUS_UNREADABLE}
-     *                   BECAUSE the scan ran out of budget, rather than
-     *                   because anything in the exchange said 599
+     *                   BECAUSE no final status line could be read behind a
+     *                   reported 1xx, rather than because anything in the
+     *                   exchange said 599
      */
     record StatusScan(int code, boolean unreadable) { }
 
@@ -17368,8 +17563,11 @@ PRE_ISSUANCE = frozenset({"scope_denied", "rate_limited"})
 # of these describe a request that SUCCEEDED, or failed in a way no error
 # class names. `status_unreadable` is one of those -- it arrives on a `result`
 # frame, not an `error` frame, and it means the exchange completed while its
-# final status could not be read (more interim 1xx heads than the extension's
-# scan tolerates), with `status` holding the conservative sentinel 599.
+# final status could not be read: the transport reported an interim 1xx head
+# and no final status line was found behind it, whether because the peer sent
+# more interim heads than the extension's scan tolerates or because the
+# response was truncated after one. `status` holds the conservative sentinel
+# 599 either way.
 #
 # The wire value and the column value are DELIBERATELY the same string, so
 # there is no map here to keep in step -- see the spec's S5/S6 amendment of
@@ -19917,6 +20115,29 @@ def test_the_hints_route_emits_the_number_asked_for_and_no_more(target):
         "the exhausted-scan case stops being reachable from this route")
 
 
+def test_the_hints_route_can_close_without_ever_sending_a_final_head(target):
+    """The CDN whose origin died after the early hints went out.
+
+    `n` alone can only produce the ending where the scan runs out of BUDGET.
+    This is the other one the whole-branch review found open: one interim
+    head, then the connection ends, and `Sender.scanStatus` reported that
+    1xx as the exchange's final status. The integration suite drives it
+    against a real Burp; this is the instrument that produces it, checked
+    where it costs milliseconds.
+
+    The assertion that matters is the ABSENCE. A route that emitted the
+    interim head and then the 500 anyway would leave the integration test
+    passing for the wrong reason -- it would be measuring the budget ending
+    a second time -- so the second `HTTP/` is what this counts.
+    """
+    raw = _request(target, "GET", "/hints?n=1&close=1")
+    assert raw == ts.INTERIM_HEAD, (
+        "the route sent something after the interim head, so this is not the "
+        f"truncated ending: {raw!r}")
+    assert raw.count(b"HTTP/") == 1, raw
+    assert [(h.method, h.path) for h in target.hits] == [("GET", "/hints")]
+
+
 def test_a_request_header_is_recorded_verbatim(target):
     """The unmanaged-credential assertion reads Cookie back off this log."""
     _get(target, "/api/orders", {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"})
@@ -20233,6 +20454,20 @@ class _Handler(BaseHTTPRequestHandler):
             # heads are on the socket before _reply's are.
             for _ in range(min(_int_param(params, "n", 1), MAX_HINT_HEADS)):
                 self.wfile.write(INTERIM_HEAD)
+            if _int_param(params, "close", 0):
+                # ...and NOTHING after them. A CDN that has already sent its
+                # `103 Early Hints` when the origin behind it dies: the
+                # interim head is on the wire, the final one never arrives,
+                # and the connection ends. This is the shape the whole-branch
+                # review found `Sender.scanStatus` reporting the 103 as final
+                # for. `close=1` is what lets that be checked against a real
+                # Burp rather than against a fake HttpReply -- MEASURED, with
+                # only scanStatus differing between the two runs, this route
+                # answered `{status: 103, outcome: 'ok'}` before the fix and
+                # `{status: 599, outcome: 'status_unreadable'}` after it.
+                self.wfile.flush()
+                self.close_connection = True
+                return
             self._reply(_int_param(params, "status", 500), {"hinted": True})
         elif parts.path == "/slow":
             time.sleep(min(_int_param(params, "ms", 250) / 1000.0,
@@ -21637,6 +21872,70 @@ def test_early_hints_do_not_hide_a_failing_origin_from_the_auto_halt(rig):
     assert bf.wait_for(lambda: bool(frames), timeout=10), (
         "early hints in front of a failing origin did not trip the auto-halt "
         "-- which is the exact failure Sender.finalStatus exists to prevent")
+    assert "5xx rate" in frames[0]["reason"], frames[0]
+    assert frames[0]["host"] == rig.target.host, frames[0]
+
+
+def test_an_early_hint_with_a_dead_origin_behind_it_still_trips_the_auto_halt(rig):
+    """The other half of the same finding, and the half that was never driven.
+
+    The test next door proves the BUDGET ending against a real Burp: nine
+    interim heads, one past `Sender.MAX_INTERIM_HEADS`. The whole-branch
+    review found a second ending open -- a peer that sends ONE interim head
+    and then nothing at all -- and `Sender.scanStatus` reported that 1xx as
+    the exchange's final status, on the reasoning that if the bytes ran out
+    there was nothing behind them to have hidden anything. Nothing was
+    hidden, and the 1xx is still not the final response.
+
+    That ending is not exotic. It is a CDN that has already flushed its
+    `103 Early Hints` when the origin behind it dies, which is why the route
+    exists: `/hints?n=1&close=1` writes the interim head and closes.
+
+    MEASURED HERE, against Burp Suite Community Edition and the same rig, with
+    only `Sender.scanStatus` differing between the two runs:
+
+        before:  {status: 103, outcome: 'ok',                bytes: 76}
+        after:   {status: 599, outcome: 'status_unreadable', bytes: 76}
+
+    So this answers the review's open question as well. Burp does NOT report
+    an interim-then-close as a response-less exchange: `hasResponse()` is
+    true, `statusCode()` is the interim `103`, and `toByteArray()` carries the
+    76-byte interim head and nothing else. Every one of those exchanges was a
+    healthy sample, the 5xx rate stayed at 0%, and the consecutive-error
+    streak stayed at 0 because something did answer.
+    """
+    rig.configure()
+
+    frames: list[dict] = []
+    # Appended, not acted on: this callback runs on the bridge's read-loop
+    # thread and the store connection belongs to the thread owning the run.
+    rig.srv.on_halted = frames.append
+
+    reply = rig.get("/hints?n=1&close=1")
+    assert (reply["status"], reply["outcome"]) == (599, "status_unreadable"), (
+        "an interim head with nothing behind it was reported as the "
+        f"exchange's final status: {reply['status']} / {reply['outcome']!r}")
+    raw = reply[server.BridgeServer.BODY_KEY]
+    # The bytes are the evidence that this is the truncated ending and not the
+    # budget one: one head, and no second status line anywhere in them.
+    assert raw.startswith(b"HTTP/1.1 103 Early Hints"), raw[:64]
+    assert raw.count(b"HTTP/") == 1, (
+        "this is meant to be the TRUNCATED ending -- one interim head and no "
+        f"final one -- and the bytes carry more than one head: {raw[:256]!r}")
+
+    # THE CONSEQUENCE, which is the only reason the number above matters.
+    seen = _issue_until(rig, "/hints?n=1&close=1", want="halted")
+    assert seen[-1] == "halted", seen
+    assert set(seen[:-1]) == {599}, (
+        "a sample that was not the conservative sentinel reached Distress: "
+        f"{sorted(set(seen[:-1]), key=str)}")
+    answered = len(rig.target.hits_for("/hints"))
+    assert answered >= 10, \
+        f"the 5xx rule needs ten answered samples before it may trip; got {answered}"
+
+    assert bf.wait_for(lambda: bool(frames), timeout=10), (
+        "a dead origin behind a live CDN's early hints did not trip the "
+        "auto-halt: every exchange it saw looked healthy")
     assert "5xx rate" in frames[0]["reason"], frames[0]
     assert frames[0]["host"] == rig.target.host, frames[0]
 ```

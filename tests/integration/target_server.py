@@ -212,6 +212,20 @@ class _Handler(BaseHTTPRequestHandler):
             # heads are on the socket before _reply's are.
             for _ in range(min(_int_param(params, "n", 1), MAX_HINT_HEADS)):
                 self.wfile.write(INTERIM_HEAD)
+            if _int_param(params, "close", 0):
+                # ...and NOTHING after them. A CDN that has already sent its
+                # `103 Early Hints` when the origin behind it dies: the
+                # interim head is on the wire, the final one never arrives,
+                # and the connection ends. This is the shape the whole-branch
+                # review found `Sender.scanStatus` reporting the 103 as final
+                # for. `close=1` is what lets that be checked against a real
+                # Burp rather than against a fake HttpReply -- MEASURED, with
+                # only scanStatus differing between the two runs, this route
+                # answered `{status: 103, outcome: 'ok'}` before the fix and
+                # `{status: 599, outcome: 'status_unreadable'}` after it.
+                self.wfile.flush()
+                self.close_connection = True
+                return
             self._reply(_int_param(params, "status", 500), {"hinted": True})
         elif parts.path == "/slow":
             time.sleep(min(_int_param(params, "ms", 250) / 1000.0,

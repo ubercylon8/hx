@@ -81,8 +81,11 @@ PRE_ISSUANCE = frozenset({"scope_denied", "rate_limited"})
 # of these describe a request that SUCCEEDED, or failed in a way no error
 # class names. `status_unreadable` is one of those -- it arrives on a `result`
 # frame, not an `error` frame, and it means the exchange completed while its
-# final status could not be read (more interim 1xx heads than the extension's
-# scan tolerates), with `status` holding the conservative sentinel 599.
+# final status could not be read: the transport reported an interim 1xx head
+# and no final status line was found behind it, whether because the peer sent
+# more interim heads than the extension's scan tolerates or because the
+# response was truncated after one. `status` holds the conservative sentinel
+# 599 either way.
 #
 # The wire value and the column value are DELIBERATELY the same string, so
 # there is no map here to keep in step -- see the spec's S5/S6 amendment of

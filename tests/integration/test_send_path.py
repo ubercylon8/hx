@@ -865,3 +865,67 @@ def test_early_hints_do_not_hide_a_failing_origin_from_the_auto_halt(rig):
         "-- which is the exact failure Sender.finalStatus exists to prevent")
     assert "5xx rate" in frames[0]["reason"], frames[0]
     assert frames[0]["host"] == rig.target.host, frames[0]
+
+
+def test_an_early_hint_with_a_dead_origin_behind_it_still_trips_the_auto_halt(rig):
+    """The other half of the same finding, and the half that was never driven.
+
+    The test next door proves the BUDGET ending against a real Burp: nine
+    interim heads, one past `Sender.MAX_INTERIM_HEADS`. The whole-branch
+    review found a second ending open -- a peer that sends ONE interim head
+    and then nothing at all -- and `Sender.scanStatus` reported that 1xx as
+    the exchange's final status, on the reasoning that if the bytes ran out
+    there was nothing behind them to have hidden anything. Nothing was
+    hidden, and the 1xx is still not the final response.
+
+    That ending is not exotic. It is a CDN that has already flushed its
+    `103 Early Hints` when the origin behind it dies, which is why the route
+    exists: `/hints?n=1&close=1` writes the interim head and closes.
+
+    MEASURED HERE, against Burp Suite Community Edition and the same rig, with
+    only `Sender.scanStatus` differing between the two runs:
+
+        before:  {status: 103, outcome: 'ok',                bytes: 76}
+        after:   {status: 599, outcome: 'status_unreadable', bytes: 76}
+
+    So this answers the review's open question as well. Burp does NOT report
+    an interim-then-close as a response-less exchange: `hasResponse()` is
+    true, `statusCode()` is the interim `103`, and `toByteArray()` carries the
+    76-byte interim head and nothing else. Every one of those exchanges was a
+    healthy sample, the 5xx rate stayed at 0%, and the consecutive-error
+    streak stayed at 0 because something did answer.
+    """
+    rig.configure()
+
+    frames: list[dict] = []
+    # Appended, not acted on: this callback runs on the bridge's read-loop
+    # thread and the store connection belongs to the thread owning the run.
+    rig.srv.on_halted = frames.append
+
+    reply = rig.get("/hints?n=1&close=1")
+    assert (reply["status"], reply["outcome"]) == (599, "status_unreadable"), (
+        "an interim head with nothing behind it was reported as the "
+        f"exchange's final status: {reply['status']} / {reply['outcome']!r}")
+    raw = reply[server.BridgeServer.BODY_KEY]
+    # The bytes are the evidence that this is the truncated ending and not the
+    # budget one: one head, and no second status line anywhere in them.
+    assert raw.startswith(b"HTTP/1.1 103 Early Hints"), raw[:64]
+    assert raw.count(b"HTTP/") == 1, (
+        "this is meant to be the TRUNCATED ending -- one interim head and no "
+        f"final one -- and the bytes carry more than one head: {raw[:256]!r}")
+
+    # THE CONSEQUENCE, which is the only reason the number above matters.
+    seen = _issue_until(rig, "/hints?n=1&close=1", want="halted")
+    assert seen[-1] == "halted", seen
+    assert set(seen[:-1]) == {599}, (
+        "a sample that was not the conservative sentinel reached Distress: "
+        f"{sorted(set(seen[:-1]), key=str)}")
+    answered = len(rig.target.hits_for("/hints"))
+    assert answered >= 10, \
+        f"the 5xx rule needs ten answered samples before it may trip; got {answered}"
+
+    assert bf.wait_for(lambda: bool(frames), timeout=10), (
+        "a dead origin behind a live CDN's early hints did not trip the "
+        "auto-halt: every exchange it saw looked healthy")
+    assert "5xx rate" in frames[0]["reason"], frames[0]
+    assert frames[0]["host"] == rig.target.host, frames[0]

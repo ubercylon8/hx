@@ -79,9 +79,19 @@ out of the response bytes rather than trusting its HTTP client's parse of the
 first. Reporting the interim status puts a wrong number on the evidence line
 and -- much worse -- feeds a healthy sample to the auto-halt, so a CDN sending
 early hints in front of a failing origin would hold a 0% 5xx rate forever. The
-scan is bounded (8 heads, the last of which must be the final one), and a scan
-that runs out of budget reports **599** rather than the interim status: an
-unreadable status must not read as a healthy one.
+scan is bounded (8 heads, the last of which must be the final one). Any scan
+that does not reach a final status line reports **599** rather than the interim
+status: an unreadable status must not read as a healthy one. That is the
+budget running out, and equally the bytes running out -- truncated mid-status-
+line, truncated after the interim head's blank line, or a line the scan cannot
+read. "The bytes ran out, so nothing was hidden" is a statement about the bytes;
+a 1xx is still not the final response when the connection dies. The truncated
+ending is not the exotic one of the two: it is what a CDN's `103 Early Hints`
+in front of a dead origin looks like, and it was measured against Burp Suite
+Community Edition 2026.7.3 -- `hasResponse()` is **true**, `statusCode()`
+answers the interim **103**, and `toByteArray()` carries the interim head and
+nothing else. A second implementation that reports that 103 hands its own
+auto-halt a healthy sample for every request against a dead origin.
 
 `result.outcome` is `ok`, or `status_unreadable` when that 599 is the
 extension's own answer rather than the peer's. The two need telling apart and

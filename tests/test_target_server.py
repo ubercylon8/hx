@@ -261,6 +261,29 @@ def test_the_hints_route_emits_the_number_asked_for_and_no_more(target):
         "the exhausted-scan case stops being reachable from this route")
 
 
+def test_the_hints_route_can_close_without_ever_sending_a_final_head(target):
+    """The CDN whose origin died after the early hints went out.
+
+    `n` alone can only produce the ending where the scan runs out of BUDGET.
+    This is the other one the whole-branch review found open: one interim
+    head, then the connection ends, and `Sender.scanStatus` reported that
+    1xx as the exchange's final status. The integration suite drives it
+    against a real Burp; this is the instrument that produces it, checked
+    where it costs milliseconds.
+
+    The assertion that matters is the ABSENCE. A route that emitted the
+    interim head and then the 500 anyway would leave the integration test
+    passing for the wrong reason -- it would be measuring the budget ending
+    a second time -- so the second `HTTP/` is what this counts.
+    """
+    raw = _request(target, "GET", "/hints?n=1&close=1")
+    assert raw == ts.INTERIM_HEAD, (
+        "the route sent something after the interim head, so this is not the "
+        f"truncated ending: {raw!r}")
+    assert raw.count(b"HTTP/") == 1, raw
+    assert [(h.method, h.path) for h in target.hits] == [("GET", "/hints")]
+
+
 def test_a_request_header_is_recorded_verbatim(target):
     """The unmanaged-credential assertion reads Cookie back off this log."""
     _get(target, "/api/orders", {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"})
