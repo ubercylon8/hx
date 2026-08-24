@@ -133,9 +133,8 @@ class Rig:
         self.last_request = raw
         req = {"identity_id": None, "target_host": dest.host,
                "target_port": dest.port, "tls": False}
-        if guarded:
-            return self.srv.send(req, raw, timeout=timeout)
-        return self._past_the_local_guards(req, raw, timeout)
+        return self.srv.send(req, raw, timeout=timeout,
+                             enforce_locally=guarded)
 
     def get(self, target_path: str, **kwargs) -> dict:
         return self.send("GET", target_path, **kwargs)
@@ -152,30 +151,21 @@ class Rig:
         is that shape of vacuous guard, and it is the shape this project has
         already been bitten by seven times.
 
-        So this path builds the same `send` frame and hands it straight to the
-        request/reply machinery. A refusal that comes back through it came back
-        from the JVM. Every caller pairs it with an assertion on `target.hits`,
-        because the target server's own log is the one witness no state on this
-        side can fake.
+        So this goes through `BridgeServer.send(..., enforce_locally=False)`,
+        which drops those three refusals and NOTHING else -- same frame, same
+        deadline, same translation of the peer's `error` frame into a
+        BridgeError. A refusal that comes back through it came back from the
+        JVM. Every caller pairs it with an assertion on `target.hits`, because
+        the target server's own log is the one witness no state on this side
+        can fake.
+
+        This rig USED to reach past `send()` into `srv._request` and translate
+        the reply itself. That copy is gone: it was a second spelling of the
+        five lines at the bottom of `send()`, free to drift from them, and the
+        three tests that depend on it would have gone on asserting the old
+        shape after any change to either.
         """
         return self.send(method, target_path, guarded=False, **kwargs)
-
-    def _past_the_local_guards(self, req: dict, raw: bytes,
-                               timeout: float) -> dict:
-        reply = self.srv._request(
-            {"v": codec.PROTOCOL_VERSION, "t": "send",
-             "engagement_id": self.srv.engagement_id, **req},
-            raw, timeout=timeout)
-        if reply.get("t") == "result":
-            return reply
-        # The same translation BridgeServer.send does on the way out, so a
-        # caller cannot tell the two paths apart by the shape of the failure --
-        # only by which side refused, which is the whole point.
-        raise server.BridgeError(
-            f"{reply.get('class', 'unspecified')}: "
-            f"{reply.get('detail', '')}".rstrip(": "),
-            error_class=reply.get("class"),
-            retry_after_us=reply.get("retry_after_us"))
 
 
 @pytest.fixture

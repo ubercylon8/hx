@@ -3413,6 +3413,124 @@ def test_a_shell_created_sentinel_stops_send(srv_with_halt):
         c.close()
 
 
+def _send_and_answer(s, c, reader, answer: dict, **kwargs):
+    """One send, answered with `answer`. Returns (outcome dict, sent header).
+
+    The outcome carries `err` for a BridgeError and `reply` for a result, so a
+    caller can assert on either without the send having to raise to be read.
+    """
+    out = {}
+
+    def go():
+        try:
+            out["reply"] = s.send({"target_host": "app.example.test"},
+                                  REQ, **kwargs)
+        except server.BridgeError as exc:
+            out["err"] = exc
+
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        header, _ = reader.read()
+    except TimeoutError:
+        # Not a bare TimeoutError out of the codec. A send that never framed
+        # is the interesting failure here -- it means THIS side answered it --
+        # and the answer it gave is the diagnosis, so say it.
+        t.join(timeout=5)
+        raise AssertionError(
+            "no frame reached the wire; the send was answered before it, by "
+            f"this side: {out.get('err') or out.get('reply')!r}") from None
+    c.sendall(codec.encode({**answer, "id": header["id"]}))
+    t.join(timeout=5)
+    assert not t.is_alive(), "the send never returned"
+    return out, header
+
+
+def test_enforce_locally_false_reaches_the_wire_and_answers_the_same_way(srv_with_halt):
+    """The seam the integration rig sends through, and the copy it replaced.
+
+    This side refuses a send whenever the durable halt is armed, and that is
+    right in production. It is fatal to a test OF THE EXTENSION: the frame
+    never leaves, the assertion is satisfied by this dict of state, and it
+    goes on passing with the extension wide open. `enforce_locally=False`
+    drops exactly those refusals -- both halves are asserted below, zero
+    frames against one -- and is the reason the rig can prove anything about
+    a JVM's kill switch at all.
+
+    THE LAST TWO ASSERTIONS ARE THE POINT. The rig used to reach past send()
+    into `_request` and translate the peer's `error` frame itself: a second
+    copy of the five lines at the bottom of send(), which nothing compared
+    with the original. A new frame type, a renamed `retry_after_us`, a changed
+    message shape -- any of them would have been handled on one path and not
+    the other, silently, with the three tests that use the unguarded path
+    still asserting the old shape. There is one translation now, and this is
+    what says the two callers get it.
+    """
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        answer = {"v": 1, "t": "error", "class": "rate_limited",
+                  "detail": "3 rps, 617000us to the next slot",
+                  "retry_after_us": 617_000}
+
+        guarded, _ = _send_and_answer(s, c, reader, answer)
+        assert guarded["err"].error_class == "rate_limited"
+
+        # Arm the durable halt by hand, exactly as S4's "the socket is dead,
+        # stop from a shell" path does.
+        oh.sentinel_path.write_text("stopped by hand\n")
+
+        # Guarded: refused HERE, and ZERO frames on the wire. That absence is
+        # what makes the guarded path useless for asking the extension
+        # anything -- and it is asserted rather than described, because the
+        # whole justification for the keyword rests on it.
+        with pytest.raises(server.BridgeError) as local:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert local.value.error_class == "halted"
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+        c.settimeout(5)
+
+        # Unguarded, with that same sentinel still armed: the frame goes out.
+        unguarded, header = _send_and_answer(s, c, reader, answer,
+                                             enforce_locally=False)
+        assert header["t"] == "send", header
+        assert header["engagement_id"] == "e-1", (
+            "the unguarded path must build the same frame, id and all -- it "
+            "is the same method, not a second one")
+        assert oh.halted is True, "the sentinel was cleared by a send"
+
+        assert unguarded["err"].error_class == guarded["err"].error_class
+        assert unguarded["err"].retry_after_us == guarded["err"].retry_after_us
+        assert str(unguarded["err"]) == str(guarded["err"]) == \
+            "rate_limited: 3 rps, 617000us to the next slot"
+    finally:
+        c.close()
+
+
+def test_enforce_locally_false_still_refuses_the_keys_send_stamps(srv_with_halt):
+    """The carve-out, pinned. `enforce_locally` drops the three DENIALS and
+    nothing else: the reserved-key guard catches a malformed call -- a bug,
+    not a denial -- and a caller who could turn a send into a halt frame by
+    passing `guarded=False` would have found a way around the one guard that
+    is not about policy at all."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        with pytest.raises(server.BridgeError, match="engagement_id"):
+            s.send({"target_host": "app.example.test",
+                    "engagement_id": "SOMEONE-ELSE"}, REQ,
+                   enforce_locally=False)
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
 def test_halt_arms_the_durable_record_and_only_resume_clears_it(srv_with_halt):
     s, oh, conn = srv_with_halt
     c = _client(s.socket_path)
@@ -4097,7 +4215,8 @@ class BridgeServer:
             self.state = "halted" if self.state == "halted" else "configured"
         return self.config_epoch
 
-    def send(self, req: dict, body: bytes = b"", timeout: float = 30.0) -> dict:
+    def send(self, req: dict, body: bytes = b"", timeout: float = 30.0,
+             *, enforce_locally: bool = True) -> dict:
         """Issue one request through the extension; return the `result` header.
 
         `req` carries the destination and the identity the extension applies --
@@ -4108,6 +4227,28 @@ class BridgeServer:
         Enforcement is the extension's (S4: every byte that leaves this machine
         crosses one of two points inside the JVM). Everything refused here is
         refused a second time there; nothing allowed here is thereby allowed.
+
+        `enforce_locally=False` drops THIS side's three duplicate refusals --
+        the durable halt, `state == "halted"`, and anything short of
+        `configured` -- and nothing else. It exists for one caller, the
+        integration rig, and for one reason: those refusals are answered
+        BEFORE the wire, so a test of the extension's gate written the obvious
+        way writes ZERO frames to the socket, is satisfied by this side's own
+        bookkeeping, and goes on passing with the extension wide open. It
+        weakens nothing in production -- the extension refuses each of these a
+        second time, which is the half that actually stands between the agent
+        and the network -- and a caller passing it is asking to be answered by
+        the JVM rather than by this dict of state.
+
+        It is a KEYWORD on this method rather than a second code path in the
+        rig because the rig used to own a copy of the error translation below,
+        and a copy is what drifts: a new frame type or a renamed hint field
+        would have been handled here and not there, silently, with the three
+        tests that use it still asserting the old shape.
+
+        The reserved-key guard above is NOT part of it. That one catches a
+        malformed call -- a bug, not a denial -- and there is no test worth
+        writing that needs it off.
 
         Raises BridgeError. `.error_class` is the peer's class for an `error`
         frame; `timeout` when no reply arrives in time; `bridge_lost` when the
@@ -4124,23 +4265,24 @@ class BridgeServer:
                 "them. An engagement_id from the caller in particular would "
                 "address whichever extension answers, not this engagement's."
             )
-        # The durable halt is consulted on EVERY send, not only at hello. An
-        # operator can create the sentinel file from a shell while the socket
-        # is dead or the agent has stopped responding -- S4 names that as the
-        # reason the file exists -- and that halt has to work with no frame
-        # ever arriving.
-        if self.operator_halt.halted:
-            raise BridgeError(f"halted: {self.operator_halt.reason}",
-                              error_class="halted")
-        state = self.state
-        if state == "halted":
-            raise BridgeError("halted", error_class="halted")
-        if state != "configured":
-            # DENY-ALL is the initial and terminal state. "connected" is not
-            # configured: no configure frame has been acknowledged, so the
-            # extension would refuse this anyway, with not_configured.
-            raise BridgeError(f"not configured: bridge state is {state!r}",
-                              error_class="not_configured")
+        if enforce_locally:
+            # The durable halt is consulted on EVERY send, not only at hello.
+            # An operator can create the sentinel file from a shell while the
+            # socket is dead or the agent has stopped responding -- S4 names
+            # that as the reason the file exists -- and that halt has to work
+            # with no frame ever arriving.
+            if self.operator_halt.halted:
+                raise BridgeError(f"halted: {self.operator_halt.reason}",
+                                  error_class="halted")
+            state = self.state
+            if state == "halted":
+                raise BridgeError("halted", error_class="halted")
+            if state != "configured":
+                # DENY-ALL is the initial and terminal state. "connected" is
+                # not configured: no configure frame has been acknowledged, so
+                # the extension would refuse this anyway, with not_configured.
+                raise BridgeError(f"not configured: bridge state is {state!r}",
+                                  error_class="not_configured")
 
         reply = self._request({"v": codec.PROTOCOL_VERSION, "t": "send",
                                "engagement_id": self.engagement_id, **req},

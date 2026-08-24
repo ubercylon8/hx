@@ -1563,6 +1563,124 @@ def test_a_shell_created_sentinel_stops_send(srv_with_halt):
         c.close()
 
 
+def _send_and_answer(s, c, reader, answer: dict, **kwargs):
+    """One send, answered with `answer`. Returns (outcome dict, sent header).
+
+    The outcome carries `err` for a BridgeError and `reply` for a result, so a
+    caller can assert on either without the send having to raise to be read.
+    """
+    out = {}
+
+    def go():
+        try:
+            out["reply"] = s.send({"target_host": "app.example.test"},
+                                  REQ, **kwargs)
+        except server.BridgeError as exc:
+            out["err"] = exc
+
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        header, _ = reader.read()
+    except TimeoutError:
+        # Not a bare TimeoutError out of the codec. A send that never framed
+        # is the interesting failure here -- it means THIS side answered it --
+        # and the answer it gave is the diagnosis, so say it.
+        t.join(timeout=5)
+        raise AssertionError(
+            "no frame reached the wire; the send was answered before it, by "
+            f"this side: {out.get('err') or out.get('reply')!r}") from None
+    c.sendall(codec.encode({**answer, "id": header["id"]}))
+    t.join(timeout=5)
+    assert not t.is_alive(), "the send never returned"
+    return out, header
+
+
+def test_enforce_locally_false_reaches_the_wire_and_answers_the_same_way(srv_with_halt):
+    """The seam the integration rig sends through, and the copy it replaced.
+
+    This side refuses a send whenever the durable halt is armed, and that is
+    right in production. It is fatal to a test OF THE EXTENSION: the frame
+    never leaves, the assertion is satisfied by this dict of state, and it
+    goes on passing with the extension wide open. `enforce_locally=False`
+    drops exactly those refusals -- both halves are asserted below, zero
+    frames against one -- and is the reason the rig can prove anything about
+    a JVM's kill switch at all.
+
+    THE LAST TWO ASSERTIONS ARE THE POINT. The rig used to reach past send()
+    into `_request` and translate the peer's `error` frame itself: a second
+    copy of the five lines at the bottom of send(), which nothing compared
+    with the original. A new frame type, a renamed `retry_after_us`, a changed
+    message shape -- any of them would have been handled on one path and not
+    the other, silently, with the three tests that use the unguarded path
+    still asserting the old shape. There is one translation now, and this is
+    what says the two callers get it.
+    """
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        reader = _configured(s, c)
+        answer = {"v": 1, "t": "error", "class": "rate_limited",
+                  "detail": "3 rps, 617000us to the next slot",
+                  "retry_after_us": 617_000}
+
+        guarded, _ = _send_and_answer(s, c, reader, answer)
+        assert guarded["err"].error_class == "rate_limited"
+
+        # Arm the durable halt by hand, exactly as S4's "the socket is dead,
+        # stop from a shell" path does.
+        oh.sentinel_path.write_text("stopped by hand\n")
+
+        # Guarded: refused HERE, and ZERO frames on the wire. That absence is
+        # what makes the guarded path useless for asking the extension
+        # anything -- and it is asserted rather than described, because the
+        # whole justification for the keyword rests on it.
+        with pytest.raises(server.BridgeError) as local:
+            s.send({"target_host": "app.example.test"}, REQ, timeout=0.5)
+        assert local.value.error_class == "halted"
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+        c.settimeout(5)
+
+        # Unguarded, with that same sentinel still armed: the frame goes out.
+        unguarded, header = _send_and_answer(s, c, reader, answer,
+                                             enforce_locally=False)
+        assert header["t"] == "send", header
+        assert header["engagement_id"] == "e-1", (
+            "the unguarded path must build the same frame, id and all -- it "
+            "is the same method, not a second one")
+        assert oh.halted is True, "the sentinel was cleared by a send"
+
+        assert unguarded["err"].error_class == guarded["err"].error_class
+        assert unguarded["err"].retry_after_us == guarded["err"].retry_after_us
+        assert str(unguarded["err"]) == str(guarded["err"]) == \
+            "rate_limited: 3 rps, 617000us to the next slot"
+    finally:
+        c.close()
+
+
+def test_enforce_locally_false_still_refuses_the_keys_send_stamps(srv_with_halt):
+    """The carve-out, pinned. `enforce_locally` drops the three DENIALS and
+    nothing else: the reserved-key guard catches a malformed call -- a bug,
+    not a denial -- and a caller who could turn a send into a halt frame by
+    passing `guarded=False` would have found a way around the one guard that
+    is not about policy at all."""
+    s, oh, conn = srv_with_halt
+    c = _client(s.socket_path)
+    try:
+        _configured(s, c)
+        with pytest.raises(server.BridgeError, match="engagement_id"):
+            s.send({"target_host": "app.example.test",
+                    "engagement_id": "SOMEONE-ELSE"}, REQ,
+                   enforce_locally=False)
+        c.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            c.recv(4096)
+    finally:
+        c.close()
+
+
 def test_halt_arms_the_durable_record_and_only_resume_clears_it(srv_with_halt):
     s, oh, conn = srv_with_halt
     c = _client(s.socket_path)
