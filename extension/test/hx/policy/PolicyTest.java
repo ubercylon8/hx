@@ -44,6 +44,7 @@ public class PolicyTest {
         t("epochZeroIsNotConfigured", PolicyTest::epochZeroIsNotConfigured);
         t("anInScopeRequestIsAllowed", PolicyTest::anInScopeRequestIsAllowed);
         t("scopeMatchesSchemeHostPortAndPath", PolicyTest::scopeMatchesSchemeHostPortAndPath);
+        t("anEmptyScopeIncludeIsAnsweredByItsOwnGuard", PolicyTest::anEmptyScopeIncludeIsAnsweredByItsOwnGuard);
         t("aWildcardSubdomainDoesNotMatchTheApex", PolicyTest::aWildcardSubdomainDoesNotMatchTheApex);
         t("theHostHalfIsGuardedInBothOfItsParts", PolicyTest::theHostHalfIsGuardedInBothOfItsParts);
         t("aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes", PolicyTest::aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes);
@@ -164,6 +165,22 @@ public class PolicyTest {
         check(label + " -> " + expectedClass + " (got "
               + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
               !d.allowed() && expectedClass.equals(d.errorClass()));
+    }
+
+    /**
+     * denies(), plus the DETAIL. Needed wherever two guards answer the same
+     * class, because there the class is not evidence about which of them
+     * answered -- the whole of finding A on this branch.
+     */
+    static void deniesWithDetail(String label, Policy p, HxRequest r,
+                                 BridgeClient.Authorisation a,
+                                 String expectedClass, String expectedDetail) {
+        Decision d = p.decide(r, a);
+        check(label + " -> " + expectedClass + " (got "
+              + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
+              !d.allowed() && expectedClass.equals(d.errorClass()));
+        check(label + " -> detail \"" + expectedDetail + "\" (got \""
+              + d.detail() + "\")", expectedDetail.equals(d.detail()));
     }
 
     // ---- the verdict type ------------------------------------------------
@@ -295,14 +312,62 @@ public class PolicyTest {
                    "APP.EXAMPLE.TEST", "/api/orders", ""),
                APP);
 
-        // An epoch with limits but no scope.include authorises nothing.
-        denies("an Authorisation with no scope.include authorises nothing", p, orders(),
-               authorised("limit.rate_rps", "5"), "scope_denied");
+        // An epoch with limits but no scope.include authorises nothing. The
+        // DETAIL is asserted, not just the class: see
+        // anEmptyScopeIncludeIsAnsweredByItsOwnGuard for why the class alone
+        // is not evidence here.
+        deniesWithDetail("an Authorisation with no scope.include authorises nothing", p, orders(),
+               authorised("limit.rate_rps", "5"), "scope_denied",
+               "no scope.include pattern is configured");
 
         // Two includes: the second one is reached.
         allows("a later scope.include is reached", p, orders(),
                authorised("scope.include", "https://other.example.test/*",
                           "scope.include", "https://app.example.test/*"));
+    }
+
+    /**
+     * The `include.isEmpty()` guard in checkScope, separated from its absence.
+     *
+     * MEASURED on this branch: DELETE that guard and the whole Java suite
+     * stays at 9 x ALL PASS / 1375 ok / 0 FAIL. It is invisible because the
+     * fallthrough at the END of checkScope -- "matches no scope.include
+     * pattern" -- answers an empty include list with the SAME CLASS. Every
+     * test of the empty-scope case asserted the class, so every one of them
+     * was passing on the fallthrough's answer rather than on the guard's.
+     *
+     * The two are not interchangeable, and the difference is the sentence an
+     * operator acts on. "no scope.include pattern is configured" sends them to
+     * their engagement config; "https://... matches no scope.include pattern"
+     * sends them to compare a URL against patterns that do not exist. The
+     * guard is also the only thing that refuses BEFORE checkScope builds the
+     * reading set for a request no pattern could ever have authorised.
+     *
+     * So the pin is on the DETAIL. There is no input that separates the guard
+     * from the fallthrough by class, because both are correctly scope_denied:
+     * deleting the guard is a diagnostic regression, not a bypass, and that is
+     * exactly why nothing caught it.
+     */
+    static void anEmptyScopeIncludeIsAnsweredByItsOwnGuard() {
+        Policy p = allowingPolicy();
+
+        // scope.include absent from the map entirely.
+        deniesWithDetail("an absent scope.include is refused by the guard, naming the config",
+               p, orders(), authorised("limit.rate_rps", "5"), "scope_denied",
+               "no scope.include pattern is configured");
+
+        // An Authorisation whose scope map is empty but whose epoch is real:
+        // a configure frame that committed with nothing in it.
+        deniesWithDetail("an empty scope map at a real epoch is refused the same way",
+               p, orders(), authorised(), "scope_denied",
+               "no scope.include pattern is configured");
+
+        // And the fallthrough the guard is NOT: a populated include that does
+        // not match must say so about the url, or the two messages have
+        // collapsed into one and the guard is decoration again.
+        deniesWithDetail("a populated include that misses says so about the url, not about the config",
+               p, orders(), authorised("scope.include", "https://other.example.test/*"),
+               "scope_denied", "https://app.example.test/api/orders matches no scope.include pattern");
     }
 
     static void aWildcardSubdomainDoesNotMatchTheApex() {

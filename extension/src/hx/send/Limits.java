@@ -78,10 +78,25 @@ public final class Limits implements Gate {
     public Decision check(HxRequest req) {
         Limiter l = limiter;
         if (l == null)
-            // Unreachable through HxExtension, which arms this from the same
-            // snapshot before it calls issue() -- and Sender refuses epoch 0
-            // as not_configured before Policy consults a Gate at all. A gate
-            // that does not know its budget still has to answer no.
+            // Unreachable through HxExtension, which calls arm() on the same
+            // snapshot on the line before issue(): epoch 0 returns early from
+            // arm() but is refused by Sender before Policy consults a Gate,
+            // and every epoch >= 1 either arms this or throws. A gate that
+            // does not know its budget still has to answer no.
+            //
+            // THIS BRANCH IS NOT ONE OF THE DENY-ALL GUARDS, and a fix wave on
+            // this branch recorded that it was, so the correction is written
+            // here rather than in a report. It is reached only when scope
+            // ALLOWS -- Policy consults the Gate last, after scope, method and
+            // dangerous.path -- so it cannot answer for an unconfigured run at
+            // all. MEASURED: with Sender's epoch check, Policy's epoch check
+            // AND checkScope's empty-include guard all deleted, a DENY-ALL
+            // decide() still answers scope_denied from the fallthrough at the
+            // end of checkScope, and this line is never executed. It becomes
+            // reachable only if the empty-include case is made to ALLOW, which
+            // is a rewrite rather than a deletion. What it guards is the
+            // narrower thing its first paragraph says: an armed-looking
+            // authorisation whose limiter was never built.
             return Decision.deny("not_configured", "the rate and budget are not armed");
         return l.check(req);
     }

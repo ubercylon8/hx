@@ -62,6 +62,8 @@ public class SenderTest {
               () -> anAllowedRequestIsIssuedOnceAndFramedAsAResult(sentinel));
             t("everyDenialClassLeavesTheWireUntouched",
               () -> everyDenialClassLeavesTheWireUntouched(sentinel));
+            t("theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks",
+              () -> theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks(sentinel));
             t("theRefusalOrderIsPinned", () -> theRefusalOrderIsPinned(sentinel));
             t("rateLimitedCarriesRetryAfterUs", () -> rateLimitedCarriesRetryAfterUs(sentinel));
             t("anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget",
@@ -469,6 +471,49 @@ public class SenderTest {
         noDeadline.remove("deadline_us");
         denied("bad_frame (no deadline_us)", new Rig(sentinel), noDeadline,
                request("GET", "/api/orders"), authorised(), "bad_frame");
+    }
+
+    /**
+     * Sender's OWN epoch-0 check, separated from Policy's.
+     *
+     * There are two epoch-0 guards on this path and they answer with the same
+     * class AND the same detail string: Sender.decideAndIssue's
+     * `auth.epoch() == 0` and Policy.decide's `auth == null ||
+     * auth.epoch() == 0`. MEASURED on this branch: delete Sender's and the
+     * dedicated site in everyDenialClassLeavesTheWireUntouched stays green in
+     * all four of its assertions, because Policy answers in its place --
+     * including "COSTS NO RATE TOKEN OR BUDGET SLOT", since Policy also
+     * refuses before it consults the Gate.
+     *
+     * So no input separates the two by what comes BACK. The only thing
+     * Sender's guard does that Policy's cannot is refuse EARLIER: before the
+     * halt check, before the distress check and before the credential check,
+     * none of which Policy can see. That is what this pins, and it is the
+     * whole of the guard's observable contract.
+     *
+     * theRefusalOrderIsPinned's first case covers the halt half of that
+     * (delete Sender's guard and it answers `halted`). This covers the
+     * credential half, so the pin does not rest on a single rig having its
+     * sentinel armed.
+     */
+    static void theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        byte[] withCredential = request("GET", "/api/orders",
+                "Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x");
+
+        // The sentinel is the suite's, and it is deliberately ABSENT, so
+        // nothing here is halted and no distress has been recorded: the only
+        // two candidates are not_configured and unmanaged_credential, and
+        // which one comes back says which guard ran.
+        deniedBeforeTheGate("epoch 0 is refused before the credential check",
+               new Rig(sentinel), header, withCredential, denyAll(), "not_configured");
+
+        // The same frame at a real epoch IS the credential refusal, so the
+        // case above is not vacuous: the credential guard is armed and would
+        // have answered if Sender's epoch check had not run first.
+        deniedBeforeTheGate("and the same frame at a real epoch is the credential refusal",
+               new Rig(sentinel), header, withCredential, authorised(),
+               "unmanaged_credential");
     }
 
     /**
@@ -1272,7 +1317,18 @@ public class SenderTest {
         }
         check("and a budget of zero is refused rather than defaulted to 2000", zeroRefused);
 
-        check("an unarmed gate denies rather than allowing",
-              !new Limits(clock, 5L, 2000L).check(REQ).allowed());
+        // The CLASS is asserted, not just "not allowed". MEASURED on this
+        // branch: change this branch's class from not_configured to
+        // scope_denied and the whole Java suite stays at 9 x ALL PASS / 1375
+        // ok / 0 FAIL. The class is what the agent switches on (s6) -- a
+        // *_denied means "the answer will not change", which is the wrong
+        // thing to tell a caller whose only problem is that no configure has
+        // been acknowledged yet.
+        Decision unarmed = new Limits(clock, 5L, 2000L).check(REQ);
+        check("an unarmed gate denies rather than allowing", !unarmed.allowed());
+        check("and it denies as not_configured (got " + unarmed.errorClass() + ")",
+              "not_configured".equals(unarmed.errorClass()));
+        check("naming the reason (got \"" + unarmed.detail() + "\")",
+              "the rate and budget are not armed".equals(unarmed.detail()));
     }
 }

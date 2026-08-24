@@ -364,6 +364,19 @@ public final class Policy {
             // An engagement with no scope.include authorises nothing. This is
             // reachable with a non-zero epoch: a configure frame carrying only
             // limits commits fine.
+            //
+            // DELETING THIS LINE IS FAIL-CLOSED AND WAS INVISIBLE. The
+            // fallthrough at the end of this method answers an empty include
+            // list with the same scope_denied, so no test that asserted the
+            // CLASS could tell the two apart -- measured on this branch: the
+            // whole Java suite stayed at 9 x ALL PASS with this guard removed.
+            // What is lost is the sentence the operator acts on. This one
+            // sends them to their engagement config; the fallthrough's
+            // "<url> matches no scope.include pattern" sends them to compare a
+            // URL against patterns that do not exist. It also refuses before
+            // the reading set is built for a request no pattern could have
+            // authorised. anEmptyScopeIncludeIsAnsweredByItsOwnGuard pins the
+            // detail, which is the only thing that separates the two.
             return Decision.deny("scope_denied", "no scope.include pattern is configured");
 
         List<Rule> excludes = new ArrayList<>();

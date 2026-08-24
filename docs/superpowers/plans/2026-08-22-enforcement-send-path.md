@@ -353,6 +353,7 @@ public class PolicyTest {
         t("epochZeroIsNotConfigured", PolicyTest::epochZeroIsNotConfigured);
         t("anInScopeRequestIsAllowed", PolicyTest::anInScopeRequestIsAllowed);
         t("scopeMatchesSchemeHostPortAndPath", PolicyTest::scopeMatchesSchemeHostPortAndPath);
+        t("anEmptyScopeIncludeIsAnsweredByItsOwnGuard", PolicyTest::anEmptyScopeIncludeIsAnsweredByItsOwnGuard);
         t("aWildcardSubdomainDoesNotMatchTheApex", PolicyTest::aWildcardSubdomainDoesNotMatchTheApex);
         t("theHostHalfIsGuardedInBothOfItsParts", PolicyTest::theHostHalfIsGuardedInBothOfItsParts);
         t("aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes", PolicyTest::aWindowsBestFitHomoglyphIsReadAsTheSeparatorItBecomes);
@@ -473,6 +474,22 @@ public class PolicyTest {
         check(label + " -> " + expectedClass + " (got "
               + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
               !d.allowed() && expectedClass.equals(d.errorClass()));
+    }
+
+    /**
+     * denies(), plus the DETAIL. Needed wherever two guards answer the same
+     * class, because there the class is not evidence about which of them
+     * answered -- the whole of finding A on this branch.
+     */
+    static void deniesWithDetail(String label, Policy p, HxRequest r,
+                                 BridgeClient.Authorisation a,
+                                 String expectedClass, String expectedDetail) {
+        Decision d = p.decide(r, a);
+        check(label + " -> " + expectedClass + " (got "
+              + (d.allowed() ? "ALLOWED" : d.errorClass()) + ")",
+              !d.allowed() && expectedClass.equals(d.errorClass()));
+        check(label + " -> detail \"" + expectedDetail + "\" (got \""
+              + d.detail() + "\")", expectedDetail.equals(d.detail()));
     }
 
     // ---- the verdict type ------------------------------------------------
@@ -604,14 +621,62 @@ public class PolicyTest {
                    "APP.EXAMPLE.TEST", "/api/orders", ""),
                APP);
 
-        // An epoch with limits but no scope.include authorises nothing.
-        denies("an Authorisation with no scope.include authorises nothing", p, orders(),
-               authorised("limit.rate_rps", "5"), "scope_denied");
+        // An epoch with limits but no scope.include authorises nothing. The
+        // DETAIL is asserted, not just the class: see
+        // anEmptyScopeIncludeIsAnsweredByItsOwnGuard for why the class alone
+        // is not evidence here.
+        deniesWithDetail("an Authorisation with no scope.include authorises nothing", p, orders(),
+               authorised("limit.rate_rps", "5"), "scope_denied",
+               "no scope.include pattern is configured");
 
         // Two includes: the second one is reached.
         allows("a later scope.include is reached", p, orders(),
                authorised("scope.include", "https://other.example.test/*",
                           "scope.include", "https://app.example.test/*"));
+    }
+
+    /**
+     * The `include.isEmpty()` guard in checkScope, separated from its absence.
+     *
+     * MEASURED on this branch: DELETE that guard and the whole Java suite
+     * stays at 9 x ALL PASS / 1375 ok / 0 FAIL. It is invisible because the
+     * fallthrough at the END of checkScope -- "matches no scope.include
+     * pattern" -- answers an empty include list with the SAME CLASS. Every
+     * test of the empty-scope case asserted the class, so every one of them
+     * was passing on the fallthrough's answer rather than on the guard's.
+     *
+     * The two are not interchangeable, and the difference is the sentence an
+     * operator acts on. "no scope.include pattern is configured" sends them to
+     * their engagement config; "https://... matches no scope.include pattern"
+     * sends them to compare a URL against patterns that do not exist. The
+     * guard is also the only thing that refuses BEFORE checkScope builds the
+     * reading set for a request no pattern could ever have authorised.
+     *
+     * So the pin is on the DETAIL. There is no input that separates the guard
+     * from the fallthrough by class, because both are correctly scope_denied:
+     * deleting the guard is a diagnostic regression, not a bypass, and that is
+     * exactly why nothing caught it.
+     */
+    static void anEmptyScopeIncludeIsAnsweredByItsOwnGuard() {
+        Policy p = allowingPolicy();
+
+        // scope.include absent from the map entirely.
+        deniesWithDetail("an absent scope.include is refused by the guard, naming the config",
+               p, orders(), authorised("limit.rate_rps", "5"), "scope_denied",
+               "no scope.include pattern is configured");
+
+        // An Authorisation whose scope map is empty but whose epoch is real:
+        // a configure frame that committed with nothing in it.
+        deniesWithDetail("an empty scope map at a real epoch is refused the same way",
+               p, orders(), authorised(), "scope_denied",
+               "no scope.include pattern is configured");
+
+        // And the fallthrough the guard is NOT: a populated include that does
+        // not match must say so about the url, or the two messages have
+        // collapsed into one and the guard is decoration again.
+        deniesWithDetail("a populated include that misses says so about the url, not about the config",
+               p, orders(), authorised("scope.include", "https://other.example.test/*"),
+               "scope_denied", "https://app.example.test/api/orders matches no scope.include pattern");
     }
 
     static void aWildcardSubdomainDoesNotMatchTheApex() {
@@ -4336,6 +4401,19 @@ public final class Policy {
             // An engagement with no scope.include authorises nothing. This is
             // reachable with a non-zero epoch: a configure frame carrying only
             // limits commits fine.
+            //
+            // DELETING THIS LINE IS FAIL-CLOSED AND WAS INVISIBLE. The
+            // fallthrough at the end of this method answers an empty include
+            // list with the same scope_denied, so no test that asserted the
+            // CLASS could tell the two apart -- measured on this branch: the
+            // whole Java suite stayed at 9 x ALL PASS with this guard removed.
+            // What is lost is the sentence the operator acts on. This one
+            // sends them to their engagement config; the fallthrough's
+            // "<url> matches no scope.include pattern" sends them to compare a
+            // URL against patterns that do not exist. It also refuses before
+            // the reading set is built for a request no pattern could have
+            // authorised. anEmptyScopeIncludeIsAnsweredByItsOwnGuard pins the
+            // detail, which is the only thing that separates the two.
             return Decision.deny("scope_denied", "no scope.include pattern is configured");
 
         List<Rule> excludes = new ArrayList<>();
@@ -13032,6 +13110,8 @@ public class SenderTest {
               () -> anAllowedRequestIsIssuedOnceAndFramedAsAResult(sentinel));
             t("everyDenialClassLeavesTheWireUntouched",
               () -> everyDenialClassLeavesTheWireUntouched(sentinel));
+            t("theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks",
+              () -> theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks(sentinel));
             t("theRefusalOrderIsPinned", () -> theRefusalOrderIsPinned(sentinel));
             t("rateLimitedCarriesRetryAfterUs", () -> rateLimitedCarriesRetryAfterUs(sentinel));
             t("anExpiredDeadlineIsRefusedWithoutIssuingOrSpendingBudget",
@@ -13439,6 +13519,49 @@ public class SenderTest {
         noDeadline.remove("deadline_us");
         denied("bad_frame (no deadline_us)", new Rig(sentinel), noDeadline,
                request("GET", "/api/orders"), authorised(), "bad_frame");
+    }
+
+    /**
+     * Sender's OWN epoch-0 check, separated from Policy's.
+     *
+     * There are two epoch-0 guards on this path and they answer with the same
+     * class AND the same detail string: Sender.decideAndIssue's
+     * `auth.epoch() == 0` and Policy.decide's `auth == null ||
+     * auth.epoch() == 0`. MEASURED on this branch: delete Sender's and the
+     * dedicated site in everyDenialClassLeavesTheWireUntouched stays green in
+     * all four of its assertions, because Policy answers in its place --
+     * including "COSTS NO RATE TOKEN OR BUDGET SLOT", since Policy also
+     * refuses before it consults the Gate.
+     *
+     * So no input separates the two by what comes BACK. The only thing
+     * Sender's guard does that Policy's cannot is refuse EARLIER: before the
+     * halt check, before the distress check and before the credential check,
+     * none of which Policy can see. That is what this pins, and it is the
+     * whole of the guard's observable contract.
+     *
+     * theRefusalOrderIsPinned's first case covers the halt half of that
+     * (delete Sender's guard and it answers `halted`). This covers the
+     * credential half, so the pin does not rest on a single rig having its
+     * sentinel armed.
+     */
+    static void theSendPathRefusesEpochZeroBeforeItsOwnLaterChecks(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        byte[] withCredential = request("GET", "/api/orders",
+                "Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x");
+
+        // The sentinel is the suite's, and it is deliberately ABSENT, so
+        // nothing here is halted and no distress has been recorded: the only
+        // two candidates are not_configured and unmanaged_credential, and
+        // which one comes back says which guard ran.
+        deniedBeforeTheGate("epoch 0 is refused before the credential check",
+               new Rig(sentinel), header, withCredential, denyAll(), "not_configured");
+
+        // The same frame at a real epoch IS the credential refusal, so the
+        // case above is not vacuous: the credential guard is armed and would
+        // have answered if Sender's epoch check had not run first.
+        deniedBeforeTheGate("and the same frame at a real epoch is the credential refusal",
+               new Rig(sentinel), header, withCredential, authorised(),
+               "unmanaged_credential");
     }
 
     /**
@@ -14242,8 +14365,19 @@ public class SenderTest {
         }
         check("and a budget of zero is refused rather than defaulted to 2000", zeroRefused);
 
-        check("an unarmed gate denies rather than allowing",
-              !new Limits(clock, 5L, 2000L).check(REQ).allowed());
+        // The CLASS is asserted, not just "not allowed". MEASURED on this
+        // branch: change this branch's class from not_configured to
+        // scope_denied and the whole Java suite stays at 9 x ALL PASS / 1375
+        // ok / 0 FAIL. The class is what the agent switches on (s6) -- a
+        // *_denied means "the answer will not change", which is the wrong
+        // thing to tell a caller whose only problem is that no configure has
+        // been acknowledged yet.
+        Decision unarmed = new Limits(clock, 5L, 2000L).check(REQ);
+        check("an unarmed gate denies rather than allowing", !unarmed.allowed());
+        check("and it denies as not_configured (got " + unarmed.errorClass() + ")",
+              "not_configured".equals(unarmed.errorClass()));
+        check("naming the reason (got \"" + unarmed.detail() + "\")",
+              "the rate and budget are not armed".equals(unarmed.detail()));
     }
 }
 ```
@@ -14361,10 +14495,25 @@ public final class Limits implements Gate {
     public Decision check(HxRequest req) {
         Limiter l = limiter;
         if (l == null)
-            // Unreachable through HxExtension, which arms this from the same
-            // snapshot before it calls issue() -- and Sender refuses epoch 0
-            // as not_configured before Policy consults a Gate at all. A gate
-            // that does not know its budget still has to answer no.
+            // Unreachable through HxExtension, which calls arm() on the same
+            // snapshot on the line before issue(): epoch 0 returns early from
+            // arm() but is refused by Sender before Policy consults a Gate,
+            // and every epoch >= 1 either arms this or throws. A gate that
+            // does not know its budget still has to answer no.
+            //
+            // THIS BRANCH IS NOT ONE OF THE DENY-ALL GUARDS, and a fix wave on
+            // this branch recorded that it was, so the correction is written
+            // here rather than in a report. It is reached only when scope
+            // ALLOWS -- Policy consults the Gate last, after scope, method and
+            // dangerous.path -- so it cannot answer for an unconfigured run at
+            // all. MEASURED: with Sender's epoch check, Policy's epoch check
+            // AND checkScope's empty-include guard all deleted, a DENY-ALL
+            // decide() still answers scope_denied from the fallthrough at the
+            // end of checkScope, and this line is never executed. It becomes
+            // reachable only if the empty-include case is made to ALLOW, which
+            // is a rewrite rather than a deletion. What it guards is the
+            // narrower thing its first paragraph says: an armed-looking
+            // authorisation whose limiter was never built.
             return Decision.deny("not_configured", "the rate and budget are not armed");
         return l.check(req);
     }
