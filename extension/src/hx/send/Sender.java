@@ -746,9 +746,46 @@ public final class Sender {
      */
     record StatusScan(int code, boolean unreadable) { }
 
-    /** The three-digit code of a status line, or -1 for a line that is not
-     *  one. Deliberately strict: a line this cannot read is a line this must
-     *  not report a status from. */
+    /**
+     * The three-digit code of a status line, or -1 for a line that is not
+     * one. Deliberately strict: a line this cannot read is a line this must
+     * not report a status from.
+     *
+     * A STATUS-CODE IS EXACTLY THREE DIGITS, and the delimiter after the third
+     * is part of the grammar: RFC 9112 s4 is `status-line = HTTP-version SP
+     * status-code SP [ reason-phrase ]`. Until that was checked, a FOURTH
+     * digit was simply dropped and the three-digit prefix reported as the
+     * status. MEASURED against the shipped method, each line below behind a
+     * `103 Early Hints` head and in front of a real `HTTP/1.1 500`:
+     *
+     *     HTTP/1.1 1010 Weird  ->  101 / ok
+     *     HTTP/1.1 2000        ->  200 / ok
+     *     HTTP/1.1 5000        ->  500 / ok
+     *
+     * `1010` is the sharp one and it is new: 101 is final (see
+     * {@link #SWITCHING_PROTOCOLS}), so the scan STOPPED at a line no RFC
+     * calls a status line and filed a HEALTHY sample for an exchange whose own
+     * bytes say 500 -- the auto-halt disarmed by a peer writing one extra
+     * digit. All three now answer -1, which scanStatus reads as `not a status
+     * line: stop guessing` and answers {@link #STATUS_UNREADABLE}: a 5xx
+     * sample rather than a healthy one, which is the direction this whole
+     * function fails in.
+     *
+     * END OF LINE IS A DELIMITER TOO, and it has to be. `line` is stripped
+     * before this reads it, so a status line with NO REASON PHRASE ends at the
+     * third digit whichever way the peer wrote it: `HTTP/1.1 204` and
+     * `HTTP/1.1 204 ` -- the grammar's SP with nothing after it -- are the same
+     * string by then, and both are still read.
+     *
+     * THE DELIMITER SET IS {@link Redactor}'s, not a second opinion. Its
+     * `isInterim` has read this same grammar off the same bytes since it was
+     * written -- `c + 3 == to || raw[c + 3] == ' ' || raw[c + 3] == '\t'`, and
+     * `"HTTP/1.1 1000 x" is not a 1xx` is its own comment -- so this method was
+     * the one reader of a status CODE in this package that did not check it.
+     * Two readers of one grammar that disagree is the drift this branch keeps
+     * finding: SP, HTAB or end of line here means the redaction pass and the
+     * status pass cannot classify the same head two ways.
+     */
     private static int statusCodeOf(String line) {
         String s = line.strip();
         if (!s.startsWith("HTTP/")) return -1;
@@ -760,6 +797,10 @@ public final class Sender {
             if (c < '0' || c > '9') return -1;
             code = code * 10 + (c - '0');
         }
+        // Exactly three digits (RFC 9112 s4), so what follows them is the
+        // whitespace before the reason phrase -- or nothing at all.
+        if (s.length() > sp + 4 && s.charAt(sp + 4) != ' ' && s.charAt(sp + 4) != '\t')
+            return -1;
         return code;
     }
 

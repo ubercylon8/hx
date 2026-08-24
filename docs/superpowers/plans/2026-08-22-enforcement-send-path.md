@@ -14765,6 +14765,72 @@ public class SenderTest {
               + Sender.finalStatus(noBlankLine, 103) + ")",
               Sender.finalStatus(noBlankLine, 103) == Sender.STATUS_UNREADABLE);
 
+        // ---- A STATUS-CODE IS EXACTLY THREE DIGITS (RFC 9112 s4) --------
+        //
+        // A FOURTH digit used to be dropped and the three-digit prefix
+        // reported as the status. MEASURED against the shipped method, each
+        // of these three behind a `103 Early Hints` head and in front of a
+        // real `HTTP/1.1 500`:
+        //
+        //     HTTP/1.1 1010 Weird  ->  101 / ok
+        //     HTTP/1.1 2000        ->  200 / ok
+        //     HTTP/1.1 5000        ->  500 / ok
+        //
+        // `1010` is the sharp one and it is NEW, arriving with the in-loop
+        // 101 arm: 101 is final, so the scan STOPPED at a line no RFC calls a
+        // status line and filed a HEALTHY sample for an exchange whose own
+        // bytes say 500 -- the auto-halt disarmed by a peer writing one extra
+        // digit. All three are now `not a status line: stop guessing`, which
+        // is 599 / status_unreadable: a 5xx sample rather than a healthy one.
+        // The real 500 behind them is NOT read, and deliberately -- a line
+        // this cannot read is a line it must not scan past either.
+        for (String bad : new String[] {"HTTP/1.1 1010 Weird", "HTTP/1.1 2000",
+                                        "HTTP/1.1 5000"}) {
+            byte[] raw = hintsThen(bad);
+            check("`" + bad + "` is not a status line, so it reports the sentinel ("
+                  + Sender.finalStatus(raw, 103) + ")",
+                  Sender.finalStatus(raw, 103) == Sender.STATUS_UNREADABLE);
+            check("...and says the exchange never stated it ("
+                  + Sender.scanStatus(raw, 103) + ")",
+                  Sender.scanStatus(raw, 103).unreadable());
+        }
+        // ...and a LEGITIMATE status line is untouched by that strictness, in
+        // every shape it comes in. The one with no reason phrase is why the
+        // delimiter set includes END OF LINE and not just SP: `HTTP/1.1 204`
+        // is what a peer that omits the phrase sends, and the line is stripped
+        // before it is read, so the grammar's trailing SP is already gone. A
+        // real 101 behind a 103 is the shape not repeated here, because
+        // aSuccessfulUpgradeIsNeitherUnreadableNorDistress drives it.
+        check("a real 500 behind the same hints still reads 500 ("
+              + Sender.finalStatus(interimHeads(1, "HTTP/1.1 500 Internal Server Error"), 103)
+              + ")",
+              Sender.finalStatus(interimHeads(1, "HTTP/1.1 500 Internal Server Error"), 103)
+              == 500);
+        byte[] noReasonPhrase = "HTTP/1.1 103 X\r\n\r\nHTTP/1.1 204\r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        check("and a status line with no reason phrase is still read ("
+              + Sender.finalStatus(noReasonPhrase, 103) + ")",
+              Sender.finalStatus(noReasonPhrase, 103) == 204);
+        // Both spellings of it. RFC 9112 s4 puts an SP after the code whether
+        // or not a phrase follows, so a peer that omits the phrase may send
+        // the trailing SP -- which the strip() inside statusCodeOf removes,
+        // making these two the same line by the time the delimiter is checked.
+        byte[] trailingSpace = "HTTP/1.1 103 X\r\n\r\nHTTP/1.1 204 \r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        check("with or without the grammar's trailing space ("
+              + Sender.finalStatus(trailingSpace, 103) + ")",
+              Sender.finalStatus(trailingSpace, 103) == 204);
+        // The delimiter set is Redactor.isInterim's -- SP, HTAB or end of
+        // line -- and not a second, stricter opinion written 40 lines away
+        // from it. Two readers of one grammar that disagree would classify
+        // the same head two ways, one redacting it as interim and the other
+        // calling it unreadable.
+        byte[] tabDelimited = "HTTP/1.1 103 X\r\n\r\nHTTP/1.1 204\tNo Content\r\n\r\n"
+                .getBytes(StandardCharsets.ISO_8859_1);
+        check("and a tab where the space should be is read as Redactor reads it ("
+              + Sender.finalStatus(tabDelimited, 103) + ")",
+              Sender.finalStatus(tabDelimited, 103) == 204);
+
         check("and a reply that is not 1xx is never touched at all",
               Sender.finalStatus(interimHeads(8, "HTTP/1.1 500 Internal Server Error"), 204)
               == 204);
@@ -15177,6 +15243,17 @@ public class SenderTest {
               firstRefused == -1);
         check("so all 30 reached the wire, not 10 (" + up.http.calls + ")",
               up.http.calls == 30);
+    }
+
+    /** One `103 Early Hints` head, then {@code head}, then a real 500 -- the
+     *  shape a four-digit status code cost a whole exchange's evidence in.
+     *  Not {@link #interimHeads}, which has no head BEHIND the last one, and
+     *  the 500 behind is the point: it is what the exchange actually said. */
+    static byte[] hintsThen(String head) {
+        return ("HTTP/1.1 103 Early Hints\r\nLink: </0.css>; rel=preload\r\n\r\n"
+                + head + "\r\nContent-Length: 0\r\n\r\n"
+                + "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .getBytes(StandardCharsets.ISO_8859_1);
     }
 
     /** {@code n} interim heads, then {@code last} -- which may be empty, for
@@ -16380,9 +16457,46 @@ public final class Sender {
      */
     record StatusScan(int code, boolean unreadable) { }
 
-    /** The three-digit code of a status line, or -1 for a line that is not
-     *  one. Deliberately strict: a line this cannot read is a line this must
-     *  not report a status from. */
+    /**
+     * The three-digit code of a status line, or -1 for a line that is not
+     * one. Deliberately strict: a line this cannot read is a line this must
+     * not report a status from.
+     *
+     * A STATUS-CODE IS EXACTLY THREE DIGITS, and the delimiter after the third
+     * is part of the grammar: RFC 9112 s4 is `status-line = HTTP-version SP
+     * status-code SP [ reason-phrase ]`. Until that was checked, a FOURTH
+     * digit was simply dropped and the three-digit prefix reported as the
+     * status. MEASURED against the shipped method, each line below behind a
+     * `103 Early Hints` head and in front of a real `HTTP/1.1 500`:
+     *
+     *     HTTP/1.1 1010 Weird  ->  101 / ok
+     *     HTTP/1.1 2000        ->  200 / ok
+     *     HTTP/1.1 5000        ->  500 / ok
+     *
+     * `1010` is the sharp one and it is new: 101 is final (see
+     * {@link #SWITCHING_PROTOCOLS}), so the scan STOPPED at a line no RFC
+     * calls a status line and filed a HEALTHY sample for an exchange whose own
+     * bytes say 500 -- the auto-halt disarmed by a peer writing one extra
+     * digit. All three now answer -1, which scanStatus reads as `not a status
+     * line: stop guessing` and answers {@link #STATUS_UNREADABLE}: a 5xx
+     * sample rather than a healthy one, which is the direction this whole
+     * function fails in.
+     *
+     * END OF LINE IS A DELIMITER TOO, and it has to be. `line` is stripped
+     * before this reads it, so a status line with NO REASON PHRASE ends at the
+     * third digit whichever way the peer wrote it: `HTTP/1.1 204` and
+     * `HTTP/1.1 204 ` -- the grammar's SP with nothing after it -- are the same
+     * string by then, and both are still read.
+     *
+     * THE DELIMITER SET IS {@link Redactor}'s, not a second opinion. Its
+     * `isInterim` has read this same grammar off the same bytes since it was
+     * written -- `c + 3 == to || raw[c + 3] == ' ' || raw[c + 3] == '\t'`, and
+     * `"HTTP/1.1 1000 x" is not a 1xx` is its own comment -- so this method was
+     * the one reader of a status CODE in this package that did not check it.
+     * Two readers of one grammar that disagree is the drift this branch keeps
+     * finding: SP, HTAB or end of line here means the redaction pass and the
+     * status pass cannot classify the same head two ways.
+     */
     private static int statusCodeOf(String line) {
         String s = line.strip();
         if (!s.startsWith("HTTP/")) return -1;
@@ -16394,6 +16508,10 @@ public final class Sender {
             if (c < '0' || c > '9') return -1;
             code = code * 10 + (c - '0');
         }
+        // Exactly three digits (RFC 9112 s4), so what follows them is the
+        // whitespace before the reason phrase -- or nothing at all.
+        if (s.length() > sp + 4 && s.charAt(sp + 4) != ' ' && s.charAt(sp + 4) != '\t')
+            return -1;
         return code;
     }
 

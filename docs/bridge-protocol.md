@@ -105,9 +105,10 @@ bytes behind an earlier interim head such as a CDN's `103`. Measured without it:
 a WebSocket upgrade answered `599 / status_unreadable`, and driving 30 of them
 against a healthy host filed the first ten that way, tripped the auto-halt on the
 tenth with `5xx rate 100.0%`, and had the remaining twenty refused `halted` --
-naming a host that had answered every request it was given, correctly. That is the paragraph above in reverse -- a peer DISARMING the
-auto-halt versus a healthy peer TRIPPING it -- and a rule that closes only one of
-the two directions has not closed the rail. `100 Continue` and `102 Processing`
+naming a host that had answered every request it was given, correctly. That is
+the paragraph above in reverse -- a peer DISARMING the auto-halt versus a
+healthy peer TRIPPING it -- and a rule that closes only one of the two
+directions has not closed the rail. `100 Continue` and `102 Processing`
 head-only remain genuine truncations and remain **599**.
 
 `result.outcome` is `ok`, or `status_unreadable` when that 599 is the
