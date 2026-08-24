@@ -463,6 +463,12 @@ public class PolicyTest {
 
     /** A request in the shape Sender.parse produces: the url built from the
      *  frame's target_host and the origin-form target, the parts split out. */
+    /** The long, cheap-to-read fixture: same byte volume as the costly one,
+     *  two readings instead of sixteen. Used as the reference for the cost
+     *  ratio AND as the benign case, deliberately the same literal so a change
+     *  to one cannot silently diverge from the other. */
+    static final String LONG_BENIGN = "/sso/saml/" + "QUJD".repeat(2000);
+
     static HxRequest req(String method, String url, String host, String path, String query) {
         Map<String, List<String>> headers = new LinkedHashMap<>();
         headers.put("Host", List.of(host));
@@ -2297,9 +2303,17 @@ public class PolicyTest {
         long dotStart = System.nanoTime();
         Decision dotVerdict = p.decide(dottedReq, APP);
         long dotMs = (System.nanoTime() - dotStart) / 1_000_000;
-        check("a path of " + (Policy.MAX_TARGET_CHARS - 1) + " U+0130 characters is "
-              + "decided in " + dotMs + " ms (was 99 ms, and allowed)",
-              dotMs < 30 && dotVerdict != null);
+        // The bound is the READING COUNT, with the milliseconds printed but not
+        // asserted on -- amended 2026-08-24. The `dotMs < 30` this replaces
+        // measured 8 ms quiescent and FAILED at 32 and 35 ms under 24 and 48
+        // busy threads: 3.75x headroom on a machine whose absolute figures
+        // move 5x, which is a check that goes red for reasons unrelated to the
+        // code. What "was 99 ms" actually measured was a fold deriving one
+        // reading per code point; the count is that fact directly.
+        int dottedReadings = Policy.readings(dotted, Policy.readingBudget(dotted.length())).size();
+        check("a path of " + (Policy.MAX_TARGET_CHARS - 1) + " U+0130 characters reads "
+              + dottedReadings + " ways and is decided (" + dotMs + " ms, was 99 ms and allowed)",
+              dottedReadings <= 4 && dotVerdict != null);
 
         char[] alphabet = ("ab/./..;\\ %2e2f5c%c0%aeADMIN" + '\0'
                 + "\u00c0\u00ae\uff0f\uff0e\u0130\u2215\ufe52").toCharArray();
@@ -3066,6 +3080,22 @@ public class PolicyTest {
               + ") in " + ms + " ms",
               !big.allowed() && "scope_denied".equals(big.errorClass()) && ms < 60);
 
+        // AND THE COUNT, WHICH IS THE THING THAT ACTUALLY MOVES -- added
+        // 2026-08-24 after a reviewer reintroduced the defect these checks
+        // exist for (the reading bound moved from construction back to
+        // matching) and found the timing checks BOTH still green: this one at
+        // 44 ms against its 60 ms ceiling, and the ratio check below at an
+        // unchanged 54x. The set went 17 members -> 50. So the explosion was
+        // caught by nothing, while two checks written to catch it passed.
+        //
+        // Time was always a proxy for the count, and a bad one: it moves with
+        // the machine, and the previous ceiling on this file went red at load
+        // with no code change. The count moves only with the code.
+        int worstReadings = Policy.readings(worst, Policy.readingBudget(worst.length())).size();
+        check("and its reading set is bounded at " + worstReadings + " members, "
+              + "not the 50 an unbounded derivation builds",
+              worstReadings <= 24);
+
         // The costliest target a hill climb over the trigger alphabet could
         // build, tiled to the length bound. It is UNDER the reading bound and
         // so it is DECIDED rather than refused -- which is the point: nothing
@@ -3118,9 +3148,21 @@ public class PolicyTest {
         // not move with it: measured 54 on two consecutive runs at load 3-4.6,
         // where the absolute figures were 108 ms and 109 ms against a
         // quiescent 40 ms. The ceiling of 100 is roughly 2x the measured
-        // ratio, and the defect this check exists for -- the unbounded 406 ms
-        // reading blow-up found in Plan 3's Task 1 -- sits near 200-400 on the
-        // same scale. Still caught, no longer load-dependent.
+        // ratio. The first version of this comment also claimed the defect
+        // this check exists for "sits near 200-400 on the same scale". THAT
+        // NUMBER WAS NEVER MEASURED, in a comment whose whole argument is
+        // measure-do-not-assume, and a reviewer who did measure it found the
+        // opposite: with the reading bound removed the ratio reads an
+        // unchanged 54x. The ratio does not catch that defect. THE READING
+        // COUNT ABOVE DOES, and it is where that guarantee now lives.
+        //
+        // What this ratio catches is a change that makes the EXPENSIVE path
+        // disproportionately worse. What it cannot see is a UNIFORM slowdown:
+        // if every decide() got 5x slower both halves scale together, the
+        // ratio holds, and only the printed milliseconds would say so. The old
+        // absolute ceiling did catch that, and this trade is deliberate --
+        // a uniform slowdown is visible in the suite's wall time, while a
+        // load-dependent ceiling is red for reasons no reader can act on.
         //
         // The absolute figures are still PRINTED, because a reader chasing a
         // slow suite wants the milliseconds even when the ratio is fine.
@@ -3131,10 +3173,12 @@ public class PolicyTest {
         String costlyPath = costlyTiled.toString();
         HxRequest costlyReq = req("GET", "https://app.example.test" + costlyPath,
                                   "app.example.test", costlyPath, "");
-        // Same byte volume, cheap to read: this is the reference, and it is
-        // the SAME fixture the benign check below uses, so a change to one
-        // cannot silently diverge from the other.
-        String refPath = "/sso/saml/" + "QUJD".repeat(2000);
+        // Same byte volume, cheap to read. ONE literal, shared with the benign
+        // check below -- it is hoisted rather than repeated because the first
+        // version of this comment claimed the sharing while declaring a second
+        // identical literal forty lines down, which is a guarantee asserted
+        // and not provided.
+        String refPath = LONG_BENIGN;
         HxRequest refReq = req("GET", "https://app.example.test" + refPath,
                                "app.example.test", refPath, "");
         p.decide(costlyReq, APP);
@@ -3165,7 +3209,7 @@ public class PolicyTest {
 
         // ...while a long BENIGN target is decided rather than refused: the
         // size bound must not turn into a length bound of its own.
-        String longBenign = "/sso/saml/" + "QUJD".repeat(2000);
+        String longBenign = LONG_BENIGN;
         check("the long benign fixture is near the length bound and reads "
               + Policy.readings(longBenign).size() + " ways",
               longBenign.length() > 4096 && Policy.readings(longBenign).size() <= 2);
