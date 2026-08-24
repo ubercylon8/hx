@@ -1,13 +1,27 @@
 # What Burp's proxy actually does
 
 **Measured against Burp Suite Community `2026.7.3`** (`burpsuite_desktop_v2026.7.3.jar`),
-Montoya API as shipped in `burp-lab/probe/lib/montoya-api.jar`, on 2026-08-24,
-JRE 26.0.2, headless, loopback only.
+on 2026-08-24, JRE 26.0.2, headless, loopback only.
+
+The probe is compiled against **the Burp jar itself**, not against the
+standalone `burp-lab/probe/lib/montoya-api.jar`: Burp ships the whole Montoya
+API inside `burpsuite_desktop_v2026.7.3.jar` (997 entries under
+`burp/api/montoya/`), so the measurement adds no prerequisite that
+`-m integration` did not already have. That standalone jar is
+`Implementation-Version: 2025.10` — older — and it is what `extension/build.sh`
+compiles the shipped extension against. For the accessors below it makes no
+difference, and that is measured rather than assumed:
+`InterceptedRequest.class` and `InterceptedHttpMessage.class` are byte-identical
+between the two jars (`sha256` match on both). An earlier version of this line
+credited the measurements to the standalone jar and contradicted the fixture.
 
 This document is one half of a deliverable. The other half is
 `tests/integration/test_proxy_facts.py`, which re-measures all three answers
-against a real Burp and fails if any of them changes. Q1's test reads this file
-back, so the prose and the measurement cannot drift apart in silence.
+against a real Burp and fails if any of them changes. Two of those tests read
+this file back — Q1's checks the accessor table, Q3's checks the status and byte
+count Burp answers a dropped client with — so the prose and the measurement
+cannot drift apart in silence. Everything outside those two readbacks is prose
+that nothing enforces, and is marked as such where it matters.
 
 **These are measurements, not decisions.** Nothing below was chosen; it is what
 Burp did when asked. Two facts on the previous branch were designed around
@@ -36,6 +50,15 @@ Task 7 requires exactly one `registerRequestHandler`. It was written under
 `extension/src` to take these measurements and removed from there in the same
 task; keeping it beside the test is what stops this document from becoming a
 claim nothing checks.
+
+**Deleting it is a test failure, not a skip.** Task 1's brief ends with a step
+that says "delete the probe", and that step means *delete it from
+`extension/src`* — where it breaks `ChokepointTest` and Task 7 — and not from
+here. Removing `tests/integration/probe/` used to produce `3 skipped in 0.03s`
+with no error and no diagnostic, while the default run's summary line announces
+*deselected* integration tests and never mentions skipped ones. A missing Burp
+jar or JDK still skips; those are facts about a machine. A file this repository
+ships is not.
 
 It writes to a **file** rather than to `api.logging()`, because
 `logToOutput`/`logToError` reach Burp's own extension log and not the process
@@ -86,7 +109,7 @@ absence rather than a compile error.
 | --- | --- | --- |
 | `listenerInterface()` | present | `127.0.0.1:42969` — the listener's `host:port`. **This is the answer to Q1.** |
 | `listenerPort()` | absent | No such method, on `InterceptedRequest` or anywhere in its hierarchy. The port must be parsed out of `listenerInterface()`. |
-| `sourceIpAddress()` | present | `/127.0.0.1` — a `java.net.InetAddress`, so `toString()` carries the leading slash. The **client's** address, not the listener's; it cannot tell two listeners apart. |
+| `sourceIpAddress()` | present | `/127.0.0.1` — a `java.net.InetAddress`, so `toString()` carries the leading slash. The **client's** address, not the listener's; it cannot tell two listeners apart. Its `toString()` is **not a stable shape**: the same client through a `CONNECT` tunnel rendered as `localhost/127.0.0.1`, hostname included. Do not parse it. |
 | `destinationIpAddress()` | throws | `java.lang.UnsupportedOperationException: Not yet implemented`. **A trap.** It is declared on `InterceptedHttpMessage` alongside `listenerInterface()`, it compiles, and it raises on every call. |
 | `httpService()` | present | `http://127.0.0.1:42797` — the **target**, not the listener. Identical for both listeners, so it answers a different question. |
 
@@ -120,12 +143,56 @@ Both listeners are named explicitly, including the first. A config naming only
 the second would leave the first wherever Burp's default put it — see the port
 warning below.
 
-The list **replaces** Burp's defaults rather than adding to them. With the two
-above configured, `ss -tlnp` against the Burp process shows exactly those two
-proxy listeners and no 8080. Both bind `[::ffff:127.0.0.1]` — loopback only,
-never `0.0.0.0`, which is what `listen_mode: loopback_only` buys and is not
-optional: a proxy listener on `0.0.0.0` is an open relay on whatever network
-the machine is attached to.
+The list **replaces** Burp's defaults rather than adding to them: no 8080
+appears. But it does not account for every socket Burp opens. With the two
+above configured, `ss -ltnp` against the Burp process shows **three** listening
+sockets, not two (a different run from the Q1 excerpt above — the ports are
+allocated free per run and are never the same twice):
+
+```
+LISTEN [::ffff:127.0.0.1]:45327   users:(("java",pid=...))   <- configured
+LISTEN [::ffff:127.0.0.1]:46387   users:(("java",pid=...))   <- configured
+LISTEN [::ffff:127.0.0.1]:43719   users:(("java",pid=...))   <- nobody asked for this
+```
+
+All three bind `[::ffff:127.0.0.1]` — loopback, never `0.0.0.0`.
+
+### Burp's third listener
+
+The extra one is Burp's own, on an ephemeral port that changes every run, and
+it is **not** a second proxy. Measured directly against it:
+
+| sent to it | it answered |
+| --- | --- |
+| absolute-URI `GET http://target/from-third` | `HTTP/1.1 204 No Content` (27 bytes) |
+| origin-form `GET /plain` | nothing; the connection closes |
+| `CONNECT target:port` | `HTTP/1.1 200 Connection established` |
+| a `GET` inside that tunnel | `HTTP/1.1 204 No Content` |
+
+The target server's log stayed **empty** throughout and the probe's own handler
+never saw any of it. It accepts, answers `204`, and forwards nothing. So it is
+not an enforcement hole — but it is on loopback, and any check that all of this
+Burp's listeners are on loopback has to expect it rather than fail on it.
+
+### `loopback_only` is checked, not assumed
+
+`listen_mode: loopback_only` is what keeps the two configured listeners off the
+network, and it is **not optional**: a proxy listener on `0.0.0.0` is an open
+forward relay on whatever network the machine is attached to, for as long as the
+run lasts.
+
+Until `burp_fixture.not_loopback_only()` existed, that was asserted in three
+places — this paragraph among them — and checked by nothing. Changing that one
+string to `all_interfaces` left the suite reporting `3 passed in 38.03s` while
+`ss` showed the two proxy listeners bound to `*:34777` and `*:38399` —
+reproduced, on this machine. The
+fixture in `test_proxy_facts.py` now reads `ss -ltnpH` for the Burp pid after
+`PROBE READY` and fails naming the address it found; the same mutation now
+reports:
+
+```
+burp pid 3827568 is listening on ['*:44741', '*:33527'], which is not loopback.
+```
 
 ### Do not hard-code 8080
 
@@ -178,6 +245,12 @@ pairing.
 `messageId()` is an `int` and is per-Burp-instance, not per-listener: the ids
 above were drawn from one sequence shared by both listeners.
 
+The ids are **not contiguous**. Three requests sent through `CONNECT` tunnels
+reached the handler as `5`, `7` and `9`; `4`, `6` and `8` were never delivered
+to it. The `CONNECT` requests themselves are the obvious candidate for the
+missing ids, but that was not confirmed — what is measured is only that the
+sequence has gaps, so nothing may infer "the next request" from `id + 1`.
+
 ---
 
 ## Q3. Does `drop()` actually prevent egress?
@@ -222,6 +295,17 @@ X-Content-Type-Options: nosniff
 request and a delivered one are therefore **indistinguishable by status code**
 from the client's side.
 
+The page is static — two drops of very different path lengths measured 1529
+bytes each, and it echoes nothing of the request — so that number is a constant
+rather than a fingerprint of one URL.
+
+> **Both numbers above are read back by `test_q3_drop_means_the_target_receives_nothing`,**
+> which measures the real response and then requires this document to record the
+> same status and the same byte count on one line, and requires the word
+> *indistinguishable* to still appear. This section used to be deletable in
+> full with that test still green — reproduced, both directions. Editing it is
+> fine; deleting the finding is what goes red.
+
 Consequences for Plan 4, since this is the second enforcement point:
 
 - **Never read the client-visible status as evidence a request was blocked.**
@@ -236,23 +320,76 @@ Consequences for Plan 4, since this is the second enforcement point:
 
 ---
 
+## Q1 and Q3 over HTTPS, through a `CONNECT` tunnel
+
+An earlier version of this document listed HTTPS as unmeasured and told Task 5
+to re-measure Q1 before relying on the split for browser traffic. It has since
+been measured, twice independently — by this task's review and again here. Both
+answers hold, and Task 5 does not need to re-derive them.
+
+The rig, a throwaway script rather than anything in the suite (see the note at
+the end of this section): a self-signed TLS server on loopback in place of the
+plain-HTTP target, and a client that sends `CONNECT 127.0.0.1:<tls-port>`, wraps
+the tunnel in TLS (Burp MITMs it with its own per-host certificate) and sends
+the request inside. The TLS server counts **TCP accepts** and completed
+handshakes, so "the target received nothing" is a claim about the socket rather
+than about HTTP.
+
+### Q1 holds. `listenerInterface()` still discriminates.
+
+Two tunnelled requests, one through each listener:
+
+```
+REQ id=5 path=/tunnel/one listenerInterface=127.0.0.1:40421 ... httpService=https://127.0.0.1:41431
+REQ id=7 path=/tunnel/two listenerInterface=127.0.0.1:41543 ... httpService=https://127.0.0.1:41431
+```
+
+Two listeners, two values, each naming the port the tunnel was opened on —
+exactly as for plain HTTP. `httpService()` reports the `https://` scheme, so the
+handler can also tell that the request came out of a tunnel. **The
+operator/crawler split is not broken for browser traffic.**
+
+### Q3 holds, and more strongly than over plain HTTP.
+
+`drop()` returned for a request read out of an established tunnel:
+
+```
+REQ id=9 path=/drop/in-a-tunnel listenerInterface=127.0.0.1:40421 ... httpService=https://127.0.0.1:41431
+DROPPED id=9
+```
+
+The TLS target's counters were `accepts=3, handshakes=3` before the drop and
+`accepts=3, handshakes=3` after it. **Zero TCP accepts, therefore zero TLS
+handshakes and no SNI** — Burp does not dial the target before the handler has
+decided. Over plain HTTP the evidence is "no HTTP request arrived"; here it is
+"no connection was ever made".
+
+The client-side half is the same trap: inside the tunnel the dropping client
+received Burp's own `HTTP/1.1 200 OK` error page. Its head is identical to the
+plain-HTTP one above, down to `X-Content-Type-Options: nosniff`; the total
+length was not compared, so treat 1529 as a plain-HTTP measurement.
+
+**Not covered by the standing test.** `tests/integration/target_server.py`
+serves no TLS, so `test_proxy_facts.py` re-measures Q1 and Q3 over plain HTTP
+only. These two answers are recorded here and are **not** protected against a
+future Burp changing them. If Task 5 or later comes to depend on tunnelled
+behaviour specifically, that dependency needs a TLS target in the suite first.
+
+---
+
 ## What was NOT measured
 
 Stated rather than left to be discovered, because each of these is a place where
 the answers above could fail to hold and nothing here would notice.
 
-- **HTTPS / `CONNECT` tunnels.** Every measurement used plain HTTP through an
-  absolute-URI proxy request. Whether `listenerInterface()` still names the
-  accepting listener for a request read out of a TLS tunnel is **untested**, and
-  it is the majority of real browsing. `tests/integration/target_server.py`
-  serves no TLS, so measuring it needs a TLS target first. **Task 5 should
-  re-measure Q1 over HTTPS before relying on the split for browser traffic.**
 - **WebSocket traffic.** `registerWebSocketCreationHandler` was never exercised.
-- **More than two listeners**, and listeners bound to anything other than
-  `127.0.0.1`. `listen_mode` was `loopback_only` throughout — nothing in this
-  project has ever sent a request off this machine, and a proxy listener on
-  `0.0.0.0` is an open relay on whatever network the laptop is attached to.
+- **More than two configured listeners**, and listeners bound to anything other
+  than `127.0.0.1`. `listen_mode` was `loopback_only` throughout — nothing in
+  this project has ever sent a request off this machine — and that is now
+  enforced rather than intended; see "`loopback_only` is checked, not assumed".
 - **Burp Professional.** Community only.
 - **`drop()` from `handleRequestToBeSent`.** The drop measured here is from
   `handleRequestReceived`, which is the earlier of the two and the one Plan 4's
   gate uses.
+- **What Burp's third listener is for.** Its behaviour is measured above; why it
+  exists is not. Nothing in Plan 4 sends anything to it.

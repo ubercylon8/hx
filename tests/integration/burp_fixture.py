@@ -15,6 +15,7 @@ Everything here was established empirically, most of it the hard way:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shutil
@@ -268,18 +269,148 @@ PROBE_CLASS = "hx.proxy.Probe"
 
 
 def probe_missing() -> list[str]:
-    """What the probe needs beyond what missing() already covers.
+    """What the probe needs FROM THIS MACHINE beyond what missing() covers.
+
+    Environment facts only, and the split is not tidiness. PROBE_SRC used to
+    be in this list, which made an absent probe a SKIP: renaming
+    tests/integration/probe/ produced `3 skipped in 0.03s` -- no error, no
+    diagnostic -- and the default run's summary line announces DESELECTED
+    integration tests, not skipped ones. So the three facts eight tasks rest
+    on stopped being checked with nothing red anywhere.
+
+    A Burp jar and a JDK are things a machine may legitimately not have. A
+    file this repository ships is not one of those. See probe_source_missing().
 
     Kept out of missing() deliberately. That function runs at import time for
     the whole repository and its contract is that nothing escapes it; this one
     is called by a single fixture and may be as ordinary as it likes.
     """
     absent = missing()
-    if not PROBE_SRC.exists():
-        absent.append(f"probe source: {PROBE_SRC}")
     if shutil.which("javac") is None:
         absent.append("javac (a JDK, not just a JRE) to compile the probe")
     return absent
+
+
+def probe_source_missing() -> str | None:
+    """Why the probe cannot be compiled at all -- or None when its source is here.
+
+    Separate from probe_missing() so the caller can treat it differently, and
+    the caller must: this is a FAILURE, not a skip. The scenario is specific
+    enough to answer in the message -- somebody reads Task 1's brief, sees
+    "Step 8: Delete the probe", and deletes the wrong copy.
+    """
+    if PROBE_SRC.exists():
+        return None
+    return (
+        f"the probe's source is gone: {PROBE_SRC}. This is not a missing "
+        "environment prerequisite, it is a file this repository ships, and "
+        "without it the three measurements in test_proxy_facts.py -- the only "
+        "check that Burp's proxy still behaves the way Plan 4 was designed "
+        "around -- cannot run at all. If it was deleted because Task 1's brief "
+        "says Step 8 deletes the probe: that step removed it from "
+        "extension/src, where a second registerRequestHandler breaks "
+        "ChokepointTest and Task 7. It belongs here. Restore it with "
+        "`git checkout tests/integration/probe/`."
+    )
+
+
+# --- F1: loopback_only, checked ------------------------------------------
+
+def _listening_sockets(pid: int) -> list[str]:
+    """Every local `address:port` this pid holds a LISTENING socket on.
+
+    `ss -ltnpH`: -l listening, -t tcp, -n numeric (a resolved `localhost`
+    would defeat the address parsing below), -p with the owning process, -H
+    without the header row. The process column reads
+    `users:(("java",pid=123,fd=8))`, so the pid is matched with its trailing
+    comma -- a bare `pid=123` also matches pid 1234.
+    """
+    out = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True,
+                         check=True).stdout
+    return [line.split()[3] for line in out.splitlines()
+            if f"pid={pid}," in line]
+
+
+def _is_loopback(local: str) -> bool:
+    """Is this `ss` local-address field on 127.0.0.0/8 or ::1?
+
+    The forms that actually turn up here, all measured on this machine:
+    `127.0.0.1:8080`, `[::1]:631`, `[::ffff:127.0.0.1]:40421` (what Burp's own
+    listeners look like), `0.0.0.0:8443`, `*:8444` and `127.0.0.53%lo:53`.
+
+    Anything unparseable -- `*` above all -- is NOT loopback. That direction
+    matters: `*` is the wildcard bind this whole check exists to catch, and a
+    parser that fell through to True for what it did not understand would
+    report an open relay as safe.
+    """
+    host = local.rsplit(":", 1)[0].strip("[]").split("%")[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    # Both halves, and the second is not redundant belt-and-braces. Whether
+    # IPv6Address.is_loopback answers True for an IPv4-MAPPED address is a
+    # property of the interpreter: the 3.12.13 running this suite says True
+    # (measured), and CPython has not always. `::ffff:127.0.0.1` is the form
+    # EVERY Burp listener takes here, so an interpreter that answered False
+    # would fail every honest run. The explicit test costs nothing and does
+    # not depend on which CPython this is.
+    return bool(addr.is_loopback or (mapped is not None and mapped.is_loopback))
+
+
+def not_loopback_only(pid: int, ports: list[int]) -> str | None:
+    """Why this Burp is not listening on loopback alone -- or None when it is.
+
+    `listen_mode: loopback_only` is written into every listener launch_probe
+    configures, three places in this tree call it non-optional, and until this
+    function existed NOTHING checked it. Changing that one string to
+    `all_interfaces` left `test_proxy_facts.py` reporting `3 passed in 38.03s`
+    while `ss` showed the two configured listeners bound to `*:34777` and
+    `*:38399` -- a forward proxy open to whatever network this laptop is
+    attached to, for the 38 s those three tests take. Reproduced here.
+
+    Two claims, because either one alone passes while the other is false:
+
+      - every port the config named is LISTENING for this pid, so the check
+        cannot pass vacuously against a Burp that bound nothing at all;
+      - every socket this pid listens on is on a loopback address, INCLUDING
+        the ones the config did not ask for. Burp opens a third listener of
+        its own on an ephemeral loopback port every run -- measured: it
+        answers `HTTP/1.1 204 No Content` to an absolute-URI GET, `200
+        Connection established` to a CONNECT and `204` again inside the
+        tunnel, forwards nothing to the target, and never reaches the
+        extension's handler. Harmless, and it must not fail this check; but a
+        check written only against the configured ports would also miss a
+        future listener that is not harmless.
+    """
+    try:
+        sockets = _listening_sockets(pid)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # NOT a pass. A guard that evaporates when its tool is missing is the
+        # defect this function was written to fix, one level down.
+        return (f"the listening sockets of burp pid {pid} could not be read, so "
+                f"`listen_mode: loopback_only` is unverified: {exc}")
+    if not sockets:
+        return (f"`ss -ltnpH` attributes no listening socket to burp pid {pid}, "
+                "so nothing here can say whether its proxy is on loopback. Burp "
+                "is running and its extension has loaded -- `PROBE READY` is on "
+                "disk -- so read this as a broken check before reading it as a "
+                "Burp that bound nothing.")
+    unbound = [port for port in ports
+               if not any(sock.endswith(f":{port}") for sock in sockets)]
+    if unbound:
+        return (f"burp pid {pid} was configured to listen on {unbound} and is "
+                f"not: it holds {sockets}. A check for `loopback_only` against "
+                "a port nothing bound would pass without measuring anything.")
+    off = [sock for sock in sockets if not _is_loopback(sock)]
+    if off:
+        return (f"burp pid {pid} is listening on {off}, which is not loopback. "
+                "A proxy listener on a wildcard or routable address is an open "
+                "forward relay on whatever network this machine is attached to, "
+                "for as long as the run lasts. Check `listen_mode` in "
+                f"{PROXY_CONFIG}: it must be loopback_only.")
+    return None
 
 
 def _compile_probe(workdir: Path) -> Path:
@@ -344,7 +475,11 @@ def launch_probe(workdir: Path, out: Path,
 
     `loopback_only` is not decoration. Nothing in this project has ever sent a
     request off this machine, and a proxy listener on 0.0.0.0 is an open relay
-    on whatever network the laptop is attached to.
+    on whatever network the laptop is attached to. It is also not self-
+    enforcing: this string was the whole of the protection until
+    not_loopback_only() was written, and changing it to `all_interfaces` left
+    the suite green with the proxy bound to `*`. Callers must run that check
+    once the listeners are up -- test_proxy_facts.py's fixture does.
     """
     home = make_home(workdir)
     classes = _compile_probe(workdir)
