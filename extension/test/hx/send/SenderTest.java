@@ -1867,6 +1867,69 @@ public class SenderTest {
         check("and does not refill the budget (" + limits.issued() + ")",
               limits.issued() == 1L);
 
+        // ...AND IT IS REFUSED RATHER THAN IGNORED. s4, amended 2026-08-23:
+        // an operator pushing `limit.rate_rps: 1` mid-run because the target
+        // is wobbling got a fresh config_epoch, no error, no log line, and the
+        // old rate. Lowering a rate is the one change that is always safe, so
+        // being unable to make it must at least be said out loud. Not
+        // re-arming -- refusing.
+        String slower = limits.refuseIfLimitsMoved(Map.of(
+                "limit.rate_rps", List.of("1")));
+        check("a configure asking for a DIFFERENT rate is refused (" + slower + ")",
+              slower != null && slower.contains("limit.rate_rps cannot change mid-run")
+              && slower.contains("armed at 5") && slower.contains("asks for 1"));
+        String bigger = limits.refuseIfLimitsMoved(Map.of(
+                "limit.max_requests", List.of("1000000")));
+        check("and so is one asking for a different budget (" + bigger + ")",
+              bigger != null && bigger.contains("limit.max_requests cannot change"));
+
+        // The two configures that MUST still go through, or this refusal
+        // breaks the commonest thing an operator does.
+        check("a configure repeating the SAME rate is not a change",
+              limits.refuseIfLimitsMoved(Map.of(
+                      "limit.rate_rps", List.of("5"),
+                      "limit.max_requests", List.of("2000"))) == null);
+        check("and one that narrows SCOPE and says nothing about limits goes through",
+              limits.refuseIfLimitsMoved(Map.of(
+                      "scope.include", List.of("https://app.example.test/api/*"))) == null);
+        // An omitted key means "no opinion" -- arm()'s own contract. Reading
+        // the built-in default and comparing it would refuse exactly the
+        // configure above, which is the one that fixes a scope mistake.
+        //
+        // THE INPUT THAT SEPARATES THAT FROM ITS ABSENCE is a run armed at a
+        // rate the built-in default does NOT equal. The rig above is armed at
+        // 5 with a default of 5, so a version that filled the absent key in
+        // from the default would compare 5 against 5 and look correct. Armed
+        // at 3 against a default of 5, it refuses a scope-only configure.
+        Limits three = new Limits(clock, 5L, 2000L);
+        three.arm(new BridgeClient.Authorisation(4L, Map.of(
+                "limit.rate_rps", List.of("3"),
+                "limit.max_requests", List.of("40"))));
+        check("armed away from the built-in defaults (" + three.ratePerSecond()
+              + " rps / " + three.maxRequests() + ")",
+              three.ratePerSecond() == 3L && three.maxRequests() == 40L);
+        check("a scope-only configure is STILL not a limit change",
+              three.refuseIfLimitsMoved(Map.of(
+                      "scope.include", List.of("https://x.test/*"))) == null);
+        check("...and one naming the built-in default IS a change, since it "
+              + "contradicts what is armed",
+              three.refuseIfLimitsMoved(Map.of(
+                      "limit.rate_rps", List.of("5"))) != null);
+
+        // A present-but-unusable value is refused HERE rather than throwing on
+        // the next send: bad_config keeps the channel, not_configured does not.
+        String unusable = limits.refuseIfLimitsMoved(Map.of(
+                "limit.rate_rps", List.of("as fast as possible")));
+        check("an unparseable limit in a later configure is refused by name ("
+              + unusable + ")",
+              unusable != null && unusable.contains("limit.rate_rps is not an integer"));
+
+        // Before anything is armed there is nothing to contradict: THIS
+        // configure is the one that will supply the numbers.
+        check("an unarmed Limits refuses no configure at all",
+              new Limits(clock, 5L, 2000L).refuseIfLimitsMoved(Map.of(
+                      "limit.rate_rps", List.of("99"))) == null);
+
         // Unreadable is not "use the default". An operator who asked for a
         // limit we cannot parse has not been given the limit they asked for,
         // and BridgeClient's send arm turns this throw into an error frame and

@@ -4230,7 +4230,16 @@ class BridgeServer:
 
         `enforce_locally=False` drops THIS side's three duplicate refusals --
         the durable halt, `state == "halted"`, and anything short of
-        `configured` -- and nothing else. It exists for one caller, the
+        `configured` -- and nothing else.
+
+        SAY THE FIRST ONE OUT LOUD, because the keyword reads like
+        belt-and-braces and one of the three is not. Dropping the DURABLE HALT
+        means this call goes out while an operator has stopped the run by hand.
+        It is duplicated only while the two sides are looking at the SAME
+        sentinel file: the extension polls whatever `-Dhx.halt_sentinel` names
+        and this side writes `OperatorHalt.sentinel_path`, and the integration
+        rig makes them one path deliberately. Point them at two paths and this
+        keyword is not a duplicate at all -- it is the halt, off. It exists for one caller, the
         integration rig, and for one reason: those refusals are answered
         BEFORE the wire, so a test of the extension's gate written the obvious
         way writes ZERO frames to the socket, is satisfied by this side's own
@@ -4853,6 +4862,8 @@ public class BridgeClientTest {
             t("haltFramesReachTheSwitchTheSendPathAsks", BridgeClientTest::haltFramesReachTheSwitchTheSendPathAsks);
             t("theKillPathsThatNeverTouchTheLocalFlagStillDenySending",
               BridgeClientTest::theKillPathsThatNeverTouchTheLocalFlagStillDenySending);
+            t("aConfigureTheGuardRefusesIsBadConfigAndKeepsTheChannel",
+              BridgeClientTest::aConfigureTheGuardRefusesIsBadConfigAndKeepsTheChannel);
             t("aHaltFrameWithNoReasonDoesNotDeliverTheWordNull", BridgeClientTest::aHaltFrameWithNoReasonDoesNotDeliverTheWordNull);
             t("aHaltSinkThatThrowsDropsToDenyAll", BridgeClientTest::aHaltSinkThatThrowsDropsToDenyAll);
             t("theSendArmHandsTheHandlerOneCoherentAuthorisation", BridgeClientTest::theSendArmHandsTheHandlerOneCoherentAuthorisation);
@@ -5452,6 +5463,106 @@ public class BridgeClientTest {
             check("and the client is sending again", l.client.maySend());
         } finally {
             Files.deleteIfExists(dir.resolve("hs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A configure the guard refuses is `bad_config`, leaves no epoch behind,
+     * and keeps the channel.
+     *
+     * Spec s4, amended 2026-08-23: `Limits` takes the rate and budget from the
+     * FIRST authorisation with an epoch and holds them, because the budget
+     * must be monotonic -- a scope push must not resupply a run that has spent
+     * its requests. So an operator pushing `limit.rate_rps: 1` mid-run because
+     * the target is wobbling got a fresh `config_epoch`, no error, no log line
+     * and the OLD RATE. Lowering a rate is the one change that is always safe;
+     * believing you have made it when you have not is the failure to avoid.
+     *
+     * The guard installed here is a stand-in for
+     * `Limits.refuseIfLimitsMoved`, so this file needs no hx.send import to
+     * say what it has to say: that this client ASKS, that a refusal is
+     * bad_config rather than an ack, and that the refusal happens BEFORE the
+     * commit. The real predicate -- which configures move an armed limit and
+     * which do not -- is SenderTest's, where Limits is.
+     *
+     * The epoch assertion is the one that pins the placement. Refusing after
+     * the commit would still answer bad_config, and the operator would still
+     * be told; what they would ALSO have is a fresh `config_epoch` stamped on
+     * every later evidence line, granted by a configure that was refused.
+     */
+    static void aConfigureTheGuardRefusesIsBadConfigAndKeepsTheChannel() throws Exception {
+        Path dir = Files.createTempDirectory("hxconfigguard");
+        try (Live l = live(dir, "cg.sock")) {
+            long armed = l.client.authorisation().epoch();
+            check("the run is configured before any of this (epoch " + armed + ")",
+                  armed == 1L && l.client.maySend());
+
+            l.client.setConfigGuard(scope -> scope.containsKey("limit.rate_rps")
+                    ? "limit.rate_rps cannot change mid-run: this run armed at 5"
+                    : null);
+
+            l.out.write(Frame.encode(configureFrame("e-1", 41L),
+                    ("scope.include\thttps://a/*\nlimit.rate_rps\t1\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded err = read(l.reader, l.peer, "the refused configure");
+            check("a configure that would move an armed limit is refused, not acked (got "
+                  + err.header.get("t") + ")", "error".equals(err.header.get("t")));
+            check("with class bad_config (got " + err.header.get("class") + ")",
+                  "bad_config".equals(err.header.get("class")));
+            check("and the detail is the guard's own words",
+                  String.valueOf(err.header.get("detail"))
+                          .contains("cannot change mid-run"));
+
+            waitUntil(() -> !l.client.maySend());
+            check("a configure it could not act on drops to DENY-ALL", !l.client.maySend());
+
+            // A configure the guard allows still works, and the epoch it gets
+            // is the NEXT one -- not the next but one.
+            l.out.write(Frame.encode(configureFrame("e-1", 42L),
+                    ("scope.include\thttps://NARROW/*\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded ack = read(l.reader, l.peer, "the corrected configured ack");
+            check("the channel survives, so a corrected configure is heard (got "
+                  + ack.header.get("t") + ")", "configured".equals(ack.header.get("t")));
+            check("and the refused configure consumed NO epoch (got "
+                  + ack.header.get("config_epoch") + ")",
+                  Long.valueOf(armed + 1).equals(ack.header.get("config_epoch")));
+            waitUntil(l.client::maySend);
+            check("with the corrected scope",
+                  l.client.authorisation().scope().toString().contains("NARROW"));
+
+            // A guard that THROWS is a refusal. It is asked about an
+            // operator's intent, and an answer it could not produce is not
+            // permission.
+            l.client.setConfigGuard(scope -> { throw new IllegalStateException("boom"); });
+            l.out.write(Frame.encode(configureFrame("e-1", 43L),
+                    ("scope.include\thttps://b/*\n").getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded threw = read(l.reader, l.peer, "the throwing-guard error");
+            check("a guard that throws refuses rather than letting the configure through ("
+                  + threw.header.get("class") + ")",
+                  "error".equals(threw.header.get("t"))
+                  && "bad_config".equals(threw.header.get("class")));
+            check("and says so rather than escaping",
+                  String.valueOf(threw.header.get("detail")).contains("boom"));
+
+            // ...and NO guard accepts. The asymmetry with setHaltSource is
+            // deliberate and setConfigGuard says why: a missing halt source
+            // leaves a question about stopping unanswered, where a missing
+            // config guard leaves the pre-existing silent-ignore. Failing
+            // closed here would mean an extension that cannot be configured.
+            l.client.setConfigGuard(null);
+            l.out.write(Frame.encode(configureFrame("e-1", 44L),
+                    ("scope.include\thttps://c/*\nlimit.rate_rps\t1\n")
+                            .getBytes(StandardCharsets.UTF_8)));
+            l.out.flush();
+            Frame.Decoded none = read(l.reader, l.peer, "the unguarded configured ack");
+            check("an uninstalled guard accepts (got " + none.header.get("t") + ")",
+                  "configured".equals(none.header.get("t")));
+        } finally {
+            Files.deleteIfExists(dir.resolve("cg.sock")); Files.deleteIfExists(dir);
         }
     }
 
@@ -6183,6 +6294,48 @@ public final class BridgeClient {
      *  does not get to say it is not. */
     public void setHaltSource(HaltSource s) { this.haltSource = s; }
 
+    /**
+     * Whether a `configure` can be acted on, asked before it is committed.
+     *
+     * There is exactly one thing this answers today and spec s4 names it:
+     * `Limits` takes the rate and budget from the FIRST authorisation with an
+     * epoch and holds them for the run, because the budget must be monotonic
+     * -- a scope push must not resupply a run that has spent its requests. So
+     * an operator pushing `limit.rate_rps: 1` mid-run got a fresh
+     * `config_epoch`, no error, no log line, and the OLD RATE. Lowering a rate
+     * is the one change that is always safe, and believing you have slowed a
+     * run down when you have not is the failure to avoid.
+     *
+     * A refusal here is `bad_config`: DENY-ALL first, channel kept, so a
+     * corrected configure can follow. Same answer as an unparseable configure
+     * and for the same reason -- carrying on under the PREVIOUS intent is
+     * exactly the harm when the new intent was tighter.
+     *
+     * This is NOT re-arming, which is a later plan's work. It is the refusal
+     * that makes the absence of re-arming visible.
+     */
+    public interface ConfigGuard {
+        /** Why this configure cannot be acted on, or null when it can. */
+        String refuse(Map<String, List<String>> scope);
+    }
+
+    private volatile ConfigGuard configGuard;
+
+    /**
+     * Install it. Called before connect(), with the others.
+     *
+     * An UNINSTALLED guard accepts, unlike {@link #setHaltSource}, and the
+     * asymmetry is deliberate: a halt source that is missing leaves a question
+     * about stopping unanswered, where a config guard that is missing leaves
+     * the pre-existing silent-ignore. Failing closed here would mean an
+     * extension that cannot be configured at all, which is worse than the
+     * thing being fixed. ChokepointTest counts the wire instead.
+     *
+     * A guard that THROWS is a refusal. It is asked about an operator's
+     * intent, and an answer it could not produce is not permission.
+     */
+    public void setConfigGuard(ConfigGuard g) { this.configGuard = g; }
+
     private final Path socketPath;
     private final String engagementId;
     private final String instanceId;
@@ -6459,6 +6612,16 @@ public final class BridgeClient {
                     error(f, "bad_config", e.getMessage());
                     return true;
                 }
+                // BEFORE the commit, so a refused configure leaves no epoch
+                // behind. An operator who was told `bad_config` must not find
+                // a fresh config_epoch on the next result frame.
+                String unusable = refuseConfigure(scope);
+                if (unusable != null) {
+                    denyAll();
+                    error(f, "bad_config", unusable);
+                    return true;
+                }
+
                 long epoch;
                 synchronized (commitLock) {
                     // Either close() got here first -- and we must not undo it
@@ -6563,6 +6726,19 @@ public final class BridgeClient {
             }
         }
         return true;
+    }
+
+    /** Ask the {@link ConfigGuard}, safely. A guard that throws refuses: it
+     *  is asked about an operator's intent, and an answer it could not
+     *  produce is not permission. */
+    private String refuseConfigure(Map<String, List<String>> scope) {
+        ConfigGuard g = configGuard;
+        if (g == null) return null;
+        try {
+            return g.refuse(scope);
+        } catch (Throwable t) {
+            return "the configure guard could not decide about this body: " + t;
+        }
     }
 
     /**

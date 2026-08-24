@@ -325,6 +325,56 @@ def test_at_most_one_plan_is_pending():
     )
 
 
+# A method declaration inside a `NOT_A_FILE` sketch: modifiers, a return type,
+# a name, an open paren. Deliberately anchored to the indentation the sketches
+# use, so a line of prose in a comment cannot look like one.
+_SKETCH_METHOD = re.compile(
+    r"^    (?:public|protected)(?: static| final| synchronized| abstract)* "
+    r"[\w.<>\[\], ]+? (\w+)\(", re.M)
+
+
+def test_no_java_sketch_declares_a_method_that_exists_nowhere():
+    """The Interface Contract's `Redactor` block declared three signatures the
+    shipped class never had, and the block called itself the source of truth.
+
+    None of these markers names a file, so the byte comparison above never
+    looked -- a package sketch spanning four classes has nothing to be
+    compared to. That is still true, and this is the part of it that CAN be
+    checked: a method the sketch names must exist somewhere in extension/src.
+    `clear()` did not exist anywhere in the tree, which is what this would
+    have caught.
+
+    WHAT IT DOES NOT SEE, said plainly rather than left to be discovered: it
+    matches on NAME only. The same block's `redactRequest(byte[] raw)` has a
+    real name and the wrong arity, and `register(...)` is real but lives on
+    `Injected` rather than on `Redactor` -- neither is visible here. The
+    defence against those is the precedence sentence in the block itself,
+    which now says the CODE is right when the two disagree; this test is the
+    cheap half, not the whole of it.
+    """
+    java = "\n".join(p.read_text(encoding="utf-8")
+                     for p in sorted((REPO / "extension" / "src").rglob("*.java")))
+    missing: list[tuple[str, str]] = []
+    checked = 0
+    for plan in PLANS:
+        if _is_pending(plan):
+            continue
+        for lang, prefix, marker, body in BLOCK.findall(plan.read_text()):
+            if lang != "java" or marker.strip() not in NOT_A_FILE:
+                continue
+            for name in _SKETCH_METHOD.findall(body):
+                checked += 1
+                if f"{name}(" not in java:
+                    missing.append((marker.strip(), name))
+    assert checked > 10, (
+        f"only {checked} sketch declarations were parsed; the regex stopped "
+        "matching and this test is now vacuous")
+    assert missing == [], (
+        "these Interface Contract signatures name methods that exist nowhere "
+        f"in extension/src: {missing}. The CODE is right -- fix the block."
+    )
+
+
 def test_a_file_whose_first_line_is_its_own_path_marker_is_compared_whole(tmp_path):
     """The comparison must follow the file, not a convention.
 

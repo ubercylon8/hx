@@ -525,7 +525,16 @@ class BridgeServer:
 
         `enforce_locally=False` drops THIS side's three duplicate refusals --
         the durable halt, `state == "halted"`, and anything short of
-        `configured` -- and nothing else. It exists for one caller, the
+        `configured` -- and nothing else.
+
+        SAY THE FIRST ONE OUT LOUD, because the keyword reads like
+        belt-and-braces and one of the three is not. Dropping the DURABLE HALT
+        means this call goes out while an operator has stopped the run by hand.
+        It is duplicated only while the two sides are looking at the SAME
+        sentinel file: the extension polls whatever `-Dhx.halt_sentinel` names
+        and this side writes `OperatorHalt.sentinel_path`, and the integration
+        rig makes them one path deliberately. Point them at two paths and this
+        keyword is not a duplicate at all -- it is the halt, off. It exists for one caller, the
         integration rig, and for one reason: those refusals are answered
         BEFORE the wire, so a test of the extension's gate written the obvious
         way writes ZERO frames to the socket, is satisfied by this side's own

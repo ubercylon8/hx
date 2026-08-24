@@ -176,3 +176,94 @@ def test_a_store_with_no_engagement_row_is_refused(tmp_path):
             halt_mod.OperatorHalt(root, conn)
     finally:
         conn.close()
+
+
+def _fd_double_close_probe(monkeypatch, run):
+    """Run `run()` with a write that fails, and report which fds were closed.
+
+    Returns (fds_opened_by_the_writer, fds_closed_by_hand). The claim under
+    test is that the second contains none of the first: once `os.fdopen` has
+    the descriptor, the file object closes it during unwinding and a second
+    close by hand lands on whatever number the OS has handed out since.
+    """
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(*a, **kw):
+        fd = real_open(*a, **kw)
+        opened.append(fd)
+        return fd
+
+    def spy_close(fd, *a, **kw):
+        closed.append(fd)
+        return real_close(fd, *a, **kw)
+
+    def boom(*a, **kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "close", spy_close)
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError):
+        run()
+    return opened, closed
+
+
+def test_a_failed_sentinel_write_does_not_close_a_descriptor_twice(engagement,
+                                                                   monkeypatch):
+    """S4's "stop by hand" path must not close somebody else's file.
+
+    `_write_sentinel` opened a descriptor, handed it to `os.fdopen`, and
+    wrapped BOTH in one try whose except arm called `os.close(fd)`. The file
+    object had already closed it on the way out, so that call landed on a
+    descriptor this code no longer owned.
+
+    DEMONSTRATED, outside this suite, in the shape the arm actually runs:
+
+        opened fd=4
+        os.close(4) -> OSError 9 (EBADF)        # before: caught, shrugged off
+
+        ...and with one intervening open() in that window:
+        opened fd=4;  another open() handed out fd=4   <-- THE SAME NUMBER
+        os.close(4) succeeded;  fstat(fd=4) -> EBADF
+
+    The second is the one that matters, and nothing about the first prevents
+    it. The bridge's accept loop opens sockets continuously, so the window is
+    not hypothetical -- it is the ordinary state of a running harness.
+
+    MEASURED with the pre-fix files and these tests: `opened [15], closed by
+    hand [15]`. With the pre-fix files and the tests as they were, 38 passed.
+    """
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    opened, closed = _fd_double_close_probe(
+        monkeypatch, lambda: h.halt("the operator stopped the run"))
+
+    assert opened, "the probe never saw an open(); it is not measuring anything"
+    assert [fd for fd in closed if fd in opened] == [], (
+        f"a descriptor os.fdopen already closed was closed again: "
+        f"opened {opened}, closed by hand {closed}")
+    # ...and the guard did not cost the cleanup it was tangled up with.
+    assert list(root.glob(".*")) == [], "a temp sentinel was left behind"
+    assert not h.sentinel_path.exists()
+
+
+def test_a_failed_config_write_does_not_close_a_descriptor_twice(tmp_path,
+                                                                 monkeypatch):
+    """`engagement._write_config_secure` had the identical shape, and
+    `halt.py`'s comment says so in as many words. Fixed together and tested
+    together -- one of them fixed alone is the pair drifting."""
+    from hx import engagement as engagement_mod
+
+    target = tmp_path / "config.yaml"
+    opened, closed = _fd_double_close_probe(
+        monkeypatch,
+        lambda: engagement_mod._write_config_secure(target, "name: x\n"))
+
+    assert opened, "the probe never saw an open(); it is not measuring anything"
+    assert [fd for fd in closed if fd in opened] == [], (
+        f"a descriptor os.fdopen already closed was closed again: "
+        f"opened {opened}, closed by hand {closed}")
+    assert list(tmp_path.glob(".*")) == [], "a temp config was left behind"
+    assert not target.exists()

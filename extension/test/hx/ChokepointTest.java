@@ -81,6 +81,7 @@ public class ChokepointTest {
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
         t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
           () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
+        t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
 
@@ -243,6 +244,47 @@ public class ChokepointTest {
     }
 
     /**
+     * There is no SECOND EGRESS FAMILY, not merely one Montoya call.
+     *
+     * Everything else in this class counts `http().sendRequest` -- Montoya's
+     * way out. Spec s4 says "never add a third egress path", and the JDK
+     * itself is the second one nobody was counting: `new Socket(...)`,
+     * `URL.openConnection()`, `java.net.http.HttpClient`, a `DatagramSocket`.
+     * A request issued through any of those never crosses Sender at all, so
+     * scope, method, dangerous-path, rate, budget and the credential refusal
+     * do not run and nothing anywhere would say so.
+     *
+     * And it needs no import line to become possible: `BridgeClient` already
+     * carries `import java.net.*` for its unix socket, so `new Socket(host,
+     * port)` compiles in that file today. Grepping for a new import would
+     * have found nothing.
+     *
+     * Clean at the time of writing -- every needle below is 0 -- so this is a
+     * tripwire rather than a fix. The needles are chosen NOT to collide with
+     * the bridge's legitimate unix-domain socket: that uses
+     * `SocketChannel.open(UnixDomainSocketAddress)` and
+     * `ServerSocketChannel`, neither of which contains `Socket(`. The one
+     * that does the most work is `InetSocketAddress` -- a SocketChannel is
+     * harmless until something gives it a network address to connect to.
+     */
+    static void noSecondEgressFamilyExists(List<Path> sources) throws IOException {
+        String[] needles = {
+            "new Socket(",        // a TCP client socket, straight from the JDK
+            "InetSocketAddress",  // ...or the address that turns a channel into one
+            "openConnection(",    // URL -> URLConnection / HttpURLConnection
+            "openStream(",        // URL.openStream(), the one-liner version
+            "HttpClient",         // java.net.http, the modern one
+            "DatagramSocket",     // UDP is egress too
+        };
+        for (String needle : needles) {
+            int total = 0;
+            for (Path p : sources) total += count(text(p), needle);
+            check("no `" + needle + "` anywhere in extension/src (" + total + ")",
+                  total == 0);
+        }
+    }
+
+    /**
      * Policy is asked in two halves, and both halves are asked exactly once.
      *
      * `decide()` was split so spec s7's credential refusal could sit BETWEEN
@@ -281,7 +323,7 @@ public class ChokepointTest {
     }
 
     /**
-     * The five wires that make the send path and its kill paths real, counted
+     * The six wires that make the send path and its kill paths real, counted
      * where they are made.
      *
      * Nothing can test HxExtension behaviourally -- it needs Burp -- and every
@@ -298,7 +340,11 @@ public class ChokepointTest {
      * the bridge does not -- is missing. Without setHaltNotifier an auto-halt
      * is invisible until the next send fails, and run.stop_reason is written
      * from a frame nobody sent. Without setSendHandler every send is refused
-     * `not_configured`, which is at least loud.
+     * `not_configured`, which is at least loud. Without setConfigGuard an
+     * operator who lowers `limit.rate_rps` mid-run gets a fresh config_epoch,
+     * no error and the OLD RATE -- s4 says that must be refused rather than
+     * ignored, and an uninstalled guard ACCEPTS (see setConfigGuard for why
+     * that asymmetry is deliberate), so this line is the whole of the check.
      *
      * Counting is all this can do, and it is worth more than nothing: the
      * failure being guarded against is the line being DELETED or never
@@ -316,6 +362,9 @@ public class ChokepointTest {
               + count(entry, "setHaltNotifier(") + ")", count(entry, "setHaltNotifier(") == 1);
         check("and the send path is installed (" + count(entry, "setSendHandler(") + ")",
               count(entry, "setSendHandler(") == 1);
+        check("and a configure that would move an armed limit is refused ("
+              + count(entry, "setConfigGuard(") + ")",
+              count(entry, "setConfigGuard(") == 1);
     }
 
     /**

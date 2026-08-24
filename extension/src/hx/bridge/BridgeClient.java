@@ -192,6 +192,48 @@ public final class BridgeClient {
      *  does not get to say it is not. */
     public void setHaltSource(HaltSource s) { this.haltSource = s; }
 
+    /**
+     * Whether a `configure` can be acted on, asked before it is committed.
+     *
+     * There is exactly one thing this answers today and spec s4 names it:
+     * `Limits` takes the rate and budget from the FIRST authorisation with an
+     * epoch and holds them for the run, because the budget must be monotonic
+     * -- a scope push must not resupply a run that has spent its requests. So
+     * an operator pushing `limit.rate_rps: 1` mid-run got a fresh
+     * `config_epoch`, no error, no log line, and the OLD RATE. Lowering a rate
+     * is the one change that is always safe, and believing you have slowed a
+     * run down when you have not is the failure to avoid.
+     *
+     * A refusal here is `bad_config`: DENY-ALL first, channel kept, so a
+     * corrected configure can follow. Same answer as an unparseable configure
+     * and for the same reason -- carrying on under the PREVIOUS intent is
+     * exactly the harm when the new intent was tighter.
+     *
+     * This is NOT re-arming, which is a later plan's work. It is the refusal
+     * that makes the absence of re-arming visible.
+     */
+    public interface ConfigGuard {
+        /** Why this configure cannot be acted on, or null when it can. */
+        String refuse(Map<String, List<String>> scope);
+    }
+
+    private volatile ConfigGuard configGuard;
+
+    /**
+     * Install it. Called before connect(), with the others.
+     *
+     * An UNINSTALLED guard accepts, unlike {@link #setHaltSource}, and the
+     * asymmetry is deliberate: a halt source that is missing leaves a question
+     * about stopping unanswered, where a config guard that is missing leaves
+     * the pre-existing silent-ignore. Failing closed here would mean an
+     * extension that cannot be configured at all, which is worse than the
+     * thing being fixed. ChokepointTest counts the wire instead.
+     *
+     * A guard that THROWS is a refusal. It is asked about an operator's
+     * intent, and an answer it could not produce is not permission.
+     */
+    public void setConfigGuard(ConfigGuard g) { this.configGuard = g; }
+
     private final Path socketPath;
     private final String engagementId;
     private final String instanceId;
@@ -468,6 +510,16 @@ public final class BridgeClient {
                     error(f, "bad_config", e.getMessage());
                     return true;
                 }
+                // BEFORE the commit, so a refused configure leaves no epoch
+                // behind. An operator who was told `bad_config` must not find
+                // a fresh config_epoch on the next result frame.
+                String unusable = refuseConfigure(scope);
+                if (unusable != null) {
+                    denyAll();
+                    error(f, "bad_config", unusable);
+                    return true;
+                }
+
                 long epoch;
                 synchronized (commitLock) {
                     // Either close() got here first -- and we must not undo it
@@ -572,6 +624,19 @@ public final class BridgeClient {
             }
         }
         return true;
+    }
+
+    /** Ask the {@link ConfigGuard}, safely. A guard that throws refuses: it
+     *  is asked about an operator's intent, and an answer it could not
+     *  produce is not permission. */
+    private String refuseConfigure(Map<String, List<String>> scope) {
+        ConfigGuard g = configGuard;
+        if (g == null) return null;
+        try {
+            return g.refuse(scope);
+        } catch (Throwable t) {
+            return "the configure guard could not decide about this body: " + t;
+        }
     }
 
     /**

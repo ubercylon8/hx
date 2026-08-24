@@ -9,6 +9,7 @@ import hx.policy.HxRequest;
 import hx.policy.Limiter;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * The Gate Policy consults, holding the rate and budget an operator
@@ -67,8 +68,8 @@ public final class Limits implements Gate {
      */
     public synchronized void arm(BridgeClient.Authorisation auth) {
         if (limiter != null || auth.epoch() == 0) return;
-        long rps = positive(auth, "limit.rate_rps", defaultRatePerSecond);
-        long max = positive(auth, "limit.max_requests", defaultMaxRequests);
+        long rps = positive(auth.scope(), "limit.rate_rps", defaultRatePerSecond);
+        long max = positive(auth.scope(), "limit.max_requests", defaultMaxRequests);
         ratePerSecond = rps;
         maxRequests = max;
         limiter = new Limiter(clock, rps, max);
@@ -104,6 +105,66 @@ public final class Limits implements Gate {
         return l.check(req);
     }
 
+    /**
+     * Why this configure's limits cannot be honoured, or null when they can.
+     *
+     * REFUSED, NOT IGNORED, and spec s4 says so since the 2026-08-23
+     * amendment. The numbers are taken from the first authorisation that has
+     * an epoch and held for the run -- see {@link #arm} for why the budget
+     * must be monotonic -- so an operator pushing `limit.rate_rps: 1` mid-run
+     * because the target is wobbling got a fresh `config_epoch`, no error, no
+     * log line, and the old rate. The failure to avoid is an operator who
+     * believes they slowed the run down and did not; lowering a rate is the
+     * one change that is always safe, so being unable to do it must at least
+     * be said out loud.
+     *
+     * This does not implement re-arming. It refuses, which BridgeClient's
+     * configure arm turns into `bad_config` -- DENY-ALL first, channel kept,
+     * so a corrected configure can follow. That is the same answer an
+     * unparseable configure gets and for the same reason: carrying on under
+     * the PREVIOUS limits is exactly the harm when an operator has just asked
+     * for tighter ones.
+     *
+     * AN OMITTED KEY IS NOT A CHANGE. {@link #arm}'s own contract is that an
+     * omitted key means the operator expressed no opinion and this jar's
+     * built-in answers -- so a later configure narrowing SCOPE and saying
+     * nothing about limits must go through. Reading the default and comparing
+     * it would refuse the commonest configure there is: the one that fixes a
+     * scope mistake.
+     *
+     * Before the first {@link #arm} there is nothing to contradict: the
+     * configure being checked is the one that will supply the numbers.
+     */
+    public synchronized String refuseIfLimitsMoved(Map<String, List<String>> scope) {
+        if (limiter == null || scope == null) return null;
+        String rate = movedFrom(scope, "limit.rate_rps", ratePerSecond);
+        if (rate != null) return rate;
+        return movedFrom(scope, "limit.max_requests", maxRequests);
+    }
+
+    /** How {@code key} in this configure contradicts what is armed, or null. */
+    private static String movedFrom(Map<String, List<String>> scope, String key, long armed) {
+        List<String> values = scope.get(key);
+        if (values == null || values.isEmpty()) return null;   // no opinion: not a change
+        long asked;
+        try {
+            asked = positive(scope, key, armed);
+        } catch (IllegalArgumentException e) {
+            // A present-but-unusable value. Refusing HERE is strictly better
+            // than where this used to surface: arm() throws on the next SEND,
+            // which BridgeClient answers with `not_configured` and a closed
+            // channel. bad_config keeps the channel and names the key.
+            return e.getMessage();
+        }
+        if (asked == armed) return null;
+        return key + " cannot change mid-run: this run armed at " + armed
+             + " and this configure asks for " + asked
+             + ". A configure re-authorises scope, not issuance -- the rate and"
+             + " budget are taken from the first authorisation and held, because"
+             + " the budget must not be resupplied by a scope push. Start a new"
+             + " run for a new limit, or re-send this configure without " + key + ".";
+    }
+
     // Test seams, package-private, in the same shape as Distress's.
     long ratePerSecond() { return limiter == null ? 0L : ratePerSecond; }
 
@@ -114,8 +175,8 @@ public final class Limits implements Gate {
         return l == null ? 0L : l.issued();
     }
 
-    private static long positive(BridgeClient.Authorisation auth, String key, long fallback) {
-        List<String> values = auth.scope().get(key);
+    private static long positive(Map<String, List<String>> scope, String key, long fallback) {
+        List<String> values = scope.get(key);
         if (values == null || values.isEmpty()) return fallback;
         if (values.size() != 1)
             // The protocol document says "integer, once". This comment used to

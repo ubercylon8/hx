@@ -179,6 +179,19 @@ is equally fail-closed and much worse to recover from: the extension dials once
 and has no reconnect, so the send-time refusal closes the channel and the
 corrected configure cannot be sent at all.
 
+**A limit is armed once per run and a later `configure` may not move it.** The
+rate and budget are taken from the first authorisation with an epoch and held,
+because the budget must be monotonic: a scope push must not resupply a run that
+has spent its requests. A later `configure` NAMING either key with a different
+value is answered `bad_config` -- DENY-ALL first, channel kept -- and consumes
+no `config_epoch`, so a refused configure leaves nothing behind for a later
+result frame to be attributed to. Omitting the key is not a change: it means
+the operator expressed no opinion, and a `configure` that narrows scope and
+says nothing about limits must go through. Silently ignoring the new value is
+the failure to avoid (spec §4): lowering a rate mid-run because the target is
+wobbling is always safe, and an operator who believes they made that change and
+did not is worse off than one who was refused.
+
 `halt` and `resume` carry no `id` and no `deadline_us`. Only `_request()`
 stamps those two, and both of these go out through `_send()`: nothing replies
 to a control frame, so there is nothing to correlate and no work to abandon at

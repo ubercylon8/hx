@@ -1,3 +1,4 @@
+import inspect
 import pathlib
 import re
 import sqlite3
@@ -283,6 +284,55 @@ def test_the_extension_fault_marker_is_the_same_string_on_both_sides():
     # ...and it is actually USED at the two sites that mean "this jar is
     # broken", rather than declared and forgotten.
     assert java.read_text().count("EXTENSION_FAULT +") == 2
+
+
+def test_the_module_docstrings_counts_are_the_counts():
+    """The docstring said "twenty-one columns, six of which are nullable ids".
+    Both numbers were wrong, and neither was checkable by reading.
+
+    MEASURED: the two INSERTs name 25 columns (9 + 16). Twenty-one is the
+    number of keyword parameters (8 + 13) -- a different thing, and the likely
+    source of the error, so it is derived here too and named as itself. Five
+    keyword parameters are nullable ids; `req_blob` and `resp_blob` are `str |
+    None` as well and are deliberately excluded, because a blob digest is not
+    a row id.
+
+    Derived rather than transcribed. A comment carrying a number nothing
+    computes is a comment that goes stale on the next column.
+    """
+    columns, keywords, nullable_ids = 0, 0, []
+    for name in ("record_denial", "record_exchange"):
+        fn = getattr(records, name)
+        source = inspect.getsource(fn)
+        insert = re.search(r"INSERT INTO \w+\((.*?)\)\s*\"?\s*\"?\s*VALUES",
+                           source, re.S)
+        assert insert, f"{name} no longer opens with a single INSERT"
+        named = [c.strip() for c in
+                 insert.group(1).replace('"', " ").replace("\n", " ").split(",")
+                 if c.strip()]
+        columns += len(named)
+        for param in inspect.signature(fn).parameters.values():
+            if param.kind is not param.KEYWORD_ONLY:
+                continue
+            keywords += 1
+            annotation = (param.annotation if isinstance(param.annotation, str)
+                          else str(param.annotation))
+            if annotation == "str | None" and param.name.endswith("_id"):
+                nullable_ids.append(f"{name}.{param.name}")
+
+    assert columns == 25, columns
+    assert keywords == 21, keywords
+    assert nullable_ids == [
+        "record_denial.run_id", "record_denial.scope_version_id",
+        "record_exchange.run_id", "record_exchange.surface_id",
+        "record_exchange.scope_version_id",
+    ], nullable_ids
+
+    # ...and the docstring says the numbers this just computed.
+    doc = records.__doc__
+    assert "**25** columns" in doc, doc
+    assert "9 on `denial`, 16 on `exchange`" in doc, doc
+    assert "**five**" in doc, doc
 
 
 def test_a_kind_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn):

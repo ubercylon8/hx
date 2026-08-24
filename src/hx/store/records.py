@@ -6,10 +6,21 @@ evidence store -- so every row the send path produces is written from here.
 Spec S4: "Any denial produces a `denial` row and a distinct error class.
 Denials are never silent."
 
-Both writers are keyword-only. Between them the two tables take twenty-one
-columns, six of which are nullable ids of the same shape, and a positional
-call site that drifted by one argument would file evidence against the wrong
-run without any type error to show for it.
+Both writers are keyword-only, and a positional call site that drifted by one
+argument would file evidence against the wrong run without any type error to
+show for it.
+
+COUNTED, because this paragraph had both numbers wrong. The two INSERTs name
+**25** columns -- 9 on `denial`, 16 on `exchange` -- not twenty-one; 21 is the
+number of KEYWORD PARAMETERS the two writers take between them (8 and 13),
+which is a different thing and the likely source of the error. And **five** of
+those parameters are nullable ids of the same shape, not six:
+`record_denial.run_id`, `record_denial.scope_version_id`,
+`record_exchange.run_id`, `record_exchange.surface_id` and
+`record_exchange.scope_version_id`. (`req_blob` and `resp_blob` are `str |
+None` too and are deliberately not in that five: a blob digest is not a row id
+and confusing one for the other is not the mistake this warns about.) A test
+derives all three numbers rather than trusting this comment again.
 
 Neither writer opens a transaction. Each is a single INSERT (or a single
 UPDATE), which is atomic on its own under `db.connect`'s autocommit
@@ -270,9 +281,11 @@ def row_for(error_class: str, *,
         return None
     raise ValueError(
         f"{error_class!r} is not an error class this module knows where to "
-        "put. Every class spec S6 lists is in exactly one of DENIAL_KIND, "
-        "EXCHANGE_OUTCOME and UNRECORDABLE; a new one has to be decided "
-        "about here rather than discarded."
+        "put. Every class spec S6 lists is named by at least one of "
+        "DENIAL_KIND, EXCHANGE_OUTCOME and UNRECORDABLE -- two of them by "
+        "both of the first two, which is what the precedence note above is "
+        "for -- and a new one has to be decided about here rather than "
+        "discarded."
     )
 
 

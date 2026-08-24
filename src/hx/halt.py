@@ -208,17 +208,36 @@ class OperatorHalt:
         """
         tmp = self.engagement_dir / f".{uuid.uuid4().hex}.{SENTINEL_NAME}"
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # OWNERSHIP OF `fd` TRANSFERS AT THE os.fdopen BELOW, and the two
+        # guards exist because it does: os.fdopen wraps the descriptor in a file
+        # object that closes it -- so once this succeeds, `fd` is the file
+        # object's to close and closing it here as well closes whatever number
+        # the OS has handed out since.
+        #
+        # It used to be one `try` around both, with `os.close(fd)` in the
+        # except arm. DEMONSTRATED: raise inside the `with` body and that arm
+        # runs `os.close` on an already-closed descriptor -- OSError 9 (EBADF),
+        # caught and shrugged off. Harmless only while nothing else opens
+        # anything in that window. Demonstrated too: with one intervening
+        # open() the kernel hands back THE SAME NUMBER, `os.close` then
+        # succeeds, and an `fstat` on the new owner's descriptor answers EBADF.
+        # The bridge's accept loop opens sockets continuously.
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            # It did NOT take ownership, so `fd` is still ours to close.
+            os.close(fd)
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        try:
+            with fh:
                 fh.write(f"{reason}\n{_now_us()}\n")
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.sentinel_path)
         except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            # No os.close here: `fh` owns the descriptor and the `with` has
+            # already closed it on the way out.
             Path(tmp).unlink(missing_ok=True)
             raise
         # The rename is atomic against a concurrent reader the moment it

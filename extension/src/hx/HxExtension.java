@@ -134,6 +134,11 @@ public class HxExtension implements BurpExtension {
         // A method reference and not a lambda body, so there is one answer to
         // "is the run stopped" and the send path runs it too.
         c.setHaltSource(sender::issuanceHeldReason);
+        // s4: the rate and budget are armed once and held for the run, so a
+        // later configure naming a different one must be REFUSED rather than
+        // silently ignored -- an operator who believes they slowed the run
+        // down and did not is the failure this exists to prevent.
+        c.setConfigGuard(limits::refuseIfLimitsMoved);
         haltSwitch.start();
         this.halt = haltSwitch;
         this.client = c;

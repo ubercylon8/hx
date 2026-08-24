@@ -69,9 +69,30 @@
 
 ## The Interface Contract
 
-Every task binds to these exact signatures. They are repeated in the tasks that
-use them, but this is the source of truth — if a task's code disagrees with
-this block, this block is right.
+Every task binds to these exact signatures, and the tasks repeat them.
+
+**Corrected 2026-08-23, and the correction is the point.** This block used to
+end "this is the source of truth — if a task's code disagrees with this block,
+this block is right." Three of the `Redactor` signatures below had never been
+true: it declared `register(String, int, int)` and `clear()` on the Redactor
+and `redactRequest(byte[])` with one argument, where the shipped class has
+`redactRequest(byte[], Injected)`, `register` on `Injected`, and no `clear`.
+Transcribed, they do not compile — but the *instruction* was the danger, not
+the signatures. It told the next implementer the code was wrong, and "fixing"
+the code to match would have reinstated the registry-on-the-`Redactor` design
+Task 4 measured as fail-open: the worker's registry is empty, so
+`redactRequest` hands back a verbatim copy INCLUDING the credential, with no
+exception and no signal.
+
+None of the markers here name a file, so `tests/test_plan_matches_repo.py`
+never looked (they are `NOT_A_FILE` entries — a package sketch is not a
+transcription of anything on disk). Nothing can compare a sketch to four
+files, so what is written down instead is which way to read a disagreement:
+
+> **These are a RECORD of the shipped signatures, not an instruction to the
+> code.** They are synced by hand and nothing checks them. If a task's code
+> disagrees with this block, THE CODE IS RIGHT and this block is stale — fix
+> it here. Never change a shipped signature to match this block.
 
 ```java
 // hx.policy
@@ -91,6 +112,11 @@ public interface Clock { long nowUs(); }
 public final class Policy {
     public Policy(Gate gate);
     public Decision decide(HxRequest req, BridgeClient.Authorisation auth);
+    // decide(), split, so spec S7's credential refusal can sit BETWEEN them:
+    // after the boundary checks (whose classes have denial rows) and before
+    // the Gate (the only check that spends a rate token and a budget slot).
+    public Decision decideBeforeGate(HxRequest req, BridgeClient.Authorisation auth);
+    public Decision checkGate(HxRequest req);
 }
 
 public final class Limiter implements Gate {
@@ -112,11 +138,21 @@ public final class Distress {
 ```java
 // hx.send
 public final class Redactor {
-    public void register(String identityId, int start, int end);
     public String unmanagedCredential(HxRequest req);   // header name, or null
-    public byte[] redactRequest(byte[] raw);
+    public byte[] redactRequest(byte[] raw, Injected injected);
     public byte[] redactResponse(byte[] raw);
-    public void clear();
+
+    // The ranges are held on a per-request value built FROM the bytes they are
+    // offsets into, never on the Redactor. A registry on the Redactor is what
+    // Task 4 measured as fail-open: a worker whose registry is empty gets a
+    // verbatim copy back INCLUDING the credential, with no exception and no
+    // signal. There is no clear() for the same reason -- nothing outlives the
+    // call, so there is nothing to clear.
+    public static final class Injected {
+        public Injected(byte[] forThese);
+        public synchronized void register(String identityId, int start, int end);
+    }
+    public static final class RangeError extends RuntimeException { }
 }
 
 public final class HaltSwitch {
@@ -139,6 +175,12 @@ public final class Sender {
     public Map<String, Object> issue(Map<String, Object> header, byte[] body,
                                      BridgeClient.Authorisation auth);
     public void setHaltNotifier(BridgeClient.HaltNotifier n);
+    // Why issuance is held, or null. The request-INDEPENDENT half of the
+    // refusals, so that BridgeClient.maySend() can ask the same authority the
+    // send path enforces rather than its own `halt` frame flag.
+    public String issuanceHeldReason();
+    public static int finalStatus(byte[] raw, int reported);
+    public static final int STATUS_UNREADABLE = 599;
 }
 ```
 
@@ -151,12 +193,17 @@ public interface HaltSink {                 // a halt/resume frame reaching the 
     void halted(String reason);
     void resumed();
 }
+public interface HaltSource {               // ...and the way back: what the send path enforces
+    String heldReason();                    // null while nothing is holding issuance
+}
 public interface HaltNotifier {             // the unsolicited `halted` frame, burp -> py
     void halted(String reason, String host, String window);
 }
 // on BridgeClient:
 public void setSendHandler(SendHandler h);
 public void setHaltSink(HaltSink s);
+public void setHaltSource(HaltSource s);    // maySend() fails CLOSED without one
+public static final String EXTENSION_FAULT = "extension fault: ";  // see the not_configured overload
 public HaltNotifier haltNotifier();         // frames {v, t:"halted", reason, host, window}
 ```
 
@@ -15066,6 +15113,69 @@ public class SenderTest {
         check("and does not refill the budget (" + limits.issued() + ")",
               limits.issued() == 1L);
 
+        // ...AND IT IS REFUSED RATHER THAN IGNORED. s4, amended 2026-08-23:
+        // an operator pushing `limit.rate_rps: 1` mid-run because the target
+        // is wobbling got a fresh config_epoch, no error, no log line, and the
+        // old rate. Lowering a rate is the one change that is always safe, so
+        // being unable to make it must at least be said out loud. Not
+        // re-arming -- refusing.
+        String slower = limits.refuseIfLimitsMoved(Map.of(
+                "limit.rate_rps", List.of("1")));
+        check("a configure asking for a DIFFERENT rate is refused (" + slower + ")",
+              slower != null && slower.contains("limit.rate_rps cannot change mid-run")
+              && slower.contains("armed at 5") && slower.contains("asks for 1"));
+        String bigger = limits.refuseIfLimitsMoved(Map.of(
+                "limit.max_requests", List.of("1000000")));
+        check("and so is one asking for a different budget (" + bigger + ")",
+              bigger != null && bigger.contains("limit.max_requests cannot change"));
+
+        // The two configures that MUST still go through, or this refusal
+        // breaks the commonest thing an operator does.
+        check("a configure repeating the SAME rate is not a change",
+              limits.refuseIfLimitsMoved(Map.of(
+                      "limit.rate_rps", List.of("5"),
+                      "limit.max_requests", List.of("2000"))) == null);
+        check("and one that narrows SCOPE and says nothing about limits goes through",
+              limits.refuseIfLimitsMoved(Map.of(
+                      "scope.include", List.of("https://app.example.test/api/*"))) == null);
+        // An omitted key means "no opinion" -- arm()'s own contract. Reading
+        // the built-in default and comparing it would refuse exactly the
+        // configure above, which is the one that fixes a scope mistake.
+        //
+        // THE INPUT THAT SEPARATES THAT FROM ITS ABSENCE is a run armed at a
+        // rate the built-in default does NOT equal. The rig above is armed at
+        // 5 with a default of 5, so a version that filled the absent key in
+        // from the default would compare 5 against 5 and look correct. Armed
+        // at 3 against a default of 5, it refuses a scope-only configure.
+        Limits three = new Limits(clock, 5L, 2000L);
+        three.arm(new BridgeClient.Authorisation(4L, Map.of(
+                "limit.rate_rps", List.of("3"),
+                "limit.max_requests", List.of("40"))));
+        check("armed away from the built-in defaults (" + three.ratePerSecond()
+              + " rps / " + three.maxRequests() + ")",
+              three.ratePerSecond() == 3L && three.maxRequests() == 40L);
+        check("a scope-only configure is STILL not a limit change",
+              three.refuseIfLimitsMoved(Map.of(
+                      "scope.include", List.of("https://x.test/*"))) == null);
+        check("...and one naming the built-in default IS a change, since it "
+              + "contradicts what is armed",
+              three.refuseIfLimitsMoved(Map.of(
+                      "limit.rate_rps", List.of("5"))) != null);
+
+        // A present-but-unusable value is refused HERE rather than throwing on
+        // the next send: bad_config keeps the channel, not_configured does not.
+        String unusable = limits.refuseIfLimitsMoved(Map.of(
+                "limit.rate_rps", List.of("as fast as possible")));
+        check("an unparseable limit in a later configure is refused by name ("
+              + unusable + ")",
+              unusable != null && unusable.contains("limit.rate_rps is not an integer"));
+
+        // Before anything is armed there is nothing to contradict: THIS
+        // configure is the one that will supply the numbers.
+        check("an unarmed Limits refuses no configure at all",
+              new Limits(clock, 5L, 2000L).refuseIfLimitsMoved(Map.of(
+                      "limit.rate_rps", List.of("99"))) == null);
+
         // Unreadable is not "use the default". An operator who asked for a
         // limit we cannot parse has not been given the limit they asked for,
         // and BridgeClient's send arm turns this throw into an error frame and
@@ -15166,6 +15276,7 @@ import hx.policy.HxRequest;
 import hx.policy.Limiter;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * The Gate Policy consults, holding the rate and budget an operator
@@ -15224,8 +15335,8 @@ public final class Limits implements Gate {
      */
     public synchronized void arm(BridgeClient.Authorisation auth) {
         if (limiter != null || auth.epoch() == 0) return;
-        long rps = positive(auth, "limit.rate_rps", defaultRatePerSecond);
-        long max = positive(auth, "limit.max_requests", defaultMaxRequests);
+        long rps = positive(auth.scope(), "limit.rate_rps", defaultRatePerSecond);
+        long max = positive(auth.scope(), "limit.max_requests", defaultMaxRequests);
         ratePerSecond = rps;
         maxRequests = max;
         limiter = new Limiter(clock, rps, max);
@@ -15261,6 +15372,66 @@ public final class Limits implements Gate {
         return l.check(req);
     }
 
+    /**
+     * Why this configure's limits cannot be honoured, or null when they can.
+     *
+     * REFUSED, NOT IGNORED, and spec s4 says so since the 2026-08-23
+     * amendment. The numbers are taken from the first authorisation that has
+     * an epoch and held for the run -- see {@link #arm} for why the budget
+     * must be monotonic -- so an operator pushing `limit.rate_rps: 1` mid-run
+     * because the target is wobbling got a fresh `config_epoch`, no error, no
+     * log line, and the old rate. The failure to avoid is an operator who
+     * believes they slowed the run down and did not; lowering a rate is the
+     * one change that is always safe, so being unable to do it must at least
+     * be said out loud.
+     *
+     * This does not implement re-arming. It refuses, which BridgeClient's
+     * configure arm turns into `bad_config` -- DENY-ALL first, channel kept,
+     * so a corrected configure can follow. That is the same answer an
+     * unparseable configure gets and for the same reason: carrying on under
+     * the PREVIOUS limits is exactly the harm when an operator has just asked
+     * for tighter ones.
+     *
+     * AN OMITTED KEY IS NOT A CHANGE. {@link #arm}'s own contract is that an
+     * omitted key means the operator expressed no opinion and this jar's
+     * built-in answers -- so a later configure narrowing SCOPE and saying
+     * nothing about limits must go through. Reading the default and comparing
+     * it would refuse the commonest configure there is: the one that fixes a
+     * scope mistake.
+     *
+     * Before the first {@link #arm} there is nothing to contradict: the
+     * configure being checked is the one that will supply the numbers.
+     */
+    public synchronized String refuseIfLimitsMoved(Map<String, List<String>> scope) {
+        if (limiter == null || scope == null) return null;
+        String rate = movedFrom(scope, "limit.rate_rps", ratePerSecond);
+        if (rate != null) return rate;
+        return movedFrom(scope, "limit.max_requests", maxRequests);
+    }
+
+    /** How {@code key} in this configure contradicts what is armed, or null. */
+    private static String movedFrom(Map<String, List<String>> scope, String key, long armed) {
+        List<String> values = scope.get(key);
+        if (values == null || values.isEmpty()) return null;   // no opinion: not a change
+        long asked;
+        try {
+            asked = positive(scope, key, armed);
+        } catch (IllegalArgumentException e) {
+            // A present-but-unusable value. Refusing HERE is strictly better
+            // than where this used to surface: arm() throws on the next SEND,
+            // which BridgeClient answers with `not_configured` and a closed
+            // channel. bad_config keeps the channel and names the key.
+            return e.getMessage();
+        }
+        if (asked == armed) return null;
+        return key + " cannot change mid-run: this run armed at " + armed
+             + " and this configure asks for " + asked
+             + ". A configure re-authorises scope, not issuance -- the rate and"
+             + " budget are taken from the first authorisation and held, because"
+             + " the budget must not be resupplied by a scope push. Start a new"
+             + " run for a new limit, or re-send this configure without " + key + ".";
+    }
+
     // Test seams, package-private, in the same shape as Distress's.
     long ratePerSecond() { return limiter == null ? 0L : ratePerSecond; }
 
@@ -15271,8 +15442,8 @@ public final class Limits implements Gate {
         return l == null ? 0L : l.issued();
     }
 
-    private static long positive(BridgeClient.Authorisation auth, String key, long fallback) {
-        List<String> values = auth.scope().get(key);
+    private static long positive(Map<String, List<String>> scope, String key, long fallback) {
+        List<String> values = scope.get(key);
         if (values == null || values.isEmpty()) return fallback;
         if (values.size() != 1)
             // The protocol document says "integer, once". This comment used to
@@ -16222,6 +16393,7 @@ public class ChokepointTest {
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
         t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
           () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
+        t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
 
@@ -16384,6 +16556,47 @@ public class ChokepointTest {
     }
 
     /**
+     * There is no SECOND EGRESS FAMILY, not merely one Montoya call.
+     *
+     * Everything else in this class counts `http().sendRequest` -- Montoya's
+     * way out. Spec s4 says "never add a third egress path", and the JDK
+     * itself is the second one nobody was counting: `new Socket(...)`,
+     * `URL.openConnection()`, `java.net.http.HttpClient`, a `DatagramSocket`.
+     * A request issued through any of those never crosses Sender at all, so
+     * scope, method, dangerous-path, rate, budget and the credential refusal
+     * do not run and nothing anywhere would say so.
+     *
+     * And it needs no import line to become possible: `BridgeClient` already
+     * carries `import java.net.*` for its unix socket, so `new Socket(host,
+     * port)` compiles in that file today. Grepping for a new import would
+     * have found nothing.
+     *
+     * Clean at the time of writing -- every needle below is 0 -- so this is a
+     * tripwire rather than a fix. The needles are chosen NOT to collide with
+     * the bridge's legitimate unix-domain socket: that uses
+     * `SocketChannel.open(UnixDomainSocketAddress)` and
+     * `ServerSocketChannel`, neither of which contains `Socket(`. The one
+     * that does the most work is `InetSocketAddress` -- a SocketChannel is
+     * harmless until something gives it a network address to connect to.
+     */
+    static void noSecondEgressFamilyExists(List<Path> sources) throws IOException {
+        String[] needles = {
+            "new Socket(",        // a TCP client socket, straight from the JDK
+            "InetSocketAddress",  // ...or the address that turns a channel into one
+            "openConnection(",    // URL -> URLConnection / HttpURLConnection
+            "openStream(",        // URL.openStream(), the one-liner version
+            "HttpClient",         // java.net.http, the modern one
+            "DatagramSocket",     // UDP is egress too
+        };
+        for (String needle : needles) {
+            int total = 0;
+            for (Path p : sources) total += count(text(p), needle);
+            check("no `" + needle + "` anywhere in extension/src (" + total + ")",
+                  total == 0);
+        }
+    }
+
+    /**
      * Policy is asked in two halves, and both halves are asked exactly once.
      *
      * `decide()` was split so spec s7's credential refusal could sit BETWEEN
@@ -16422,7 +16635,7 @@ public class ChokepointTest {
     }
 
     /**
-     * The five wires that make the send path and its kill paths real, counted
+     * The six wires that make the send path and its kill paths real, counted
      * where they are made.
      *
      * Nothing can test HxExtension behaviourally -- it needs Burp -- and every
@@ -16439,7 +16652,11 @@ public class ChokepointTest {
      * the bridge does not -- is missing. Without setHaltNotifier an auto-halt
      * is invisible until the next send fails, and run.stop_reason is written
      * from a frame nobody sent. Without setSendHandler every send is refused
-     * `not_configured`, which is at least loud.
+     * `not_configured`, which is at least loud. Without setConfigGuard an
+     * operator who lowers `limit.rate_rps` mid-run gets a fresh config_epoch,
+     * no error and the OLD RATE -- s4 says that must be refused rather than
+     * ignored, and an uninstalled guard ACCEPTS (see setConfigGuard for why
+     * that asymmetry is deliberate), so this line is the whole of the check.
      *
      * Counting is all this can do, and it is worth more than nothing: the
      * failure being guarded against is the line being DELETED or never
@@ -16457,6 +16674,9 @@ public class ChokepointTest {
               + count(entry, "setHaltNotifier(") + ")", count(entry, "setHaltNotifier(") == 1);
         check("and the send path is installed (" + count(entry, "setSendHandler(") + ")",
               count(entry, "setSendHandler(") == 1);
+        check("and a configure that would move an armed limit is refused ("
+              + count(entry, "setConfigGuard(") + ")",
+              count(entry, "setConfigGuard(") == 1);
     }
 
     /**
@@ -16814,6 +17034,11 @@ public class HxExtension implements BurpExtension {
         // A method reference and not a lambda body, so there is one answer to
         // "is the run stopped" and the send path runs it too.
         c.setHaltSource(sender::issuanceHeldReason);
+        // s4: the rate and budget are armed once and held for the run, so a
+        // later configure naming a different one must be REFUSED rather than
+        // silently ignored -- an operator who believes they slowed the run
+        // down and did not is the failure this exists to prevent.
+        c.setConfigGuard(limits::refuseIfLimitsMoved);
         haltSwitch.start();
         this.halt = haltSwitch;
         this.client = c;
@@ -17462,6 +17687,7 @@ to correlate and no work to abandon.
 
 ```python
 # tests/test_records.py
+import inspect
 import pathlib
 import re
 import sqlite3
@@ -17749,6 +17975,55 @@ def test_the_extension_fault_marker_is_the_same_string_on_both_sides():
     assert java.read_text().count("EXTENSION_FAULT +") == 2
 
 
+def test_the_module_docstrings_counts_are_the_counts():
+    """The docstring said "twenty-one columns, six of which are nullable ids".
+    Both numbers were wrong, and neither was checkable by reading.
+
+    MEASURED: the two INSERTs name 25 columns (9 + 16). Twenty-one is the
+    number of keyword parameters (8 + 13) -- a different thing, and the likely
+    source of the error, so it is derived here too and named as itself. Five
+    keyword parameters are nullable ids; `req_blob` and `resp_blob` are `str |
+    None` as well and are deliberately excluded, because a blob digest is not
+    a row id.
+
+    Derived rather than transcribed. A comment carrying a number nothing
+    computes is a comment that goes stale on the next column.
+    """
+    columns, keywords, nullable_ids = 0, 0, []
+    for name in ("record_denial", "record_exchange"):
+        fn = getattr(records, name)
+        source = inspect.getsource(fn)
+        insert = re.search(r"INSERT INTO \w+\((.*?)\)\s*\"?\s*\"?\s*VALUES",
+                           source, re.S)
+        assert insert, f"{name} no longer opens with a single INSERT"
+        named = [c.strip() for c in
+                 insert.group(1).replace('"', " ").replace("\n", " ").split(",")
+                 if c.strip()]
+        columns += len(named)
+        for param in inspect.signature(fn).parameters.values():
+            if param.kind is not param.KEYWORD_ONLY:
+                continue
+            keywords += 1
+            annotation = (param.annotation if isinstance(param.annotation, str)
+                          else str(param.annotation))
+            if annotation == "str | None" and param.name.endswith("_id"):
+                nullable_ids.append(f"{name}.{param.name}")
+
+    assert columns == 25, columns
+    assert keywords == 21, keywords
+    assert nullable_ids == [
+        "record_denial.run_id", "record_denial.scope_version_id",
+        "record_exchange.run_id", "record_exchange.surface_id",
+        "record_exchange.scope_version_id",
+    ], nullable_ids
+
+    # ...and the docstring says the numbers this just computed.
+    doc = records.__doc__
+    assert "**25** columns" in doc, doc
+    assert "9 on `denial`, 16 on `exchange`" in doc, doc
+    assert "**five**" in doc, doc
+
+
 def test_a_kind_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn):
     with pytest.raises(ValueError, match="not a denial kind"):
         records.record_denial(conn, run_id="r-1", kind="unmanaged_credential",
@@ -18015,10 +18290,21 @@ evidence store -- so every row the send path produces is written from here.
 Spec S4: "Any denial produces a `denial` row and a distinct error class.
 Denials are never silent."
 
-Both writers are keyword-only. Between them the two tables take twenty-one
-columns, six of which are nullable ids of the same shape, and a positional
-call site that drifted by one argument would file evidence against the wrong
-run without any type error to show for it.
+Both writers are keyword-only, and a positional call site that drifted by one
+argument would file evidence against the wrong run without any type error to
+show for it.
+
+COUNTED, because this paragraph had both numbers wrong. The two INSERTs name
+**25** columns -- 9 on `denial`, 16 on `exchange` -- not twenty-one; 21 is the
+number of KEYWORD PARAMETERS the two writers take between them (8 and 13),
+which is a different thing and the likely source of the error. And **five** of
+those parameters are nullable ids of the same shape, not six:
+`record_denial.run_id`, `record_denial.scope_version_id`,
+`record_exchange.run_id`, `record_exchange.surface_id` and
+`record_exchange.scope_version_id`. (`req_blob` and `resp_blob` are `str |
+None` too and are deliberately not in that five: a blob digest is not a row id
+and confusing one for the other is not the mistake this warns about.) A test
+derives all three numbers rather than trusting this comment again.
 
 Neither writer opens a transaction. Each is a single INSERT (or a single
 UPDATE), which is atomic on its own under `db.connect`'s autocommit
@@ -18279,9 +18565,11 @@ def row_for(error_class: str, *,
         return None
     raise ValueError(
         f"{error_class!r} is not an error class this module knows where to "
-        "put. Every class spec S6 lists is in exactly one of DENIAL_KIND, "
-        "EXCHANGE_OUTCOME and UNRECORDABLE; a new one has to be decided "
-        "about here rather than discarded."
+        "put. Every class spec S6 lists is named by at least one of "
+        "DENIAL_KIND, EXCHANGE_OUTCOME and UNRECORDABLE -- two of them by "
+        "both of the first two, which is what the precedence note above is "
+        "for -- and a new one has to be decided about here rather than "
+        "discarded."
     )
 
 
@@ -18629,6 +18917,97 @@ def test_a_store_with_no_engagement_row_is_refused(tmp_path):
             halt_mod.OperatorHalt(root, conn)
     finally:
         conn.close()
+
+
+def _fd_double_close_probe(monkeypatch, run):
+    """Run `run()` with a write that fails, and report which fds were closed.
+
+    Returns (fds_opened_by_the_writer, fds_closed_by_hand). The claim under
+    test is that the second contains none of the first: once `os.fdopen` has
+    the descriptor, the file object closes it during unwinding and a second
+    close by hand lands on whatever number the OS has handed out since.
+    """
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(*a, **kw):
+        fd = real_open(*a, **kw)
+        opened.append(fd)
+        return fd
+
+    def spy_close(fd, *a, **kw):
+        closed.append(fd)
+        return real_close(fd, *a, **kw)
+
+    def boom(*a, **kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "close", spy_close)
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError):
+        run()
+    return opened, closed
+
+
+def test_a_failed_sentinel_write_does_not_close_a_descriptor_twice(engagement,
+                                                                   monkeypatch):
+    """S4's "stop by hand" path must not close somebody else's file.
+
+    `_write_sentinel` opened a descriptor, handed it to `os.fdopen`, and
+    wrapped BOTH in one try whose except arm called `os.close(fd)`. The file
+    object had already closed it on the way out, so that call landed on a
+    descriptor this code no longer owned.
+
+    DEMONSTRATED, outside this suite, in the shape the arm actually runs:
+
+        opened fd=4
+        os.close(4) -> OSError 9 (EBADF)        # before: caught, shrugged off
+
+        ...and with one intervening open() in that window:
+        opened fd=4;  another open() handed out fd=4   <-- THE SAME NUMBER
+        os.close(4) succeeded;  fstat(fd=4) -> EBADF
+
+    The second is the one that matters, and nothing about the first prevents
+    it. The bridge's accept loop opens sockets continuously, so the window is
+    not hypothetical -- it is the ordinary state of a running harness.
+
+    MEASURED with the pre-fix files and these tests: `opened [15], closed by
+    hand [15]`. With the pre-fix files and the tests as they were, 38 passed.
+    """
+    root, conn = engagement
+    h = halt_mod.OperatorHalt(root, conn)
+    opened, closed = _fd_double_close_probe(
+        monkeypatch, lambda: h.halt("the operator stopped the run"))
+
+    assert opened, "the probe never saw an open(); it is not measuring anything"
+    assert [fd for fd in closed if fd in opened] == [], (
+        f"a descriptor os.fdopen already closed was closed again: "
+        f"opened {opened}, closed by hand {closed}")
+    # ...and the guard did not cost the cleanup it was tangled up with.
+    assert list(root.glob(".*")) == [], "a temp sentinel was left behind"
+    assert not h.sentinel_path.exists()
+
+
+def test_a_failed_config_write_does_not_close_a_descriptor_twice(tmp_path,
+                                                                 monkeypatch):
+    """`engagement._write_config_secure` had the identical shape, and
+    `halt.py`'s comment says so in as many words. Fixed together and tested
+    together -- one of them fixed alone is the pair drifting."""
+    from hx import engagement as engagement_mod
+
+    target = tmp_path / "config.yaml"
+    opened, closed = _fd_double_close_probe(
+        monkeypatch,
+        lambda: engagement_mod._write_config_secure(target, "name: x\n"))
+
+    assert opened, "the probe never saw an open(); it is not measuring anything"
+    assert [fd for fd in closed if fd in opened] == [], (
+        f"a descriptor os.fdopen already closed was closed again: "
+        f"opened {opened}, closed by hand {closed}")
+    assert list(tmp_path.glob(".*")) == [], "a temp config was left behind"
+    assert not target.exists()
 ```
 
 
@@ -18853,17 +19232,36 @@ class OperatorHalt:
         """
         tmp = self.engagement_dir / f".{uuid.uuid4().hex}.{SENTINEL_NAME}"
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # OWNERSHIP OF `fd` TRANSFERS AT THE os.fdopen BELOW, and the two
+        # guards exist because it does: os.fdopen wraps the descriptor in a file
+        # object that closes it -- so once this succeeds, `fd` is the file
+        # object's to close and closing it here as well closes whatever number
+        # the OS has handed out since.
+        #
+        # It used to be one `try` around both, with `os.close(fd)` in the
+        # except arm. DEMONSTRATED: raise inside the `with` body and that arm
+        # runs `os.close` on an already-closed descriptor -- OSError 9 (EBADF),
+        # caught and shrugged off. Harmless only while nothing else opens
+        # anything in that window. Demonstrated too: with one intervening
+        # open() the kernel hands back THE SAME NUMBER, `os.close` then
+        # succeeds, and an `fstat` on the new owner's descriptor answers EBADF.
+        # The bridge's accept loop opens sockets continuously.
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            # It did NOT take ownership, so `fd` is still ours to close.
+            os.close(fd)
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        try:
+            with fh:
                 fh.write(f"{reason}\n{_now_us()}\n")
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.sentinel_path)
         except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            # No os.close here: `fh` owns the descriptor and the `with` has
+            # already closed it on the way out.
             Path(tmp).unlink(missing_ok=True)
             raise
         # The rename is atomic against a concurrent reader the moment it
@@ -20089,7 +20487,16 @@ Insert `send()` immediately above `halt()`:
 
         `enforce_locally=False` drops THIS side's three duplicate refusals --
         the durable halt, `state == "halted"`, and anything short of
-        `configured` -- and nothing else. It exists for one caller, the
+        `configured` -- and nothing else.
+
+        SAY THE FIRST ONE OUT LOUD, because the keyword reads like
+        belt-and-braces and one of the three is not. Dropping the DURABLE HALT
+        means this call goes out while an operator has stopped the run by hand.
+        It is duplicated only while the two sides are looking at the SAME
+        sentinel file: the extension polls whatever `-Dhx.halt_sentinel` names
+        and this side writes `OperatorHalt.sentinel_path`, and the integration
+        rig makes them one path deliberately. Point them at two paths and this
+        keyword is not a duplicate at all -- it is the halt, off. It exists for one caller, the
         integration rig, and for one reason: those refusals are answered
         BEFORE the wire, so a test of the extension's gate written the obvious
         way writes ZERO frames to the socket, is satisfied by this side's own
