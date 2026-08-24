@@ -4251,7 +4251,38 @@ public final class Policy {
         this.gate = gate;
     }
 
+    /**
+     * The whole decision: everything before the Gate, then the Gate.
+     *
+     * SPLIT IN TWO, and the split is not a refactor for tidiness. Spec s7's
+     * unmanaged-credential refusal has to sit BETWEEN them, and it cannot be
+     * done from in here: this class is decided by its arguments alone, and a
+     * Policy that reached into hx.send for a Redactor would be the layering
+     * inverted. So the send path calls the two halves and puts its own check
+     * between; see Sender.decideAndIssue's ORDER OF REFUSAL.
+     *
+     * Callers that have no such check to interleave should keep calling this.
+     * It is exactly the composition it was before, in the same order, and
+     * PolicyTest still drives every rule through it.
+     */
     public Decision decide(HxRequest req, BridgeClient.Authorisation auth) {
+        Decision before = decideBeforeGate(req, auth);
+        if (!before.allowed()) return before;
+        return checkGate(req);
+    }
+
+    /**
+     * Everything decide() settles WITHOUT spending anything:
+     * not_configured -> scope_denied -> method_denied -> dangerous_denied.
+     *
+     * An `allowed()` answer from here is NOT permission to issue. The Gate has
+     * not run, so no rate token and no budget slot has been spent, and
+     * {@link #checkGate} is still owed. Anything that issues on the strength
+     * of this answer alone has issued past the rate limit and past the run's
+     * budget -- ChokepointTest counts the call sites in extension/src for
+     * exactly that reason, and there is one of each.
+     */
+    public Decision decideBeforeGate(HxRequest req, BridgeClient.Authorisation auth) {
         // Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before
         // any configure and after every disconnect; epochCounter is
         // pre-incremented, so a real commit is >= 1 and there is no other way
@@ -4308,10 +4339,17 @@ public final class Policy {
                         return Decision.deny("dangerous_denied",
                                 req.target() + " matches dangerous.path " + pattern);
 
-        // The Gate LAST, because it is the only check with a side effect:
-        // Limiter.check() spends a rate token and a budget slot, and spending
-        // either on a request three earlier rules would have refused shortens
-        // the run for no evidence.
+        return Decision.allow();
+    }
+
+    /**
+     * The Gate, and nothing else. LAST, because it is the only check with a
+     * side effect: Limiter.check() spends a rate token and a budget slot, and
+     * spending either on a request an earlier rule would have refused --
+     * including spec s7's credential refusal, which the send path makes
+     * between the two halves -- shortens the run for no evidence.
+     */
+    public Decision checkGate(HxRequest req) {
         Decision gated;
         try {
             gated = gate.check(req);
@@ -13228,6 +13266,8 @@ public class SenderTest {
             t("theRefusalOrderIsPinned", () -> theRefusalOrderIsPinned(sentinel));
             t("theHeldReasonIsTheSameAnswerTheSendPathActsOn",
               () -> theHeldReasonIsTheSameAnswerTheSendPathActsOn(sentinel));
+            t("aCredentialDoesNotMaskTheBoundaryTheRequestCrossed",
+              () -> aCredentialDoesNotMaskTheBoundaryTheRequestCrossed(sentinel));
             t("rateLimitedCarriesRetryAfterUs", () -> rateLimitedCarriesRetryAfterUs(sentinel));
             t("theDestinationPortAndSchemeAreReadFromTheFrameAndBounded",
               () -> theDestinationPortAndSchemeAreReadFromTheFrameAndBounded(sentinel));
@@ -13801,6 +13841,101 @@ public class SenderTest {
         check("and the frame agrees",
               "operator pressed stop".equals(
                       both.sender.issue(header, req, authorised()).get("detail")));
+    }
+
+    /**
+     * A credential does not MASK the boundary a request crossed.
+     *
+     * The credential check used to run before `policy.decide`, so it answered
+     * first for any request that both carried a credential and crossed a
+     * boundary. MEASURED, driving the real Sender:
+     *
+     *   out-of-scope AND unmanaged Cookie    -> unmanaged_credential
+     *   out-of-scope, no cookie              -> scope_denied
+     *   dangerous-path AND unmanaged Cookie  -> unmanaged_credential
+     *   wrong method AND unmanaged Cookie    -> unmanaged_credential
+     *
+     * `unmanaged_credential` is in `records.UNRECORDABLE`: there is no
+     * `denial` row for it and no `kind` to file one under. So a scope
+     * violation carrying a Cookie produced NO ROW ANYWHERE, and an error class
+     * naming the credential rather than the boundary crossed. s4: "Any denial
+     * produces a `denial` row and a distinct error class. Denials are never
+     * silent."
+     *
+     * WHY THAT WAS NOT A THEORETICAL SHAPE. Until Plan 5 ships identity
+     * injection, the natural agent action is replaying a request lifted from
+     * Burp's history -- which carries a Cookie. Every out-of-scope replay in
+     * that window was filed as a credential error, and "did the agent ever try
+     * to leave scope?" was unanswerable from the store. The integration
+     * suite's four-ways case sends its credential to an IN-SCOPE path, so this
+     * shape had never been driven at all.
+     *
+     * The stated rationale for the old position -- "before the Gate, for the
+     * same reason as 1" -- justifies before the GATE, which is where it still
+     * is. Scope, method and dangerous have no side effects; the Gate does.
+     * Both halves of that are asserted below: the class AND the gate count.
+     */
+    static void aCredentialDoesNotMaskTheBoundaryTheRequestCrossed(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        BridgeClient.Authorisation elsewhere = new BridgeClient.Authorisation(7L, Map.of(
+                "scope.include", List.of("https://other.example.test/*"),
+                "method.allow", List.of("GET", "HEAD", "OPTIONS"),
+                "dangerous.path", List.of("*/logout*", "*/password*")));
+
+        // The cookie is a REAL one in shape: this is the header an agent
+        // replaying from Burp's history carries, which is the whole reason
+        // the masking mattered before Plan 5.
+        deniedBeforeTheGate("out of scope, carrying a Cookie, is a SCOPE denial",
+               new Rig(sentinel), header,
+               request("GET", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+               elsewhere, "scope_denied");
+
+        deniedBeforeTheGate("a dangerous path carrying a Cookie is a DANGEROUS denial",
+               new Rig(sentinel), header,
+               request("GET", "/account/logout", "Cookie", "session=9f1c4a2e7b"),
+               authorised(), "dangerous_denied");
+
+        deniedBeforeTheGate("a refused method carrying a Cookie is a METHOD denial",
+               new Rig(sentinel), header,
+               request("DELETE", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+               authorised(), "method_denied");
+
+        // ...and the check is still ARMED, so none of the three above is
+        // vacuous. The same credential inside the boundary is still refused,
+        // and still before the Gate.
+        deniedBeforeTheGate("the same Cookie INSIDE the boundary is still refused",
+               new Rig(sentinel), header,
+               request("GET", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+               authorised(), "unmanaged_credential");
+        deniedBeforeTheGate("and so is an Authorization header inside it",
+               new Rig(sentinel), header,
+               request("GET", "/api/orders",
+                       "Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"),
+               authorised(), "unmanaged_credential");
+
+        // The half of the OLD rationale that was right, kept: the Gate has a
+        // side effect and the credential refusal must not pay for it. A rig
+        // whose gate would rate-limit still answers the credential, having
+        // spent nothing.
+        Rig limited = new Rig(sentinel);
+        limited.gate.verdict = Decision.rateLimited(200_000L, "5 rps, 5 issued this second");
+        deniedBeforeTheGate("the credential still beats the Gate, and costs it nothing",
+               limited, header,
+               request("GET", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+               authorised(), "unmanaged_credential");
+
+        // And every one of those refusals is a class the store has a row for,
+        // except the two that are genuinely about the credential. That is the
+        // property the move exists to restore, so it is asserted rather than
+        // left to the commit message: the three boundary classes are the three
+        // that records.DENIAL_KIND names.
+        Rig outOfScope = new Rig(sentinel);
+        Map<String, Object> e = outOfScope.sender.issue(
+                header, request("GET", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+                elsewhere);
+        check("the class an out-of-scope replay reports is one with a denial row ("
+              + e.get("class") + ")",
+              "scope_denied".equals(e.get("class")));
     }
 
     static void rateLimitedCarriesRetryAfterUs(Path sentinel) {
@@ -15218,15 +15353,29 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   2. not_configured        DENY-ALL, read from the Authorisation snapshot.
  *   3. halted                halt frame, sentinel file, or auto-halt on target
  *                            distress.
- *   4. unmanaged_credential  before the Gate, for the same reason as 1.
- *   5. Policy                scope -> method -> dangerous -> rate -> budget.
+ *   4. Policy, first half    scope -> method -> dangerous. None of them spends
+ *                            anything, so they cost nothing to run early.
+ *   5. unmanaged_credential  BETWEEN the two halves. Before the Gate for the
+ *                            same reason as 1; after 4 because this class has
+ *                            no `denial` row (records.UNRECORDABLE), so
+ *                            running it first made an out-of-scope request
+ *                            carrying a Cookie into a credential error with
+ *                            the scope violation recorded nowhere.
+ *   6. Policy, second half   the Gate: rate -> budget.
  *
- * Steps 2-5 hold the pinned order -- not_configured, halted, scope_denied,
+ * Steps 2-6 hold the pinned order -- not_configured, halted, scope_denied,
  * method_denied, dangerous_denied, rate_limited, budget_exhausted. Policy
  * checks not_configured too, and the duplication is deliberate: it is the
  * single most important check in the system, and repeating it here is what
  * lets the two halt checks run BEFORE the budget-consuming Gate without moving
  * any verdict out of its pinned position.
+ *
+ * Policy is asked in TWO calls rather than one because step 5 sits between
+ * them and cannot be made from inside Policy -- that class is decided by its
+ * arguments alone and must not reach into hx.send for a Redactor. The Gate
+ * half is owed after every allowed first half; ChokepointTest counts both
+ * call sites, because an issue path that called only the first would issue
+ * past the rate limit and past the run's budget.
  */
 public final class Sender {
 
@@ -15386,17 +15535,50 @@ public final class Sender {
         String held = issuanceHeldReason();
         if (held != null) return error(id, "halted", held);
 
+        // scope -> method -> dangerous. None of these spends anything, so
+        // they are free to run before the credential check -- and they MUST,
+        // because a credential refusal has no denial row and a scope
+        // violation does.
+        Decision boundary = policy.decideBeforeGate(req, auth);
+        if (!boundary.allowed()) return error(id, boundary);
+
         // s7: refused AND NEVER PERSISTED. Until identity injection registers
         // byte ranges, this is the only thing keeping a live client session
         // cookie out of a content-addressed blob store -- where, once written,
         // it is in every backup. This is the one item that cannot be
         // retrofitted.
+        //
+        // BEFORE THE GATE and AFTER the boundary checks, and the two halves of
+        // that placement have different reasons. Before the Gate, for the same
+        // reason as guard 1: Limits.check() spends a rate token and a budget
+        // slot on a request that is about to be refused. After scope, method
+        // and dangerous, because this class is in records.UNRECORDABLE -- there
+        // is no `denial` row for it -- so running it first turned every
+        // out-of-scope request CARRYING A COOKIE into a credential error with
+        // no row anywhere. MEASURED before this moved:
+        //
+        //   out-of-scope AND unmanaged Cookie    -> unmanaged_credential
+        //   out-of-scope, no cookie              -> scope_denied
+        //   dangerous-path AND unmanaged Cookie  -> unmanaged_credential
+        //
+        // Until Plan 5 the natural agent action is replaying a request lifted
+        // from Burp's history, which carries a Cookie -- so in that window
+        // EVERY out-of-scope replay was filed as a credential error and the
+        // scope-violation evidence was systematically absent. "Did the agent
+        // ever try to leave scope?" was unanswerable from the store. s4: "Any
+        // denial produces a `denial` row and a distinct error class. Denials
+        // are never silent."
+        //
+        // Nothing about s7 is weakened by the move. The request is still
+        // refused and still never persisted; what changed is which refusal an
+        // operator is told about when there are two.
         String credential = redactor.unmanagedCredential(req);
         if (credential != null)
             return error(id, "unmanaged_credential", "request carries a " + credential
                          + " header this extension did not inject");
 
-        Decision d = policy.decide(req, auth);
+        // The Gate LAST: the only check on this path with a side effect.
+        Decision d = policy.checkGate(req);
         if (!d.allowed()) return error(id, d);
 
         HttpReply reply;
@@ -16038,6 +16220,8 @@ public class ChokepointTest {
         t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
           () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
+        t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
+          () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
 
@@ -16197,6 +16381,44 @@ public class ChokepointTest {
         for (Path p : sources) total += count(text(p), ".authorisation()");
         check("the whole extension reads the Authorisation snapshot in exactly one "
               + "place, not " + total, total == 1);
+    }
+
+    /**
+     * Policy is asked in two halves, and both halves are asked exactly once.
+     *
+     * `decide()` was split so spec s7's credential refusal could sit BETWEEN
+     * them: it must run before the Gate (which spends a rate token and a
+     * budget slot) and after scope/method/dangerous (whose classes have
+     * `denial` rows, where `unmanaged_credential` has none). Policy cannot
+     * make that check itself -- it is decided by its arguments alone and must
+     * not reach into hx.send for a Redactor -- so the interleaving lives in
+     * Sender.
+     *
+     * The split is what this guards. `decideBeforeGate` answering `allowed()`
+     * is NOT permission to issue: the Gate has not run. A second issue path
+     * that called only the first half would issue past the rate limit and past
+     * the run's budget, with every behavioural test green, because every one
+     * of them drives the path that does call both.
+     *
+     * Counting is all this can do, and one of each is what the send path
+     * needs. `decide(` is not counted: it remains correct for a caller with
+     * nothing to interleave, and PolicyTest drives every rule through it.
+     */
+    static void bothHalvesOfTheDecisionAreAskedAndOnlyOnce(List<Path> sources)
+            throws IOException {
+        int before = 0, gate = 0;
+        for (Path p : sources) {
+            String t = text(p);
+            before += count(t, ".decideBeforeGate(");
+            gate += count(t, ".checkGate(");
+        }
+        check("the boundary half of the decision is asked exactly once (" + before + ")",
+              before == 1);
+        check("and the Gate half exactly once with it (" + gate + ")", gate == 1);
+        // The pair, not the two counts separately: what makes an allowed
+        // first half safe is that a second half follows it.
+        check("so no path in extension/src takes one without the other",
+              before == gate);
     }
 
     /**
@@ -17251,34 +17473,59 @@ from hx import engagement as engagement_mod
 from hx.store import db as db_mod
 from hx.store import records
 
-# Every class the extension may put on an `error` frame. The first ten are
-# S6's original enumeration verbatim; the four after them were added to S6 by
-# the 2026-08-23 amendment, which split them on whether the channel survives
-# (`bad_frame` and `engagement_mismatch` refuse one frame and keep it;
-# `bad_config` and `protocol_mismatch` drop to DENY-ALL first). The last is
-# NOT in S6's list at all and is pinned here so it cannot become a silent
-# denial:
+# Every class the extension may put on an `error` frame -- DERIVED from the
+# emit sites, not transcribed from S6.
 #
-#   halted               the plan's pinned decision order (not_configured ->
-#                        halted -> scope_denied -> ...) and Sender.issue both
-#                        emit it; it is the class an operator stop produces.
+# It was transcribed, and it drifted twice in the same direction. `halted` was
+# emitted by three sites and named in no list at all, and was pinned here with
+# a comment saying so -- a spec fix recorded as a test comment, which is the
+# thing dfc2080 was written to stop. `unknown_frame` was worse: emitted by
+# BridgeClient's `default ->` arm, in neither S6 nor
+# docs/bridge-protocol.md, and in NONE of DENIAL_KIND, EXCHANGE_OUTCOME or
+# UNRECORDABLE -- so test_every_error_class_has_somewhere_to_go passed while an
+# emittable class had nowhere to go. A hand-maintained list cannot catch a
+# class nobody thought to add to it; that is the definition of the failure.
 #
-# Of the five that S6 did not originally list, four can answer a `send`:
-# `bad_frame` (a send with no deadline_us, or a body that will not parse as an
-# HTTP request), `engagement_mismatch` (the frame named an engagement this
-# extension does not serve), `protocol_mismatch` (BridgeClient.handle checks
-# `v` before it switches on `t`, so a version-skewed jar answers a send with
-# it and closes) and `halted`. `bad_config` is the exception -- its only
-# emitter is handle()'s `configure` arm -- and it is pinned anyway, because
-# what this test is really anchored to is S6's list, and a class that gains a
-# second emitter later must not be able to do so silently.
-ERROR_CLASSES = frozenset({
-    "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
-    "budget_exhausted", "not_configured", "unmanaged_credential",
-    "transport_error", "timeout", "bridge_lost",
-    "bad_frame", "engagement_mismatch", "bad_config", "protocol_mismatch",
-    "halted",
-})
+# Both are in S6 and in the protocol doc now, and this set is read off the
+# code. The regexes below match the emit spellings this tree actually uses. A
+# class emitted through a spelling they do not know drops OUT of the derived
+# set, which turns the equality tests below red rather than passing quietly --
+# see test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan.
+_EMIT_PATTERNS = (
+    # Java: BridgeClient.error(f, "class", ...) and Sender.error(id, "class", ...)
+    r'\berror\(\s*\w+\s*,\s*"([a-z_]+)"',
+    # Java: Policy / Limits denials
+    r'\bDecision\.deny\(\s*"([a-z_]+)"',
+    # Python: BridgeError(..., error_class="class")
+    r"""\berror_class\s*=\s*["']([a-z_]+)["']""",
+)
+
+
+def _emitted_error_classes() -> set[str]:
+    """Scan BOTH implementations for the classes they can put on the wire."""
+    root = pathlib.Path(__file__).resolve().parents[1]
+    found: set[str] = set()
+    for tree in (root / "extension" / "src", root / "src" / "hx"):
+        assert tree.is_dir(), tree
+        for path in sorted(tree.rglob("*")):
+            if path.suffix not in (".java", ".py"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            for pattern in _EMIT_PATTERNS:
+                found.update(re.findall(pattern, text))
+    # `rate_limited` has its own constructor rather than Decision.deny,
+    # because it is the one class carrying retry_after_us (S6). Named here
+    # rather than given a fourth regex for a single site -- and the site is
+    # asserted, so this line cannot outlive it.
+    limiter = root / "extension" / "src" / "hx" / "policy" / "Limiter.java"
+    assert "Decision.rateLimited(" in limiter.read_text(encoding="utf-8"), (
+        "rate_limited is added by hand because Limiter uses "
+        "Decision.rateLimited(); that call is gone, so re-derive it properly")
+    found.add("rate_limited")
+    return found
+
+
+ERROR_CLASSES = frozenset(_emitted_error_classes())
 
 
 @pytest.fixture
@@ -17317,6 +17564,56 @@ def test_every_mapped_error_class_is_a_kind_the_schema_accepts(conn):
                               detail=error_class, at_us=1)
     assert conn.execute("SELECT COUNT(*) FROM denial").fetchone()[0] == \
         len(records.DENIAL_KIND)
+
+
+def test_the_protocol_doc_lists_exactly_the_classes_the_code_emits():
+    """The drift this whole item is about, made a test instead of a habit.
+
+    `halted` was emitted by three sites and named in neither S6 nor
+    docs/bridge-protocol.md; `unknown_frame` was emitted by one and named in
+    neither, AND in none of the store's three routing tables. Both were found
+    by a human reading the code against the document, which is not a control.
+
+    So the document is compared to the emit sites. ERROR_CLASSES is derived
+    from the code (see _emitted_error_classes) and this reads the doc's own
+    list, so the two sides of the comparison have independent sources -- which
+    is the property the hand-maintained version lacked.
+    """
+    doc = (pathlib.Path(__file__).resolve().parents[1]
+           / "docs" / "bridge-protocol.md").read_text(encoding="utf-8")
+    body = doc.split("`class` is one of:", 1)[1]
+    listed = set()
+    for line in body.splitlines()[1:]:
+        if not line.strip():
+            continue
+        if not line.startswith("    "):
+            break
+        # A NAME line starts at exactly four spaces and is followed by its
+        # description; the description's continuation lines are indented to
+        # line up under it, and must not be read as names.
+        entry = re.fullmatch(r"    ([a-z_]+)\s+\S.*", line)
+        if entry:
+            listed.add(entry.group(1))
+    assert listed == set(ERROR_CLASSES), (
+        f"only in the doc: {sorted(listed - set(ERROR_CLASSES))}; "
+        f"only in the code: {sorted(set(ERROR_CLASSES) - listed)}")
+
+
+def test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan():
+    """A regex that stopped matching would shrink ERROR_CLASSES quietly, and
+    every set-equality test here would then be comparing two small sets.
+
+    The floor is the count the code emits today, and the classes a scan that
+    lost its Java arm or its Python arm would drop first are named
+    individually: `unknown_frame` has a single Java site, `bridge_lost` is
+    mostly Python, and `rate_limited` is the one added by hand.
+    """
+    assert len(ERROR_CLASSES) == 16, sorted(ERROR_CLASSES)
+    for expected in ("halted", "unknown_frame", "bridge_lost", "rate_limited",
+                     "scope_denied", "not_configured"):
+        assert expected in ERROR_CLASSES, (
+            f"{expected!r} is emitted by this tree and the scan did not find "
+            "it; a spelling changed and the derivation went narrow silently")
 
 
 def test_every_error_class_has_somewhere_to_go():
@@ -17925,9 +18222,17 @@ NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
 #       reason as the two above even though its only emitter today is
 #       handle()'s `configure` arm: it is in S6's class list, and a class that
 #       gains a second emitter later must not be able to do so silently.
+#   unknown_frame -- the frame's `t` is not a type this version knows. Exactly
+#       bad_frame's shape: one frame refused, the channel kept, and nothing
+#       about a request decided. It was in NONE of these three sets until the
+#       2026-08-23 amendment, so `test_every_error_class_has_somewhere_to_go`
+#       passed while an emittable class had nowhere to go -- the set was
+#       transcribed from S6 by hand and S6 did not list it either. Both ends
+#       of that are fixed: S6 lists it, and the set is now DERIVED from the
+#       emit sites.
 UNRECORDABLE = frozenset({"unmanaged_credential", "transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
-                          "protocol_mismatch", "bad_config"})
+                          "protocol_mismatch", "bad_config", "unknown_frame"})
 
 
 def row_for(error_class: str, *,
@@ -21695,6 +22000,19 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     attempt("credential", "GET", "/api/orders",
             headers=[("Cookie", cookie)])
 
+    # ...and the SAME credential on a request that also leaves scope. This
+    # shape had never been driven: every case above sends its credential to
+    # an in-scope path, so the two guards were never made to compete.
+    #
+    # Until the whole-branch review it answered `unmanaged_credential`, and
+    # that class is in records.UNRECORDABLE -- so a scope violation carrying a
+    # Cookie produced no row anywhere and named the credential rather than the
+    # boundary crossed. It is not an exotic input either: until Plan 5 ships
+    # identity injection, the natural agent action is replaying a request
+    # lifted from Burp's history, and those carry a Cookie.
+    attempt("scope_with_credential", "GET", "/api/orders", to=rig.offside,
+            headers=[("Cookie", cookie)])
+
     # The assertions this test exists for, on what the SERVERS saw, and they
     # come FIRST: "an error came back" and "the request was never issued" are
     # different claims, and only the second one is S4's invariant.
@@ -21709,10 +22027,15 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
         "method": "method_denied",
         "dangerous": "dangerous_denied",
         "credential": "unmanaged_credential",
+        # The boundary, not the credential -- and so a class with a row.
+        "scope_with_credential": "scope_denied",
     }
 
-    # Denials are never silent (S4): each one becomes a row.
-    for name in ("scope", "method", "dangerous"):
+    # Denials are never silent (S4): each one becomes a row. The fifth case is
+    # in this loop and not merely in the dict above, because "it reported
+    # scope_denied" and "it produced a denial row" are different claims and
+    # only the second is S4's.
+    for name in ("scope", "method", "dangerous", "scope_with_credential"):
         assert records.record_denial(
             rig.eng.db, run_id=rig.run_id,
             kind=records.DENIAL_KIND[refusals[name].error_class],
@@ -21722,7 +22045,7 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     kinds = [r["kind"] for r in rig.eng.db.execute(
         "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us, rowid",
         (rig.run_id,))]
-    assert kinds == ["scope", "method", "dangerous"]
+    assert kinds == ["scope", "method", "dangerous", "scope"]
 
     # A gap, pinned rather than papered over: Plan 1's denial.kind CHECK
     # lists scope, method, dangerous, rate, budget and not_configured. There

@@ -213,9 +213,17 @@ NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
 #       reason as the two above even though its only emitter today is
 #       handle()'s `configure` arm: it is in S6's class list, and a class that
 #       gains a second emitter later must not be able to do so silently.
+#   unknown_frame -- the frame's `t` is not a type this version knows. Exactly
+#       bad_frame's shape: one frame refused, the channel kept, and nothing
+#       about a request decided. It was in NONE of these three sets until the
+#       2026-08-23 amendment, so `test_every_error_class_has_somewhere_to_go`
+#       passed while an emittable class had nowhere to go -- the set was
+#       transcribed from S6 by hand and S6 did not list it either. Both ends
+#       of that are fixed: S6 lists it, and the set is now DERIVED from the
+#       emit sites.
 UNRECORDABLE = frozenset({"unmanaged_credential", "transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
-                          "protocol_mismatch", "bad_config"})
+                          "protocol_mismatch", "bad_config", "unknown_frame"})
 
 
 def row_for(error_class: str, *,

@@ -42,15 +42,29 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   2. not_configured        DENY-ALL, read from the Authorisation snapshot.
  *   3. halted                halt frame, sentinel file, or auto-halt on target
  *                            distress.
- *   4. unmanaged_credential  before the Gate, for the same reason as 1.
- *   5. Policy                scope -> method -> dangerous -> rate -> budget.
+ *   4. Policy, first half    scope -> method -> dangerous. None of them spends
+ *                            anything, so they cost nothing to run early.
+ *   5. unmanaged_credential  BETWEEN the two halves. Before the Gate for the
+ *                            same reason as 1; after 4 because this class has
+ *                            no `denial` row (records.UNRECORDABLE), so
+ *                            running it first made an out-of-scope request
+ *                            carrying a Cookie into a credential error with
+ *                            the scope violation recorded nowhere.
+ *   6. Policy, second half   the Gate: rate -> budget.
  *
- * Steps 2-5 hold the pinned order -- not_configured, halted, scope_denied,
+ * Steps 2-6 hold the pinned order -- not_configured, halted, scope_denied,
  * method_denied, dangerous_denied, rate_limited, budget_exhausted. Policy
  * checks not_configured too, and the duplication is deliberate: it is the
  * single most important check in the system, and repeating it here is what
  * lets the two halt checks run BEFORE the budget-consuming Gate without moving
  * any verdict out of its pinned position.
+ *
+ * Policy is asked in TWO calls rather than one because step 5 sits between
+ * them and cannot be made from inside Policy -- that class is decided by its
+ * arguments alone and must not reach into hx.send for a Redactor. The Gate
+ * half is owed after every allowed first half; ChokepointTest counts both
+ * call sites, because an issue path that called only the first would issue
+ * past the rate limit and past the run's budget.
  */
 public final class Sender {
 
@@ -210,17 +224,50 @@ public final class Sender {
         String held = issuanceHeldReason();
         if (held != null) return error(id, "halted", held);
 
+        // scope -> method -> dangerous. None of these spends anything, so
+        // they are free to run before the credential check -- and they MUST,
+        // because a credential refusal has no denial row and a scope
+        // violation does.
+        Decision boundary = policy.decideBeforeGate(req, auth);
+        if (!boundary.allowed()) return error(id, boundary);
+
         // s7: refused AND NEVER PERSISTED. Until identity injection registers
         // byte ranges, this is the only thing keeping a live client session
         // cookie out of a content-addressed blob store -- where, once written,
         // it is in every backup. This is the one item that cannot be
         // retrofitted.
+        //
+        // BEFORE THE GATE and AFTER the boundary checks, and the two halves of
+        // that placement have different reasons. Before the Gate, for the same
+        // reason as guard 1: Limits.check() spends a rate token and a budget
+        // slot on a request that is about to be refused. After scope, method
+        // and dangerous, because this class is in records.UNRECORDABLE -- there
+        // is no `denial` row for it -- so running it first turned every
+        // out-of-scope request CARRYING A COOKIE into a credential error with
+        // no row anywhere. MEASURED before this moved:
+        //
+        //   out-of-scope AND unmanaged Cookie    -> unmanaged_credential
+        //   out-of-scope, no cookie              -> scope_denied
+        //   dangerous-path AND unmanaged Cookie  -> unmanaged_credential
+        //
+        // Until Plan 5 the natural agent action is replaying a request lifted
+        // from Burp's history, which carries a Cookie -- so in that window
+        // EVERY out-of-scope replay was filed as a credential error and the
+        // scope-violation evidence was systematically absent. "Did the agent
+        // ever try to leave scope?" was unanswerable from the store. s4: "Any
+        // denial produces a `denial` row and a distinct error class. Denials
+        // are never silent."
+        //
+        // Nothing about s7 is weakened by the move. The request is still
+        // refused and still never persisted; what changed is which refusal an
+        // operator is told about when there are two.
         String credential = redactor.unmanagedCredential(req);
         if (credential != null)
             return error(id, "unmanaged_credential", "request carries a " + credential
                          + " header this extension did not inject");
 
-        Decision d = policy.decide(req, auth);
+        // The Gate LAST: the only check on this path with a side effect.
+        Decision d = policy.checkGate(req);
         if (!d.allowed()) return error(id, d);
 
         HttpReply reply;

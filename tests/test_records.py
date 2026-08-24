@@ -9,34 +9,59 @@ from hx import engagement as engagement_mod
 from hx.store import db as db_mod
 from hx.store import records
 
-# Every class the extension may put on an `error` frame. The first ten are
-# S6's original enumeration verbatim; the four after them were added to S6 by
-# the 2026-08-23 amendment, which split them on whether the channel survives
-# (`bad_frame` and `engagement_mismatch` refuse one frame and keep it;
-# `bad_config` and `protocol_mismatch` drop to DENY-ALL first). The last is
-# NOT in S6's list at all and is pinned here so it cannot become a silent
-# denial:
+# Every class the extension may put on an `error` frame -- DERIVED from the
+# emit sites, not transcribed from S6.
 #
-#   halted               the plan's pinned decision order (not_configured ->
-#                        halted -> scope_denied -> ...) and Sender.issue both
-#                        emit it; it is the class an operator stop produces.
+# It was transcribed, and it drifted twice in the same direction. `halted` was
+# emitted by three sites and named in no list at all, and was pinned here with
+# a comment saying so -- a spec fix recorded as a test comment, which is the
+# thing dfc2080 was written to stop. `unknown_frame` was worse: emitted by
+# BridgeClient's `default ->` arm, in neither S6 nor
+# docs/bridge-protocol.md, and in NONE of DENIAL_KIND, EXCHANGE_OUTCOME or
+# UNRECORDABLE -- so test_every_error_class_has_somewhere_to_go passed while an
+# emittable class had nowhere to go. A hand-maintained list cannot catch a
+# class nobody thought to add to it; that is the definition of the failure.
 #
-# Of the five that S6 did not originally list, four can answer a `send`:
-# `bad_frame` (a send with no deadline_us, or a body that will not parse as an
-# HTTP request), `engagement_mismatch` (the frame named an engagement this
-# extension does not serve), `protocol_mismatch` (BridgeClient.handle checks
-# `v` before it switches on `t`, so a version-skewed jar answers a send with
-# it and closes) and `halted`. `bad_config` is the exception -- its only
-# emitter is handle()'s `configure` arm -- and it is pinned anyway, because
-# what this test is really anchored to is S6's list, and a class that gains a
-# second emitter later must not be able to do so silently.
-ERROR_CLASSES = frozenset({
-    "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
-    "budget_exhausted", "not_configured", "unmanaged_credential",
-    "transport_error", "timeout", "bridge_lost",
-    "bad_frame", "engagement_mismatch", "bad_config", "protocol_mismatch",
-    "halted",
-})
+# Both are in S6 and in the protocol doc now, and this set is read off the
+# code. The regexes below match the emit spellings this tree actually uses. A
+# class emitted through a spelling they do not know drops OUT of the derived
+# set, which turns the equality tests below red rather than passing quietly --
+# see test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan.
+_EMIT_PATTERNS = (
+    # Java: BridgeClient.error(f, "class", ...) and Sender.error(id, "class", ...)
+    r'\berror\(\s*\w+\s*,\s*"([a-z_]+)"',
+    # Java: Policy / Limits denials
+    r'\bDecision\.deny\(\s*"([a-z_]+)"',
+    # Python: BridgeError(..., error_class="class")
+    r"""\berror_class\s*=\s*["']([a-z_]+)["']""",
+)
+
+
+def _emitted_error_classes() -> set[str]:
+    """Scan BOTH implementations for the classes they can put on the wire."""
+    root = pathlib.Path(__file__).resolve().parents[1]
+    found: set[str] = set()
+    for tree in (root / "extension" / "src", root / "src" / "hx"):
+        assert tree.is_dir(), tree
+        for path in sorted(tree.rglob("*")):
+            if path.suffix not in (".java", ".py"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            for pattern in _EMIT_PATTERNS:
+                found.update(re.findall(pattern, text))
+    # `rate_limited` has its own constructor rather than Decision.deny,
+    # because it is the one class carrying retry_after_us (S6). Named here
+    # rather than given a fourth regex for a single site -- and the site is
+    # asserted, so this line cannot outlive it.
+    limiter = root / "extension" / "src" / "hx" / "policy" / "Limiter.java"
+    assert "Decision.rateLimited(" in limiter.read_text(encoding="utf-8"), (
+        "rate_limited is added by hand because Limiter uses "
+        "Decision.rateLimited(); that call is gone, so re-derive it properly")
+    found.add("rate_limited")
+    return found
+
+
+ERROR_CLASSES = frozenset(_emitted_error_classes())
 
 
 @pytest.fixture
@@ -75,6 +100,56 @@ def test_every_mapped_error_class_is_a_kind_the_schema_accepts(conn):
                               detail=error_class, at_us=1)
     assert conn.execute("SELECT COUNT(*) FROM denial").fetchone()[0] == \
         len(records.DENIAL_KIND)
+
+
+def test_the_protocol_doc_lists_exactly_the_classes_the_code_emits():
+    """The drift this whole item is about, made a test instead of a habit.
+
+    `halted` was emitted by three sites and named in neither S6 nor
+    docs/bridge-protocol.md; `unknown_frame` was emitted by one and named in
+    neither, AND in none of the store's three routing tables. Both were found
+    by a human reading the code against the document, which is not a control.
+
+    So the document is compared to the emit sites. ERROR_CLASSES is derived
+    from the code (see _emitted_error_classes) and this reads the doc's own
+    list, so the two sides of the comparison have independent sources -- which
+    is the property the hand-maintained version lacked.
+    """
+    doc = (pathlib.Path(__file__).resolve().parents[1]
+           / "docs" / "bridge-protocol.md").read_text(encoding="utf-8")
+    body = doc.split("`class` is one of:", 1)[1]
+    listed = set()
+    for line in body.splitlines()[1:]:
+        if not line.strip():
+            continue
+        if not line.startswith("    "):
+            break
+        # A NAME line starts at exactly four spaces and is followed by its
+        # description; the description's continuation lines are indented to
+        # line up under it, and must not be read as names.
+        entry = re.fullmatch(r"    ([a-z_]+)\s+\S.*", line)
+        if entry:
+            listed.add(entry.group(1))
+    assert listed == set(ERROR_CLASSES), (
+        f"only in the doc: {sorted(listed - set(ERROR_CLASSES))}; "
+        f"only in the code: {sorted(set(ERROR_CLASSES) - listed)}")
+
+
+def test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan():
+    """A regex that stopped matching would shrink ERROR_CLASSES quietly, and
+    every set-equality test here would then be comparing two small sets.
+
+    The floor is the count the code emits today, and the classes a scan that
+    lost its Java arm or its Python arm would drop first are named
+    individually: `unknown_frame` has a single Java site, `bridge_lost` is
+    mostly Python, and `rate_limited` is the one added by hand.
+    """
+    assert len(ERROR_CLASSES) == 16, sorted(ERROR_CLASSES)
+    for expected in ("halted", "unknown_frame", "bridge_lost", "rate_limited",
+                     "scope_denied", "not_configured"):
+        assert expected in ERROR_CLASSES, (
+            f"{expected!r} is emitted by this tree and the scan did not find "
+            "it; a spelling changed and the derivation went narrow silently")
 
 
 def test_every_error_class_has_somewhere_to_go():

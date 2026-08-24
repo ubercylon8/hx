@@ -67,6 +67,8 @@ public class SenderTest {
             t("theRefusalOrderIsPinned", () -> theRefusalOrderIsPinned(sentinel));
             t("theHeldReasonIsTheSameAnswerTheSendPathActsOn",
               () -> theHeldReasonIsTheSameAnswerTheSendPathActsOn(sentinel));
+            t("aCredentialDoesNotMaskTheBoundaryTheRequestCrossed",
+              () -> aCredentialDoesNotMaskTheBoundaryTheRequestCrossed(sentinel));
             t("rateLimitedCarriesRetryAfterUs", () -> rateLimitedCarriesRetryAfterUs(sentinel));
             t("theDestinationPortAndSchemeAreReadFromTheFrameAndBounded",
               () -> theDestinationPortAndSchemeAreReadFromTheFrameAndBounded(sentinel));
@@ -640,6 +642,101 @@ public class SenderTest {
         check("and the frame agrees",
               "operator pressed stop".equals(
                       both.sender.issue(header, req, authorised()).get("detail")));
+    }
+
+    /**
+     * A credential does not MASK the boundary a request crossed.
+     *
+     * The credential check used to run before `policy.decide`, so it answered
+     * first for any request that both carried a credential and crossed a
+     * boundary. MEASURED, driving the real Sender:
+     *
+     *   out-of-scope AND unmanaged Cookie    -> unmanaged_credential
+     *   out-of-scope, no cookie              -> scope_denied
+     *   dangerous-path AND unmanaged Cookie  -> unmanaged_credential
+     *   wrong method AND unmanaged Cookie    -> unmanaged_credential
+     *
+     * `unmanaged_credential` is in `records.UNRECORDABLE`: there is no
+     * `denial` row for it and no `kind` to file one under. So a scope
+     * violation carrying a Cookie produced NO ROW ANYWHERE, and an error class
+     * naming the credential rather than the boundary crossed. s4: "Any denial
+     * produces a `denial` row and a distinct error class. Denials are never
+     * silent."
+     *
+     * WHY THAT WAS NOT A THEORETICAL SHAPE. Until Plan 5 ships identity
+     * injection, the natural agent action is replaying a request lifted from
+     * Burp's history -- which carries a Cookie. Every out-of-scope replay in
+     * that window was filed as a credential error, and "did the agent ever try
+     * to leave scope?" was unanswerable from the store. The integration
+     * suite's four-ways case sends its credential to an IN-SCOPE path, so this
+     * shape had never been driven at all.
+     *
+     * The stated rationale for the old position -- "before the Gate, for the
+     * same reason as 1" -- justifies before the GATE, which is where it still
+     * is. Scope, method and dangerous have no side effects; the Gate does.
+     * Both halves of that are asserted below: the class AND the gate count.
+     */
+    static void aCredentialDoesNotMaskTheBoundaryTheRequestCrossed(Path sentinel) {
+        Map<String, Object> header = sendHeader(NOW + THIRTY_SECONDS);
+        BridgeClient.Authorisation elsewhere = new BridgeClient.Authorisation(7L, Map.of(
+                "scope.include", List.of("https://other.example.test/*"),
+                "method.allow", List.of("GET", "HEAD", "OPTIONS"),
+                "dangerous.path", List.of("*/logout*", "*/password*")));
+
+        // The cookie is a REAL one in shape: this is the header an agent
+        // replaying from Burp's history carries, which is the whole reason
+        // the masking mattered before Plan 5.
+        deniedBeforeTheGate("out of scope, carrying a Cookie, is a SCOPE denial",
+               new Rig(sentinel), header,
+               request("GET", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+               elsewhere, "scope_denied");
+
+        deniedBeforeTheGate("a dangerous path carrying a Cookie is a DANGEROUS denial",
+               new Rig(sentinel), header,
+               request("GET", "/account/logout", "Cookie", "session=9f1c4a2e7b"),
+               authorised(), "dangerous_denied");
+
+        deniedBeforeTheGate("a refused method carrying a Cookie is a METHOD denial",
+               new Rig(sentinel), header,
+               request("DELETE", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+               authorised(), "method_denied");
+
+        // ...and the check is still ARMED, so none of the three above is
+        // vacuous. The same credential inside the boundary is still refused,
+        // and still before the Gate.
+        deniedBeforeTheGate("the same Cookie INSIDE the boundary is still refused",
+               new Rig(sentinel), header,
+               request("GET", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+               authorised(), "unmanaged_credential");
+        deniedBeforeTheGate("and so is an Authorization header inside it",
+               new Rig(sentinel), header,
+               request("GET", "/api/orders",
+                       "Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"),
+               authorised(), "unmanaged_credential");
+
+        // The half of the OLD rationale that was right, kept: the Gate has a
+        // side effect and the credential refusal must not pay for it. A rig
+        // whose gate would rate-limit still answers the credential, having
+        // spent nothing.
+        Rig limited = new Rig(sentinel);
+        limited.gate.verdict = Decision.rateLimited(200_000L, "5 rps, 5 issued this second");
+        deniedBeforeTheGate("the credential still beats the Gate, and costs it nothing",
+               limited, header,
+               request("GET", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+               authorised(), "unmanaged_credential");
+
+        // And every one of those refusals is a class the store has a row for,
+        // except the two that are genuinely about the credential. That is the
+        // property the move exists to restore, so it is asserted rather than
+        // left to the commit message: the three boundary classes are the three
+        // that records.DENIAL_KIND names.
+        Rig outOfScope = new Rig(sentinel);
+        Map<String, Object> e = outOfScope.sender.issue(
+                header, request("GET", "/api/orders", "Cookie", "session=9f1c4a2e7b"),
+                elsewhere);
+        check("the class an out-of-scope replay reports is one with a denial row ("
+              + e.get("class") + ")",
+              "scope_denied".equals(e.get("class")));
     }
 
     static void rateLimitedCarriesRetryAfterUs(Path sentinel) {

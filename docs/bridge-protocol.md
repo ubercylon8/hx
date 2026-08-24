@@ -141,6 +141,21 @@ build the mapping the spec forbids.)
     engagement_mismatch  the frame names another engagement
     bad_config           the configure body could not be acted on
     protocol_mismatch    the frame's `v` is not this protocol version
+    halted               issuance is stopped: a `halt` frame, the sentinel
+                         file, a stalled sentinel poller, or the auto-halt on
+                         target distress. Not a per-request denial -- the run
+                         is what stopped
+    unknown_frame        the frame's `t` is not a type this version knows.
+                         Refuses one frame and keeps the channel, like
+                         `bad_frame`
+
+The last two were on the wire and in neither this list nor S6's until the
+2026-08-23 amendment, and `unknown_frame` was in none of the store's routing
+tables either -- so `test_every_error_class_has_somewhere_to_go` passed while
+an emittable class had nowhere to go. That set is no longer transcribed by
+hand: it is DERIVED from the emit sites in `extension/src` and `src/hx` by
+`tests/test_records.py`, which is what makes "somewhere to go" a claim about
+the classes this implementation can actually produce.
 
 They split on WHAT HAPPENS NEXT, and a second implementation has to get that
 split right or an operator loses a control channel they could have kept:

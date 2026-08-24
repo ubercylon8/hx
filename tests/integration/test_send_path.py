@@ -348,6 +348,19 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     attempt("credential", "GET", "/api/orders",
             headers=[("Cookie", cookie)])
 
+    # ...and the SAME credential on a request that also leaves scope. This
+    # shape had never been driven: every case above sends its credential to
+    # an in-scope path, so the two guards were never made to compete.
+    #
+    # Until the whole-branch review it answered `unmanaged_credential`, and
+    # that class is in records.UNRECORDABLE -- so a scope violation carrying a
+    # Cookie produced no row anywhere and named the credential rather than the
+    # boundary crossed. It is not an exotic input either: until Plan 5 ships
+    # identity injection, the natural agent action is replaying a request
+    # lifted from Burp's history, and those carry a Cookie.
+    attempt("scope_with_credential", "GET", "/api/orders", to=rig.offside,
+            headers=[("Cookie", cookie)])
+
     # The assertions this test exists for, on what the SERVERS saw, and they
     # come FIRST: "an error came back" and "the request was never issued" are
     # different claims, and only the second one is S4's invariant.
@@ -362,10 +375,15 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
         "method": "method_denied",
         "dangerous": "dangerous_denied",
         "credential": "unmanaged_credential",
+        # The boundary, not the credential -- and so a class with a row.
+        "scope_with_credential": "scope_denied",
     }
 
-    # Denials are never silent (S4): each one becomes a row.
-    for name in ("scope", "method", "dangerous"):
+    # Denials are never silent (S4): each one becomes a row. The fifth case is
+    # in this loop and not merely in the dict above, because "it reported
+    # scope_denied" and "it produced a denial row" are different claims and
+    # only the second is S4's.
+    for name in ("scope", "method", "dangerous", "scope_with_credential"):
         assert records.record_denial(
             rig.eng.db, run_id=rig.run_id,
             kind=records.DENIAL_KIND[refusals[name].error_class],
@@ -375,7 +393,7 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     kinds = [r["kind"] for r in rig.eng.db.execute(
         "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us, rowid",
         (rig.run_id,))]
-    assert kinds == ["scope", "method", "dangerous"]
+    assert kinds == ["scope", "method", "dangerous", "scope"]
 
     # A gap, pinned rather than papered over: Plan 1's denial.kind CHECK
     # lists scope, method, dangerous, rate, budget and not_configured. There

@@ -79,6 +79,8 @@ public class ChokepointTest {
         t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
           () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
+        t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
+          () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
 
@@ -238,6 +240,44 @@ public class ChokepointTest {
         for (Path p : sources) total += count(text(p), ".authorisation()");
         check("the whole extension reads the Authorisation snapshot in exactly one "
               + "place, not " + total, total == 1);
+    }
+
+    /**
+     * Policy is asked in two halves, and both halves are asked exactly once.
+     *
+     * `decide()` was split so spec s7's credential refusal could sit BETWEEN
+     * them: it must run before the Gate (which spends a rate token and a
+     * budget slot) and after scope/method/dangerous (whose classes have
+     * `denial` rows, where `unmanaged_credential` has none). Policy cannot
+     * make that check itself -- it is decided by its arguments alone and must
+     * not reach into hx.send for a Redactor -- so the interleaving lives in
+     * Sender.
+     *
+     * The split is what this guards. `decideBeforeGate` answering `allowed()`
+     * is NOT permission to issue: the Gate has not run. A second issue path
+     * that called only the first half would issue past the rate limit and past
+     * the run's budget, with every behavioural test green, because every one
+     * of them drives the path that does call both.
+     *
+     * Counting is all this can do, and one of each is what the send path
+     * needs. `decide(` is not counted: it remains correct for a caller with
+     * nothing to interleave, and PolicyTest drives every rule through it.
+     */
+    static void bothHalvesOfTheDecisionAreAskedAndOnlyOnce(List<Path> sources)
+            throws IOException {
+        int before = 0, gate = 0;
+        for (Path p : sources) {
+            String t = text(p);
+            before += count(t, ".decideBeforeGate(");
+            gate += count(t, ".checkGate(");
+        }
+        check("the boundary half of the decision is asked exactly once (" + before + ")",
+              before == 1);
+        check("and the Gate half exactly once with it (" + gate + ")", gate == 1);
+        // The pair, not the two counts separately: what makes an allowed
+        // first half safe is that a second half follows it.
+        check("so no path in extension/src takes one without the other",
+              before == gate);
     }
 
     /**

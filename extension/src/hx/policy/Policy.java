@@ -214,7 +214,38 @@ public final class Policy {
         this.gate = gate;
     }
 
+    /**
+     * The whole decision: everything before the Gate, then the Gate.
+     *
+     * SPLIT IN TWO, and the split is not a refactor for tidiness. Spec s7's
+     * unmanaged-credential refusal has to sit BETWEEN them, and it cannot be
+     * done from in here: this class is decided by its arguments alone, and a
+     * Policy that reached into hx.send for a Redactor would be the layering
+     * inverted. So the send path calls the two halves and puts its own check
+     * between; see Sender.decideAndIssue's ORDER OF REFUSAL.
+     *
+     * Callers that have no such check to interleave should keep calling this.
+     * It is exactly the composition it was before, in the same order, and
+     * PolicyTest still drives every rule through it.
+     */
     public Decision decide(HxRequest req, BridgeClient.Authorisation auth) {
+        Decision before = decideBeforeGate(req, auth);
+        if (!before.allowed()) return before;
+        return checkGate(req);
+    }
+
+    /**
+     * Everything decide() settles WITHOUT spending anything:
+     * not_configured -> scope_denied -> method_denied -> dangerous_denied.
+     *
+     * An `allowed()` answer from here is NOT permission to issue. The Gate has
+     * not run, so no rate token and no budget slot has been spent, and
+     * {@link #checkGate} is still owed. Anything that issues on the strength
+     * of this answer alone has issued past the rate limit and past the run's
+     * budget -- ChokepointTest counts the call sites in extension/src for
+     * exactly that reason, and there is one of each.
+     */
+    public Decision decideBeforeGate(HxRequest req, BridgeClient.Authorisation auth) {
         // Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before
         // any configure and after every disconnect; epochCounter is
         // pre-incremented, so a real commit is >= 1 and there is no other way
@@ -271,10 +302,17 @@ public final class Policy {
                         return Decision.deny("dangerous_denied",
                                 req.target() + " matches dangerous.path " + pattern);
 
-        // The Gate LAST, because it is the only check with a side effect:
-        // Limiter.check() spends a rate token and a budget slot, and spending
-        // either on a request three earlier rules would have refused shortens
-        // the run for no evidence.
+        return Decision.allow();
+    }
+
+    /**
+     * The Gate, and nothing else. LAST, because it is the only check with a
+     * side effect: Limiter.check() spends a rate token and a budget slot, and
+     * spending either on a request an earlier rule would have refused --
+     * including spec s7's credential refusal, which the send path makes
+     * between the two halves -- shortens the run for no evidence.
+     */
+    public Decision checkGate(HxRequest req) {
         Decision gated;
         try {
             gated = gate.check(req);
