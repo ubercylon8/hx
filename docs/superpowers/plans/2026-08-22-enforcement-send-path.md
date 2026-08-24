@@ -11415,11 +11415,12 @@ public class HaltSwitchTest {
      * The file's own javadoc says every filesystem call here is treated as
      * able to throw something it does not name, and that this exact class of
      * defect has opened three guards on this project. These two clauses were
-     * the ones no input reached: the method is entered only from pollOnce()'s
-     * NoSuchFileException clause, and on every real parent shape -- absent,
-     * dangling symlink, regular file, unreadable directory -- the parent read
-     * that follows either succeeds or throws an IOException too. On real
-     * filesystems the only way in is a TOCTOU race, and a race is not a test.
+     * the ones no input reached: the method has exactly one call site,
+     * pollOnce()'s NoSuchFileException clause, and on the real parent shapes
+     * that follow -- absent, dangling symlink, regular file, unreadable
+     * directory, all of which the tests above already drive -- the parent read
+     * either succeeds or throws an IOException too. On real filesystems the
+     * way in is a TOCTOU race, and a race is not a test.
      *
      * MEASURED before this test existed: narrowing the first clause to
      * `RuntimeException`, narrowing the second to `IOException`, and making
@@ -11464,9 +11465,8 @@ public class HaltSwitchTest {
         // spellings of that clause differ ONLY here -- ClosedFileSystemException
         // above is a RuntimeException, so `catch (RuntimeException)` still
         // holds the line for it, and MEASURED: narrowing to RuntimeException
-        // with only the case above in place left the suite green. IOError is
-        // what Path.toAbsolutePath() is documented to throw, so this is the
-        // real shape rather than an invented one.
+        // with only the case above in place left the suite green. See
+        // HostilePath.ioError for why IOError is the honest Error to use.
         HostilePath noParent = new HostilePath("HALTED", HostilePath.OnRead.ENOENT, null);
         noParent.absoluteThrow = HostilePath.ioError();
         HaltSwitch anError = new HaltSwitch(new TickClock(T0), noParent, 60_000L);
@@ -13648,9 +13648,9 @@ public class SenderTest {
      * `auth.epoch() == 0` and Policy.decide's `auth == null ||
      * auth.epoch() == 0`. MEASURED on this branch: delete Sender's and the
      * dedicated site in everyDenialClassLeavesTheWireUntouched stays green in
-     * all four of its assertions, because Policy answers in its place --
-     * including "COSTS NO RATE TOKEN OR BUDGET SLOT", since Policy also
-     * refuses before it consults the Gate.
+     * ALL SIX of the assertions deniedBeforeTheGate makes, because Policy
+     * answers in its place -- including "COSTS NO RATE TOKEN OR BUDGET SLOT",
+     * since Policy also refuses before it consults the Gate.
      *
      * So no input separates the two by what comes BACK. The only thing
      * Sender's guard does that Policy's cannot is refuse EARLIER: before the
@@ -13860,10 +13860,13 @@ public class SenderTest {
      * 1. Burp would open a connection to port 1 of an address the operator
      * asked for on 443.
      *
-     * The ONLY reason that is not a live defect today is the first check
-     * below: Policy refuses every IPv6 url before portOf is ever consulted,
-     * EVEN WHEN THE OPERATOR NAMED THAT EXACT ADDRESS in scope.include,
-     * because Target.parse cannot read the authority. Both halves are asserted
+     * The reason that is not a live defect today is the first check below:
+     * Policy refuses the IPv6 url before portOf is ever consulted, EVEN WHEN
+     * THE OPERATOR NAMED THAT EXACT ADDRESS in scope.include, because
+     * Target.parse cannot read the authority. MEASURED on all three spellings
+     * -- bare, bracketed, and bracketed with an explicit port -- each answered
+     * scope_denied with the detail "url port is not a number". Both halves are
+     * asserted
      * here so neither can move alone. IF THE FIRST CHECK EVER GOES RED BECAUSE
      * SOMEBODY TAUGHT Target.parse ABOUT IPv6, THE SECOND ONE IS THE LIVE BUG
      * THEY JUST EXPOSED: bracket the literal in parse() -- and then portOf's
@@ -14877,14 +14880,17 @@ public final class Limits implements Gate {
             // here rather than in a report. It is reached only when scope
             // ALLOWS -- Policy consults the Gate last, after scope, method and
             // dangerous.path -- so it cannot answer for an unconfigured run at
-            // all. MEASURED: with Sender's epoch check, Policy's epoch check
-            // AND checkScope's empty-include guard all deleted, a DENY-ALL
-            // decide() still answers scope_denied from the fallthrough at the
-            // end of checkScope, and this line is never executed. It becomes
-            // reachable only if the empty-include case is made to ALLOW, which
-            // is a rewrite rather than a deletion. What it guards is the
-            // narrower thing its first paragraph says: an armed-looking
-            // authorisation whose limiter was never built.
+            // all. MEASURED, calling Policy.decide directly with a DENY-ALL
+            // snapshot so that Sender's own epoch check is out of the way:
+            // with Policy's epoch check AND checkScope's empty-include guard
+            // both deleted, decide() still answers scope_denied from the
+            // fallthrough at the end of checkScope, and this line is never
+            // executed -- proved by making it return allow() instead, which
+            // changed the answer not at all. It becomes reachable only if the
+            // empty-include case is REWRITTEN to allow, which is not a
+            // deletion. What it guards is the narrower thing its first
+            // paragraph says: an armed-looking authorisation whose limiter was
+            // never built.
             return Decision.deny("not_configured", "the rate and budget are not armed");
         return l.check(req);
     }

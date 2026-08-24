@@ -320,11 +320,12 @@ public class HaltSwitchTest {
      * The file's own javadoc says every filesystem call here is treated as
      * able to throw something it does not name, and that this exact class of
      * defect has opened three guards on this project. These two clauses were
-     * the ones no input reached: the method is entered only from pollOnce()'s
-     * NoSuchFileException clause, and on every real parent shape -- absent,
-     * dangling symlink, regular file, unreadable directory -- the parent read
-     * that follows either succeeds or throws an IOException too. On real
-     * filesystems the only way in is a TOCTOU race, and a race is not a test.
+     * the ones no input reached: the method has exactly one call site,
+     * pollOnce()'s NoSuchFileException clause, and on the real parent shapes
+     * that follow -- absent, dangling symlink, regular file, unreadable
+     * directory, all of which the tests above already drive -- the parent read
+     * either succeeds or throws an IOException too. On real filesystems the
+     * way in is a TOCTOU race, and a race is not a test.
      *
      * MEASURED before this test existed: narrowing the first clause to
      * `RuntimeException`, narrowing the second to `IOException`, and making
@@ -369,9 +370,8 @@ public class HaltSwitchTest {
         // spellings of that clause differ ONLY here -- ClosedFileSystemException
         // above is a RuntimeException, so `catch (RuntimeException)` still
         // holds the line for it, and MEASURED: narrowing to RuntimeException
-        // with only the case above in place left the suite green. IOError is
-        // what Path.toAbsolutePath() is documented to throw, so this is the
-        // real shape rather than an invented one.
+        // with only the case above in place left the suite green. See
+        // HostilePath.ioError for why IOError is the honest Error to use.
         HostilePath noParent = new HostilePath("HALTED", HostilePath.OnRead.ENOENT, null);
         noParent.absoluteThrow = HostilePath.ioError();
         HaltSwitch anError = new HaltSwitch(new TickClock(T0), noParent, 60_000L);

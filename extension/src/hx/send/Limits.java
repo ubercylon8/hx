@@ -89,14 +89,17 @@ public final class Limits implements Gate {
             // here rather than in a report. It is reached only when scope
             // ALLOWS -- Policy consults the Gate last, after scope, method and
             // dangerous.path -- so it cannot answer for an unconfigured run at
-            // all. MEASURED: with Sender's epoch check, Policy's epoch check
-            // AND checkScope's empty-include guard all deleted, a DENY-ALL
-            // decide() still answers scope_denied from the fallthrough at the
-            // end of checkScope, and this line is never executed. It becomes
-            // reachable only if the empty-include case is made to ALLOW, which
-            // is a rewrite rather than a deletion. What it guards is the
-            // narrower thing its first paragraph says: an armed-looking
-            // authorisation whose limiter was never built.
+            // all. MEASURED, calling Policy.decide directly with a DENY-ALL
+            // snapshot so that Sender's own epoch check is out of the way:
+            // with Policy's epoch check AND checkScope's empty-include guard
+            // both deleted, decide() still answers scope_denied from the
+            // fallthrough at the end of checkScope, and this line is never
+            // executed -- proved by making it return allow() instead, which
+            // changed the answer not at all. It becomes reachable only if the
+            // empty-include case is REWRITTEN to allow, which is not a
+            // deletion. What it guards is the narrower thing its first
+            // paragraph says: an armed-looking authorisation whose limiter was
+            // never built.
             return Decision.deny("not_configured", "the rate and budget are not armed");
         return l.check(req);
     }

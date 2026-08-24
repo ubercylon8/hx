@@ -37,23 +37,28 @@ import java.util.Set;
  * this project. Two of those catch clauses -- both inside
  * parentIsNotADirectory() -- had no input that could reach them:
  *
- *   * `parentIsNotADirectory()` is entered ONLY from pollOnce()'s
- *     NoSuchFileException clause, so the sentinel read has to have answered
+ *   * `parentIsNotADirectory()` has exactly ONE call site -- pollOnce()'s
+ *     NoSuchFileException clause -- so the sentinel read has to have answered
  *     ENOENT first; and
- *   * on every real parent shape that then follows -- absent, dangling
- *     symlink, regular file, unreadable directory -- the parent read either
- *     succeeds or throws an IOException too.
+ *   * on the real parent shapes that then follow, the parent read either
+ *     succeeds or throws an IOException too. Task 5 measured that across eight
+ *     shapes; the mutations below confirm it from the other side, since
+ *     narrowing the second clause to `IOException` left every real-shape test
+ *     in HaltSwitchTest green.
  *
- * So on real filesystems the only way in is a TOCTOU race: the parent replaced
+ * So on real filesystems the way in is a TOCTOU race: the parent replaced
  * between the two stats. A race is not a test. MEASURED on this branch, before
  * this class existed: narrowing either clause -- the first to
  * `RuntimeException`, the second to `IOException` -- left the whole Java suite
  * at 9 x ALL PASS / 1396 ok / 0 FAIL, and so did making the first one return
  * null, which is the fail-OPEN direction.
  *
- * A wrapper around a real Path cannot do this job: every real provider casts
- * its argument to its own Path type and throws ProviderMismatchException on
- * anything else. The provider has to be ours all the way down.
+ * A wrapper around a real Path cannot do this job: a provider casts its
+ * argument to its own Path type, so a delegating wrapper is rejected before it
+ * is asked anything. CHECKED, on the default provider, with a wrapper that
+ * forwards all twenty of Path's methods to a real temp file:
+ * `Files.readAttributes` answered ProviderMismatchException. The provider has
+ * to be ours all the way down.
  *
  * Everything not needed by HaltSwitch throws UnsupportedOperationException
  * rather than returning a plausible value: a double that quietly answers a
@@ -75,11 +80,14 @@ final class HostilePath implements Path {
      * When set, toAbsolutePath() throws this instead of answering.
      *
      * An ERROR, not a RuntimeException, and that is the point: `catch
-     * (Throwable)` and `catch (RuntimeException)` differ only here, and
-     * Path.toAbsolutePath() is DOCUMENTED to throw java.io.IOError. It is the
-     * one call in parentIsNotADirectory() whose javadoc names an Error, so it
-     * is the honest input for the breadth of that clause rather than an
-     * invented one.
+     * (Throwable)` and `catch (RuntimeException)` differ exactly there.
+     * CHECKED reflectively rather than asserted: java.io.IOError extends
+     * Error, not RuntimeException, and Path.toAbsolutePath() declares an EMPTY
+     * throws clause -- so an implementation that has to consult the filesystem
+     * for the default directory, which is what that method does for a relative
+     * path, has no checked exception available to report a failure with.
+     * IOError is the platform's unchecked answer to exactly that, which is why
+     * it is the honest input here rather than an invented Error.
      */
     Error absoluteThrow;
 
@@ -90,7 +98,10 @@ final class HostilePath implements Path {
     }
 
     /** The unchecked failure a closed provider raises. Named rather than
-     *  invented: it is one of the three HaltSwitch's own comment lists. */
+     *  invented: pollOnce()'s own catch clause lists three things it exists
+     *  for -- an AccessDeniedException, a vanished mount, and a
+     *  ClosedFileSystemException from a provider we do not control -- and this
+     *  is the third of them. */
     static RuntimeException unchecked() {
         return new java.nio.file.ClosedFileSystemException();
     }

@@ -40,7 +40,10 @@ with a later task's test now between them in the repo, so it is two excerpts, an
 it is now two blocks with a sentence between them saying why. Step 16's block is
 one contiguous run of 173 lines and always was -- it was merely stale, four
 `l.reader.read()` calls that have since been given a deadline -- so it is one
-excerpt. All three are compared here now.
+excerpt. All three are compared here now, which took this check from 78 blocks to
+81. (Counted with `len(_cases())`. The pytest line for this file reads 86, which is
+81 plus the five tests below that are not parametrised over blocks -- an easy pair of
+numbers to confuse, and this wave confused them once already.)
 
 A plan still being authored is a special case, and an honest one: it describes
 files it has not written yet. For a file it CREATES that is handled already --

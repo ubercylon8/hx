@@ -487,9 +487,9 @@ public class SenderTest {
      * `auth.epoch() == 0` and Policy.decide's `auth == null ||
      * auth.epoch() == 0`. MEASURED on this branch: delete Sender's and the
      * dedicated site in everyDenialClassLeavesTheWireUntouched stays green in
-     * all four of its assertions, because Policy answers in its place --
-     * including "COSTS NO RATE TOKEN OR BUDGET SLOT", since Policy also
-     * refuses before it consults the Gate.
+     * ALL SIX of the assertions deniedBeforeTheGate makes, because Policy
+     * answers in its place -- including "COSTS NO RATE TOKEN OR BUDGET SLOT",
+     * since Policy also refuses before it consults the Gate.
      *
      * So no input separates the two by what comes BACK. The only thing
      * Sender's guard does that Policy's cannot is refuse EARLIER: before the
@@ -699,10 +699,13 @@ public class SenderTest {
      * 1. Burp would open a connection to port 1 of an address the operator
      * asked for on 443.
      *
-     * The ONLY reason that is not a live defect today is the first check
-     * below: Policy refuses every IPv6 url before portOf is ever consulted,
-     * EVEN WHEN THE OPERATOR NAMED THAT EXACT ADDRESS in scope.include,
-     * because Target.parse cannot read the authority. Both halves are asserted
+     * The reason that is not a live defect today is the first check below:
+     * Policy refuses the IPv6 url before portOf is ever consulted, EVEN WHEN
+     * THE OPERATOR NAMED THAT EXACT ADDRESS in scope.include, because
+     * Target.parse cannot read the authority. MEASURED on all three spellings
+     * -- bare, bracketed, and bracketed with an explicit port -- each answered
+     * scope_denied with the detail "url port is not a number". Both halves are
+     * asserted
      * here so neither can move alone. IF THE FIRST CHECK EVER GOES RED BECAUSE
      * SOMEBODY TAUGHT Target.parse ABOUT IPv6, THE SECOND ONE IS THE LIVE BUG
      * THEY JUST EXPOSED: bracket the literal in parse() -- and then portOf's
