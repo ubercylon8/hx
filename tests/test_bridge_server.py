@@ -71,6 +71,52 @@ def _client(path):
     return c
 
 
+def _never_served(c, frame: bytes) -> bytes | None:
+    """Send `frame` and collect what came back. b"" is "nothing, ever".
+
+    None means the socket was STILL OPEN when the read timed out, which is a
+    different and much worse answer -- the bridge never replies to a hello
+    with a frame, so an open socket is one nothing refused.
+
+    THREE ENDINGS ALL MEAN "REFUSED", AND THIS TEST MUST NOT CARE WHICH:
+
+      * a clean FIN, and recv answers b"".
+      * an RST, and recv raises ConnectionResetError. Linux sends one when a
+        socket is closed with unread data still in its receive buffer, which
+        is exactly what BridgeServer._serve does to a foreign uid: it closes
+        WITHOUT EVER READING the frame.
+      * EPIPE on the WRITE. The server closed before this frame could be
+        written at all -- the refusal arriving sooner, not failing to arrive.
+
+    THE THIRD ONE IS A REAL RACE AND IT MADE THIS FILE'S ONE SECURITY TEST
+    FLAKY: two failures in ~19 full-suite runs against 25/25 in isolation, on
+    a file that wave had not touched. It was never the bridge. The main thread
+    releases the GIL inside connect(), and whether it gets it back before the
+    accept-loop thread runs the uid check and closes decides which of the two
+    orderings a run gets. MEASURED, same client sequence, one server:
+
+        contending threads   0 ->   0/500 EPIPE   (why isolation never fails)
+        contending threads   2 -> 163/500 EPIPE
+        contending threads   8 -> 180/500 EPIPE
+
+    A full-suite run is the contended case. So `sendall` raising here is not
+    the failure -- it is the guard being fast -- and a test that reddens on it
+    trains everyone to re-run instead of look. The failure is the connection
+    still being open, or bytes coming back, and those are what the caller
+    asserts on.
+    """
+    try:
+        c.sendall(frame)
+    except (BrokenPipeError, ConnectionResetError):
+        return b""
+    try:
+        return c.recv(4096)
+    except ConnectionResetError:
+        return b""
+    except TimeoutError:
+        return None
+
+
 def _connected(srv):
     """Drive srv to state 'connected' and return the live client socket."""
     c = _client(srv.socket_path)
@@ -447,7 +493,14 @@ def test_late_reply_after_timeout_does_not_leak_into_replies(srv):
 def test_so_peercred_rejects_a_foreign_uid(srv, monkeypatch):
     """The one security-critical branch in the file, previously uncovered.
     Cannot actually connect as another uid in a test, so fake the credential
-    lookup SO_PEERCRED reports."""
+    lookup SO_PEERCRED reports.
+
+    THIS TEST WAS FLAKY -- twice in ~19 full-suite runs, 25/25 in isolation --
+    and the cause was here, not in the bridge. See _never_served below, which
+    is where the race is written down and where it is now absorbed. The
+    server's behaviour was correct in both orderings the race produces; it
+    was this file that could only cope with one of them.
+    """
     real_getsockopt = socket.socket.getsockopt
 
     def fake_getsockopt(self, level, optname, buflen=0):
@@ -459,19 +512,26 @@ def test_so_peercred_rejects_a_foreign_uid(srv, monkeypatch):
 
     c = _client(srv.socket_path)
     try:
-        c.sendall(codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
-                                "pid": os.getpid(), "burp_version": "x",
-                                "instance_id": "i-1", "engagement_id": "e-1"}))
-        # The server closes without ever reading the hello it left unread in
-        # its receive buffer, so Linux resets the connection (RST) rather
-        # than closing it cleanly (FIN) -- both mean "never served".
-        try:
-            data = c.recv(4096)
-        except ConnectionResetError:
-            data = b""
-        assert data == b"", "a foreign uid must never be served"
-        time.sleep(0.2)
+        hello = codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                              "pid": os.getpid(), "burp_version": "x",
+                              "instance_id": "i-1", "engagement_id": "e-1"})
+        served = _never_served(c, hello)
+        assert served == b"", (
+            f"a foreign uid must never be served (state {srv.state!r}): "
+            + (f"the server answered {served!r}" if served is not None else
+               "the connection was STILL OPEN when the read timed out. The "
+               "bridge never answers a hello with a frame, so a socket left "
+               "open is one the uid check did not close"))
+
+        # Not merely "no bytes came back". These two are the assignment the
+        # uid check `return`s in front of -- see BridgeServer._serve -- so
+        # they say the connection was REFUSED rather than merely quiet, which
+        # a shut-down server would also be.
+        assert (srv.peer_uid, srv.peer_pid) == (None, None), (
+            "a foreign peer was recorded as this bridge's peer: "
+            f"uid={srv.peer_uid} pid={srv.peer_pid}")
         assert srv.state == "waiting"
+        assert srv.hello is None, "a foreign uid's hello was accepted"
     finally:
         c.close()
 
