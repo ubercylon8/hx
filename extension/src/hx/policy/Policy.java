@@ -316,7 +316,14 @@ public final class Policy {
      * It fails closed on its own -- epoch 0 and an unreadable scope are
      * `not_configured` here exactly as in {@link #decideBeforeGate}, from the
      * same helper -- so a future caller that reaches for it directly cannot
-     * get an allow out of an authorisation nobody committed.
+     * get an allow out of an authorisation nobody committed. That preamble is
+     * pinned by PolicyTest.scopeOnlyFailsClosedWithoutHelpFromItsCaller, which
+     * calls THIS method directly with the two inputs that separate it from its
+     * absence: `new Authorisation(0, Map.of())` -- which ProxyGate's own epoch
+     * guard would otherwise answer for it -- and `new Authorisation(7, null)`,
+     * which nothing else on the operator path exercises. Without those two the
+     * preamble could be deleted with the whole suite green; it was, and it
+     * could.
      */
     public Decision decideScopeOnly(HxRequest req, BridgeClient.Authorisation auth) {
         Decision unusable = unusable(auth);
@@ -335,8 +342,17 @@ public final class Policy {
      *
      * Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before any
      * configure and after every disconnect; epochCounter is pre-incremented,
-     * so a real commit is >= 1 and there is no other way to observe a 0. A
-     * null snapshot is a caller bug, and the fail-closed reading of a caller
+     * so a real commit is >= 1 and there is no other way to observe a 0.
+     *
+     * `== 0`, not `< 1`, and the same shape is in ProxyGate's own copy of this
+     * guard. That is a REACHABILITY argument rather than a range check: epoch
+     * is a long, and a hand-built `new Authorisation(-1, scope)` is treated as
+     * CONFIGURED and decided under at both enforcement points -- measured.
+     * BridgeClient's pre-incremented counter is the only writer of the field,
+     * so nothing in this tree can produce one; the inherited shape is kept and
+     * the reachability is written down rather than left to be re-derived.
+     *
+     * A null snapshot is a caller bug, and the fail-closed reading of a caller
      * bug is the same one. An Authorisation that cannot be READ is answered
      * the same way as one that was never committed -- see malformation().
      */

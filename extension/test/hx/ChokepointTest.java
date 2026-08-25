@@ -121,6 +121,7 @@ public class ChokepointTest {
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
         t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
           () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
+        t("oneRunHasOnePolicy", () -> oneRunHasOnePolicy(sources));
         t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
@@ -395,6 +396,49 @@ public class ChokepointTest {
         // first half safe is that a second half follows it.
         check("so no path in extension/src takes one without the other",
               before == gate);
+    }
+
+    /**
+     * The extension builds ONE Policy, and the second enforcement point is
+     * handed that one.
+     *
+     * Policy owns the Gate, and the Gate is where the rate limit and the
+     * per-run budget live. Two Policy objects sharing one Limits would be
+     * harmless -- this is NOT a claim that a second Policy is wrong in
+     * itself. It is a tripwire on the shape a second one arrives in: the
+     * natural way to give the proxy path a Policy, when the send path's was
+     * built inline at its call site, is to write another
+     * `new Policy(new Limits(...))` -- and that is a SECOND per-run budget for
+     * one run, which no behavioural test can see because each half of it is
+     * internally consistent. The pair counter above cannot see it either: it
+     * counts `.decideBeforeGate(` and `.checkGate(`, not constructions.
+     *
+     * A WIRE-EXISTS needle, so it reads {@link #code}: prose cannot construct
+     * anything. That is not theoretical here -- the entry point's own comment
+     * spells `new Policy(new Limits(...))` to explain the hazard, and this
+     * count is 1 with that comment in place, which is the measurement that
+     * this needle is blind to prose. Whole-tree, because the answer is a fixed
+     * count of a CALL nobody writes in prose -- the class javadoc's rule for
+     * when that is safe.
+     *
+     * WHAT IT DOES NOT SEE: a second Limits. `new Limits(` is not counted,
+     * because Limits is legitimately constructible for defaults and the
+     * damage is done by the Policy that takes it. If this count ever needs to
+     * be two, say which Limits the second one shares before changing the
+     * number.
+     */
+    static void oneRunHasOnePolicy(List<Path> sources) throws IOException {
+        int total = 0;
+        List<String> hits = new ArrayList<>();
+        for (Path p : sources) {
+            int n = count(code(p), "new Policy(");
+            total += n;
+            if (n > 0) hits.add(p + " x" + n);
+        }
+        check("extension/src builds exactly one Policy, not " + total + " " + hits,
+              total == 1);
+        check("and it is in " + ENTRY_POINT + ", not " + hits,
+              hits.size() == 1 && hits.get(0).startsWith(ENTRY_POINT));
     }
 
     /**

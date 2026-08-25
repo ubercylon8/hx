@@ -102,7 +102,20 @@ public class HxExtension implements BurpExtension {
                     public void error(String s) { api.logging().logToError(s); }
                 });
 
-        Sender sender = new Sender(new Policy(limits), redactor, haltSwitch,
+        // ONE Policy for the whole extension, given a name so the second
+        // enforcement point can be handed THIS one. Policy owns the Gate, and
+        // the Gate is where the rate limit and the per-run budget live: a
+        // proxy path that built its own `new Policy(new Limits(...))` would be
+        // a SECOND per-run budget for one run, and no behavioural test can see
+        // that -- each half of it is internally consistent, and the pair
+        // counter in ChokepointTest counts `.decideBeforeGate(` and
+        // `.checkGate(`, not constructions. Measured: adding that second
+        // Policy here was 10 x ALL PASS before ChokepointTest.oneRunHasOnePolicy
+        // existed, and is 1 FAIL naming this file now. Sharing this reference
+        // is the wiring Task 7 needs; the inline construction this replaces is
+        // the shape that makes a second one the natural thing to write.
+        Policy policy = new Policy(limits);
+        Sender sender = new Sender(policy, redactor, haltSwitch,
                                    distress, montoyaHttp(api, clock), clock);
         // Auto-halt is extension-initiated: there is no outstanding id to
         // answer, so this frame is the only way the harness hears about a stop

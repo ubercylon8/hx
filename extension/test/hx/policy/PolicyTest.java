@@ -42,6 +42,8 @@ public class PolicyTest {
         t("theVerdictTypeCarriesItsClassAndItsHint", PolicyTest::theVerdictTypeCarriesItsClassAndItsHint);
         t("aRequestFieldThatIsNullIsARejectedFrameNotANullPointer", PolicyTest::aRequestFieldThatIsNullIsARejectedFrameNotANullPointer);
         t("epochZeroIsNotConfigured", PolicyTest::epochZeroIsNotConfigured);
+        t("scopeOnlyFailsClosedWithoutHelpFromItsCaller",
+          PolicyTest::scopeOnlyFailsClosedWithoutHelpFromItsCaller);
         t("anInScopeRequestIsAllowed", PolicyTest::anInScopeRequestIsAllowed);
         t("scopeMatchesSchemeHostPortAndPath", PolicyTest::scopeMatchesSchemeHostPortAndPath);
         t("anEmptyScopeIncludeIsAnsweredByItsOwnGuard", PolicyTest::anEmptyScopeIncludeIsAnsweredByItsOwnGuard);
@@ -249,6 +251,52 @@ public class PolicyTest {
                "not_configured");
         denies("a null Authorisation is not_configured, not a crash",
                p, orders(), null, "not_configured");
+    }
+
+    /**
+     * decideScopeOnly's `not_configured` preamble, with the inputs that
+     * separate it from its absence.
+     *
+     * It had none. Deleting `unusable(auth)` from decideScopeOnly -- leaving
+     * `return checkScope(req, auth.scope());` -- was 10 x ALL PASS / 1637 ok /
+     * 0 FAIL, measured: the only caller is ProxyGate, whose own epoch-0 guard
+     * answers before this method is reached, and nothing drove a
+     * malformed-but-non-zero-epoch authorisation down the operator path. A
+     * guard is only tested by the input that separates it from its absence,
+     * and that rule is not for other people's guards.
+     *
+     * So both calls below are DIRECT -- `p.decideScopeOnly(...)`, not through
+     * ProxyGate -- which is also the caller the javadoc's promise is about.
+     * The two inputs are the two arms of Policy.unusable: epoch 0, and a
+     * readable epoch with a scope that cannot be read. With the preamble gone
+     * the first answers `scope_denied` (the empty-include guard) and the
+     * second throws three frames down, which the per-method guard turns into a
+     * named FAIL.
+     *
+     * NOT claimed: that these two exhaust what decideScopeOnly refuses. They
+     * are the two arms of unusable() as it stands; a third arm added there
+     * needs its own check here, and this one will not notice.
+     */
+    static void scopeOnlyFailsClosedWithoutHelpFromItsCaller() {
+        CountingGate gate = new CountingGate();
+        Policy p = new Policy(gate);
+
+        Decision none = p.decideScopeOnly(orders(), denyAll());
+        check("epoch 0 asked scope-only is not_configured (got "
+              + (none.allowed() ? "ALLOWED" : none.errorClass()) + ")",
+              !none.allowed() && "not_configured".equals(none.errorClass()));
+
+        Decision unreadable =
+                p.decideScopeOnly(orders(), new BridgeClient.Authorisation(EPOCH, null));
+        check("and an authorisation carrying no scope is too (got "
+              + (unreadable.allowed() ? "ALLOWED" : unreadable.errorClass()) + ")",
+              !unreadable.allowed()
+              && "not_configured".equals(unreadable.errorClass()));
+
+        // The question stops before the Gate for the same reason decide() does
+        // not reach it on a refusal: a request refused for having no usable
+        // authorisation must not spend the run's budget.
+        check("neither refusal spent the gate (" + gate.calls + " call(s))", gate.calls == 0);
     }
 
     // ---- scope -----------------------------------------------------------

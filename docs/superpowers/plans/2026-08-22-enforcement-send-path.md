@@ -398,6 +398,8 @@ public class PolicyTest {
         t("theVerdictTypeCarriesItsClassAndItsHint", PolicyTest::theVerdictTypeCarriesItsClassAndItsHint);
         t("aRequestFieldThatIsNullIsARejectedFrameNotANullPointer", PolicyTest::aRequestFieldThatIsNullIsARejectedFrameNotANullPointer);
         t("epochZeroIsNotConfigured", PolicyTest::epochZeroIsNotConfigured);
+        t("scopeOnlyFailsClosedWithoutHelpFromItsCaller",
+          PolicyTest::scopeOnlyFailsClosedWithoutHelpFromItsCaller);
         t("anInScopeRequestIsAllowed", PolicyTest::anInScopeRequestIsAllowed);
         t("scopeMatchesSchemeHostPortAndPath", PolicyTest::scopeMatchesSchemeHostPortAndPath);
         t("anEmptyScopeIncludeIsAnsweredByItsOwnGuard", PolicyTest::anEmptyScopeIncludeIsAnsweredByItsOwnGuard);
@@ -605,6 +607,52 @@ public class PolicyTest {
                "not_configured");
         denies("a null Authorisation is not_configured, not a crash",
                p, orders(), null, "not_configured");
+    }
+
+    /**
+     * decideScopeOnly's `not_configured` preamble, with the inputs that
+     * separate it from its absence.
+     *
+     * It had none. Deleting `unusable(auth)` from decideScopeOnly -- leaving
+     * `return checkScope(req, auth.scope());` -- was 10 x ALL PASS / 1637 ok /
+     * 0 FAIL, measured: the only caller is ProxyGate, whose own epoch-0 guard
+     * answers before this method is reached, and nothing drove a
+     * malformed-but-non-zero-epoch authorisation down the operator path. A
+     * guard is only tested by the input that separates it from its absence,
+     * and that rule is not for other people's guards.
+     *
+     * So both calls below are DIRECT -- `p.decideScopeOnly(...)`, not through
+     * ProxyGate -- which is also the caller the javadoc's promise is about.
+     * The two inputs are the two arms of Policy.unusable: epoch 0, and a
+     * readable epoch with a scope that cannot be read. With the preamble gone
+     * the first answers `scope_denied` (the empty-include guard) and the
+     * second throws three frames down, which the per-method guard turns into a
+     * named FAIL.
+     *
+     * NOT claimed: that these two exhaust what decideScopeOnly refuses. They
+     * are the two arms of unusable() as it stands; a third arm added there
+     * needs its own check here, and this one will not notice.
+     */
+    static void scopeOnlyFailsClosedWithoutHelpFromItsCaller() {
+        CountingGate gate = new CountingGate();
+        Policy p = new Policy(gate);
+
+        Decision none = p.decideScopeOnly(orders(), denyAll());
+        check("epoch 0 asked scope-only is not_configured (got "
+              + (none.allowed() ? "ALLOWED" : none.errorClass()) + ")",
+              !none.allowed() && "not_configured".equals(none.errorClass()));
+
+        Decision unreadable =
+                p.decideScopeOnly(orders(), new BridgeClient.Authorisation(EPOCH, null));
+        check("and an authorisation carrying no scope is too (got "
+              + (unreadable.allowed() ? "ALLOWED" : unreadable.errorClass()) + ")",
+              !unreadable.allowed()
+              && "not_configured".equals(unreadable.errorClass()));
+
+        // The question stops before the Gate for the same reason decide() does
+        // not reach it on a refusal: a request refused for having no usable
+        // authorisation must not spend the run's budget.
+        check("neither refusal spent the gate (" + gate.calls + " call(s))", gate.calls == 0);
     }
 
     // ---- scope -----------------------------------------------------------
@@ -4484,7 +4532,14 @@ public final class Policy {
      * It fails closed on its own -- epoch 0 and an unreadable scope are
      * `not_configured` here exactly as in {@link #decideBeforeGate}, from the
      * same helper -- so a future caller that reaches for it directly cannot
-     * get an allow out of an authorisation nobody committed.
+     * get an allow out of an authorisation nobody committed. That preamble is
+     * pinned by PolicyTest.scopeOnlyFailsClosedWithoutHelpFromItsCaller, which
+     * calls THIS method directly with the two inputs that separate it from its
+     * absence: `new Authorisation(0, Map.of())` -- which ProxyGate's own epoch
+     * guard would otherwise answer for it -- and `new Authorisation(7, null)`,
+     * which nothing else on the operator path exercises. Without those two the
+     * preamble could be deleted with the whole suite green; it was, and it
+     * could.
      */
     public Decision decideScopeOnly(HxRequest req, BridgeClient.Authorisation auth) {
         Decision unusable = unusable(auth);
@@ -4503,8 +4558,17 @@ public final class Policy {
      *
      * Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before any
      * configure and after every disconnect; epochCounter is pre-incremented,
-     * so a real commit is >= 1 and there is no other way to observe a 0. A
-     * null snapshot is a caller bug, and the fail-closed reading of a caller
+     * so a real commit is >= 1 and there is no other way to observe a 0.
+     *
+     * `== 0`, not `< 1`, and the same shape is in ProxyGate's own copy of this
+     * guard. That is a REACHABILITY argument rather than a range check: epoch
+     * is a long, and a hand-built `new Authorisation(-1, scope)` is treated as
+     * CONFIGURED and decided under at both enforcement points -- measured.
+     * BridgeClient's pre-incremented counter is the only writer of the field,
+     * so nothing in this tree can produce one; the inherited shape is kept and
+     * the reachability is written down rather than left to be re-derived.
+     *
+     * A null snapshot is a caller bug, and the fail-closed reading of a caller
      * bug is the same one. An Authorisation that cannot be READ is answered
      * the same way as one that was never committed -- see malformation().
      */
@@ -16911,6 +16975,7 @@ public class ChokepointTest {
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
         t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
           () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
+        t("oneRunHasOnePolicy", () -> oneRunHasOnePolicy(sources));
         t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
@@ -17185,6 +17250,49 @@ public class ChokepointTest {
         // first half safe is that a second half follows it.
         check("so no path in extension/src takes one without the other",
               before == gate);
+    }
+
+    /**
+     * The extension builds ONE Policy, and the second enforcement point is
+     * handed that one.
+     *
+     * Policy owns the Gate, and the Gate is where the rate limit and the
+     * per-run budget live. Two Policy objects sharing one Limits would be
+     * harmless -- this is NOT a claim that a second Policy is wrong in
+     * itself. It is a tripwire on the shape a second one arrives in: the
+     * natural way to give the proxy path a Policy, when the send path's was
+     * built inline at its call site, is to write another
+     * `new Policy(new Limits(...))` -- and that is a SECOND per-run budget for
+     * one run, which no behavioural test can see because each half of it is
+     * internally consistent. The pair counter above cannot see it either: it
+     * counts `.decideBeforeGate(` and `.checkGate(`, not constructions.
+     *
+     * A WIRE-EXISTS needle, so it reads {@link #code}: prose cannot construct
+     * anything. That is not theoretical here -- the entry point's own comment
+     * spells `new Policy(new Limits(...))` to explain the hazard, and this
+     * count is 1 with that comment in place, which is the measurement that
+     * this needle is blind to prose. Whole-tree, because the answer is a fixed
+     * count of a CALL nobody writes in prose -- the class javadoc's rule for
+     * when that is safe.
+     *
+     * WHAT IT DOES NOT SEE: a second Limits. `new Limits(` is not counted,
+     * because Limits is legitimately constructible for defaults and the
+     * damage is done by the Policy that takes it. If this count ever needs to
+     * be two, say which Limits the second one shares before changing the
+     * number.
+     */
+    static void oneRunHasOnePolicy(List<Path> sources) throws IOException {
+        int total = 0;
+        List<String> hits = new ArrayList<>();
+        for (Path p : sources) {
+            int n = count(code(p), "new Policy(");
+            total += n;
+            if (n > 0) hits.add(p + " x" + n);
+        }
+        check("extension/src builds exactly one Policy, not " + total + " " + hits,
+              total == 1);
+        check("and it is in " + ENTRY_POINT + ", not " + hits,
+              hits.size() == 1 && hits.get(0).startsWith(ENTRY_POINT));
     }
 
     /**
@@ -17804,7 +17912,20 @@ public class HxExtension implements BurpExtension {
                     public void error(String s) { api.logging().logToError(s); }
                 });
 
-        Sender sender = new Sender(new Policy(limits), redactor, haltSwitch,
+        // ONE Policy for the whole extension, given a name so the second
+        // enforcement point can be handed THIS one. Policy owns the Gate, and
+        // the Gate is where the rate limit and the per-run budget live: a
+        // proxy path that built its own `new Policy(new Limits(...))` would be
+        // a SECOND per-run budget for one run, and no behavioural test can see
+        // that -- each half of it is internally consistent, and the pair
+        // counter in ChokepointTest counts `.decideBeforeGate(` and
+        // `.checkGate(`, not constructions. Measured: adding that second
+        // Policy here was 10 x ALL PASS before ChokepointTest.oneRunHasOnePolicy
+        // existed, and is 1 FAIL naming this file now. Sharing this reference
+        // is the wiring Task 7 needs; the inline construction this replaces is
+        // the shape that makes a second one the natural thing to write.
+        Policy policy = new Policy(limits);
+        Sender sender = new Sender(policy, redactor, haltSwitch,
                                    distress, montoyaHttp(api, clock), clock);
         // Auto-halt is extension-initiated: there is no outstanding id to
         // answer, so this frame is the only way the harness hears about a stop
