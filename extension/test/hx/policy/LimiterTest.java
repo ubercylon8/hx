@@ -11,6 +11,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
@@ -390,6 +391,23 @@ public class LimiterTest {
               3 == raceAgainst(new Limiter(new TickClock(T0), 10_000, 3)));
     }
 
+    /**
+     * How long 1600 non-blocking calls get before the race is called HUNG.
+     *
+     * `check` takes a monitor and does arithmetic; 1600 of them across eight
+     * threads is microseconds of work. Ten seconds is four orders of magnitude
+     * above that, so this can only fire on a genuine park -- and it is the
+     * whole reason it exists. MEASURED on this file: making `check` sleep
+     * instead of returning `rateLimited` -- a rate limiter that THROTTLES the
+     * caller rather than REFUSING it, the same §4 violation the capture layer
+     * above exists to forbid, one layer down -- parked all eight workers on
+     * `check`'s monitor, parked this method on the unbounded `w.join()` that
+     * used to be below, and took the suite from ELEVEN summary lines to TEN
+     * with ZERO FAIL lines anywhere. Only test.sh's `timeout 300` ended it,
+     * and only the exit code said so. See {@link hx.TestSupport#t}.
+     */
+    static final long RACE_DEADLINE_MS = 10_000L;
+
     static int raceAgainst(Limiter l) throws Exception {
         int threads = 8, callsEach = 200;
         AtomicInteger allowed = new AtomicInteger();
@@ -397,15 +415,24 @@ public class LimiterTest {
         List<Thread> workers = new ArrayList<>();
         for (int t = 0; t < threads; t++) {
             Thread w = new Thread(() -> {
-                try { go.await(); } catch (InterruptedException e) { return; }
+                try {
+                    // Bounded, and the workers are DAEMONS. A non-daemon
+                    // worker that never releases holds the JVM up AFTER
+                    // main() has printed ALL PASS: eleven green summary lines
+                    // and a suite that still blocks to the backstop.
+                    if (!go.await(RACE_DEADLINE_MS, TimeUnit.MILLISECONDS)) return;
+                } catch (InterruptedException e) { return; }
                 for (int i = 0; i < callsEach; i++)
                     if (l.check(ACCOUNT).allowed()) allowed.incrementAndGet();
             });
+            w.setDaemon(true);
             workers.add(w);
             w.start();
         }
         go.countDown();
-        for (Thread w : workers) w.join();
+        for (Thread w : workers)
+            TestSupport.join(w, RACE_DEADLINE_MS,
+                             "a concurrent caller of Limiter.check");
         // issued() is the limiter's own count; allowed is the callers'. They
         // must agree, or one of the two is not counting what it claims to.
         if (l.issued() != allowed.get())

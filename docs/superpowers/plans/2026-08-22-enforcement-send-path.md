@@ -7352,6 +7352,21 @@ public final class TestSupport {
      * green from a truncation -- and under {@code ./test.sh | grep -c FAIL},
      * the idiom this project's briefs prescribe, a truncation reads as 0.
      *
+     * A THROW IS ONLY THE FIRST WAY A CLASS PRINTS NO SUMMARY LINE. The second
+     * is a HANG, and this guard cannot catch it: a test method parked on an
+     * unbounded {@code join()} or {@code await()} never returns, so there is
+     * nothing to catch, the methods after it never run, and test.sh's
+     * {@code timeout 300} kills the class from outside. That run prints one
+     * FEWER summary line and still zero FAIL lines. MEASURED on this repo:
+     * making {@code Limiter.check} PARK instead of denying when rate-limited --
+     * a rate limiter that throttles rather than refuses, which is the §4
+     * violation the proxy layer above it exists to forbid -- wedged
+     * LimiterTest's unbounded {@code raceAgainst} join and produced 10 summary
+     * lines, 10 ALL PASS and 0 FAIL. The exit code was 1, because test.sh
+     * propagates {@code timeout}'s kill; it is the only thing that noticed.
+     * So: JUDGE A RUN BY ITS SUMMARY-LINE COUNT AND ITS EXIT CODE, and give
+     * every wait in a test a bound -- {@link #join} is the one for threads.
+     *
      * Catching {@link Throwable} rather than {@link Exception} is deliberate:
      * an {@link AssertionError} or a {@link StackOverflowError} out of a test
      * method truncates a run exactly as an NPE does.
@@ -7362,6 +7377,35 @@ public final class TestSupport {
         } catch (Throwable e) {
             reporter.check(name + " threw " + e, false);
         }
+    }
+
+    /**
+     * Join a helper thread with a BOUND, or fail by name.
+     *
+     * `t.join()` with no argument is the second truncation described on
+     * {@link #t}: it cannot fail, only hang, and a hung class prints no
+     * summary line. This throws instead, which {@link #t} turns into a named
+     * FAIL against the class's own counter -- the difference between "the
+     * suite lost a class" and "this named property is broken".
+     *
+     * The caller supplies the bound, because only the caller knows what the
+     * thread is doing: a millisecond of non-blocking arithmetic and a socket
+     * round trip deserve different numbers. Every bound in this repo is at
+     * least an order of magnitude above the work it covers, so it can only
+     * fire on a genuine hang, and comfortably inside test.sh's 300 s backstop.
+     *
+     * The thread is NOT interrupted on the deadline. Unparking it would let
+     * the assertions after this call run against work the hang had quietly
+     * finished, hiding the very thing being reported -- and a leaked DAEMON
+     * costs nothing, which is why every caller here makes its helper one.
+     */
+    public static void join(Thread t, long ms, String what) throws Exception {
+        t.join(ms);
+        if (t.isAlive())
+            throw new AssertionError(
+                what + " had not finished after " + ms + " ms, so it HUNG. An "
+                + "unbounded join here would have printed no summary line at "
+                + "all and read as zero failures");
     }
 
     /**
@@ -7423,6 +7467,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
@@ -7802,6 +7847,23 @@ public class LimiterTest {
               3 == raceAgainst(new Limiter(new TickClock(T0), 10_000, 3)));
     }
 
+    /**
+     * How long 1600 non-blocking calls get before the race is called HUNG.
+     *
+     * `check` takes a monitor and does arithmetic; 1600 of them across eight
+     * threads is microseconds of work. Ten seconds is four orders of magnitude
+     * above that, so this can only fire on a genuine park -- and it is the
+     * whole reason it exists. MEASURED on this file: making `check` sleep
+     * instead of returning `rateLimited` -- a rate limiter that THROTTLES the
+     * caller rather than REFUSING it, the same §4 violation the capture layer
+     * above exists to forbid, one layer down -- parked all eight workers on
+     * `check`'s monitor, parked this method on the unbounded `w.join()` that
+     * used to be below, and took the suite from ELEVEN summary lines to TEN
+     * with ZERO FAIL lines anywhere. Only test.sh's `timeout 300` ended it,
+     * and only the exit code said so. See {@link hx.TestSupport#t}.
+     */
+    static final long RACE_DEADLINE_MS = 10_000L;
+
     static int raceAgainst(Limiter l) throws Exception {
         int threads = 8, callsEach = 200;
         AtomicInteger allowed = new AtomicInteger();
@@ -7809,15 +7871,24 @@ public class LimiterTest {
         List<Thread> workers = new ArrayList<>();
         for (int t = 0; t < threads; t++) {
             Thread w = new Thread(() -> {
-                try { go.await(); } catch (InterruptedException e) { return; }
+                try {
+                    // Bounded, and the workers are DAEMONS. A non-daemon
+                    // worker that never releases holds the JVM up AFTER
+                    // main() has printed ALL PASS: eleven green summary lines
+                    // and a suite that still blocks to the backstop.
+                    if (!go.await(RACE_DEADLINE_MS, TimeUnit.MILLISECONDS)) return;
+                } catch (InterruptedException e) { return; }
                 for (int i = 0; i < callsEach; i++)
                     if (l.check(ACCOUNT).allowed()) allowed.incrementAndGet();
             });
+            w.setDaemon(true);
             workers.add(w);
             w.start();
         }
         go.countDown();
-        for (Thread w : workers) w.join();
+        for (Thread w : workers)
+            TestSupport.join(w, RACE_DEADLINE_MS,
+                             "a concurrent caller of Limiter.check");
         // issued() is the limiter's own count; allowed is the callers'. They
         // must agree, or one of the two is not counting what it claims to.
         if (l.issued() != allowed.get())
@@ -10049,8 +10120,14 @@ public class RedactorTest {
         injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
         String[] fromWorker = new String[1];
         Thread worker = new Thread(() -> fromWorker[0] = text(r.redactRequest(raw, injected)));
+        // Daemon and bounded, for the reason on TestSupport.t: an unbounded
+        // `worker.join()` here turns any `redactRequest` that ever takes a
+        // lock into a class that prints NO summary line and no FAIL line, and
+        // a non-daemon worker holds the JVM open past ALL PASS. Ten seconds
+        // against a single in-memory byte-copy.
+        worker.setDaemon(true);
         worker.start();
-        worker.join();
+        TestSupport.join(worker, 10_000L, "the worker thread doing the redaction");
         check("a range registered on the read loop is applied by the worker that redacts",
               fromWorker[0].contains("Authorization: {{identity:ident-admin:authz}}\r\n")
               && !fromWorker[0].contains(TOKEN));

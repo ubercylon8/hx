@@ -347,8 +347,14 @@ public class RedactorTest {
         injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
         String[] fromWorker = new String[1];
         Thread worker = new Thread(() -> fromWorker[0] = text(r.redactRequest(raw, injected)));
+        // Daemon and bounded, for the reason on TestSupport.t: an unbounded
+        // `worker.join()` here turns any `redactRequest` that ever takes a
+        // lock into a class that prints NO summary line and no FAIL line, and
+        // a non-daemon worker holds the JVM open past ALL PASS. Ten seconds
+        // against a single in-memory byte-copy.
+        worker.setDaemon(true);
         worker.start();
-        worker.join();
+        TestSupport.join(worker, 10_000L, "the worker thread doing the redaction");
         check("a range registered on the read loop is applied by the worker that redacts",
               fromWorker[0].contains("Authorization: {{identity:ident-admin:authz}}\r\n")
               && !fromWorker[0].contains(TOKEN));
