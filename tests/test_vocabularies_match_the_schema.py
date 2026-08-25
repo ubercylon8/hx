@@ -240,6 +240,17 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
             if isinstance(value, (frozenset, set, tuple, dict)) and value and \
                     all(isinstance(v, str) for v in value):
                 found.add(f"{name}.{attr}")
+    # The widening this test just gained, pinned by its one witness. Both
+    # halves of it were unheld: reverting `dict` from the isinstance tuple
+    # above, and dropping `capture_mod` from the modules scanned, each left
+    # the whole suite green -- `537 passed`, measured at the commit before
+    # this assertion existed -- either edit silently restoring the blind spot
+    # that hid a map between two CHECK-constrained columns. A scan whose
+    # reach is not asserted is a scan that can be narrowed by accident.
+    assert "hx.capture.DISCOVERED_BY" in found, (
+        "the scan no longer reaches hx.capture, or no longer looks at dicts; "
+        "either way the map it was widened to catch is invisible to it again"
+    )
     unaccounted = found - paired - unpaired_with_reason
     assert not unaccounted, (
         f"vocabulary constants with no pairing and no reason: {sorted(unaccounted)}. "

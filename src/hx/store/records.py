@@ -411,11 +411,26 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
             f"{sorted(EXCHANGE_OUTCOMES)}. Map an error class through "
             "records.EXCHANGE_OUTCOME."
         )
-    if outcome == "ok" and status is None:
-        # 'ok' means a response came back. A row claiming one with no status
-        # is a row that reads as evidence and is not.
-        raise ValueError("an 'ok' exchange with no status is not an exchange "
-                         "that happened; give it the outcome it really had")
+    if status is None and outcome in ("ok", "truncated"):
+        # Both mean a response CAME BACK -- 'ok' whole, 'truncated' cut short
+        # -- so a row claiming one with no status is a row that reads as
+        # evidence and is not.
+        #
+        # 'truncated' was outside this guard until 2026-08-25, and the guard's
+        # absence was reachable: a `result` frame with no `status` key at all
+        # reached `hx.capture` and MEASURED an accepted exchange, one surface,
+        # `requests_issued=1` and `status NULL`. The third outcome that means
+        # a response came back, 'status_unreadable', is refused by the
+        # stricter guard below -- its only legal status is the 599 sentinel,
+        # so None fails there.
+        #
+        # What is left may be NULL and the NULL is the fact: NO_STATUS_OUTCOMES
+        # never had a status to carry, and scope_denied/rate_limited were
+        # decided before issuance. A test drives this off the same table that
+        # says which status each outcome may legally carry.
+        raise ValueError(
+            f"an exchange with outcome={outcome!r} and no status is not an "
+            "exchange that happened; give it the outcome it really had")
     if outcome == "status_unreadable" and status != STATUS_UNREADABLE:
         # The converse of the guard above, and the one this task was the
         # deliberate verification for. See STATUS_UNREADABLE.

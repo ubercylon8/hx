@@ -507,6 +507,36 @@ def test_every_outcome_this_module_accepts_is_one_the_schema_accepts(conn):
                         ).fetchone()[0] == len(records.EXCHANGE_OUTCOMES)
 
 
+@pytest.mark.parametrize(
+    "outcome", sorted(o for o, s in LEGAL_STATUS.items() if s is not None))
+def test_an_outcome_that_means_a_response_came_back_is_refused_without_one(
+        conn, outcome):
+    """The other direction of the table above, and it was short by one.
+
+    `truncated` means the response ARRIVED and was cut short, so a truncated
+    row with a NULL status is the same "row that reads as evidence and is
+    not" that the `ok` guard has always refused. It was outside the guard
+    until 2026-08-25 and the gap was reachable from the wire: a `result`
+    frame with no `status` key at all, through `hx.capture`, MEASURED an
+    accepted exchange with `status NULL`, one surface and
+    `requests_issued=1`.
+
+    Driven off LEGAL_STATUS rather than a literal pair, so an outcome added
+    later that carries a status inherits the refusal instead of falling
+    through a decision nobody made. The table is asserted to cover
+    EXCHANGE_OUTCOMES exactly a few lines above, which is what makes this
+    parametrisation total rather than a sample.
+    """
+    expected = "599" if outcome == "status_unreadable" else "no status"
+    with pytest.raises(ValueError, match=expected):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=None, req_blob="a" * 64,
+                                resp_blob=None, ms=1, at_us=1,
+                                outcome=outcome)
+    assert conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+
+
 def test_the_module_and_the_schema_agree_on_the_outcome_vocabulary():
     """The other direction, which no INSERT can reach: a value SQLite would
     accept that record_exchange refuses is unreachable evidence, and the

@@ -406,10 +406,16 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     # for the one class here that IS a denial about a request the extension
     # agreed to look at. SCHEMA_VERSION 6 added 'credential'.
     #
-    # The classes still wider than the tables are halted, transport_error,
-    # timeout and bridge_lost, and none of those is a denial: a run-wide stop,
-    # a transport failure, and two that name a request the caller gave up on.
-    # records.UNRECORDABLE carries each with its reason.
+    # Classes still wider than the tables remain, and none of them is a
+    # denial about a request the extension agreed to look at -- which is the
+    # sentence S4 makes. This is not the place they are enumerated: an
+    # earlier version of this comment named four as a closed list and was
+    # wrong twice over -- short by the five frame-level refusals
+    # records.UNRECORDABLE also holds (bad_frame, engagement_mismatch,
+    # protocol_mismatch, bad_config, unknown_frame), and attributing two of
+    # the four it did name, timeout and bridge_lost, to a set that does not
+    # contain them. records.UNRECORDABLE and records.AMBIGUOUS_ISSUANCE hold
+    # the membership, with a reason written against each name; read it there.
     assert "unmanaged_credential" not in records.UNRECORDABLE
     assert records.record_denial(
         rig.eng.db, run_id=rig.run_id,

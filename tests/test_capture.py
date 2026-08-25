@@ -471,16 +471,24 @@ class TestRefusals:
             "SELECT dropped_total FROM run").fetchone()[0] == 3
 
     def test_a_refused_frame_opens_no_run(self, cap):
-        """Every refusal this module owns is settled before `current_run`, so
-        a stream of malformed frames cannot manufacture runs whose coverage is
-        zero.
+        """Each frame below is refused before `current_run` is reached, so a
+        stream of malformed frames manufactures neither runs whose coverage is
+        zero nor blob files nothing will ever name.
 
-        The sentence used to name only the two refusals above it and it was
-        measured false twice: an unparseable port (`normalise` is explicitly
-        NOT TOTAL) and an unrecognised `error_class` -- including the empty
-        string `header.get("error_class") or ""` produces -- each opened one
-        run and then raised. Both are in the list below now, because
-        `row_for` and `normalise` are pure and were hoisted above `_run`.
+        THE LIST IS THE CLAIM; the module's comment deliberately no longer
+        says it is complete. Five of the entries were added after being
+        measured opening a run: the unparseable port (`normalise` is
+        explicitly NOT TOTAL), the unrecognised `error_class` and the empty
+        string `header.get("error_class") or ""` produces, and then `ms="abc"`
+        and `outcome="bogus"`, which raised from INSIDE `record_exchange` --
+        below the blob puts as well. Three frames of either measured 1 run, 0
+        exchanges and 2 orphan blob files: six puts of two distinct bodies
+        into a content-addressed store.
+
+        The blob assertion is why the last two belong here rather than in a
+        test of their own: a refusal that opens no run can still leave files
+        behind, and that is strictly the worse leak of the two -- a run with
+        no exchanges is visible in the store, an orphan blob is not.
         """
         bad_frames = (
             _header(via="carrier-pigeon"),
@@ -490,11 +498,38 @@ class TestRefusals:
             _header(url="http://h:abc/x"),
             _header(t="denial", error_class="no-such-class"),
             _header(t="denial", error_class=""),
+            _header(ms="abc"),
+            _header(outcome="bogus"),
         )
         for bad in bad_frames:
             with pytest.raises(ValueError):
                 cap.on_exchange(bad, REQ, RESP)
         assert cap.conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+        assert not cap.blobs.path_for(
+            hashlib.sha256(REQ).hexdigest()).exists()
+
+    def test_a_response_that_came_back_cannot_be_filed_without_a_status(self, cap):
+        """An absent `status` is refused, not written as NULL.
+
+        This module invents a default for nine header fields and for `status`
+        it invents nothing -- so the frame with no `status` key at all had to
+        land somewhere, and for `outcome='truncated'` it landed on disk:
+        MEASURED `ACCEPTED rid=x-...  exchange 1  surface 1
+        requests_issued 1  status NULL`. `record_exchange` guarded only 'ok'
+        and 'status_unreadable'.
+
+        A truncated response is a response that CAME BACK, so that row said a
+        peer answered and declined to say what it answered -- while
+        `status_unreadable` plus the 599 sentinel is the store's whole
+        apparatus for saying exactly that. A NULL status now carries one
+        reading and only one: nothing on the far side ever answered.
+        """
+        header = _header(outcome="truncated")
+        del header["status"]
+        with pytest.raises(ValueError, match="no status"):
+            cap.on_exchange(header, REQ, RESP)
+        assert cap.conn.execute(
+            "SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
 
     def test_the_one_refusal_that_does_leave_a_run_behind(self, cap):
         """The boundary of the sentence above, pinned from the other side.

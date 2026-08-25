@@ -14,9 +14,15 @@ review. The rules it owns, each named where it is written:
   - `via` -> `surface.discovered_by`, in `DISCOVERED_BY`;
   - what an ABSENT header field means, which is nine separate decisions:
     `t`, `n`, `source`, `via`, `method`, `error_class`, `detail`, `ms` and
-    `outcome` all have a default here. Only `url` and `status` have none, and
-    both are refused rather than filled in -- `url` by this module, `status`
-    by `record_exchange`'s coherence guard;
+    `outcome` all have a default here. `url` and `status` have none, and
+    neither is INVENTED: an absent `url` is refused by this module, and an
+    absent `status` is refused by `record_exchange`'s coherence guard for the
+    outcomes that mean a response came back -- `ok`, `truncated` and
+    `status_unreadable`. For the rest the row keeps a NULL, and that NULL is
+    the reading: nothing on the far side ever answered, because the transport
+    failed or the request was refused before it left. It never means a
+    response came back whose status went unrecorded -- `status_unreadable`
+    with its 599 sentinel is how that is said;
   - the `requests_issued` bump, and that the denial path does not do it;
   - the whole upsert/conflict policy in `upsert_surface`;
   - the `exchange.surface_id` back-reference.
@@ -147,24 +153,30 @@ class Capture:
             raise ValueError("exchange frame has no url")
         method = header.get("method") or ""
 
-        # EVERY REFUSAL ABOUT THE FRAME ITSELF RUNS ABOVE `_run`. `row_for`
-        # raises on an error class it cannot place -- including the empty
-        # string the `or ""` below produces -- and `normalise` is explicitly
-        # NOT TOTAL: `http://h:abc/x` raises on the port. Both used to run
-        # after the run was opened, so a stream of malformed frames measured
-        # one empty run each, which is precisely what
-        # `test_a_refused_frame_opens_no_run` says cannot happen. Neither call
-        # touches the database, so hoisting them costs nothing and the run is
-        # opened only once this frame is known to be recordable.
+        # READING THE FRAME IS SETTLED ABOVE `_run`, and this paragraph names
+        # what is BELOW rather than claiming the list above is complete:
+        # three successive versions of it claimed completeness and a
+        # counter-example was measured against each. The hoisted refusals so
+        # far are the frame type, `via`, `url`, the drop count `n`, and --
+        # further down this method -- `error_class` through `row_for`, the
+        # template through `normalise`, `ms` through `int()` and `outcome`
+        # against the store's vocabulary. Each of the last four was measured
+        # firing BELOW the run -- one empty run per malformed frame -- and
+        # `ms` and `outcome` fired below the BLOB PUTS as well, leaving the
+        # files for a row that was never written. None of them touches the
+        # database, so hoisting costs nothing and the run is opened once the
+        # frame is known to be readable.
         #
-        # ONE REFUSAL IS STILL BELOW, deliberately: `record_exchange`'s
-        # coherence guards are the STORE's, they fire on a frame this module
-        # already accepted, and they are about what the ROW would claim rather
-        # than about whether the frame could be read. That case does leave an
-        # empty run behind, and
-        # `test_the_one_refusal_that_does_leave_a_run_behind` pins the
-        # boundary from that side so the sentence above stays exactly as wide
-        # as it is true.
+        # BELOW `_run` sit `record_exchange`'s COHERENCE GUARDS, deliberately.
+        # They are the STORE's; they fire on a frame this module has already
+        # read successfully; and they are about what the ROW would claim --
+        # the status/outcome pairing -- rather than about whether the frame
+        # could be read at all. That case leaves an empty run and an orphan
+        # blob behind, which is the honest cost of catching a row that would
+        # have lied: `test_the_one_refusal_that_does_leave_a_run_behind` and
+        # `test_a_row_that_cannot_be_written_leaves_its_blob_behind` pin the
+        # boundary from that side, and the second needs this exact window to
+        # exist at all.
         if t == "denial":
             error_class = header.get("error_class") or ""
             # row_for answers ("denial", kind) OR ("exchange", outcome) -- it
@@ -211,6 +223,33 @@ class Capture:
                 detail=header.get("detail") or "", at_us=at, via=via)
             return None
 
+        # The two exchange-only header fields, read HERE and not at the
+        # `record_exchange` call, which sits below `_run` AND below the blob
+        # puts. Both were measured leaking there, three frames each:
+        #
+        #   ms="abc"          ValueError from int()     1 run, 0 exchanges,
+        #                                               2 orphan blob files
+        #   outcome="bogus"   ValueError from records   1 run, 0 exchanges,
+        #                                               2 orphan blob files
+        #
+        # Six puts, two files: the store is content-addressed and the three
+        # frames carried the same bodies. Distinct bodies would be six.
+        #
+        # A value the frame cannot be read with is the same family as the
+        # unparseable port and the unplaceable error class -- nothing about
+        # the row's claims, everything about the frame -- so it belongs with
+        # them, above anything that opens or writes. `record_exchange` checks
+        # the outcome again at the writer; this one is placed early rather
+        # than instead.
+        ms = int(header.get("ms") or 0)
+        outcome = header.get("outcome") or "ok"
+        if outcome not in records.EXCHANGE_OUTCOMES:
+            raise ValueError(
+                f"unknown outcome {outcome!r}; the exchange table's "
+                f"vocabulary is {sorted(records.EXCHANGE_OUTCOMES)}. Map an "
+                "error class through records.EXCHANGE_OUTCOME rather than "
+                "inventing a value here")
+
         norm = surface_mod.normalise(
             method, url,
             preserve=frozenset(self.config.preserve_segments),
@@ -242,8 +281,7 @@ class Capture:
                 self.conn, run_id=run_id, method=method, url=url,
                 status=header.get("status"), req_blob=req_blob,
                 resp_blob=resp_blob, resp_len=resp_len,
-                ms=int(header.get("ms") or 0), at_us=at,
-                outcome=header.get("outcome") or "ok", via=via)
+                ms=ms, at_us=at, outcome=outcome, via=via)
 
             # S5's run.requests_issued, which nothing has ever written to. It
             # counts what LEFT, so it is bumped here and not on the denial

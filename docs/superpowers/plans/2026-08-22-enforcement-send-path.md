@@ -18954,6 +18954,36 @@ def test_every_outcome_this_module_accepts_is_one_the_schema_accepts(conn):
                         ).fetchone()[0] == len(records.EXCHANGE_OUTCOMES)
 
 
+@pytest.mark.parametrize(
+    "outcome", sorted(o for o, s in LEGAL_STATUS.items() if s is not None))
+def test_an_outcome_that_means_a_response_came_back_is_refused_without_one(
+        conn, outcome):
+    """The other direction of the table above, and it was short by one.
+
+    `truncated` means the response ARRIVED and was cut short, so a truncated
+    row with a NULL status is the same "row that reads as evidence and is
+    not" that the `ok` guard has always refused. It was outside the guard
+    until 2026-08-25 and the gap was reachable from the wire: a `result`
+    frame with no `status` key at all, through `hx.capture`, MEASURED an
+    accepted exchange with `status NULL`, one surface and
+    `requests_issued=1`.
+
+    Driven off LEGAL_STATUS rather than a literal pair, so an outcome added
+    later that carries a status inherits the refusal instead of falling
+    through a decision nobody made. The table is asserted to cover
+    EXCHANGE_OUTCOMES exactly a few lines above, which is what makes this
+    parametrisation total rather than a sample.
+    """
+    expected = "599" if outcome == "status_unreadable" else "no status"
+    with pytest.raises(ValueError, match=expected):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=None, req_blob="a" * 64,
+                                resp_blob=None, ms=1, at_us=1,
+                                outcome=outcome)
+    assert conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+
+
 def test_the_module_and_the_schema_agree_on_the_outcome_vocabulary():
     """The other direction, which no INSERT can reach: a value SQLite would
     accept that record_exchange refuses is unreachable evidence, and the
@@ -19510,11 +19540,26 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
             f"{sorted(EXCHANGE_OUTCOMES)}. Map an error class through "
             "records.EXCHANGE_OUTCOME."
         )
-    if outcome == "ok" and status is None:
-        # 'ok' means a response came back. A row claiming one with no status
-        # is a row that reads as evidence and is not.
-        raise ValueError("an 'ok' exchange with no status is not an exchange "
-                         "that happened; give it the outcome it really had")
+    if status is None and outcome in ("ok", "truncated"):
+        # Both mean a response CAME BACK -- 'ok' whole, 'truncated' cut short
+        # -- so a row claiming one with no status is a row that reads as
+        # evidence and is not.
+        #
+        # 'truncated' was outside this guard until 2026-08-25, and the guard's
+        # absence was reachable: a `result` frame with no `status` key at all
+        # reached `hx.capture` and MEASURED an accepted exchange, one surface,
+        # `requests_issued=1` and `status NULL`. The third outcome that means
+        # a response came back, 'status_unreadable', is refused by the
+        # stricter guard below -- its only legal status is the 599 sentinel,
+        # so None fails there.
+        #
+        # What is left may be NULL and the NULL is the fact: NO_STATUS_OUTCOMES
+        # never had a status to carry, and scope_denied/rate_limited were
+        # decided before issuance. A test drives this off the same table that
+        # says which status each outcome may legally carry.
+        raise ValueError(
+            f"an exchange with outcome={outcome!r} and no status is not an "
+            "exchange that happened; give it the outcome it really had")
     if outcome == "status_unreadable" and status != STATUS_UNREADABLE:
         # The converse of the guard above, and the one this task was the
         # deliberate verification for. See STATUS_UNREADABLE.
@@ -23454,10 +23499,16 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     # for the one class here that IS a denial about a request the extension
     # agreed to look at. SCHEMA_VERSION 6 added 'credential'.
     #
-    # The classes still wider than the tables are halted, transport_error,
-    # timeout and bridge_lost, and none of those is a denial: a run-wide stop,
-    # a transport failure, and two that name a request the caller gave up on.
-    # records.UNRECORDABLE carries each with its reason.
+    # Classes still wider than the tables remain, and none of them is a
+    # denial about a request the extension agreed to look at -- which is the
+    # sentence S4 makes. This is not the place they are enumerated: an
+    # earlier version of this comment named four as a closed list and was
+    # wrong twice over -- short by the five frame-level refusals
+    # records.UNRECORDABLE also holds (bad_frame, engagement_mismatch,
+    # protocol_mismatch, bad_config, unknown_frame), and attributing two of
+    # the four it did name, timeout and bridge_lost, to a set that does not
+    # contain them. records.UNRECORDABLE and records.AMBIGUOUS_ISSUANCE hold
+    # the membership, with a reason written against each name; read it there.
     assert "unmanaged_credential" not in records.UNRECORDABLE
     assert records.record_denial(
         rig.eng.db, run_id=rig.run_id,
