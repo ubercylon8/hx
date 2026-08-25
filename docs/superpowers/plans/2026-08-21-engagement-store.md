@@ -1685,6 +1685,14 @@ class Config:
     rate_limit_rps: int = 5
     max_concurrency: int = 2
     identities: dict[str, dict] = field(default_factory=dict)
+    # `preserve_segments` names path segments the normaliser must NOT template.
+    # THE DEFAULT PROTECTS NOTHING, and an operator who leaves it alone should
+    # know that: no rule in `hx.surface` matches `api`, `v1`, `v2` or `v3` at
+    # any threshold above 2, so the list changes no template until you put
+    # something in it that a rule would otherwise reach. That is a numeric
+    # segment which is really a route -- a year, an API generation, a tenant
+    # number -- which is what the field is for. `["2024", "2025"]` is a list
+    # that does something; the shipped one is a placeholder.
     preserve_segments: list[str] = field(default_factory=lambda: ["api", "v1", "v2", "v3"])
     slug_threshold: int = 12
 
