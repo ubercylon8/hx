@@ -63,11 +63,48 @@ public final class TestSupport {
      * an {@link AssertionError} or a {@link StackOverflowError} out of a test
      * method truncates a run exactly as an NPE does.
      */
+    /**
+     * The method currently running, so a HANG can name itself.
+     *
+     * The docstring above says the exit code is the only thing that notices a
+     * hang. That is detection; this is diagnosis, and they are different
+     * problems. rc=1 tells you the suite lost a class. It does not tell you
+     * WHICH of that class's methods parked, and the output stops before the
+     * method that hung would have printed anything -- so the last line you see
+     * is the previous method's `ok`, which points at the wrong place.
+     *
+     * `timeout` sends SIGTERM, and the JVM runs shutdown hooks on SIGTERM. So
+     * the hook below prints the name that was in flight. It costs one volatile
+     * write per test method and prints NOTHING on a healthy run -- a diagnostic
+     * that fires unconditionally is noise, and noise is what stops people
+     * reading output at all.
+     */
+    private static volatile String inFlight;
+
+    static {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            String name = inFlight;
+            if (name != null) {
+                // stderr, not stdout: a killed run's stdout may be mid-buffer,
+                // and this line has to survive to be worth writing.
+                System.err.println("hx: KILLED WHILE RUNNING " + name
+                        + " -- this class printed no summary line because the "
+                        + "method never returned. Bound the wait.");
+                System.err.flush();
+            }
+        }, "hx-inflight-reporter"));
+    }
+
     public static void t(Reporter reporter, String name, Body body) {
+        inFlight = name;
         try {
             body.run();
         } catch (Throwable e) {
             reporter.check(name + " threw " + e, false);
+        } finally {
+            // Cleared in a finally, so a THROWN method does not leave its name
+            // in flight and get blamed for a later method's hang.
+            inFlight = null;
         }
     }
 
