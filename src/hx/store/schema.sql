@@ -48,7 +48,14 @@ CREATE TABLE IF NOT EXISTS authorization (
 CREATE TABLE IF NOT EXISTS run (
   id               TEXT PRIMARY KEY,
   engagement_id    TEXT NOT NULL REFERENCES engagement(id),
-  kind             TEXT NOT NULL CHECK (kind IN ('manual','scheduled','retest')),
+  -- Amended 2026-08-24 with SCHEMA_VERSION 4. S5's vocabulary is
+  -- browse | crawl | manual | scan, and this CHECK still named
+  -- ('manual','scheduled','retest') -- values from before the proxy existed.
+  -- The spec text was amended for Plan 4 and the constraint was not, which is
+  -- exactly the drift the spec amendment itself warns about: a spec that
+  -- disagrees with its implementation stops being consulted. Found by Task 3
+  -- refusing to start rather than working around it.
+  kind             TEXT NOT NULL CHECK (kind IN ('browse','crawl','manual','scan')),
   safety_profile   TEXT NOT NULL CHECK (safety_profile IN ('production','staging')),
   scope_version_id TEXT REFERENCES scope_version(id),
   started_us       INTEGER NOT NULL,
@@ -75,7 +82,12 @@ CREATE TABLE IF NOT EXISTS surface (
                       CHECK (kind IN ('idempotent_read','state_changing','unknown')),
   discovered_by       TEXT NOT NULL DEFAULT 'proxy'
                       CHECK (discovered_by IN ('proxy','crawl','import','agent')),
-  normaliser_version  INTEGER NOT NULL DEFAULT 1,
+  -- NO DEFAULT, amended 2026-08-24. This column answers "which ruleset
+  -- produced this row", and a default answers it with a guess. It read
+  -- DEFAULT 1 while the ruleset moved to 2 in Plan 4's Task 2, so an insert
+  -- omitting it would have stamped rows with a ruleset that no longer exists
+  -- and nothing could tell afterwards. An omission must fail loudly instead.
+  normaliser_version  INTEGER NOT NULL,
   first_seen_run      TEXT REFERENCES run(id),
   last_seen_run       TEXT REFERENCES run(id),
   exemplar_exchange_id TEXT REFERENCES exchange(id),
@@ -168,6 +180,14 @@ CREATE TABLE IF NOT EXISTS finding (
   scope_level        TEXT NOT NULL
                      CHECK (scope_level IN ('engagement','host','surface','insertion')),
   payload            TEXT,
+  -- Still DEFAULT 1, deliberately and temporarily. The same argument as
+  -- surface.normaliser_version applies -- a column answering "which ruleset
+  -- produced this row" should not answer it with a guess -- but nothing
+  -- produces a finding until Plan 6, so the default is not yet WRONG here,
+  -- only premature. Removing it now costs 11 fixture rewrites in a merged
+  -- plan's test file, in a commit whose job is unblocking Task 3. Take it in
+  -- the plan that first writes a finding, and take it BEFORE that plan writes
+  -- one.
   normaliser_version INTEGER NOT NULL DEFAULT 1,
   first_seen_run     TEXT REFERENCES run(id),
   last_seen_run      TEXT REFERENCES run(id),
