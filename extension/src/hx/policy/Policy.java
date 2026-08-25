@@ -246,21 +246,10 @@ public final class Policy {
      * exactly that reason, and there is one of each.
      */
     public Decision decideBeforeGate(HxRequest req, BridgeClient.Authorisation auth) {
-        // Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before
-        // any configure and after every disconnect; epochCounter is
-        // pre-incremented, so a real commit is >= 1 and there is no other way
-        // to observe a 0. A null snapshot is a caller bug, and the fail-closed
-        // reading of a caller bug is the same one.
-        if (auth == null || auth.epoch() == 0)
-            return Decision.deny("not_configured", "no configure frame acknowledged yet");
+        Decision unusable = unusable(auth);
+        if (unusable != null) return unusable;
 
         Map<String, List<String>> scope = auth.scope();
-        // An Authorisation that cannot be read is answered the same way as one
-        // that was never committed. See malformation().
-        String malformed = malformation(scope);
-        if (malformed != null)
-            return Decision.deny("not_configured", malformed);
-
         Decision scoped = checkScope(req, scope);
         if (!scoped.allowed()) return scoped;
 
@@ -303,6 +292,61 @@ public final class Policy {
                                 req.target() + " matches dangerous.path " + pattern);
 
         return Decision.allow();
+    }
+
+    /**
+     * Scope, and nothing after it.
+     *
+     * Separate method rather than a boolean parameter on {@link #decide},
+     * because a boolean at a call site reads as a mode and this is a different
+     * QUESTION: "is this inside the client's boundary", asked without asking
+     * any of the four rules that constrain an agent. Spec s4 draws that line
+     * for the proxy's operator branch -- a human clicking a form is a
+     * deliberate act by the person legally responsible for the engagement, and
+     * their login POST is not the crawler's `method.allow` to refuse. Scope is
+     * the one nobody may spend, so it is the one this still asks.
+     *
+     * NOT a partial {@link #decideBeforeGate}, and callers may not treat it as
+     * one: an `allowed()` from here has passed scope alone. ChokepointTest
+     * counts `.decideBeforeGate(` and `.checkGate(` and requires one of each
+     * because that pair IS the send path's whole decision; this method is not
+     * in that pair and issuing on its answer would issue past method,
+     * dangerous-path, the rate limit and the budget at once.
+     *
+     * It fails closed on its own -- epoch 0 and an unreadable scope are
+     * `not_configured` here exactly as in {@link #decideBeforeGate}, from the
+     * same helper -- so a future caller that reaches for it directly cannot
+     * get an allow out of an authorisation nobody committed.
+     */
+    public Decision decideScopeOnly(HxRequest req, BridgeClient.Authorisation auth) {
+        Decision unusable = unusable(auth);
+        if (unusable != null) return unusable;
+        return checkScope(req, auth.scope());
+    }
+
+    /**
+     * Why this Authorisation cannot be decided under at all, or null when it
+     * can. The `not_configured` preamble both public questions above share.
+     *
+     * Extracted rather than written twice. A second copy is where a fail-open
+     * drifts in: the two would be edited at different times, and the one that
+     * was not edited answers `allowed()` for an authorisation the other
+     * refuses -- with nothing comparing them.
+     *
+     * Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before any
+     * configure and after every disconnect; epochCounter is pre-incremented,
+     * so a real commit is >= 1 and there is no other way to observe a 0. A
+     * null snapshot is a caller bug, and the fail-closed reading of a caller
+     * bug is the same one. An Authorisation that cannot be READ is answered
+     * the same way as one that was never committed -- see malformation().
+     */
+    private static Decision unusable(BridgeClient.Authorisation auth) {
+        if (auth == null || auth.epoch() == 0)
+            return Decision.deny("not_configured", "no configure frame acknowledged yet");
+        String malformed = malformation(auth.scope());
+        if (malformed != null)
+            return Decision.deny("not_configured", malformed);
+        return null;
     }
 
     /**

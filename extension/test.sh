@@ -23,6 +23,7 @@ CLASSES=(
     hx.send.RedactorTest
     hx.send.HaltSwitchTest
     hx.send.SenderTest
+    hx.proxy.ProxyGateTest
     hx.ChokepointTest
 )
 
