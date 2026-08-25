@@ -97,6 +97,24 @@ class TestAutoOpen:
                                 now_us=1000 + run_mod.IDLE_CLOSE_US)
         assert b == a
 
+    def test_a_closed_run_is_not_handed_back_as_the_current_one(self, conn):
+        """Found by Task 3's mutation sweep, not by the brief: dropping
+        `status='running'` from `current_run`'s lookup reddened NOTHING.
+
+        Every close in the file as written happened inside `current_run` itself,
+        so no test ever asked what `current_run` does when a run was closed
+        deliberately and the idle window has not yet expired. Without the filter
+        it hands the CLOSED run straight back, and every exchange recorded
+        afterwards lands on a run whose `ended_us` is already in the past.
+        """
+        a = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                safety_profile="production", now_us=1000)
+        run_mod.close_run(conn, run_id=a, now_us=2000)
+        b = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                safety_profile="production", now_us=3000)
+        assert b != a
+        assert _status(conn, a) == "completed"
+
     def test_one_microsecond_inside_the_window_is_still_the_same_run(self, conn):
         """Inside the window, well away from the boundary."""
         a = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
@@ -139,6 +157,22 @@ class TestStale:
         run_mod.close_run(conn, run_id=rid, now_us=2000)
         assert run_mod.reap_stale(conn, now_us=1000 + HOUR) == []
         assert _status(conn, rid) == "completed"
+
+    def test_a_reaped_run_cannot_be_closed_clean_afterwards(self, conn):
+        """S5's sentence in the other direction, and the sweep found it untested.
+
+        `close_run` guards on `status='running'`. Deleting that guard reddened
+        NOTHING: every close in the file as written ran on a live run. Without
+        it, a late `close_run` -- the harness coming back after the reaper has
+        already filed the run as dead -- rewrites `error` to `completed`, and
+        the aborted run renders as a clean one. That is the exact outcome S5
+        forbids, reached from the opposite direction to the reaper.
+        """
+        rid = run_mod.open_run(conn, engagement_id=ENG, kind="browse",
+                               safety_profile="production", now_us=1000)
+        assert run_mod.reap_stale(conn, now_us=1000 + HOUR) == [rid]
+        run_mod.close_run(conn, run_id=rid, now_us=1000 + 2 * HOUR)
+        assert _status(conn, rid) == "error"
 
     def test_a_run_idle_but_not_yet_stale_is_left_alone(self, conn):
         """The distinction the two windows exist for, and it had no test.
