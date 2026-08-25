@@ -2336,26 +2336,43 @@ public class CaptureTest {
     }
 
     static void dropsAreReportedWithNothingBehindThem() throws Exception {
-        // The input that separates a drain parked on take() from one that
-        // polls: the drops happen, the queue is then FULLY drained, and no
-        // further traffic arrives. A take()-based drain has nothing to wake
-        // it and the report never leaves -- which is the exact moment it is
-        // most needed, because a saturated harness is what makes an operator
-        // stop browsing.
+        // THE INPUT THAT SEPARATES `poll(POLL_MS)` FROM `take()`, and finding
+        // it took a measurement that came out the wrong way. The obvious
+        // version -- overflow a queue, let the drain empty it, assert the
+        // report arrived -- separates NOTHING: an EVICTION always leaves the
+        // evicting record in the queue behind it, so a take()-parked drain is
+        // woken by that record and reports on its way past. Measured: with
+        // `take()` in place of the poll, that version stayed green.
+        //
+        // The refusal path is different in exactly the way that matters. An
+        // unattributed record is counted and NOT enqueued, so a drop can be
+        // the last thing that ever happens -- and a take()-parked drain then
+        // sleeps on it forever. Which is the moment the report is most needed:
+        // a saturated harness is what makes an operator stop browsing, and
+        // "traffic stopped" is precisely "no record behind it".
         Recording sink = new Recording();
-        Capture c = new Capture(1, sink);
-        offerRange(c, 5);                             // 4 evicted, 1 queued
-        check("four were dropped before the drain existed (" + c.dropped() + ")",
-              c.dropped() == 4);
+        Capture c = new Capture(4, sink);
         c.start();
         try {
+            // Drain the queue first, so the drain is parked and idle.
+            offerAll(c, obs(1));
             waitUntil(() -> sink.seen.size() == 1);
-            // Everything the queue will ever hold has now been delivered.
+            check("the drain is idle with an empty queue", sink.seen.size() == 1);
+
+            offerAll(c, obs(2, Source.UNATTRIBUTED));
             waitUntil(() -> !sink.drops.isEmpty());
             long total = 0;
             for (Long n : sink.drops) total += n;
-            check("the drops were reported with nothing following them ("
-                  + sink.drops + ")", total == 4);
+            check("the drop was reported with nothing following it ("
+                  + sink.drops + ")", total == 1);
+
+            // And the eviction path reports too -- behaviour, not a separator:
+            // this half stays green under `take()`, and is kept as a pin on
+            // the answer rather than dressed up as more than it is.
+            offerAll(c, obs(3), obs(4), obs(5), obs(6), obs(7), obs(8));
+            waitUntil(() -> c.dropped() > 1 && reported(sink, Source.OPERATOR) > 0);
+            check("and an evicted record's drop is reported as well ("
+                  + sink.drops + ")", reported(sink, Source.OPERATOR) > 0);
         } finally { c.stop(); }
     }
 
