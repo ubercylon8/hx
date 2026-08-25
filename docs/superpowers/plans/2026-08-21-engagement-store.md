@@ -871,6 +871,22 @@ CREATE TABLE IF NOT EXISTS denial (
   url              TEXT,
   resolved_ip      TEXT,
   reason           TEXT,
+  -- Added 2026-08-25 with SCHEMA_VERSION 5. `exchange` has carried `via`
+  -- since Plan 1 and `denial` never did, which cost nothing while `send` was
+  -- the only value either could hold. Plan 4 makes the proxy a second egress
+  -- point, and `SELECT kind, COUNT(*) FROM denial` would then answer for two
+  -- at once with no way to tell them apart -- so "the crawler is being
+  -- refused everywhere" and "my browsing is being refused everywhere" become
+  -- one number, and they are opposite instructions.
+  --
+  -- The same three values as exchange.via, deliberately: a fourth would mean
+  -- a fourth egress path, which S4 forbids outright. NOT NULL with no
+  -- DEFAULT, for the reason surface.normaliser_version lost its own.
+  -- `records.record_denial` does default the PARAMETER to 'send', which is a
+  -- documented fact about which callers exist; a DEFAULT here would be a
+  -- different thing -- the answer a raw INSERT gets without being asked, and
+  -- a raw INSERT is exactly the shape a future writer takes.
+  via              TEXT NOT NULL CHECK (via IN ('proxy','send','crawl')),
   scope_version_id TEXT REFERENCES scope_version(id)
 );
 
@@ -907,7 +923,7 @@ from pathlib import Path
 
 from hx.store.paths import secure_mkdir
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 TABLES: tuple[str, ...] = (
     "engagement",

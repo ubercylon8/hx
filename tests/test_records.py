@@ -292,12 +292,17 @@ def test_the_module_docstrings_counts_are_the_counts():
     """The docstring said "twenty-one columns, six of which are nullable ids".
     Both numbers were wrong, and neither was checkable by reading.
 
-    MEASURED: the two INSERTs name 25 columns (9 + 16). Twenty-one is the
-    number of keyword parameters (8 + 13) -- a different thing, and the likely
+    MEASURED: the two INSERTs name 26 columns (10 + 16). Twenty-three is the
+    number of keyword parameters (9 + 14) -- a different thing, and the likely
     source of the error, so it is derived here too and named as itself. Five
     keyword parameters are nullable ids; `req_blob` and `resp_blob` are `str |
     None` as well and are deliberately excluded, because a blob digest is not
     a row id.
+
+    The numbers were 25 and 21 until Plan 4 gave both writers a `via` and
+    `denial` the column to put it in. That they MOVED is the demonstration:
+    the docstring they pin was updated because this went red, which is the
+    opposite of the comment that carried a stale number for two plans.
 
     Derived rather than transcribed. A comment carrying a number nothing
     computes is a comment that goes stale on the next column.
@@ -322,8 +327,8 @@ def test_the_module_docstrings_counts_are_the_counts():
             if annotation == "str | None" and param.name.endswith("_id"):
                 nullable_ids.append(f"{name}.{param.name}")
 
-    assert columns == 25, columns
-    assert keywords == 21, keywords
+    assert columns == 26, columns
+    assert keywords == 23, keywords
     assert nullable_ids == [
         "record_denial.run_id", "record_denial.scope_version_id",
         "record_exchange.run_id", "record_exchange.surface_id",
@@ -332,8 +337,8 @@ def test_the_module_docstrings_counts_are_the_counts():
 
     # ...and the docstring says the numbers this just computed.
     doc = records.__doc__
-    assert "**25** columns" in doc, doc
-    assert "9 on `denial`, 16 on `exchange`" in doc, doc
+    assert "**26** columns" in doc, doc
+    assert "10 on `denial`, 16 on `exchange`" in doc, doc
     assert "**five**" in doc, doc
 
 
@@ -362,6 +367,56 @@ def test_a_denial_with_no_run_is_allowed(conn):
                                    at_us=1)
     assert conn.execute("SELECT run_id FROM denial WHERE id=?",
                         (row_id,)).fetchone()["run_id"] is None
+
+
+def test_both_writers_still_default_to_the_send_path(conn):
+    """The default is what makes `via` a safe edit to a module with coherence
+    guards already in it: every call site written before Plan 4 keeps writing
+    the rows it always wrote. Both writers, because a default added to one of
+    them is a silent behaviour change in the other."""
+    d = records.record_denial(conn, run_id="r-1", kind="scope", method="GET",
+                              url="https://elsewhere.test/", detail="out of scope",
+                              at_us=1)
+    x = records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/", status=200,
+                                req_blob=None, resp_blob=None, ms=1, at_us=1)
+    assert conn.execute("SELECT via FROM denial WHERE id=?", (d,)).fetchone()[0] \
+        == "send"
+    assert conn.execute("SELECT via FROM exchange WHERE id=?", (x,)).fetchone()[0] \
+        == "send"
+
+
+def test_a_second_egress_point_is_recorded_as_itself(conn):
+    """The whole reason `via` is a parameter now. `SELECT kind, COUNT(*) FROM
+    denial` answered for two egress points at once while the column existed on
+    only one of the two tables, and "the crawler is being refused everywhere"
+    and "my browsing is being refused everywhere" are opposite instructions."""
+    d = records.record_denial(conn, run_id="r-1", kind="scope", method="GET",
+                              url="https://elsewhere.test/", detail="out of scope",
+                              at_us=1, via="proxy")
+    x = records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/", status=200,
+                                req_blob=None, resp_blob=None, ms=1, at_us=1,
+                                via="proxy")
+    assert conn.execute("SELECT via FROM denial WHERE id=?", (d,)).fetchone()[0] \
+        == "proxy"
+    assert conn.execute("SELECT via FROM exchange WHERE id=?", (x,)).fetchone()[0] \
+        == "proxy"
+
+
+@pytest.mark.parametrize("writer", ["record_denial", "record_exchange"])
+def test_a_via_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn, writer):
+    """Redundant with both CHECK constraints and worth its lines for the same
+    reason the `kind` check is: SQLite answers with "CHECK constraint failed:
+    denial", which names neither the value nor the three it would accept."""
+    common = dict(run_id="r-1", method="GET", url="https://app.example.test/",
+                  at_us=1, via="carrier-pigeon")
+    extra = ({"kind": "scope", "detail": "x"} if writer == "record_denial"
+             else {"status": 200, "req_blob": None, "resp_blob": None, "ms": 1})
+    with pytest.raises(ValueError, match="unknown via"):
+        getattr(records, writer)(conn, **common, **extra)
+    table = "denial" if writer == "record_denial" else "exchange"
+    assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
 def test_an_exchange_row_records_the_pair_and_derives_recv_us(conn):

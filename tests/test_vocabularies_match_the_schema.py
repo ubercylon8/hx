@@ -133,6 +133,21 @@ def test_denial_kinds_matches_the_schema():
     assert set(records_mod.DENIAL_KINDS) == _checks()["denial.kind"]
 
 
+def test_via_values_matches_the_schema():
+    """`records.VIA_VALUES` against `exchange.via` AND `denial.via`.
+
+    Two columns, because Plan 4 added the second: `exchange` has carried `via`
+    since Plan 1, `denial` never did, and the omission was invisible while the
+    send path was the only writer of either. Comparing against one of them
+    would leave the other free to drift, which is this file's whole subject --
+    and `_checks()` keys by table AND column precisely because a shared column
+    name is not a shared vocabulary.
+    """
+    checks = _checks()
+    assert set(records_mod.VIA_VALUES) == checks["exchange.via"]
+    assert set(records_mod.VIA_VALUES) == checks["denial.via"]
+
+
 def test_every_python_vocabulary_in_this_repo_is_covered_here():
     """The list of pairings is itself a thing that drifts.
 
@@ -147,6 +162,7 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
         "hx.config.VALID_PROFILES",
         "hx.store.records.EXCHANGE_OUTCOMES",
         "hx.store.records.DENIAL_KINDS",
+        "hx.store.records.VIA_VALUES",
     }
     unpaired_with_reason = {
         # Error CLASSES are a wire vocabulary from §6, not a column. The

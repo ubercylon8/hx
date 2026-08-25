@@ -11,9 +11,12 @@ argument would file evidence against the wrong run without any type error to
 show for it.
 
 COUNTED, because this paragraph had both numbers wrong. The two INSERTs name
-**25** columns -- 9 on `denial`, 16 on `exchange` -- not twenty-one; 21 is the
-number of KEYWORD PARAMETERS the two writers take between them (8 and 13),
-which is a different thing and the likely source of the error. And **five** of
+**26** columns -- 10 on `denial`, 16 on `exchange` -- not twenty-one; 23 is the
+number of KEYWORD PARAMETERS the two writers take between them (9 and 14),
+which is a different thing and the likely source of the error. (25/21/8/13
+until Plan 4 gave both writers a `via`, and `denial` the column to put it in.
+The numbers move; that they are DERIVED rather than transcribed is the point.)
+And **five** of
 those parameters are nullable ids of the same shape, not six:
 `record_denial.run_id`, `record_denial.scope_version_id`,
 `record_exchange.run_id`, `record_exchange.surface_id` and
@@ -192,6 +195,18 @@ STATUS_UNREADABLE = 599
 NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
                                 "tls_error", "bridge_lost"})
 
+# S5's `via` vocabulary, and the schema's CHECK enforces the same three.
+# `send` was the only value either writer could produce until Plan 4:
+# record_exchange hardcoded the literal and `denial` had no column to put one
+# in. `proxy` and `crawl` are the two other egress points, and a fourth value
+# would mean a fourth path -- which S4 forbids outright.
+#
+# Both `exchange.via` and `denial.via` carry it, and a test compares this
+# constant against BOTH constraints rather than one: the column was added to
+# `denial` in Plan 4 and two CHECKs spelling the same vocabulary are two
+# places for it to drift.
+VIA_VALUES = frozenset({"proxy", "send", "crawl"})
+
 # Error classes with no row of their own, named rather than forgotten.
 # `denial.kind` and `exchange.outcome` are CHECK-constrained vocabularies
 # written before these classes existed, and widening either is a schema
@@ -303,7 +318,7 @@ def new_id(prefix: str) -> str:
 
 def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
                   method: str, url: str, detail: str, at_us: int,
-                  resolved_ip: str | None = None,
+                  via: str = "send", resolved_ip: str | None = None,
                   scope_version_id: str | None = None) -> str:
     """Record one refused request. Returns the row id.
 
@@ -314,7 +329,14 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
 
     `run_id` may be None. A `not_configured` denial at 02:00 happens before
     any run row exists, and that denial is exactly the one worth having.
+
+    `via` says WHICH EGRESS POINT refused. It defaults to 'send' because these
+    writers were built for the send path and every call site that predates
+    Plan 4 is one of its rows -- a default that is a fact about this module's
+    history, not a guess about the caller. `hx.capture` passes 'proxy'.
     """
+    if via not in VIA_VALUES:
+        raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
     if kind not in DENIAL_KINDS:
         raise ValueError(
             f"{kind!r} is not a denial kind; the schema accepts "
@@ -325,8 +347,8 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
     row_id = new_id("d")
     conn.execute(
         "INSERT INTO denial(id, run_id, ts_us, kind, method, url, resolved_ip,"
-        " reason, scope_version_id) VALUES(?,?,?,?,?,?,?,?,?)",
-        (row_id, run_id, at_us, kind, method, url, resolved_ip, detail,
+        " reason, via, scope_version_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (row_id, run_id, at_us, kind, method, url, resolved_ip, detail, via,
          scope_version_id),
     )
     return row_id
@@ -335,7 +357,7 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
 def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
                     method: str, url: str, status: int | None,
                     req_blob: str | None, resp_blob: str | None, ms: int,
-                    at_us: int, outcome: str = "ok",
+                    at_us: int, outcome: str = "ok", via: str = "send",
                     resp_len: int | None = None,
                     surface_id: str | None = None,
                     scope_version_id: str | None = None,
@@ -356,14 +378,16 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     carries the outcome at all. That pairing reaches disk HERE and nowhere
     else, so this is the only place it can be enforced.
 
-    `via` is always 'send' here. The other two values in that vocabulary
-    belong to the proxy and the crawler, which are their own egress point and
-    their own plan.
+    `via` was always 'send' here until Plan 4, when `hx.capture` became the
+    proxy's egress point and passed 'proxy'. It still DEFAULTS to 'send', so
+    every send-path call site is unchanged; `crawl` has no caller yet.
 
     `identity`, `identity_generation` and `identity_state` stay NULL. Identity
     injection ships in Plan 5; writing 'assumed' now would be a claim about
     authentication that nothing in this plan can support.
     """
+    if via not in VIA_VALUES:
+        raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
     if outcome not in EXCHANGE_OUTCOMES:
         raise ValueError(
             f"{outcome!r} is not an exchange outcome; the schema accepts "
@@ -400,7 +424,7 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
         " recv_us, method, url, status, req_blob, resp_blob, resp_len,"
         " body_shed, scope_version_id, seq)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (row_id, run_id, surface_id, "send", outcome, at_us,
+        (row_id, run_id, surface_id, via, outcome, at_us,
          at_us + ms * 1000, method, url, status, req_blob, resp_blob,
          resp_len,
          # S6: solicited exchanges are NEVER shed -- they are about to become
