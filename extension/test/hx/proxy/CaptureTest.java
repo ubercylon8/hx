@@ -2,6 +2,7 @@
 package hx.proxy;
 
 import hx.TestSupport;
+import hx.bridge.BridgeClient;
 
 import java.util.*;
 import java.util.concurrent.*;
@@ -51,7 +52,18 @@ public class CaptureTest {
         t("a drop report that throws does not kill it either",
           CaptureTest::aThrowingDropReportDoesNotKillTheDrain);
         t("the drain thread is a daemon", CaptureTest::theDrainIsADaemon);
-        t("stop() does not hang on a wedged sink", CaptureTest::stopDoesNotHang);
+        t("stop() does not hang on a wedged sink, and ends the drain",
+          CaptureTest::stopDoesNotHang);
+        t("stop() counts and reports what it throws away",
+          CaptureTest::stopFlushesWhatItThrowsAway);
+        t("stop() then start() does not re-report the cumulative count",
+          CaptureTest::stopThenStartDoesNotReReportTheCount);
+        t("start() twice leaves one drain and one report",
+          CaptureTest::startTwiceLeavesOneDrain);
+        t("an exchange the sink would not take is a drop",
+          CaptureTest::anUndeliveredExchangeIsCountedAsADrop);
+        t("a drop report that answers 'not delivered' is retried in full",
+          CaptureTest::aDropReportThatSaysNotDeliveredIsRetriedInFull);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -68,26 +80,35 @@ public class CaptureTest {
                             ("req" + n).getBytes(), ("resp" + n).getBytes(), s);
     }
 
-    static final class Recording implements Capture.ExchangeSink {
+    static final class Recording implements BridgeClient.ExchangeSink {
         final List<String> seen = Collections.synchronizedList(new ArrayList<>());
         final List<Long> drops = Collections.synchronizedList(new ArrayList<>());
-        final List<Source> dropSources =
+        final List<String> dropSources =
                 Collections.synchronizedList(new ArrayList<>());
         final List<Map<String, Object>> headers =
                 Collections.synchronizedList(new ArrayList<>());
         volatile CountDownLatch gate;
         volatile boolean throwOnce;
         volatile boolean throwOnDropOnce;
+        /** RETURN false rather than throw -- the production sink's shape.
+         *  BridgeClient.exchangeSink catches its own IOException, so "the
+         *  sink threw" is the case that never happens on the wire and "the
+         *  sink returned without delivering" is the case that always does. */
+        volatile boolean refuseExchange;
+        volatile boolean refuseDropOnce;
 
-        public void exchange(Map<String, Object> h, byte[] req, byte[] resp) {
-            if (gate != null) { try { gate.await(); } catch (InterruptedException e) { return; } }
+        public boolean exchange(Map<String, Object> h, byte[] req, byte[] resp) {
+            if (gate != null) { try { gate.await(); } catch (InterruptedException e) { return false; } }
             if (throwOnce) { throwOnce = false; throw new RuntimeException("sink"); }
+            if (refuseExchange) return false;
             headers.add(new LinkedHashMap<>(h));
             seen.add(String.valueOf(h.get("url")));
+            return true;
         }
 
-        public void dropped(long n, Source s) {
+        public boolean dropped(long n, String s) {
             if (throwOnDropOnce) { throwOnDropOnce = false; throw new RuntimeException("drop"); }
+            if (refuseDropOnce) { refuseDropOnce = false; return false; }
             // Both lists appended under ONE monitor, and read back under the
             // same one: `reported()` pairs them by index, and two independent
             // synchronized lists let a reader see a count whose source has not
@@ -96,6 +117,7 @@ public class CaptureTest {
                 drops.add(n);
                 dropSources.add(s);
             }
+            return true;
         }
     }
 
@@ -167,21 +189,50 @@ public class CaptureTest {
         }
     }
 
-    /** Everything the sink was told was dropped, for one source. */
-    static long reported(Recording sink, Source s) {
+    /** Everything the sink was told was dropped, for one source -- named by
+     *  the spelling that crosses the bridge, `null` for a source that has
+     *  none. */
+    static long reported(Recording sink, String s) {
         long total = 0;
         synchronized (sink.drops) {
             for (int i = 0; i < sink.drops.size(); i++)
-                if (sink.dropSources.get(i) == s) total += sink.drops.get(i);
+                if (Objects.equals(sink.dropSources.get(i), s))
+                    total += sink.drops.get(i);
         }
         return total;
     }
 
-    /** The live drain, found by the name {@link Capture#start} gives it. */
+    /** Everything the sink was told was dropped, whatever the source. */
+    static long reportedTotal(Recording sink) {
+        long total = 0;
+        synchronized (sink.drops) {
+            for (Long n : sink.drops) total += n;
+        }
+        return total;
+    }
+
+    /**
+     * The live drain, found by the name {@link Capture#start} gives it.
+     *
+     * BY NAME, so it cannot tell a leaked drain from the live one -- which is
+     * why every assertion about a STOPPED drain below is made against a
+     * captured thread's IDENTITY (`!found.isAlive()`) and not against this.
+     * A test that leaks a wedged daemon hands the next one a thread that
+     * answers here; `stopDoesNotHang` used to be that test.
+     */
     static Thread drainThread() {
         for (Thread th : Thread.getAllStackTraces().keySet())
             if ("hx-capture".equals(th.getName())) return th;
         return null;
+    }
+
+    /** How many live threads carry that name. One is correct; two is a leak,
+     *  and drainThread() above cannot tell the difference. */
+    static int drainCount() {
+        int n = 0;
+        for (Thread th : Thread.getAllStackTraces().keySet())
+            if ("hx-capture".equals(th.getName()) && th.isAlive()) n++;
+        return n;
     }
 
     // ---- the tests ------------------------------------------------------
@@ -303,9 +354,9 @@ public class CaptureTest {
             // this half stays green under `take()`, and is kept as a pin on
             // the answer rather than dressed up as more than it is.
             offerAll(c, obs(3), obs(4), obs(5), obs(6), obs(7), obs(8));
-            waitUntil(() -> c.dropped() > 1 && reported(sink, Source.OPERATOR) > 0);
+            waitUntil(() -> c.dropped() > 1 && reported(sink, "operator") > 0);
             check("and an evicted record's drop is reported as well ("
-                  + sink.drops + ")", reported(sink, Source.OPERATOR) > 0);
+                  + sink.drops + ")", reported(sink, "operator") > 0);
         } finally { c.stop(); }
     }
 
@@ -332,14 +383,14 @@ public class CaptureTest {
               c.dropped() == 8);
         c.start();
         try {
-            waitUntil(() -> sink.dropSources.contains(Source.OPERATOR)
-                            && sink.dropSources.contains(Source.CRAWLER));
+            waitUntil(() -> sink.dropSources.contains("operator")
+                            && sink.dropSources.contains("crawler"));
             check("the operator's five were reported against the operator ("
-                  + reported(sink, Source.OPERATOR) + ")",
-                  reported(sink, Source.OPERATOR) == 5);
+                  + reported(sink, "operator") + ")",
+                  reported(sink, "operator") == 5);
             check("and the crawler's three against the crawler ("
-                  + reported(sink, Source.CRAWLER) + ")",
-                  reported(sink, Source.CRAWLER) == 3);
+                  + reported(sink, "crawler") + ")",
+                  reported(sink, "crawler") == 3);
         } finally { c.stop(); }
     }
 
@@ -363,10 +414,14 @@ public class CaptureTest {
             waitUntil(() -> !sink.drops.isEmpty());
             check("refused is not discarded: it was counted (" + c.dropped() + ")",
                   c.dropped() == 1);
-            check("and reported as UNATTRIBUTED, not as the operator ("
+            // A NULL source, not the operator's spelling. The sink now takes a
+            // String, so "no spelling" travels as null -- and null must not
+            // become "operator" on this side of the interface any more than it
+            // was allowed to on the other.
+            check("and reported with NO spelling, not as the operator ("
                   + sink.dropSources + ")",
-                  sink.dropSources.contains(Source.UNATTRIBUTED)
-                  && !sink.dropSources.contains(Source.OPERATOR));
+                  sink.dropSources.contains(null)
+                  && !sink.dropSources.contains("operator"));
             check("and sourceName has no spelling for it",
                   Capture.sourceName(Source.UNATTRIBUTED) == null);
         } finally { c.stop(); }
@@ -462,26 +517,188 @@ public class CaptureTest {
 
     static void stopDoesNotHang() throws Exception {
         Recording sink = new Recording();
-        sink.gate = new CountDownLatch(1);   // never released
+        sink.gate = new CountDownLatch(1);
         Capture c = new Capture(8, sink);
         c.start();
-        offerAll(c, obs(1));
-        // The drain has to be INSIDE the wedged sink before stop() is called.
-        // Without this the queue may still be undrained, stop() returns in
-        // microseconds, and the check passes against a drain that was never
-        // wedged at all -- a green that measures the scheduler.
-        waitUntil(() -> {
-            Thread d = drainThread();
-            // WAITING and not TIMED_WAITING: an untaken record leaves the
-            // drain in `queue.poll(POLL_MS, ...)`, which is TIMED_WAITING.
-            // Only the wedged sink's `gate.await()` is WAITING.
-            return d != null && d.getState() == Thread.State.WAITING;
-        });
-        long start = System.nanoTime();
-        c.stop();
-        long ms = (System.nanoTime() - start) / 1_000_000;
-        // Unloading the extension must not hang Burp. Same bound and same
-        // reason as HaltSwitch.STOP_JOIN_MS.
-        check("stop() returned in " + ms + " ms", ms < 4000);
+        Thread found;
+        try {
+            offerAll(c, obs(1));
+            // The drain has to be INSIDE the wedged sink before stop() is
+            // called. Without this the queue may still be undrained, stop()
+            // returns in microseconds, and the check passes against a drain
+            // that was never wedged at all -- a green that measures the
+            // scheduler.
+            waitUntil(() -> {
+                Thread d = drainThread();
+                // WAITING and not TIMED_WAITING: an untaken record leaves the
+                // drain in `queue.poll(POLL_MS, ...)`, which is TIMED_WAITING.
+                // Only the wedged sink's `gate.await()` is WAITING.
+                return d != null && d.getState() == Thread.State.WAITING;
+            });
+            found = drainThread();
+            long start = System.nanoTime();
+            c.stop();
+            long ms = (System.nanoTime() - start) / 1_000_000;
+            // Unloading the extension must not hang Burp. Same bound and same
+            // reason as HaltSwitch.STOP_JOIN_MS.
+            check("stop() returned in " + ms + " ms", ms < 4000);
+            // AND THE DRAIN IS GONE, which is the half `ms < 4000` cannot see:
+            // `join(STOP_JOIN_MS)` returns after two seconds whether or not
+            // the thread ever died, so deleting `t.interrupt()` from stop()
+            // left this class fully green -- 11 ALL PASS, 0 FAIL -- with one
+            // live `hx-capture` daemon per call, each polling a queue and
+            // calling into a torn-down BridgeClient. Inside Burp that is one
+            // per extension reload. Asserted on the CAPTURED thread rather
+            // than on drainThread(), which matches by name and so cannot tell
+            // a leak from the live one.
+            check("...and the drain thread is actually gone",
+                  found != null && !found.isAlive());
+        } finally {
+            // RELEASED, unlike the version this replaced. A gate left closed
+            // leaks a wedged daemon named `hx-capture` into every test that
+            // runs after it.
+            sink.gate.countDown();
+            c.stop();
+        }
+    }
+
+    // ---- what stop() throws away, and what a restart re-reports ----------
+
+    static void stopFlushesWhatItThrowsAway() throws Exception {
+        // MEASURED on the version this replaces: 200 records queued into a
+        // 512-slot Capture behind a slow sink, then stop() -- delivered=0,
+        // dropped()=0, reports=[]. Two hundred exchanges lost and counted as
+        // ZERO, on every extension unload and at the end of every run, with
+        // run.dropped_total still reading 0. S5 makes that number the reason
+        // a run's coverage is a floor; a floor of zero is a claim of
+        // completeness.
+        Recording sink = new Recording();
+        sink.gate = new CountDownLatch(1);   // the drain wedges on record 1
+        Capture c = new Capture(512, sink);
+        c.start();
+        try {
+            offerRange(c, 200);
+            // The drain has to be inside the wedged sink, or stop() may find
+            // an empty queue and this measures nothing.
+            waitUntil(() -> {
+                Thread d = drainThread();
+                return d != null && d.getState() == Thread.State.WAITING;
+            });
+            sink.gate.countDown();           // let stop()'s interrupt through
+            c.stop();
+            check("every queued record was counted, not discarded ("
+                  + c.dropped() + " of 200)", c.dropped() == 200);
+            check("and the count crossed the sink (" + reportedTotal(sink)
+                  + " reported, " + c.dropped() + " counted)",
+                  reportedTotal(sink) == c.dropped());
+        } finally { sink.gate.countDown(); c.stop(); }
+    }
+
+    static void stopThenStartDoesNotReReportTheCount() throws Exception {
+        // `reported[]` was a LOCAL in loop() and `dropped[]` a field, so every
+        // restart re-reported the whole cumulative total from zero. Measured:
+        // 3 real drops -> [3]; stop(); start(); -> [3, 3], SIX reported
+        // against three that happened. `count_drop` accumulates and only
+        // refuses n < 1, so the Python side cannot catch it: run.dropped_total
+        // inflates without bound across reconnects.
+        Recording sink = new Recording();
+        Capture c = new Capture(1, sink);
+        offerRange(c, 4);                              // 3 evicted
+        c.start();
+        try {
+            waitUntil(() -> reportedTotal(sink) == 3);
+            check("three drops, reported once (" + sink.drops + ")",
+                  reportedTotal(sink) == 3 && c.dropped() == 3);
+            c.stop();
+            c.start();
+            offerAll(c, obs(9));                       // wake the new drain
+            waitUntil(() -> sink.seen.contains("http://app.test/9"));
+            Thread.sleep(3 * POLL_SETTLE_MS);
+            check("the restart re-reported nothing (" + sink.drops
+                  + ", " + reportedTotal(sink) + " reported against "
+                  + c.dropped() + " counted)",
+                  reportedTotal(sink) == c.dropped());
+        } finally { c.stop(); }
+    }
+
+    static void startTwiceLeavesOneDrain() throws Exception {
+        // A leaked thread rather than an inflated count: the second start()
+        // overwrote `drain`, so stop() could never reach the first again -- N
+        // extension reloads, N live `hx-capture` daemons, each polling a queue
+        // and calling into a torn-down BridgeClient. Counted, not found by
+        // name: drainThread() matches on the name they all share, so it
+        // answers just as confidently with two of them alive.
+        Recording sink = new Recording();
+        Capture c = new Capture(4, sink);
+        c.start();
+        try {
+            waitUntil(() -> drainCount() == 1);
+            check("one drain to begin with (" + drainCount() + ")",
+                  drainCount() == 1);
+            c.start();                                 // the second call
+            Thread.sleep(3 * POLL_SETTLE_MS);
+            check("start() twice is still ONE drain (" + drainCount() + ")",
+                  drainCount() == 1);
+            offerAll(c, obs(1));
+            waitUntil(() -> sink.seen.contains("http://app.test/1"));
+            check("and that drain is the one still delivering (" + sink.seen + ")",
+                  sink.seen.contains("http://app.test/1"));
+        } finally { c.stop(); }
+    }
+
+    // ---- the sink says "not delivered" without throwing ------------------
+
+    /** Three drain cycles' worth of settling, for the checks that assert a
+     *  report did NOT happen. A negative needs a bound: nothing to wait for
+     *  means nothing waitUntil can watch. */
+    static final long POLL_SETTLE_MS = Capture.POLL_MS;
+
+    static void anUndeliveredExchangeIsCountedAsADrop() throws Exception {
+        // The third way a record is lost, and it used to touch no counter at
+        // all: a frame over MAX_FRAME -- a 64 MB download through the proxy --
+        // or a socket that died between two requests took
+        // `catch (Throwable) { log.error(...) }` and vanished. hx then reported
+        // complete coverage for a run that had lost them.
+        Recording sink = new Recording();
+        sink.refuseExchange = true;
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, obs(1), obs(2), obs(3));
+            waitUntil(() -> c.dropped() == 3);
+            check("a record the sink would not take is counted ("
+                  + c.dropped() + ")", c.dropped() == 3);
+            waitUntil(() -> reportedTotal(sink) == 3);
+            check("and reported, against its own source ("
+                  + sink.drops + " " + sink.dropSources + ")",
+                  reported(sink, "operator") == 3);
+            check("and nothing was recorded as delivered (" + sink.seen + ")",
+                  sink.seen.isEmpty());
+        } finally { c.stop(); }
+    }
+
+    static void aDropReportThatSaysNotDeliveredIsRetriedInFull() throws Exception {
+        // THE PRODUCTION SHAPE, and the one aThrowingDropReportDoesNotKillTheDrain
+        // could not reach. BridgeClient.exchangeSink catches its own
+        // IOException, logs and returns -- so the only sink that ever SIGNALLED
+        // failure was the test's, and against the real one the drain read a
+        // failed write as success and advanced `reported` past it. Scenario:
+        // the queue saturates while the Python harness restarts, 5,000 drops
+        // are counted, the write fails, one line lands in Burp's log, the
+        // bridge reconnects, and run.dropped_total reads 0.
+        Recording sink = new Recording();
+        sink.refuseDropOnce = true;
+        Capture c = new Capture(1, sink);
+        offerRange(c, 4);                             // 3 dropped
+        c.start();
+        try {
+            waitUntil(() -> !sink.drops.isEmpty());
+            check("the report that answered false was retried in full ("
+                  + sink.drops + ")", reportedTotal(sink) == 3);
+            offerAll(c, obs(9));
+            waitUntil(() -> sink.seen.contains("http://app.test/9"));
+            check("and the drain is still delivering exchanges (" + sink.seen + ")",
+                  sink.seen.contains("http://app.test/9"));
+        } finally { c.stop(); }
     }
 }

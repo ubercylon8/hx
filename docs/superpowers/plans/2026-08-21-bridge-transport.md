@@ -6748,14 +6748,16 @@ public class BridgeClientTest {
     static void theExchangeSinkFramesBothHalves() throws Exception {
         Path dir = Files.createTempDirectory("hxbridge-x");
         try (Live l = live(dir, "xs.sock")) {
-            hx.proxy.Capture.ExchangeSink sink = l.client.exchangeSink();
+            BridgeClient.ExchangeSink sink = l.client.exchangeSink();
             Map<String, Object> h = new LinkedHashMap<>();
             h.put("t", "exchange");
             h.put("via", "proxy");
             h.put("source", "operator");
             h.put("url", "http://app.test/x");
-            sink.exchange(h, "REQ".getBytes(StandardCharsets.UTF_8),
-                          "RESPONSE".getBytes(StandardCharsets.UTF_8));
+            check("a delivered exchange answers TRUE, which is what lets the "
+                  + "drain not count it as a drop",
+                  sink.exchange(h, "REQ".getBytes(StandardCharsets.UTF_8),
+                                "RESPONSE".getBytes(StandardCharsets.UTF_8)));
             Frame.Decoded f = read(l.reader, l.peer, "the exchange frame");
             check("the frame is an exchange (" + f.header.get("t") + ")",
                   "exchange".equals(f.header.get("t")));
@@ -6773,7 +6775,9 @@ public class BridgeClientTest {
                   && "RESPONSE".equals(new String(f.second, StandardCharsets.UTF_8)));
 
             // A drop report the far side can add to run.dropped_total.
-            sink.dropped(4L, hx.proxy.Source.CRAWLER);
+            check("a delivered drop report answers TRUE, which is what lets "
+                  + "the drain advance its cumulative counter",
+                  sink.dropped(4L, "crawler"));
             Frame.Decoded d = read(l.reader, l.peer, "the drop report");
             check("the drop frame is the type hx.capture knows ("
                   + d.header.get("t") + ")", "dropped".equals(d.header.get("t")));
@@ -6786,8 +6790,11 @@ public class BridgeClientTest {
             // A source with no spelling gets no key, rather than the operator's.
             // hx/capture.py documents what an ABSENT source means and answers
             // the operator's run for it; a second place writing "operator" is a
-            // second place that decision can drift.
-            sink.dropped(1L, hx.proxy.Source.UNATTRIBUTED);
+            // second place that decision can drift. NULL is how "no spelling"
+            // reaches here now: `Capture.sourceName` answers it for a Source
+            // this side has no string for, and this file no longer knows what
+            // an hx.proxy enum is at all.
+            sink.dropped(1L, null);
             Frame.Decoded u = read(l.reader, l.peer, "the unattributed drop report");
             check("an unspellable source is omitted, not defaulted ("
                   + u.header.get("source") + ")",
@@ -6798,31 +6805,48 @@ public class BridgeClientTest {
     }
 
     /**
-     * A dead socket loses the records. It must not ALSO stop the browser.
+     * A dead socket loses the records. It must not ALSO stop the browser, and
+     * it must not read as success.
      *
-     * Same rule as "offering never blocks", one layer down: an exception out
-     * of here lands on Capture's drain thread, and the drain dying is how a
-     * lost record becomes a permanently silent capture. Both methods swallow.
+     * Not raising is the same rule as "offering never blocks", one layer down:
+     * an exception out of here lands on Capture's drain thread, and the drain
+     * dying is how a lost record becomes a permanently silent capture. So both
+     * methods swallow.
+     *
+     * SWALLOWING IS NOT ENOUGH, and this method's last check used to say it
+     * was: "and so was the lost drop report, which is the coverage floor",
+     * about a line in Burp's log. It is not the coverage floor.
+     * `run.dropped_total` is, and nothing reads Burp's log into it. Because
+     * these methods returned normally after logging, the drain read a failed
+     * write as an acknowledged report and advanced its cumulative counter past
+     * it: 5,000 drops counted while the harness restarts, one log line, a
+     * reconnect, and `run.dropped_total = 0`. The boolean is what the far side
+     * can act on.
      */
     static void theExchangeSinkNeverRaisesIntoCapture() throws Exception {
         Path dir = Files.createTempDirectory("hxbridge-xd");
         try (Live l = live(dir, "xd.sock")) {
-            hx.proxy.Capture.ExchangeSink sink = l.client.exchangeSink();
+            BridgeClient.ExchangeSink sink = l.client.exchangeSink();
             l.peer.close();
             l.client.close();          // the channel is gone; writes must fail
             boolean threw = false;
+            boolean anyClaimedDelivery = false;
             try {
                 for (int i = 0; i < 5; i++) {
-                    sink.exchange(Map.of("t", "exchange", "url", "http://a/" + i),
-                                  "r".getBytes(StandardCharsets.UTF_8),
-                                  "s".getBytes(StandardCharsets.UTF_8));
-                    sink.dropped(1L, hx.proxy.Source.OPERATOR);
+                    anyClaimedDelivery |=
+                        sink.exchange(Map.of("t", "exchange", "url", "http://a/" + i),
+                                      "r".getBytes(StandardCharsets.UTF_8),
+                                      "s".getBytes(StandardCharsets.UTF_8));
+                    anyClaimedDelivery |= sink.dropped(1L, "operator");
                 }
             } catch (Throwable t) { threw = true; }
             check("neither half raised into the drain thread", !threw);
+            check("and neither claimed to have delivered anything, which is "
+                  + "what keeps the coverage floor countable",
+                  !anyClaimedDelivery);
             check("the lost exchange was logged, not swallowed silently",
                   l.log.sawError("exchange frame undeliverable"));
-            check("and so was the lost drop report, which is the coverage floor",
+            check("and so was the lost drop report",
                   l.log.sawError("drop report undeliverable"));
         } finally {
             Files.deleteIfExists(dir.resolve("xd.sock")); Files.deleteIfExists(dir);
@@ -7559,14 +7583,32 @@ public final class BridgeClient {
     }
 
     /**
-     * Where {@link hx.proxy.Capture} pushes what it has recorded.
+     * Where the capture drain pushes what it has recorded.
      *
-     * IT NEVER RAISES INTO CAPTURE, and that is the same rule as "offering
-     * never blocks", one layer down. A dead socket means these records are
-     * lost; losing them must not ALSO stop the browser, and an exception
-     * thrown back into the drain thread is how it would. So both methods
-     * swallow, log, and return -- there is no third thing to do with a
-     * record whose only destination is gone.
+     * DECLARED HERE, like {@link HaltSink} and {@link SendHandler}, and for
+     * the same reason: the package that CALLS the bridge depends on the
+     * bridge, never the other way round. Returning an `hx.proxy` type from
+     * this class made `hx.bridge` import `hx.proxy` while `hx.proxy` already
+     * imported `hx.bridge` -- a cycle javac does not mind and a reader does.
+     *
+     * SOURCE-AGNOSTIC, which is the half that actually breaks it. A
+     * `dropped(long, hx.proxy.Source)` still names the other package, and an
+     * implementation of it still has to know how an `hx.proxy` enum is
+     * spelled. So the caller does the spelling -- `Capture.sourceName`, where
+     * it already lived -- and hands over a STRING, with `null` meaning "this
+     * source has no spelling". The sink's whole job with a null is to omit
+     * the key.
+     *
+     * BOTH METHODS ANSWER WHETHER THE RECORD REACHED THE WIRE, and neither
+     * raises. Not raising is the same rule as "offering never blocks", one
+     * layer down: an exception thrown back into the drain thread kills it,
+     * and every record after it is lost silently. But "swallow and return"
+     * alone was a second silence -- the drain read a normal return as
+     * success and advanced its cumulative counter past drops that never left
+     * the process. Measured shape: the queue saturates while the Python
+     * harness restarts, 5,000 drops are counted, the write fails, one line
+     * lands in Burp's log, the bridge reconnects, and `run.dropped_total`
+     * reads 0. A BURP LOG LINE IS NOT THE COVERAGE FLOOR. False is.
      *
      * NOT A SEND, and not gated like one. `maySend()` answers "may this
      * extension ISSUE a request", and an exchange frame issues nothing: it
@@ -7575,37 +7617,51 @@ public final class BridgeClient {
      * mean an operator hitting stop also stopped the record of what had been
      * seen up to that moment -- the halt erasing its own evidence.
      */
-    public hx.proxy.Capture.ExchangeSink exchangeSink() {
-        return new hx.proxy.Capture.ExchangeSink() {
-            public void exchange(Map<String, Object> header, byte[] request,
-                                 byte[] response) {
+    public interface ExchangeSink {
+        /** True once the frame is on the wire. False means the record is
+         *  lost and the caller is the only thing that can count it. */
+        boolean exchange(Map<String, Object> header, byte[] request, byte[] response);
+
+        /** `source` is the far side's spelling, or null for a source that has
+         *  none. True once the report is on the wire; false leaves the whole
+         *  outstanding total with the caller, to go out again. */
+        boolean dropped(long n, String source);
+    }
+
+    public ExchangeSink exchangeSink() {
+        return new ExchangeSink() {
+            public boolean exchange(Map<String, Object> header, byte[] request,
+                                    byte[] response) {
                 Map<String, Object> f = new LinkedHashMap<>();
                 f.put("v", PROTOCOL_VERSION);
                 f.putAll(header);
                 try {
                     send(f, request, response);
+                    return true;
                 } catch (Throwable e) {
                     log.error("hx: exchange frame undeliverable, record lost: " + e);
+                    return false;
                 }
             }
 
-            public void dropped(long n, hx.proxy.Source source) {
+            public boolean dropped(long n, String source) {
                 Map<String, Object> f = new LinkedHashMap<>();
                 f.put("v", PROTOCOL_VERSION);
                 f.put("t", "dropped");
                 f.put("n", n);
-                String named = hx.proxy.Capture.sourceName(source);
                 // OMITTED, not defaulted, when the source has no spelling.
                 // `hx.capture` documents what an absent `source` means and
                 // answers the operator's run for it; writing "operator" here
                 // would make this file a second, quieter place that decision
                 // is taken, and the two would drift.
-                if (named != null) f.put("source", named);
+                if (source != null) f.put("source", source);
                 try {
                     send(f, new byte[0]);
+                    return true;
                 } catch (Throwable e) {
                     log.error("hx: drop report undeliverable, coverage floor "
                               + "unrecorded: " + e);
+                    return false;
                 }
             }
         };

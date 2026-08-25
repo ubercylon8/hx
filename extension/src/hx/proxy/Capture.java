@@ -1,11 +1,16 @@
 // extension/src/hx/proxy/Capture.java
 package hx.proxy;
 
+import hx.bridge.BridgeClient;
+
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * The bounded queue between the proxy handler and the bridge.
@@ -18,10 +23,30 @@ import java.util.concurrent.atomic.AtomicLong;
  * on the client's application. That would turn a harness bug into an
  * incident.
  *
- * ITS CONVERSE: a drop is never silent. Every eviction is counted and the
- * count crosses the bridge, because S5 says a run with drops has coverage
- * numbers that are a FLOOR and nothing on the far side can know that unless
- * it is told.
+ * ITS CONVERSE: a drop is never silent. S5 says a run with drops has coverage
+ * numbers that are a FLOOR, and nothing on the far side can know that unless
+ * it is told. There are FOUR ways this class can hold a record it does not
+ * pass on, and each one increments {@link #dropped} for the record's own
+ * source:
+ *
+ *   1. EVICTION, when {@link #offer} finds the queue full;
+ *   2. REFUSAL, when a record's source has no spelling;
+ *   3. AN UNDELIVERED EXCHANGE -- the sink threw, or answered false;
+ *   4. {@link #stop}, which throws away whatever is still queued.
+ *
+ * They are ONE number, not four, because they are one fact: a record hx does
+ * not have. A frame over MAX_FRAME and a socket that died between two
+ * requests differ to whoever is debugging the bridge and not at all to
+ * whoever is reading the run's coverage.
+ *
+ * WHAT IS NOT CLAIMED HERE is that the count reaches the far side. It reaches
+ * it when {@link BridgeClient.ExchangeSink#dropped} SAYS it did, by answering
+ * true; a report that answers false leaves {@link #reported} where it was and
+ * the whole outstanding total goes out on the next attempt. That distinction
+ * is the entire point of the boolean: the production sink catches its own
+ * IOException, and before it answered, a write that failed advanced the
+ * counter anyway -- 5,000 drops became one line in Burp's log and
+ * `run.dropped_total = 0`. A log line is not the coverage floor.
  *
  * Oldest-first eviction, deliberately. The recent requests are the ones an
  * operator is currently looking at; the old ones are already reasoned about.
@@ -37,11 +62,6 @@ public final class Capture {
      * to overflow, it is not allowed to block, and every overflow is counted.
      */
     public static final int DEFAULT_CAPACITY = 512;
-
-    public interface ExchangeSink {
-        void exchange(Map<String, Object> header, byte[] request, byte[] response);
-        void dropped(long n, Source source);
-    }
 
     /** Same bound and same reason as HaltSwitch.STOP_JOIN_MS: unloading the
      *  extension must not hang Burp. */
@@ -61,7 +81,7 @@ public final class Capture {
     static final long POLL_MS = 100L;
 
     private final ArrayBlockingQueue<Observed> queue;
-    private final ExchangeSink sink;
+    private final BridgeClient.ExchangeSink sink;
 
     /**
      * Drops COUNTED PER SOURCE, because the report carries a source and the
@@ -73,10 +93,41 @@ public final class Capture {
      * coverage.
      */
     private final AtomicLong[] dropped = new AtomicLong[Source.values().length];
+
+    /**
+     * How much of {@link #dropped} the far side has ACKNOWLEDGED, per source.
+     *
+     * A FIELD, and it used to be a local in `loop()`. Measured with it local:
+     * three real drops reported `[OPERATOR:3]`, then `stop(); start();`
+     * reported `[OPERATOR:3, OPERATOR:3]` -- six reported against three that
+     * happened. `hx.capture` only refuses `n < 1` and `count_drop`
+     * ACCUMULATES, so nothing on the Python side can catch an inflated
+     * report: `run.dropped_total` climbs without bound across reconnects, and
+     * the number that exists to say "coverage is a floor" becomes a number
+     * that is wrong in the direction of alarm.
+     *
+     * Guarded by {@link #reportLock}, which is what lets {@link #stop} report
+     * the flush without racing a drain that outlived its join.
+     */
+    private final long[] reported = new long[Source.values().length];
+
+    /**
+     * Held across one whole reporting pass.
+     *
+     * `stop()` reports too, and a drain that did not die inside STOP_JOIN_MS
+     * is still reporting. Two passes over the same `reported[]` would each
+     * read the same outstanding total and each send it -- E3's bug with two
+     * threads instead of two runs. `stop()` takes it with `tryLock` and never
+     * waits: a drain wedged INSIDE the sink holds this, and a stop() that
+     * blocked on it would hang Burp's unload, which is the one thing
+     * STOP_JOIN_MS exists to prevent.
+     */
+    private final ReentrantLock reportLock = new ReentrantLock();
+
     private volatile Thread drain;
     private volatile boolean running;
 
-    public Capture(int capacity, ExchangeSink sink) {
+    public Capture(int capacity, BridgeClient.ExchangeSink sink) {
         this.queue = new ArrayBlockingQueue<>(capacity);
         this.sink = sink;
         for (int i = 0; i < dropped.length; i++) dropped[i] = new AtomicLong();
@@ -100,6 +151,11 @@ public final class Capture {
      * two explicit answers rather than `s == CRAWLER ? "crawler" : "operator"`,
      * so a constant added to {@link Source} later is a null here and a refused
      * record, not a silent promotion to the operator's run.
+     *
+     * It lives HERE, and the sink takes the STRING it produces. `hx.bridge`
+     * knowing how to spell an `hx.proxy` enum was a package cycle and a
+     * second place the decision could drift; a `null` crossing to the sink
+     * means "no spelling", and the sink's only job with it is to omit the key.
      */
     public static String sourceName(Source s) {
         if (s == Source.CRAWLER) return "crawler";
@@ -135,7 +191,18 @@ public final class Capture {
         }
     }
 
-    public void start() {
+    /**
+     * Start the drain, or do nothing if it is already running.
+     *
+     * IDEMPOTENT, and that is not tidiness. Called twice, the previous
+     * version started a second `hx-capture` thread over the first -- two
+     * drains on one queue, and `drain` naming only the second, so `stop()`
+     * could never reach the first again. Inside Burp that is one leaked
+     * daemon per extension reload, each polling a queue and calling into a
+     * torn-down BridgeClient.
+     */
+    public synchronized void start() {
+        if (drain != null) return;
         running = true;
         Thread t = new Thread(this::loop, "hx-capture");
         t.setDaemon(true);   // must never hold Burp open
@@ -143,9 +210,28 @@ public final class Capture {
         t.start();
     }
 
-    public void stop() {
+    /**
+     * Stop the drain, and account for what is still queued.
+     *
+     * THE FLUSH IS THE POINT. Measured on the previous version: 200 records
+     * queued into a 512-slot Capture behind a slow sink, then `stop()` --
+     * `delivered=0, dropped()=0, reports=[]`. Two hundred exchanges gone and
+     * counted as zero, on every extension unload and at the end of every run.
+     *
+     * The queue is COUNTED, not delivered. Delivering it would mean pushing
+     * up to DEFAULT_CAPACITY frames into a sink that may be exactly as wedged
+     * as the one that let the queue fill, on the thread Burp is unloading the
+     * extension on -- an unbounded wait where STOP_JOIN_MS is the bound. A
+     * record hx cannot pass on is a drop; saying so is the honest half, and
+     * it is the half S5 depends on.
+     *
+     * Idempotent: a second call finds no drain, an empty queue and nothing
+     * outstanding.
+     */
+    public synchronized void stop() {
         running = false;
         Thread t = drain;
+        drain = null;
         if (t != null) {
             t.interrupt();
             try {
@@ -154,11 +240,21 @@ public final class Capture {
                 Thread.currentThread().interrupt();
             }
         }
-        drain = null;
+        List<Observed> left = new ArrayList<>();
+        queue.drainTo(left);
+        for (Observed o : left) dropped[o.source().ordinal()].incrementAndGet();
+        // tryLock, never lock: see reportLock. A drain wedged in the sink is
+        // holding it, and there is nothing to report through anyway.
+        if (reportLock.tryLock()) {
+            try {
+                reportOutstanding();
+            } finally {
+                reportLock.unlock();
+            }
+        }
     }
 
     private void loop() {
-        long[] reported = new long[dropped.length];
         while (running) {
             Observed o;
             try {
@@ -166,36 +262,58 @@ public final class Capture {
             } catch (InterruptedException e) {
                 return;
             }
-            if (o != null) {
-                try {
-                    Map<String, Object> h = new LinkedHashMap<>();
-                    h.put("t", "exchange");
-                    h.put("via", "proxy");
-                    h.put("source", sourceName(o.source()));
-                    h.put("method", o.method());
-                    h.put("url", o.url());
-                    h.put("status", (long) o.status());
-                    h.put("ms", o.ms());
-                    h.put("outcome", "ok");
-                    sink.exchange(h, o.request(), o.response());
-                } catch (Throwable t) {
-                    // A sink that throws is someone else's code failing. Losing
-                    // this record is bad; losing every record after it because
-                    // the drain thread died is worse, and silent.
-                }
+            if (o != null) deliver(o);
+            reportLock.lock();
+            try {
+                reportOutstanding();
+            } finally {
+                reportLock.unlock();
             }
-            for (Source s : Source.values()) {
-                int i = s.ordinal();
-                long now = dropped[i].get();
-                if (now == reported[i]) continue;
-                try {
-                    sink.dropped(now - reported[i], s);
-                    reported[i] = now;
-                } catch (Throwable t) {
-                    // Same reasoning; the count is cumulative, so the next
-                    // successful report catches up.
-                }
+        }
+    }
+
+    /** One record to the sink, or one more drop. */
+    private void deliver(Observed o) {
+        boolean delivered;
+        try {
+            Map<String, Object> h = new LinkedHashMap<>();
+            h.put("t", "exchange");
+            h.put("via", "proxy");
+            h.put("source", sourceName(o.source()));
+            h.put("method", o.method());
+            h.put("url", o.url());
+            h.put("status", (long) o.status());
+            h.put("ms", o.ms());
+            h.put("outcome", "ok");
+            delivered = sink.exchange(h, o.request(), o.response());
+        } catch (Throwable t) {
+            // A sink that throws is someone else's code failing. Losing
+            // this record is bad; losing every record after it because
+            // the drain thread died is worse, and silent.
+            delivered = false;
+        }
+        if (!delivered) dropped[o.source().ordinal()].incrementAndGet();
+    }
+
+    /** Called with {@link #reportLock} held. */
+    private void reportOutstanding() {
+        for (Source s : Source.values()) {
+            int i = s.ordinal();
+            long now = dropped[i].get();
+            if (now == reported[i]) continue;
+            boolean told;
+            try {
+                told = sink.dropped(now - reported[i], sourceName(s));
+            } catch (Throwable t) {
+                // Same reasoning as deliver(): a sink that throws must not
+                // kill the drain.
+                told = false;
             }
+            // ONLY on an acknowledged report. The count is cumulative, so the
+            // next attempt carries the whole outstanding total -- and the
+            // previous version advanced on a sink that had merely RETURNED,
+            // which the production one does after logging its own IOException.
+            if (told) reported[i] = now;
         }
     }
 }
