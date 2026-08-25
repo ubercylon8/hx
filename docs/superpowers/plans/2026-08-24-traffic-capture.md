@@ -67,7 +67,7 @@ Reproduce before starting any task and again when finishing it:
 
 | File | Responsibility |
 |---|---|
-| `extension/src/hx/proxy/Source.java` | The traffic source enum (`OPERATOR`, `CRAWLER`) and how a request is attributed to one. One file because the attribution rule is the security boundary and must be readable on its own. |
+| `extension/src/hx/proxy/Source.java` | The traffic source enum (`OPERATOR`, `CRAWLER`, `UNATTRIBUTED`) and how a request is attributed to one. One file because the attribution rule is the security boundary and must be readable on its own. **`UNATTRIBUTED` was added by Task 5's fix round 1**: a listener port that cannot be determined is its own answer, and `ProxyGate` refuses it, rather than falling into the permissive branch. |
 | `extension/src/hx/proxy/ProxyGate.java` | §4's second enforcement point. Decides scope (operator) or the full order (crawler), returns drop-or-continue, and emits the denial. Owns no I/O. |
 | `extension/src/hx/proxy/Observed.java` | The immutable record of one observed exchange: redacted request bytes, redacted response bytes, timing, source, status. |
 | `extension/src/hx/proxy/Capture.java` | The bounded queue: accept an `Observed`, drop oldest when full, count drops, hand to the bridge on its own thread. Never blocks the caller. |
@@ -1576,7 +1576,8 @@ The extension gains the point §4 has promised since the spec was written. `Prox
 **Interfaces:**
 - Consumes: `hx.policy.Policy.decide(HxRequest, BridgeClient.Authorisation)`, `hx.policy.Decision`, `hx.policy.HxRequest`, `hx.bridge.BridgeClient.Authorisation`, `hx.policy.Gate`
 - Produces:
-  - `enum Source { OPERATOR, CRAWLER }` with `static Source forListenerPort(int port, int crawlerPort)`
+  - `enum Source { OPERATOR, CRAWLER, UNATTRIBUTED }` with `static Source forListenerPort(int port, int crawlerPort)` and `static final int NO_PORT = 0`
+    - **Amended by fix round 1, and this is the contract Task 7 implements against.** `forListenerPort` answers `UNATTRIBUTED` for any `port` outside `1..65535` — `NO_PORT` is the spelling for "the caller could not read one" — and `ProxyGate.decide` REFUSES `UNATTRIBUTED` and `null` with class `not_configured` and a detail carrying `BridgeClient.EXTENSION_FAULT`. A port that parses and is not the crawler's is still `OPERATOR`. The code blocks below are Task 5's original text and predate the amendment; the files are the authority (this plan is `plan-drift: pending`, so its blocks are not compared).
   - `record ProxyGate.Verdict(boolean allow, String errorClass, String detail)`
   - `ProxyGate(Policy policy)` and `Verdict decide(HxRequest req, Authorisation auth, Source source)`
 
@@ -2411,7 +2412,9 @@ Two properties the code must have, and both are sabotaged in Step 3:
 - **The gate is consulted before anything is queued.** Enforcement does not wait on capture.
 - **`Redactor` runs on both halves before `Capture.offer`.** An `Observed` holding raw bytes would put a live credential in the queue, and §7 says the store is content-addressed so anything that reaches hashing is unrecoverable.
 
-The crawler listener port comes from `-Dhx.crawler_port`, defaulting to `0` — which `Source.forListenerPort` reads as "no crawler configured", so a deployment that never sets it attributes everything to `OPERATOR` rather than accidentally applying the agent's rules to a human.
+The crawler listener port comes from `-Dhx.crawler_port`, defaulting to `0` — which `Source.forListenerPort` reads as "no crawler configured", so a deployment that never sets it attributes every request whose own listener port parses to `OPERATOR` rather than accidentally applying the agent's rules to a human.
+
+**The request's own port is the other half, and fix round 1 changed it.** Parse it off `listenerInterface()` after the last `:`; when that parse fails — no colon, a non-numeric tail, a null interface — hand `Source.NO_PORT` over rather than inventing a number. `forListenerPort` answers `UNATTRIBUTED` for it and `ProxyGate` refuses the request (`not_configured`, detail prefixed `extension fault: `). Do not catch that refusal and retry as `OPERATOR`: "we could not work out who is driving" is a code failure, and the operator branch is the one that drops the method allowlist, the dangerous-path denylist, the rate limit and the budget. A sabotage row for it: make the parse return `0` unconditionally and the whole proxy path must go red, not quiet.
 
 - [ ] **Step 2: Grow the structural test**
 

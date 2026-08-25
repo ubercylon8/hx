@@ -30,6 +30,13 @@ import hx.policy.Policy;
  * `Policy.decide` is the full pinned order and `Policy.decideScopeOnly` stops
  * after scope. Which of the two a request gets is the whole of what
  * {@link Source} buys.
+ *
+ * THERE IS A THIRD ANSWER AND IT IS NEITHER QUESTION. A source this class
+ * cannot recognise -- `Source.UNATTRIBUTED`, or a null -- is REFUSED here
+ * without asking Policy anything. The lenient branch is chosen for a human
+ * whose deliberate act it is; "we could not work out who is driving" is a code
+ * failure or a change in Burp, and defaulting it to the branch that drops four
+ * of the five rules is a fail-open dressed as a default.
  */
 public final class ProxyGate {
     private final Policy policy;
@@ -65,14 +72,71 @@ public final class ProxyGate {
             // DENY-ALL is the initial and terminal state, at BOTH points, and
             // this copy of it is REDUNDANT with the one inside Policy: both
             // questions below refuse an epoch-0 authorisation on their own, so
-            // with these three lines deleted the four `DENY-ALL holds for`
-            // checks in ProxyGateTest stay green -- measured, row D of this
-            // task's sabotage table. What it changes is WHEN the answer is
-            // given: here, before the Policy reference is touched at all. The
-            // input that separates the two is a ProxyGate holding no Policy,
-            // and ProxyGateTest uses it for exactly that.
+            // with these three lines deleted the three `DENY-ALL holds for`
+            // checks in ProxyGateTest -- one per Source constant -- stay
+            // green. Re-measured on this tree after the third constant was
+            // added: 9 x ALL PASS + 1 FAILURE, 1652 ok, and the single FAIL is
+            // an NPE out of unconfiguredRefusesBoth, not a check saying an
+            // unconfigured extension allowed something. (Row D of this task's
+            // sabotage table measured the same mutation when Source had two
+            // constants.) What these lines change is WHEN the answer is given:
+            // here, before the Policy reference is touched at all. The input
+            // that separates the two is a ProxyGate holding no Policy, which
+            // is where that NPE comes from and what ProxyGateTest uses it for.
+            //
+            // `== 0`, not `< 1`, at BOTH enforcement points (the other copy is
+            // Policy.unusable). That is a REACHABILITY argument and not a
+            // range check: epoch is a long, and a hand-built
+            // `new Authorisation(-1, scope)` is treated as CONFIGURED and
+            // decided under, here and there alike -- measured. Nothing in this
+            // tree can produce one, because BridgeClient's counter is
+            // pre-incremented from 0 and is the only writer of the field, so
+            // the inherited shape is kept and the reachability is written down
+            // rather than left for the next reader to re-derive.
             return new Verdict(false, "not_configured",
                                "no configure frame acknowledged yet");
+        }
+        if (source != Source.OPERATOR && source != Source.CRAWLER) {
+            // UNATTRIBUTED, null, and anything a later constant adds. Written
+            // as "not one of the two I know" rather than as
+            // `source == Source.UNATTRIBUTED`, because the enum is CLOSED and
+            // a fourth constant added later would otherwise fall into
+            // whichever branch it was not named in -- and the operator branch
+            // is the one it would fall into.
+            //
+            // Two separating inputs, both in ProxyGateTest and both ALLOWED
+            // before this guard existed, measured: `POST /login` (no
+            // method_denied on the operator branch) and `GET /logout` (no
+            // dangerous_denied), each with source UNATTRIBUTED and again with
+            // a null. The control is that the same two requests are still
+            // allowed for Source.OPERATOR -- theOperatorIsNotMethodChecked and
+            // theOperatorIsNotDangerousPathChecked -- so what these pin is
+            // attribution, not the rules.
+            //
+            // The CLASS is `not_configured`, reusing S6's documented overload
+            // rather than minting a wire class from a call site that does not
+            // exist yet. The detail carries BridgeClient.EXTENSION_FAULT --
+            // the prefix records.py declares as its own constant, pinned
+            // byte-identical across the two languages by
+            // test_the_extension_fault_marker_is_the_same_string_on_both_sides
+            // -- because "this jar could not tell who was driving" is the same
+            // kind of thing as "this jar has no send handler" and not the same
+            // kind as "the operator never configured a run".
+            //
+            // A class of its own is Task 7's to settle when it wires the
+            // recording: a new class needs a row to go in
+            // (tests/test_records.py) and there is nothing to record from
+            // here yet. Worth knowing before minting one HERE, and it is not
+            // an argument for doing so: that test derives the class set by
+            // scanning for `Decision.deny("...")` and `error(f, "...")`, and
+            // this file's spelling is `new Verdict(false, "...")` -- which it
+            // does not scan, for this line or for the epoch-0 one above. A
+            // class introduced here would be invisible to the check that
+            // exists to catch a denial with nowhere to go.
+            return new Verdict(false, "not_configured",
+                               BridgeClient.EXTENSION_FAULT
+                               + "the proxy listener could not be attributed "
+                               + "to the operator or the crawler");
         }
         if (source == Source.CRAWLER) {
             // The agent's rules, in S4's pinned order, Gate included.

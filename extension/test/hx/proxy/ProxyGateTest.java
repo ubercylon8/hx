@@ -61,8 +61,10 @@ public class ProxyGateTest {
           ProxyGateTest::theOperatorDoesNotSpendTheGate);
         t("but the crawler does (the gate)",
           ProxyGateTest::theCrawlerSpendsTheGate);
-        t("an unconfigured extension refuses both sources",
+        t("an unconfigured extension refuses every source",
           ProxyGateTest::unconfiguredRefusesBoth);
+        t("a source that could not be attributed is refused, not defaulted",
+          ProxyGateTest::anUnattributableSourceIsRefused);
         t("the listener port decides the source",
           ProxyGateTest::theListenerPortDecides);
 
@@ -197,10 +199,15 @@ public class ProxyGateTest {
         }
 
         // The separating input for ProxyGate's OWN epoch guard, and it is not
-        // the four checks above. Policy refuses an epoch-0 authorisation on
-        // both of the paths this class calls, so with ProxyGate's guard
-        // deleted those four printed `ok` and only the two below went red --
-        // measured, row D of this task's sabotage table. The guard adds that
+        // the checks above. Policy refuses an epoch-0 authorisation on both of
+        // the paths this class calls, so with that guard deleted the three
+        // above still print `ok` and the failure is the NPE thrown out of THIS
+        // method the moment the loop below reaches a ProxyGate with no Policy
+        // -- re-measured on this tree, 9 x ALL PASS + 1 FAILURE / 1652 ok, the
+        // one FAIL being this method's name and a NullPointerException. (Row D
+        // of the sabotage table measured it when Source had two constants; the
+        // third constant adds a green check, not a red one, because an
+        // unattributable source is refused either way.) The guard adds that
         // the answer is given BEFORE the
         // Policy is consulted, and a ProxyGate holding no Policy is the one
         // caller that can tell the two apart: with the guard it is a verdict,
@@ -214,6 +221,55 @@ public class ProxyGateTest {
         }
     }
 
+    // ---- the third answer ------------------------------------------------
+
+    /**
+     * A source this gate cannot recognise is REFUSED, and both spellings of
+     * one are: `Source.UNATTRIBUTED` and a null.
+     *
+     * Both were ALLOWED before the guard that answers them existed --
+     * measured, and with the whole suite at 10 x ALL PASS, because
+     * `source == Source.CRAWLER` is false for each and the else branch is the
+     * lenient one. The two requests are chosen as the separating inputs: a
+     * POST the allowlist omits, and a GET on a dangerous path. The CONTROL is
+     * that both are still allowed for Source.OPERATOR two methods up, so what
+     * these pin is attribution and not the four rules.
+     *
+     * NOT claimed: that null and UNATTRIBUTED exhaust what this branch
+     * catches. It is written as "neither of the two I know", so a constant
+     * added to Source later lands here too -- and that constant needs its own
+     * check, because this method names two and cannot see a third.
+     */
+    static void anUnattributableSourceIsRefused() {
+        CountingGate gate = new CountingGate();
+        ProxyGate g = gateOver(gate);
+        Source[] unknown = { Source.UNATTRIBUTED, null };
+        for (Source s : unknown) {
+            var post = g.decide(req("POST", "http://app.test/login"), authorised(), s);
+            check("a POST the allowlist omits is refused for " + s + " ("
+                  + post.errorClass() + ")",
+                  !post.allow() && "not_configured".equals(post.errorClass()));
+
+            var logout = g.decide(req("GET", "http://app.test/logout"), authorised(), s);
+            check("and so is a dangerous path for " + s + " ("
+                  + logout.errorClass() + ")",
+                  !logout.allow() && "not_configured".equals(logout.errorClass()));
+
+            // The class is shared with DENY-ALL, so the class alone does not
+            // say which guard answered. The detail does, and the prefix it
+            // starts with is the one records.py declares for itself -- the
+            // marker that separates "this jar is broken" from "the operator
+            // never configured a run", pinned identical on both sides by
+            // test_the_extension_fault_marker_is_the_same_string_on_both_sides.
+            check("with the extension-fault marker on the detail for " + s
+                  + " (" + logout.detail() + ")",
+                  logout.detail() != null
+                  && logout.detail().startsWith(BridgeClient.EXTENSION_FAULT));
+        }
+        check("and refusing an unattributable request spends nothing ("
+              + gate.calls + ")", gate.calls == 0);
+    }
+
     // ---- attribution -----------------------------------------------------
 
     static void theListenerPortDecides() {
@@ -221,20 +277,39 @@ public class ProxyGateTest {
               Source.forListenerPort(8081, 8081) == Source.CRAWLER);
         check("any other port attributes to OPERATOR",
               Source.forListenerPort(8080, 8081) == Source.OPERATOR);
-        // The separating case. An unknown port must not become CRAWLER by
-        // accident: crawler attribution is the STRICTER branch, and getting
-        // it by default would silently apply the agent's rules to a human.
-        check("and an unknown port is OPERATOR, not CRAWLER",
+        // A port that PARSED and belongs to no listener hx knows about is the
+        // operator's: they may configure extra listeners, and crawler
+        // attribution is the stricter branch, so getting it by default would
+        // silently apply the agent's rules to a human.
+        check("and an unrecognised but usable port is OPERATOR, not CRAWLER",
               Source.forListenerPort(9999, 8081) == Source.OPERATOR);
-        // ...and the converse, which is the one with teeth: a crawler port
-        // that was never configured (0) must not swallow every request.
+        // Behaviour, not a guard: an unconfigured crawler port must swallow
+        // nothing. This input separates no branch of forListenerPort as it now
+        // stands -- 8080 is in range and 8080 != 0 -- and is kept as a pin on
+        // the answer rather than dressed up as more than it is.
         check("an unconfigured crawler port matches nothing",
               Source.forListenerPort(8080, 0) == Source.OPERATOR);
-        // The line above does NOT separate `crawlerPort > 0` from its absence
-        // -- 8080 != 0 either way. This one does, and it is the only input in
-        // this method that does: two absences, an unreadable port and an
-        // unconfigured crawler, must not agree their way into CRAWLER.
-        check("and two absences do not agree their way into CRAWLER",
-              Source.forListenerPort(0, 0) == Source.OPERATOR);
+
+        // The four inputs that separate the range test, and with it the whole
+        // third answer. Each is a port the caller could not determine, and
+        // each answered OPERATOR -- the branch that drops four of the five
+        // rules -- before the range test existed; measured, all four, against
+        // the committed body. (0, 0) was the sharpest: it answered OPERATOR
+        // only because of a `crawlerPort > 0` clause that existed for that one
+        // pair, and a bare equality made it CRAWLER instead.
+        check("a port that could not be read is UNATTRIBUTED, with a crawler configured",
+              Source.forListenerPort(Source.NO_PORT, 8081) == Source.UNATTRIBUTED);
+        check("and without one",
+              Source.forListenerPort(Source.NO_PORT, 0) == Source.UNATTRIBUTED);
+        check("a negative sentinel is UNATTRIBUTED, not a listener",
+              Source.forListenerPort(-1, 8081) == Source.UNATTRIBUTED);
+        check("and so is a number no TCP port can be",
+              Source.forListenerPort(70000, 8081) == Source.UNATTRIBUTED);
+        // The constant is the spelling Task 7 hands over, and it must be the
+        // value the rule actually treats that way -- a NO_PORT of, say, 1
+        // would make the two lines above pass while every real parse failure
+        // answered OPERATOR.
+        check("and NO_PORT is one of those numbers (" + Source.NO_PORT + ")",
+              Source.NO_PORT < 1 || Source.NO_PORT > 65535);
     }
 }
