@@ -217,6 +217,7 @@ The `hex` field is left empty for all but the first vector deliberately: Step 5 
 ```python
 # tests/test_bridge_codec.py
 import json
+import re
 import socket
 from pathlib import Path
 
@@ -504,6 +505,120 @@ def test_encode_refuses_an_integer_outside_signed_64_bit_range():
     # The boundary values themselves must still be accepted.
     codec.encode({"v": 1, "t": "send", "deadline_us": 2 ** 63 - 1})
     codec.encode({"v": 1, "t": "send", "deadline_us": -(2 ** 63)})
+
+
+# ---- the two-body form -------------------------------------------------
+#
+# Plan 4's `exchange` frame carries a request AND a response, and they cannot
+# share one opaque body: the far side content-addresses each on its own. The
+# form declares itself in the header under `codec.BODIES_KEY` and packs the
+# body slot as [len(first)][first][len(second)][second], leaving the OUTER
+# frame -- length prefix, header, newline, body slot -- exactly as it was.
+
+
+# The SAME literal CodecTest.java records for the same inputs. Two codecs that
+# only round-trip against themselves can disagree forever, which is why the
+# golden vectors exist at all; this is that pin for the two-body form. It is a
+# literal here rather than a row in frames.json because every consumer of that
+# file calls the ONE-body encoder.
+TWO_BODY_HEX = (
+    "0000004f7b2276223a312c2274223a2265786368616e6765222c2275726c223a"
+    "22687474703a2f2f6170702e746573742f78222c22626f64696573223a327d0a"
+    "0000000352455100000008524553504f4e5345"
+)
+
+
+def _exchange_header():
+    return {"v": 1, "t": "exchange", "url": "http://app.test/x"}
+
+
+def test_the_two_body_wire_form_is_the_same_on_both_sides():
+    raw = codec.encode_two(_exchange_header(), b"REQ", b"RESPONSE")
+    assert raw.hex() == TWO_BODY_HEX
+    header, body, _ = codec.decode(bytes.fromhex(TWO_BODY_HEX))
+    assert codec.split_bodies(header, body) == (b"REQ", b"RESPONSE")
+
+
+def test_two_bodies_round_trip_and_stay_apart():
+    """A first half whose own bytes look like a length prefix, and an empty
+    second half: the pair that separates real length prefixes from a scan."""
+    first, second = b"\x00\x00\x00\x08x", b""
+    header, body, _ = codec.decode(codec.encode_two(_exchange_header(), first, second))
+    assert codec.split_bodies(header, body) == (first, second)
+
+    big = bytes(range(256)) * 300
+    header, body, _ = codec.decode(codec.encode_two(_exchange_header(), big, big))
+    assert codec.split_bodies(header, body) == (big, big)
+
+
+def test_the_one_body_form_is_untouched_by_the_two_body_form():
+    """Every existing frame goes through `encode`, and the golden vectors pin
+    their bytes. This says it from the other side: a one-body frame declares
+    no `bodies`, so nothing can read its payload as two halves."""
+    header, body, _ = codec.decode(codec.encode(_exchange_header(), b"BODY"))
+    assert codec.BODIES_KEY not in header
+    assert body == b"BODY"
+    with pytest.raises(codec.FrameError, match="one body, not two"):
+        codec.split_bodies(header, body)
+
+
+def test_encoding_two_bodies_does_not_stamp_the_callers_header():
+    """Or the next frame that header builds silently declares two bodies it
+    has not got."""
+    header = _exchange_header()
+    codec.encode_two(header, b"a", b"b")
+    assert codec.BODIES_KEY not in header
+
+
+@pytest.mark.parametrize("payload,why", [
+    (b"\x00\x00", "no length prefix for its first body"),
+    (b"\x00\x00\x00\x63a", "declares a first body of 99"),
+    (b"\x00\x00\x00\x01a\x00\x00\x00\x63", "declares bodies of 1 \\+ 99"),
+    (b"\x00\x00\x00\x01a\x00\x00\x00\x01bX", "do not fill"),
+])
+def test_a_malformed_two_body_payload_is_refused(payload, why):
+    """Each is a payload a lenient reader would accept by guessing, and each
+    guess is a different pair of halves than the writer meant. EXACT FIT is
+    required: the lengths are on the wire so neither side has to guess."""
+    raw = codec.encode({**_exchange_header(), codec.BODIES_KEY: 2}, payload)
+    header, body, _ = codec.decode(raw)
+    with pytest.raises(codec.FrameError, match=why):
+        codec.split_bodies(header, body)
+
+
+@pytest.mark.parametrize("declared", [1, 3, 0, True])
+def test_a_bodies_count_this_version_does_not_know_is_refused(declared):
+    """`bodies` is a declaration, not a hint. `True` is in this list because
+    `True == 1` in Python and a header may legitimately carry bools, so an
+    `== 2` test written the obvious way on a future version that accepted 1
+    would let it through."""
+    raw = codec.encode({**_exchange_header(), codec.BODIES_KEY: declared}, b"abc")
+    header, body, _ = codec.decode(raw)
+    with pytest.raises(codec.FrameError, match="reads 2 and no other value"):
+        codec.split_bodies(header, body)
+
+
+def test_the_java_side_rejects_the_same_malformed_two_body_payloads():
+    """The same payloads are refused on both sides, at different POINTS.
+
+    Java's `Frame.decode` splits eagerly and raises there. This side splits at
+    `split_bodies`, so a mis-packed capture frame is counted by BridgeServer
+    rather than closing the control channel -- see the note in `decode`. What
+    is shared is the four payloads, the unknown-count case, and the bytes
+    below; what differs is which call raises.
+
+    The Java half is CodecTest.malformedTwoBodyPayloadsAreRefused. Named here
+    so a change to one is a change someone can find in the other; there is no
+    JVM in this suite to run it from.
+    """
+    java = Path(__file__).parents[1] / "extension" / "test" / "hx" / "bridge" / "CodecTest.java"
+    text = java.read_text()
+    assert "malformedTwoBodyPayloadsAreRefused" in text
+    # The literal itself, reassembled from the Java string concatenation, so a
+    # drift in either file's expected bytes reddens here rather than waiting
+    # for someone to run the other suite.
+    declaration = text.split("TWO_BODY_HEX =", 1)[1].split(";", 1)[0]
+    assert "".join(re.findall(r'"([0-9a-f]*)"', declaration)) == TWO_BODY_HEX
 ```
 
 - [ ] **Step 4: Run tests to verify they fail**
@@ -534,6 +649,22 @@ import struct
 PROTOCOL_VERSION = 1
 MAX_FRAME = 64 * 1024 * 1024        # a length prefix is attacker-influenced input
 _LEN = struct.Struct(">I")
+
+# The header key that says the body slot holds TWO length-prefixed bodies:
+#
+#     [4-byte BE len(first)][first][4-byte BE len(second)][second]
+#
+# Plan 4's `exchange` frame carries a request and a response, and they cannot
+# share one opaque body: each is content-addressed into the blob store on its
+# own. The OUTER frame is unchanged -- same length prefix, header, newline and
+# body slot -- so every one-body frame is byte-identical to what it was, which
+# tests/vectors/frames.json pins for both codecs.
+#
+# In the HEADER rather than inferred from `t`: this module has no business
+# knowing the frame vocabulary, and a reader that guessed from `t == "exchange"`
+# would mis-parse the first two-body frame type someone adds without teaching it.
+# `Frame.BODIES_KEY` is the same string on the Java side.
+BODIES_KEY = "bodies"
 
 CONFIG_KEYS = frozenset(
     {
@@ -602,6 +733,81 @@ def encode(header: dict, body: bytes = b"") -> bytes:
     return _LEN.pack(len(payload)) + payload
 
 
+def encode_two(header: dict, first: bytes, second: bytes) -> bytes:
+    """One frame carrying two bodies. Mirrors `Frame.encode(header, a, b)`.
+
+    The header is COPIED and stamped here rather than trusted from the caller,
+    so the declaration on the wire cannot disagree with the shape of the bytes:
+    a caller that forgot the key would produce a frame whose second body is
+    read as trailing bytes of the first.
+    """
+    payload = (_LEN.pack(len(first)) + first
+               + _LEN.pack(len(second)) + second)
+    return encode({**header, BODIES_KEY: 2}, payload)
+
+
+def _declares_two_bodies(header: dict) -> bool:
+    """Whether the header says the body slot holds two bodies.
+
+    `2` and no other value. A `bodies` this version does not know is a frame
+    it cannot read, not one to guess at -- and `bodies` is checked against a
+    bool separately because `True == 1` in Python and a header is allowed to
+    carry bools, so `bodies: True` would otherwise sail past an `== 1` test on
+    a future version that accepted one.
+    """
+    if BODIES_KEY not in header:
+        return False
+    value = header[BODIES_KEY]
+    if value == 2 and not isinstance(value, bool):
+        return True
+    raise FrameError(
+        f"header declares {BODIES_KEY}={value!r}; this version reads 2 and no "
+        "other value"
+    )
+
+
+def _body_spans(payload: bytes) -> tuple[int, int, int, int]:
+    """(start, end) of each body, or FrameError.
+
+    EXACT FIT is required: the two declared lengths must consume the payload to
+    its last byte. Bytes left over are bytes the two implementations would read
+    differently, and the lengths are on the wire precisely so neither side has
+    to guess where a half ends.
+    """
+    if len(payload) < _LEN.size:
+        raise FrameError("two-body frame has no length prefix for its first body")
+    (n1,) = _LEN.unpack_from(payload, 0)
+    if len(payload) < _LEN.size + n1 + _LEN.size:
+        raise FrameError(
+            f"two-body frame declares a first body of {n1} but holds "
+            f"{len(payload)} bytes"
+        )
+    (n2,) = _LEN.unpack_from(payload, _LEN.size + n1)
+    if len(payload) != 2 * _LEN.size + n1 + n2:
+        raise FrameError(
+            f"two-body frame declares bodies of {n1} + {n2}, which do not fill "
+            f"its {len(payload)} bytes"
+        )
+    first = _LEN.size
+    second = 2 * _LEN.size + n1
+    return first, first + n1, second, second + n2
+
+
+def split_bodies(header: dict, payload: bytes) -> tuple[bytes, bytes]:
+    """The two halves of a two-body frame. Mirrors `Frame.Decoded.second`.
+
+    Raises FrameError when the header does not declare the two-body form: a
+    caller asking for two halves of a one-body frame has misread the frame, and
+    handing it `(payload, b"")` would turn that into a silently empty response.
+    """
+    if not _declares_two_bodies(header):
+        raise FrameError(
+            f"frame does not declare {BODIES_KEY}=2, so it has one body, not two"
+        )
+    a, b, c, d = _body_spans(payload)
+    return payload[a:b], payload[c:d]
+
+
 def decode(buf: bytes) -> tuple[dict, bytes, int]:
     if len(buf) < _LEN.size:
         raise Incomplete("need a length prefix")
@@ -626,6 +832,19 @@ def decode(buf: bytes) -> tuple[dict, bytes, int]:
     # bound what the far side may produce, so this is the one place that can
     # actually defend it against a peer that ignores the contract.
     _check_header(header)
+    # THE TWO-BODY SPLIT IS NOT DONE HERE, and that is a decision rather than
+    # an omission. `decode` raising FrameError is how `_serve` learns the
+    # stream is unreadable, and it answers by CLOSING -- which drops the far
+    # side to DENY-ALL and takes the `halt` path down with it. The outer frame
+    # is well-formed here; only the packing INSIDE the body slot is wrong, and
+    # a capture frame that was packed wrong must not cost the operator their
+    # control channel (S4: a lost record changes what hx knows, never what it
+    # allows). So the split happens at `split_bodies`, which `BridgeServer`
+    # calls where the failure can be counted and contained.
+    #
+    # Java's `Frame.decode` DOES split eagerly. The asymmetry is real and it
+    # is bounded: two-body frames travel Burp -> Python only, so that path is
+    # exercised by CodecTest's own round trip and by nothing on the wire.
     return header, payload[nl + 1 : end], end
 
 
@@ -871,6 +1090,12 @@ public class CodecTest {
         t("malformedInputsAreRejected", CodecTest::malformedInputsAreRejected);
         t("invalidUtf8HeaderIsRejected", CodecTest::invalidUtf8HeaderIsRejected);
         t("pairedSurrogateEqualsRawSupplementaryCharacter", CodecTest::pairedSurrogateEqualsRawSupplementaryCharacter);
+        t("twoBodiesRoundTripAndStayApart", CodecTest::twoBodiesRoundTripAndStayApart);
+        t("theOneBodyFormIsUntouchedByTheTwoBodyForm",
+          CodecTest::theOneBodyFormIsUntouchedByTheTwoBodyForm);
+        t("malformedTwoBodyPayloadsAreRefused", CodecTest::malformedTwoBodyPayloadsAreRefused);
+        t("theTwoBodyWireFormIsTheSameOnBothSides",
+          CodecTest::theTwoBodyWireFormIsTheSameOnBothSides);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -1149,6 +1374,122 @@ public class CodecTest {
         raw[2] = (byte) (len >>> 8);  raw[3] = (byte) len;
         System.arraycopy(payload, 0, raw, 4, len);
         return raw;
+    }
+
+    // ---- the two-body form ---------------------------------------------
+
+    /**
+     * The SAME bytes tests/test_bridge_codec.py records for the same inputs.
+     *
+     * A frame both codecs merely round-trip against THEMSELVES is a frame two
+     * implementations can disagree about forever: the existing golden vectors
+     * exist for exactly that reason, and the two-body form needs its own,
+     * because none of them declares `bodies`. Written as a literal in both
+     * files rather than added to frames.json, whose every consumer calls the
+     * ONE-body encoder.
+     */
+    static final String TWO_BODY_HEX =
+        "0000004f7b2276223a312c2274223a2265786368616e6765222c2275726c223a"
+      + "22687474703a2f2f6170702e746573742f78222c22626f64696573223a327d0a"
+      + "0000000352455100000008524553504f4e5345";
+
+    static Map<String, Object> exchangeHeader() {
+        Map<String, Object> h = new LinkedHashMap<>();
+        h.put("v", 1L);
+        h.put("t", "exchange");
+        h.put("url", "http://app.test/x");
+        return h;
+    }
+
+    static void theTwoBodyWireFormIsTheSameOnBothSides() {
+        byte[] raw = Frame.encode(exchangeHeader(),
+                                  "REQ".getBytes(StandardCharsets.UTF_8),
+                                  "RESPONSE".getBytes(StandardCharsets.UTF_8));
+        check("the two-body frame is byte-for-byte what Python writes ("
+              + hex(raw) + ")", TWO_BODY_HEX.equals(hex(raw)));
+        Frame.Decoded d = Frame.decode(unhex(TWO_BODY_HEX));
+        check("and Python's bytes decode here to the same request half",
+              "REQ".equals(new String(d.body, StandardCharsets.UTF_8)));
+        check("and to the same response half",
+              d.second != null
+              && "RESPONSE".equals(new String(d.second, StandardCharsets.UTF_8)));
+    }
+
+    static void twoBodiesRoundTripAndStayApart() {
+        // Two EMPTY halves, and a first half whose bytes are a plausible
+        // length prefix of their own: the case that separates real length
+        // prefixes from a delimiter scan.
+        byte[] first = new byte[] {0, 0, 0, 8, 'x'};
+        byte[] second = new byte[0];
+        Frame.Decoded d = Frame.decode(Frame.encode(exchangeHeader(), first, second));
+        check("a first half that looks like a length prefix survives whole",
+              Arrays.equals(first, d.body));
+        check("an EMPTY second half is an empty array, not a null -- an "
+              + "exchange with no response is not a one-body frame",
+              d.second != null && d.second.length == 0);
+
+        byte[] big = new byte[70000];
+        for (int i = 0; i < big.length; i++) big[i] = (byte) i;
+        Frame.Decoded e = Frame.decode(Frame.encode(exchangeHeader(), big, big));
+        check("a body larger than one read chunk round-trips as the first half",
+              Arrays.equals(big, e.body));
+        check("and as the second", Arrays.equals(big, e.second));
+    }
+
+    static void theOneBodyFormIsUntouchedByTheTwoBodyForm() {
+        // Item 5 of this task: every existing frame goes through Frame, and
+        // the golden vectors pin their bytes. This says the same thing from
+        // the other side -- a one-body frame decodes with NO second body, so
+        // nothing that reads `second` can mistake a payload for two halves.
+        Map<String, Object> h = exchangeHeader();
+        byte[] raw = Frame.encode(h, "BODY".getBytes(StandardCharsets.UTF_8));
+        Frame.Decoded d = Frame.decode(raw);
+        check("a one-body frame has no second body", d.second == null);
+        check("and its body is the whole payload",
+              "BODY".equals(new String(d.body, StandardCharsets.UTF_8)));
+        check("and its header carries no " + Frame.BODIES_KEY + " key",
+              !d.header.containsKey(Frame.BODIES_KEY));
+        // The stamp goes on a COPY: a caller's map must not come back mutated,
+        // or the next frame it builds silently declares two bodies it has not
+        // got.
+        Frame.encode(h, "a".getBytes(StandardCharsets.UTF_8),
+                     "b".getBytes(StandardCharsets.UTF_8));
+        check("and encoding two bodies did not stamp the caller's header",
+              !h.containsKey(Frame.BODIES_KEY));
+    }
+
+    static void malformedTwoBodyPayloadsAreRefused() {
+        // Each case is a payload a lenient reader would accept by guessing,
+        // and each guess is a different pair of halves than the writer meant.
+        expectThrows("a payload too short to hold a first length prefix",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(new byte[] {0, 0})));
+        expectThrows("a first length that runs past the payload",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(new byte[] {0, 0, 0, 99, 'a'})));
+        expectThrows("a second length that runs past the payload",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(
+                         new byte[] {0, 0, 0, 1, 'a', 0, 0, 0, 99})));
+        expectThrows("bodies that leave trailing bytes behind them",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(
+                         new byte[] {0, 0, 0, 1, 'a', 0, 0, 0, 1, 'b', 'X'})));
+        // `bodies` is a declaration, not a hint: a value this version does not
+        // know is a frame it cannot read, and reading it as one body would
+        // hand the far side a request with a response spliced onto it.
+        Map<String, Object> three = exchangeHeader();
+        three.put(Frame.BODIES_KEY, 3L);
+        expectThrows("a bodies count this version does not know",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(Frame.encode(three, new byte[] {1, 2, 3})));
+    }
+
+    /** A frame declaring two bodies over a payload chosen by the caller. */
+    static byte[] twoBodyFrame(byte[] payload) {
+        Map<String, Object> h = exchangeHeader();
+        h.put(Frame.BODIES_KEY, 2L);
+        return Frame.encode(h, payload);
     }
 
     static String hex(byte[] b) {
@@ -1527,10 +1868,44 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Map;
 
-/** [4-byte BE length][header JSON]\n[body bytes] */
+/**
+ * [4-byte BE length][header JSON]\n[body bytes]
+ *
+ * TWO BODIES, when a frame carries a request AND a response. Plan 4's
+ * `exchange` frame has two halves and they cannot share one opaque body: the
+ * far side content-addresses each independently. The two-body form declares
+ * itself in the HEADER, under {@link #BODIES_KEY}, and packs the body slot as
+ *
+ *     [4-byte BE len(first)][first][4-byte BE len(second)][second]
+ *
+ * so the OUTER frame is unchanged: same length prefix, same header, same
+ * newline, same opaque body slot. Every frame this jar wrote before -- hello,
+ * configured, result, error, halted -- still goes through the one-body
+ * {@link #encode(Map, byte[])} and is byte-identical to what it was.
+ *
+ * HOW TO FALSIFY THAT rather than take it on trust: `Frame.encode(` appears
+ * exactly twice in extension/src, both inside BridgeClient's two `send`
+ * overloads, and the three-argument one is reached only from
+ * `BridgeClient.exchangeSink()`. A third call site, or a `send` that started
+ * routing control frames through the two-body form, would make the sentence
+ * false -- and would also redden CodecTest.goldenVectors and Python's
+ * test_vectors_match_their_recorded_hex, which assert the same recorded bytes
+ * from opposite sides of the bridge.
+ */
 public final class Frame {
 
     public static final int MAX_FRAME = 64 * 1024 * 1024;
+
+    /**
+     * The header key that says the body slot holds two length-prefixed bodies.
+     *
+     * In the HEADER rather than inferred from `t`, deliberately: the codec has
+     * no business knowing the frame vocabulary, and a reader that guessed from
+     * `t == "exchange"` would silently mis-parse the first frame type someone
+     * adds with two bodies and forgets to teach it about. `codec.BODIES_KEY`
+     * is the same string on the Python side.
+     */
+    public static final String BODIES_KEY = "bodies";
 
     /** The buffer holds less than one whole frame. Normal on a stream socket. */
     public static class Incomplete extends RuntimeException {
@@ -1545,9 +1920,19 @@ public final class Frame {
     public static final class Decoded {
         public final Map<String, Object> header;
         public final byte[] body;
+        /** The SECOND body, or null when the frame carries one. Null and
+         *  zero-length are different answers: a two-body frame whose response
+         *  half is empty decodes to an empty array here, and reading that as
+         *  "there was no second half" is how an exchange with no response
+         *  would come to look like an ordinary one-body frame. */
+        public final byte[] second;
         public final int consumed;
         Decoded(Map<String, Object> header, byte[] body, int consumed) {
-            this.header = header; this.body = body; this.consumed = consumed;
+            this(header, body, null, consumed);
+        }
+        Decoded(Map<String, Object> header, byte[] body, byte[] second, int consumed) {
+            this.header = header; this.body = body;
+            this.second = second; this.consumed = consumed;
         }
     }
 
@@ -1564,6 +1949,80 @@ public final class Frame {
         out[4 + head.length] = '\n';
         System.arraycopy(body, 0, out, 5 + head.length, body.length);
         return out;
+    }
+
+    /**
+     * The two-body form: one frame carrying a request and a response.
+     *
+     * The header is COPIED and stamped with {@link #BODIES_KEY} here rather
+     * than trusted from the caller, so the declaration on the wire and the
+     * shape of the bytes cannot disagree -- a caller that forgot the key would
+     * otherwise produce a frame whose second body is silently read as trailing
+     * bytes of the first. The frame is then built by the one-body encoder
+     * above, which is what keeps the outer form identical.
+     */
+    public static byte[] encode(Map<String, Object> header, byte[] first, byte[] second) {
+        long total = 4L + first.length + 4L + second.length;
+        // Checked before the arrays are joined, not after: MAX_FRAME exists so
+        // one frame cannot make this JVM allocate arbitrarily, and a check that
+        // runs after the allocation it is bounding has already lost.
+        if (total > MAX_FRAME)
+            throw new FrameError("two bodies of " + first.length + " + "
+                                 + second.length + " exceed MAX_FRAME " + MAX_FRAME);
+        byte[] payload = new byte[(int) total];
+        putInt(payload, 0, first.length);
+        System.arraycopy(first, 0, payload, 4, first.length);
+        putInt(payload, 4 + first.length, second.length);
+        System.arraycopy(second, 0, payload, 8 + first.length, second.length);
+        Map<String, Object> stamped = new java.util.LinkedHashMap<>(header);
+        stamped.put(BODIES_KEY, 2L);
+        return encode(stamped, payload);
+    }
+
+    private static void putInt(byte[] out, int at, int v) {
+        out[at] = (byte) (v >>> 24); out[at + 1] = (byte) (v >>> 16);
+        out[at + 2] = (byte) (v >>> 8); out[at + 3] = (byte) v;
+    }
+
+    private static long getInt(byte[] b, int at) {
+        return ((long) (b[at] & 0xff) << 24) | ((b[at + 1] & 0xff) << 16)
+             | ((b[at + 2] & 0xff) << 8) | (b[at + 3] & 0xff);
+    }
+
+    /** Whether the header declares the two-body form. `2L` and nothing else:
+     *  Json.parse yields Long for every integer, and a `bodies` this version
+     *  does not know is a frame it cannot read, not one to guess at. */
+    private static boolean declaresTwoBodies(Map<String, Object> header) {
+        Object b = header.get(BODIES_KEY);
+        if (b == null) return false;
+        if (Long.valueOf(2L).equals(b)) return true;
+        throw new FrameError("header declares " + BODIES_KEY + "=" + b
+                             + "; this version reads 2 and no other value");
+    }
+
+    /**
+     * Split a declared two-body payload. EXACT FIT is required: the two
+     * declared lengths must consume the payload to its last byte. A payload
+     * with bytes left over is a frame this side and the other side would read
+     * differently, and the whole reason the lengths are on the wire at all is
+     * so neither has to guess where the halves end.
+     */
+    private static byte[][] splitBodies(byte[] payload) {
+        if (payload.length < 4)
+            throw new FrameError("two-body frame has no length prefix for its first body");
+        long n1 = getInt(payload, 0);
+        if (payload.length < 4 + n1 + 4)
+            throw new FrameError("two-body frame declares a first body of " + n1
+                                 + " but holds " + payload.length + " bytes");
+        long n2 = getInt(payload, (int) (4 + n1));
+        if (payload.length != 8 + n1 + n2)
+            throw new FrameError("two-body frame declares bodies of " + n1 + " + "
+                                 + n2 + ", which do not fill its " + payload.length
+                                 + " bytes");
+        return new byte[][] {
+            Arrays.copyOfRange(payload, 4, (int) (4 + n1)),
+            Arrays.copyOfRange(payload, (int) (8 + n1), (int) (8 + n1 + n2)),
+        };
     }
 
     public static Decoded decode(byte[] buf) {
@@ -1597,7 +2056,12 @@ public final class Frame {
         } catch (Json.JsonError e) {
             throw new FrameError("header is not valid JSON: " + e.getMessage());
         }
-        return new Decoded(header, Arrays.copyOfRange(buf, nl + 1, end), end);
+        byte[] payload = Arrays.copyOfRange(buf, nl + 1, end);
+        if (declaresTwoBodies(header)) {
+            byte[][] two = splitBodies(payload);
+            return new Decoded(header, two[0], two[1], end);
+        }
+        return new Decoded(header, payload, end);
     }
 
     /** Peer closed the connection. Distinct from Incomplete, which means
@@ -3692,6 +4156,156 @@ def test_send_refuses_a_reply_that_is_not_a_result_or_an_error(srv_with_halt):
         assert out["err"].error_class is None
     finally:
         c.close()
+
+
+# ---- Plan 4's unsolicited proxy traffic ---------------------------------
+#
+# `exchange`, `denial` and `dropped` frames answer no request: nothing is
+# waiting on an id, so `_deliver` would drop them on the floor. They go to
+# `on_exchange`, on the READ THREAD, with the same discipline `on_hello` and
+# `on_halted` carry -- and with one deliberate difference, which the first two
+# tests below are about.
+
+
+def _exchange_server(tmp_path, halt, sink):
+    s = server.BridgeServer(tmp_path / "x.sock", engagement_id="e-1",
+                            operator_halt=halt, on_exchange=sink)
+    s.start()
+    return s
+
+
+def _push(c, frame: bytes, srv, predicate, timeout=5.0):
+    """Write an unsolicited frame and wait for the read thread to act on it."""
+    c.sendall(frame)
+    deadline = time.time() + timeout
+    while time.time() < deadline and not predicate():
+        time.sleep(0.005)
+    return predicate()
+
+
+def test_an_exchange_frame_reaches_the_sink_with_both_halves(tmp_path, halt):
+    seen = []
+    s = _exchange_server(tmp_path, halt,
+                         lambda h, req, resp: seen.append((h, req, resp)))
+    try:
+        c = _connected(s)
+        frame = codec.encode_two(
+            {"v": 1, "t": "exchange", "via": "proxy", "source": "operator",
+             "method": "GET", "url": "http://app.test/x", "status": 200,
+             "ms": 12, "outcome": "ok"},
+            b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\nhi")
+        assert _push(c, frame, s, lambda: len(seen) == 1)
+        header, request, response = seen[0]
+        assert header["url"] == "http://app.test/x"
+        # The two halves arrive APART. Spliced, the far side would hash one
+        # blob for what S5 stores as two, and every request digest in the
+        # engagement would carry its response's bytes.
+        assert request == b"GET / HTTP/1.1\r\n\r\n"
+        assert response == b"HTTP/1.1 200 OK\r\n\r\nhi"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_dropped_frame_reaches_the_sink_and_does_not_close_the_channel(tmp_path, halt):
+    """Before this arm existed a `dropped` frame fell through `_handle` to
+    `return False`: the drop report -- the one thing that says a run's coverage
+    is a floor -- closed the connection that carried it, and DENY-ALL is where
+    a closed connection lands."""
+    seen = []
+    s = _exchange_server(tmp_path, halt,
+                         lambda h, req, resp: seen.append(h))
+    try:
+        c = _connected(s)
+        assert _push(c, codec.encode({"v": 1, "t": "dropped", "n": 7,
+                                      "source": "crawler"}),
+                     s, lambda: len(seen) == 1)
+        assert seen[0]["n"] == 7
+        assert seen[0]["source"] == "crawler"
+        # Still live: another frame gets through on the same connection.
+        assert _push(c, codec.encode({"v": 1, "t": "denial", "via": "proxy",
+                                      "url": "http://app.test/y",
+                                      "error_class": "scope_denied"}),
+                     s, lambda: len(seen) == 2)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_sink_that_throws_does_not_take_the_connection_down(tmp_path, halt):
+    """The one callback whose throw is NOT fatal, and S4 is why: a wedged
+    harness or a lost record changes what hx KNOWS, never what it ALLOWS. A
+    bookkeeping bug closing the channel would drop the extension to DENY-ALL
+    and stop the operator's browsing -- the failure turned into an outage.
+
+    `on_halted` is the opposite case and stays that way: a stop nothing wrote
+    down is a stop that did not happen.
+    """
+    calls = []
+
+    def sink(header, request, response):
+        calls.append(header)
+        raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        assert _push(c, frame, s, lambda: len(calls) == 1)
+        assert isinstance(s.exchange_callback_error, RuntimeError)
+        assert s.exchange_errors == 1
+        # ...and the NEXT one still arrives, which is what "not fatal" means.
+        assert _push(c, frame, s, lambda: len(calls) == 2)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_malformed_two_body_payload_is_counted_not_raised(tmp_path, halt):
+    """`_serve` closes the connection on a FrameError, so a split that raised
+    out of `_handle` would be the same outage by another route."""
+    seen = []
+    s = _exchange_server(tmp_path, halt, lambda h, q, r: seen.append(h))
+    try:
+        c = _connected(s)
+        # Declares two bodies; the payload holds one truncated length prefix.
+        bad = codec.encode({"v": 1, "t": "exchange", "url": "http://app.test/x",
+                            codec.BODIES_KEY: 2}, b"\x00\x00")
+        assert _push(c, bad, s, lambda: s.exchange_errors == 1)
+        assert isinstance(s.exchange_callback_error, codec.FrameError)
+        assert seen == []
+        good = codec.encode_two({"v": 1, "t": "exchange",
+                                 "url": "http://app.test/y"}, b"a", b"b")
+        assert _push(c, good, s, lambda: len(seen) == 1)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_an_exchange_frame_with_no_sink_installed_keeps_the_channel(tmp_path, halt):
+    """A harness that has not wired capture up yet is a harness that loses the
+    records, not one that loses the connection."""
+    s = server.BridgeServer(tmp_path / "n.sock", engagement_id="e-1",
+                            operator_halt=halt)
+    s.start()
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        c.sendall(frame)
+        c.sendall(codec.encode({"v": 1, "t": "dropped", "n": 1}))
+        # Nothing to observe on the sink, so observe the channel instead: a
+        # hello over the same connection still lands.
+        assert _push(c, codec.encode({"v": 1, "t": "halted", "reason": "x",
+                                      "host": "h", "window": "w"}),
+                     s, lambda: s.last_halted is not None)
+        c.close()
+    finally:
+        s.stop()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3784,7 +4398,7 @@ class BridgeServer:
                                      "engagement_id"})
 
     def __init__(self, socket_path: Path, engagement_id: str, operator_halt,
-                 on_hello=None, on_halted=None):
+                 on_hello=None, on_halted=None, on_exchange=None):
         """
         `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
         module keeps no dependency on the store, and tests can attach anything
@@ -3812,11 +4426,24 @@ class BridgeServer:
         sentinel in a directory of its own, which is exactly the discipline
         the Java side imposes on itself.
 
-        `on_hello` and `on_halted` are both called ON THE READ THREAD, so
-        neither may touch a sqlite3 connection opened elsewhere: it belongs to
-        the thread that created it and raises ProgrammingError anywhere else
-        (tests/test_halt.py demonstrates it). Hand the work to the thread that
-        owns the store instead.
+        `on_hello`, `on_halted` and `on_exchange` are ALL called ON THE READ
+        THREAD, so none may touch a sqlite3 connection opened elsewhere: it
+        belongs to the thread that created it and raises ProgrammingError
+        anywhere else (tests/test_halt.py demonstrates it). Hand the work to
+        the thread that owns the store instead.
+
+        `on_exchange(header, request, response)` takes Plan 4's proxy traffic:
+        `exchange`, `denial` and `dropped` frames, which are UNSOLICITED --
+        nothing is waiting on an id, so without a sink installed they are read
+        and discarded. `hx.capture.Capture.on_exchange` has this shape.
+
+        IT IS THE ONE CALLBACK WHOSE THROW IS NOT FATAL. `on_halted` returning
+        an exception closes the connection, because a stop nothing wrote down
+        is a stop that did not happen. Capture is the opposite case and S4 says
+        so: a wedged harness or a lost record changes what hx KNOWS, never what
+        it ALLOWS, so a bookkeeping failure here must not become an outage on
+        the operator's browser. The exception is kept in
+        `exchange_callback_error` and the channel is kept with it.
         """
         if operator_halt is None:
             # The signature already refuses an OMITTED argument. This refuses
@@ -3835,11 +4462,17 @@ class BridgeServer:
         self.engagement_id = engagement_id
         self.on_hello = on_hello
         self.on_halted = on_halted
+        self.on_exchange = on_exchange
         self.operator_halt = operator_halt
         # The last unsolicited `halted` frame, kept so a harness with no
         # on_halted callback installed can still see why issuance stopped.
         self.last_halted: dict | None = None
         self.halted_callback_error: BaseException | None = None
+        # The last thing an `on_exchange` frame failed on -- a malformed
+        # two-body payload, or a throw out of the sink. Recorded rather than
+        # raised: see the note on the constructor's `on_exchange`.
+        self.exchange_callback_error: BaseException | None = None
+        self.exchange_errors = 0
 
         self.state = "waiting"
         self.config_epoch = 0
@@ -4032,15 +4665,47 @@ class BridgeServer:
                     return False
             return True
 
+        if t in ("exchange", "denial", "dropped"):
+            self._capture(t, header, body)
+            return True
+
         if t == "configured":
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error", "exchange"):
+        if t in ("result", "error"):
             self._deliver(header, body)
             return True
 
         return False
+
+    def _capture(self, t: str, header: dict, body: bytes) -> None:
+        """Plan 4's unsolicited proxy traffic, handed to the sink.
+
+        NOTHING RAISES OUT OF HERE. `_serve` closes the connection on a
+        FrameError, and DENY-ALL is where a closed connection lands -- so a
+        malformed body or a sink that threw would take the operator's browsing
+        down with it, and the `halt` path with it. S4: a lost record changes
+        what hx knows, never what it allows. The failure is counted and kept
+        instead. `codec.decode` leaves the two-body split to `split_bodies`
+        for exactly this reason; see the note there.
+
+        Only `exchange` carries two bodies. `denial` and `dropped` describe
+        something that produced no traffic, so they arrive with an empty body
+        and are passed on as two empty halves -- which is what the far side's
+        `Capture.on_exchange` reads for them anyway.
+        """
+        if self.on_exchange is None:
+            return
+        try:
+            if t == "exchange":
+                request, response = codec.split_bodies(header, body)
+            else:
+                request, response = b"", b""
+            self.on_exchange(header, request, response)
+        except Exception as exc:
+            self.exchange_callback_error = exc
+            self.exchange_errors += 1
 
     def _reassert_halt(self) -> bool:
         """Tell a freshly connected peer it is still halted. False to close.
@@ -4874,6 +5539,10 @@ public class BridgeClientTest {
               BridgeClientTest::aThrowingSendArmBothDeniesAndStopsTheLoop);
             t("anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives",
               BridgeClientTest::anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives);
+            t("theExchangeSinkFramesBothHalves",
+              BridgeClientTest::theExchangeSinkFramesBothHalves);
+            t("theExchangeSinkNeverRaisesIntoCapture",
+              BridgeClientTest::theExchangeSinkNeverRaisesIntoCapture);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -6069,6 +6738,97 @@ public class BridgeClientTest {
         }
     }
 
+    /**
+     * The capture sink, on the wire: one frame, two bodies, version stamped.
+     *
+     * The two halves cannot share one opaque body -- the far side
+     * content-addresses each on its own -- and a `v` this side forgets is a
+     * frame BridgeServer._handle drops before it looks at `t` at all.
+     */
+    static void theExchangeSinkFramesBothHalves() throws Exception {
+        Path dir = Files.createTempDirectory("hxbridge-x");
+        try (Live l = live(dir, "xs.sock")) {
+            hx.proxy.Capture.ExchangeSink sink = l.client.exchangeSink();
+            Map<String, Object> h = new LinkedHashMap<>();
+            h.put("t", "exchange");
+            h.put("via", "proxy");
+            h.put("source", "operator");
+            h.put("url", "http://app.test/x");
+            sink.exchange(h, "REQ".getBytes(StandardCharsets.UTF_8),
+                          "RESPONSE".getBytes(StandardCharsets.UTF_8));
+            Frame.Decoded f = read(l.reader, l.peer, "the exchange frame");
+            check("the frame is an exchange (" + f.header.get("t") + ")",
+                  "exchange".equals(f.header.get("t")));
+            check("and carries the protocol version (" + f.header.get("v") + ")",
+                  Long.valueOf(BridgeClient.PROTOCOL_VERSION).equals(f.header.get("v")));
+            check("and declares two bodies (" + f.header.get(Frame.BODIES_KEY) + ")",
+                  Long.valueOf(2L).equals(f.header.get(Frame.BODIES_KEY)));
+            check("the request half arrived intact ("
+                  + new String(f.body, StandardCharsets.UTF_8) + ")",
+                  "REQ".equals(new String(f.body, StandardCharsets.UTF_8)));
+            check("and the response half separately, not spliced onto it ("
+                  + (f.second == null ? "null"
+                     : new String(f.second, StandardCharsets.UTF_8)) + ")",
+                  f.second != null
+                  && "RESPONSE".equals(new String(f.second, StandardCharsets.UTF_8)));
+
+            // A drop report the far side can add to run.dropped_total.
+            sink.dropped(4L, hx.proxy.Source.CRAWLER);
+            Frame.Decoded d = read(l.reader, l.peer, "the drop report");
+            check("the drop frame is the type hx.capture knows ("
+                  + d.header.get("t") + ")", "dropped".equals(d.header.get("t")));
+            check("and carries n as an integer (" + d.header.get("n") + ")",
+                  Long.valueOf(4L).equals(d.header.get("n")));
+            check("and names the source whose run it belongs to ("
+                  + d.header.get("source") + ")",
+                  "crawler".equals(d.header.get("source")));
+
+            // A source with no spelling gets no key, rather than the operator's.
+            // hx/capture.py documents what an ABSENT source means and answers
+            // the operator's run for it; a second place writing "operator" is a
+            // second place that decision can drift.
+            sink.dropped(1L, hx.proxy.Source.UNATTRIBUTED);
+            Frame.Decoded u = read(l.reader, l.peer, "the unattributed drop report");
+            check("an unspellable source is omitted, not defaulted ("
+                  + u.header.get("source") + ")",
+                  !u.header.containsKey("source"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("xs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A dead socket loses the records. It must not ALSO stop the browser.
+     *
+     * Same rule as "offering never blocks", one layer down: an exception out
+     * of here lands on Capture's drain thread, and the drain dying is how a
+     * lost record becomes a permanently silent capture. Both methods swallow.
+     */
+    static void theExchangeSinkNeverRaisesIntoCapture() throws Exception {
+        Path dir = Files.createTempDirectory("hxbridge-xd");
+        try (Live l = live(dir, "xd.sock")) {
+            hx.proxy.Capture.ExchangeSink sink = l.client.exchangeSink();
+            l.peer.close();
+            l.client.close();          // the channel is gone; writes must fail
+            boolean threw = false;
+            try {
+                for (int i = 0; i < 5; i++) {
+                    sink.exchange(Map.of("t", "exchange", "url", "http://a/" + i),
+                                  "r".getBytes(StandardCharsets.UTF_8),
+                                  "s".getBytes(StandardCharsets.UTF_8));
+                    sink.dropped(1L, hx.proxy.Source.OPERATOR);
+                }
+            } catch (Throwable t) { threw = true; }
+            check("neither half raised into the drain thread", !threw);
+            check("the lost exchange was logged, not swallowed silently",
+                  l.log.sawError("exchange frame undeliverable"));
+            check("and so was the lost drop report, which is the coverage floor",
+                  l.log.sawError("drop report undeliverable"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("xd.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
     static final byte[] CFG =
             "scope.include\thttps://RACE/*\n".getBytes(StandardCharsets.UTF_8);
 
@@ -6786,6 +7546,69 @@ public final class BridgeClient {
     private synchronized void send(Map<String, Object> header, byte[] body) throws IOException {
         out.write(Frame.encode(header, body));
         out.flush();
+    }
+
+    /** The two-body write, on the SAME monitor as the one-body one. Frames are
+     *  built whole and written under one lock precisely so two threads cannot
+     *  splice their bytes together -- and this one is written by the capture
+     *  drain while the read loop may be answering a send. */
+    private synchronized void send(Map<String, Object> header, byte[] first,
+                                   byte[] second) throws IOException {
+        out.write(Frame.encode(header, first, second));
+        out.flush();
+    }
+
+    /**
+     * Where {@link hx.proxy.Capture} pushes what it has recorded.
+     *
+     * IT NEVER RAISES INTO CAPTURE, and that is the same rule as "offering
+     * never blocks", one layer down. A dead socket means these records are
+     * lost; losing them must not ALSO stop the browser, and an exception
+     * thrown back into the drain thread is how it would. So both methods
+     * swallow, log, and return -- there is no third thing to do with a
+     * record whose only destination is gone.
+     *
+     * NOT A SEND, and not gated like one. `maySend()` answers "may this
+     * extension ISSUE a request", and an exchange frame issues nothing: it
+     * reports traffic that has ALREADY happened, through the proxy, under
+     * S4's other enforcement point. Refusing to report it while halted would
+     * mean an operator hitting stop also stopped the record of what had been
+     * seen up to that moment -- the halt erasing its own evidence.
+     */
+    public hx.proxy.Capture.ExchangeSink exchangeSink() {
+        return new hx.proxy.Capture.ExchangeSink() {
+            public void exchange(Map<String, Object> header, byte[] request,
+                                 byte[] response) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.putAll(header);
+                try {
+                    send(f, request, response);
+                } catch (Throwable e) {
+                    log.error("hx: exchange frame undeliverable, record lost: " + e);
+                }
+            }
+
+            public void dropped(long n, hx.proxy.Source source) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.put("t", "dropped");
+                f.put("n", n);
+                String named = hx.proxy.Capture.sourceName(source);
+                // OMITTED, not defaulted, when the source has no spelling.
+                // `hx.capture` documents what an absent `source` means and
+                // answers the operator's run for it; writing "operator" here
+                // would make this file a second, quieter place that decision
+                // is taken, and the two would drift.
+                if (named != null) f.put("source", named);
+                try {
+                    send(f, new byte[0]);
+                } catch (Throwable e) {
+                    log.error("hx: drop report undeliverable, coverage floor "
+                              + "unrecorded: " + e);
+                }
+            }
+        };
     }
 
     public void close() {

@@ -24,6 +24,7 @@ CLASSES=(
     hx.send.HaltSwitchTest
     hx.send.SenderTest
     hx.proxy.ProxyGateTest
+    hx.proxy.CaptureTest
     hx.ChokepointTest
 )
 

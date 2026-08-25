@@ -686,6 +686,69 @@ public final class BridgeClient {
         out.flush();
     }
 
+    /** The two-body write, on the SAME monitor as the one-body one. Frames are
+     *  built whole and written under one lock precisely so two threads cannot
+     *  splice their bytes together -- and this one is written by the capture
+     *  drain while the read loop may be answering a send. */
+    private synchronized void send(Map<String, Object> header, byte[] first,
+                                   byte[] second) throws IOException {
+        out.write(Frame.encode(header, first, second));
+        out.flush();
+    }
+
+    /**
+     * Where {@link hx.proxy.Capture} pushes what it has recorded.
+     *
+     * IT NEVER RAISES INTO CAPTURE, and that is the same rule as "offering
+     * never blocks", one layer down. A dead socket means these records are
+     * lost; losing them must not ALSO stop the browser, and an exception
+     * thrown back into the drain thread is how it would. So both methods
+     * swallow, log, and return -- there is no third thing to do with a
+     * record whose only destination is gone.
+     *
+     * NOT A SEND, and not gated like one. `maySend()` answers "may this
+     * extension ISSUE a request", and an exchange frame issues nothing: it
+     * reports traffic that has ALREADY happened, through the proxy, under
+     * S4's other enforcement point. Refusing to report it while halted would
+     * mean an operator hitting stop also stopped the record of what had been
+     * seen up to that moment -- the halt erasing its own evidence.
+     */
+    public hx.proxy.Capture.ExchangeSink exchangeSink() {
+        return new hx.proxy.Capture.ExchangeSink() {
+            public void exchange(Map<String, Object> header, byte[] request,
+                                 byte[] response) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.putAll(header);
+                try {
+                    send(f, request, response);
+                } catch (Throwable e) {
+                    log.error("hx: exchange frame undeliverable, record lost: " + e);
+                }
+            }
+
+            public void dropped(long n, hx.proxy.Source source) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.put("t", "dropped");
+                f.put("n", n);
+                String named = hx.proxy.Capture.sourceName(source);
+                // OMITTED, not defaulted, when the source has no spelling.
+                // `hx.capture` documents what an absent `source` means and
+                // answers the operator's run for it; writing "operator" here
+                // would make this file a second, quieter place that decision
+                // is taken, and the two would drift.
+                if (named != null) f.put("source", named);
+                try {
+                    send(f, new byte[0]);
+                } catch (Throwable e) {
+                    log.error("hx: drop report undeliverable, coverage floor "
+                              + "unrecorded: " + e);
+                }
+            }
+        };
+    }
+
     public void close() {
         synchronized (commitLock) {
             closed = true;           // sticky: checked by connect() and handle()

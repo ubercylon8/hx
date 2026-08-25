@@ -1842,3 +1842,153 @@ def test_send_refuses_a_reply_that_is_not_a_result_or_an_error(srv_with_halt):
         assert out["err"].error_class is None
     finally:
         c.close()
+
+
+# ---- Plan 4's unsolicited proxy traffic ---------------------------------
+#
+# `exchange`, `denial` and `dropped` frames answer no request: nothing is
+# waiting on an id, so `_deliver` would drop them on the floor. They go to
+# `on_exchange`, on the READ THREAD, with the same discipline `on_hello` and
+# `on_halted` carry -- and with one deliberate difference, which the first two
+# tests below are about.
+
+
+def _exchange_server(tmp_path, halt, sink):
+    s = server.BridgeServer(tmp_path / "x.sock", engagement_id="e-1",
+                            operator_halt=halt, on_exchange=sink)
+    s.start()
+    return s
+
+
+def _push(c, frame: bytes, srv, predicate, timeout=5.0):
+    """Write an unsolicited frame and wait for the read thread to act on it."""
+    c.sendall(frame)
+    deadline = time.time() + timeout
+    while time.time() < deadline and not predicate():
+        time.sleep(0.005)
+    return predicate()
+
+
+def test_an_exchange_frame_reaches_the_sink_with_both_halves(tmp_path, halt):
+    seen = []
+    s = _exchange_server(tmp_path, halt,
+                         lambda h, req, resp: seen.append((h, req, resp)))
+    try:
+        c = _connected(s)
+        frame = codec.encode_two(
+            {"v": 1, "t": "exchange", "via": "proxy", "source": "operator",
+             "method": "GET", "url": "http://app.test/x", "status": 200,
+             "ms": 12, "outcome": "ok"},
+            b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\nhi")
+        assert _push(c, frame, s, lambda: len(seen) == 1)
+        header, request, response = seen[0]
+        assert header["url"] == "http://app.test/x"
+        # The two halves arrive APART. Spliced, the far side would hash one
+        # blob for what S5 stores as two, and every request digest in the
+        # engagement would carry its response's bytes.
+        assert request == b"GET / HTTP/1.1\r\n\r\n"
+        assert response == b"HTTP/1.1 200 OK\r\n\r\nhi"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_dropped_frame_reaches_the_sink_and_does_not_close_the_channel(tmp_path, halt):
+    """Before this arm existed a `dropped` frame fell through `_handle` to
+    `return False`: the drop report -- the one thing that says a run's coverage
+    is a floor -- closed the connection that carried it, and DENY-ALL is where
+    a closed connection lands."""
+    seen = []
+    s = _exchange_server(tmp_path, halt,
+                         lambda h, req, resp: seen.append(h))
+    try:
+        c = _connected(s)
+        assert _push(c, codec.encode({"v": 1, "t": "dropped", "n": 7,
+                                      "source": "crawler"}),
+                     s, lambda: len(seen) == 1)
+        assert seen[0]["n"] == 7
+        assert seen[0]["source"] == "crawler"
+        # Still live: another frame gets through on the same connection.
+        assert _push(c, codec.encode({"v": 1, "t": "denial", "via": "proxy",
+                                      "url": "http://app.test/y",
+                                      "error_class": "scope_denied"}),
+                     s, lambda: len(seen) == 2)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_sink_that_throws_does_not_take_the_connection_down(tmp_path, halt):
+    """The one callback whose throw is NOT fatal, and S4 is why: a wedged
+    harness or a lost record changes what hx KNOWS, never what it ALLOWS. A
+    bookkeeping bug closing the channel would drop the extension to DENY-ALL
+    and stop the operator's browsing -- the failure turned into an outage.
+
+    `on_halted` is the opposite case and stays that way: a stop nothing wrote
+    down is a stop that did not happen.
+    """
+    calls = []
+
+    def sink(header, request, response):
+        calls.append(header)
+        raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        assert _push(c, frame, s, lambda: len(calls) == 1)
+        assert isinstance(s.exchange_callback_error, RuntimeError)
+        assert s.exchange_errors == 1
+        # ...and the NEXT one still arrives, which is what "not fatal" means.
+        assert _push(c, frame, s, lambda: len(calls) == 2)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_malformed_two_body_payload_is_counted_not_raised(tmp_path, halt):
+    """`_serve` closes the connection on a FrameError, so a split that raised
+    out of `_handle` would be the same outage by another route."""
+    seen = []
+    s = _exchange_server(tmp_path, halt, lambda h, q, r: seen.append(h))
+    try:
+        c = _connected(s)
+        # Declares two bodies; the payload holds one truncated length prefix.
+        bad = codec.encode({"v": 1, "t": "exchange", "url": "http://app.test/x",
+                            codec.BODIES_KEY: 2}, b"\x00\x00")
+        assert _push(c, bad, s, lambda: s.exchange_errors == 1)
+        assert isinstance(s.exchange_callback_error, codec.FrameError)
+        assert seen == []
+        good = codec.encode_two({"v": 1, "t": "exchange",
+                                 "url": "http://app.test/y"}, b"a", b"b")
+        assert _push(c, good, s, lambda: len(seen) == 1)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_an_exchange_frame_with_no_sink_installed_keeps_the_channel(tmp_path, halt):
+    """A harness that has not wired capture up yet is a harness that loses the
+    records, not one that loses the connection."""
+    s = server.BridgeServer(tmp_path / "n.sock", engagement_id="e-1",
+                            operator_halt=halt)
+    s.start()
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        c.sendall(frame)
+        c.sendall(codec.encode({"v": 1, "t": "dropped", "n": 1}))
+        # Nothing to observe on the sink, so observe the channel instead: a
+        # hello over the same connection still lands.
+        assert _push(c, codec.encode({"v": 1, "t": "halted", "reason": "x",
+                                      "host": "h", "window": "w"}),
+                     s, lambda: s.last_halted is not None)
+        c.close()
+    finally:
+        s.stop()

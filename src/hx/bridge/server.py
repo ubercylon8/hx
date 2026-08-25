@@ -79,7 +79,7 @@ class BridgeServer:
                                      "engagement_id"})
 
     def __init__(self, socket_path: Path, engagement_id: str, operator_halt,
-                 on_hello=None, on_halted=None):
+                 on_hello=None, on_halted=None, on_exchange=None):
         """
         `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
         module keeps no dependency on the store, and tests can attach anything
@@ -107,11 +107,24 @@ class BridgeServer:
         sentinel in a directory of its own, which is exactly the discipline
         the Java side imposes on itself.
 
-        `on_hello` and `on_halted` are both called ON THE READ THREAD, so
-        neither may touch a sqlite3 connection opened elsewhere: it belongs to
-        the thread that created it and raises ProgrammingError anywhere else
-        (tests/test_halt.py demonstrates it). Hand the work to the thread that
-        owns the store instead.
+        `on_hello`, `on_halted` and `on_exchange` are ALL called ON THE READ
+        THREAD, so none may touch a sqlite3 connection opened elsewhere: it
+        belongs to the thread that created it and raises ProgrammingError
+        anywhere else (tests/test_halt.py demonstrates it). Hand the work to
+        the thread that owns the store instead.
+
+        `on_exchange(header, request, response)` takes Plan 4's proxy traffic:
+        `exchange`, `denial` and `dropped` frames, which are UNSOLICITED --
+        nothing is waiting on an id, so without a sink installed they are read
+        and discarded. `hx.capture.Capture.on_exchange` has this shape.
+
+        IT IS THE ONE CALLBACK WHOSE THROW IS NOT FATAL. `on_halted` returning
+        an exception closes the connection, because a stop nothing wrote down
+        is a stop that did not happen. Capture is the opposite case and S4 says
+        so: a wedged harness or a lost record changes what hx KNOWS, never what
+        it ALLOWS, so a bookkeeping failure here must not become an outage on
+        the operator's browser. The exception is kept in
+        `exchange_callback_error` and the channel is kept with it.
         """
         if operator_halt is None:
             # The signature already refuses an OMITTED argument. This refuses
@@ -130,11 +143,17 @@ class BridgeServer:
         self.engagement_id = engagement_id
         self.on_hello = on_hello
         self.on_halted = on_halted
+        self.on_exchange = on_exchange
         self.operator_halt = operator_halt
         # The last unsolicited `halted` frame, kept so a harness with no
         # on_halted callback installed can still see why issuance stopped.
         self.last_halted: dict | None = None
         self.halted_callback_error: BaseException | None = None
+        # The last thing an `on_exchange` frame failed on -- a malformed
+        # two-body payload, or a throw out of the sink. Recorded rather than
+        # raised: see the note on the constructor's `on_exchange`.
+        self.exchange_callback_error: BaseException | None = None
+        self.exchange_errors = 0
 
         self.state = "waiting"
         self.config_epoch = 0
@@ -327,15 +346,47 @@ class BridgeServer:
                     return False
             return True
 
+        if t in ("exchange", "denial", "dropped"):
+            self._capture(t, header, body)
+            return True
+
         if t == "configured":
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error", "exchange"):
+        if t in ("result", "error"):
             self._deliver(header, body)
             return True
 
         return False
+
+    def _capture(self, t: str, header: dict, body: bytes) -> None:
+        """Plan 4's unsolicited proxy traffic, handed to the sink.
+
+        NOTHING RAISES OUT OF HERE. `_serve` closes the connection on a
+        FrameError, and DENY-ALL is where a closed connection lands -- so a
+        malformed body or a sink that threw would take the operator's browsing
+        down with it, and the `halt` path with it. S4: a lost record changes
+        what hx knows, never what it allows. The failure is counted and kept
+        instead. `codec.decode` leaves the two-body split to `split_bodies`
+        for exactly this reason; see the note there.
+
+        Only `exchange` carries two bodies. `denial` and `dropped` describe
+        something that produced no traffic, so they arrive with an empty body
+        and are passed on as two empty halves -- which is what the far side's
+        `Capture.on_exchange` reads for them anyway.
+        """
+        if self.on_exchange is None:
+            return
+        try:
+            if t == "exchange":
+                request, response = codec.split_bodies(header, body)
+            else:
+                request, response = b"", b""
+            self.on_exchange(header, request, response)
+        except Exception as exc:
+            self.exchange_callback_error = exc
+            self.exchange_errors += 1
 
     def _reassert_halt(self) -> bool:
         """Tell a freshly connected peer it is still halted. False to close.

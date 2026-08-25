@@ -18,6 +18,22 @@ PROTOCOL_VERSION = 1
 MAX_FRAME = 64 * 1024 * 1024        # a length prefix is attacker-influenced input
 _LEN = struct.Struct(">I")
 
+# The header key that says the body slot holds TWO length-prefixed bodies:
+#
+#     [4-byte BE len(first)][first][4-byte BE len(second)][second]
+#
+# Plan 4's `exchange` frame carries a request and a response, and they cannot
+# share one opaque body: each is content-addressed into the blob store on its
+# own. The OUTER frame is unchanged -- same length prefix, header, newline and
+# body slot -- so every one-body frame is byte-identical to what it was, which
+# tests/vectors/frames.json pins for both codecs.
+#
+# In the HEADER rather than inferred from `t`: this module has no business
+# knowing the frame vocabulary, and a reader that guessed from `t == "exchange"`
+# would mis-parse the first two-body frame type someone adds without teaching it.
+# `Frame.BODIES_KEY` is the same string on the Java side.
+BODIES_KEY = "bodies"
+
 CONFIG_KEYS = frozenset(
     {
         "scope.include",
@@ -85,6 +101,81 @@ def encode(header: dict, body: bytes = b"") -> bytes:
     return _LEN.pack(len(payload)) + payload
 
 
+def encode_two(header: dict, first: bytes, second: bytes) -> bytes:
+    """One frame carrying two bodies. Mirrors `Frame.encode(header, a, b)`.
+
+    The header is COPIED and stamped here rather than trusted from the caller,
+    so the declaration on the wire cannot disagree with the shape of the bytes:
+    a caller that forgot the key would produce a frame whose second body is
+    read as trailing bytes of the first.
+    """
+    payload = (_LEN.pack(len(first)) + first
+               + _LEN.pack(len(second)) + second)
+    return encode({**header, BODIES_KEY: 2}, payload)
+
+
+def _declares_two_bodies(header: dict) -> bool:
+    """Whether the header says the body slot holds two bodies.
+
+    `2` and no other value. A `bodies` this version does not know is a frame
+    it cannot read, not one to guess at -- and `bodies` is checked against a
+    bool separately because `True == 1` in Python and a header is allowed to
+    carry bools, so `bodies: True` would otherwise sail past an `== 1` test on
+    a future version that accepted one.
+    """
+    if BODIES_KEY not in header:
+        return False
+    value = header[BODIES_KEY]
+    if value == 2 and not isinstance(value, bool):
+        return True
+    raise FrameError(
+        f"header declares {BODIES_KEY}={value!r}; this version reads 2 and no "
+        "other value"
+    )
+
+
+def _body_spans(payload: bytes) -> tuple[int, int, int, int]:
+    """(start, end) of each body, or FrameError.
+
+    EXACT FIT is required: the two declared lengths must consume the payload to
+    its last byte. Bytes left over are bytes the two implementations would read
+    differently, and the lengths are on the wire precisely so neither side has
+    to guess where a half ends.
+    """
+    if len(payload) < _LEN.size:
+        raise FrameError("two-body frame has no length prefix for its first body")
+    (n1,) = _LEN.unpack_from(payload, 0)
+    if len(payload) < _LEN.size + n1 + _LEN.size:
+        raise FrameError(
+            f"two-body frame declares a first body of {n1} but holds "
+            f"{len(payload)} bytes"
+        )
+    (n2,) = _LEN.unpack_from(payload, _LEN.size + n1)
+    if len(payload) != 2 * _LEN.size + n1 + n2:
+        raise FrameError(
+            f"two-body frame declares bodies of {n1} + {n2}, which do not fill "
+            f"its {len(payload)} bytes"
+        )
+    first = _LEN.size
+    second = 2 * _LEN.size + n1
+    return first, first + n1, second, second + n2
+
+
+def split_bodies(header: dict, payload: bytes) -> tuple[bytes, bytes]:
+    """The two halves of a two-body frame. Mirrors `Frame.Decoded.second`.
+
+    Raises FrameError when the header does not declare the two-body form: a
+    caller asking for two halves of a one-body frame has misread the frame, and
+    handing it `(payload, b"")` would turn that into a silently empty response.
+    """
+    if not _declares_two_bodies(header):
+        raise FrameError(
+            f"frame does not declare {BODIES_KEY}=2, so it has one body, not two"
+        )
+    a, b, c, d = _body_spans(payload)
+    return payload[a:b], payload[c:d]
+
+
 def decode(buf: bytes) -> tuple[dict, bytes, int]:
     if len(buf) < _LEN.size:
         raise Incomplete("need a length prefix")
@@ -109,6 +200,19 @@ def decode(buf: bytes) -> tuple[dict, bytes, int]:
     # bound what the far side may produce, so this is the one place that can
     # actually defend it against a peer that ignores the contract.
     _check_header(header)
+    # THE TWO-BODY SPLIT IS NOT DONE HERE, and that is a decision rather than
+    # an omission. `decode` raising FrameError is how `_serve` learns the
+    # stream is unreadable, and it answers by CLOSING -- which drops the far
+    # side to DENY-ALL and takes the `halt` path down with it. The outer frame
+    # is well-formed here; only the packing INSIDE the body slot is wrong, and
+    # a capture frame that was packed wrong must not cost the operator their
+    # control channel (S4: a lost record changes what hx knows, never what it
+    # allows). So the split happens at `split_bodies`, which `BridgeServer`
+    # calls where the failure can be counted and contained.
+    #
+    # Java's `Frame.decode` DOES split eagerly. The asymmetry is real and it
+    # is bounded: two-body frames travel Burp -> Python only, so that path is
+    # exercised by CodecTest's own round trip and by nothing on the wire.
     return header, payload[nl + 1 : end], end
 
 
