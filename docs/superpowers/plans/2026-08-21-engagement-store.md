@@ -266,18 +266,28 @@ def test_agent_can_set_other_statuses(tmp_path: Path):
 
 
 def test_dangling_first_seen_run_rejected(tmp_path: Path):
-    """A dangling first_seen_run reference is rejected by FK constraint."""
+    """A dangling first_seen_run reference is rejected by FK constraint.
+
+    MEASURED: this raised `NOT NULL constraint failed:
+    surface.normaliser_version` -- and later `surface.discovered_by` -- and
+    never reached the foreign key at all. Both columns are deliberately
+    DEFAULT-less, so an INSERT that names neither fails before SQLite looks at
+    the reference, and `pytest.raises(IntegrityError)` could not tell the two
+    apart. The row below is complete except for the one thing under test, and
+    the match is on the constraint's own name.
+    """
     conn = db.connect(tmp_path / "hx.db")
     db.init_schema(conn)
     conn.execute(
         "INSERT INTO engagement(id, name, client, created_us, status)"
         " VALUES('e1','acme','Acme',1,'active')"
     )
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
         conn.execute(
             "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
-            " path_template, first_seen_run)"
-            " VALUES('s1','e1','GET','https','app.acme.com',443,'/api/users','NO_SUCH_RUN')"
+            " path_template, discovered_by, normaliser_version, first_seen_run)"
+            " VALUES('s1','e1','GET','https','app.acme.com',443,'/api/users',"
+            "'proxy',1,'NO_SUCH_RUN')"
         )
 
 
@@ -634,7 +644,15 @@ CREATE TABLE IF NOT EXISTS surface (
   query_key_set       TEXT NOT NULL DEFAULT '',
   kind                TEXT NOT NULL DEFAULT 'unknown'
                       CHECK (kind IN ('idempotent_read','state_changing','unknown')),
-  discovered_by       TEXT NOT NULL DEFAULT 'proxy'
+  -- NO DEFAULT, amended 2026-08-25 with SCHEMA_VERSION 6, on the same
+  -- argument `normaliser_version` lost its own and `denial.via` was never
+  -- given one. This column answers "which egress point found this surface",
+  -- and S5 draws a coverage figure straight off it -- "crawl-discovered
+  -- surfaces are recorded with discovered_by = 'crawl'". DEFAULT 'proxy'
+  -- answered that question for any writer who did not ask it, so every
+  -- crawler-discovered surface would have been labelled `proxy` with nothing
+  -- to tell afterwards. An omission must fail loudly instead.
+  discovered_by       TEXT NOT NULL
                       CHECK (discovered_by IN ('proxy','crawl','import','agent')),
   -- NO DEFAULT, amended 2026-08-24. This column answers "which ruleset
   -- produced this row", and a default answers it with a guess. It read
@@ -864,9 +882,17 @@ CREATE TABLE IF NOT EXISTS denial (
   id               TEXT PRIMARY KEY,
   run_id           TEXT REFERENCES run(id),
   ts_us            INTEGER NOT NULL,
+  -- `credential` added 2026-08-25 with SCHEMA_VERSION 6. S4 is
+  -- unconditional -- "Any denial produces a `denial` row and a distinct error
+  -- class. Denials are never silent" -- and `unmanaged_credential` was a
+  -- denial this vocabulary had no value for, so it reached the proxy's egress
+  -- point and vanished: no row, no counter, no exception. S7 refuses the
+  -- request and never persists it; that is a fact about the REQUEST BYTES,
+  -- and it never meant the refusal itself goes unrecorded. The row carries
+  -- method, url and a reason, never the credential.
   kind             TEXT NOT NULL
                    CHECK (kind IN ('scope','method','dangerous','rate','budget',
-                                   'not_configured')),
+                                   'not_configured','credential')),
   method           TEXT,
   url              TEXT,
   resolved_ip      TEXT,
@@ -923,7 +949,18 @@ from pathlib import Path
 
 from hx.store.paths import secure_mkdir
 
-SCHEMA_VERSION = 5
+# 5 -> 6 (2026-08-25): `denial.kind` gained 'credential' and
+# `surface.discovered_by` lost its DEFAULT. Both land inside Plan 4's branch,
+# on top of the 4 -> 5 bump that added `denial.via` a commit earlier -- and
+# reusing 5 for them would have made two INCOMPATIBLE schemas share one
+# version number, since a database created at that earlier commit already
+# exists on disk. Such a file refuses every `credential` denial this code now
+# writes: its CHECK has no such value, so SQLite rejects the INSERT. It also
+# still answers 'proxy' for any writer that omits `surface.discovered_by`
+# rather than failing, which is the guess the DEFAULT was removed to stop.
+# `engagement.open_`'s comparison against this constant is the only thing in
+# the tree that can notice either.
+SCHEMA_VERSION = 6
 
 TABLES: tuple[str, ...] = (
     "engagement",
@@ -996,9 +1033,11 @@ def transaction(conn: sqlite3.Connection):
     any multi-statement write that is not wrapped in an explicit
     BEGIN/COMMIT is not atomic -- a failure partway through leaves whatever
     already ran committed. Exactly one place in this codebase remembered
-    that on its own before this helper existed; two more call sites are
-    coming in later plans, and this is cheap insurance against one of them
-    forgetting.
+    that on its own before this helper existed; more call sites were expected
+    in later plans, and this is cheap insurance against one of them
+    forgetting. `hx.capture.on_exchange` is the first of those and did forget
+    -- it wrote four statements unwrapped, and `upsert_surface` failing left a
+    committed exchange row with a NULL `surface_id` behind it.
     """
     conn.execute("BEGIN")
     try:

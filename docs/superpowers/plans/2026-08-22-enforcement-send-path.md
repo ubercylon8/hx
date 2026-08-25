@@ -13988,12 +13988,14 @@ public class SenderTest {
      *   dangerous-path AND unmanaged Cookie  -> unmanaged_credential
      *   wrong method AND unmanaged Cookie    -> unmanaged_credential
      *
-     * `unmanaged_credential` is in `records.UNRECORDABLE`: there is no
-     * `denial` row for it and no `kind` to file one under. So a scope
+     * `unmanaged_credential` was in `records.UNRECORDABLE` when this moved:
+     * no `denial` row for it and no `kind` to file one under. So a scope
      * violation carrying a Cookie produced NO ROW ANYWHERE, and an error class
      * naming the credential rather than the boundary crossed. s4: "Any denial
      * produces a `denial` row and a distinct error class. Denials are never
-     * silent."
+     * silent." SCHEMA_VERSION 6 gave the class `kind='credential'`, which
+     * settles the row half; the WRONG-CLASS half is what this ordering fixes
+     * and it is unaffected.
      *
      * WHY THAT WAS NOT A THEORETICAL SHAPE. Until Plan 5 ships identity
      * injection, the natural agent action is replaying a request lifted from
@@ -15840,11 +15842,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   4. Policy, first half    scope -> method -> dangerous. None of them spends
  *                            anything, so they cost nothing to run early.
  *   5. unmanaged_credential  BETWEEN the two halves. Before the Gate for the
- *                            same reason as 1; after 4 because this class has
- *                            no `denial` row (records.UNRECORDABLE), so
- *                            running it first made an out-of-scope request
- *                            carrying a Cookie into a credential error with
- *                            the scope violation recorded nowhere.
+ *                            same reason as 1; after 4 because running it
+ *                            first made an out-of-scope request carrying a
+ *                            Cookie into a credential error, naming the
+ *                            credential rather than the boundary crossed.
+ *                            (The class had no `denial` row at all until
+ *                            SCHEMA_VERSION 6 gave it `kind='credential'`, so
+ *                            the scope violation was then recorded nowhere;
+ *                            the ordering stands on the first reason alone.)
  *   6. Policy, second half   the Gate: rate -> budget.
  *
  * Steps 2-6 hold the pinned order -- not_configured, halted, scope_denied,
@@ -16043,10 +16048,11 @@ public final class Sender {
         // that placement have different reasons. Before the Gate, for the same
         // reason as guard 1: Limits.check() spends a rate token and a budget
         // slot on a request that is about to be refused. After scope, method
-        // and dangerous, because this class is in records.UNRECORDABLE -- there
-        // is no `denial` row for it -- so running it first turned every
-        // out-of-scope request CARRYING A COOKIE into a credential error with
-        // no row anywhere. MEASURED before this moved:
+        // and dangerous, because running it first turned every out-of-scope
+        // request CARRYING A COOKIE into a credential error naming the
+        // credential rather than the boundary crossed -- and while the class
+        // was in records.UNRECORDABLE, which it was until SCHEMA_VERSION 6,
+        // with no row anywhere either. MEASURED before this moved:
         //
         //   out-of-scope AND unmanaged Cookie    -> unmanaged_credential
         //   out-of-scope, no cookie              -> scope_denied
@@ -17099,8 +17105,8 @@ public class ChokepointTest {
      *
      * `decide()` was split so spec s7's credential refusal could sit BETWEEN
      * them: it must run before the Gate (which spends a rate token and a
-     * budget slot) and after scope/method/dangerous (whose classes have
-     * `denial` rows, where `unmanaged_credential` has none). Policy cannot
+     * budget slot) and after scope/method/dangerous, whose classes name the
+     * boundary crossed rather than the credential carried. Policy cannot
      * make that check itself -- it is decided by its arguments alone and must
      * not reach into hx.send for a Redactor -- so the interleaving lives in
      * Sender.
@@ -19139,6 +19145,12 @@ DENIAL_KIND: dict[str, str] = {
     "rate_limited": "rate",
     "budget_exhausted": "budget",
     "not_configured": "not_configured",
+    # Added 2026-08-25 with SCHEMA_VERSION 6, closing the gap the comment on
+    # UNRECORDABLE called "the gap to close first". S4 is unconditional and
+    # this class was the one denial the vocabulary could not express, so it
+    # reached `hx.capture` and vanished silently. S7's "never persisted" is
+    # about the request bytes; the refusal is a denial like any other.
+    "unmanaged_credential": "credential",
 }
 DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 
@@ -19306,10 +19318,17 @@ VIA_VALUES = frozenset({"proxy", "send", "crawl"})
 # migration -- a new SCHEMA_VERSION and a table rebuild. A class in here still
 # reaches the caller as BridgeError.error_class; what it does not get is a row.
 #
-#   unmanaged_credential -- a real denial (S7 refuses the request and never
-#       persists it) with no `kind` to record it under. This is the gap to
-#       close first: it is the only class here that S4 calls a denial about a
-#       request the extension agreed to look at.
+# WHAT IS LEFT HERE IS NOT A DENIAL, and that is the whole of why the set is
+# allowed to be non-empty. S4's sentence -- "Any denial produces a `denial` row
+# and a distinct error class. Denials are never silent" -- is about DENIALS,
+# and every remaining member is a transport failure, a run-wide stop, or a
+# refusal about a FRAME rather than about a request the extension agreed to
+# look at. `unmanaged_credential` was the one exception, which is exactly why
+# it was called "the gap to close first"; it left this set on 2026-08-25 for
+# DENIAL_KIND and a `credential` row. What is left is a category rather than a
+# backlog, and the rule that follows from it is the useful part: a new class
+# that IS a denial must be given a `kind` rather than added below.
+#
 #   transport_error -- the request DID leave the JVM, so it belongs in
 #       `exchange`, but see EXCHANGE_OUTCOME above.
 #   halted -- not a per-request denial at all. One distressed host aborts the
@@ -19341,7 +19360,7 @@ VIA_VALUES = frozenset({"proxy", "send", "crawl"})
 #       transcribed from S6 by hand and S6 did not list it either. Both ends
 #       of that are fixed: S6 lists it, and the set is now DERIVED from the
 #       emit sites.
-UNRECORDABLE = frozenset({"unmanaged_credential", "transport_error", "halted",
+UNRECORDABLE = frozenset({"transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
                           "protocol_mismatch", "bad_config", "unknown_frame"})
 
@@ -19368,8 +19387,12 @@ def row_for(error_class: str, *,
     An `issued=False` ambiguous class routes NOWHERE. `denial.kind`'s
     vocabulary is Plan 1's and has no value for "the caller's deadline had
     already passed", so the honest answer today is no row rather than a row
-    filed under a reason that is not the reason -- the same position
-    `unmanaged_credential` is in, and it belongs in the same schema migration.
+    filed under a reason that is not the reason. This was the same position
+    `unmanaged_credential` was in until SCHEMA_VERSION 6 gave it a kind; the
+    difference is that a never-issued `timeout` is not a DENIAL -- nobody
+    refused it, the caller gave up -- so S4's "denials are never silent" does
+    not reach it, and a kind of its own would be a new fact rather than a
+    vocabulary this store already had.
     """
     if error_class in DENIAL_KIND:
         # Precedence, and it is the whole reason this is a function: the two
@@ -23119,8 +23142,9 @@ CLOCK_SKEW_SLACK_US = 5_000
 # Error class -> `denial.kind` is records.DENIAL_KIND, imported rather than
 # restated. A second copy here would be the copy nothing tests, and the two
 # would agree right up until Plan 1's CHECK constraint grew a value.
-# unmanaged_credential is in neither: see records.UNRECORDABLE, and the
-# assertion that pins the gap in test_the_gate_refuses_four_ways.
+# unmanaged_credential was in neither until SCHEMA_VERSION 6 gave it the
+# `credential` kind; the assertions in test_the_gate_refuses_four_ways are
+# where that closure is demonstrated rather than asserted.
 
 
 def _blobs_containing(eng, needle: bytes) -> list[Path]:
@@ -23377,10 +23401,13 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     # shape had never been driven: every case above sends its credential to
     # an in-scope path, so the two guards were never made to compete.
     #
-    # Until the whole-branch review it answered `unmanaged_credential`, and
-    # that class is in records.UNRECORDABLE -- so a scope violation carrying a
+    # Until the whole-branch review it answered `unmanaged_credential`, which
+    # was then in records.UNRECORDABLE -- so a scope violation carrying a
     # Cookie produced no row anywhere and named the credential rather than the
-    # boundary crossed. It is not an exotic input either: until Plan 5 ships
+    # boundary crossed. The class has a row of its own now, and the ordering
+    # still matters: the scope boundary is the fact worth recording, and a
+    # `credential` row would name the wrong reason for the refusal. It is not
+    # an exotic input either: until Plan 5 ships
     # identity injection, the natural agent action is replaying a request
     # lifted from Burp's history, and those carry a Cookie.
     attempt("scope_with_credential", "GET", "/api/orders", to=rig.offside,
@@ -23420,15 +23447,31 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
         (rig.run_id,))]
     assert kinds == ["scope", "method", "dangerous", "scope"]
 
-    # A gap, pinned rather than papered over: Plan 1's denial.kind CHECK
-    # lists scope, method, dangerous, rate, budget and not_configured. There
-    # is no kind for unmanaged_credential -- nor for halted, transport_error,
-    # timeout or bridge_lost -- so S6's error classes are wider than the
-    # table that is supposed to record them. records.UNRECORDABLE is where
-    # that is written down; this is where it is demonstrated, and when the
-    # schema grows a kind these two assertions are what will say so.
-    assert "unmanaged_credential" in records.UNRECORDABLE
-    with pytest.raises((sqlite3.IntegrityError, ValueError)):
+    # The gap this block used to pin is CLOSED, and these assertions are what
+    # said so. Plan 1's denial.kind CHECK listed scope, method, dangerous,
+    # rate, budget and not_configured, and there was no kind for
+    # unmanaged_credential -- so S4's "denials are never silent" did not hold
+    # for the one class here that IS a denial about a request the extension
+    # agreed to look at. SCHEMA_VERSION 6 added 'credential'.
+    #
+    # The classes still wider than the tables are halted, transport_error,
+    # timeout and bridge_lost, and none of those is a denial: a run-wide stop,
+    # a transport failure, and two that name a request the caller gave up on.
+    # records.UNRECORDABLE carries each with its reason.
+    assert "unmanaged_credential" not in records.UNRECORDABLE
+    assert records.record_denial(
+        rig.eng.db, run_id=rig.run_id,
+        kind=records.DENIAL_KIND["unmanaged_credential"],
+        method="GET", url=f"{rig.target.origin}/api/orders",
+        detail="a Cookie header this extension did not inject",
+        at_us=engagement.now_us()).startswith("d-")
+    assert rig.eng.db.execute(
+        "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us DESC, rowid DESC",
+        (rig.run_id,)).fetchone()["kind"] == "credential"
+    # ...and the class is still not a KIND. Passing the wire name where a
+    # schema value belongs is the mistake this refusal exists for, and closing
+    # the gap did not make the two words interchangeable.
+    with pytest.raises(ValueError, match="not a denial kind"):
         records.record_denial(
             rig.eng.db, run_id=rig.run_id, kind="unmanaged_credential",
             method="GET", url=f"{rig.target.origin}/api/orders",
@@ -23584,8 +23627,7 @@ def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
         "the gate refused, named a wait, and was still refusing after it")
     assert len(rig.target.hits_for("/health")) == hits_before + 1
 
-    # Denials are never silent (S4). rate_limited has a kind of its own,
-    # unlike unmanaged_credential.
+    # Denials are never silent (S4), and rate_limited has a kind of its own.
     assert records.record_denial(
         rig.eng.db, run_id=rig.run_id,
         kind=records.DENIAL_KIND["rate_limited"],

@@ -31,6 +31,7 @@ import re
 
 import pytest
 
+from hx import capture as capture_mod
 from hx import config as config_mod
 from hx import run as run_mod
 from hx.store import db as db_mod
@@ -120,7 +121,13 @@ def test_exchange_outcomes_matches_the_schema():
     measurement against real Burp -- so this pairing has already moved once
     under load.
     """
-    assert set(records_mod.EXCHANGE_OUTCOMES) == _checks()["exchange.outcome"]
+    checks = _checks()
+    assert set(records_mod.EXCHANGE_OUTCOMES) == checks["exchange.outcome"]
+    # And the MAP whose values feed the same column. It is narrower than the
+    # set above by design -- most outcomes name no error class -- so this half
+    # is a subset check, and it is the half that catches an error class mapped
+    # onto an outcome the CHECK will refuse.
+    assert set(records_mod.EXCHANGE_OUTCOME.values()) <= checks["exchange.outcome"]
 
 
 def test_denial_kinds_matches_the_schema():
@@ -148,6 +155,25 @@ def test_via_values_matches_the_schema():
     assert set(records_mod.VIA_VALUES) == checks["denial.via"]
 
 
+def test_discovered_by_is_total_over_via_and_says_only_what_the_schema_takes():
+    """`hx.capture.DISCOVERED_BY` against BOTH vocabularies it sits between.
+
+    It is a map, not a set, and both halves can drift on their own. Its KEYS
+    must cover `via` completely or an egress point this store already accepts
+    raises KeyError on the first surface it discovers -- `via` is checked
+    against VIA_VALUES a few lines earlier, so a fourth value would pass that
+    check and die here. Its VALUES must be ones `surface.discovered_by`'s
+    CHECK accepts, or the INSERT fails at the far end instead.
+
+    The two vocabularies are deliberately NOT the same: S5 spells the egress
+    point `send` and the discovery `agent`, so this cannot be an identity map
+    and the pairing has to be stated.
+    """
+    checks = _checks()
+    assert set(capture_mod.DISCOVERED_BY) == set(records_mod.VIA_VALUES)
+    assert set(capture_mod.DISCOVERED_BY.values()) <= checks["surface.discovered_by"]
+
+
 def test_every_python_vocabulary_in_this_repo_is_covered_here():
     """The list of pairings is itself a thing that drifts.
 
@@ -156,9 +182,24 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
     here recreates the hole. So the pairings are enumerated, and any
     module-level vocabulary constant not named must be either added above or
     named as deliberately unpaired.
+
+    DICTS ARE SCANNED TOO, and they were not until Plan 4's Task 4 added
+    `hx.capture.DISCOVERED_BY` -- a map whose keys are one vocabulary and
+    whose values are another. Turning the scan on found three more that had
+    been invisible to it all along, two of them in `records`. A map between
+    two CHECK-constrained columns is more exposed than a set, not less: it can
+    drift at either end.
     """
     paired = {
+        "hx.capture.DISCOVERED_BY",
         "hx.run.RUN_KINDS",
+        # The two error-class MAPS. Their KEYS are the wire vocabulary and are
+        # pinned in test_records.py against the emit sites; their VALUES are
+        # column vocabularies and are pinned above -- DENIAL_KIND through
+        # DENIAL_KINDS, which is its own value set, and EXCHANGE_OUTCOME by
+        # the subset assertion in test_exchange_outcomes_matches_the_schema.
+        "hx.store.records.DENIAL_KIND",
+        "hx.store.records.EXCHANGE_OUTCOME",
         "hx.config.VALID_PROFILES",
         "hx.store.records.EXCHANGE_OUTCOMES",
         "hx.store.records.DENIAL_KINDS",
@@ -176,15 +217,27 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
         # vocabulary, no column: a pre-issuance refusal produces a `denial`
         # row whose KIND is pinned above, never an `exchange`.
         "hx.store.records.PRE_ISSUANCE",
+        # The WIRE's frame types, from S6 and docs/bridge-protocol.md. No
+        # column holds one: a frame's `t` decides which table it becomes a row
+        # in, and the vocabularies of those tables are pinned above. It is
+        # here rather than absent because the scan below would otherwise not
+        # notice a fourth frame type appearing with nowhere to be decided
+        # about.
+        "hx.capture.FRAME_TYPES",
+        # Which CHECK FAMILIES are enabled, from the config file. Plan 6's
+        # subject; no column holds the set, and `config.load` refuses a key
+        # outside it directly.
+        "hx.config.DEFAULT_CHECKS",
     }
     found = set()
     for mod, name in ((run_mod, "hx.run"), (config_mod, "hx.config"),
+                      (capture_mod, "hx.capture"),
                       (records_mod, "hx.store.records")):
         for attr in dir(mod):
             if attr.startswith("_") or not attr.isupper():
                 continue
             value = getattr(mod, attr)
-            if isinstance(value, (frozenset, set, tuple)) and value and \
+            if isinstance(value, (frozenset, set, tuple, dict)) and value and \
                     all(isinstance(v, str) for v in value):
                 found.add(f"{name}.{attr}")
     unaccounted = found - paired - unpaired_with_reason

@@ -14,7 +14,18 @@ from pathlib import Path
 
 from hx.store.paths import secure_mkdir
 
-SCHEMA_VERSION = 5
+# 5 -> 6 (2026-08-25): `denial.kind` gained 'credential' and
+# `surface.discovered_by` lost its DEFAULT. Both land inside Plan 4's branch,
+# on top of the 4 -> 5 bump that added `denial.via` a commit earlier -- and
+# reusing 5 for them would have made two INCOMPATIBLE schemas share one
+# version number, since a database created at that earlier commit already
+# exists on disk. Such a file refuses every `credential` denial this code now
+# writes: its CHECK has no such value, so SQLite rejects the INSERT. It also
+# still answers 'proxy' for any writer that omits `surface.discovered_by`
+# rather than failing, which is the guess the DEFAULT was removed to stop.
+# `engagement.open_`'s comparison against this constant is the only thing in
+# the tree that can notice either.
+SCHEMA_VERSION = 6
 
 TABLES: tuple[str, ...] = (
     "engagement",
@@ -87,9 +98,11 @@ def transaction(conn: sqlite3.Connection):
     any multi-statement write that is not wrapped in an explicit
     BEGIN/COMMIT is not atomic -- a failure partway through leaves whatever
     already ran committed. Exactly one place in this codebase remembered
-    that on its own before this helper existed; two more call sites are
-    coming in later plans, and this is cheap insurance against one of them
-    forgetting.
+    that on its own before this helper existed; more call sites were expected
+    in later plans, and this is cheap insurance against one of them
+    forgetting. `hx.capture.on_exchange` is the first of those and did forget
+    -- it wrote four statements unwrapped, and `upsert_surface` failing left a
+    committed exchange row with a NULL `surface_id` behind it.
     """
     conn.execute("BEGIN")
     try:

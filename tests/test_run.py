@@ -214,6 +214,25 @@ class TestDrops:
         assert conn.execute("SELECT dropped_total FROM run WHERE id=?",
                             (rid,)).fetchone()[0] == 7
 
+    def test_an_accumulator_cannot_be_made_to_run_backwards(self, conn):
+        """The floor S5 spends this column on, and it was not a floor.
+
+        `n` arrives off a wire frame -- `int(header["n"])` in `hx.capture` --
+        and a negative one MEASURED `dropped_total = -5`. Two drop reports and
+        one malformed frame could then leave a run whose coverage was
+        incomplete reading as one with no gaps at all, which is the single
+        direction this column exists to prevent. `n=0` goes with it: a drop
+        report of nothing is not a drop report.
+        """
+        rid = run_mod.open_run(conn, engagement_id=ENG, kind="browse",
+                               safety_profile="production", now_us=1000)
+        run_mod.count_drop(conn, run_id=rid, n=4)
+        for bad in (-5, 0):
+            with pytest.raises(ValueError, match="floor"):
+                run_mod.count_drop(conn, run_id=rid, n=bad)
+        assert conn.execute("SELECT dropped_total FROM run WHERE id=?",
+                            (rid,)).fetchone()[0] == 4
+
     def test_a_fresh_run_has_no_drops_rather_than_null(self, conn):
         """NULL would make `dropped_total > 0` quietly false for every run,
         which is the reading a report would take as 'no gaps'."""

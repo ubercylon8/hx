@@ -45,11 +45,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   4. Policy, first half    scope -> method -> dangerous. None of them spends
  *                            anything, so they cost nothing to run early.
  *   5. unmanaged_credential  BETWEEN the two halves. Before the Gate for the
- *                            same reason as 1; after 4 because this class has
- *                            no `denial` row (records.UNRECORDABLE), so
- *                            running it first made an out-of-scope request
- *                            carrying a Cookie into a credential error with
- *                            the scope violation recorded nowhere.
+ *                            same reason as 1; after 4 because running it
+ *                            first made an out-of-scope request carrying a
+ *                            Cookie into a credential error, naming the
+ *                            credential rather than the boundary crossed.
+ *                            (The class had no `denial` row at all until
+ *                            SCHEMA_VERSION 6 gave it `kind='credential'`, so
+ *                            the scope violation was then recorded nowhere;
+ *                            the ordering stands on the first reason alone.)
  *   6. Policy, second half   the Gate: rate -> budget.
  *
  * Steps 2-6 hold the pinned order -- not_configured, halted, scope_denied,
@@ -248,10 +251,11 @@ public final class Sender {
         // that placement have different reasons. Before the Gate, for the same
         // reason as guard 1: Limits.check() spends a rate token and a budget
         // slot on a request that is about to be refused. After scope, method
-        // and dangerous, because this class is in records.UNRECORDABLE -- there
-        // is no `denial` row for it -- so running it first turned every
-        // out-of-scope request CARRYING A COOKIE into a credential error with
-        // no row anywhere. MEASURED before this moved:
+        // and dangerous, because running it first turned every out-of-scope
+        // request CARRYING A COOKIE into a credential error naming the
+        // credential rather than the boundary crossed -- and while the class
+        // was in records.UNRECORDABLE, which it was until SCHEMA_VERSION 6,
+        // with no row anywhere either. MEASURED before this moved:
         //
         //   out-of-scope AND unmanaged Cookie    -> unmanaged_credential
         //   out-of-scope, no cookie              -> scope_denied

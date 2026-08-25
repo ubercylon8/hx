@@ -359,8 +359,8 @@ public class ChokepointTest {
      *
      * `decide()` was split so spec s7's credential refusal could sit BETWEEN
      * them: it must run before the Gate (which spends a rate token and a
-     * budget slot) and after scope/method/dangerous (whose classes have
-     * `denial` rows, where `unmanaged_credential` has none). Policy cannot
+     * budget slot) and after scope/method/dangerous, whose classes name the
+     * boundary crossed rather than the credential carried. Policy cannot
      * make that check itself -- it is decided by its arguments alone and must
      * not reach into hx.send for a Redactor -- so the interleaving lives in
      * Sender.

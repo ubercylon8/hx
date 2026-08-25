@@ -134,6 +134,22 @@ def count_drop(conn: sqlite3.Connection, *, run_id: str, n: int = 1) -> None:
     S5: a run with drops has coverage numbers that are a FLOOR, not a count.
     Accumulates rather than sets, because drops arrive in bursts as the queue
     fills and each burst is real.
+
+    An accumulator only floors anything if it cannot go backwards. `n=-5`
+    measured `dropped_total = -5` here, and a run's own drop reports could
+    then erase the signal that its coverage is incomplete -- one malformed
+    frame turning an incomplete run into a clean-looking one, which is the
+    direction S5 spends this column to prevent. `n=0` is refused with it: a
+    `dropped` frame reporting no drops is a frame that means nothing, and the
+    caller's own `n` is malformed either way. `hx.capture` checks the same
+    bound BEFORE it opens a run, so a stream of these cannot manufacture
+    empty runs; this is the floor at the writer, where it also covers callers
+    that do not exist yet.
     """
+    if n < 1:
+        raise ValueError(
+            f"a drop report of {n!r} is not a drop report; dropped_total is "
+            "an accumulator and S5 makes it the reason a run's coverage "
+            "numbers are a floor, so it must never move backwards")
     conn.execute("UPDATE run SET dropped_total = dropped_total + ? WHERE id=?",
                  (n, run_id))

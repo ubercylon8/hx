@@ -94,8 +94,9 @@ CLOCK_SKEW_SLACK_US = 5_000
 # Error class -> `denial.kind` is records.DENIAL_KIND, imported rather than
 # restated. A second copy here would be the copy nothing tests, and the two
 # would agree right up until Plan 1's CHECK constraint grew a value.
-# unmanaged_credential is in neither: see records.UNRECORDABLE, and the
-# assertion that pins the gap in test_the_gate_refuses_four_ways.
+# unmanaged_credential was in neither until SCHEMA_VERSION 6 gave it the
+# `credential` kind; the assertions in test_the_gate_refuses_four_ways are
+# where that closure is demonstrated rather than asserted.
 
 
 def _blobs_containing(eng, needle: bytes) -> list[Path]:
@@ -352,10 +353,13 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     # shape had never been driven: every case above sends its credential to
     # an in-scope path, so the two guards were never made to compete.
     #
-    # Until the whole-branch review it answered `unmanaged_credential`, and
-    # that class is in records.UNRECORDABLE -- so a scope violation carrying a
+    # Until the whole-branch review it answered `unmanaged_credential`, which
+    # was then in records.UNRECORDABLE -- so a scope violation carrying a
     # Cookie produced no row anywhere and named the credential rather than the
-    # boundary crossed. It is not an exotic input either: until Plan 5 ships
+    # boundary crossed. The class has a row of its own now, and the ordering
+    # still matters: the scope boundary is the fact worth recording, and a
+    # `credential` row would name the wrong reason for the refusal. It is not
+    # an exotic input either: until Plan 5 ships
     # identity injection, the natural agent action is replaying a request
     # lifted from Burp's history, and those carry a Cookie.
     attempt("scope_with_credential", "GET", "/api/orders", to=rig.offside,
@@ -395,15 +399,31 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
         (rig.run_id,))]
     assert kinds == ["scope", "method", "dangerous", "scope"]
 
-    # A gap, pinned rather than papered over: Plan 1's denial.kind CHECK
-    # lists scope, method, dangerous, rate, budget and not_configured. There
-    # is no kind for unmanaged_credential -- nor for halted, transport_error,
-    # timeout or bridge_lost -- so S6's error classes are wider than the
-    # table that is supposed to record them. records.UNRECORDABLE is where
-    # that is written down; this is where it is demonstrated, and when the
-    # schema grows a kind these two assertions are what will say so.
-    assert "unmanaged_credential" in records.UNRECORDABLE
-    with pytest.raises((sqlite3.IntegrityError, ValueError)):
+    # The gap this block used to pin is CLOSED, and these assertions are what
+    # said so. Plan 1's denial.kind CHECK listed scope, method, dangerous,
+    # rate, budget and not_configured, and there was no kind for
+    # unmanaged_credential -- so S4's "denials are never silent" did not hold
+    # for the one class here that IS a denial about a request the extension
+    # agreed to look at. SCHEMA_VERSION 6 added 'credential'.
+    #
+    # The classes still wider than the tables are halted, transport_error,
+    # timeout and bridge_lost, and none of those is a denial: a run-wide stop,
+    # a transport failure, and two that name a request the caller gave up on.
+    # records.UNRECORDABLE carries each with its reason.
+    assert "unmanaged_credential" not in records.UNRECORDABLE
+    assert records.record_denial(
+        rig.eng.db, run_id=rig.run_id,
+        kind=records.DENIAL_KIND["unmanaged_credential"],
+        method="GET", url=f"{rig.target.origin}/api/orders",
+        detail="a Cookie header this extension did not inject",
+        at_us=engagement.now_us()).startswith("d-")
+    assert rig.eng.db.execute(
+        "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us DESC, rowid DESC",
+        (rig.run_id,)).fetchone()["kind"] == "credential"
+    # ...and the class is still not a KIND. Passing the wire name where a
+    # schema value belongs is the mistake this refusal exists for, and closing
+    # the gap did not make the two words interchangeable.
+    with pytest.raises(ValueError, match="not a denial kind"):
         records.record_denial(
             rig.eng.db, run_id=rig.run_id, kind="unmanaged_credential",
             method="GET", url=f"{rig.target.origin}/api/orders",
@@ -559,8 +579,7 @@ def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
         "the gate refused, named a wait, and was still refusing after it")
     assert len(rig.target.hits_for("/health")) == hits_before + 1
 
-    # Denials are never silent (S4). rate_limited has a kind of its own,
-    # unlike unmanaged_credential.
+    # Denials are never silent (S4), and rate_limited has a kind of its own.
     assert records.record_denial(
         rig.eng.db, run_id=rig.run_id,
         kind=records.DENIAL_KIND["rate_limited"],

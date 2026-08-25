@@ -46,6 +46,12 @@ DENIAL_KIND: dict[str, str] = {
     "rate_limited": "rate",
     "budget_exhausted": "budget",
     "not_configured": "not_configured",
+    # Added 2026-08-25 with SCHEMA_VERSION 6, closing the gap the comment on
+    # UNRECORDABLE called "the gap to close first". S4 is unconditional and
+    # this class was the one denial the vocabulary could not express, so it
+    # reached `hx.capture` and vanished silently. S7's "never persisted" is
+    # about the request bytes; the refusal is a denial like any other.
+    "unmanaged_credential": "credential",
 }
 DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 
@@ -213,10 +219,17 @@ VIA_VALUES = frozenset({"proxy", "send", "crawl"})
 # migration -- a new SCHEMA_VERSION and a table rebuild. A class in here still
 # reaches the caller as BridgeError.error_class; what it does not get is a row.
 #
-#   unmanaged_credential -- a real denial (S7 refuses the request and never
-#       persists it) with no `kind` to record it under. This is the gap to
-#       close first: it is the only class here that S4 calls a denial about a
-#       request the extension agreed to look at.
+# WHAT IS LEFT HERE IS NOT A DENIAL, and that is the whole of why the set is
+# allowed to be non-empty. S4's sentence -- "Any denial produces a `denial` row
+# and a distinct error class. Denials are never silent" -- is about DENIALS,
+# and every remaining member is a transport failure, a run-wide stop, or a
+# refusal about a FRAME rather than about a request the extension agreed to
+# look at. `unmanaged_credential` was the one exception, which is exactly why
+# it was called "the gap to close first"; it left this set on 2026-08-25 for
+# DENIAL_KIND and a `credential` row. What is left is a category rather than a
+# backlog, and the rule that follows from it is the useful part: a new class
+# that IS a denial must be given a `kind` rather than added below.
+#
 #   transport_error -- the request DID leave the JVM, so it belongs in
 #       `exchange`, but see EXCHANGE_OUTCOME above.
 #   halted -- not a per-request denial at all. One distressed host aborts the
@@ -248,7 +261,7 @@ VIA_VALUES = frozenset({"proxy", "send", "crawl"})
 #       transcribed from S6 by hand and S6 did not list it either. Both ends
 #       of that are fixed: S6 lists it, and the set is now DERIVED from the
 #       emit sites.
-UNRECORDABLE = frozenset({"unmanaged_credential", "transport_error", "halted",
+UNRECORDABLE = frozenset({"transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
                           "protocol_mismatch", "bad_config", "unknown_frame"})
 
@@ -275,8 +288,12 @@ def row_for(error_class: str, *,
     An `issued=False` ambiguous class routes NOWHERE. `denial.kind`'s
     vocabulary is Plan 1's and has no value for "the caller's deadline had
     already passed", so the honest answer today is no row rather than a row
-    filed under a reason that is not the reason -- the same position
-    `unmanaged_credential` is in, and it belongs in the same schema migration.
+    filed under a reason that is not the reason. This was the same position
+    `unmanaged_credential` was in until SCHEMA_VERSION 6 gave it a kind; the
+    difference is that a never-issued `timeout` is not a DENIAL -- nobody
+    refused it, the caller gave up -- so S4's "denials are never silent" does
+    not reach it, and a kind of its own would be a new fact rather than a
+    vocabulary this store already had.
     """
     if error_class in DENIAL_KIND:
         # Precedence, and it is the whole reason this is a function: the two
