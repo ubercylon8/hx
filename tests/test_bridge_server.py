@@ -1939,11 +1939,81 @@ def test_a_sink_that_throws_does_not_take_the_connection_down(tmp_path, halt):
         c = _connected(s)
         frame = codec.encode_two({"v": 1, "t": "exchange",
                                   "url": "http://app.test/x"}, b"a", b"b")
-        assert _push(c, frame, s, lambda: len(calls) == 1)
-        assert isinstance(s.exchange_callback_error, RuntimeError)
-        assert s.exchange_errors == 1
-        # ...and the NEXT one still arrives, which is what "not fatal" means.
+        # TWO calls for one frame: the exchange, and the `dropped` frame that
+        # says the exchange was lost. The retry is attempted ONCE and only for
+        # a frame that was not itself a drop report, so a sink that raises on
+        # everything costs one extra call and not a recursion.
         assert _push(c, frame, s, lambda: len(calls) == 2)
+        assert calls[0]["t"] == "exchange"
+        assert calls[1] == {"v": 1, "t": "dropped", "n": 1}
+        assert isinstance(s.exchange_callback_error, RuntimeError)
+        assert s.exchange_errors == 2      # the exchange, and the retry
+        # ...and the NEXT one still arrives, which is what "not fatal" means.
+        assert _push(c, frame, s, lambda: len(calls) == 4)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_lost_exchange_is_handed_back_as_a_drop(tmp_path, halt):
+    """The coverage floor, on this side of the bridge.
+
+    `exchange_callback_error` and `exchange_errors` are kept, and nothing
+    outside tests/ reads either -- so a run whose every exchange frame was
+    malformed reported COMPLETE coverage. That is the Java side's "a Burp log
+    line is not the coverage floor" wearing a different hat. `run.dropped_total`
+    is the number S5 makes the floor, and the only way a loss here reaches it
+    is a `dropped` frame.
+    """
+    seen = []
+
+    def sink(header, request, response):
+        seen.append(header)
+        if header.get("t") != "dropped":
+            raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange", "via": "proxy",
+                                  "source": "crawler",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        assert _push(c, frame, s, lambda: len(seen) == 2)
+        assert seen[1]["t"] == "dropped" and seen[1]["n"] == 1
+        # Against the CRAWLER's run, not the operator's. `hx.capture._run`
+        # turns this string into a run KIND, and filing the crawler's lost
+        # exchange against the operator inflates the wrong row's floor.
+        assert seen[1]["source"] == "crawler"
+        assert s.exchange_errors == 1      # the retry succeeded
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_lost_drop_report_is_not_re_reported_as_another_drop(tmp_path, halt):
+    """One extra call, never a recursion -- and never a count of its own.
+
+    A `dropped` frame the sink could not record is already the coverage floor
+    failing to land; answering it with a second `dropped` frame would be a
+    number this side invented, and a sink that refuses every drop report would
+    invent one per frame forever.
+    """
+    seen = []
+
+    def sink(header, request, response):
+        seen.append(header)
+        raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        assert _push(c, codec.encode({"v": 1, "t": "dropped", "n": 5}),
+                     s, lambda: s.exchange_errors == 1)
+        time.sleep(0.05)
+        assert len(seen) == 1 and seen[0]["n"] == 5
+        assert s.exchange_errors == 1
         assert s.state == "connected"
         c.close()
     finally:
@@ -1962,10 +2032,13 @@ def test_a_malformed_two_body_payload_is_counted_not_raised(tmp_path, halt):
                             codec.BODIES_KEY: 2}, b"\x00\x00")
         assert _push(c, bad, s, lambda: s.exchange_errors == 1)
         assert isinstance(s.exchange_callback_error, codec.FrameError)
-        assert seen == []
+        # The frame never became an exchange row -- and it did not vanish
+        # either. A payload that could not be split is a record hx does not
+        # have, so it reaches the sink as a drop instead.
+        assert seen == [{"v": 1, "t": "dropped", "n": 1}]
         good = codec.encode_two({"v": 1, "t": "exchange",
                                  "url": "http://app.test/y"}, b"a", b"b")
-        assert _push(c, good, s, lambda: len(seen) == 1)
+        assert _push(c, good, s, lambda: len(seen) == 2)
         assert s.state == "connected"
         c.close()
     finally:

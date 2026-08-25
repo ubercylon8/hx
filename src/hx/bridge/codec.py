@@ -108,7 +108,22 @@ def encode_two(header: dict, first: bytes, second: bytes) -> bytes:
     so the declaration on the wire cannot disagree with the shape of the bytes:
     a caller that forgot the key would produce a frame whose second body is
     read as trailing bytes of the first.
+
+    The size is checked BEFORE the two bodies are joined, the same way and for
+    the same reason as the Java side: MAX_FRAME exists so one frame cannot make
+    the process allocate arbitrarily, and a check that runs after the
+    allocation it bounds has already lost. This used to build the whole
+    concatenation and let `encode` check afterwards -- the opposite of what the
+    comment in `Frame.encode` says the two files do -- which is harmless here
+    only because nothing in `src/` calls this. `test_encode_two_has_no_caller
+    _outside_the_tests` is what makes that "only" a fact rather than a habit.
     """
+    total = _LEN.size + len(first) + _LEN.size + len(second)
+    if total > MAX_FRAME:
+        raise FrameError(
+            f"two bodies of {len(first)} + {len(second)} bytes exceed "
+            f"MAX_FRAME {MAX_FRAME}"
+        )
     payload = (_LEN.pack(len(first)) + first
                + _LEN.pack(len(second)) + second)
     return encode({**header, BODIES_KEY: 2}, payload)

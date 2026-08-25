@@ -39,6 +39,15 @@ import java.util.concurrent.locks.ReentrantLock;
  * requests differ to whoever is debugging the bridge and not at all to
  * whoever is reading the run's coverage.
  *
+ * HOW TO FALSIFY THE FOUR rather than take the list on trust:
+ * `incrementAndGet` appears exactly four times in this file, once per path
+ * above, and it is the only way `dropped[]` is written. A fifth loss would
+ * need a fifth increment or would be a record leaving with none, and either
+ * is visible in one grep. What is NOT covered, and cannot be from inside this
+ * class: a JVM that dies without reaching {@link #stop} takes the queue with
+ * it uncounted. That is Burp crashing, not hx losing a record quietly, and
+ * there is no code path left to run at that point.
+ *
  * WHAT IS NOT CLAIMED HERE is that the count reaches the far side. It reaches
  * it when {@link BridgeClient.ExchangeSink#dropped} SAYS it did, by answering
  * true; a report that answers false leaves {@link #reported} where it was and

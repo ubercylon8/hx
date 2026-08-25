@@ -562,6 +562,47 @@ def test_the_one_body_form_is_untouched_by_the_two_body_form():
         codec.split_bodies(header, body)
 
 
+def test_encode_two_has_no_caller_outside_the_tests():
+    """The bound the split-point asymmetry rests on, made falsifiable.
+
+    `codec.decode` deliberately does NOT split the two bodies and Java's
+    `Frame.decode` does; the note at `split_bodies` says the asymmetry "is
+    bounded: two-body frames travel Burp -> Python only". Nothing enforced
+    that. Java pins its half -- `Frame.encode(` has exactly two call sites in
+    `extension/src`, both in BridgeClient, and the golden vectors redden if a
+    third appears -- and this is the matching pin: the only encoder of a
+    two-body frame on this side has no production caller, so this side emits
+    none.
+
+    A search over `src/`, not an import graph: a call reached through
+    `getattr` or a re-export would slip past the latter, and the string is
+    what a reviewer greps for anyway.
+    """
+    src = Path(__file__).resolve().parents[1] / "src"
+    callers = sorted(
+        f"{p.relative_to(src).as_posix()}:{n}"
+        for p in src.rglob("*.py")
+        for n, line in enumerate(p.read_text().splitlines(), 1)
+        if "encode_two(" in line and not line.lstrip().startswith("def ")
+    )
+    assert callers == [], (
+        "encode_two now has production callers "
+        f"({callers}); two-body frames travel Burp -> Python only, and the "
+        "note at codec.split_bodies rests on that. Python -> Burp two-body "
+        "traffic means Java's eager split CLOSES the connection where this "
+        "side counts and continues -- DENY-ALL, and the halt path with it."
+    )
+
+
+def test_two_bodies_over_max_frame_are_refused_before_they_are_joined():
+    """Mirrors `Frame.encode(header, a, b)`, which checks first for the same
+    reason: a bound on how much one frame may make the process allocate is
+    lost if it is enforced after the allocation."""
+    half = b"x" * (codec.MAX_FRAME // 2 + 16)
+    with pytest.raises(codec.FrameError, match="exceed MAX_FRAME"):
+        codec.encode_two(_exchange_header(), half, half)
+
+
 def test_encoding_two_bodies_does_not_stamp_the_callers_header():
     """Or the next frame that header builds silently declares two bodies it
     has not got."""
@@ -740,7 +781,22 @@ def encode_two(header: dict, first: bytes, second: bytes) -> bytes:
     so the declaration on the wire cannot disagree with the shape of the bytes:
     a caller that forgot the key would produce a frame whose second body is
     read as trailing bytes of the first.
+
+    The size is checked BEFORE the two bodies are joined, the same way and for
+    the same reason as the Java side: MAX_FRAME exists so one frame cannot make
+    the process allocate arbitrarily, and a check that runs after the
+    allocation it bounds has already lost. This used to build the whole
+    concatenation and let `encode` check afterwards -- the opposite of what the
+    comment in `Frame.encode` says the two files do -- which is harmless here
+    only because nothing in `src/` calls this. `test_encode_two_has_no_caller
+    _outside_the_tests` is what makes that "only" a fact rather than a habit.
     """
+    total = _LEN.size + len(first) + _LEN.size + len(second)
+    if total > MAX_FRAME:
+        raise FrameError(
+            f"two bodies of {len(first)} + {len(second)} bytes exceed "
+            f"MAX_FRAME {MAX_FRAME}"
+        )
     payload = (_LEN.pack(len(first)) + first
                + _LEN.pack(len(second)) + second)
     return encode({**header, BODIES_KEY: 2}, payload)
@@ -4253,11 +4309,81 @@ def test_a_sink_that_throws_does_not_take_the_connection_down(tmp_path, halt):
         c = _connected(s)
         frame = codec.encode_two({"v": 1, "t": "exchange",
                                   "url": "http://app.test/x"}, b"a", b"b")
-        assert _push(c, frame, s, lambda: len(calls) == 1)
-        assert isinstance(s.exchange_callback_error, RuntimeError)
-        assert s.exchange_errors == 1
-        # ...and the NEXT one still arrives, which is what "not fatal" means.
+        # TWO calls for one frame: the exchange, and the `dropped` frame that
+        # says the exchange was lost. The retry is attempted ONCE and only for
+        # a frame that was not itself a drop report, so a sink that raises on
+        # everything costs one extra call and not a recursion.
         assert _push(c, frame, s, lambda: len(calls) == 2)
+        assert calls[0]["t"] == "exchange"
+        assert calls[1] == {"v": 1, "t": "dropped", "n": 1}
+        assert isinstance(s.exchange_callback_error, RuntimeError)
+        assert s.exchange_errors == 2      # the exchange, and the retry
+        # ...and the NEXT one still arrives, which is what "not fatal" means.
+        assert _push(c, frame, s, lambda: len(calls) == 4)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_lost_exchange_is_handed_back_as_a_drop(tmp_path, halt):
+    """The coverage floor, on this side of the bridge.
+
+    `exchange_callback_error` and `exchange_errors` are kept, and nothing
+    outside tests/ reads either -- so a run whose every exchange frame was
+    malformed reported COMPLETE coverage. That is the Java side's "a Burp log
+    line is not the coverage floor" wearing a different hat. `run.dropped_total`
+    is the number S5 makes the floor, and the only way a loss here reaches it
+    is a `dropped` frame.
+    """
+    seen = []
+
+    def sink(header, request, response):
+        seen.append(header)
+        if header.get("t") != "dropped":
+            raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange", "via": "proxy",
+                                  "source": "crawler",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        assert _push(c, frame, s, lambda: len(seen) == 2)
+        assert seen[1]["t"] == "dropped" and seen[1]["n"] == 1
+        # Against the CRAWLER's run, not the operator's. `hx.capture._run`
+        # turns this string into a run KIND, and filing the crawler's lost
+        # exchange against the operator inflates the wrong row's floor.
+        assert seen[1]["source"] == "crawler"
+        assert s.exchange_errors == 1      # the retry succeeded
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_lost_drop_report_is_not_re_reported_as_another_drop(tmp_path, halt):
+    """One extra call, never a recursion -- and never a count of its own.
+
+    A `dropped` frame the sink could not record is already the coverage floor
+    failing to land; answering it with a second `dropped` frame would be a
+    number this side invented, and a sink that refuses every drop report would
+    invent one per frame forever.
+    """
+    seen = []
+
+    def sink(header, request, response):
+        seen.append(header)
+        raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        assert _push(c, codec.encode({"v": 1, "t": "dropped", "n": 5}),
+                     s, lambda: s.exchange_errors == 1)
+        time.sleep(0.05)
+        assert len(seen) == 1 and seen[0]["n"] == 5
+        assert s.exchange_errors == 1
         assert s.state == "connected"
         c.close()
     finally:
@@ -4276,10 +4402,13 @@ def test_a_malformed_two_body_payload_is_counted_not_raised(tmp_path, halt):
                             codec.BODIES_KEY: 2}, b"\x00\x00")
         assert _push(c, bad, s, lambda: s.exchange_errors == 1)
         assert isinstance(s.exchange_callback_error, codec.FrameError)
-        assert seen == []
+        # The frame never became an exchange row -- and it did not vanish
+        # either. A payload that could not be split is a record hx does not
+        # have, so it reaches the sink as a drop instead.
+        assert seen == [{"v": 1, "t": "dropped", "n": 1}]
         good = codec.encode_two({"v": 1, "t": "exchange",
                                  "url": "http://app.test/y"}, b"a", b"b")
-        assert _push(c, good, s, lambda: len(seen) == 1)
+        assert _push(c, good, s, lambda: len(seen) == 2)
         assert s.state == "connected"
         c.close()
     finally:
@@ -4443,7 +4572,9 @@ class BridgeServer:
         so: a wedged harness or a lost record changes what hx KNOWS, never what
         it ALLOWS, so a bookkeeping failure here must not become an outage on
         the operator's browser. The exception is kept in
-        `exchange_callback_error` and the channel is kept with it.
+        `exchange_callback_error`, the channel is kept with it, and the lost
+        record is handed back as a `dropped` frame so the run's coverage floor
+        moves -- see `_capture`, which explains why keeping it was not enough.
         """
         if operator_halt is None:
             # The signature already refuses an OMITTED argument. This refuses
@@ -4470,7 +4601,12 @@ class BridgeServer:
         self.halted_callback_error: BaseException | None = None
         # The last thing an `on_exchange` frame failed on -- a malformed
         # two-body payload, or a throw out of the sink. Recorded rather than
-        # raised: see the note on the constructor's `on_exchange`.
+        # raised: see the note on the constructor's `on_exchange`. These two
+        # are DIAGNOSTICS, read by tests and by whoever is debugging the
+        # bridge; the coverage consequence of the same failure travels the
+        # `dropped` frame `_capture` hands back, because nothing outside
+        # tests/ reads either of these and a run cannot get its floor from a
+        # number no one looks at.
         self.exchange_callback_error: BaseException | None = None
         self.exchange_errors = 0
 
@@ -4666,6 +4802,13 @@ class BridgeServer:
             return True
 
         if t in ("exchange", "denial", "dropped"):
+            # `exchange` USED TO BE IN THE `_deliver` TUPLE BELOW and is not any
+            # more, which is deliberate rather than an oversight. `_deliver`
+            # answers a WAITER by `id`; these three are UNSOLICITED -- nothing
+            # holds an id for them -- so `_deliver` had nothing to wake and the
+            # frame reached no one. Nothing regressed on the send path when it
+            # moved: no solicited `exchange` reply exists in either
+            # implementation, and no `_request` waits on one.
             self._capture(t, header, body)
             return True
 
@@ -4686,9 +4829,23 @@ class BridgeServer:
         FrameError, and DENY-ALL is where a closed connection lands -- so a
         malformed body or a sink that threw would take the operator's browsing
         down with it, and the `halt` path with it. S4: a lost record changes
-        what hx knows, never what it allows. The failure is counted and kept
-        instead. `codec.decode` leaves the two-body split to `split_bodies`
-        for exactly this reason; see the note there.
+        what hx knows, never what it allows. `codec.decode` leaves the two-body
+        split to `split_bodies` for exactly this reason; see the note there.
+
+        THE FAILURE IS KEPT *AND* COUNTED WHERE COVERAGE IS READ. Keeping it in
+        `exchange_callback_error` / `exchange_errors` was the whole of it, and
+        nothing outside `tests/` ever read either -- so a run whose every
+        exchange frame was malformed reported COMPLETE coverage, which is the
+        Java side's "a Burp log line is not the coverage floor" wearing a
+        different hat. A frame that could not be recorded is a record hx does
+        not have, so it goes back to the sink as a one-record `dropped` frame:
+        `run.dropped_total` is the number S5 makes the floor, and this is how a
+        loss on THIS side reaches it.
+
+        The retry is attempted ONCE and only for a frame that was not itself a
+        drop report, so a sink that raises on everything costs one extra call
+        and not a recursion; if that call fails too, the count stands and the
+        channel is still kept.
 
         Only `exchange` carries two bodies. `denial` and `dropped` describe
         something that produced no traffic, so they arrive with an empty body
@@ -4703,6 +4860,25 @@ class BridgeServer:
             else:
                 request, response = b"", b""
             self.on_exchange(header, request, response)
+        except Exception as exc:
+            self.exchange_callback_error = exc
+            self.exchange_errors += 1
+            self._count_as_dropped(t, header)
+
+    def _count_as_dropped(self, t: str, header: dict) -> None:
+        """Tell the sink one record was lost. See `_capture`.
+
+        The `source` is carried across so the loss lands on the run the frame
+        belonged to; `hx.capture` reads an absent one as the operator's, which
+        is the same answer it gives an omitted key on the wire.
+        """
+        if t == "dropped":
+            return
+        drop = {"v": codec.PROTOCOL_VERSION, "t": "dropped", "n": 1}
+        if isinstance(header.get("source"), str):
+            drop["source"] = header["source"]
+        try:
+            self.on_exchange(drop, b"", b"")
         except Exception as exc:
             self.exchange_callback_error = exc
             self.exchange_errors += 1
@@ -7587,17 +7763,21 @@ public final class BridgeClient {
      *
      * DECLARED HERE, like {@link HaltSink} and {@link SendHandler}, and for
      * the same reason: the package that CALLS the bridge depends on the
-     * bridge, never the other way round. Returning an `hx.proxy` type from
-     * this class made `hx.bridge` import `hx.proxy` while `hx.proxy` already
-     * imported `hx.bridge` -- a cycle javac does not mind and a reader does.
+     * bridge, never the other way round. Returning a proxy-package type from
+     * this class made the two packages import each other -- a cycle javac
+     * does not mind and a reader does.
      *
      * SOURCE-AGNOSTIC, which is the half that actually breaks it. A
-     * `dropped(long, hx.proxy.Source)` still names the other package, and an
-     * implementation of it still has to know how an `hx.proxy` enum is
-     * spelled. So the caller does the spelling -- `Capture.sourceName`, where
-     * it already lived -- and hands over a STRING, with `null` meaning "this
+     * `dropped(long, Source)` still names the other package in its signature,
+     * and an implementation of it still has to know how that enum is spelled.
+     * So the caller does the spelling -- `Capture.sourceName`, where it
+     * already lived -- and hands over a STRING, with `null` meaning "this
      * source has no spelling". The sink's whole job with a null is to omit
      * the key.
+     *
+     * FALSIFIABLE rather than asserted: ChokepointTest's
+     * `theBridgeNamesNothingInTheProxyPackage` counts the needle across every
+     * file in this package and requires zero, comments included.
      *
      * BOTH METHODS ANSWER WHETHER THE RECORD REACHED THE WIRE, and neither
      * raises. Not raising is the same rule as "offering never blocks", one

@@ -7390,9 +7390,10 @@ public final class TestSupport {
      *
      * The caller supplies the bound, because only the caller knows what the
      * thread is doing: a millisecond of non-blocking arithmetic and a socket
-     * round trip deserve different numbers. Every bound in this repo is at
-     * least an order of magnitude above the work it covers, so it can only
-     * fire on a genuine hang, and comfortably inside test.sh's 300 s backstop.
+     * round trip deserve different numbers. Both callers today pass 10 s
+     * against work their whole test class finishes in well under a second, so
+     * neither can fire on anything but a genuine hang -- and four of them in a
+     * row still sit inside test.sh's 300 s backstop.
      *
      * The thread is NOT interrupted on the deadline. Unparking it would let
      * the assertions after this call run against work the hang had quietly
@@ -7851,9 +7852,9 @@ public class LimiterTest {
      * How long 1600 non-blocking calls get before the race is called HUNG.
      *
      * `check` takes a monitor and does arithmetic; 1600 of them across eight
-     * threads is microseconds of work. Ten seconds is four orders of magnitude
-     * above that, so this can only fire on a genuine park -- and it is the
-     * whole reason it exists. MEASURED on this file: making `check` sleep
+     * threads is a fraction of the well-under-a-second this whole class takes
+     * to run. Ten seconds cannot fire on anything but a genuine park -- and a
+     * genuine park is the whole reason it exists. MEASURED on this file: making `check` sleep
      * instead of returning `rateLimited` -- a rate limiter that THROTTLES the
      * caller rather than REFUSING it, the same §4 violation the capture layer
      * above exists to forbid, one layer down -- parked all eight workers on
@@ -17043,6 +17044,8 @@ public class ChokepointTest {
         t("noBatchEgressPath", () -> noBatchEgressPath(sources));
         t("redirectsAreNotFollowed", ChokepointTest::redirectsAreNotFollowed);
         t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
+        t("theBridgeNamesNothingInTheProxyPackage",
+          () -> theBridgeNamesNothingInTheProxyPackage(sources));
         t("theDeprecatedAccessorsAreUnusedEverywhere",
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
         t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
@@ -17194,6 +17197,39 @@ public class ChokepointTest {
         // all -- which is what makes the refusal tests able to count calls.
         check("burp.* is imported only by " + ENTRY_POINT + ", not by " + importers,
               importers.equals(List.of(ENTRY_POINT)));
+    }
+
+    /**
+     * The dependency runs one way: hx.proxy -> hx.bridge, and never back.
+     *
+     * `HaltSink` and `SendHandler` are declared in BridgeClient precisely so
+     * the packages that call the bridge need no compile-time dependency the
+     * other way. `ExchangeSink` was declared in `Capture` instead, and
+     * `exchangeSink()` returned it -- so the bridge imported the proxy package
+     * while the proxy package already imported the bridge. javac does not mind
+     * a cycle, because it sees every source at once; a reader trying to work
+     * out which of two files is the authority on a drop's spelling does.
+     *
+     * MOVING THE INTERFACE ALONE WOULD NOT HAVE FIXED IT: its second method
+     * was `dropped(long, Source)` and its body called `Capture.sourceName`,
+     * both of which survive the move. Making the callback source-agnostic --
+     * a String, null for "no spelling" -- is what actually cut it, and this
+     * counts the needle rather than trusting that.
+     *
+     * A MUST-BE-ZERO needle, so a COMMENT counts too. That is the same rule
+     * as the deprecated-accessor check below and it has the same answer: a
+     * javadoc that needs to talk about the other package says "the proxy
+     * package", not the dotted name. Fix the prose, do not widen the needle.
+     */
+    static void theBridgeNamesNothingInTheProxyPackage(List<Path> sources)
+            throws IOException {
+        List<String> naming = new ArrayList<>();
+        for (Path p : sources) {
+            if (!p.toString().contains("hx/bridge/")) continue;
+            if (count(text(p), "hx.proxy") > 0) naming.add(p.toString());
+        }
+        check("no file in hx.bridge names hx.proxy (" + naming + ")",
+              naming.isEmpty());
     }
 
     /**
@@ -21478,7 +21514,9 @@ so the block can be pasted whole.
         so: a wedged harness or a lost record changes what hx KNOWS, never what
         it ALLOWS, so a bookkeeping failure here must not become an outage on
         the operator's browser. The exception is kept in
-        `exchange_callback_error` and the channel is kept with it.
+        `exchange_callback_error`, the channel is kept with it, and the lost
+        record is handed back as a `dropped` frame so the run's coverage floor
+        moves -- see `_capture`, which explains why keeping it was not enough.
         """
         if operator_halt is None:
             # The signature already refuses an OMITTED argument. This refuses
@@ -21505,7 +21543,12 @@ so the block can be pasted whole.
         self.halted_callback_error: BaseException | None = None
         # The last thing an `on_exchange` frame failed on -- a malformed
         # two-body payload, or a throw out of the sink. Recorded rather than
-        # raised: see the note on the constructor's `on_exchange`.
+        # raised: see the note on the constructor's `on_exchange`. These two
+        # are DIAGNOSTICS, read by tests and by whoever is debugging the
+        # bridge; the coverage consequence of the same failure travels the
+        # `dropped` frame `_capture` hands back, because nothing outside
+        # tests/ reads either of these and a run cannot get its floor from a
+        # number no one looks at.
         self.exchange_callback_error: BaseException | None = None
         self.exchange_errors = 0
 
@@ -21580,6 +21623,13 @@ arms with these three:
             return True
 
         if t in ("exchange", "denial", "dropped"):
+            # `exchange` USED TO BE IN THE `_deliver` TUPLE BELOW and is not any
+            # more, which is deliberate rather than an oversight. `_deliver`
+            # answers a WAITER by `id`; these three are UNSOLICITED -- nothing
+            # holds an id for them -- so `_deliver` had nothing to wake and the
+            # frame reached no one. Nothing regressed on the send path when it
+            # moved: no solicited `exchange` reply exists in either
+            # implementation, and no `_request` waits on one.
             self._capture(t, header, body)
             return True
 

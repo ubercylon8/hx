@@ -344,6 +344,47 @@ def test_the_one_body_form_is_untouched_by_the_two_body_form():
         codec.split_bodies(header, body)
 
 
+def test_encode_two_has_no_caller_outside_the_tests():
+    """The bound the split-point asymmetry rests on, made falsifiable.
+
+    `codec.decode` deliberately does NOT split the two bodies and Java's
+    `Frame.decode` does; the note at `split_bodies` says the asymmetry "is
+    bounded: two-body frames travel Burp -> Python only". Nothing enforced
+    that. Java pins its half -- `Frame.encode(` has exactly two call sites in
+    `extension/src`, both in BridgeClient, and the golden vectors redden if a
+    third appears -- and this is the matching pin: the only encoder of a
+    two-body frame on this side has no production caller, so this side emits
+    none.
+
+    A search over `src/`, not an import graph: a call reached through
+    `getattr` or a re-export would slip past the latter, and the string is
+    what a reviewer greps for anyway.
+    """
+    src = Path(__file__).resolve().parents[1] / "src"
+    callers = sorted(
+        f"{p.relative_to(src).as_posix()}:{n}"
+        for p in src.rglob("*.py")
+        for n, line in enumerate(p.read_text().splitlines(), 1)
+        if "encode_two(" in line and not line.lstrip().startswith("def ")
+    )
+    assert callers == [], (
+        "encode_two now has production callers "
+        f"({callers}); two-body frames travel Burp -> Python only, and the "
+        "note at codec.split_bodies rests on that. Python -> Burp two-body "
+        "traffic means Java's eager split CLOSES the connection where this "
+        "side counts and continues -- DENY-ALL, and the halt path with it."
+    )
+
+
+def test_two_bodies_over_max_frame_are_refused_before_they_are_joined():
+    """Mirrors `Frame.encode(header, a, b)`, which checks first for the same
+    reason: a bound on how much one frame may make the process allocate is
+    lost if it is enforced after the allocation."""
+    half = b"x" * (codec.MAX_FRAME // 2 + 16)
+    with pytest.raises(codec.FrameError, match="exceed MAX_FRAME"):
+        codec.encode_two(_exchange_header(), half, half)
+
+
 def test_encoding_two_bodies_does_not_stamp_the_callers_header():
     """Or the next frame that header builds silently declares two bodies it
     has not got."""

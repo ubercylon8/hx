@@ -124,7 +124,9 @@ class BridgeServer:
         so: a wedged harness or a lost record changes what hx KNOWS, never what
         it ALLOWS, so a bookkeeping failure here must not become an outage on
         the operator's browser. The exception is kept in
-        `exchange_callback_error` and the channel is kept with it.
+        `exchange_callback_error`, the channel is kept with it, and the lost
+        record is handed back as a `dropped` frame so the run's coverage floor
+        moves -- see `_capture`, which explains why keeping it was not enough.
         """
         if operator_halt is None:
             # The signature already refuses an OMITTED argument. This refuses
@@ -151,7 +153,12 @@ class BridgeServer:
         self.halted_callback_error: BaseException | None = None
         # The last thing an `on_exchange` frame failed on -- a malformed
         # two-body payload, or a throw out of the sink. Recorded rather than
-        # raised: see the note on the constructor's `on_exchange`.
+        # raised: see the note on the constructor's `on_exchange`. These two
+        # are DIAGNOSTICS, read by tests and by whoever is debugging the
+        # bridge; the coverage consequence of the same failure travels the
+        # `dropped` frame `_capture` hands back, because nothing outside
+        # tests/ reads either of these and a run cannot get its floor from a
+        # number no one looks at.
         self.exchange_callback_error: BaseException | None = None
         self.exchange_errors = 0
 
@@ -347,6 +354,13 @@ class BridgeServer:
             return True
 
         if t in ("exchange", "denial", "dropped"):
+            # `exchange` USED TO BE IN THE `_deliver` TUPLE BELOW and is not any
+            # more, which is deliberate rather than an oversight. `_deliver`
+            # answers a WAITER by `id`; these three are UNSOLICITED -- nothing
+            # holds an id for them -- so `_deliver` had nothing to wake and the
+            # frame reached no one. Nothing regressed on the send path when it
+            # moved: no solicited `exchange` reply exists in either
+            # implementation, and no `_request` waits on one.
             self._capture(t, header, body)
             return True
 
@@ -367,9 +381,23 @@ class BridgeServer:
         FrameError, and DENY-ALL is where a closed connection lands -- so a
         malformed body or a sink that threw would take the operator's browsing
         down with it, and the `halt` path with it. S4: a lost record changes
-        what hx knows, never what it allows. The failure is counted and kept
-        instead. `codec.decode` leaves the two-body split to `split_bodies`
-        for exactly this reason; see the note there.
+        what hx knows, never what it allows. `codec.decode` leaves the two-body
+        split to `split_bodies` for exactly this reason; see the note there.
+
+        THE FAILURE IS KEPT *AND* COUNTED WHERE COVERAGE IS READ. Keeping it in
+        `exchange_callback_error` / `exchange_errors` was the whole of it, and
+        nothing outside `tests/` ever read either -- so a run whose every
+        exchange frame was malformed reported COMPLETE coverage, which is the
+        Java side's "a Burp log line is not the coverage floor" wearing a
+        different hat. A frame that could not be recorded is a record hx does
+        not have, so it goes back to the sink as a one-record `dropped` frame:
+        `run.dropped_total` is the number S5 makes the floor, and this is how a
+        loss on THIS side reaches it.
+
+        The retry is attempted ONCE and only for a frame that was not itself a
+        drop report, so a sink that raises on everything costs one extra call
+        and not a recursion; if that call fails too, the count stands and the
+        channel is still kept.
 
         Only `exchange` carries two bodies. `denial` and `dropped` describe
         something that produced no traffic, so they arrive with an empty body
@@ -384,6 +412,25 @@ class BridgeServer:
             else:
                 request, response = b"", b""
             self.on_exchange(header, request, response)
+        except Exception as exc:
+            self.exchange_callback_error = exc
+            self.exchange_errors += 1
+            self._count_as_dropped(t, header)
+
+    def _count_as_dropped(self, t: str, header: dict) -> None:
+        """Tell the sink one record was lost. See `_capture`.
+
+        The `source` is carried across so the loss lands on the run the frame
+        belonged to; `hx.capture` reads an absent one as the operator's, which
+        is the same answer it gives an omitted key on the wire.
+        """
+        if t == "dropped":
+            return
+        drop = {"v": codec.PROTOCOL_VERSION, "t": "dropped", "n": 1}
+        if isinstance(header.get("source"), str):
+            drop["source"] = header["source"]
+        try:
+            self.on_exchange(drop, b"", b"")
         except Exception as exc:
             self.exchange_callback_error = exc
             self.exchange_errors += 1

@@ -112,6 +112,8 @@ public class ChokepointTest {
         t("noBatchEgressPath", () -> noBatchEgressPath(sources));
         t("redirectsAreNotFollowed", ChokepointTest::redirectsAreNotFollowed);
         t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
+        t("theBridgeNamesNothingInTheProxyPackage",
+          () -> theBridgeNamesNothingInTheProxyPackage(sources));
         t("theDeprecatedAccessorsAreUnusedEverywhere",
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
         t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
@@ -263,6 +265,39 @@ public class ChokepointTest {
         // all -- which is what makes the refusal tests able to count calls.
         check("burp.* is imported only by " + ENTRY_POINT + ", not by " + importers,
               importers.equals(List.of(ENTRY_POINT)));
+    }
+
+    /**
+     * The dependency runs one way: hx.proxy -> hx.bridge, and never back.
+     *
+     * `HaltSink` and `SendHandler` are declared in BridgeClient precisely so
+     * the packages that call the bridge need no compile-time dependency the
+     * other way. `ExchangeSink` was declared in `Capture` instead, and
+     * `exchangeSink()` returned it -- so the bridge imported the proxy package
+     * while the proxy package already imported the bridge. javac does not mind
+     * a cycle, because it sees every source at once; a reader trying to work
+     * out which of two files is the authority on a drop's spelling does.
+     *
+     * MOVING THE INTERFACE ALONE WOULD NOT HAVE FIXED IT: its second method
+     * was `dropped(long, Source)` and its body called `Capture.sourceName`,
+     * both of which survive the move. Making the callback source-agnostic --
+     * a String, null for "no spelling" -- is what actually cut it, and this
+     * counts the needle rather than trusting that.
+     *
+     * A MUST-BE-ZERO needle, so a COMMENT counts too. That is the same rule
+     * as the deprecated-accessor check below and it has the same answer: a
+     * javadoc that needs to talk about the other package says "the proxy
+     * package", not the dotted name. Fix the prose, do not widen the needle.
+     */
+    static void theBridgeNamesNothingInTheProxyPackage(List<Path> sources)
+            throws IOException {
+        List<String> naming = new ArrayList<>();
+        for (Path p : sources) {
+            if (!p.toString().contains("hx/bridge/")) continue;
+            if (count(text(p), "hx.proxy") > 0) naming.add(p.toString());
+        }
+        check("no file in hx.bridge names hx.proxy (" + naming + ")",
+              naming.isEmpty());
     }
 
     /**

@@ -82,9 +82,10 @@ public final class TestSupport {
      *
      * The caller supplies the bound, because only the caller knows what the
      * thread is doing: a millisecond of non-blocking arithmetic and a socket
-     * round trip deserve different numbers. Every bound in this repo is at
-     * least an order of magnitude above the work it covers, so it can only
-     * fire on a genuine hang, and comfortably inside test.sh's 300 s backstop.
+     * round trip deserve different numbers. Both callers today pass 10 s
+     * against work their whole test class finishes in well under a second, so
+     * neither can fire on anything but a genuine hang -- and four of them in a
+     * row still sit inside test.sh's 300 s backstop.
      *
      * The thread is NOT interrupted on the deadline. Unparking it would let
      * the assertions after this call run against work the hang had quietly

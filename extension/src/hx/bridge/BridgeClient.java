@@ -701,17 +701,21 @@ public final class BridgeClient {
      *
      * DECLARED HERE, like {@link HaltSink} and {@link SendHandler}, and for
      * the same reason: the package that CALLS the bridge depends on the
-     * bridge, never the other way round. Returning an `hx.proxy` type from
-     * this class made `hx.bridge` import `hx.proxy` while `hx.proxy` already
-     * imported `hx.bridge` -- a cycle javac does not mind and a reader does.
+     * bridge, never the other way round. Returning a proxy-package type from
+     * this class made the two packages import each other -- a cycle javac
+     * does not mind and a reader does.
      *
      * SOURCE-AGNOSTIC, which is the half that actually breaks it. A
-     * `dropped(long, hx.proxy.Source)` still names the other package, and an
-     * implementation of it still has to know how an `hx.proxy` enum is
-     * spelled. So the caller does the spelling -- `Capture.sourceName`, where
-     * it already lived -- and hands over a STRING, with `null` meaning "this
+     * `dropped(long, Source)` still names the other package in its signature,
+     * and an implementation of it still has to know how that enum is spelled.
+     * So the caller does the spelling -- `Capture.sourceName`, where it
+     * already lived -- and hands over a STRING, with `null` meaning "this
      * source has no spelling". The sink's whole job with a null is to omit
      * the key.
+     *
+     * FALSIFIABLE rather than asserted: ChokepointTest's
+     * `theBridgeNamesNothingInTheProxyPackage` counts the needle across every
+     * file in this package and requires zero, comments included.
      *
      * BOTH METHODS ANSWER WHETHER THE RECORD REACHED THE WIRE, and neither
      * raises. Not raising is the same rule as "offering never blocks", one

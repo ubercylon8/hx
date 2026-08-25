@@ -395,9 +395,9 @@ public class LimiterTest {
      * How long 1600 non-blocking calls get before the race is called HUNG.
      *
      * `check` takes a monitor and does arithmetic; 1600 of them across eight
-     * threads is microseconds of work. Ten seconds is four orders of magnitude
-     * above that, so this can only fire on a genuine park -- and it is the
-     * whole reason it exists. MEASURED on this file: making `check` sleep
+     * threads is a fraction of the well-under-a-second this whole class takes
+     * to run. Ten seconds cannot fire on anything but a genuine park -- and a
+     * genuine park is the whole reason it exists. MEASURED on this file: making `check` sleep
      * instead of returning `rateLimited` -- a rate limiter that THROTTLES the
      * caller rather than REFUSING it, the same §4 violation the capture layer
      * above exists to forbid, one layer down -- parked all eight workers on
