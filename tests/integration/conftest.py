@@ -93,10 +93,20 @@ def _announce_skipped(terminalreporter) -> None:
     stale skipped all 17 integration tests while the commit that did it
     recorded them as passing.
     """
+    # `stats["skipped"]` holds TestReport, NOT Item -- and a TestReport has no
+    # get_closest_marker. The first version of this filter was copied from the
+    # deselected path above, where the objects ARE Items, and the
+    # `getattr(..., None)` guard turned the resulting AttributeError into
+    # permanent silence: 17 skipped integration tests printed not one line.
+    # Measured with HX_BURP_LAB=/nonexistent.
+    #
+    # That is worse than the hole it was written to close. A warning that is
+    # never present is not a warning, which is the same reasoning the
+    # deselected line's own docstring gives for not printing unconditionally.
+    # `keywords` is what a TestReport carries, and it holds the marker names.
     skipped = [
-        item for item in terminalreporter.stats.get("skipped", [])
-        if getattr(item, "get_closest_marker", None)
-        and item.get_closest_marker("integration") is not None
+        report for report in terminalreporter.stats.get("skipped", [])
+        if "integration" in getattr(report, "keywords", ())
     ]
     if skipped:
         terminalreporter.write_line(

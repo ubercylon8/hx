@@ -72,6 +72,31 @@ def missing() -> list[str]:
         return [f"prerequisites under {LAB} could not be checked: {exc}"]
 
 
+def _jar_problem() -> str | None:
+    """The ONE place the jar's state is judged: "missing", "stale", "future", None.
+
+    One function because the first version of this split had two, and they had
+    already diverged in the commit that created them: `_missing()` special-
+    cased a future-dated source and `unbuilt()` did not. That is not a
+    cosmetic drift. A future mtime cannot be cleared by rebuilding -- no jar
+    can be stamped later than a source dated years ahead -- and `_missing()`'s
+    own comment records it being reproduced ("two honest rebuilds, still
+    reported stale both times"). Routing it to a hard FAIL told the operator
+    to run a script that provably cannot help, permanently.
+
+    So the three outcomes are distinguished HERE, once, and routed by who can
+    fix them: "missing" and "stale" are build.sh's, "future" is the clock's.
+    """
+    if not EXT_JAR.exists():
+        return "missing"
+    newest = _newest_source_mtime()
+    if newest > time.time() + 60:
+        return "future"
+    if newest > _jar_mtime():
+        return "stale"
+    return None
+
+
 def unbuilt() -> list[str]:
     """Build products of THIS repo that are absent or stale. These must FAIL.
 
@@ -90,13 +115,31 @@ def unbuilt() -> list[str]:
     Kept separate from `missing()` rather than merged into it because the two
     have opposite correct behaviours, and a single list forces one of them to
     be wrong.
+
+    Returns EMPTY when the machine cannot build at all. `build.sh` needs the
+    montoya jar from the same lab `_environment_missing()` reports and exits 1
+    without it, so telling a contributor with no lab to "run extension/build.sh"
+    sends them to a script that cannot succeed. A build product is only
+    independent of the machine when the machine can build it.
+
+    Wrapped for the same reason `missing()` is: this runs at IMPORT TIME
+    through test_real_burp's skipif, and an exception here is not a skipped
+    test, it is `Interrupted: 1 error during collection` for the entire
+    repository -- 396 fast tests reporting nothing. That was measured against
+    a lab directory at mode 000, and `missing()`'s docstring already records
+    the same hazard biting twice before.
     """
-    problems = []
-    if not EXT_JAR.exists():
-        problems.append(f"extension jar is missing (run extension/build.sh): {EXT_JAR}")
-    elif _jar_is_stale():
-        problems.append("extension jar is older than its sources (run extension/build.sh)")
-    return problems
+    try:
+        if _environment_missing():
+            return []
+        problem = _jar_problem()
+        if problem == "missing":
+            return [f"extension jar is missing (run extension/build.sh): {EXT_JAR}"]
+        if problem == "stale":
+            return ["extension jar is older than its sources (run extension/build.sh)"]
+        return []
+    except OSError as exc:
+        return []
 
 
 def _environment_missing() -> list[str]:
@@ -110,6 +153,13 @@ def _environment_missing() -> list[str]:
     A prerequisite that is not one is still a skip, and a skip still reports
     green.
     """
+    try:
+        return _environment_missing_unguarded()
+    except OSError as exc:
+        return [f"prerequisites under {LAB} could not be checked: {exc}"]
+
+
+def _environment_missing_unguarded() -> list[str]:
     absent = []
     if not BURP_JAR.exists():
         absent.append(f"burp jar: {BURP_JAR}")

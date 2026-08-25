@@ -403,3 +403,54 @@ def test_no_socket_attributed_to_the_pid_is_reported_rather_than_passed(monkeypa
     monkeypatch.setattr(bf, "_listening_sockets", _sockets())
     reason = bf.not_loopback_only(1234, [40421])
     assert reason and "no listening socket" in reason, reason
+
+
+class TestTheSkipFailSplit:
+    """`unbuilt()` and `_environment_missing()`, in both directions.
+
+    Both were added in a commit that shipped zero tests for them, and its
+    review found three defects that a single test would each have caught. The
+    guards below are the three.
+    """
+
+    def test_a_future_dated_source_is_not_a_build_problem(self, tmp_path,
+                                                          monkeypatch):
+        """It is the clock's, and build.sh provably cannot fix it.
+
+        No jar can be stamped later than a source dated years ahead, so
+        routing this to a hard FAIL tells the operator to run a script that
+        changes nothing -- permanently, for every run. Measured before the
+        fix: two honest rebuilds, still reported unbuilt both times.
+        """
+        monkeypatch.setattr(bf, "_jar_problem", lambda: "future")
+        monkeypatch.setattr(bf, "_environment_missing", lambda: [])
+        assert bf.unbuilt() == []
+
+    def test_but_a_stale_jar_is(self, monkeypatch):
+        """The separating case: without it the test above passes on a function
+        that always returns empty."""
+        monkeypatch.setattr(bf, "_jar_problem", lambda: "stale")
+        monkeypatch.setattr(bf, "_environment_missing", lambda: [])
+        assert bf.unbuilt() and "build.sh" in bf.unbuilt()[0]
+
+    def test_a_machine_that_cannot_build_is_not_told_to_build(self, monkeypatch):
+        """build.sh needs the montoya jar from the same lab the environment
+        check reports, and exits 1 without it. A build product is only
+        independent of the machine when the machine can build it."""
+        monkeypatch.setattr(bf, "_jar_problem", lambda: "missing")
+        monkeypatch.setattr(bf, "_environment_missing",
+                            lambda: ["burp jar: /nope"])
+        assert bf.unbuilt() == []
+
+    def test_neither_predicate_raises_on_an_unreadable_lab(self, monkeypatch):
+        """Both run at IMPORT TIME through test_real_burp's skipif, so an
+        exception here is not a skipped test -- it is `Interrupted: 1 error
+        during collection` for the entire repository, 396 fast tests included.
+        Measured against a lab at mode 000 before the fix: 0 of 396 ran.
+        """
+        def boom():
+            raise PermissionError(13, "Permission denied")
+        monkeypatch.setattr(bf, "_environment_missing_unguarded", boom)
+        assert bf._environment_missing()          # reports, does not raise
+        monkeypatch.setattr(bf, "_jar_problem", boom)
+        assert bf.unbuilt() == []                 # same, and stays silent
