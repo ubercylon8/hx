@@ -37,16 +37,56 @@ class TestNumericSegments:
 
 
 class TestPreservedSegments:
-    def test_a_preserved_segment_is_never_templated(self):
-        """`v1` is digits-adjacent and must survive; this is why the list exists."""
+    """The preserve list, and the fact that the DEFAULT list does nothing.
+
+    Deleting the preserve rule entirely reddens NOTHING in the rest of this
+    file, and the reason is not a missing test -- it is that none of the
+    defaults (`api`, `v1`, `v2`, `v3`) is matched by any shape rule anyway.
+    `_DIGITS` is `\A[0-9]+\Z`, so `v1` never matched it; there is nothing for
+    the list to protect them from.
+
+    Three claims in the first version of this class asserted otherwise -- that
+    `v1` "is digits-adjacent and must survive, this is why the list exists",
+    that `/v2` would "otherwise match a rule", and that `/v9` "separates the
+    preserve list" (it separates the digits rule). All three were false, and
+    they are the reason the no-op went unnoticed: a class full of confident
+    comments about a rule that was doing nothing.
+
+    The rule is kept because it IS reachable under legal configurations, and
+    the last test here is the one that separates it from its absence.
+    """
+
+    def test_a_preserved_segment_survives_alongside_templated_ones(self):
+        """Not because the list protects it -- nothing threatens `v1` under the
+        defaults -- but because the digits rule must not reach across it."""
         assert t("/api/v1/order/7") == "/api/v1/order/{id}"
 
-    def test_even_when_it_would_otherwise_match_a_rule(self):
+    def test_a_default_preserved_segment_alone_is_unchanged(self):
         assert t("/v2") == "/v2"
 
-    def test_a_segment_not_on_the_list_gets_no_protection(self):
-        """Separates the preserve list from a blanket exemption."""
+    def test_a_segment_not_on_the_list_is_templated_by_the_digits_rule(self):
+        """`/v9` is not on the list, but that is not what templates `7`."""
         assert t("/v9/order/7") == "/v9/order/{id}"
+
+    def test_the_list_is_load_bearing_under_a_config_that_needs_it(self):
+        """THE SEPARATING CASE, and the only one in this file.
+
+        A numeric path segment that is genuinely a route -- a year, a version,
+        an API generation -- is exactly what an operator puts on this list, and
+        without the rule it templates to `{id}` and merges with every other
+        number in that position. Measured: `/2024/report` becomes
+        `/{id}/report` when the rule is deleted.
+        """
+        kw = {"preserve": frozenset({"2024"}), "slug_threshold": 12}
+        assert surface.path_template("/2024/report", **kw) == "/2024/report"
+        assert surface.path_template("/2025/report", **kw) == "/{id}/report"
+
+    def test_and_under_a_threshold_low_enough_to_reach_the_defaults(self):
+        """The other direction: with a short slug threshold the default entries
+        DO become reachable, so the list stops being decorative."""
+        kw = {"preserve": frozenset({"v1"}), "slug_threshold": 2}
+        assert surface.path_template("/v1", **kw) == "/v1"
+        assert surface.path_template("/v9", **kw) == "/{slug}"
 
 
 class TestIdentifierShapes:
