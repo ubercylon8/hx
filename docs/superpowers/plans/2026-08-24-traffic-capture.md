@@ -910,9 +910,23 @@ class TestAutoOpen:
         assert b != a
         assert _status(conn, a) == "completed"
 
+    def test_exactly_at_the_window_the_run_is_still_live(self, conn):
+        """THE separating input, and the only one for `<=` versus `<`.
+
+        Measured before this test existed: changing `<=` to `<` reddened
+        NOTHING. Both other probes sit at +/-1 and agree under either operator,
+        so the boundary looked tested from both sides and was tested from
+        neither. The one input that tells them apart is exactly
+        IDLE_CLOSE_US."""
+        a = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                safety_profile="production", now_us=1000)
+        b = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                safety_profile="production",
+                                now_us=1000 + run_mod.IDLE_CLOSE_US)
+        assert b == a
+
     def test_one_microsecond_inside_the_window_is_still_the_same_run(self, conn):
-        """The boundary, from the side that must NOT close. A test that only
-        probes the far side passes on an off-by-one."""
+        """Inside the window, well away from the boundary."""
         a = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
                                 safety_profile="production", now_us=1000)
         b = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
@@ -953,6 +967,29 @@ class TestStale:
         run_mod.close_run(conn, run_id=rid, now_us=2000)
         assert run_mod.reap_stale(conn, now_us=1000 + HOUR) == []
         assert _status(conn, rid) == "completed"
+
+    def test_a_run_idle_but_not_yet_stale_is_left_alone(self, conn):
+        """The distinction the two windows exist for, and it had no test.
+
+        An IDLE run is one nobody used; a STALE run is one whose process is
+        gone. Reaping at the idle boundary would file every ordinary pause as a
+        crash, and `reap_stale`'s window was free to collapse to IDLE_CLOSE_US
+        with nothing red."""
+        rid = run_mod.open_run(conn, engagement_id=ENG, kind="browse",
+                               safety_profile="production", now_us=1000)
+        just_idle = 1000 + run_mod.IDLE_CLOSE_US + 1
+        assert run_mod.reap_stale(conn, now_us=just_idle) == []
+        assert _status(conn, rid) == "running"
+
+    def test_a_run_that_never_heartbeated_is_still_reaped(self, conn):
+        """`NULL < x` is NULL and WHERE treats it as false, so a bare
+        comparison never reaps a run that died before its first heartbeat --
+        the exact case the mechanism is for."""
+        rid = run_mod.open_run(conn, engagement_id=ENG, kind="browse",
+                               safety_profile="production", now_us=1000)
+        conn.execute("UPDATE run SET heartbeat_us=NULL WHERE id=?", (rid,))
+        assert run_mod.reap_stale(conn, now_us=1000 + HOUR) == [rid]
+        assert _status(conn, rid) == "error"
 
 
 class TestDrops:
@@ -1045,7 +1082,12 @@ def close_run(conn: sqlite3.Connection, *, run_id: str,
               stop_reason: str | None = None) -> None:
     at = _now_us() if now_us is None else now_us
     conn.execute(
-        "UPDATE run SET status=?, ended_us=?, stop_reason=COALESCE(?, stop_reason)"
+        # Plain assignment, not COALESCE(?, stop_reason). The preserve form was
+        # a provable no-op: this statement only touches status='running' rows,
+        # and nothing writes stop_reason before a close, so there was never an
+        # existing value to preserve. A no-op that looks like a rule is worse
+        # than no rule -- it is the shape Task 2 spent a round on.
+        "UPDATE run SET status=?, ended_us=?, stop_reason=?"
         " WHERE id=? AND status='running'",
         (status, at, stop_reason, run_id))
 
@@ -1056,8 +1098,9 @@ def current_run(conn: sqlite3.Connection, *, engagement_id: str, kind: str,
 
     Auto-open exists to avoid one specific afternoon: browsing an application
     for an hour and then discovering nothing was recorded because a command
-    was forgotten. `hx capture start` still exists for a deliberately named
-    run; this is the fallback, not the only path.
+    was forgotten. `hx capture start` will open a deliberately named run when
+    Task 8 adds it -- the CLI registers only `new` and `info` today -- and this
+    is the fallback rather than the only path.
 
     A run of a DIFFERENT kind does not satisfy this call. A crawl running
     while you browse is two runs, because the enforcement rules differ by
@@ -1092,8 +1135,16 @@ def reap_stale(conn: sqlite3.Connection, *, now_us: int | None = None,
     """
     at = _now_us() if now_us is None else now_us
     window = IDLE_CLOSE_US * 2 if stale_after_us is None else stale_after_us
+    # COALESCE, not a bare comparison: heartbeat_us is NULLable, and in SQL
+    # `NULL < x` is NULL, which WHERE treats as false. A `running` run that
+    # never heartbeated at all would therefore never be reaped -- and a run
+    # that died before its first heartbeat is precisely the case this
+    # mechanism exists for. It falls back to started_us, which is NOT NULL, so
+    # a run that started long ago and never reported is stale on its own
+    # evidence.
     rows = conn.execute(
-        "SELECT id FROM run WHERE status='running' AND heartbeat_us < ?",
+        "SELECT id FROM run WHERE status='running'"
+        " AND COALESCE(heartbeat_us, started_us) < ?",
         (at - window,)).fetchall()
     ids = [r[0] for r in rows]
     for run_id in ids:
