@@ -2803,78 +2803,480 @@ git commit -m "feat(proxy): a bounded queue that never blocks and never lies"
 
 ---
 
-### Task 7: Wire it, and grow the structural test
+### Task 7: Wire it — the second enforcement point goes live
 
-The pieces exist and nothing calls them. This task registers the handlers and makes the structural test cover the second egress point — including the gap the previous branch's whole-branch review left open.
+The pieces exist and **nothing calls them**. `ProxyGate`, `Capture`, `Observed`
+and `src/hx/capture.py` are all inert: no production caller, no registration,
+no frame. This task is the join, and every serious defect on this branch and
+the last has lived at a join.
+
+It is the largest task in the plan and it is deliberately not split, because
+the three pieces below only have one correct shape *together*: the denial
+frame's fields are decided by what `capture.py` already reads, the pending
+map's contents are decided by what the response handler cannot otherwise
+know, and both are decided by what a Burp proxy thread is allowed to do
+(nothing that blocks). Land it as the commits named in Step 8 so the review
+can read the halves apart.
+
+**Rulings already taken. Do not re-litigate; each is recorded with what it
+costs if wrong.**
+
+- **R1 — the JDK-egress count already exists.** An earlier draft of this task
+  asked for a new `n4` check counting `new Socket(`, `HttpClient.`, `URL(`,
+  `.openConnection(`, `SocketChannel.open(` with a named exception for
+  `BridgeClient`'s unix socket. `ChokepointTest.noSecondEgressFamilyExists`
+  has counted six such needles across `extension/src` since the previous
+  branch's whole-branch review, all must-be-zero, read from **raw text** so a
+  comment naming one turns it red. Its needles were chosen so the bridge's
+  legitimate `SocketChannel.open(UnixDomainSocketAddress)` collides with none
+  of them — which is why it needs no exception list. **Do not add a second
+  copy, and above all do not add the exception list**: introducing one would
+  weaken a check that currently needs none. Verify it is still there and still
+  zero; that is all.
+- **R2 — no new error class.** `ProxyGate` separates "this jar could not tell
+  who was driving" from "the operator has not configured a run" only by the
+  `extension fault: ` prefix on the detail, and that stays. A new class needs
+  a `DENIAL_KIND` entry, a `denial.kind` CHECK widening, a `SCHEMA_VERSION`
+  bump, and a row in `tests/test_records.py` — whose class-derivation scan
+  reads `Decision.deny("...")` and `error(f, "...")` and **does not read**
+  `new Verdict(false, "...")`, so a class minted in `ProxyGate` today is
+  invisible to the check that exists to catch a denial with nowhere to go.
+  Cost if wrong: `SELECT kind, COUNT(*) FROM denial` files an unattributable
+  listener under `not_configured`, greppable by the prefix that
+  `records.EXTENSION_FAULT` pins byte-identical across both languages.
+- **R3 — the proxy path does not check the halt, and that is a stated gap.**
+  §4's decision order puts `halted` second, and `ProxyGate` asks `Policy`,
+  which does not know about halts — the send path asks `HaltSwitch`
+  separately. Closing it here would need `halted` in `DENIAL_KIND` and in
+  `denial.kind`'s CHECK, or the denial routes to `row_for(...) is None` and
+  vanishes silently, which is §4's "denials are never silent" broken by the
+  fix for §4. **Plan 5 closes it before the crawler ships**; write that
+  condition into `ProxyGate`'s javadoc where Plan 5's implementer will read
+  it. Cost if wrong, stated rather than argued away: between now and Plan 5 an
+  operator's halt does not stop the operator's own browsing. That is the
+  branch where it matters least — a human who hit stop can close their
+  browser — and the crawler, where it matters, does not exist yet.
+- **R4 — there is no plan block to sync.** This plan carries no
+  `// extension/src/hx/HxExtension.java` block and no
+  `// extension/test/hx/ChokepointTest.java` block, so
+  `scripts/sync_plan_block.py` would exit with "no block ... opens with". Do
+  not run it, and do not add blocks for them: transcribing finished work
+  backwards into a plan is that script's own incidents 1-2. `Capture.java` and
+  `CaptureTest.java` **do** have blocks and they are **stale** (P10) — leave
+  them stale; they come off with the `plan-drift: pending` marker at the end
+  of the plan, not in this task.
+- **R5 — one `stop()`, on unload.** P8 asked whether Task 7 wants a second.
+  It does not: a record offered *during* `stop()` counts itself and has
+  nothing left to report through, and a second `stop()` races the first
+  identically while the JVM is being torn down. One call, in the unloading
+  handler that already closes the bridge.
+- **R6 — `via` stays `"proxy"` for everything this point sees.** `Capture`
+  hard-codes it and that is correct today: `via` is S5's *egress point*, and
+  the crawler's traffic will leave through this same point. The consequence
+  worth writing down for Plan 5 — a crawler-discovered surface lands with
+  `discovered_by = 'proxy'`, not `'crawl'`, so S5's crawl-coverage figure
+  reads zero until Plan 5 decides otherwise — is **P12**, not this task's.
 
 **Files:**
-- Modify: `extension/src/hx/HxExtension.java`, `extension/test/hx/ChokepointTest.java`
+- Create: `extension/src/hx/proxy/Captured.java`, `extension/src/hx/proxy/Denied.java`,
+  `extension/src/hx/proxy/Pending.java`, `extension/test/hx/proxy/PendingTest.java`
+- Modify: `extension/src/hx/HxExtension.java`,
+  `extension/src/hx/proxy/Observed.java`, `extension/src/hx/proxy/Capture.java`,
+  `extension/src/hx/proxy/ProxyGate.java` (javadoc only, per R3),
+  `extension/src/hx/bridge/BridgeClient.java`,
+  `extension/test/hx/proxy/CaptureTest.java`, `extension/test/hx/ChokepointTest.java`,
+  `extension/test.sh`
 
 **Interfaces:**
-- Consumes: everything from Tasks 5 and 6, plus `hx.send.Redactor`
-- Produces: nothing new; this is the wiring task
+- Consumes: `Source.forListenerPort(int, int)`, `Source.NO_PORT`;
+  `ProxyGate(Policy)` and `ProxyGate.decide(HxRequest, BridgeClient.Authorisation, Source)`
+  returning `Verdict(boolean allow, String errorClass, String detail)`;
+  `Capture(int, BridgeClient.ExchangeSink)`, `Capture.DEFAULT_CAPACITY`,
+  `Capture.sourceName(Source)`; `BridgeClient.authorisation()`,
+  `BridgeClient.exchangeSink()`, `BridgeClient.EXTENSION_FAULT`;
+  `Redactor.redactRequest(byte[], Redactor.Injected)`,
+  `Redactor.redactResponse(byte[])`, `new Redactor.Injected(byte[])`;
+  `HxRequest(method, url, host, path, query, headers, body)`.
+- Produces: nothing any later task consumes as a type. Task 8's CLI reads the
+  **rows** this produces, never these classes.
 
-- [ ] **Step 1: Register the handlers**
+**Measured Burp facts this task is built on. None is guessable from the code.**
 
-In `HxExtension.initialize`, after the send path is wired: construct `ProxyGate` and `Capture`, register a `ProxyRequestHandler` and a `ProxyResponseHandler`, and start the capture drain.
+- `InterceptedRequest` and `InterceptedResponse` both extend
+  `InterceptedHttpMessage`, which declares `int messageId()` and
+  `String listenerInterface()` — **compile-time, both of them.**
+- `listenerInterface()` returns `"127.0.0.1:<port>"` and names a different
+  port per listener, over plain HTTP and through a CONNECT tunnel. There is
+  **no `listenerPort()`** on the intercepted message. (`ProxyHttpRequestResponse`,
+  the *history* item, does have `listenerPort()` — it is a different type and
+  is not reachable from a handler.)
+- `destinationIpAddress()` compiles and **throws
+  `UnsupportedOperationException: Not yet implemented`** on every call. Never
+  call it.
+- `messageId()` correlates request to response, including out of order.
+- `drop()` sends **zero bytes** to the target and returns **`200 OK`** to the
+  client with ~1529 bytes of Burp's own HTML. **A drop is indistinguishable
+  from a delivery by status code.** No code and no test here may read a
+  client-side response as evidence of a block.
+- The drop above was measured from `handleRequestReceived`. `drop()` from
+  `handleRequestToBeSent` is **not measured** — Step 5 uses it anyway, and
+  says why, and Task 9 measures it.
+- `InterceptedResponse.initiatingRequest()` returns the request that produced
+  this response, so the request bytes need no map to reach the response
+  handler.
+- Neither handler carries timing. `InterceptedResponse` has no `timingData()`;
+  only the history type does. `ms` must be measured by this extension or not
+  reported.
 
-The request handler: read `authorisation()` **once**, attribute the `Source` from the listener (per Task 1's measured answer), ask `ProxyGate`, and either `drop()` — emitting a denial through the sink — or `continueWith`. The response handler pairs by `messageId()`, redacts both halves, and offers an `Observed`.
+- [ ] **Step 1: One queue, two kinds of record**
 
-Two properties the code must have, and both are sabotaged in Step 3:
+`Capture`'s queue holds `Observed`. A denial is not an observed exchange — the
+request never left, there are no bodies, and `capture.py`'s denial arm reads
+`error_class`, `detail`, `method`, `url`, `via` and `source` and no more. It
+still needs the *same* queue: it is offered from a Burp proxy thread that may
+not block, and a loss of it is a loss of coverage counted in the same number.
 
-- **The gate is consulted before anything is queued.** Enforcement does not wait on capture.
-- **`Redactor` runs on both halves before `Capture.offer`.** An `Observed` holding raw bytes would put a live credential in the queue, and §7 says the store is content-addressed so anything that reaches hashing is unrecoverable.
-
-The crawler listener port comes from `-Dhx.crawler_port`, defaulting to `0` — which `Source.forListenerPort` reads as "no crawler configured", so a deployment that never sets it attributes every request whose own listener port parses to `OPERATOR` rather than accidentally applying the agent's rules to a human.
-
-**The request's own port is the other half, and fix round 1 changed it.** Parse it off `listenerInterface()` after the last `:`; when that parse fails — no colon, a non-numeric tail, a null interface — hand `Source.NO_PORT` over rather than inventing a number. `forListenerPort` answers `UNATTRIBUTED` for it and `ProxyGate` refuses the request (`not_configured`, detail prefixed `extension fault: `). Do not catch that refusal and retry as `OPERATOR`: "we could not work out who is driving" is a code failure, and the operator branch is the one that drops the method allowlist, the dangerous-path denylist, the rate limit and the budget. A sabotage row for it: make the parse return `0` unconditionally and the whole proxy path must go red, not quiet.
-
-- [ ] **Step 2: Grow the structural test**
-
-`ChokepointTest` asserts one Montoya HTTP call site. Add four checks, all counted over `code()` — the comment-and-literal-stripped text, so neither a comment nor a string can supply a wire:
+Introduce a sealed carrier and widen the queue to it:
 
 ```java
-    // The second egress point exists, exactly once.
+// extension/src/hx/proxy/Captured.java
+package hx.proxy;
+
+/** One record on its way to the harness: an exchange that happened, or a
+ *  denial that stopped one happening. Sealed, so `Capture.deliver`'s switch
+ *  is exhaustive and a third kind is a COMPILE error rather than a record
+ *  that silently reaches no arm. */
+public sealed interface Captured permits Observed, Denied {
+    Source source();
+}
+```
+
+```java
+// extension/src/hx/proxy/Denied.java
+package hx.proxy;
+
+/** One request this extension refused at S4's second enforcement point.
+ *
+ *  NO BODIES, deliberately. `bridge/server.py::_capture` reads `denial` and
+ *  `dropped` as frames that "describe something that produced no traffic, so
+ *  they arrive with an empty body" -- one body slot, not two -- and
+ *  `capture.py`'s denial arm writes a `denial` row with no blobs. Carrying
+ *  the refused request's bytes here would put a body on the wire nothing
+ *  reads and S7 never cleared for the store. */
+public record Denied(String method, String url, String errorClass,
+                     String detail, Source source) implements Captured { }
+```
+
+`Observed` gains `implements Captured` and nothing else — its `source()`
+accessor already satisfies the interface.
+
+In `Capture`:
+- `ArrayBlockingQueue<Observed>` becomes `ArrayBlockingQueue<Captured>`;
+  `offer(Observed)` becomes `offer(Captured)`; `discardQueued`'s list and the
+  `deliver` parameter follow.
+- `deliver` switches on the kind. The exchange arm is unchanged. The denial
+  arm builds `{t: "denial", via: "proxy", source, method, url, error_class,
+  detail}` and sends it through **one body**, not two.
+- add `public void countLost(Source s)`, which increments `dropped` for that
+  source and does nothing else. Step 3 is its only caller. It is a **sixth**
+  exit for a record that never entered the queue — update the class javadoc's
+  enumeration and, more importantly, the paragraph that explains why counting
+  `incrementAndGet` sites is **not** a falsifier. That paragraph exists
+  because a previous count of the paths was wrong; adding a path without
+  amending it repeats the error it was written about.
+
+`BridgeClient.ExchangeSink` gains a third method, alongside `exchange` and
+`dropped` and shaped exactly like `dropped`:
+
+```java
+        /** A request S4's second enforcement point refused. One body slot,
+         *  empty: `server.py::_capture` hands `denial` and `dropped` to the
+         *  sink as two empty halves. True once the frame is on the wire;
+         *  false means the record is lost and the caller must count it. */
+        boolean denial(Map<String, Object> header);
+```
+
+...implemented in `exchangeSink()` the way `dropped` is — `f.put("v",
+PROTOCOL_VERSION)`, `f.putAll(header)`, `send(f, new byte[0])`, catch
+`Throwable`, log, return false. **Not** through `exchange(...)` with two empty
+byte arrays: that method's name says what its frame is, and a denial routed
+through it is a naming lie that the next reader inherits.
+
+`CaptureTest` gains, at minimum: a denial offered and delivered as a
+`t: "denial"` frame with the six keys above and no seventh; a denial whose
+sink answers false counted as a drop for **its own source**; and `countLost`
+counted against the right source. Its existing fake sink needs the new method.
+
+- [ ] **Step 2: Update `docs/bridge-protocol.md`**
+
+The document still says `exchange {v,t,...} unsolicited; no id. Defined in a
+later plan.` and names neither `dropped` nor `denial`. Three frames now exist
+on the Java side and are read on the Python side; a protocol document that
+does not carry them is a document a second implementation cannot be written
+from. Add the three rows with their real fields, and say which carry one body
+and which carry two. This is documentation of what Tasks 4 and 6 already
+built, not new design.
+
+- [ ] **Step 3: `Pending` — the two things a response handler cannot otherwise know**
+
+The response handler needs the exchange's **duration** and its **source**.
+Burp gives it neither: `InterceptedResponse` carries no timing at all, and
+while it does expose `listenerInterface()`, that accessor was measured on
+*requests* only — using it on a response would be an unmeasured assumption
+sitting under the field that decides which run a record is filed against.
+
+So the request handler records both, keyed by `messageId()`, and the response
+handler takes them back:
+
+`extension/src/hx/proxy/Pending.java`, whose javadoc must carry the
+reasoning below — this is a SKETCH of the shape, not the file:
+
+    // extension/src/hx/proxy/Pending.java
+    package hx.proxy;
+
+    /**
+     * The start time and the attributed source of a request that has not been
+     * answered yet, keyed by Burp's own message id.
+     *
+     * BOUNDED, AND EVICTION IS A LOSS SOMEONE IS TOLD ABOUT. The alternative --
+     * an unbounded map in a Burp that runs for days -- leaks an entry for every
+     * request that never gets a response, which includes every request the gate
+     * dropped and every connection that died. `Capture`'s bound exists for the
+     * same reason and this one follows its shape: a ceiling on MEMORY, oldest
+     * evicted first, and the record's absence reported rather than papered over.
+     * A `take` that misses is NOT an exchange recorded with a guessed duration;
+     * it is a record hx does not have, and S5 makes that a number.
+     */
+    public final class Pending { ... }
+
+
+Shape:
+- `Pending(int capacity)`; the extension passes `Capture.DEFAULT_CAPACITY`, so
+  one number bounds both and a miss cannot happen while the queue is coping.
+- `void put(int messageId, long startNanos, Source source)`
+- `Entry take(int messageId)` — removes and returns, or `null`.
+- Backed by a `LinkedHashMap` in a `synchronized` block, evicting eldest past
+  capacity. **Not** `ConcurrentHashMap`: eviction needs insertion order, and
+  the critical section is a map write on a proxy thread — nanoseconds, next
+  to a network round trip.
+- `long evicted()` — a counter, for the test and for anyone reading a run
+  whose coverage is short.
+
+`PendingTest` must pin, at least: put/take round-trips the exact values;
+a second `take` of the same id answers null (an entry is consumed once, so a
+retried response cannot double-count); `capacity + 1` puts evict the **oldest**
+and only the oldest; `evicted()` counts exactly the evictions; and a `take`
+of an id never put answers null rather than throwing. Add
+`hx.proxy.PendingTest` to `extension/test.sh`'s `CLASSES` list — **the run
+goes from eleven summary lines to twelve, and Rule 1 judges by that count and
+the exit code.**
+
+- [ ] **Step 4: Register the handlers**
+
+In `HxExtension.initialize`, after the send path is wired and **before** the
+dial — the same rule the kill paths follow, and for the same reason: a window
+in which the proxy is live and the gate is not is a window in which §4 is
+false.
+
+```java
+        int crawlerPort = Integer.getInteger("hx.crawler_port", 0);
+        ProxyGate gate = new ProxyGate(policy);   // THE SAME Policy. See below.
+        Capture capture = new Capture(Capture.DEFAULT_CAPACITY, c.exchangeSink());
+        Pending pending = new Pending(Capture.DEFAULT_CAPACITY);
+```
+
+`policy` is the field `HxExtension` already names for exactly this — one
+`Policy` per run, so the rate limit and the per-run budget are one counter and
+not two. `ChokepointTest.oneRunHasOnePolicy` reddens a second `new Policy(`.
+**Do not construct one here.**
+
+`-Dhx.crawler_port` defaults to `0`, which `Source.forListenerPort` reads as
+"no crawler configured": a deployment that never sets it attributes every
+request whose own listener port parses to `OPERATOR`, rather than accidentally
+applying the agent's rules to a human.
+
+The request handler, in order:
+
+1. **Attribute the source.** Parse the port off `listenerInterface()` after
+   the **last** `:`. When that parse fails — a null interface, no colon, a
+   non-numeric tail, a number outside `1..65535` — hand `Source.NO_PORT` over
+   rather than inventing one. `forListenerPort` answers `UNATTRIBUTED`, and
+   `ProxyGate` **refuses** it with `not_configured` and a detail carrying
+   `BridgeClient.EXTENSION_FAULT`. **Do not catch that refusal and retry as
+   `OPERATOR`.** "We could not work out who is driving" is a code failure, and
+   the operator branch is the one that drops the method allowlist, the
+   dangerous-path denylist, the rate limit and the budget.
+2. **Read `authorisation()` ONCE** into a local and pass it in. `configEpoch()`
+   and `scopeConfig()` are two reads of one record and can straddle a commit;
+   a decision made from two halves of two authorisations is a decision about a
+   request nobody authorised. `ChokepointTest.theAuthorisationSnapshotIsReadInExactlyOnePlace`
+   already counts this — check what it counts before you add a second read.
+3. **Ask the gate**, inside a `try`. A `RuntimeException` out of `decide` or
+   out of building the `HxRequest` is **DENY**, with `not_configured` and an
+   `EXTENSION_FAULT` detail. A gate that threw has decided nothing, and the
+   only safe reading of "nothing" is no.
+4. **On refusal:** `capture.offer(new Denied(...))` carrying the verdict's
+   `errorClass` and `detail`, then `return ProxyRequestReceivedAction.drop()`.
+5. **On pass:** `pending.put(r.messageId(), System.nanoTime(), source)`, then
+   `return ProxyRequestReceivedAction.continueWith(r)`.
+
+`System.nanoTime()`, not the wall clock: this is a **duration**. `Instant.now()`
+would measure an NTP step as latency. The entry point's `montoyaHttp` adapter
+already makes this distinction and says why — match it.
+
+The response handler (`handleResponseReceived`):
+
+1. `Pending.Entry e = pending.take(r.messageId())`.
+2. **On a miss:** `capture.countLost(<source from nothing>)` — and here is the
+   one place the source is genuinely unknown, so count it against
+   `Source.UNATTRIBUTED` and let it be a drop with no run attached rather than
+   guessing a run. Then `continueWith`. **Do not record an exchange with a
+   fabricated duration**; this project has refused fabricated evidence twice
+   already (`transport_error`'s absence, and the 599 sentinel's separate
+   outcome) and this is the same rule.
+3. **On a hit:** redact **both halves** before anything else —
+   `redactor.redactResponse(r.toByteArray().getBytes())` and
+   `redactor.redactRequest(reqBytes, new Injected(reqBytes))` where `reqBytes`
+   is `r.initiatingRequest().toByteArray().getBytes()`. The proxy path injects
+   no identity, so the `Injected` is empty; it is still required, and it must
+   be constructed **over the same array** the ranges would have been measured
+   from — `Injected` compares by identity and refuses a different array.
+4. `capture.offer(new Observed(method, url, r.statusCode(), ms, redactedReq,
+   redactedResp, e.source()))`, then `continueWith`.
+
+`ms` is `(System.nanoTime() - e.startNanos()) / 1_000_000L`.
+
+**Redaction runs before `offer`, not after, and not in the drain.** S7 makes
+the blob store content-addressed: a credential that reaches the hashing step
+on the Python side is already unrecoverable. `Observed`'s own javadoc says its
+byte arrays are post-redaction — an `Observed` holding raw bytes is a live
+credential sitting in a queue, and it is the exact defect Step 7 row D exists
+to catch.
+
+Finally, `capture.start()` alongside `haltSwitch.start()`, and
+`capture.stop()` in the unloading handler that already closes the bridge —
+read the field into a local first, the way `client` and `halt` are, because
+that handler runs on a different thread than `initialize`.
+
+- [ ] **Step 5: Scope again, at the last point before the bytes leave**
+
+`ProxyRequestHandler` has **two** methods. `handleRequestReceived` fires when
+the request arrives from the browser; `handleRequestToBeSent` fires after
+Burp's interception step, immediately before the request goes to the target.
+Between them sits the Intercept tab, where an operator can rewrite the
+request — including its host.
+
+A gate that runs only at the first point therefore lets an **edited** request
+leave without any decision at all. §4 is unambiguous about what that costs:
+*"Scope is absolute at both points, for all traffic. It is the client's
+boundary and the one thing no caller may spend."* A request that changed after
+it was decided about is a request nobody decided about, and this is the one
+hole in the whole system where bytes could cross the engagement boundary.
+
+So `handleRequestToBeSent` asks **scope and nothing else**, for **every**
+source:
+
+- build the `HxRequest` from `r` as it now stands,
+- read `authorisation()` once,
+- `policy.decideScopeOnly(req, auth)`,
+- on refusal, `capture.offer(new Denied(...))`, discard the pending entry for
+  `r.messageId()` (it will never be answered), and
+  `return ProxyRequestToBeSentAction.drop()`,
+- otherwise `continueWith(r)`.
+
+**`decideScopeOnly`, never `decide`.** The full question reaches the Gate,
+which spends a rate token and a budget slot — asking it twice would charge a
+crawler twice for one request, and `ChokepointTest.bothHalvesOfTheDecisionAreAskedAndOnlyOnce`
+would not see it, because that check counts `Policy`'s internal halves on the
+send path. `decideScopeOnly` spends nothing, so this re-check is free.
+
+Two honest limits, both stated rather than discovered:
+
+- **`drop()` from this callback is unmeasured.** Task 1 measured the drop from
+  `handleRequestReceived` only. Task 9 measures this one against real Burp.
+  Until then the claim in this step is "Montoya documents both actions
+  identically", not "we saw zero bytes".
+- **This is a second scope decision, not a second enforcement point.** §4
+  counts egress paths, not callbacks; both of these belong to the one proxy
+  request handler, and `ChokepointTest`'s egress counts are unchanged by it.
+
+`handleResponseToBeSent` stays a bare `continueWith` — the response has
+already been captured at `handleResponseReceived`, and capturing it twice
+would double every row.
+
+- [ ] **Step 6: Grow the structural test**
+
+Four new checks in `ChokepointTest`, all counted over `code()` — the
+comment-and-literal-stripped text — because each must be **exactly one** and a
+count that must be one can be supplied by a comment anywhere in the tree. (The
+class's own javadoc explains the per-needle rule; read it before choosing
+`text` over `code`.)
+
+```java
+    // The second egress point exists, exactly once each.
     check("registerRequestHandler appears exactly once (" + n1 + ")", n1 == 1);
     check("registerResponseHandler appears exactly once (" + n2 + ")", n2 == 1);
     // ...and the gate is inside it. A handler that forwards without asking is
     // a third egress path wearing the second one's name.
     check("the proxy handler asks the gate (" + n3 + ")", n3 == 1);
-    // The family, not the spelling. The previous branch's whole-branch review
-    // found ChokepointTest proving "one Montoya HTTP call" rather than "one
-    // egress path": nothing counted java.net.Socket, HttpClient or
-    // URL.openConnection, and BridgeClient already imports java.net.*, so a
-    // future contributor needs no new import line to open one.
-    check("no other socket-opening API appears in extension/src (" + n4 + ")",
-          n4 == 0);
+    // ...and scope is asked again at the last point before the bytes leave,
+    // because the Intercept tab sits between the two callbacks.
+    check("scope is re-decided before the request is sent (" + n4 + ")", n4 == 1);
 ```
 
-`n4` counts `new Socket(`, `HttpClient.`, `URL(`, `.openConnection(`, `SocketChannel.open(` across `extension/src`, **excluding** `BridgeClient.java`'s one legitimate `SocketChannel.open(UnixDomainSocketAddress` — named as a single explicit exception with its reason, the way `test_plan_matches_repo.py`'s `NOT_A_FILE` set is, so the exemption cannot quietly grow.
+Then the two this task exists to protect, and **neither has a check yet —
+write them**:
 
-- [ ] **Step 3: Sabotage — five rows, judged by the eleven summary lines**
+- **The gate is consulted before anything is queued.** Enforcement never waits
+  on capture. Assert by position, the way `theAdapterBuildsItsRequestInsideTheTry`
+  does: in `HxExtension`'s `code()`, the index of the `gate.decide(` call is
+  less than the index of the first `capture.offer(`.
+- **`Redactor` runs on both halves before `capture.offer(`.** Same technique:
+  the indices of `redactRequest(` and `redactResponse(` are both less than the
+  index of the `capture.offer(new Observed`.
+
+Positional checks have a known weakness — they pass on any file where the
+needles happen to fall in that order — so each must be shown to **separate**:
+Step 7 rows C and D are exactly those two mutations, and a row that reddens
+nothing is the finding, not a pass.
+
+Per **R1**, verify `noSecondEgressFamilyExists` still runs and still counts
+zero. Do not duplicate it and do not give it an exception list.
+
+- [ ] **Step 7: Sabotage — seven rows, judged by the twelve summary lines and the exit code**
 
 | # | Edit | Expect red |
 |---|---|---|
 | A | comment out `registerRequestHandler` | the registration count |
-| B | handler returns `continueWith` without asking the gate | the gate-is-inside-it check |
-| C | `Capture.offer` before the gate decides | a new check you must add; if nothing reddens, that is the finding |
-| D | offer raw bytes instead of redacted | a new check; same rule |
-| E | add `new java.net.Socket()` to any file in `extension/src` | the family count |
+| B | request handler returns `continueWith` without asking the gate | the gate-is-inside-it check |
+| C | move `capture.offer` above the gate decision | the new ordering check |
+| D | offer raw bytes instead of redacted | the new redaction-ordering check |
+| E | `handleRequestToBeSent` returns `continueWith` unconditionally | the scope-re-decided check |
+| F | `Pending.take` returns the entry without removing it | `PendingTest`'s consumed-once check |
+| G | `add new java.net.Socket()` to any file in `extension/src` | `noSecondEgressFamilyExists` |
 
-Row C and row D are the two this task exists to protect and neither has a check yet. Write them.
+Row G is a **verification of R1**, not new work: it must redden the check that
+already exists. If it does not, that is a finding about the existing check and
+it is worth more than anything else in this table.
 
-- [ ] **Step 4: Commit**
+Rows C and D are the two properties this task exists to protect. Report each
+row's summary-line count **and** exit code, per Rule 1 — a hang prints no
+summary line at all.
+
+- [ ] **Step 8: Commit, in two**
 
 ```bash
 ./extension/test.sh && ./extension/build.sh
-./scripts/sync_plan_block.py docs/superpowers/plans/2026-08-24-traffic-capture.md \
-    extension/src/hx/HxExtension.java extension/test/hx/ChokepointTest.java
-git add extension/ docs/
+.venv/bin/pytest -q
+git add extension/src/hx/proxy/ extension/src/hx/bridge/BridgeClient.java \
+        extension/test/hx/proxy/ extension/test.sh docs/bridge-protocol.md
+git commit -m "feat(proxy): a denial is a record, and a pending request has a clock"
+
+git add extension/src/hx/HxExtension.java extension/test/hx/ChokepointTest.java
 git commit -m "feat(proxy): the second egress point is wired and counted"
 ```
 
----
-
+Do **not** run `scripts/sync_plan_block.py` — see R4.
 ### Task 8: `hx capture` and a grown `hx info`
 
 Two verbs and a report. The CLI is where a human finds out what happened, and §5's rule that a run with drops has coverage numbers that are a floor is only true if something says so out loud.
