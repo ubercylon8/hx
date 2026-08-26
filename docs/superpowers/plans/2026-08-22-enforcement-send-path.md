@@ -4264,7 +4264,7 @@ import java.util.Set;
  *   /x/..%ef%bc%8flogout  is /x/../logout wherever a wide string reaches an
  *                      ANSI API, because U+FF0F best-fits to `/`
  *   /foo%2fbar/../admin/users  is /admin/users in python's urljoin, node's
- *                      new URL() and java's URI.normalize alike: none of them
+ *                      JavaScript's new URL and java's URI.normalize alike: none of them
  *                      decodes %2f before resolving the `..`, so the `..`
  *                      pops one whole segment called `foo%2fbar`
  *   /a%2fb/%2e%2e/admin/users  is /admin/users on anything that decodes AFTER
@@ -4276,7 +4276,7 @@ import java.util.Set;
  * involved. For `/a//../admin/users`:
  *
  *   python  urljoin()             -> /a/admin/users
- *   node    new URL().pathname    -> /a/admin/users
+ *   node    new URL .pathname     -> /a/admin/users
  *   java    URI.normalize()       -> /admin/users
  *
  * An earlier round of this class picked ONE reading (merge empty segments,
@@ -5484,7 +5484,7 @@ public final class Policy {
      *
      *   /foo%2fbar/../admin/users
      *     python urljoin()       -> /admin/users
-     *     node   new URL()       -> /admin/users
+     *     node   new URL        -> /admin/users
      *     java   URI.normalize() -> /admin/users
      *     readings()             -> { raw, /foo/admin/users }
      *
@@ -5498,7 +5498,7 @@ public final class Policy {
      *
      *   - the member ITSELF, undecoded. The server routed on the bytes it was
      *     sent and unescaped afterwards, if at all. This is the RFC reading,
-     *     and the one urljoin, new URL() and URI.normalize() give.
+     *     and the one urljoin, JavaScript's new URL and URI.normalize give.
      *   - the member DECODED to a fixed point, with the decoded characters
      *     read as syntax. The server unescaped before it routed, so a %2f is a
      *     separator and a %2e%2e is a dot segment. This was the only base.
@@ -9972,6 +9972,33 @@ public class RedactorTest {
         t("aHeadWhoseFirstLineIsAFieldIsStillRedacted", RedactorTest::aHeadWhoseFirstLineIsAFieldIsStillRedacted);
         t("theResponseBodyIsNeverRewritten", RedactorTest::theResponseBodyIsNeverRewritten);
 
+        t("anObservedCookieIsReplacedAndItsNameKept",
+          RedactorTest::anObservedCookieIsReplacedAndItsNameKept);
+        t("anObservedAuthorizationIsReplaced",
+          RedactorTest::anObservedAuthorizationIsReplaced);
+        t("anObservedProxyAuthorizationIsReplaced",
+          RedactorTest::anObservedProxyAuthorizationIsReplaced);
+        t("twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob);
+        t("anObservedCredentialNameIsMatchedWhateverItsCase",
+          RedactorTest::anObservedCredentialNameIsMatchedWhateverItsCase);
+        t("aCookieInTheREQUESTBodyIsNeverRewritten",
+          RedactorTest::aCookieInTheRequestBodyIsNeverRewritten);
+        t("aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases",
+          RedactorTest::aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases);
+        t("aFoldedContinuationOfAnObservedCredentialIsRedacted",
+          RedactorTest::aFoldedContinuationOfAnObservedCredentialIsRedacted);
+        t("whitespaceBeforeTheColonDoesNotHideAnObservedCredential",
+          RedactorTest::whitespaceBeforeTheColonDoesNotHideAnObservedCredential);
+        t("aBlankLineBeforeTheRequestLineDoesNotEndTheHead",
+          RedactorTest::aBlankLineBeforeTheRequestLineDoesNotEndTheHead);
+        t("anAbsoluteFormRequestLineIsNotMatchedAsAField",
+          RedactorTest::anAbsoluteFormRequestLineIsNotMatchedAsAField);
+        t("redactObservedRequestRefusesNullBytes",
+          RedactorTest::redactObservedRequestRefusesNullBytes);
+        t("theEmptyInjectedPathIsWhyJobFourExists",
+          RedactorTest::theEmptyInjectedPathIsWhyJobFourExists);
+
         t("redactionHappensBeforeHashing", RedactorTest::redactionHappensBeforeHashing);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
@@ -10725,6 +10752,250 @@ public class RedactorTest {
               text(hashedFirst.get(sha256(raw))).contains(TOKEN));
     }
 
+    // ---- job 4: a request hx OBSERVED, not one it composed -----------------
+    //
+    // Every method below drives redactObservedRequest, which is the ONLY
+    // mechanism between an operator's live session cookie and a
+    // content-addressed blob store. Deleting the header-name match from that
+    // method has to redden here or the finding it was written for is back.
+
+    static final String COOKIE_SECRET = "3f9a1c77e5b24d0e8a1b6c4d2f7e9013";
+    static final String BEARER_SECRET = "eyJhbGciOiJIUzI1NiJ9.b3BlcmF0b3I.7d1a";
+
+    /** What the operator's browser sends through the proxy: a credential this
+     *  extension did not compose, cannot refuse, and must not store. */
+    static byte[] browsedRequest(String cookieValue) {
+        return bytes("GET /account/settings HTTP/1.1\r\n"
+                   + "Host: app.example.test\r\n"
+                   + "User-Agent: Mozilla/5.0\r\n"
+                   + "Cookie: JSESSIONID=" + cookieValue + "; theme=dark\r\n"
+                   + "Accept: text/html\r\n"
+                   + "\r\n");
+    }
+
+    static void anObservedCookieIsReplacedAndItsNameKept() {
+        Redactor r = new Redactor();
+        byte[] raw = browsedRequest(COOKIE_SECRET);
+        byte[] wire = raw.clone();
+        String out = text(r.redactObservedRequest(raw));
+        // THE CHECK WHOSE ABSENCE WAS THE WHOLE FINDING. With redactRequest
+        // and an empty Injected -- the shipped state for one commit -- this
+        // line is the operator's live session cookie, verbatim, on its way
+        // into a content-addressed store.
+        check("the live session cookie is GONE (" + out.replace("\r\n", " | ") + ")",
+              !out.contains(COOKIE_SECRET));
+        check("the header name and colon survive, so the evidence still shows "
+              + "a credential was sent",
+              out.contains("Cookie: {{observed:cookie}}\r\n"));
+        // THE WHOLE VALUE, not a parsed part of it. `theme=dark` is inside the
+        // Cookie header and goes with it: a per-pair rule here would have to
+        // decide which cookie names are secrets, and the browser's own
+        // `JSESSIONID=` tells a check nothing the response's Set-Cookie did
+        // not already say.
+        check("and the whole value went, not just the pair that looked secret",
+              !out.contains("theme=dark"));
+        check("every other header is verbatim",
+              out.contains("GET /account/settings HTTP/1.1\r\n")
+              && out.contains("Host: app.example.test\r\n")
+              && out.contains("User-Agent: Mozilla/5.0\r\n")
+              && out.contains("Accept: text/html\r\n"));
+        check("and the argument is not modified", Arrays.equals(raw, wire));
+    }
+
+    static void anObservedAuthorizationIsReplaced() {
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /api/me HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Authorization: Bearer " + BEARER_SECRET + "\r\n"
+                         + "\r\n");
+        String out = text(r.redactObservedRequest(raw));
+        check("the bearer token is gone", !out.contains(BEARER_SECRET));
+        check("...and so is the scheme that carried it, because the whole "
+              + "value is the secret",
+              out.contains("Authorization: {{observed:authorization}}\r\n"));
+    }
+
+    static void anObservedProxyAuthorizationIsReplaced() {
+        // The third of §6's three names, and the one a reader is likeliest to
+        // assume is covered because the other two are.
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /x HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Proxy-Authorization: Basic b3A6cDRzc3cwcmQ=\r\n"
+                         + "\r\n");
+        String out = text(r.redactObservedRequest(raw));
+        check("the proxy credential is gone", !out.contains("b3A6cDRzc3cwcmQ="));
+        check("and its name is kept",
+              out.contains("Proxy-Authorization: {{observed:proxy-authorization}}\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob() throws Exception {
+        // THE DETERMINISM CONSTRAINT, and it is not a style point. The plan's
+        // Global Constraints require redaction to be deterministic -- "two
+        // requests differing only in credential bytes must produce the same
+        // blob" -- and the store is CONTENT-ADDRESSED, so a hash, a length or
+        // any other function of the secret would give one page browsed under
+        // two sessions two digests and two stored copies. Before job 4 existed
+        // the proxy path broke this as well as leaking, because the raw
+        // credential bytes WERE the difference between the two blobs.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(browsedRequest(COOKIE_SECRET));
+        byte[] b = r.redactObservedRequest(
+                browsedRequest("00000000000000000000000000000000"));
+        check("two sessions, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        // And the control: the raw bytes really did differ, so the equality
+        // above is the redaction's doing and not the fixture's.
+        check("the inputs genuinely differed",
+              !Arrays.equals(browsedRequest(COOKIE_SECRET),
+                             browsedRequest("00000000000000000000000000000000")));
+    }
+
+    static void anObservedCredentialNameIsMatchedWhateverItsCase() {
+        // A browser may send any case it likes; HTTP field names are
+        // case-insensitive. A match that folded only one way would store the
+        // credential of every client that spells it differently.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "COOKIE: sid=" + COOKIE_SECRET + "\r\n"
+                    + "authorization: Bearer " + BEARER_SECRET + "\r\n"
+                    + "\r\n")));
+        check("an upper-case Cookie is matched", !out.contains(COOKIE_SECRET));
+        check("a lower-case Authorization is matched", !out.contains(BEARER_SECRET));
+        check("and the names are echoed as the client wrote them",
+              out.contains("COOKIE: {{observed:cookie}}\r\n")
+              && out.contains("authorization: {{observed:authorization}}\r\n"));
+    }
+
+    static void aCookieInTheRequestBodyIsNeverRewritten() {
+        // Only the head is scanned, for job 3's reason exactly: a body may
+        // legitimately carry the text. A form that posts a captured request,
+        // a bug report, an API doc -- rewriting those corrupts the evidence a
+        // check reads, and the body is not where a live credential is sent.
+        Redactor r = new Redactor();
+        String body = "report=Cookie: JSESSIONID=abc123; and it did not work";
+        String out = text(r.redactObservedRequest(
+                bytes("POST /support HTTP/1.1\r\n"
+                    + "Host: app.example.test\r\n"
+                    + "Content-Type: application/x-www-form-urlencoded\r\n"
+                    + "\r\n"
+                    + body)));
+        check("the body is byte-identical (" + out.substring(out.indexOf("\r\n\r\n") + 4) + ")",
+              out.endsWith(body));
+        check("and no placeholder was written into it",
+              !out.substring(out.indexOf("\r\n\r\n")).contains("{{observed:"));
+    }
+
+    static void aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases() {
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /public/index.html HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Accept: text/html\r\n"
+                         + "\r\n");
+        byte[] out = r.redactObservedRequest(raw);
+        check("a request with nothing to redact comes back byte-identical",
+              Arrays.equals(raw, out));
+        // The same rule redactRequest's `raw.clone()` comment insists on: the
+        // returned array must never alias the array that goes on the wire, or
+        // a later in-place fix-up to one silently edits the other.
+        check("...and is a DIFFERENT array, not the one that goes on the wire",
+              raw != out);
+    }
+
+    static void aFoldedContinuationOfAnObservedCredentialIsRedacted() {
+        // obs-fold. RFC 9110 says a recipient must reject it and no real
+        // client emits it -- but if one does, the folded remainder of a
+        // credential is credential bytes. Same trade as job 3's fold branch:
+        // lose the continuation rather than store it.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\tcontinued=" + BEARER_SECRET + "\r\n"
+                    + "Accept: text/html\r\n"
+                    + "\r\n")));
+        check("the first line's value is gone", !out.contains(COOKIE_SECRET));
+        check("and so is the folded continuation", !out.contains(BEARER_SECRET));
+        check("the fold's leading whitespace is kept, so the message still "
+              + "parses the way it arrived",
+              out.contains("\r\n\t{{observed:cookie}}\r\n"));
+        check("and the header after the fold is untouched",
+              out.contains("Accept: text/html\r\n"));
+    }
+
+    static void whitespaceBeforeTheColonDoesNotHideAnObservedCredential() {
+        // RFC 9110 requires a recipient to reject `Cookie : v`, but name
+        // matching is all job 4 has, and a name we fail to match passes a live
+        // credential through verbatim. The same trim job 3 does.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "Cookie : JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\r\n")));
+        check("the credential is still gone (" + out.replace("\r\n", " | ") + ")",
+              !out.contains(COOKIE_SECRET));
+    }
+
+    static void aBlankLineBeforeTheRequestLineDoesNotEndTheHead() {
+        // RFC 9112 2.2: a recipient MAY ignore an empty line before the
+        // request line, so one can reach us. Stopping there would end the head
+        // before a single field was read and copy the WHOLE request through as
+        // "body" -- every credential raw. Same guard, same reason, as job 3's.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("\r\n"
+                    + "GET /x HTTP/1.1\r\n"
+                    + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\r\n")));
+        check("the leading blank line did not end the head",
+              !out.contains(COOKIE_SECRET));
+        check("and it is still there, verbatim", out.startsWith("\r\nGET /x"));
+    }
+
+    static void anAbsoluteFormRequestLineIsNotMatchedAsAField() {
+        // No line is privileged here -- every head line is matched as a field
+        // -- so the one line that is NOT a field has to survive that match. An
+        // absolute-form target carries a colon, which is the only way a
+        // request line can look like `name: value` at all.
+        Redactor r = new Redactor();
+        String line = "GET http://app.example.test:8080/x HTTP/1.1\r\n";
+        String out = text(r.redactObservedRequest(
+                bytes(line + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n\r\n")));
+        check("the request line is verbatim (" + out.replace("\r\n", " | ") + ")",
+              out.startsWith(line));
+        check("and the credential after it is still redacted",
+              !out.contains(COOKIE_SECRET));
+    }
+
+    static void redactObservedRequestRefusesNullBytes() {
+        Redactor r = new Redactor();
+        // A RangeError, not the NPE it would otherwise be, for the reason the
+        // other two entry points give: an NPE out of here reaches a Burp proxy
+        // thread and the send path's catch-all alike.
+        expectThrows("null bytes are a RangeError", Redactor.RangeError.class,
+                     () -> r.redactObservedRequest(null));
+    }
+
+    static void theEmptyInjectedPathIsWhyJobFourExists() {
+        // THE FINDING, kept as a test so it cannot come back quietly. This is
+        // not a complaint about redactRequest -- an empty Injected returning
+        // the bytes unchanged is CORRECT for the send path, where job 2
+        // refuses any credential job 1 did not inject. It is only wrong as the
+        // whole of a path's redaction, and this pins the difference so that
+        // routing the proxy path back through redactRequest is visibly a leak
+        // rather than a plausible simplification.
+        Redactor r = new Redactor();
+        byte[] raw = browsedRequest(COOKIE_SECRET);
+        String viaInjected = text(r.redactRequest(raw, new Redactor.Injected(raw)));
+        check("redactRequest with an empty Injected returns the credential "
+              + "VERBATIM -- it is not a redaction of observed traffic",
+              viaInjected.contains(COOKIE_SECRET));
+        check("...while job 4 removes it", 
+              !text(r.redactObservedRequest(raw)).contains(COOKIE_SECRET));
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     static byte[] bytes(String s) { return s.getBytes(StandardCharsets.UTF_8); }
@@ -10795,8 +11066,25 @@ import java.util.Map;
 /**
  * Credential redaction for the copy of an exchange that crosses the bridge.
  *
- * Three jobs, and they are three because a credential reaches disk by three
- * different routes (§7):
+ * FOUR jobs, and they are four because a credential reaches disk by four
+ * different routes (§7). WHICH JOB COVERS WHICH PATH is the thing to read
+ * first, because getting that wrong is how a path ends up with no mechanism at
+ * all -- which is exactly what happened to the proxy path's request half
+ * between Task 7 and its first fix round, and it stored the operator's live
+ * session cookies verbatim in a content-addressed store:
+ *
+ *   SEND path, request   -- jobs 1 and 2, which cover each other. A credential
+ *                           this extension injected has a known byte range
+ *                           (job 1); one the harness supplied is REFUSED
+ *                           before issuance (job 2), so it never reaches the
+ *                           store at all.
+ *   SEND path, response  -- job 3.
+ *   PROXY path, request  -- job 4, and ONLY job 4. Job 1 has nothing
+ *                           registered, because this extension composed
+ *                           nothing; job 2 cannot apply, because §4
+ *                           deliberately does not rule-check the operator's
+ *                           own browsing and refusing it is not on the table.
+ *   PROXY path, response -- job 3, the same call the send path makes.
  *
  *  1. What WE injected. The extension knows the exact byte range it wrote, so
  *     it replaces that range with {@code {{identity:<id>:authz}}}. Byte ranges,
@@ -10821,6 +11109,23 @@ import java.util.Map;
  *     Header-name matching is all there is, so cookie VALUES are replaced with
  *     {@code {{observed:set-cookie}}} and the cookie name and its attributes
  *     are kept, so session-fixation and cookie-flag checks still read.
+ *
+ *  4. What we merely WATCHED GO PAST. {@link #redactObservedRequest} is job 3
+ *     pointed at a request instead of a response: the operator's browser sends
+ *     its own {@code Cookie} and {@code Authorization} headers through the
+ *     proxy, this extension composed none of them, and it may not refuse them
+ *     either. Header-name matching is again all there is, so the three
+ *     {@link #CREDENTIAL_HEADERS} values are replaced with
+ *     {@code {{observed:<name>}}} and the names are kept.
+ *
+ *     THE PLACEHOLDER IS FIXED, and that is a second requirement rather than a
+ *     stylistic choice. The plan's Global Constraints require redaction to be
+ *     DETERMINISTIC -- "two requests differing only in credential bytes must
+ *     produce the same blob" -- and the blob store is content-addressed, so a
+ *     hash or a length here would give one page browsed under two sessions two
+ *     different digests and two stored copies. Before job 4 existed the proxy
+ *     path violated that constraint as well as leaking, because the raw
+ *     credential bytes WERE the difference between the two blobs.
  *
  * Redaction runs BEFORE hashing. The blob store is content-addressed: the
  * digest names the bytes it was computed over, so hashing raw bytes and
@@ -10864,6 +11169,27 @@ public final class Redactor {
 
     private static final byte[] OBSERVED_COOKIE =
         "{{observed:set-cookie}}".getBytes(StandardCharsets.US_ASCII);
+
+    /**
+     * Job 4's placeholders, one per {@link #CREDENTIAL_HEADERS} entry and in
+     * the same order.
+     *
+     * DERIVED from that array rather than written out beside it. A fourth
+     * credential header added there gets a placeholder here for free; a second
+     * hand-kept list would be a vocabulary in two places, and the drift that
+     * matters is silent -- a name matched with no placeholder to write is an
+     * {@code ArrayIndexOutOfBoundsException} on a Burp proxy thread, and a
+     * placeholder with no name is dead bytes nobody notices.
+     */
+    private static final byte[][] OBSERVED_CREDENTIAL = observedPlaceholders();
+
+    private static byte[][] observedPlaceholders() {
+        byte[][] out = new byte[CREDENTIAL_HEADERS.length][];
+        for (int i = 0; i < out.length; i++)
+            out[i] = ("{{observed:" + CREDENTIAL_HEADERS[i] + "}}")
+                     .getBytes(StandardCharsets.US_ASCII);
+        return out;
+    }
 
     /** RFC 9112 2.3: the HTTP-name is case-SENSITIVE, so this is a byte match. */
     private static final byte[] HTTP_NAME = "HTTP/".getBytes(StandardCharsets.US_ASCII);
@@ -11073,6 +11399,148 @@ public final class Redactor {
             at = r.end();
         }
         out.write(raw, at, raw.length - at);
+        return out.toByteArray();
+    }
+
+    /**
+     * The bytes of a request hx merely OBSERVED, with every credential header
+     * VALUE replaced. The argument is not modified.
+     *
+     * JOB 4. See the class javadoc for which job covers which path; the short
+     * version is that this is the ONLY mechanism standing between an
+     * operator's live session cookie and a content-addressed blob store, and
+     * {@link #redactRequest} is not a substitute for it. Handed an empty
+     * {@link Injected} -- which is what the proxy path has, because it
+     * composed nothing -- {@code redactRequest} returns {@code raw.clone()},
+     * i.e. the credential verbatim. That was the shipped state of the proxy
+     * path for one commit and it is the reason this method exists.
+     *
+     * NAME KEPT, VALUE REPLACED, exactly as job 3 does it: the evidence still
+     * shows that a credential WAS sent and which kind, which is what an
+     * auth-boundary check reads, while the bytes that would still authenticate
+     * are gone. The placeholder is FIXED -- see {@link #OBSERVED_CREDENTIAL}
+     * -- so two browses of one page under two sessions produce one blob.
+     *
+     * ONLY THE HEAD IS SCANNED, for job 3's reason exactly: a body may
+     * legitimately carry the text {@code Cookie: sid=...} -- a documentation
+     * page, an API error dump, a captured request pasted into a form -- and
+     * rewriting it would corrupt the evidence a check reads. The head ends at
+     * the first empty line.
+     *
+     * NO REQUEST LINE IS RECOGNISED, and that is deliberate rather than an
+     * omission. {@link #redactResponse} has to know its status line, because
+     * taking the first non-empty line for one whatever it says would let a
+     * head whose first field is Set-Cookie have that cookie consumed as the
+     * status line and copied through raw. Here no line is privileged: every
+     * head line is matched as a field, and a request line survives that match
+     * because the name before its first colon always begins with the method
+     * token and a space -- {@code GET /x HTTP/1.1} has no colon at all, and
+     * {@code GET http://h:8080/x HTTP/1.1} gives the name {@code GET http},
+     * neither of which is one of the three. That holds for a SYNTACTICALLY
+     * VALID request line and is not claimed beyond one: ':' is not a tchar, so
+     * no method token can carry one, and the trim below takes whitespace off
+     * the ENDS only. A malformed first line that genuinely reads
+     * {@code Cookie: x} is redacted, which is the safe direction and the same
+     * answer this method gives that line anywhere else in the head.
+     *
+     * WHAT THIS EXCLUDES, named rather than left to be discovered:
+     *
+     *   - a credential in the request LINE -- {@code /login?token=...} -- and
+     *     in the body. Neither is touched here. The url is a separate exposure
+     *     with a separate column and is a whole-branch item, not this one's;
+     *   - a credential in a header this list does not name: {@code X-Api-Key},
+     *     {@code X-Auth-Token}, a bearer token in a custom header. §6 names
+     *     three and {@link #CREDENTIAL_HEADERS} is those three. A fourth name
+     *     added there is covered here automatically, which is why the
+     *     placeholders are derived from it;
+     *   - a 1xx-style interim head. There is no such thing in a request, so
+     *     unlike {@link #redactResponse} this scan does not look for one --
+     *     and if a pipelined SECOND request followed the first in one array,
+     *     its head would be treated as body and go through raw. This class is
+     *     handed one message at a time by contract (Montoya's
+     *     {@code initiatingRequest().toByteArray()}), and that contract is
+     *     UNMEASURED here, like everything else this file's proxy caller
+     *     assumes about Burp -- see HxExtension's assumption block.
+     *
+     * A null {@code raw} is a {@link RangeError}, the same as the other two
+     * entry points, and for the same reason: an NPE out of here reaches a Burp
+     * proxy thread and the send path's catch-all alike.
+     */
+    public byte[] redactObservedRequest(byte[] raw) {
+        if (raw == null)
+            throw new RangeError("redactObservedRequest needs the request bytes");
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int i = 0;
+        boolean first = true;        // no line of the head has been read yet
+        int credential = -1;         // index into CREDENTIAL_HEADERS, or -1
+        while (i < raw.length) {
+            int next = lineStartAfter(raw, i);      // start of the following line
+            int content = contentEnd(raw, i, next); // this line without its CR/LF
+
+            if (content == i) {                     // an empty line
+                if (first) {
+                    // RFC 9112 2.2: a recipient MAY ignore an empty line
+                    // before the request line, so one can reach us. Stopping
+                    // here would end the head before a single field was read
+                    // and copy the WHOLE request through as "body", every
+                    // credential raw. Keep it verbatim and keep looking.
+                    out.write(raw, i, next - i);
+                    i = next;
+                    continue;
+                }
+                out.write(raw, i, raw.length - i);  // the head really is over
+                return out.toByteArray();
+            }
+            first = false;
+            if (raw[i] == ' ' || raw[i] == '\t') {
+                // obs-fold. RFC 9110 says a recipient must reject it and no
+                // real client emits it, but if one does, the folded remainder
+                // of a credential is credential bytes -- so the whole
+                // continuation goes. Same trade as job 3's fold branch.
+                if (credential >= 0) {
+                    int ws = i;
+                    while (ws < content && (raw[ws] == ' ' || raw[ws] == '\t')) ws++;
+                    out.write(raw, i, ws - i);
+                    out.writeBytes(OBSERVED_CREDENTIAL[credential]);
+                    out.write(raw, content, next - content);
+                } else {
+                    out.write(raw, i, next - i);
+                }
+                i = next;
+                continue;
+            }
+            int colon = indexOf(raw, i, content, (byte) ':');
+            // Whitespace off the NAME before matching, through the same
+            // predicate job 3 uses, so the two cannot drift: a name this side
+            // lets through is a live credential stored verbatim.
+            int nameEnd = colon;
+            while (nameEnd > i && isOws((char) (raw[nameEnd - 1] & 0xff))) nameEnd--;
+            credential = -1;
+            if (colon > i)
+                for (int k = 0; k < CREDENTIAL_HEADERS.length; k++)
+                    if (asciiEqualsIgnoreCase(CREDENTIAL_HEADERS[k], raw, i, nameEnd)) {
+                        credential = k;
+                        break;
+                    }
+            if (credential < 0) {
+                out.write(raw, i, next - i);
+                i = next;
+                continue;
+            }
+            out.write(raw, i, colon + 1 - i);             // the name and colon
+            int v = colon + 1;
+            while (v < content && (raw[v] == ' ' || raw[v] == '\t')) v++;
+            out.write(raw, colon + 1, v - (colon + 1));   // the OWS, verbatim
+            // THE WHOLE VALUE, not a parsed part of it. Job 3 keeps a cookie's
+            // NAME because `sid=` is what a session-fixation check reads and
+            // it is not a secret. Here the whole value is the secret --
+            // `Bearer eyJ...`, `sid=...; other=...` -- and a cookie NAME sent
+            // by the browser tells a check nothing the response's Set-Cookie
+            // did not already say.
+            out.writeBytes(OBSERVED_CREDENTIAL[credential]);
+            out.write(raw, content, next - content);      // the CRLF
+            i = next;
+        }
         return out.toByteArray();
     }
 
@@ -17139,6 +17607,29 @@ import java.util.stream.Stream;
  * {@link #ENTRY_POINT} alone -- see {@link #redirectsAreNotFollowed} -- and
  * assert the whole family appears once there, so a second setting cannot hide
  * behind the first.
+ *
+ * ORDERING IS NOT DATAFLOW, AND THAT APPLIES TO EVERY POSITION CHECK IN THIS
+ * FILE. A position check says one needle appears before another. It says
+ * NOTHING about whether the first one's RESULT reaches the second, and there
+ * are two shapes it cannot see at all:
+ *
+ *   - A VALUE COMPUTED AND THEN NOT USED. MEASURED on this file's own
+ *     {@link #bothHalvesAreRedactedBeforeTheRecordIsQueued}: with both
+ *     redaction calls left exactly where they were and the queued record's two
+ *     byte arguments changed to the RAW locals -- one identifier each, no code
+ *     moved, nothing deleted -- the whole suite read 12 summary lines / 0 FAIL
+ *     / rc=0 while raw request and response bytes went into a
+ *     content-addressed store. Every offset in that check was still correct.
+ *   - AN IDENTITY FUNCTION. `x = f(y)` with `f` returning its argument
+ *     satisfies presence, order and every use-count this class can take.
+ *
+ * The first is closable here, and is closed, by asserting USE as well as
+ * ORDER: each local bound once and read once, and the consuming expression
+ * delimited textually so it can be searched for the names it must NOT contain.
+ * The second is not closable here at all and belongs to a behavioural test of
+ * the function itself -- for redaction, RedactorTest's job-4 cases. When a
+ * position check is the only thing holding a property, say which of these two
+ * it is blind to rather than leaving the next reader to find out by measuring.
  */
 public class ChokepointTest {
 
@@ -17182,14 +17673,20 @@ public class ChokepointTest {
         t("theStripperIsNotVacuousAndDoesNotOverreach",
           ChokepointTest::theStripperIsNotVacuousAndDoesNotOverreach);
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
-        t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
-          () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
+        t("theGateIsSpentOnlyWhereTheHalvesArePaired",
+          () -> theGateIsSpentOnlyWhereTheHalvesArePaired(sources));
         t("oneRunHasOnePolicy", () -> oneRunHasOnePolicy(sources));
         t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
         t("theSecondEnforcementPointIsRegisteredAndAsksTheGate",
           ChokepointTest::theSecondEnforcementPointIsRegisteredAndAsksTheGate);
+        t("theRefusalIsHeldBeforeItIsRecorded",
+          ChokepointTest::theRefusalIsHeldBeforeItIsRecorded);
+        t("theClockAndTheAttributionAreWrittenDownAndTakenBack",
+          ChokepointTest::theClockAndTheAttributionAreWrittenDownAndTakenBack);
+        t("theRecordingStructuresHoldTheirMonitors",
+          ChokepointTest::theRecordingStructuresHoldTheirMonitors);
         t("theGateDecidesBeforeAnythingIsQueued",
           ChokepointTest::theGateDecidesBeforeAnythingIsQueued);
         t("bothHalvesAreRedactedBeforeTheRecordIsQueued",
@@ -17396,13 +17893,18 @@ public class ChokepointTest {
     static final String BRIDGE_CLIENT =
             Path.of("src", "hx", "bridge", "BridgeClient.java").toString();
 
+    /** The issuing path: the one file that interleaves S7's credential refusal
+     *  between Policy's two halves. */
+    static final String SENDER =
+            Path.of("src", "hx", "send", "Sender.java").toString();
+
     /**
-     * ONE READ PER DECISION, AND NO READ THAT IS NOT A DECISION'S.
+     * ONE READ PER DECIDING CALLBACK, AND NO READ THAT IS NOT ONE'S.
      *
      * This check counted ONE read in the whole of extension/src until Task 7,
      * and one was right while the send arm was the only thing deciding.
      * Wiring the second enforcement point makes it THREE: the send arm, the
-     * proxy request handler, and the scope re-check before the bytes leave.
+     * proxy request handler, and the re-decision before the bytes leave.
      *
      * THE NUMBER IS NOT WHAT MATTERS AND WIDENING IT TO 3 WOULD PIN NOTHING.
      * `configEpoch()` and `scopeConfig()` are two reads of one record and can
@@ -17410,24 +17912,33 @@ public class ChokepointTest {
      * unsafe direction. What that costs is a decision assembled from two
      * halves of two authorisations, and the shape of that bug is A SECOND READ
      * INSIDE ONE DECISION, which a bare total of 3 cannot tell from one
-     * decision moved to another file. So the reads are pinned to the decisions
-     * they belong to, DERIVED from the decision sites rather than restated:
+     * decision moved to another file. So the reads are pinned to the things
+     * that make them, DERIVED rather than restated:
      *
      *   - BridgeClient reads once, for the send arm;
-     *   - the entry point reads exactly as many times as it DECIDES
-     *     (`gate.decide(` + `decideScopeOnly(`), which is the equality that
-     *     turns a second read inside either handler red;
-     *   - and each read comes BEFORE the decision it feeds, in order, so the
-     *     equality cannot be satisfied by two reads in one handler and none in
-     *     the other;
+     *   - the entry point reads exactly as many times as it has DECIDING
+     *     CALLBACKS, which is the equality that turns a second read inside
+     *     either handler red;
+     *   - each read comes BEFORE the question it feeds, in order, so the
+     *     equality cannot be satisfied by two reads in one callback and none
+     *     in the other;
      *   - and nothing else in extension/src reads it at all.
+     *
+     * DERIVED FROM THE CALLBACK DECLARATIONS, not from the questions, and that
+     * changed in fix round 1. It used to count `gate.decide(` +
+     * `decideScopeOnly(` -- one question per callback, which was true until
+     * the second callback gained a SECOND question (`decideBeforeGate` for the
+     * crawler, `decideScopeOnly` for the operator -- two branches of one
+     * decision, taken under one snapshot). Counting questions would then read
+     * three decisions against two reads and go red on correct code. The
+     * callbacks are the right unit: a callback decides once, whatever it asks.
      *
      * THE WITNESS FOR THE WIDENING, in the shape
      * `test_vocabularies_match_the_schema.py` uses for its own: the equality
-     * above is vacuous if both sides are zero -- a file with no reads and no
-     * decisions satisfies it -- so the entry point's decision count is
-     * asserted to be 2 outright. Deleting either handler is then red here as
-     * well as in the registration counts.
+     * is vacuous if both sides are zero -- a file with no reads and no
+     * callbacks satisfies it -- so the callback count is asserted to be 2
+     * outright. Deleting either callback is then red here as well as in the
+     * registration counts.
      *
      * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
      * `this.authorisation()` cannot supply one. BridgeClient's send arm writes
@@ -17451,33 +17962,42 @@ public class ChokepointTest {
         String entry = code(Path.of(ENTRY_POINT));
         int inBridge = count(bridge, ".authorisation()");
         int inEntry = count(entry, ".authorisation()");
-        int decisions = count(entry, "gate.decide(") + count(entry, "decideScopeOnly(");
+        // The two callbacks a request is decided about in, by their
+        // declarations. A response handler decides nothing and must read
+        // nothing, which is what the totals below enforce.
+        int callbacks = count(entry, "handleRequestReceived(InterceptedRequest r)")
+                      + count(entry, "handleRequestToBeSent(InterceptedRequest r)");
 
         check("the send arm reads the Authorisation snapshot once (" + inBridge + ")",
               inBridge == 1);
-        check("the entry point decides twice -- the proxy request handler and "
-              + "the pre-send scope re-check (" + decisions + ")", decisions == 2);
-        check("and reads the snapshot exactly once per decision (" + inEntry
-              + " reads, " + decisions + " decisions)", inEntry == decisions);
+        check("the entry point has two deciding callbacks -- the proxy request "
+              + "handler and the pre-send re-decision (" + callbacks + ")",
+              callbacks == 2);
+        check("and reads the snapshot exactly once per deciding callback ("
+              + inEntry + " reads, " + callbacks + " callbacks)",
+              inEntry == callbacks);
         check("nothing else in extension/src reads it at all " + elsewhere,
               elsewhere.isEmpty());
-        check("so the whole extension reads it " + (1 + decisions) + " times, "
-              + "once per decision (" + total + ")", total == 1 + decisions);
+        check("so the whole extension reads it " + (1 + callbacks) + " times, "
+              + "once per decision (" + total + ")", total == 1 + callbacks);
 
-        // Each read AHEAD of the decision it feeds. Without this, two reads in
-        // one handler and none in the other satisfies the equality above --
+        // Each read AHEAD of the question it feeds. Without this, two reads in
+        // one callback and none in the other satisfies the equality above --
         // and "none in the other" is a decision taken under an authorisation
-        // fetched for a different request.
+        // fetched for a different request. The second callback asks one of two
+        // questions and both are spelled `policy.decide...`, so the common
+        // prefix is what is looked for; nothing before it in this file spells
+        // that (the first callback asks `gate.decide(`).
         int read1 = entry.indexOf(".authorisation()");
         int gate = entry.indexOf("gate.decide(");
         int read2 = entry.indexOf(".authorisation()", read1 + 1);
-        int scope = entry.indexOf("decideScopeOnly(");
+        int reDecision = entry.indexOf("policy.decide", read2);
         check("the request handler reads before it asks the gate (" + read1
               + " < " + gate + ")", read1 >= 0 && read1 < gate);
-        check("and the scope re-check reads its own, after that gate call and "
+        check("and the re-decision reads its own, after that gate call and "
               + "before its own question (" + gate + " < " + read2 + " < "
-              + scope + ")",
-              read2 > gate && read2 < scope);
+              + reDecision + ")",
+              read2 > gate && reDecision > read2);
     }
 
     /**
@@ -17529,22 +18049,71 @@ public class ChokepointTest {
      * `SocketChannel.open(` and `ServerSocketChannel`, and neither has the
      * paren against the word.
      *
-     * The other five needles have no such blind spot and were not touched: a
-     * qualified `java.net.DatagramSocket`, `java.net.http.HttpClient` or
-     * `java.net.InetSocketAddress` still contains its own type name, and
-     * `openConnection(`/`openStream(` are calls on an instance, so no
-     * qualification of the type can hide them. `new ` glued to a simple name
-     * was the one shape that could.
+     * QUALIFICATION WAS NOT THE ONLY HOLE, and the sentence that used to stand
+     * here -- "the other five needles have no such blind spot" -- was FALSE.
+     * Two reviewers found it independently, and each measured its probe as a
+     * single added line in `extension/src` against a clean 12 / 0 FAIL / rc=0:
+     *
+     *     new java.net.URL("http://127.0.0.1:1/").getContent()  12 / 0 / rc=0
+     *     new ProcessBuilder("curl", ...).start()               12 / 0 / rc=0
+     *     java.net.InetAddress.getByName(...)                   12 / 0 / rc=0
+     *     api.collaborator().createClient()...                  12 / 0 / rc=0
+     *     new java.net.URL("http://127.0.0.1:1/").openStream()  12 / 1 / rc=1
+     *
+     * The last is the control: the needle works for the door it names. The
+     * first is the lesson -- `getContent()` is a THIRD door on the very object
+     * `openConnection(` and `openStream(` guard, so the list was enumerating
+     * SPELLINGS where the capability was the thing to name. The needle is now
+     * the object (`URL(`), which no method on it can get past.
+     *
+     * `URL(` WAS NOT FREE, and the four occurrences it collided with were
+     * PROSE: comments in `Policy.java` discussing JavaScript's `new URL()` for
+     * path normalisation. These needles read {@link #text}, so prose counts,
+     * and this class's own rule for a must-be-zero needle applies -- rewrite
+     * the comment, do not loosen the needle. The four were rewritten to say
+     * `new URL` without the paren, which says the same thing, and `URL(` is 0.
+     * The other four additions were 0 to begin with.
+     *
+     * WHAT THIS LIST STILL EXCLUDES, named rather than claimed away, because a
+     * falsifier is itself a claim about the space of failures and this one has
+     * been wrong twice:
+     *
+     *   - EGRESS THROUGH AN OBJECT WHOSE TYPE IS NEVER SPELLED HERE.
+     *     `uri.toURL().getContent()`, a `Socket` from a `SocketFactory`, a
+     *     channel from a provider, anything reached by reflection. Every
+     *     needle below is a type name or a call spelling; a value that arrives
+     *     already built is invisible to all of them. This is the shape both
+     *     escapes so far have had, one generation apart, and adding type names
+     *     does not close it.
+     *   - A DEPENDENCY. This jar has none today, and `extension/build.sh`
+     *     compiles `src` alone against the Montoya API, so there is no third
+     *     party to hide in -- but nothing here would notice one arriving.
+     *   - A WRITE THAT IS EGRESS BY SITUATION rather than by API: a file
+     *     written to a network mount, a JNI call, a `ServiceLoader`.
+     *   - MONTOYA FACILITIES NOT NAMED. `collaborator()` is named now because
+     *     a reviewer found it; the list of Burp's own network-touching APIs is
+     *     not enumerated anywhere and this is four of them, not all of them.
+     *
+     * So this check is a TRIPWIRE on the shapes a second egress path has
+     * actually taken in this repository, and it is not a proof that none
+     * exists. The proof, such as it is, is that {@link #montoyaIsConfinedToTheEntryPoint}
+     * keeps `burp.*` in one file and {@link #oneEgressPath} keeps
+     * Montoya's HTTP API to one reach inside it.
      */
     static void noSecondEgressFamilyExists(List<Path> sources) throws IOException {
         String[] needles = {
             "Socket(",            // a TCP client socket, straight from the JDK,
                                   // qualified or not -- see the javadoc above
             "InetSocketAddress",  // ...or the address that turns a channel into one
+            "URL(",               // the OBJECT, not one of its doors: see above
             "openConnection(",    // URL -> URLConnection / HttpURLConnection
             "openStream(",        // URL.openStream(), the one-liner version
             "HttpClient",         // java.net.http, the modern one
             "DatagramSocket",     // UDP is egress too
+            "InetAddress",        // a DNS lookup is bytes off this machine
+            "ProcessBuilder",     // ...and so is `curl`
+            "Runtime.getRuntime", // the older spelling of the same thing
+            "collaborator()",     // Montoya's OTHER network facility
         };
         for (String needle : needles) {
             int total = 0;
@@ -17555,46 +18124,104 @@ public class ChokepointTest {
     }
 
     /**
-     * Policy is asked in two halves, and both halves are asked exactly once.
+     * WHEREVER THE PAID HALF IS SPENT, THE FREE HALF WENT BEFORE IT -- and the
+     * paid half is spent in exactly one place.
      *
-     * `decide()` was split so spec s7's credential refusal could sit BETWEEN
-     * them: it must run before the Gate (which spends a rate token and a
-     * budget slot) and after scope/method/dangerous, whose classes name the
-     * boundary crossed rather than the credential carried. Policy cannot
-     * make that check itself -- it is decided by its arguments alone and must
-     * not reach into hx.send for a Redactor -- so the interleaving lives in
-     * Sender.
+     * `Policy.decide()` was split so spec s7's credential refusal could sit
+     * BETWEEN the halves: it must run before the Gate (which spends a rate
+     * token and a budget slot) and after scope/method/dangerous, whose classes
+     * name the boundary crossed rather than the credential carried. Policy
+     * cannot make that check itself -- it is decided by its arguments alone
+     * and must not reach into hx.send for a Redactor -- so the interleaving
+     * lives in Sender.
      *
-     * The split is what this guards. `decideBeforeGate` answering `allowed()`
-     * is NOT permission to issue: the Gate has not run. A second issue path
-     * that called only the first half would issue past the rate limit and past
-     * the run's budget, with every behavioural test green, because every one
-     * of them drives the path that does call both.
+     * `decideBeforeGate` answering `allowed()` is NOT permission to issue: the
+     * Gate has not run. A second ISSUE path that called only the first half
+     * would issue past the rate limit and past the run's budget, with every
+     * behavioural test green, because every one of them drives the path that
+     * does call both.
+     *
+     * THIS USED TO BE `before == 1 && gate == 1 && before == gate`, WHOLE-TREE,
+     * and fix round 1 made that false rather than wrong. The proxy path's
+     * second callback re-decides an INTERCEPT-EDITED request: S4 says the
+     * method allowlist and the dangerous-path denylist apply to crawler
+     * traffic in full, and an edit after the first callback's decision is a
+     * request nobody checked. So it asks `decideBeforeGate` -- and it must NOT
+     * ask the Gate, because the Gate was already spent for this request at the
+     * first callback, and asking again charges a crawler twice for one
+     * request.
+     *
+     * Bumping the constant to 2 would have said nothing about that. What the
+     * check says instead, DERIVED per file rather than restated as a total:
+     *
+     *   - the ISSUING path (Sender) asks both halves, the same number of
+     *     times, and that number is one. This is the original pair assertion,
+     *     narrowed to the file where the interleaving actually lives -- so a
+     *     deleted `.checkGate(` there is still red;
+     *   - the entry point asks the free half and NEVER the paid one. A
+     *     must-be-zero, which is the strongest shape this class has, and it is
+     *     the thing that would go wrong: `policy.decide(` or `.checkGate(` at
+     *     the second callback is a double charge no behavioural test can see;
+     *   - NO OTHER FILE asks either half. A third caller of `decideBeforeGate`
+     *     is a path that might issue on a half-decision, and it has to be
+     *     looked at by a human rather than absorbed into a total.
      *
      * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
      * `.checkGate(` beside a live `.decideBeforeGate(` would otherwise keep
-     * both counts at 1 and the pair assertion below satisfied, with the Gate
-     * never asked.
+     * the counts satisfied with the Gate never asked.
      *
-     * Counting is all this can do, and one of each is what the send path
-     * needs. `decide(` is not counted: it remains correct for a caller with
-     * nothing to interleave, and PolicyTest drives every rule through it.
+     * `decide(` is not counted: it remains correct for a caller with nothing
+     * to interleave -- the proxy path's FIRST callback reaches it through
+     * `ProxyGate` -- and PolicyTest drives every rule through it.
      */
-    static void bothHalvesOfTheDecisionAreAskedAndOnlyOnce(List<Path> sources)
+    static void theGateIsSpentOnlyWhereTheHalvesArePaired(List<Path> sources)
             throws IOException {
-        int before = 0, gate = 0;
+        String sender = code(Path.of(SENDER));
+        String entry = code(Path.of(ENTRY_POINT));
+        int senderBefore = count(sender, ".decideBeforeGate(");
+        int senderGate = count(sender, ".checkGate(");
+        int entryBefore = count(entry, ".decideBeforeGate(");
+        int entryGate = count(entry, ".checkGate(");
+
+        check("the issuing path asks the boundary half exactly once ("
+              + senderBefore + ")", senderBefore == 1);
+        check("and the Gate half exactly once with it (" + senderGate + ")",
+              senderGate == 1);
+        // The pair, not the two counts separately: what makes an allowed first
+        // half safe is that a second half follows it.
+        check("so the issuing path never takes one without the other",
+              senderBefore == senderGate);
+
+        check("the proxy path re-decides with the free half (" + entryBefore + ")",
+              entryBefore == 1);
+        // THE ONE THAT WOULD GO WRONG. The Gate was spent for this request at
+        // the first callback; spending it again charges a crawler twice for
+        // one request, shortening the run for no evidence, and every
+        // behavioural test stays green because each half of it is internally
+        // consistent.
+        check("and NEVER the paid one -- the Gate is not spent twice for one "
+              + "request (" + entryGate + ")", entryGate == 0);
+        // ...and not through the front door either. `policy.decide(` runs both
+        // halves INSIDE Policy, so it reaches the Gate without ever spelling
+        // `.checkGate(` here -- which is the shape a double charge would
+        // actually be written in, and the count above cannot see it. The
+        // needle takes the paren, so `policy.decideBeforeGate(` and
+        // `policy.decideScopeOnly(` do not match it. ProxyGate's own
+        // `policy.decide(` is a different file and is the FIRST callback's
+        // paying decision, which is correct.
+        int entryFull = count(entry, "policy.decide(");
+        check("and not through policy.decide(), which reaches the Gate without "
+              + "naming it (" + entryFull + ")", entryFull == 0);
+
+        List<String> elsewhere = new ArrayList<>();
         for (Path p : sources) {
-            String t = code(p);
-            before += count(t, ".decideBeforeGate(");
-            gate += count(t, ".checkGate(");
+            if (p.toString().equals(SENDER) || p.toString().equals(ENTRY_POINT)) continue;
+            String c = code(p);
+            int n = count(c, ".decideBeforeGate(") + count(c, ".checkGate(");
+            if (n > 0) elsewhere.add(p + " x" + n);
         }
-        check("the boundary half of the decision is asked exactly once (" + before + ")",
-              before == 1);
-        check("and the Gate half exactly once with it (" + gate + ")", gate == 1);
-        // The pair, not the two counts separately: what makes an allowed
-        // first half safe is that a second half follows it.
-        check("so no path in extension/src takes one without the other",
-              before == gate);
+        check("and no other file in extension/src asks either half " + elsewhere,
+              elsewhere.isEmpty());
     }
 
     /**
@@ -17609,8 +18236,9 @@ public class ChokepointTest {
      * built inline at its call site, is to write another
      * `new Policy(new Limits(...))` -- and that is a SECOND per-run budget for
      * one run, which no behavioural test can see because each half of it is
-     * internally consistent. The pair counter above cannot see it either: it
-     * counts `.decideBeforeGate(` and `.checkGate(`, not constructions.
+     * internally consistent. {@link #theGateIsSpentOnlyWhereTheHalvesArePaired}
+     * cannot see it either: it counts `.decideBeforeGate(` and `.checkGate(`,
+     * not constructions.
      *
      * A WIRE-EXISTS needle, so it reads {@link #code}: prose cannot construct
      * anything. That is not theoretical here -- the entry point's own comment
@@ -17895,10 +18523,20 @@ public class ChokepointTest {
      * {@link #montoyaIsConfinedToTheEntryPoint}, which is what makes that
      * narrowing safe rather than convenient.
      *
-     * WHAT THESE DO NOT SEE: whether the handler HONOURS the verdict. A
-     * `gate.decide(...)` whose result is dropped on the floor satisfies every
-     * count here, and only Task 9 driving real Burp can catch it. The two
-     * position checks below cover the orderings; this one covers existence.
+     * WHAT THESE DO NOT SEE: whether the handler HONOURS the verdict. MEASURED
+     * by a reviewer, on the committed tree: `if (!verdict.allow() && false)`
+     * forwards every refused request to the target and reads 12 summary lines
+     * / 0 FAIL / rc=0. `gate.decide(` is still called once, the offer is still
+     * textually after it, and every count here is satisfied. Only Task 9
+     * driving real Burp can catch it, and the CONDITION IT MUST MEET is
+     * written where its implementer will read it -- in HxExtension's
+     * assumption block, item 2: assert a refused request reaches the target
+     * ZERO times, measured AT THE TARGET, never by reading the client's
+     * response, because `drop()` answers the client 200 OK with ~1529 bytes of
+     * Burp's own HTML and is indistinguishable from a delivery by status code.
+     *
+     * The two position checks below cover the orderings; this one covers
+     * existence.
      */
     static void theSecondEnforcementPointIsRegisteredAndAsksTheGate()
             throws IOException {
@@ -17912,6 +18550,138 @@ public class ChokepointTest {
         check("the proxy handler asks the gate (" + n3 + ")", n3 == 1);
         check("scope is re-decided before the request is sent (" + n4 + ")",
               n4 == 1);
+    }
+
+    /**
+     * THE REFUSAL IS DECIDED AND HELD BEFORE ANYTHING IS RECORDED, AND IS
+     * RETURNED WHATEVER THE RECORDING DID.
+     *
+     * "Capture never gates enforcement" was true at the two request callbacks
+     * only because {@link hx.proxy.Capture#offer} documents that it never
+     * throws. That is a contingent property of another class, not a structure,
+     * and it is one field made nullable away from being false: a `Captured`
+     * with a null `Source` NPEs at `dropped[o.source().ordinal()]`. A throw
+     * out of that line escaped the handler with `drop()` never executed, and
+     * what Burp does with a proxy handler that threw is measured nowhere in
+     * this repository.
+     *
+     * So the action is bound to a local BEFORE the offer and returned AFTER
+     * it, with the offer inside a `try`. The property is then the control
+     * flow's rather than the callee's -- {@link hx.proxy.Capture}'s promise is
+     * still worth keeping, and nothing depends on it any more.
+     *
+     * Counted, not positioned per callback, because there are exactly two of
+     * these and a count of two is what a deleted one turns into. The response
+     * handler is not counted here: it already wrapped its offer, and its
+     * action carries no enforcement -- it forwards either way.
+     */
+    static void theRefusalIsHeldBeforeItIsRecorded() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int bound = count(entry, "Action refuse =");
+        int returned = count(entry, "return refuse;");
+        int bind = entry.indexOf("Action refuse =");
+        int offer = entry.indexOf("capture.offer(");
+        int ret = entry.indexOf("return refuse;");
+        check("both refusing callbacks bind their action first (" + bound + ")",
+              bound == 2);
+        check("and return that local rather than a fresh call (" + returned + ")",
+              returned == 2);
+        check("the action is decided before anything is recorded (" + bind
+              + " < " + offer + ")", bind >= 0 && offer >= 0 && bind < offer);
+        check("and returned after (" + ret + " > " + offer + ")",
+              ret > offer);
+    }
+
+    /**
+     * THE CLOCK AND THE ATTRIBUTION ARE WRITTEN DOWN, AND TAKEN BACK.
+     *
+     * `Pending` is well tested as a CLASS and was held by nothing as WIRING.
+     * MEASURED by a reviewer on the committed tree: guard `pending.put(...)`
+     * so it never runs -- one `if` -- and the suite reads 12 summary lines /
+     * 0 FAIL / rc=0 while hx captures ZERO proxy exchanges. Every response
+     * handler then takes a miss, counts `countLost(UNATTRIBUTED)` and records
+     * nothing, so the only symptom is `run.dropped_total` climbing, which S5
+     * presents as a coverage FLOOR -- i.e. the failure looks exactly like "the
+     * harness is fine, this run just saw little traffic". A total outage that
+     * reads as poor coverage is the worst shape a defect can have here.
+     *
+     * TWO takes, not one, and both are needed: the response handler takes the
+     * entry to build the record, and the second request callback takes it when
+     * it refuses, because that request will never be answered and the map's
+     * bound should be spent on requests actually in flight.
+     *
+     * WIRE-EXISTS needles, so they read {@link #code}.
+     *
+     * WHAT THEY DO NOT SEE, and it is why the counts are not the whole check:
+     * a `put` that is never REACHED still counts 1, and the measured mutation
+     * is exactly that -- a guard, not a deletion. So the statement's own line
+     * is asserted to carry nothing in front of it and to be indented like the
+     * `continueWith` it precedes, which is what a same-line guard and an
+     * enclosing block respectively disturb.
+     *
+     * MEASURED, three shapes, each 12 summary lines and rc=1: the put DELETED
+     * (3 FAIL), the reviewer's same-line guard `if (source == null) ...`
+     * (2 FAIL, the line prefix and the indent), and an ENCLOSING `if { }`
+     * block (1 FAIL, the indent alone -- the block re-indents by four).
+     *
+     * WHAT REMAINS UNSEEN even so: a guard whose block happens to re-indent to
+     * exactly this column, and any condition that is false at RUNTIME rather
+     * than in the text. Closing that needs Burp driving real traffic, and it
+     * is Task 9's -- see HxExtension's assumption block.
+     */
+    static void theClockAndTheAttributionAreWrittenDownAndTakenBack()
+            throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int put = count(entry, "pending.put(");
+        int take = count(entry, "pending.take(");
+        check("the request handler writes the clock and the source down ("
+              + put + ")", put == 1);
+        check("and both the response handler and the refusing re-decision take "
+              + "them back (" + take + ")", take == 2);
+
+        // AND THE PUT IS UNCONDITIONAL. The measured mutation is not a
+        // deletion -- it is `if (source == null) pending.put(...)`, which
+        // leaves the count above at 1. So the statement's own line is checked:
+        // nothing but whitespace in front of it, and the same indentation as
+        // the `continueWith` that follows it in the same block.
+        int put1 = entry.indexOf("pending.put(");
+        int lineStart = entry.lastIndexOf('\n', put1) + 1;
+        String prefix = put1 >= 0 ? entry.substring(lineStart, put1) : "x";
+        check("the put is a statement of its own, with no guard in front of it "
+              + "[" + prefix + "]", put1 >= 0 && prefix.isBlank());
+        int cont = entry.indexOf("return ProxyRequestReceivedAction.continueWith(r);");
+        int contStart = entry.lastIndexOf('\n', cont) + 1;
+        check("and sits in the same block as the pass-through it precedes ("
+              + prefix.length() + " vs " + (cont - contStart) + ")",
+              cont > put1 && prefix.length() == cont - contStart);
+    }
+
+    /**
+     * THE RECORDING STRUCTURES HOLD THEIR MONITORS.
+     *
+     * `Pending` is reached from Burp's proxy threads, so every read and every
+     * write of its map and its counter is inside `synchronized (live)`. The
+     * concurrency test in `PendingTest` separates that for `put` and `take` --
+     * with all four monitors removed it goes red 3 runs of 3 -- but NOT for
+     * `evicted()` and `size()`, which no test reads from a second thread.
+     * MEASURED by a reviewer: de-synchronizing those two alone reads 12 / 0
+     * FAIL / rc=0, so the claim in `Pending`'s javadoc was true and held by
+     * nothing.
+     *
+     * A COUNT IS NOT A PLACEMENT CHECK and this one does not pretend to be:
+     * four `synchronized (live) {` in that file could in principle be four
+     * monitors around the wrong code. What it does catch is the shape that
+     * actually happens -- an accessor written or edited without one -- and the
+     * placement of the two that matter most is separated behaviourally next
+     * door. The four are `put`, `take`, `evicted` and `size`; the number is
+     * stated rather than derived because there is nothing in the file to
+     * derive it from that is not the same count read twice.
+     */
+    static void theRecordingStructuresHoldTheirMonitors() throws IOException {
+        String pending = code(Path.of("src", "hx", "proxy", "Pending.java"));
+        int monitors = count(pending, "synchronized (live) {");
+        check("Pending guards all four of its accessors -- put, take, evicted, "
+              + "size (" + monitors + ")", monitors == 4);
     }
 
     /**
@@ -17955,7 +18725,7 @@ public class ChokepointTest {
     }
 
     /**
-     * BOTH HALVES ARE REDACTED BEFORE THE RECORD IS QUEUED.
+     * BOTH HALVES ARE REDACTED, AND THE REDACTION'S OUTPUT IS WHAT IS QUEUED.
      *
      * S7 makes the blob store content-addressed, so a credential that reaches
      * the hashing step on the Python side is ALREADY UNRECOVERABLE -- the
@@ -17963,21 +18733,47 @@ public class ChokepointTest {
      * Redaction therefore cannot be something the drain or the far side does
      * later. {@link hx.proxy.Observed}'s own javadoc says its byte arrays are
      * post-redaction; an Observed holding raw bytes is a live credential
-     * sitting in a queue, and this is the check that says so.
+     * sitting in a queue.
      *
-     * The needle for the queueing end is `capture.offer(new Observed`, not
-     * `capture.offer(`: the denial arm offers first and carries no bytes at
-     * all, and a check anchored on the earlier offer would be comparing the
-     * redaction of one record against the queueing of another.
+     * THIS METHOD USED TO BE THREE OFFSETS AND THAT WAS NOT ENOUGH. It proved
+     * the two redaction calls appear and appear FIRST, and nothing tied the
+     * values they produce to the record. MEASURED, by a reviewer, on the
+     * committed tree: leave both calls exactly where they are and change the
+     * offer's two byte arguments from {@code redactedReq, redactedResp} to
+     * {@code reqBytes, r.toByteArray().getBytes()} -- a one-identifier edit,
+     * no code motion, nothing deleted -- and the suite read
+     * 12 summary lines / 0 FAIL / rc=0 with raw request AND response bytes
+     * going to the content-addressed store. The general lesson is in this
+     * class's javadoc: ORDERING IS NOT DATAFLOW.
      *
-     * Anti-vacuity, again load-bearing: deleting `redactRequest(` outright --
-     * offering the raw bytes -- leaves its index at -1, which is less than
-     * every real offset, so the ordering alone would go GREEN on exactly the
-     * mutation this exists to catch.
+     * So there are now three kinds of assertion here and they fail
+     * independently:
+     *
+     *   - PRESENCE. Deleting a redaction call leaves its index at -1, and -1
+     *     is less than every real offset, so the ordering assertions alone
+     *     would go GREEN on exactly the mutation they exist to catch. These
+     *     guards are load-bearing and are repeated inside each ordering test.
+     *   - ORDER. Each redaction precedes the queueing.
+     *   - USE. Each redacted local is bound ONCE and read ONCE (two
+     *     occurrences), the raw request local is bound once and consumed once
+     *     by the redaction (two occurrences), and the RECORD CONSTRUCTION
+     *     ITSELF names both redacted locals and neither raw byte source. The
+     *     construction is delimited textually -- from `capture.offer(new
+     *     Observed` to the `));` that closes it -- so a `toByteArray()`
+     *     elsewhere in the file (the send adapter has one) cannot satisfy or
+     *     break it.
+     *
+     * WHAT USE STILL DOES NOT SEE: an identity function. `byte[] redactedReq =
+     * passThrough(reqBytes);` keeps every count and every name intact. What
+     * closes THAT is behavioural and lives in RedactorTest, whose job-4 cases
+     * drive `redactObservedRequest` against a live cookie and fail if the
+     * output still carries it. Neither half is sufficient alone: the
+     * structural half says the record carries the redaction's output, the
+     * behavioural half says that output is redacted.
      */
     static void bothHalvesAreRedactedBeforeTheRecordIsQueued() throws IOException {
         String entry = code(Path.of(ENTRY_POINT));
-        int req = entry.indexOf("redactRequest(");
+        int req = entry.indexOf("redactObservedRequest(");
         int resp = entry.indexOf("redactResponse(");
         int offer = entry.indexOf("capture.offer(new Observed");
         check("the request half is redacted in " + ENTRY_POINT + " (" + req + ")",
@@ -17988,6 +18784,35 @@ public class ChokepointTest {
               + req + " < " + offer + ")", req >= 0 && offer >= 0 && req < offer);
         check("and so is the response half (" + resp + " < " + offer + ")",
               resp >= 0 && offer >= 0 && resp < offer);
+
+        // ---- and the record carries what they RETURNED ---------------------
+        int reqUses = count(entry, "redactedReq");
+        int respUses = count(entry, "redactedResp");
+        int rawUses = count(entry, "reqBytes");
+        check("the redacted request local is bound once and read once, not "
+              + reqUses + " times", reqUses == 2);
+        check("and the redacted response local likewise, not " + respUses,
+              respUses == 2);
+        // The raw local exists only to be redacted. A third occurrence is it
+        // being used for something else -- and the only something else in
+        // reach is being queued.
+        check("the raw request local is bound once and consumed once by the "
+              + "redaction, not used " + rawUses + " times", rawUses == 2);
+
+        int end = entry.indexOf("));", offer);
+        check("the record construction is delimited (" + offer + ".." + end + ")",
+              offer >= 0 && end > offer);
+        String record = end > offer ? entry.substring(offer, end) : "";
+        check("the queued record names the redacted request",
+              record.contains("redactedReq"));
+        check("and the redacted response", record.contains("redactedResp"));
+        // The two raw byte sources by name. Under the measured mutation the
+        // construction reads `reqBytes, r.toByteArray().getBytes()`, and each
+        // of these two is what sees it.
+        check("and no raw request bytes (" + record.contains("reqBytes") + ")",
+              !record.contains("reqBytes"));
+        check("and no raw response bytes (" + record.contains("toByteArray(") + ")",
+              !record.contains("toByteArray("));
     }
 
     static int count(String haystack, String needle) {
@@ -18480,14 +19305,50 @@ public class HxExtension implements BurpExtension {
         // ordinary code is `listenerPort` below, which takes a String; it is
         // public and ProxyGateTest drives it.
         //
-        // AN ASSUMPTION THIS WIRING RESTS ON AND CANNOT CHECK, written down
-        // for Task 9 to measure rather than left implicit: that a request
-        // issued by the SEND path -- `api.http().sendRequest` in the adapter
-        // below -- does NOT also traverse these proxy handlers. If it did,
-        // every send would be decided twice and, worse, attributed by a
-        // listener port it does not have: UNATTRIBUTED, refused, and the send
-        // path dead. Montoya issues those from Burp's own HTTP stack rather
-        // than through a proxy listener, and nothing here has measured it.
+        // WHAT THIS WIRING RESTS ON AND CANNOT CHECK -- Task 9's list, written
+        // down here rather than left implicit. Every item is a thing a real
+        // Burp settles in minutes and nothing in this repository can settle at
+        // all.
+        //
+        //  1. THAT A SEND-PATH REQUEST DOES NOT TRAVERSE THESE HANDLERS.
+        //     `api.http().sendRequest` in the adapter below issues from Burp's
+        //     own HTTP stack rather than through a proxy listener. If it did
+        //     traverse them, every send would be decided twice and, worse,
+        //     attributed by a listener port it does not have: UNATTRIBUTED,
+        //     refused, and the send path dead. Unmeasured.
+        //  2. THAT THE HANDLER'S VERDICT IS HONOURED. Nothing in the suite
+        //     sees this: `if (!verdict.allow() && false)` forwards every
+        //     refused request and reads 12 summary lines / 0 FAIL / rc=0 --
+        //     measured. THE CONDITION TASK 9 MUST MEET, and it is not
+        //     negotiable: assert a refused request reaches the target ZERO
+        //     times, MEASURED AT THE TARGET -- a request log, a connection
+        //     count -- and NEVER by reading the client's response. Task 1
+        //     measured `drop()` returning 200 OK with ~1529 bytes of Burp's
+        //     own HTML, so a drop and a delivery are indistinguishable by
+        //     status code at the client. A test that reads the client side
+        //     passes on a gate that forwards everything.
+        //  3. THAT `drop()` FROM THE SECOND CALLBACK SENDS NOTHING. Task 1
+        //     measured the drop from `handleRequestReceived` only. Montoya
+        //     documents both actions identically; nobody has watched the wire.
+        //  4. THAT `path()` CARRIES THE QUERY AND `httpService().host()` IS
+        //     THE CONNECTION HOST. Montoya's documented contract, unmeasured
+        //     here. If either is wrong the request is scope_denied by
+        //     Policy.checkScope's host/path agreement test -- fail-closed, but
+        //     it would refuse working traffic.
+        //  5. TWO PROXY BYTE-FLOWS THAT REACH NEITHER CALLBACK, so neither is
+        //     enforced or captured here:
+        //       - WEBSOCKET. After a scope-allowed 101 upgrade, frames
+        //         traverse Burp's separate proxy-WebSocket handlers, and this
+        //         extension registers none. The destination was scope-decided
+        //         at upgrade time, so the engagement boundary itself holds;
+        //         per-message enforcement and ALL capture do not.
+        //       - PER-HOST CERTIFICATE MINTING. Burp connects to the target to
+        //         copy its certificate when minting the CA-signed one for a
+        //         CONNECT, and that happens before any request reaches a
+        //         handler -- so a TLS ClientHello carrying the target's SNI
+        //         can leave for a host these handlers would then refuse.
+        //         Unverified, and exactly the kind of claim a real-Burp
+        //         measurement should settle.
         //
         // 0 is "no crawler configured", which Source.forListenerPort reads as
         // "attribute every request whose own listener port parses to
@@ -18550,9 +19411,31 @@ public class HxExtension implements BurpExtension {
                             + "the proxy request handler threw: " + e);
                 }
                 if (!verdict.allow()) {
-                    capture.offer(new Denied(method, url, verdict.errorClass(),
-                                             verdict.detail(), source));
-                    return ProxyRequestReceivedAction.drop();
+                    // THE ACTION IS DECIDED AND HELD BEFORE ANYTHING IS
+                    // RECORDED, and it is returned whatever the recording did.
+                    // "Capture never gates enforcement" was true here only
+                    // because Capture.offer documents that it never throws --
+                    // a property worth keeping AND worth not depending on. A
+                    // throw out of this line (a Captured with a null Source
+                    // NPEs at `dropped[o.source().ordinal()]`) would escape the
+                    // handler with drop() never executed, and what Burp does
+                    // with a handler that threw is measured nowhere in this
+                    // repo. Now the refusal cannot be undone by the record.
+                    ProxyRequestReceivedAction refuse =
+                            ProxyRequestReceivedAction.drop();
+                    try {
+                        capture.offer(new Denied(method, url, verdict.errorClass(),
+                                                 verdict.detail(), source));
+                    } catch (Throwable ignored) {
+                        // Throwable, and swallowed, and that IS a silent loss
+                        // -- the one place in this design where a lost record
+                        // is not counted, because the thing that counts is the
+                        // thing that threw. The trade is stated rather than
+                        // hidden: a refusal hx failed to record is a gap in
+                        // the evidence; a refusal hx failed to ENFORCE is
+                        // bytes on the wire.
+                    }
+                    return refuse;
                 }
                 // nanoTime, not the wall clock: this is the origin of a
                 // DURATION, and Instant.now() would measure an NTP step as
@@ -18589,16 +19472,59 @@ public class HxExtension implements BurpExtension {
              */
             @Override
             public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest r) {
+                // ATTRIBUTED AGAIN, FROM THE LISTENER, and NOT read back out
+                // of `pending`. The entry is there and carries the first
+                // callback's answer, and using it would make ENFORCEMENT
+                // depend on a bounded RECORDING structure: past
+                // DEFAULT_CAPACITY requests in flight the map evicts, the
+                // source reads UNATTRIBUTED, and a request the first callback
+                // allowed is refused here because the capture map overflowed.
+                // S4 is explicit that a full queue changes what hx KNOWS and
+                // never what it ALLOWS, and that has to hold in both
+                // directions. The listener is the same connection either way,
+                // and `listenerInterface()` is measured on requests -- this is
+                // one (docs/burp-proxy-measurements.md, Q1).
+                Source source = Source.UNATTRIBUTED;
                 String method = "";
                 String url = "";
                 boolean allow;
                 String errorClass = null;
                 String detail = null;
                 try {
+                    source = Source.forListenerPort(
+                            listenerPort(r.listenerInterface()), crawlerPort);
                     method = r.method();
                     url = r.url();
                     BridgeClient.Authorisation auth = c.authorisation();
-                    Decision d = policy.decideScopeOnly(proxyRequest(r), auth);
+                    HxRequest edited = proxyRequest(r);
+                    Decision d;
+                    if (source == Source.CRAWLER)
+                        // THE AGENT'S FREE RULES, in S4's order, Gate excluded.
+                        // S4 says the method allowlist and the dangerous-path
+                        // denylist apply to crawler traffic IN FULL, and an
+                        // edit in the Intercept tab can turn `GET /x` into
+                        // `POST /account/delete` after the first callback
+                        // checked the original. decideBeforeGate is scope +
+                        // method + dangerous and spends NOTHING -- its own
+                        // javadoc says so -- so keeping those two across an
+                        // edit is free.
+                        d = policy.decideBeforeGate(edited, auth);
+                    else if (source == Source.OPERATOR)
+                        // Scope, and nothing after it. The operator branch
+                        // drops the other four rules here for the same reason
+                        // ProxyGate drops them at the first callback: applying
+                        // an agent's rules to a human drives them off the
+                        // proxy, and then hx records nothing at all.
+                        d = policy.decideScopeOnly(edited, auth);
+                    else
+                        // "Not one of the two I know", written the way
+                        // ProxyGate writes it, so a constant added to Source
+                        // later is a refusal rather than falling into whichever
+                        // branch it was not named in.
+                        d = Decision.deny("not_configured",
+                                BridgeClient.EXTENSION_FAULT
+                                + "the proxy listener could not be attributed "
+                                + "to the operator or the crawler");
                     allow = d.allowed();
                     errorClass = d.errorClass();
                     detail = d.detail();
@@ -18611,16 +19537,25 @@ public class HxExtension implements BurpExtension {
                     detail = d.detail();
                 }
                 if (!allow) {
+                    // THE ACTION IS DECIDED AND HELD BEFORE ANYTHING IS
+                    // RECORDED. See the first callback for why this is
+                    // structure rather than tidiness.
+                    ProxyRequestToBeSentAction refuse =
+                            ProxyRequestToBeSentAction.drop();
                     // The entry will never be answered: this request is not
                     // going to the target, so no response can arrive for it.
                     // Taken rather than left to age out, so the map's bound is
-                    // spent on requests that are actually in flight -- and the
-                    // source it carries is the attribution the FIRST callback
-                    // made, which is the only one either callback ever makes.
-                    Pending.Entry e = pending.take(r.messageId());
-                    capture.offer(new Denied(method, url, errorClass, detail,
-                                             e == null ? Source.UNATTRIBUTED : e.source()));
-                    return ProxyRequestToBeSentAction.drop();
+                    // spent on requests that are actually in flight.
+                    try {
+                        pending.take(r.messageId());
+                        capture.offer(new Denied(method, url, errorClass,
+                                                 detail, source));
+                    } catch (Throwable ignored) {
+                        // See the first callback: the counter is the thing
+                        // that threw, so there is nothing left to count with,
+                        // and the refusal below stands regardless.
+                    }
+                    return refuse;
                 }
                 return ProxyRequestToBeSentAction.continueWith(r);
             }
@@ -18650,12 +19585,17 @@ public class HxExtension implements BurpExtension {
                     // arrays are post-redaction, which makes an Observed
                     // holding raw bytes a live credential sitting in a queue.
                     byte[] reqBytes = r.initiatingRequest().toByteArray().getBytes();
-                    // Empty, because the proxy path injects no identity of its
-                    // own -- but still REQUIRED, and constructed over the same
-                    // array the ranges would have been measured from: Injected
-                    // compares by identity and refuses a different array.
-                    byte[] redactedReq = redactor.redactRequest(
-                            reqBytes, new Redactor.Injected(reqBytes));
+                    // redactObservedRequest, NOT redactRequest, and the
+                    // difference is the whole of §7 on this path. redactRequest
+                    // replaces byte ranges THIS EXTENSION INJECTED; the proxy
+                    // path injects nothing, so the Injected it would be handed
+                    // is empty, and an empty one makes redactRequest a
+                    // `return raw.clone()` -- the operator's live Cookie and
+                    // Authorization headers content-addressed into the blob
+                    // store verbatim. That was the shipped state for one
+                    // commit. Job 4 matches header NAMES, which is all there
+                    // is for traffic hx watched rather than composed.
+                    byte[] redactedReq = redactor.redactObservedRequest(reqBytes);
                     byte[] redactedResp = redactor.redactResponse(
                             r.toByteArray().getBytes());
                     long ms = (System.nanoTime() - e.startNanos()) / 1_000_000L;
@@ -18738,17 +19678,35 @@ public class HxExtension implements BurpExtension {
      * drops the method allowlist, the dangerous-path denylist, the rate limit
      * and the budget. The refusal is not caught and retried as OPERATOR.
      *
-     * WHAT THIS METHOD DOES NOT DO IS RANGE-CHECK, and that is deliberate
-     * rather than an omission. `70000` parses fine and is handed over as
-     * itself; {@link Source#forListenerPort} answers UNATTRIBUTED for anything
-     * outside 1..65535, and duplicating that test here would add a branch no
-     * input could separate from its absence -- the same finding Source's own
-     * comment records about a `crawlerPort > 0` clause it removed. The
-     * five-digit bound below is NOT that test wearing a disguise: it exists
-     * only because {@code Integer.parseInt} THROWS on a longer run of digits,
-     * and a throw out of here reaches a Burp proxy thread with no answer for
-     * it. `ProxyGateTest.theListenerInterfaceIsParsedOrRefused` pins the
-     * boundary from both sides.
+     * WHAT THIS METHOD DOES NOT DO IS CHECK THE VALUE RANGE, and that is
+     * deliberate rather than an omission. `70000` parses fine and is handed
+     * over as itself; {@link Source#forListenerPort} answers UNATTRIBUTED for
+     * anything outside 1..65535, and duplicating that test here would add a
+     * branch no input could separate from its absence -- the same finding
+     * Source's own comment records about a `crawlerPort > 0` clause it
+     * removed.
+     *
+     * IT DOES BOUND THE DIGIT COUNT, and the earlier version of this paragraph
+     * gave the wrong reason for it. It said the bound "exists only because
+     * {@code Integer.parseInt} THROWS on a longer run of digits" -- true of A
+     * bound, false of THIS bound: nine digits always parse, so `> 5` also
+     * rejects every 6-to-9-digit tail that would have parsed fine. That IS a
+     * range check, on the digit count rather than on the value.
+     *
+     * MEASURED, because the obvious correction was wrong too: it is NOT "any
+     * bound below eleven". {@code Integer.parseInt} takes "999999999" and
+     * "2147483647" and THROWS on "2147483648" -- both ten digits. So the
+     * requirement is a bound of at most NINE, and a `> 10` written in the
+     * belief that ten digits always parse would let a 10-digit tail throw out
+     * of here onto a Burp proxy thread. Five is chosen because no TCP port has
+     * six digits, so nothing this bound rejects could have been a listener,
+     * and it is comfortably inside nine. What no input in this suite separates
+     * is `> 5` from `> 9`: both send a 30-digit tail to NO_PORT and both hand
+     * `70000` over, and the behaviour is identical either way because
+     * `forListenerPort`'s range test comes first.
+     * `ProxyGateTest.theListenerInterfaceIsParsedOrRefused` pins the two ends
+     * -- the 30-digit tail, which separates the bound from its absence, and
+     * `70000`, which separates this method from `Source`.
      *
      * NOT the same thing as an unrecognised port. A port that PARSES and is
      * not the crawler's is the operator, deliberately -- see Source, which
