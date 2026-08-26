@@ -5,6 +5,8 @@ import pytest
 from click.testing import CliRunner
 
 from hx import cli
+from hx import engagement as eng_mod
+from hx import run as run_mod
 
 
 def test_new_creates_engagement(tmp_path: Path):
@@ -288,3 +290,153 @@ def test_new_reports_a_clean_error_when_root_is_not_a_directory(tmp_path: Path):
     )
     assert result.exit_code != 0
     assert "Traceback" not in result.output
+
+
+# --- Task 8: `hx capture start/stop`, and `hx info` that admits its gaps ---
+
+
+@pytest.fixture
+def engagement(tmp_path: Path) -> Path:
+    """A real engagement, made the way an operator makes one.
+
+    Returns the ENGAGEMENT directory itself (`tmp_path / name`), not the
+    engagements root `new --root` takes. `info` and `capture` both open a
+    single engagement directly (`eng_mod.open_` checks for `hx.db` right at
+    the path it is given), the same way `test_info_reports_engagement` above
+    passes `tmp_path / "acme"` -- the child directory, never `tmp_path`
+    itself -- to `info --root`.
+    """
+    result = CliRunner().invoke(cli.main, [
+        "new", "acme-2026-09", "--client", "Acme Corp",
+        "--scope", "https://app.acme.com/*", "--root", str(tmp_path),
+    ])
+    assert result.exit_code == 0, result.output
+    return tmp_path / "acme-2026-09"
+
+
+@pytest.fixture
+def engagement_with_drops(engagement: Path) -> Path:
+    """A run recorded 4 dropped exchanges, through `hx.run`, not raw SQL."""
+    eng = eng_mod.open_(engagement)
+    try:
+        run_id = run_mod.open_run(
+            eng.db, engagement_id=eng.id, kind="browse",
+            safety_profile=eng.config.safety_profile)
+        run_mod.count_drop(eng.db, run_id=run_id, n=4)
+    finally:
+        eng.db.close()
+    return engagement
+
+
+@pytest.fixture
+def engagement_with_stale_run(engagement: Path) -> Path:
+    """A run whose heartbeat is old enough for `reap_stale` to find it.
+
+    `reap_stale`'s own default window is `IDLE_CLOSE_US * 2`, not
+    `IDLE_CLOSE_US` -- the two windows are deliberately different (idle vs.
+    dead-harness), per `run.reap_stale`'s docstring. Backdating by a single
+    `IDLE_CLOSE_US` would not clear reap_stale's own default threshold, so
+    this backdates well past it.
+    """
+    eng = eng_mod.open_(engagement)
+    try:
+        run_id = run_mod.open_run(
+            eng.db, engagement_id=eng.id, kind="browse",
+            safety_profile=eng.config.safety_profile)
+        stale_at = eng_mod.now_us() - (run_mod.IDLE_CLOSE_US * 3)
+        run_mod.heartbeat(eng.db, run_id=run_id, now_us=stale_at)
+    finally:
+        eng.db.close()
+    return engagement
+
+
+def test_capture_start_opens_a_named_run(engagement):
+    result = CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "browse" in result.output
+
+
+def test_capture_start_refuses_a_kind_the_schema_will_not_take(engagement):
+    """The vocabulary lives in run.RUN_KINDS and in a CHECK. A bad --kind must
+    be refused by the CLI with a readable message, not by SQLite with
+    `CHECK constraint failed: run`."""
+    result = CliRunner().invoke(cli.main,
+        ["capture", "start", "--kind", "scheduled", "--root", str(engagement)])
+    assert result.exit_code != 0
+    assert "scheduled" in result.output
+
+
+def test_capture_stop_closes_it(engagement):
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+
+
+def test_capture_stop_closes_every_live_run(engagement):
+    """Two kinds live at once is the normal case, not the exotic one: a crawl
+    runs while a human browses. An operator typing `stop` means both."""
+    for kind in ("browse", "crawl"):
+        CliRunner().invoke(cli.main,
+            ["capture", "start", "--kind", kind, "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "2" in result.output
+    # ...and assert against the STORE, not the wording: no run of this
+    # engagement is left with status='running'.
+    eng = eng_mod.open_(engagement)
+    try:
+        still_running = eng.db.execute(
+            "SELECT COUNT(*) AS n FROM run WHERE status='running'").fetchone()["n"]
+        assert still_running == 0
+    finally:
+        eng.db.close()
+
+
+def test_capture_stop_with_no_run_says_so_rather_than_failing(engagement):
+    """An operator typing stop twice has made no mistake worth an error."""
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "no" in result.output.lower()
+
+
+def test_info_reports_drops_loudly_when_there_are_any(engagement_with_drops):
+    """S5: a run with drops has coverage numbers that are a FLOOR, not a
+    count. An operator who does not know that reads the surface count as
+    complete."""
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement_with_drops)])
+    assert "floor" in result.output.lower()
+    # The COUNT, in its own context. A bare `"4" in output` passes on any
+    # unrelated 4 -- four surfaces, a timestamp digit -- which is the shape of
+    # a test that reads green for the wrong reason.
+    assert "4 dropped" in result.output
+
+
+def test_info_says_nothing_alarming_when_there_are_no_drops(engagement):
+    """The separating case. A warning that is always present is not a
+    warning."""
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert "floor" not in result.output.lower()
+
+
+def test_info_reaps_stale_runs_before_reporting(engagement_with_stale_run):
+    """Otherwise the first thing an operator sees after a crash is a run that
+    claims to be running."""
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement_with_stale_run)])
+    assert "error" in result.output.lower()
+
+
+def test_capture_start_is_idempotent(engagement):
+    """`start` calls `current_run`, not `open_run`: typing `start` twice must
+    resume the one live run of that kind, not open a second one. Row E of the
+    Task 8 sabotage table -- if `start` called `open_run` instead, nothing
+    else here would catch it."""
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    eng = eng_mod.open_(engagement)
+    try:
+        running = eng.db.execute(
+            "SELECT COUNT(*) AS n FROM run WHERE status='running' AND kind='browse'"
+        ).fetchone()["n"]
+        assert running == 1
+    finally:
+        eng.db.close()
