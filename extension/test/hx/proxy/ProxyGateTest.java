@@ -21,7 +21,7 @@ import java.util.Map;
  * sabotage table are that split turned off in each direction, and each
  * reddens only its own source's checks: neither is caught by the other's.
  *
- * Hand-rolled runner, like the other nine classes: JUnit would be a
+ * Hand-rolled runner, like the other eleven classes: JUnit would be a
  * dependency, and this jar has none.
  */
 public class ProxyGateTest {
@@ -67,6 +67,8 @@ public class ProxyGateTest {
           ProxyGateTest::anUnattributableSourceIsRefused);
         t("the listener port decides the source",
           ProxyGateTest::theListenerPortDecides);
+        t("a listener interface is parsed or refused, never guessed at",
+          ProxyGateTest::theListenerInterfaceIsParsedOrRefused);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -311,5 +313,72 @@ public class ProxyGateTest {
         // answered OPERATOR.
         check("and NO_PORT is one of those numbers (" + Source.NO_PORT + ")",
               Source.NO_PORT < 1 || Source.NO_PORT > 65535);
+    }
+
+    /**
+     * The other half of the attribution, and the only half that touches a
+     * string a Burp handed over.
+     *
+     * {@link Source} takes two ints and does no parsing on purpose. Something
+     * has to turn `listenerInterface()` into one of those ints, and that
+     * something lives in HxExtension -- a file nothing can drive, except this
+     * one static method, which is why it is public. Every failure here has to
+     * answer {@link Source#NO_PORT}, because the alternative is a number that
+     * might land on the crawler's port or on the operator's branch by
+     * accident: a parse that GUESSES is attribution decided by a malformed
+     * string.
+     *
+     * MEASURED FORM, from docs/burp-proxy-measurements.md Q1:
+     * `"127.0.0.1:8080"`, a different port per listener, over plain HTTP and
+     * through a CONNECT tunnel.
+     */
+    static void theListenerInterfaceIsParsedOrRefused() {
+        check("the measured form parses (" + hx.HxExtension.listenerPort("127.0.0.1:8080") + ")",
+              hx.HxExtension.listenerPort("127.0.0.1:8080") == 8080);
+        check("and a different listener gives a different port",
+              hx.HxExtension.listenerPort("127.0.0.1:8081") == 8081);
+        // THE LAST colon, not the first. An IPv6 interface puts colons inside
+        // the address, and splitting on the first would read `:1]:8080` --
+        // non-numeric, so NO_PORT, so UNATTRIBUTED, so every request on an
+        // IPv6 listener REFUSED. Fail-closed, but it would refuse a working
+        // configuration and read as a broken jar.
+        check("the port is taken after the LAST colon, so an IPv6 interface works ("
+              + hx.HxExtension.listenerPort("[::1]:8080") + ")",
+              hx.HxExtension.listenerPort("[::1]:8080") == 8080);
+
+        // Everything else is NO_PORT. Each of these is a shape a caller in
+        // trouble actually produces, and each would otherwise have to be
+        // invented into a number.
+        check("a null interface is NO_PORT",
+              hx.HxExtension.listenerPort(null) == Source.NO_PORT);
+        check("an interface with no colon at all is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1") == Source.NO_PORT);
+        check("an empty tail after the colon is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1:") == Source.NO_PORT);
+        check("a non-numeric tail is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1:http") == Source.NO_PORT);
+        check("and so is a tail that is only PARTLY numeric",
+              hx.HxExtension.listenerPort("127.0.0.1:8080x") == Source.NO_PORT);
+        check("a negative tail is NO_PORT, not a negative port",
+              hx.HxExtension.listenerPort("127.0.0.1:-1") == Source.NO_PORT);
+        check("an empty string is NO_PORT",
+              hx.HxExtension.listenerPort("") == Source.NO_PORT);
+        // THE INPUT THAT SEPARATES THE LENGTH BOUND FROM ITS ABSENCE. Without
+        // it `Integer.parseInt` THROWS on a run of digits past 2^31 -- out of
+        // the handler, on a Burp proxy thread, for a request that would then
+        // be neither allowed nor refused nor recorded. Every other overlong
+        // number is answered by Source's own range test; this one never
+        // reaches it.
+        check("a 30-digit tail is NO_PORT rather than an exception",
+              hx.HxExtension.listenerPort("127.0.0.1:" + "9".repeat(30))
+              == Source.NO_PORT);
+        // And a number that parses but is not a port: handed over as itself,
+        // because Source's range test is the one place that rule lives. Named
+        // here so the boundary between the two files is visible from both
+        // sides -- this method does NOT range-check.
+        check("a 5-digit number out of TCP range is handed over as itself, for "
+              + "Source to refuse (" + hx.HxExtension.listenerPort("127.0.0.1:70000") + ")",
+              hx.HxExtension.listenerPort("127.0.0.1:70000") == 70000
+              && Source.forListenerPort(70000, 8081) == Source.UNATTRIBUTED);
     }
 }

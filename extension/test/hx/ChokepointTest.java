@@ -116,8 +116,8 @@ public class ChokepointTest {
           () -> theBridgeNamesNothingInTheProxyPackage(sources));
         t("theDeprecatedAccessorsAreUnusedEverywhere",
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
-        t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
-          () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
+        t("everyDecisionReadsOneAuthorisationSnapshot",
+          () -> everyDecisionReadsOneAuthorisationSnapshot(sources));
         t("theStripperIsNotVacuousAndDoesNotOverreach",
           ChokepointTest::theStripperIsNotVacuousAndDoesNotOverreach);
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
@@ -127,6 +127,12 @@ public class ChokepointTest {
         t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
+        t("theSecondEnforcementPointIsRegisteredAndAsksTheGate",
+          ChokepointTest::theSecondEnforcementPointIsRegisteredAndAsksTheGate);
+        t("theGateDecidesBeforeAnythingIsQueued",
+          ChokepointTest::theGateDecidesBeforeAnythingIsQueued);
+        t("bothHalvesAreRedactedBeforeTheRecordIsQueued",
+          ChokepointTest::bothHalvesAreRedactedBeforeTheRecordIsQueued);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -326,23 +332,91 @@ public class ChokepointTest {
               scope == 0);
     }
 
+    static final String BRIDGE_CLIENT =
+            Path.of("src", "hx", "bridge", "BridgeClient.java").toString();
+
     /**
-     * A WIRE-EXISTS needle -- it proves a READ happens -- so it reads
-     * {@link #code} and a commented-out `this.authorisation()` cannot supply
-     * the one it is looking for.
+     * ONE READ PER DECISION, AND NO READ THAT IS NOT A DECISION'S.
      *
-     * BridgeClient's send arm writes `this.authorisation()` with an explicit
-     * receiver precisely so this count can be taken. A bare `authorisation()`
-     * there reads as zero here and turns this check red -- which is the
-     * correct failure, not a false alarm to be quietened by loosening the
-     * needle.
+     * This check counted ONE read in the whole of extension/src until Task 7,
+     * and one was right while the send arm was the only thing deciding.
+     * Wiring the second enforcement point makes it THREE: the send arm, the
+     * proxy request handler, and the scope re-check before the bytes leave.
+     *
+     * THE NUMBER IS NOT WHAT MATTERS AND WIDENING IT TO 3 WOULD PIN NOTHING.
+     * `configEpoch()` and `scopeConfig()` are two reads of one record and can
+     * straddle a commit -- measured wrong in 393/400 trials, and wrong in the
+     * unsafe direction. What that costs is a decision assembled from two
+     * halves of two authorisations, and the shape of that bug is A SECOND READ
+     * INSIDE ONE DECISION, which a bare total of 3 cannot tell from one
+     * decision moved to another file. So the reads are pinned to the decisions
+     * they belong to, DERIVED from the decision sites rather than restated:
+     *
+     *   - BridgeClient reads once, for the send arm;
+     *   - the entry point reads exactly as many times as it DECIDES
+     *     (`gate.decide(` + `decideScopeOnly(`), which is the equality that
+     *     turns a second read inside either handler red;
+     *   - and each read comes BEFORE the decision it feeds, in order, so the
+     *     equality cannot be satisfied by two reads in one handler and none in
+     *     the other;
+     *   - and nothing else in extension/src reads it at all.
+     *
+     * THE WITNESS FOR THE WIDENING, in the shape
+     * `test_vocabularies_match_the_schema.py` uses for its own: the equality
+     * above is vacuous if both sides are zero -- a file with no reads and no
+     * decisions satisfies it -- so the entry point's decision count is
+     * asserted to be 2 outright. Deleting either handler is then red here as
+     * well as in the registration counts.
+     *
+     * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
+     * `this.authorisation()` cannot supply one. BridgeClient's send arm writes
+     * `this.authorisation()` with an explicit receiver precisely so the count
+     * can be taken; a bare `authorisation()` there reads as zero and turns
+     * this red, which is the correct failure rather than a reason to loosen
+     * the needle.
      */
-    static void theAuthorisationSnapshotIsReadInExactlyOnePlace(List<Path> sources)
+    static void everyDecisionReadsOneAuthorisationSnapshot(List<Path> sources)
             throws IOException {
         int total = 0;
-        for (Path p : sources) total += count(code(p), ".authorisation()");
-        check("the whole extension reads the Authorisation snapshot in exactly one "
-              + "place, not " + total, total == 1);
+        List<String> elsewhere = new ArrayList<>();
+        for (Path p : sources) {
+            int n = count(code(p), ".authorisation()");
+            total += n;
+            if (n > 0 && !p.toString().equals(BRIDGE_CLIENT)
+                      && !p.toString().equals(ENTRY_POINT))
+                elsewhere.add(p + " x" + n);
+        }
+        String bridge = code(Path.of(BRIDGE_CLIENT));
+        String entry = code(Path.of(ENTRY_POINT));
+        int inBridge = count(bridge, ".authorisation()");
+        int inEntry = count(entry, ".authorisation()");
+        int decisions = count(entry, "gate.decide(") + count(entry, "decideScopeOnly(");
+
+        check("the send arm reads the Authorisation snapshot once (" + inBridge + ")",
+              inBridge == 1);
+        check("the entry point decides twice -- the proxy request handler and "
+              + "the pre-send scope re-check (" + decisions + ")", decisions == 2);
+        check("and reads the snapshot exactly once per decision (" + inEntry
+              + " reads, " + decisions + " decisions)", inEntry == decisions);
+        check("nothing else in extension/src reads it at all " + elsewhere,
+              elsewhere.isEmpty());
+        check("so the whole extension reads it " + (1 + decisions) + " times, "
+              + "once per decision (" + total + ")", total == 1 + decisions);
+
+        // Each read AHEAD of the decision it feeds. Without this, two reads in
+        // one handler and none in the other satisfies the equality above --
+        // and "none in the other" is a decision taken under an authorisation
+        // fetched for a different request.
+        int read1 = entry.indexOf(".authorisation()");
+        int gate = entry.indexOf("gate.decide(");
+        int read2 = entry.indexOf(".authorisation()", read1 + 1);
+        int scope = entry.indexOf("decideScopeOnly(");
+        check("the request handler reads before it asks the gate (" + read1
+              + " < " + gate + ")", read1 >= 0 && read1 < gate);
+        check("and the scope re-check reads its own, after that gate call and "
+              + "before its own question (" + gate + " < " + read2 + " < "
+              + scope + ")",
+              read2 > gate && read2 < scope);
     }
 
     /**
@@ -372,10 +446,39 @@ public class ChokepointTest {
      * `ServerSocketChannel`, neither of which contains `Socket(`. The one
      * that does the most work is `InetSocketAddress` -- a SocketChannel is
      * harmless until something gives it a network address to connect to.
+     *
+     * THE FIRST NEEDLE WAS `new Socket(` AND IT WAS BLIND TO A QUALIFIED NAME,
+     * measured on 2026-08-25 as Task 7's row G. This class's own javadoc above
+     * says the family "needs no import line to become possible"; the needle
+     * then required the one spelling that DOES need one. Three runs, each a
+     * single edit to `Pending.size()`, against a clean 12 summary lines / 0
+     * FAIL / rc=0:
+     *
+     *     new java.net.Socket()                       12 lines, 0 FAIL, rc=0
+     *     new java.net.Socket("127.0.0.1", 1).close() 12 lines, 0 FAIL, rc=0
+     *     new Socket("127.0.0.1", 1) + the import     12 lines, 1 FAIL, rc=1
+     *
+     * The middle one is a WORKING TCP egress -- the two-argument constructor
+     * connects, so it needs no `InetSocketAddress` either -- sitting in
+     * extension/src with every check green. The needle is `Socket(` now, which
+     * catches the qualified and unqualified spellings alike and `new
+     * ServerSocket(` with them. It cost nothing to tighten: `Socket(` appears
+     * ZERO times in extension/src today, measured across all 25 sources, for
+     * the reason the paragraph above gives -- the unix-domain path spells
+     * `SocketChannel.open(` and `ServerSocketChannel`, and neither has the
+     * paren against the word.
+     *
+     * The other five needles have no such blind spot and were not touched: a
+     * qualified `java.net.DatagramSocket`, `java.net.http.HttpClient` or
+     * `java.net.InetSocketAddress` still contains its own type name, and
+     * `openConnection(`/`openStream(` are calls on an instance, so no
+     * qualification of the type can hide them. `new ` glued to a simple name
+     * was the one shape that could.
      */
     static void noSecondEgressFamilyExists(List<Path> sources) throws IOException {
         String[] needles = {
-            "new Socket(",        // a TCP client socket, straight from the JDK
+            "Socket(",            // a TCP client socket, straight from the JDK,
+                                  // qualified or not -- see the javadoc above
             "InetSocketAddress",  // ...or the address that turns a channel into one
             "openConnection(",    // URL -> URLConnection / HttpURLConnection
             "openStream(",        // URL.openStream(), the one-liner version
@@ -703,6 +806,127 @@ public class ChokepointTest {
               request > guard);
         check("and the egress call is inside it too (" + egress + " > " + guard + ")",
               egress > guard);
+    }
+
+    /**
+     * S4's SECOND enforcement point exists, once, and the gate is inside it.
+     *
+     * A handler that forwards without asking is a third egress path wearing
+     * the second one's name -- and unlike the send path there is nothing
+     * behind it: the proxy is Burp's own socket, so a request the handler
+     * passes through has crossed no rule of ours at all.
+     *
+     * The FOURTH count is the one that is easiest to argue away. Montoya's
+     * ProxyRequestHandler has two callbacks, and Burp's INTERCEPT TAB sits
+     * between them: an operator can rewrite the request there, host included.
+     * A gate at the first callback only therefore lets an EDITED request leave
+     * with no decision about it, which is the one hole in this system where
+     * bytes could cross the engagement boundary. `decideScopeOnly(` and not
+     * `decide(` is deliberate and is counted as itself: the full question
+     * spends a rate token and a budget slot, so asking it twice would charge a
+     * crawler twice for one request -- and
+     * {@link #bothHalvesOfTheDecisionAreAskedAndOnlyOnce} could not see that,
+     * because it counts Policy's internal halves on the send path.
+     *
+     * WIRE-EXISTS needles, all four, so they read {@link #code}: prose cannot
+     * register a handler or ask a question. Taken in {@link #ENTRY_POINT},
+     * which is the only file allowed to name burp.* at all -- see
+     * {@link #montoyaIsConfinedToTheEntryPoint}, which is what makes that
+     * narrowing safe rather than convenient.
+     *
+     * WHAT THESE DO NOT SEE: whether the handler HONOURS the verdict. A
+     * `gate.decide(...)` whose result is dropped on the floor satisfies every
+     * count here, and only Task 9 driving real Burp can catch it. The two
+     * position checks below cover the orderings; this one covers existence.
+     */
+    static void theSecondEnforcementPointIsRegisteredAndAsksTheGate()
+            throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int n1 = count(entry, "registerRequestHandler(");
+        int n2 = count(entry, "registerResponseHandler(");
+        int n3 = count(entry, "gate.decide(");
+        int n4 = count(entry, "decideScopeOnly(");
+        check("registerRequestHandler appears exactly once (" + n1 + ")", n1 == 1);
+        check("registerResponseHandler appears exactly once (" + n2 + ")", n2 == 1);
+        check("the proxy handler asks the gate (" + n3 + ")", n3 == 1);
+        check("scope is re-decided before the request is sent (" + n4 + ")",
+              n4 == 1);
+    }
+
+    /**
+     * ENFORCEMENT NEVER WAITS ON RECORDING.
+     *
+     * The gate is asked before anything is offered to the capture queue. Put
+     * the other way round -- offer first, decide after -- and every refused
+     * request has already been queued as an exchange the harness will record,
+     * and a full or wedged queue is suddenly in the path of a DECISION rather
+     * than of a record. S4 is explicit that a wedged harness changes what hx
+     * KNOWS, never what it ALLOWS; this is that sentence made structural.
+     *
+     * A position check, and the honest reason is the same one
+     * {@link #theAdapterBuildsItsRequestInsideTheTry} gives: HxExtension needs
+     * Burp to run at all. Offsets are taken in {@link #code}, whose stripper
+     * preserves length, so an index into it is an index into the file and a
+     * commented decoy cannot move either end.
+     *
+     * THE ANTI-VACUITY CHECKS ARE LOAD-BEARING, not decoration. `indexOf`
+     * answers -1 for a needle that is not there, and -1 is less than every
+     * real offset -- so DELETING the gate call would satisfy "the gate comes
+     * first" perfectly. The presence checks are what make the mutation red.
+     *
+     * WHAT IT DOES NOT SEE: which handler each needle is in. These are
+     * FIRST-OCCURRENCE offsets over the whole file, not brace nesting, so a
+     * `gate.decide(` in one handler ahead of a `capture.offer(` in another
+     * satisfies it. There is exactly one of the former, so today it cannot
+     * drift; a second decision site would need this check rewritten around
+     * the handler's own body, the way the adapter check anchors at its
+     * declaration.
+     */
+    static void theGateDecidesBeforeAnythingIsQueued() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int decide = entry.indexOf("gate.decide(");
+        int offer = entry.indexOf("capture.offer(");
+        check("the gate is asked in " + ENTRY_POINT + " (" + decide + ")",
+              decide >= 0);
+        check("and something is queued there (" + offer + ")", offer >= 0);
+        check("and the decision comes first (" + decide + " < " + offer + ")",
+              decide >= 0 && offer >= 0 && decide < offer);
+    }
+
+    /**
+     * BOTH HALVES ARE REDACTED BEFORE THE RECORD IS QUEUED.
+     *
+     * S7 makes the blob store content-addressed, so a credential that reaches
+     * the hashing step on the Python side is ALREADY UNRECOVERABLE -- the
+     * digest is computed over the secret and the file is written under it.
+     * Redaction therefore cannot be something the drain or the far side does
+     * later. {@link hx.proxy.Observed}'s own javadoc says its byte arrays are
+     * post-redaction; an Observed holding raw bytes is a live credential
+     * sitting in a queue, and this is the check that says so.
+     *
+     * The needle for the queueing end is `capture.offer(new Observed`, not
+     * `capture.offer(`: the denial arm offers first and carries no bytes at
+     * all, and a check anchored on the earlier offer would be comparing the
+     * redaction of one record against the queueing of another.
+     *
+     * Anti-vacuity, again load-bearing: deleting `redactRequest(` outright --
+     * offering the raw bytes -- leaves its index at -1, which is less than
+     * every real offset, so the ordering alone would go GREEN on exactly the
+     * mutation this exists to catch.
+     */
+    static void bothHalvesAreRedactedBeforeTheRecordIsQueued() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int req = entry.indexOf("redactRequest(");
+        int resp = entry.indexOf("redactResponse(");
+        int offer = entry.indexOf("capture.offer(new Observed");
+        check("the request half is redacted in " + ENTRY_POINT + " (" + req + ")",
+              req >= 0);
+        check("and the response half too (" + resp + ")", resp >= 0);
+        check("and an exchange is queued there (" + offer + ")", offer >= 0);
+        check("the request half is redacted before the record is queued ("
+              + req + " < " + offer + ")", req >= 0 && offer >= 0 && req < offer);
+        check("and so is the response half (" + resp + " < " + offer + ")",
+              resp >= 0 && offer >= 0 && resp < offer);
     }
 
     static int count(String haystack, String needle) {
