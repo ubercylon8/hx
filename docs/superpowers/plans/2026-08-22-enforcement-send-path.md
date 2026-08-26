@@ -10992,7 +10992,7 @@ public class RedactorTest {
         check("redactRequest with an empty Injected returns the credential "
               + "VERBATIM -- it is not a redaction of observed traffic",
               viaInjected.contains(COOKIE_SECRET));
-        check("...while job 4 removes it", 
+        check("...while job 4 removes it",
               !text(r.redactObservedRequest(raw)).contains(COOKIE_SECRET));
     }
 
@@ -11426,6 +11426,21 @@ public final class Redactor {
      * page, an API error dump, a captured request pasted into a form -- and
      * rewriting it would corrupt the evidence a check reads. The head ends at
      * the first empty line.
+     *
+     * "EVERY HEAD LINE IS MATCHED AS A FIELD" IS TRUE OF LF-TERMINATED LINES
+     * AND OF NOTHING ELSE. {@link #lineStartAfter} scans for {@code \n}, so a
+     * message using BARE CR as its terminator is one line to this scan, has no
+     * name before its first colon that matches, and is copied through
+     * verbatim. That is a passthrough of a credential, and it is left as one
+     * deliberately: RFC 9112 2.2 requires CRLF and permits a bare LF, and
+     * nothing permits a bare CR -- a server would not parse such a message as
+     * HTTP either, so nothing on the wire reaches this shape. It is named here
+     * because the sentence above would otherwise be a claim wider than the
+     * code, not because a bare-CR parser is wanted. The other four verbatim
+     * passthroughs a review found are the same kind and are named where they
+     * arise: a NUL inside a field name, a fold following a NON-credential
+     * header (per RFC that text is the other header's value), a field name
+     * split across a fold, and a pipelined second request.
      *
      * NO REQUEST LINE IS RECOGNISED, and that is deliberate rather than an
      * omission. {@link #redactResponse} has to know its status line, because
@@ -17608,28 +17623,37 @@ import java.util.stream.Stream;
  * assert the whole family appears once there, so a second setting cannot hide
  * behind the first.
  *
- * ORDERING IS NOT DATAFLOW, AND THAT APPLIES TO EVERY POSITION CHECK IN THIS
- * FILE. A position check says one needle appears before another. It says
- * NOTHING about whether the first one's RESULT reaches the second, and there
- * are two shapes it cannot see at all:
+ * WHAT EVERY CHECK IN THIS FILE IS, AND THEREFORE WHAT NONE OF THEM CAN DO.
+ * They are TEXT SCANS. They see NAMES, not VALUES. That single sentence is a
+ * better guide than any list of shapes, and the list is why: this class has
+ * enumerated its own blind spot three times and been wrong about it twice.
  *
- *   - A VALUE COMPUTED AND THEN NOT USED. MEASURED on this file's own
- *     {@link #bothHalvesAreRedactedBeforeTheRecordIsQueued}: with both
- *     redaction calls left exactly where they were and the queued record's two
- *     byte arguments changed to the RAW locals -- one identifier each, no code
- *     moved, nothing deleted -- the whole suite read 12 summary lines / 0 FAIL
- *     / rc=0 while raw request and response bytes went into a
- *     content-addressed store. Every offset in that check was still correct.
- *   - AN IDENTITY FUNCTION. `x = f(y)` with `f` returning its argument
- *     satisfies presence, order and every use-count this class can take.
+ *   - Round 1 said the checks pin that the calls happen in the right ORDER. A
+ *     value computed and then not used defeated that: both redaction calls
+ *     left exactly where they were and the queued record's two byte arguments
+ *     changed to the RAW locals -- one identifier each -- measured at 12
+ *     summary lines / 0 FAIL / rc=0 with raw bytes going into a
+ *     content-addressed store, every offset still correct.
+ *   - Round 2 pinned DATAFLOW: each local bound once, read once, the consuming
+ *     expression delimited and searched for the names it must not contain. It
+ *     declared its residual to be "an identity function". That was too narrow
+ *     in the direction that flatters the check. The real residual is ANY CALL
+ *     WRAPPING THE VALUE AT ITS USE SITE, whatever that call returns -- a
+ *     helper that DISCARDS its redacted argument and re-fetches the raw bytes
+ *     is not an identity function and reads 12 / 0 FAIL / rc=0, so a reader
+ *     taking the old sentence as the boundary would judge it covered.
+ *   - And dataflow is not APPLICATION. Swapping two same-typed functions
+ *     between two same-typed arguments leaves every name, every count and
+ *     every offset intact: measured at 12 / 1880 ok / 0 FAIL / rc=0 with both
+ *     halves of an exchange leaking.
  *
- * The first is closable here, and is closed, by asserting USE as well as
- * ORDER: each local bound once and read once, and the consuming expression
- * delimited textually so it can be searched for the names it must NOT contain.
- * The second is not closable here at all and belongs to a behavioural test of
- * the function itself -- for redaction, RedactorTest's job-4 cases. When a
- * position check is the only thing holding a property, say which of these two
- * it is blind to rather than leaving the next reader to find out by measuring.
+ * So: A TEXT SCAN CANNOT SEE THROUGH A CALL, and it cannot tell which VALUE a
+ * name holds. Do not write a check here whose property depends on either, and
+ * when one is the only thing holding a property, say so and name the layer
+ * that actually holds it. For the redaction that layer is now
+ * `RecorderTest`, which asserts over BYTES -- see
+ * {@link #theRecordIsBuiltByTheRecorderAndNeverInline} for what was moved out
+ * of the text's reach and why.
  */
 public class ChokepointTest {
 
@@ -17689,8 +17713,8 @@ public class ChokepointTest {
           ChokepointTest::theRecordingStructuresHoldTheirMonitors);
         t("theGateDecidesBeforeAnythingIsQueued",
           ChokepointTest::theGateDecidesBeforeAnythingIsQueued);
-        t("bothHalvesAreRedactedBeforeTheRecordIsQueued",
-          ChokepointTest::bothHalvesAreRedactedBeforeTheRecordIsQueued);
+        t("theRecordIsBuiltByTheRecorderAndNeverInline",
+          () -> theRecordIsBuiltByTheRecorderAndNeverInline(sources));
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -17893,6 +17917,16 @@ public class ChokepointTest {
     static final String BRIDGE_CLIENT =
             Path.of("src", "hx", "bridge", "BridgeClient.java").toString();
 
+    /** The record itself, which declares the constructor the count below
+     *  cannot help matching. */
+    static final String OBSERVED =
+            Path.of("src", "hx", "proxy", "Observed.java").toString();
+
+    /** The one file that turns two raw halves into a redacted record. It has
+     *  no burp.* type in it, which is what lets RecorderTest execute it. */
+    static final String RECORDER =
+            Path.of("src", "hx", "proxy", "Recorder.java").toString();
+
     /** The issuing path: the one file that interleaves S7's credential refusal
      *  between Policy's two halves. */
     static final String SENDER =
@@ -18074,31 +18108,38 @@ public class ChokepointTest {
      * `new URL` without the paren, which says the same thing, and `URL(` is 0.
      * The other four additions were 0 to begin with.
      *
-     * WHAT THIS LIST STILL EXCLUDES, named rather than claimed away, because a
-     * falsifier is itself a claim about the space of failures and this one has
-     * been wrong twice:
+     * WHAT THIS LIST EXCLUDES IS EVERY SPELLING NOT IN IT, and that is the
+     * whole of it. The bullets that used to stand here read as a survey of the
+     * gap and were not one -- the first named `uri.toURL().getContent()` as an
+     * escape, and it is CAUGHT, because `toURL(` contains `URL(`. A list of
+     * exclusions that under-states the check's reach in one bullet and
+     * over-states it in the shape it misses is worse than no list, which is
+     * this class's own Rule 4 turned on itself for the third time.
      *
-     *   - EGRESS THROUGH AN OBJECT WHOSE TYPE IS NEVER SPELLED HERE.
-     *     `uri.toURL().getContent()`, a `Socket` from a `SocketFactory`, a
-     *     channel from a provider, anything reached by reflection. Every
-     *     needle below is a type name or a call spelling; a value that arrives
-     *     already built is invisible to all of them. This is the shape both
-     *     escapes so far have had, one generation apart, and adding type names
-     *     does not close it.
-     *   - A DEPENDENCY. This jar has none today, and `extension/build.sh`
-     *     compiles `src` alone against the Montoya API, so there is no third
-     *     party to hide in -- but nothing here would notice one arriving.
-     *   - A WRITE THAT IS EGRESS BY SITUATION rather than by API: a file
-     *     written to a network mount, a JNI call, a `ServiceLoader`.
-     *   - MONTOYA FACILITIES NOT NAMED. `collaborator()` is named now because
-     *     a reviewer found it; the list of Burp's own network-touching APIs is
-     *     not enumerated anywhere and this is four of them, not all of them.
+     * The measured escape is not exotic and its type IS fully spelled:
+     *
+     *     new java.util.logging.SocketHandler("127.0.0.1", 9999);
+     *
+     * One line, one JDK TCP connection, and 12 summary lines / 1880 ok /
+     * 0 FAIL / rc=0. `SocketHandler(` does not contain `Socket(` and no other
+     * needle touches it. IT IS DELIBERATELY NOT ADDED: enumerating spellings
+     * is the error F4 was raised about, one more name does not change what a
+     * text scan can do, and the JDK has more classes that open a socket than
+     * anyone will finish listing -- a logging handler is only the funniest.
+     *
+     * WHAT DOES CLOSE IT is not a longer list. It is the layers below and
+     * above this one: {@link #montoyaIsConfinedToTheEntryPoint} keeps `burp.*`
+     * to one file, {@link #oneEgressPath} keeps Montoya's HTTP API to one
+     * reach inside it, `extension/build.sh` compiles `src` alone against the
+     * Montoya API so there is no third party to hide in -- and, for anything
+     * the JDK can still do, an end-to-end run that WATCHES THE WIRE. That is
+     * Task 9's, and it is the only layer that can answer "did bytes leave"
+     * rather than "is this spelling present".
      *
      * So this check is a TRIPWIRE on the shapes a second egress path has
-     * actually taken in this repository, and it is not a proof that none
-     * exists. The proof, such as it is, is that {@link #montoyaIsConfinedToTheEntryPoint}
-     * keeps `burp.*` in one file and {@link #oneEgressPath} keeps
-     * Montoya's HTTP API to one reach inside it.
+     * actually taken in this repository -- twice now, both found by review
+     * rather than by it -- and it is not a proof that none exists. Read it as
+     * that and nothing more.
      */
     static void noSecondEgressFamilyExists(List<Path> sources) throws IOException {
         String[] needles = {
@@ -18725,94 +18766,157 @@ public class ChokepointTest {
     }
 
     /**
-     * BOTH HALVES ARE REDACTED, AND THE REDACTION'S OUTPUT IS WHAT IS QUEUED.
+     * THE RECORD IS BUILT BY THE THING THAT REDACTS, AND NEVER HERE.
      *
-     * S7 makes the blob store content-addressed, so a credential that reaches
-     * the hashing step on the Python side is ALREADY UNRECOVERABLE -- the
-     * digest is computed over the secret and the file is written under it.
-     * Redaction therefore cannot be something the drain or the far side does
-     * later. {@link hx.proxy.Observed}'s own javadoc says its byte arrays are
-     * post-redaction; an Observed holding raw bytes is a live credential
-     * sitting in a queue.
+     * THREE TURNS OF ONE SCREW, and this method is what is left of them. The
+     * redaction wiring lived in {@link #ENTRY_POINT} and the same defect was
+     * found three times, each smaller than the last and each GREEN against the
+     * check written for the one before it:
      *
-     * THIS METHOD USED TO BE THREE OFFSETS AND THAT WAS NOT ENOUGH. It proved
-     * the two redaction calls appear and appear FIRST, and nothing tied the
-     * values they produce to the record. MEASURED, by a reviewer, on the
-     * committed tree: leave both calls exactly where they are and change the
-     * offer's two byte arguments from {@code redactedReq, redactedResp} to
-     * {@code reqBytes, r.toByteArray().getBytes()} -- a one-identifier edit,
-     * no code motion, nothing deleted -- and the suite read
-     * 12 summary lines / 0 FAIL / rc=0 with raw request AND response bytes
-     * going to the content-addressed store. The general lesson is in this
-     * class's javadoc: ORDERING IS NOT DATAFLOW.
+     *   1. the request half redacted with `redactRequest` and an empty
+     *      `Injected` -- `return raw.clone()`, the operator's live cookie
+     *      into a content-addressed store. Closed by an ORDER check;
+     *   2. both redaction calls left in place and the RAW locals queued
+     *      instead of their results -- one identifier each. Closed by a
+     *      DATAFLOW check: each local bound once, read once, and the record
+     *      construction delimited and searched for the names it must not
+     *      contain;
+     *   3. the two redactors SWAPPED. Both functions still correct, both
+     *      pointed at the wrong message, BOTH HALVES leaking -- and every
+     *      assertion of (2) still satisfied, because each function is still
+     *      called and each result is still queued. MEASURED at 12 summary
+     *      lines / 1880 ok / 0 FAIL / rc=0.
      *
-     * So there are now three kinds of assertion here and they fail
-     * independently:
+     * ORDERING IS NOT DATAFLOW; DATAFLOW IS NOT APPLICATION. Every one of
+     * those checks asks a question about the TEXT of a file that needs Burp to
+     * construct a single argument and so cannot be executed by this suite at
+     * all. The fourth hole would have been smaller again. So the redaction,
+     * the pairing of each redactor to its own message, and the construction of
+     * the {@link hx.proxy.Observed} were moved into {@link hx.proxy.Recorder},
+     * which has no `burp.*` type in it, and `RecorderTest` DRIVES them: it
+     * asserts over BYTES, so a swapped pair, a discarded argument and an
+     * identity function all turn it red.
      *
-     *   - PRESENCE. Deleting a redaction call leaves its index at -1, and -1
-     *     is less than every real offset, so the ordering assertions alone
-     *     would go GREEN on exactly the mutation they exist to catch. These
-     *     guards are load-bearing and are repeated inside each ordering test.
-     *   - ORDER. Each redaction precedes the queueing.
-     *   - USE. Each redacted local is bound ONCE and read ONCE (two
-     *     occurrences), the raw request local is bound once and consumed once
-     *     by the redaction (two occurrences), and the RECORD CONSTRUCTION
-     *     ITSELF names both redacted locals and neither raw byte source. The
-     *     construction is delimited textually -- from `capture.offer(new
-     *     Observed` to the `));` that closes it -- so a `toByteArray()`
-     *     elsewhere in the file (the send adapter has one) cannot satisfy or
-     *     break it.
+     * WHAT IS LEFT FOR TEXT TO SAY, and it is the whole of what this method
+     * now does:
      *
-     * WHAT USE STILL DOES NOT SEE: an identity function. `byte[] redactedReq =
-     * passThrough(reqBytes);` keeps every count and every name intact. What
-     * closes THAT is behavioural and lives in RedactorTest, whose job-4 cases
-     * drive `redactObservedRequest` against a live cookie and fail if the
-     * output still carries it. Neither half is sufficient alone: the
-     * structural half says the record carries the redaction's output, the
-     * behavioural half says that output is redacted.
+     *   - the record is built by the Recorder and NEVER inline. `Observed(`
+     *     appears in exactly two files of extension/src -- the record's own
+     *     DECLARATION and Recorder's one construction -- so every Observed
+     *     that exists in the shipped jar was built by the thing that redacts.
+     *     (Tests construct them freely; this check walks `src` only, which is
+     *     the same boundary `theBridgeNamesNothingInTheProxyPackage` draws and
+     *     for the same reason: a test is not compiled into the jar.) A record
+     *     assembled anywhere else in src is red here rather than plausible;
+     *   - the proxy path's redaction is on the drivable side of the line.
+     *     `.redactObservedRequest(` appears exactly once in extension/src and
+     *     it is in Recorder.java, and the entry point CALLS neither redaction
+     *     method at all. Moving either call back into the entry point is red.
+     *     Counted WITH the leading dot, the way the deprecated-accessor check
+     *     is, so `Redactor`'s own declaration of the method is not a call;
+     *   - the two raw arrays go to the two slots the right way round. Both are
+     *     `byte[]`, so a swap at the call site compiles and puts the response
+     *     in the request's slot. Each binding is delimited to its own `;` and
+     *     checked for what it names, and their order inside the call is
+     *     asserted.
+     *
+     * That last one is a TEXT SCAN with the same limit as every other in this
+     * file -- see the class javadoc: it sees names, not values, and it cannot
+     * see through a call. It is the residual, it is small, and the layer that
+     * closes it is Task 9 driving real Burp.
      */
-    static void bothHalvesAreRedactedBeforeTheRecordIsQueued() throws IOException {
+    static void theRecordIsBuiltByTheRecorderAndNeverInline(List<Path> sources)
+            throws IOException {
         String entry = code(Path.of(ENTRY_POINT));
-        int req = entry.indexOf("redactObservedRequest(");
-        int resp = entry.indexOf("redactResponse(");
-        int offer = entry.indexOf("capture.offer(new Observed");
-        check("the request half is redacted in " + ENTRY_POINT + " (" + req + ")",
-              req >= 0);
-        check("and the response half too (" + resp + ")", resp >= 0);
-        check("and an exchange is queued there (" + offer + ")", offer >= 0);
-        check("the request half is redacted before the record is queued ("
-              + req + " < " + offer + ")", req >= 0 && offer >= 0 && req < offer);
-        check("and so is the response half (" + resp + " < " + offer + ")",
-              resp >= 0 && offer >= 0 && resp < offer);
 
-        // ---- and the record carries what they RETURNED ---------------------
-        int reqUses = count(entry, "redactedReq");
-        int respUses = count(entry, "redactedResp");
-        int rawUses = count(entry, "reqBytes");
-        check("the redacted request local is bound once and read once, not "
-              + reqUses + " times", reqUses == 2);
-        check("and the redacted response local likewise, not " + respUses,
-              respUses == 2);
-        // The raw local exists only to be redacted. A third occurrence is it
-        // being used for something else -- and the only something else in
-        // reach is being queued.
-        check("the raw request local is bound once and consumed once by the "
-              + "redaction, not used " + rawUses + " times", rawUses == 2);
+        // ---- the record is built where the redaction is ---------------------
+        List<String> observed = new ArrayList<>();
+        List<String> jobFour = new ArrayList<>();
+        for (Path p : sources) {
+            String c = code(p);
+            // `Observed(` and not `new Observed(`, so a QUALIFIED
+            // construction -- `new hx.proxy.Observed(...)` -- cannot slip
+            // past. That shape was measured slipping past the `new ` spelling
+            // during this round's own sabotage, which is the F4 lesson
+            // arriving a third time: needle the name, not the phrase around
+            // it. The cost is that the record's own DECLARATION matches, so
+            // the expected answer is two files rather than one.
+            int n = count(c, "Observed(");
+            if (n > 0) observed.add(p + " x" + n);
+            int j = count(c, ".redactObservedRequest(");
+            if (j > 0) jobFour.add(p + " x" + j);
+        }
+        check("Observed is DECLARED in one file and CONSTRUCTED in one, and "
+              + "the one that constructs it is " + RECORDER + " -- not " + observed,
+              observed.equals(List.of(OBSERVED + " x1", RECORDER + " x1")));
+        check("and redacts an observed request in exactly one place, the same "
+              + "one -- not " + jobFour,
+              jobFour.equals(List.of(RECORDER + " x1")));
+        // The entry point names NEITHER redaction method. This is the
+        // must-be-zero that says the wiring stayed on the drivable side of the
+        // line: put either call back in here and it is red, whatever else the
+        // line does.
+        int entryRedacts = count(entry, ".redactObservedRequest(")
+                         + count(entry, ".redactResponse(");
+        check("and the entry point redacts nothing itself (" + entryRedacts + ")",
+              entryRedacts == 0);
 
-        int end = entry.indexOf("));", offer);
-        check("the record construction is delimited (" + offer + ".." + end + ")",
-              offer >= 0 && end > offer);
-        String record = end > offer ? entry.substring(offer, end) : "";
-        check("the queued record names the redacted request",
-              record.contains("redactedReq"));
-        check("and the redacted response", record.contains("redactedResp"));
-        // The two raw byte sources by name. Under the measured mutation the
-        // construction reads `reqBytes, r.toByteArray().getBytes()`, and each
-        // of these two is what sees it.
-        check("and no raw request bytes (" + record.contains("reqBytes") + ")",
-              !record.contains("reqBytes"));
-        check("and no raw response bytes (" + record.contains("toByteArray(") + ")",
-              !record.contains("toByteArray("));
+        // ---- and it is handed the two halves the right way round ------------
+        check("the entry point builds its record through the Recorder ("
+              + entry.indexOf("recorder.record(") + ")",
+              entry.indexOf("recorder.record(") >= 0);
+        // Delimited through the same helper as the bindings, which answers ""
+        // for a needle that is gone -- so a renamed call is a clean FAIL here
+        // rather than a StringIndexOutOfBounds out of this method. Measured:
+        // the unguarded version threw, TestSupport.t turned it into a named
+        // FAIL, and every assertion after it went unrun.
+        String args = statement(entry, "recorder.record(");
+        int rawReq = args.indexOf("rawRequest");
+        int rawResp = args.indexOf("rawResponse");
+        check("the call names both raw halves (" + rawReq + ", " + rawResp + ")",
+              rawReq >= 0 && rawResp >= 0);
+        check("and passes the request half first (" + rawReq + " < " + rawResp + ")",
+              rawReq >= 0 && rawResp >= 0 && rawReq < rawResp);
+        // ADJACENT AND BARE. The ordering check above is satisfied by
+        // `asSent(r, rawRequest), rawResponse` -- a call wrapping the value at
+        // its use site, which is the residual this class's javadoc names and
+        // the one shape a text scan cannot see through. It cannot see through
+        // it here either; what it CAN say is that the two slots are the two
+        // bare locals, side by side, with nothing between them. Measured red
+        // on the wrapping shape and on the swap.
+        check("and passes them bare and adjacent, with no call between the "
+              + "locals and the slots", args.contains("rawRequest, rawResponse,"));
+
+        // Each local bound once and passed once, so a third use is something
+        // else being done with a raw array.
+        check("the raw request local is bound once and passed once, not "
+              + count(entry, "rawRequest") + " times",
+              count(entry, "rawRequest") == 2);
+        check("and the raw response local likewise, not " + count(entry, "rawResponse"),
+              count(entry, "rawResponse") == 2);
+
+        // ...and each holds what its name says. Delimited to its own binding
+        // statement, because `toByteArray()` appears three times in this file
+        // and `initiatingRequest()` five: an undelimited search would be
+        // satisfied by the wrong site.
+        String reqBind = statement(entry, "byte[] rawRequest =");
+        String respBind = statement(entry, "byte[] rawResponse =");
+        check("the request half is read from the INITIATING request ("
+              + reqBind.trim() + ")", reqBind.contains("initiatingRequest("));
+        check("and the response half from the response itself ("
+              + respBind.trim() + ")",
+              respBind.contains("toByteArray(") && !respBind.contains("initiatingRequest("));
+    }
+
+    /** One Java statement, from the start of {@code needle} to the `;` that
+     *  ends it, or "" if the needle is absent. The empty string satisfies no
+     *  `contains` check and fails every one, which is the fail-safe direction
+     *  for a needle that has been renamed away. */
+    static String statement(String haystack, String needle) {
+        int at = haystack.indexOf(needle);
+        if (at < 0) return "";
+        int end = haystack.indexOf(";", at);
+        return end < 0 ? "" : haystack.substring(at, end);
     }
 
     static int count(String haystack, String needle) {
@@ -19126,9 +19230,9 @@ import hx.policy.HxRequest;
 import hx.policy.Policy;
 import hx.proxy.Capture;
 import hx.proxy.Denied;
-import hx.proxy.Observed;
 import hx.proxy.Pending;
 import hx.proxy.ProxyGate;
+import hx.proxy.Recorder;
 import hx.proxy.Source;
 import hx.send.HaltSwitch;
 import hx.send.Http;
@@ -19358,6 +19462,12 @@ public class HxExtension implements BurpExtension {
         int crawlerPort = Integer.getInteger("hx.crawler_port", 0);
         ProxyGate gate = new ProxyGate(policy);   // THE SAME Policy -- see above
         Capture capture = new Capture(Capture.DEFAULT_CAPACITY, c.exchangeSink());
+        // The SAME Redactor the send path uses. It holds no per-request state
+        // -- Redactor.Injected exists so that the state which IS per-request
+        // travels with the bytes -- so one instance is right, and a second
+        // would be a second set of redaction rules with nothing comparing
+        // them.
+        Recorder recorder = new Recorder(redactor);
         // ONE number for both bounds, so there is one figure to reason about
         // rather than two. It is NOT a claim that the two overflow together:
         // they count different things -- the queue holds records waiting for
@@ -19578,37 +19688,40 @@ public class HxExtension implements BurpExtension {
                     return ProxyResponseReceivedAction.continueWith(r);
                 }
                 try {
-                    // REDACTION FIRST, and before anything is queued. S7 makes
-                    // the blob store content-addressed, so a credential that
-                    // reaches the hashing step on the Python side is already
-                    // unrecoverable -- and Observed's own javadoc says its byte
-                    // arrays are post-redaction, which makes an Observed
-                    // holding raw bytes a live credential sitting in a queue.
-                    byte[] reqBytes = r.initiatingRequest().toByteArray().getBytes();
-                    // redactObservedRequest, NOT redactRequest, and the
-                    // difference is the whole of §7 on this path. redactRequest
-                    // replaces byte ranges THIS EXTENSION INJECTED; the proxy
-                    // path injects nothing, so the Injected it would be handed
-                    // is empty, and an empty one makes redactRequest a
-                    // `return raw.clone()` -- the operator's live Cookie and
-                    // Authorization headers content-addressed into the blob
-                    // store verbatim. That was the shipped state for one
-                    // commit. Job 4 matches header NAMES, which is all there
-                    // is for traffic hx watched rather than composed.
-                    byte[] redactedReq = redactor.redactObservedRequest(reqBytes);
-                    byte[] redactedResp = redactor.redactResponse(
-                            r.toByteArray().getBytes());
+                    // THE ONLY THING THIS BLOCK DOES IS READ BYTES OFF MONTOYA
+                    // AND HAND THEM OVER. Redaction, the pairing of each
+                    // redactor to its own message, and the construction of the
+                    // Observed all live in Recorder -- a class with no burp.*
+                    // type in it, which is what makes them drivable. This
+                    // wiring was in here and the same defect was found three
+                    // times: the wrong redactor for the request half, the raw
+                    // locals queued instead of the redacted ones, and the two
+                    // redactors swapped. Each was invisible to the structural
+                    // check written for the one before it, because every one
+                    // of those checks reads the TEXT of a file the suite
+                    // cannot execute. See Recorder's javadoc.
+                    byte[] rawRequest = r.initiatingRequest().toByteArray().getBytes();
+                    byte[] rawResponse = r.toByteArray().getBytes();
                     long ms = (System.nanoTime() - e.startNanos()) / 1_000_000L;
-                    capture.offer(new Observed(r.initiatingRequest().method(),
-                                               r.initiatingRequest().url(),
-                                               r.statusCode(), ms,
-                                               redactedReq, redactedResp,
-                                               e.source()));
+                    // WHICH ARRAY IS WHICH IS THE ONE THING LEFT THAT ONLY THE
+                    // TEXT CAN SAY: both are byte[], so a swap here compiles
+                    // and means the request slot carries the response. That is
+                    // the last survivor of a defect found three times, and it
+                    // is pinned in ChokepointTest -- the two bindings by what
+                    // each names, and their order in this call. Everything
+                    // past this line is RecorderTest's.
+                    capture.offer(recorder.record(r.initiatingRequest().method(),
+                                                  r.initiatingRequest().url(),
+                                                  r.statusCode(), ms,
+                                                  rawRequest, rawResponse,
+                                                  e.source()));
                 } catch (RuntimeException ex) {
                     // Redaction that could not finish, or bytes Montoya would
                     // not hand over. The record is lost either way and says so
                     // -- offering it unredacted is the one answer that is
-                    // worse than losing it.
+                    // worse than losing it. Recorder deliberately does not
+                    // catch its own RangeError: it has no counter, and a
+                    // fallback there would be an unredacted record.
                     capture.countLost(e.source());
                 }
                 return ProxyResponseReceivedAction.continueWith(r);
