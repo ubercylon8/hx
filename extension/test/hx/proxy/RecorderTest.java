@@ -324,12 +324,23 @@ public class RecorderTest {
                 message(responseHead("200 OK", "Content-Type: application/octet-stream\r\n"),
                         binary)});
 
+        // EVERY SOURCE, not just the operator's. `source == Source.CRAWLER
+        // ? raw.clone() : redact(...)` inside `record` was measured at 13
+        // summary lines / 2067 ok / 0 FAIL / rc=0 -- every crawler exchange
+        // stored with Cookie, Authorization and Set-Cookie intact. It was NOT
+        // an instance of "a predicate over a property no fixture varies":
+        // `Source` is varied two methods down, in
+        // neitherRawArrayIsTouchedOrAliased -- just never inside the redaction
+        // assertions, which is the only place varying it would have caught
+        // anything. Filing a closable finding under an unclosable residual is
+        // what made the open list dishonest, twice.
+        for (Source source : Source.values())
         for (Object[] shape : shapes) {
-            String name = (String) shape[0];
+            String name = shape[0] + " / " + source;
             byte[] req = (byte[]) shape[1], resp = (byte[]) shape[2];
             Observed o = (Observed) new Recorder(new Redactor())
                     .record("POST", "http://app.example.test/x", 200, 7L,
-                            req, resp, Source.OPERATOR);
+                            req, resp, source);
             // Searched over BYTES, not over a String: a binary body is not
             // valid UTF-8, and decoding it would replace the very bytes a
             // leak might hide in.

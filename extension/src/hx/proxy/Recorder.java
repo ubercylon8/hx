@@ -38,52 +38,50 @@ import hx.send.Redactor;
  * entry point reads the two byte arrays off Montoya -- the one thing only it
  * can do -- and hands them over.
  *
- * WHAT IS STILL OPEN ON THIS PATH, AND IT IS EXACTLY FOUR THINGS. This list
- * is the canonical one; every other javadoc that names a residual names one of
- * these and points here, because three rounds each found a declared residual
- * that turned out narrower than the real one.
+ * WHAT IS STILL OPEN ON THE REDACTION PATH. This list covers THIS path --
+ * the proxy capture path and the checks that hold it. It is not a list of
+ * everything open in the extension, and the earlier claim that "every other
+ * javadoc that names a residual names one of these and points here" was
+ * FALSE: ChokepointTest names residuals of its own next to the checks they
+ * belong to, which is where they are useful.
  *
- *   1. A PREDICATE OVER A PROPERTY NO FIXTURE VARIES. `RecorderTest` drives
- *      six shapes -- small, 64 KB, no body, HEAD-style, chunked, binary -- and
- *      a bypass conditioned on any of those fires. One conditioned on
- *      something none of them varies does not, and no fixture set closes that:
- *      only execution against real traffic does, which is Task 9's.
- *   2. EGRESS THROUGH A TYPE NEVER SPELLED AT THE CALL SITE. The set of type
- *      names that can open a socket is unbounded; `ChokepointTest`'s
- *      `noSecondEgressFamilyExists` declares that exclusion rather than
- *      chasing it, and says what does close it.
- *   3. THE THREE TASK-9 ITEMS, P13-P15: raw urls in plain columns, whether the
- *      proxy handler HONOURS its verdict (which must be measured AT THE
- *      TARGET, never by reading the client's response), and the byte-flows
- *      that reach neither callback -- WebSocket frames after a 101 and
- *      per-host certificate minting. `HxExtension`'s assumption block carries
- *      all of them with the conditions Task 9 must meet.
- *   4. AN EXACTLY-N NEEDLE IN `ChokepointTest` READ THROUGH A LOCAL. Those
- *      checks count a call and cannot tell which OBJECT it was made on, so a
- *      second Policy reached through an alias the count already knows about
- *      is invisible to them. It is bounded by the construction counts rather
- *      than by the call counts, which is why those are per-file and
- *      must-be-N.
+ * EACH ITEM SAYS WHETHER IT ASSERTS IGNORANCE OR SAFETY, because those are
+ * different promises. Ignorance -- "we did not test this" -- costs nothing to
+ * say. Safety -- "this cannot hurt us" -- is an invariant and needs evidence
+ * like any other. TWICE ON THIS TASK an item asserting safety turned out to be
+ * a live finding, so no item below asserts safety without naming what would
+ * have to be true.
  *
- * WHAT IS NO LONGER ON THIS LIST, because round 4 closed both:
+ *   1. A PREDICATE OVER A PROPERTY NO FIXTURE VARIES. IGNORANCE.
+ *      `RecorderTest` drives six message shapes -- small, 64 KB, no body,
+ *      HEAD-style, chunked, binary -- across EVERY {@link Source} constant, so
+ *      a bypass conditioned on size, framing, body presence, encoding or
+ *      source fires. One conditioned on something none of those vary does not,
+ *      and no fixture set closes that: only execution against real traffic
+ *      does, which is Task 9's. NARROWED THIS ROUND: `source == CRAWLER ?
+ *      raw.clone() : redact(...)` used to be filed here and was not an
+ *      instance of it at all -- `Source` was already varied elsewhere in the
+ *      class, just never inside the redaction assertions. One loop closed it.
+ *   2. EGRESS THROUGH A TYPE NEVER SPELLED AT THE CALL SITE. IGNORANCE.
+ *      The set of type names that can open a socket is unbounded;
+ *      `ChokepointTest.noSecondEgressFamilyExists` declares that exclusion
+ *      rather than chasing it, and names the layers that do close it.
+ *   3. P13, P14, P15 -- raw urls in plain columns, whether the proxy handler
+ *      HONOURS its verdict, and the byte-flows reaching neither callback.
+ *      IGNORANCE, all three, and each needs Burp or a schema change rather
+ *      than a test here. `HxExtension`'s assumption block carries the
+ *      conditions Task 9 must meet, including that a refused request must be
+ *      counted AT THE TARGET and never by reading the client's response.
  *
- *   - `Observed::new` and `Denied::new` INSIDE `hx.proxy`. The compiler stops
- *     other packages; within the package `ChokepointTest` counts both
- *     spellings a constructor has, held in place by a sweep over all four
- *     grammar forms.
- *   - A METHOD REFERENCE against a `.method()` needle. This was written here
- *     as a residual with the claim that "the two needles it would defeat guard
- *     no S4 or S7 property". THAT CLAIM WAS FALSE AND WAS MEASURED FALSE: a
- *     second Gate charge at the second callback, written
- *     `Function<HxRequest, Decision> g = policy::checkGate; d = g.apply(edited)`,
- *     read 13 summary lines / 2024 ok / 0 FAIL / rc=0 -- a crawler charged two
- *     rate tokens and two budget slots for one request, which is S4's rate
- *     limit and per-run budget both. A deprecated accessor reached the same
- *     way was equally green. So it was a FINDING, not a residual, and it is
- *     fixed: every MUST-BE-ZERO method needle now counts `recv::m` alongside
- *     `recv.m(`, and the sweep holds that pairing. The exactly-N needles were
- *     left alone deliberately -- a reference there LOWERS the count and the
- *     check fails CLOSED.
+ * WHAT CAME OFF THIS LIST, and why the removals are recorded rather than
+ * tidied away: `Observed::new` / `Denied::new` inside `hx.proxy` (round 4 --
+ * the compiler bounds other packages, and both constructor spellings are
+ * counted within it); a METHOD REFERENCE against a must-be-zero needle (round
+ * 4 -- it was a finding, not a residual: `policy::checkGate` charged the Gate
+ * twice, green); and an exactly-N needle defeated by ADDITION (round 5 -- also
+ * a finding, also green, and on the SHIPPED send path). All three were listed
+ * here as harmless before they were measured. That is the record this list
+ * exists to keep honest.
  *
  * THE PACKAGE EDGE IS NEW AND POINTS THIS WAY ON PURPOSE: {@code hx.proxy}
  * names {@code hx.send}. This class PRODUCES an {@code hx.proxy} type and

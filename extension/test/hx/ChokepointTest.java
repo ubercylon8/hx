@@ -222,10 +222,10 @@ public class ChokepointTest {
         List<String> handleHits = new ArrayList<>();
         for (Path p : sources) {
             String t = code(p);
-            int n = count(t, "http().sendRequest");
+            int n = calls(t, "http().sendRequest", "::sendRequest");
             total += n;
             if (n > 0) hits.add(p + " x" + n);
-            int h = count(t, ".http()");
+            int h = calls(t, ".http()", "::http");
             handles += h;
             if (h > 0) handleHits.add(p + " x" + h);
         }
@@ -245,8 +245,7 @@ public class ChokepointTest {
     static void noBatchEgressPath(List<Path> sources) throws IOException {
         int total = 0;
         for (Path p : sources)
-            total += count(text(p), "sendRequests(")
-                   + count(text(p), "::sendRequests");
+            total += calls(text(p), "sendRequests(", "::sendRequests");
         // Montoya's batch call is a second egress path wearing the first one's
         // name. It was measured working on Community (spec s2), which is
         // exactly why it needs saying no to in writing: one request per
@@ -283,7 +282,10 @@ public class ChokepointTest {
      * whole family is counted: exactly one RedirectionMode is named in the
      * adapter, and it is NEVER.
      *
-     * WHAT IT DOES NOT SEE: a DISCARDED BUILDER RETURN. Montoya's options
+     * A DISCARDED BUILDER RETURN USED TO BE INVISIBLE HERE and is not any
+     * more; the two checks that close it are below and the measurement is
+     * beside them. The paragraph that follows is what the gap WAS, kept
+     * because it is the clearest statement of the shape: Montoya's options
      * builder returns a new object rather than mutating, so
      * `options.withRedirectionMode(RedirectionMode.NEVER);` written as a bare
      * statement -- return value dropped, the built options never carrying it
@@ -298,6 +300,36 @@ public class ChokepointTest {
         int never = count(entry, "RedirectionMode.NEVER");
         int any = count(entry, "RedirectionMode.");
         check("the egress call disables redirect following (" + never + ")", never == 1);
+        // ...AND THE BUILDER RETURN IS KEPT. Montoya's options builder returns
+        // a NEW object rather than mutating, so
+        // `options.withRedirectionMode(RedirectionMode.NEVER);` as a bare
+        // statement compiles, does nothing, and reads identically to the
+        // correct code. MEASURED with exactly that edit: 13 summary lines /
+        // 2067 ok / 0 FAIL / rc=0, with redirects FOLLOWED inside Burp -- each
+        // hop then a request that never crossed Policy, which is S4's third
+        // egress path wearing the first one's name. Presence is not
+        // application, one level over into a fluent chain.
+        //
+        // Delimited to the statement that BINDS `options`, so a call whose
+        // result is dropped on the floor sits outside the span. It is a text
+        // scan and it pins WHERE the setting is written, not what the built
+        // object holds; nothing here can run the builder.
+        // Read with COMMENTS STRIPPED, deliberately: `statement` ends at the
+        // first `;`, and the javadoc inside this very chain contains one
+        // ("...on sendRequest today;"). With `text` the span stopped before the
+        // builder call and this check failed against CORRECT code -- measured.
+        // Literals are kept, because `RedirectionMode.NEVER` is what is being
+        // looked for and is not one.
+        String chain = codeKeepingLiterals(Path.of(ENTRY_POINT));
+        String built = statement(chain, "RequestOptions options =");
+        check("the mode is set inside the options the adapter KEEPS, not in a "
+              + "statement whose return is discarded",
+              built.contains("RedirectionMode.NEVER"));
+        check("and every withRedirectionMode call is in that same statement ("
+              + count(built, "withRedirectionMode(") + " of "
+              + count(chain, "withRedirectionMode(") + ")",
+              count(built, "withRedirectionMode(") == count(entry, "withRedirectionMode(")
+              && count(chain, "withRedirectionMode(") == 1);
         check("and it names exactly one redirection mode, so a second setting "
               + "cannot override it (" + any + ")", any == 1);
     }
@@ -387,8 +419,8 @@ public class ChokepointTest {
             // detour walks past, which is the same grammar point the
             // constructor needles were fixed for. See
             // theTypeNeedlesCoverEveryConstructionForm.
-            epoch += count(t, ".configEpoch()") + count(t, "::configEpoch");
-            scope += count(t, ".scopeConfig()") + count(t, "::scopeConfig");
+            epoch += calls(t, ".configEpoch()", "::configEpoch");
+            scope += calls(t, ".scopeConfig()", "::scopeConfig");
         }
         // Two reads of one record, with a commit landing between them:
         // measured wrong in 393/400 trials, and wrong in the unsafe direction
@@ -484,7 +516,7 @@ public class ChokepointTest {
         int total = 0;
         List<String> elsewhere = new ArrayList<>();
         for (Path p : sources) {
-            int n = count(code(p), ".authorisation()");
+            int n = calls(code(p), ".authorisation()", "::authorisation");
             total += n;
             if (n > 0 && !p.toString().equals(BRIDGE_CLIENT)
                       && !p.toString().equals(ENTRY_POINT))
@@ -492,8 +524,8 @@ public class ChokepointTest {
         }
         String bridge = code(Path.of(BRIDGE_CLIENT));
         String entry = code(Path.of(ENTRY_POINT));
-        int inBridge = count(bridge, ".authorisation()");
-        int inEntry = count(entry, ".authorisation()");
+        int inBridge = calls(bridge, ".authorisation()", "::authorisation");
+        int inEntry = calls(entry, ".authorisation()", "::authorisation");
         // The two callbacks a request is decided about in, by their
         // declarations. A response handler decides nothing and must read
         // nothing, which is what the totals below enforce.
@@ -724,10 +756,10 @@ public class ChokepointTest {
             throws IOException {
         String sender = code(Path.of(SENDER));
         String entry = code(Path.of(ENTRY_POINT));
-        int senderBefore = count(sender, ".decideBeforeGate(");
-        int senderGate = count(sender, ".checkGate(");
-        int entryBefore = count(entry, ".decideBeforeGate(");
-        int entryGate = count(entry, ".checkGate(") + count(entry, "::checkGate");
+        int senderBefore = calls(sender, ".decideBeforeGate(", "::decideBeforeGate");
+        int senderGate = calls(sender, ".checkGate(", "::checkGate");
+        int entryBefore = calls(entry, ".decideBeforeGate(", "::decideBeforeGate");
+        int entryGate = calls(entry, ".checkGate(", "::checkGate");
 
         check("the issuing path asks the boundary half exactly once ("
               + senderBefore + ")", senderBefore == 1);
@@ -755,8 +787,7 @@ public class ChokepointTest {
         // `policy.decideScopeOnly(` do not match it. ProxyGate's own
         // `policy.decide(` is a different file and is the FIRST callback's
         // paying decision, which is correct.
-        int entryFull = count(entry, "policy.decide(")
-                      + count(entry, "policy::decide");
+        int entryFull = calls(entry, "policy.decide(", "policy::decide");
         check("and not through policy.decide(), which reaches the Gate without "
               + "naming it (" + entryFull + ")", entryFull == 0);
 
@@ -764,7 +795,13 @@ public class ChokepointTest {
         for (Path p : sources) {
             if (p.toString().equals(SENDER) || p.toString().equals(ENTRY_POINT)) continue;
             String c = code(p);
-            int n = count(c, ".decideBeforeGate(") + count(c, ".checkGate(");
+            // BOTH FORMS on BOTH halves. The round-4 report claimed every
+            // must-be-zero method needle counted both; this arm did not, so a
+            // `policy::checkGate` in ProxyGate's operator branch was invisible
+            // to it and went red only through ProxyGateTest's budget check --
+            // a different check catching it by luck of coverage.
+            int n = calls(c, ".decideBeforeGate(", "::decideBeforeGate")
+                  + calls(c, ".checkGate(", "::checkGate");
             if (n > 0) elsewhere.add(p + " x" + n);
         }
         check("and no other file in extension/src asks either half " + elsewhere,
@@ -831,7 +868,7 @@ public class ChokepointTest {
             // two spellings, `new T(` and `T::new`, each optionally qualified;
             // these two needles cover all four, and the sweep in
             // theTypeNeedlesCoverEveryConstructionForm asserts that they do.
-            int n = count(code(p), "Policy(") + count(code(p), "Policy::new");
+            int n = calls(code(p), "Policy(", "Policy::new");
             total += n;
             if (n > 0) hits.add(p + " x" + n);
         }
@@ -896,19 +933,24 @@ public class ChokepointTest {
      */
     static void everyKillPathIsWiredBeforeTheDial() throws IOException {
         String entry = code(Path.of(ENTRY_POINT));
+        // Each wire counted in BOTH grammar forms -- see calls(). A local per
+        // wire, because the pair does not fit twice on a line.
+        int sink = calls(entry, "setHaltSink(", "::setHaltSink");
+        int source = calls(entry, "setHaltSource(", "::setHaltSource");
+        int poller = calls(entry, "haltSwitch.start()", "haltSwitch::start");
+        int notifier = calls(entry, "setHaltNotifier(", "::setHaltNotifier");
+        int handler = calls(entry, "setSendHandler(", "::setSendHandler");
+        int guard = calls(entry, "setConfigGuard(", "::setConfigGuard");
         check("a halt frame is routed to the switch the send path asks ("
-              + count(entry, "setHaltSink(") + ")", count(entry, "setHaltSink(") == 1);
-        check("and maySend() asks that same authority back ("
-              + count(entry, "setHaltSource(") + ")", count(entry, "setHaltSource(") == 1);
-        check("the sentinel poller is started (" + count(entry, "haltSwitch.start()") + ")",
-              count(entry, "haltSwitch.start()") == 1);
-        check("an auto-halt has somewhere to announce itself ("
-              + count(entry, "setHaltNotifier(") + ")", count(entry, "setHaltNotifier(") == 1);
-        check("and the send path is installed (" + count(entry, "setSendHandler(") + ")",
-              count(entry, "setSendHandler(") == 1);
+              + sink + ")", sink == 1);
+        check("and maySend() asks that same authority back (" + source + ")",
+              source == 1);
+        check("the sentinel poller is started (" + poller + ")", poller == 1);
+        check("an auto-halt has somewhere to announce itself (" + notifier + ")",
+              notifier == 1);
+        check("and the send path is installed (" + handler + ")", handler == 1);
         check("and a configure that would move an armed limit is refused ("
-              + count(entry, "setConfigGuard(") + ")",
-              count(entry, "setConfigGuard(") == 1);
+              + guard + ")", guard == 1);
     }
 
     /**
@@ -1115,10 +1157,10 @@ public class ChokepointTest {
     static void theSecondEnforcementPointIsRegisteredAndAsksTheGate()
             throws IOException {
         String entry = code(Path.of(ENTRY_POINT));
-        int n1 = count(entry, "registerRequestHandler(");
-        int n2 = count(entry, "registerResponseHandler(");
-        int n3 = count(entry, "gate.decide(");
-        int n4 = count(entry, "decideScopeOnly(");
+        int n1 = calls(entry, "registerRequestHandler(", "::registerRequestHandler");
+        int n2 = calls(entry, "registerResponseHandler(", "::registerResponseHandler");
+        int n3 = calls(entry, "gate.decide(", "gate::decide");
+        int n4 = calls(entry, "decideScopeOnly(", "::decideScopeOnly");
         check("registerRequestHandler appears exactly once (" + n1 + ")", n1 == 1);
         check("registerResponseHandler appears exactly once (" + n2 + ")", n2 == 1);
         check("the proxy handler asks the gate (" + n3 + ")", n3 == 1);
@@ -1206,8 +1248,8 @@ public class ChokepointTest {
     static void theClockAndTheAttributionAreWrittenDownAndTakenBack()
             throws IOException {
         String entry = code(Path.of(ENTRY_POINT));
-        int put = count(entry, "pending.put(");
-        int take = count(entry, "pending.take(");
+        int put = calls(entry, "pending.put(", "pending::put");
+        int take = calls(entry, "pending.take(", "pending::take");
         check("the request handler writes the clock and the source down ("
               + put + ")", put == 1);
         check("and both the response handler and the refusing re-decision take "
@@ -1395,11 +1437,11 @@ public class ChokepointTest {
             // arriving a third time: needle the name, not the phrase around
             // it. The cost is that the record's own DECLARATION matches, so
             // the expected answer is two files rather than one.
-            int n = count(c, "Observed(") + count(c, "Observed::new");
+            int n = calls(c, "Observed(", "Observed::new");
             if (n > 0) observed.add(p + " x" + n);
-            int d = count(c, "Denied(") + count(c, "Denied::new");
+            int d = calls(c, "Denied(", "Denied::new");
             if (d > 0) denied.add(p + " x" + d);
-            int j = count(c, ".redactObservedRequest(");
+            int j = calls(c, ".redactObservedRequest(", "::redactObservedRequest");
             if (j > 0) jobFour.add(p + " x" + j);
         }
         check("Observed is DECLARED in one file and CONSTRUCTED in one, and "
@@ -1420,10 +1462,9 @@ public class ChokepointTest {
         // must-be-zero that says the wiring stayed on the drivable side of the
         // line: put either call back in here and it is red, whatever else the
         // line does.
-        int entryRedacts = count(entry, ".redactObservedRequest(")
-                         + count(entry, ".redactResponse(")
-                         + count(entry, "::redactObservedRequest")
-                         + count(entry, "::redactResponse");
+        int entryRedacts =
+                calls(entry, ".redactObservedRequest(", "::redactObservedRequest")
+              + calls(entry, ".redactResponse(", "::redactResponse");
         check("and the entry point redacts nothing itself (" + entryRedacts + ")",
               entryRedacts == 0);
 
@@ -1436,7 +1477,7 @@ public class ChokepointTest {
         // the cost is that Recorder's own constructor declaration matches.
         List<String> recorders = new ArrayList<>();
         for (Path p : sources) {
-            int n = count(code(p), "Recorder(") + count(code(p), "Recorder::new");
+            int n = calls(code(p), "Recorder(", "Recorder::new");
             if (n > 0) recorders.add(p + " x" + n);
         }
         check("Recorder is DECLARED in one file and CONSTRUCTED in one, and the "
@@ -1447,9 +1488,10 @@ public class ChokepointTest {
         // read by the arms below. Counting constructions alone would have left
         // that, and the sentence "there is one call site" would have been a
         // claim about a count that does not say it.
-        int calls = count(entry, "recorder.record(");
+        int recordCalls = calls(entry, "recorder.record(", "recorder::record");
         check("and the entry point calls it exactly once, so the positional "
-              + "arms below see every call there is (" + calls + ")", calls == 1);
+              + "arms below see every call there is (" + recordCalls + ")",
+              recordCalls == 1);
 
         // ---- and it is handed the two halves the right way round ------------
         check("the entry point builds its record through the Recorder ("
@@ -1583,11 +1625,24 @@ public class ChokepointTest {
      * needle was green the same way. So it was a finding rather than a
      * residual, and the `called` table below is the fix.
      *
-     * ONLY THE MUST-BE-ZERO NEEDLES ARE LISTED, and that is a decision: for a
-     * needle that must be exactly N, substituting a reference for a call
-     * LOWERS the count and the check fails CLOSED. It is only where the answer
-     * must be zero that a reference buys anything, because there it raises
-     * nothing while the forbidden thing happens.
+     * EVERY METHOD NEEDLE THAT IS *COUNTED* IS LISTED, must-be-zero and
+     * exactly-N alike -- and the qualifier is load-bearing rather than
+     * hedging. `capture.offer(` and `withRedirectionMode(` are method needles
+     * with no row, because they are read POSITIONALLY (`indexOf`) and never
+     * counted: a second call in the reference form does not move an offset the
+     * way it moves a count. What that leaves open is narrower and is named
+     * where it lives -- an ORDER check cannot see a call it does not spell, so
+     * `capture::offer` used before the gate would satisfy
+     * {@link #theGateDecidesBeforeAnythingIsQueued}. That is a recording-order
+     * failure, not an enforcement one; it is IGNORANCE, not safety. Round 4
+     * listed only the must-be-zero ones, on the argument that substituting a
+     * reference for a call LOWERS an exactly-N count and fails closed. True,
+     * and about the wrong operation: ADDING a second call in the other form
+     * leaves the count where it was while the property is false. That is how
+     * the SHIPPED send path charged the Gate twice at 13 / 2067 ok / 0 FAIL /
+     * rc=0. {@link #calls} is where the sum is taken; this table is what makes
+     * a check that forgets one form go red, because every needle here must
+     * appear in this file OUTSIDE these tables.
      */
     static void theTypeNeedlesCoverEveryConstructionForm() throws IOException {
         // {simple name, package, the needles this file uses for that type...}
@@ -1648,7 +1703,42 @@ public class ChokepointTest {
             {"openConnection",        "u",          "()",  "openConnection(", "::openConnection"},
             {"openStream",            "u",          "()",  "openStream(", "::openStream"},
             {"collaborator",          "api",        "()",  "collaborator()", "::collaborator"},
+            // ...and every EXACTLY-N method needle, which round 4 left on one
+            // form on a fail-closed argument that was about substitution and
+            // not about ADDITION. See {@link #calls}.
+            {"sendRequest",           "api.http()", "(a)", "http().sendRequest", "::sendRequest"},
+            {"http",                  "api",        "()",  ".http()", "::http"},
+            {"authorisation",         "c",          "()",  ".authorisation()", "::authorisation"},
+            {"decideBeforeGate",      "policy",     "(a)", ".decideBeforeGate(",
+                                                           "::decideBeforeGate"},
+            {"decideScopeOnly",       "policy",     "(a)", "decideScopeOnly(",
+                                                           "::decideScopeOnly"},
+            {"decide",                "gate",       "(a)", "gate.decide(", "gate::decide"},
+            {"registerRequestHandler", "api.proxy()", "(a)", "registerRequestHandler(",
+                                                           "::registerRequestHandler"},
+            {"registerResponseHandler", "api.proxy()", "(a)", "registerResponseHandler(",
+                                                           "::registerResponseHandler"},
+            {"put",                   "pending",    "(a)", "pending.put(", "pending::put"},
+            {"take",                  "pending",    "(a)", "pending.take(", "pending::take"},
+            {"record",                "recorder",   "(a)", "recorder.record(",
+                                                           "recorder::record"},
+            {"start",                 "haltSwitch", "()",  "haltSwitch.start()",
+                                                           "haltSwitch::start"},
+            {"setHaltSink",           "c",          "(a)", "setHaltSink(", "::setHaltSink"},
+            {"setHaltSource",         "c",          "(a)", "setHaltSource(", "::setHaltSource"},
+            {"setHaltNotifier",       "sender",     "(a)", "setHaltNotifier(",
+                                                           "::setHaltNotifier"},
+            {"setSendHandler",        "c",          "(a)", "setSendHandler(",
+                                                           "::setSendHandler"},
+            {"setConfigGuard",        "c",          "(a)", "setConfigGuard(",
+                                                           "::setConfigGuard"},
         };
+
+        PAIRS.clear();
+        for (String[] row : constructed)
+            if (row.length > 3) PAIRS.add(Arrays.copyOfRange(row, 2, row.length));
+        for (String[] row : called)
+            if (row.length > 4) PAIRS.add(Arrays.copyOfRange(row, 3, row.length));
 
         List<String> every = new ArrayList<>();
         for (String[] row : constructed) {
@@ -1688,7 +1778,7 @@ public class ChokepointTest {
             }
         }
 
-        String self = text(Path.of("test", "hx", "ChokepointTest.java"));
+        String self = codeKeepingLiterals(Path.of("test", "hx", "ChokepointTest.java"));
         check("this class can read its own source (" + self.length() + " chars)",
               self.length() > 10_000);
         int tablesAt = self.indexOf("String[][] constructed = {");
@@ -1701,6 +1791,38 @@ public class ChokepointTest {
         for (String needle : every)
             check("`" + needle + "` is a needle this file still uses",
                   count(elsewhere, "\"" + needle + "\"") >= 1);
+
+        // EVERY COUNT OF A PAIRED NEEDLE GOES THROUGH calls(). This is the arm
+        // that makes the sweep pin ITS OWN property rather than merely listing
+        // forms: a check that counts `.checkGate(` and forgets `::checkGate`
+        // is exactly the round-5 finding, and without this the sweep stayed
+        // green on it -- measured, S at 13 / 2197 ok / 0 FAIL / rc=0.
+        //
+        // Balance of OCCURRENCES was tried first and is the wrong rule: a
+        // needle legitimately appears in prose-free places that are not
+        // counts -- `setHaltSink(` sits three times inside the STRIPPER's own
+        // fixture -- and ten of thirty-three pairs were "unbalanced" while
+        // every one was correct. What has to hold is narrower: where a paired
+        // needle is COUNTED against a real source file, both forms are summed.
+        //
+        // `count(stripped,` is the one exception and it is named rather than
+        // filtered by a pattern: theStripperIsNotVacuousAndDoesNotOverreach
+        // counts needles inside a FIXTURE STRING to prove the stripper works,
+        // which is not policing a wire and must not be summed.
+        List<String> single = new ArrayList<>();
+        for (String[] row : pairs()) {
+            if (row.length < 2) continue;
+            for (String needle : row) {
+                for (String line : elsewhere.split("\n")) {
+                    if (!line.contains("\"" + needle + "\"")) continue;
+                    if (!line.contains("count(")) continue;
+                    if (line.contains("count(stripped,")) continue;
+                    single.add(needle + " @ " + line.trim());
+                }
+            }
+        }
+        check("every count of a paired needle sums both grammar forms through "
+              + "calls(), not one of them " + single, single.isEmpty());
 
         int from = self.indexOf("String[] needles = {");
         int to = self.indexOf("};", from);
@@ -1722,6 +1844,36 @@ public class ChokepointTest {
         check("...and every one of them has a row " + missing, missing.isEmpty());
     }
 
+    /**
+     * ONE METHOD INVOCATION, COUNTED IN EVERY GRAMMAR FORM IT HAS.
+     *
+     * Round 4 widened the MUST-BE-ZERO needles to `recv.m(` plus `recv::m` and
+     * argued the exactly-N ones were safe because a reference SUBSTITUTED for
+     * a call lowers the count and fails closed. That argument was about the
+     * wrong operation. MEASURED, in the SHIPPED send path:
+     *
+     *     Decision d = policy.checkGate(req);
+     *     Function<HxRequest, Decision> g2 = policy::checkGate;
+     *     if (d.allowed()) d = g2.apply(req);
+     *
+     *     13 summary lines / 2067 ok / 0 FAIL / rc=0
+     *
+     * ADDITION, not substitution: the original spelling stays, the count stays
+     * at one, and the Gate is charged TWICE for every request -- S4's rate
+     * limit and its per-run budget, on the path that issues. So an exactly-N
+     * count has to be a count of the SUM of the forms, and every such needle
+     * in this file goes through here.
+     */
+    /** The needle sets that have more than one grammar form, filled by the
+     *  sweep from its own tables so the two cannot drift. */
+    private static final List<String[]> PAIRS = new ArrayList<>();
+
+    static List<String[]> pairs() { return PAIRS; }
+
+    static int calls(String haystack, String dotted, String reference) {
+        return count(haystack, dotted) + count(haystack, reference);
+    }
+
     static int count(String haystack, String needle) {
         int n = 0, i = 0;
         while ((i = haystack.indexOf(needle, i)) >= 0) { n++; i += needle.length(); }
@@ -1741,6 +1893,27 @@ public class ChokepointTest {
      *  supply. */
     static String code(Path p) throws IOException {
         return stripCommentsAndLiterals(text(p));
+    }
+
+    /**
+     * The file with COMMENTS blanked and STRING LITERALS KEPT.
+     *
+     * A third reading, and it exists for one job: asking whether this class
+     * still USES a needle. That question is answered by searching for the
+     * needle as a quoted literal, so {@link #code} is useless -- it blanks
+     * literal bodies, which is the very text being looked for. And
+     * {@link #text} is fail-OPEN here, measured: deleting
+     * `count(t, "::configEpoch")` reddens the arm, but the same deletion with
+     * `// TODO(plan-9): restore count(t, "::configEpoch") here` left above it
+     * read 13 summary lines / 2067 ok / 0 FAIL / rc=0. That is the
+     * setHaltSource-TODO failure this class was built around, arriving in the
+     * check that polices the other needles.
+     *
+     * A needle proving A CHECK EXISTS is proving a wire exists, and prose
+     * cannot wire anything -- so comments go and literals stay.
+     */
+    static String codeKeepingLiterals(Path p) throws IOException {
+        return strip(text(p), false);
     }
 
     /**
@@ -1786,6 +1959,14 @@ public class ChokepointTest {
      * both directions.
      */
     static String stripCommentsAndLiterals(String src) {
+        return strip(src, true);
+    }
+
+    /** @param blankLiterals whether a literal's BODY is blanked too. Literals
+     *  are always PARSED, whichever way this is set, so a `//` inside a string
+     *  still starts no comment -- that is the over-run this class's stripper
+     *  test drives from both sides. */
+    static String strip(String src, boolean blankLiterals) {
         char[] out = src.toCharArray();
         int n = out.length, i = 0;
         while (i < n) {
@@ -1795,6 +1976,7 @@ public class ChokepointTest {
                 i += block ? 3 : 1;              // the opening delimiter is kept
                 while (i < n) {
                     if (out[i] == '\\') {
+                        if (!blankLiterals) { i += 2; continue; }
                         // The escape and the character it escapes are ONE
                         // unit. Blanking the backslash alone would leave a
                         // bare `"` behind it that reads as the close, and
@@ -1815,7 +1997,7 @@ public class ChokepointTest {
                         // the rest of the file. Stop at the line end.
                         if (out[i] == '\n') break;
                     }
-                    i = blank(out, i, n);
+                    i = blankLiterals ? blank(out, i, n) : i + 1;
                 }
                 continue;
             }
