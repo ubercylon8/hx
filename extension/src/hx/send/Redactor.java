@@ -13,8 +13,25 @@ import java.util.Map;
 /**
  * Credential redaction for the copy of an exchange that crosses the bridge.
  *
- * Three jobs, and they are three because a credential reaches disk by three
- * different routes (§7):
+ * FOUR jobs, and they are four because a credential reaches disk by four
+ * different routes (§7). WHICH JOB COVERS WHICH PATH is the thing to read
+ * first, because getting that wrong is how a path ends up with no mechanism at
+ * all -- which is exactly what happened to the proxy path's request half
+ * between Task 7 and its first fix round, and it stored the operator's live
+ * session cookies verbatim in a content-addressed store:
+ *
+ *   SEND path, request   -- jobs 1 and 2, which cover each other. A credential
+ *                           this extension injected has a known byte range
+ *                           (job 1); one the harness supplied is REFUSED
+ *                           before issuance (job 2), so it never reaches the
+ *                           store at all.
+ *   SEND path, response  -- job 3.
+ *   PROXY path, request  -- job 4, and ONLY job 4. Job 1 has nothing
+ *                           registered, because this extension composed
+ *                           nothing; job 2 cannot apply, because §4
+ *                           deliberately does not rule-check the operator's
+ *                           own browsing and refusing it is not on the table.
+ *   PROXY path, response -- job 3, the same call the send path makes.
  *
  *  1. What WE injected. The extension knows the exact byte range it wrote, so
  *     it replaces that range with {@code {{identity:<id>:authz}}}. Byte ranges,
@@ -39,6 +56,23 @@ import java.util.Map;
  *     Header-name matching is all there is, so cookie VALUES are replaced with
  *     {@code {{observed:set-cookie}}} and the cookie name and its attributes
  *     are kept, so session-fixation and cookie-flag checks still read.
+ *
+ *  4. What we merely WATCHED GO PAST. {@link #redactObservedRequest} is job 3
+ *     pointed at a request instead of a response: the operator's browser sends
+ *     its own {@code Cookie} and {@code Authorization} headers through the
+ *     proxy, this extension composed none of them, and it may not refuse them
+ *     either. Header-name matching is again all there is, so the three
+ *     {@link #CREDENTIAL_HEADERS} values are replaced with
+ *     {@code {{observed:<name>}}} and the names are kept.
+ *
+ *     THE PLACEHOLDER IS FIXED, and that is a second requirement rather than a
+ *     stylistic choice. The plan's Global Constraints require redaction to be
+ *     DETERMINISTIC -- "two requests differing only in credential bytes must
+ *     produce the same blob" -- and the blob store is content-addressed, so a
+ *     hash or a length here would give one page browsed under two sessions two
+ *     different digests and two stored copies. Before job 4 existed the proxy
+ *     path violated that constraint as well as leaking, because the raw
+ *     credential bytes WERE the difference between the two blobs.
  *
  * Redaction runs BEFORE hashing. The blob store is content-addressed: the
  * digest names the bytes it was computed over, so hashing raw bytes and
@@ -82,6 +116,27 @@ public final class Redactor {
 
     private static final byte[] OBSERVED_COOKIE =
         "{{observed:set-cookie}}".getBytes(StandardCharsets.US_ASCII);
+
+    /**
+     * Job 4's placeholders, one per {@link #CREDENTIAL_HEADERS} entry and in
+     * the same order.
+     *
+     * DERIVED from that array rather than written out beside it. A fourth
+     * credential header added there gets a placeholder here for free; a second
+     * hand-kept list would be a vocabulary in two places, and the drift that
+     * matters is silent -- a name matched with no placeholder to write is an
+     * {@code ArrayIndexOutOfBoundsException} on a Burp proxy thread, and a
+     * placeholder with no name is dead bytes nobody notices.
+     */
+    private static final byte[][] OBSERVED_CREDENTIAL = observedPlaceholders();
+
+    private static byte[][] observedPlaceholders() {
+        byte[][] out = new byte[CREDENTIAL_HEADERS.length][];
+        for (int i = 0; i < out.length; i++)
+            out[i] = ("{{observed:" + CREDENTIAL_HEADERS[i] + "}}")
+                     .getBytes(StandardCharsets.US_ASCII);
+        return out;
+    }
 
     /** RFC 9112 2.3: the HTTP-name is case-SENSITIVE, so this is a byte match. */
     private static final byte[] HTTP_NAME = "HTTP/".getBytes(StandardCharsets.US_ASCII);
@@ -291,6 +346,148 @@ public final class Redactor {
             at = r.end();
         }
         out.write(raw, at, raw.length - at);
+        return out.toByteArray();
+    }
+
+    /**
+     * The bytes of a request hx merely OBSERVED, with every credential header
+     * VALUE replaced. The argument is not modified.
+     *
+     * JOB 4. See the class javadoc for which job covers which path; the short
+     * version is that this is the ONLY mechanism standing between an
+     * operator's live session cookie and a content-addressed blob store, and
+     * {@link #redactRequest} is not a substitute for it. Handed an empty
+     * {@link Injected} -- which is what the proxy path has, because it
+     * composed nothing -- {@code redactRequest} returns {@code raw.clone()},
+     * i.e. the credential verbatim. That was the shipped state of the proxy
+     * path for one commit and it is the reason this method exists.
+     *
+     * NAME KEPT, VALUE REPLACED, exactly as job 3 does it: the evidence still
+     * shows that a credential WAS sent and which kind, which is what an
+     * auth-boundary check reads, while the bytes that would still authenticate
+     * are gone. The placeholder is FIXED -- see {@link #OBSERVED_CREDENTIAL}
+     * -- so two browses of one page under two sessions produce one blob.
+     *
+     * ONLY THE HEAD IS SCANNED, for job 3's reason exactly: a body may
+     * legitimately carry the text {@code Cookie: sid=...} -- a documentation
+     * page, an API error dump, a captured request pasted into a form -- and
+     * rewriting it would corrupt the evidence a check reads. The head ends at
+     * the first empty line.
+     *
+     * NO REQUEST LINE IS RECOGNISED, and that is deliberate rather than an
+     * omission. {@link #redactResponse} has to know its status line, because
+     * taking the first non-empty line for one whatever it says would let a
+     * head whose first field is Set-Cookie have that cookie consumed as the
+     * status line and copied through raw. Here no line is privileged: every
+     * head line is matched as a field, and a request line survives that match
+     * because the name before its first colon always begins with the method
+     * token and a space -- {@code GET /x HTTP/1.1} has no colon at all, and
+     * {@code GET http://h:8080/x HTTP/1.1} gives the name {@code GET http},
+     * neither of which is one of the three. That holds for a SYNTACTICALLY
+     * VALID request line and is not claimed beyond one: ':' is not a tchar, so
+     * no method token can carry one, and the trim below takes whitespace off
+     * the ENDS only. A malformed first line that genuinely reads
+     * {@code Cookie: x} is redacted, which is the safe direction and the same
+     * answer this method gives that line anywhere else in the head.
+     *
+     * WHAT THIS EXCLUDES, named rather than left to be discovered:
+     *
+     *   - a credential in the request LINE -- {@code /login?token=...} -- and
+     *     in the body. Neither is touched here. The url is a separate exposure
+     *     with a separate column and is a whole-branch item, not this one's;
+     *   - a credential in a header this list does not name: {@code X-Api-Key},
+     *     {@code X-Auth-Token}, a bearer token in a custom header. §6 names
+     *     three and {@link #CREDENTIAL_HEADERS} is those three. A fourth name
+     *     added there is covered here automatically, which is why the
+     *     placeholders are derived from it;
+     *   - a 1xx-style interim head. There is no such thing in a request, so
+     *     unlike {@link #redactResponse} this scan does not look for one --
+     *     and if a pipelined SECOND request followed the first in one array,
+     *     its head would be treated as body and go through raw. This class is
+     *     handed one message at a time by contract (Montoya's
+     *     {@code initiatingRequest().toByteArray()}), and that contract is
+     *     UNMEASURED here, like everything else this file's proxy caller
+     *     assumes about Burp -- see HxExtension's assumption block.
+     *
+     * A null {@code raw} is a {@link RangeError}, the same as the other two
+     * entry points, and for the same reason: an NPE out of here reaches a Burp
+     * proxy thread and the send path's catch-all alike.
+     */
+    public byte[] redactObservedRequest(byte[] raw) {
+        if (raw == null)
+            throw new RangeError("redactObservedRequest needs the request bytes");
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int i = 0;
+        boolean first = true;        // no line of the head has been read yet
+        int credential = -1;         // index into CREDENTIAL_HEADERS, or -1
+        while (i < raw.length) {
+            int next = lineStartAfter(raw, i);      // start of the following line
+            int content = contentEnd(raw, i, next); // this line without its CR/LF
+
+            if (content == i) {                     // an empty line
+                if (first) {
+                    // RFC 9112 2.2: a recipient MAY ignore an empty line
+                    // before the request line, so one can reach us. Stopping
+                    // here would end the head before a single field was read
+                    // and copy the WHOLE request through as "body", every
+                    // credential raw. Keep it verbatim and keep looking.
+                    out.write(raw, i, next - i);
+                    i = next;
+                    continue;
+                }
+                out.write(raw, i, raw.length - i);  // the head really is over
+                return out.toByteArray();
+            }
+            first = false;
+            if (raw[i] == ' ' || raw[i] == '\t') {
+                // obs-fold. RFC 9110 says a recipient must reject it and no
+                // real client emits it, but if one does, the folded remainder
+                // of a credential is credential bytes -- so the whole
+                // continuation goes. Same trade as job 3's fold branch.
+                if (credential >= 0) {
+                    int ws = i;
+                    while (ws < content && (raw[ws] == ' ' || raw[ws] == '\t')) ws++;
+                    out.write(raw, i, ws - i);
+                    out.writeBytes(OBSERVED_CREDENTIAL[credential]);
+                    out.write(raw, content, next - content);
+                } else {
+                    out.write(raw, i, next - i);
+                }
+                i = next;
+                continue;
+            }
+            int colon = indexOf(raw, i, content, (byte) ':');
+            // Whitespace off the NAME before matching, through the same
+            // predicate job 3 uses, so the two cannot drift: a name this side
+            // lets through is a live credential stored verbatim.
+            int nameEnd = colon;
+            while (nameEnd > i && isOws((char) (raw[nameEnd - 1] & 0xff))) nameEnd--;
+            credential = -1;
+            if (colon > i)
+                for (int k = 0; k < CREDENTIAL_HEADERS.length; k++)
+                    if (asciiEqualsIgnoreCase(CREDENTIAL_HEADERS[k], raw, i, nameEnd)) {
+                        credential = k;
+                        break;
+                    }
+            if (credential < 0) {
+                out.write(raw, i, next - i);
+                i = next;
+                continue;
+            }
+            out.write(raw, i, colon + 1 - i);             // the name and colon
+            int v = colon + 1;
+            while (v < content && (raw[v] == ' ' || raw[v] == '\t')) v++;
+            out.write(raw, colon + 1, v - (colon + 1));   // the OWS, verbatim
+            // THE WHOLE VALUE, not a parsed part of it. Job 3 keeps a cookie's
+            // NAME because `sid=` is what a session-fixation check reads and
+            // it is not a secret. Here the whole value is the secret --
+            // `Bearer eyJ...`, `sid=...; other=...` -- and a cookie NAME sent
+            // by the browser tells a check nothing the response's Set-Cookie
+            // did not already say.
+            out.writeBytes(OBSERVED_CREDENTIAL[credential]);
+            out.write(raw, content, next - content);      // the CRLF
+            i = next;
+        }
         return out.toByteArray();
     }
 
