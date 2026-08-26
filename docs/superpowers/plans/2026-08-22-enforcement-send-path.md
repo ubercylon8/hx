@@ -17713,6 +17713,8 @@ public class ChokepointTest {
           ChokepointTest::theRecordingStructuresHoldTheirMonitors);
         t("theGateDecidesBeforeAnythingIsQueued",
           ChokepointTest::theGateDecidesBeforeAnythingIsQueued);
+        t("everyTypeNeedleSurvivesQualification",
+          ChokepointTest::everyTypeNeedleSurvivesQualification);
         t("theRecordIsBuiltByTheRecorderAndNeverInline",
           () -> theRecordIsBuiltByTheRecorderAndNeverInline(sources));
 
@@ -17841,18 +17843,37 @@ public class ChokepointTest {
               + "cannot override it (" + any + ")", any == 1);
     }
 
-    /** A MUST-BE-ZERO-ELSEWHERE needle: it reads {@link #text}, so a comment
-     *  spelling `import burp.` in another file turns this red rather than
-     *  passing. Fail-safe, and deliberately so. */
+    /**
+     * A MUST-BE-ZERO-ELSEWHERE needle: it reads {@link #text}, so a comment
+     * naming a Montoya type in another file turns this red rather than
+     * passing. Fail-safe, and deliberately so.
+     *
+     * THE NEEDLE WAS `import burp.` AND THAT WAS NOT THE PROPERTY. Measured:
+     * a fully-qualified `burp.api.montoya.core.ByteArray` in
+     * `hx/proxy/Recorder.java`, with no import line, compiles (test.sh puts
+     * the jar on the classpath) and read 13 summary lines / 1900 ok / 0 FAIL
+     * / rc=0. The invariant held; the check did not. That matters more than
+     * usual here, because "Recorder names no Montoya type" is what makes
+     * Recorder drivable, and this check is one of the four layers
+     * {@link #noSecondEgressFamilyExists} names as what closes ITS gap.
+     *
+     * `burp.api.` and not `burp.`, and the reason is measured rather than
+     * aesthetic: the jar has exactly ONE package root, `burp/api/`, so every
+     * reference to a Montoya type -- imported, statically imported or written
+     * out in full -- contains this string, while `burp.` alone also matches
+     * the legitimate system-property NAME `"hx.burp.version"` in
+     * `BridgeClient`. A needle that forces a real property to be renamed is a
+     * needle that will be loosened by the next person in a hurry.
+     */
     static void montoyaIsConfinedToTheEntryPoint(List<Path> sources) throws IOException {
-        List<String> importers = new ArrayList<>();
+        List<String> namers = new ArrayList<>();
         for (Path p : sources)
-            if (count(text(p), "import burp.") > 0) importers.add(p.toString());
+            if (count(text(p), MONTOYA) > 0) namers.add(p.toString());
         // Stronger than the plan's global constraint, and deliberately so.
-        // With Http as an interface, hx.send.Sender needs no burp.* type at
+        // With Http as an interface, hx.send.Sender needs no Montoya type at
         // all -- which is what makes the refusal tests able to count calls.
-        check("burp.* is imported only by " + ENTRY_POINT + ", not by " + importers,
-              importers.equals(List.of(ENTRY_POINT)));
+        check("Montoya is named only by " + ENTRY_POINT + ", not by " + namers,
+              namers.equals(List.of(ENTRY_POINT)));
     }
 
     /**
@@ -17916,6 +17937,14 @@ public class ChokepointTest {
 
     static final String BRIDGE_CLIENT =
             Path.of("src", "hx", "bridge", "BridgeClient.java").toString();
+
+    /** Every reference to a Montoya type contains this: the API jar has one
+     *  package root, `burp/api/`, measured. */
+    static final String MONTOYA = "burp.api.";
+
+    /** Policy declares the constructor its count cannot help matching. */
+    static final String POLICY =
+            Path.of("src", "hx", "policy", "Policy.java").toString();
 
     /** The record itself, which declares the constructor the count below
      *  cannot help matching. */
@@ -18289,7 +18318,15 @@ public class ChokepointTest {
      * count of a CALL nobody writes in prose -- the class javadoc's rule for
      * when that is safe.
      *
-     * WHAT IT DOES NOT SEE: a second Limits. `new Limits(` is not counted,
+     * WHAT IT DOES NOT SEE, beyond a second Limits: a CONSTRUCTOR REFERENCE.
+     * `Policy::new` contains no `Policy(` and would slip past, exactly as
+     * `Observed::new` did before {@link hx.proxy.Observed} was made
+     * package-private and the compiler took over that job. There is no
+     * equivalent compiler bound available here -- `Policy` is public because
+     * `hx.send` and `hx.proxy` both need it -- so this is a declared residual
+     * and not a closed one.
+     *
+     * AND NOT A SECOND LIMITS EITHER. `new Limits(` is not counted,
      * because Limits is legitimately constructible for defaults and the
      * damage is done by the Policy that takes it. If this count ever needs to
      * be two, say which Limits the second one shares before changing the
@@ -18299,14 +18336,22 @@ public class ChokepointTest {
         int total = 0;
         List<String> hits = new ArrayList<>();
         for (Path p : sources) {
-            int n = count(code(p), "new Policy(");
+            // `Policy(` and not `new Policy(`: a QUALIFIED construction,
+            // `new hx.policy.Policy(limits)`, slipped past the `new ` spelling
+            // and read 13 summary lines / 1900 ok / 0 FAIL / rc=0 -- a second
+            // per-run budget for one run, which is the exact failure this
+            // check's javadoc says no behavioural test can see. The cost of
+            // the wider needle is that Policy's own CONSTRUCTOR DECLARATION
+            // matches, so the expected answer is two files.
+            int n = count(code(p), "Policy(");
             total += n;
             if (n > 0) hits.add(p + " x" + n);
         }
-        check("extension/src builds exactly one Policy, not " + total + " " + hits,
-              total == 1);
-        check("and it is in " + ENTRY_POINT + ", not " + hits,
-              hits.size() == 1 && hits.get(0).startsWith(ENTRY_POINT));
+        check("Policy is DECLARED in one file and CONSTRUCTED in one, and the "
+              + "one that constructs it is " + ENTRY_POINT + " -- not " + hits,
+              hits.equals(List.of(ENTRY_POINT + " x1", POLICY + " x1")));
+        check("so extension/src builds exactly one Policy (" + (total - 1)
+              + " constructions + 1 declaration = " + total + ")", total == 2);
     }
 
     /**
@@ -18800,30 +18845,46 @@ public class ChokepointTest {
      * WHAT IS LEFT FOR TEXT TO SAY, and it is the whole of what this method
      * now does:
      *
-     *   - the record is built by the Recorder and NEVER inline. `Observed(`
-     *     appears in exactly two files of extension/src -- the record's own
-     *     DECLARATION and Recorder's one construction -- so every Observed
-     *     that exists in the shipped jar was built by the thing that redacts.
-     *     (Tests construct them freely; this check walks `src` only, which is
-     *     the same boundary `theBridgeNamesNothingInTheProxyPackage` draws and
-     *     for the same reason: a test is not compiled into the jar.) A record
-     *     assembled anywhere else in src is red here rather than plausible;
+     *   - the record is built by the Recorder and NEVER inline. THE REAL BOUND
+     *     HERE IS THE COMPILER, NOT THIS COUNT. `new Observed(` missed
+     *     `new hx.proxy.Observed(`; the widened `Observed(` missed
+     *     `Observed::new` -- measured at 13 / 1900 ok / 0 FAIL / rc=0 with
+     *     both halves raw -- and a third widening would miss a fourth
+     *     spelling. So {@link hx.proxy.Observed} and {@link hx.proxy.Denied}
+     *     are PACKAGE-PRIVATE: nothing outside `hx.proxy` can name either type
+     *     by any spelling, and `javac` says so rather than a needle. That is
+     *     asserted where it can be asserted for real -- by REFLECTION, in
+     *     `RecorderTest.theCompilerBoundsConstruction`, which reads the
+     *     compiled modifiers and cannot be fooled by how a construction is
+     *     written. The count below is what remains useful AFTER that bound:
+     *     it narrows construction WITHIN the package to one file, and it is
+     *     spelling-bound in the way the compiler is not;
      *   - the proxy path's redaction is on the drivable side of the line.
      *     `.redactObservedRequest(` appears exactly once in extension/src and
      *     it is in Recorder.java, and the entry point CALLS neither redaction
      *     method at all. Moving either call back into the entry point is red.
      *     Counted WITH the leading dot, the way the deprecated-accessor check
      *     is, so `Redactor`'s own declaration of the method is not a call;
-     *   - the two raw arrays go to the two slots the right way round. Both are
-     *     `byte[]`, so a swap at the call site compiles and puts the response
-     *     in the request's slot. Each binding is delimited to its own `;` and
-     *     checked for what it names, and their order inside the call is
-     *     asserted.
+     *   - THE FIRST call site's two raw arrays go to the two slots the right
+     *     way round. Both are `byte[]`, so a swap compiles and puts the
+     *     response in the request's slot. Each binding is delimited to its own
+     *     `;` and checked for what it names, and their order inside the call
+     *     is asserted;
+     *   - and there is only one call site to check, because the Recorder is
+     *     CONSTRUCTED once and CALLED once. Both halves of that are needed and
+     *     only the first was obvious: every arm above is `indexOf`, the FIRST
+     *     match, so a second `Recorder` built in another handler with the
+     *     halves reversed was measured at 13 / 1900 ok / 0 FAIL / rc=0 with
+     *     both halves leaking -- G1 restored through a door nothing was
+     *     looking at. But ONE Recorder called TWICE is the same door, so the
+     *     call is counted too. Constructions are counted the way `Policy` is.
      *
-     * That last one is a TEXT SCAN with the same limit as every other in this
-     * file -- see the class javadoc: it sees names, not values, and it cannot
-     * see through a call. It is the residual, it is small, and the layer that
-     * closes it is Task 9 driving real Burp.
+     * THE ORDERING AND CALL-SITE ARMS ARE A TEXT SCAN with the same limit as
+     * every other in this file -- see the class javadoc: they see names, not
+     * values, they cannot see through a call, and they read the FIRST call
+     * site, which is only sufficient because the count above says there is one
+     * Recorder to call. The layer that closes what they cannot is
+     * `RecorderTest` for the transform and Task 9 for the wire.
      */
     static void theRecordIsBuiltByTheRecorderAndNeverInline(List<Path> sources)
             throws IOException {
@@ -18860,6 +18921,30 @@ public class ChokepointTest {
                          + count(entry, ".redactResponse(");
         check("and the entry point redacts nothing itself (" + entryRedacts + ")",
               entryRedacts == 0);
+
+        // ONE Recorder, counted the way one Policy is -- and for a sharper
+        // reason: every positional arm below reads the FIRST call site, so a
+        // SECOND Recorder is a second call site nothing looks at. Measured:
+        // one built in handleResponseToBeSent with the halves reversed read
+        // 13 / 1900 ok / 0 FAIL / rc=0 with both halves leaking. `Recorder(`
+        // and not `new Recorder(`, so a qualified construction cannot slip;
+        // the cost is that Recorder's own constructor declaration matches.
+        List<String> recorders = new ArrayList<>();
+        for (Path p : sources) {
+            int n = count(code(p), "Recorder(");
+            if (n > 0) recorders.add(p + " x" + n);
+        }
+        check("Recorder is DECLARED in one file and CONSTRUCTED in one, and the "
+              + "one that constructs it is " + ENTRY_POINT + " -- not " + recorders,
+              recorders.equals(List.of(ENTRY_POINT + " x1", RECORDER + " x1")));
+        // ...AND CALLED ONCE. One Recorder is not one call site: the same
+        // object called twice is two sets of arguments and only the first is
+        // read by the arms below. Counting constructions alone would have left
+        // that, and the sentence "there is one call site" would have been a
+        // claim about a count that does not say it.
+        int calls = count(entry, "recorder.record(");
+        check("and the entry point calls it exactly once, so the positional "
+              + "arms below see every call there is (" + calls + ")", calls == 1);
 
         // ---- and it is handed the two halves the right way round ------------
         check("the entry point builds its record through the Recorder ("
@@ -18917,6 +19002,127 @@ public class ChokepointTest {
         if (at < 0) return "";
         int end = haystack.indexOf(";", at);
         return end < 0 ? "" : haystack.substring(at, end);
+    }
+
+    /**
+     * EVERY NEEDLE THAT NAMES A TYPE MATCHES ITS OWN FULLY-QUALIFIED SPELLING.
+     *
+     * THIS EXISTS BECAUSE THE SAME DEFECT HAS APPEARED SIX TIMES ON ONE TASK,
+     * always in the same shape and always found by a reviewer rather than by
+     * this suite. Each was a needle that matched the spelling someone happened
+     * to write and not the CONSTRUCT it was about:
+     *
+     *     `new Socket(`     blind to `new java.net.Socket(`
+     *     `new Observed(`   blind to `new hx.proxy.Observed(`
+     *     `Observed(`       blind to `Observed::new`
+     *     `new Policy(`     blind to `new hx.policy.Policy(`   -- a second budget
+     *     `import burp.`    blind to a fully-qualified Montoya type
+     *     `openConnection(` blind to `URL.getContent()`        -- same family, API side
+     *
+     * Four of the six were WORKING defects, not hypotheticals: a live TCP
+     * egress, two raw-credential leaks and a second per-run budget, each
+     * measured at a fully green suite.
+     *
+     * So the property is asserted instead of re-derived by the next reviewer.
+     * For each needle below, a fully-qualified spelling of the same construct
+     * is written out and the needle must match it. No compilation and no
+     * subprocess -- string work over this file's own text, finite, and
+     * directly falsifiable: revert any needle to its `new `-prefixed or
+     * `import `-prefixed form and its row goes red HERE, in the suite, rather
+     * than in the next review. (It DOES read one file: its own source, for the
+     * two anti-vacuity arms below.)
+     *
+     * ANTI-VACUITY RUNS BOTH WAYS FOR THE ONE FAMILY WHERE IT CAN. The needles
+     * of {@link #noSecondEgressFamilyExists} live in one array literal, so
+     * that array is parsed out of this file's own text and every entry is
+     * required to have a row here -- adding a needle without a row is red. For
+     * the needles scattered across other methods no rule can enumerate them,
+     * so the reverse direction is all there is: every row's needle must appear
+     * verbatim somewhere in this file, which catches a needle renamed out from
+     * under its row but NOT a new needle added elsewhere without one. That
+     * asymmetry is the honest limit of this check and is why the array family
+     * -- the one with a history -- is the one held from both sides.
+     *
+     * WHAT THIS DOES NOT ASSERT, because qualification is not the only
+     * dimension: a CONSTRUCTOR REFERENCE (`Socket::new`, `Policy::new`) has no
+     * paren and matches no `X(` needle, and a METHOD REFERENCE
+     * (`client::configEpoch`) matches no `.x()` needle. Those are named as
+     * residuals where they arise. The one place that dimension IS closed is
+     * {@link hx.proxy.Observed} and {@link hx.proxy.Denied}, where the answer
+     * was not a better needle but a package-private record and a compiler.
+     */
+    static void everyTypeNeedleSurvivesQualification() throws IOException {
+        // {needle, a fully-qualified spelling of the same construct}
+        String[][] rows = {
+            {"Socket(",           "new java.net.Socket(\"127.0.0.1\", 1)"},
+            {"InetSocketAddress", "new java.net.InetSocketAddress(\"h\", 1)"},
+            {"URL(",              "new java.net.URL(\"http://h/\")"},
+            {"openConnection(",   "new java.net.URL(\"http://h/\").openConnection()"},
+            {"openStream(",       "new java.net.URL(\"http://h/\").openStream()"},
+            {"HttpClient",        "java.net.http.HttpClient.newHttpClient()"},
+            {"DatagramSocket",    "new java.net.DatagramSocket()"},
+            {"InetAddress",       "java.net.InetAddress.getByName(\"h\")"},
+            {"ProcessBuilder",    "new java.lang.ProcessBuilder(\"curl\")"},
+            {"Runtime.getRuntime", "java.lang.Runtime.getRuntime().exec(\"curl\")"},
+            {"collaborator()",    "api.collaborator().createClient()"},
+            {"Policy(",           "new hx.policy.Policy(limits)"},
+            {"Recorder(",         "new hx.proxy.Recorder(redactor)"},
+            {"Observed(",         "new hx.proxy.Observed(m, u, s, ms, q, r, src)"},
+            {MONTOYA,             "burp.api.montoya.core.ByteArray b = null;"},
+            {"RedirectionMode.",  "burp.api.montoya.http.RedirectionMode.NEVER"},
+            {"HttpService.httpService(",
+             "burp.api.montoya.http.HttpService.httpService(h, p, s)"},
+            {"HttpRequest.httpRequest(",
+             "burp.api.montoya.http.message.requests.HttpRequest.httpRequest(s, b)"},
+            {"hx.proxy",          "hx.proxy.Observed o = null;"},
+        };
+        String self = text(Path.of("test", "hx", "ChokepointTest.java"));
+        check("this class can read its own source (" + self.length() + " chars)",
+              self.length() > 10_000);
+        // The rows above are string literals in this same file, so a naive
+        // "is this needle still used" search finds the ROW and passes on a
+        // needle nothing else spells any more. The table is cut out first.
+        int rowsAt = self.indexOf("String[][] rows = {");
+        int rowsEnd = self.indexOf("        };", rowsAt);
+        check("the row table was located and excluded (" + rowsAt + ".."
+              + rowsEnd + ")", rowsAt >= 0 && rowsEnd > rowsAt);
+        String elsewhere = rowsEnd > rowsAt
+                ? self.substring(0, rowsAt) + self.substring(rowsEnd) : self;
+
+        for (String[] row : rows) {
+            check("`" + row[0] + "` matches its qualified spelling `" + row[1] + "`",
+                  count(row[1], row[0]) >= 1);
+            // ...and the needle is one this file actually uses, SOMEWHERE
+            // OTHER THAN THE ROW. A row whose needle has been renamed away is
+            // stale, and a stale row is a green check about nothing.
+            check("...and `" + row[0] + "` is a needle this file still uses",
+                  count(elsewhere, "\"" + row[0] + "\"") >= 1);
+        }
+
+        // The one family that can be enumerated: every needle in
+        // noSecondEgressFamilyExists's array must have a row above.
+        int from = self.indexOf("String[] needles = {");
+        int to = self.indexOf("};", from);
+        check("the egress needle array was found (" + from + ".." + to + ")",
+              from >= 0 && to > from);
+        List<String> missing = new ArrayList<>();
+        String array = to > from ? self.substring(from, to) : "";
+        int at = 0;
+        int found = 0;
+        while ((at = array.indexOf('"', at)) >= 0) {
+            int end = array.indexOf('"', at + 1);
+            if (end < 0) break;
+            String needle = array.substring(at + 1, end);
+            found++;
+            boolean covered = false;
+            for (String[] row : rows) if (row[0].equals(needle)) covered = true;
+            if (!covered) missing.add(needle);
+            at = end + 1;
+        }
+        check("every egress needle was read out of the array (" + found + ")",
+              found >= 10);
+        check("...and every one of them has a qualified-spelling row " + missing,
+              missing.isEmpty());
     }
 
     static int count(String haystack, String needle) {
@@ -19229,7 +19435,6 @@ import hx.policy.Distress;
 import hx.policy.HxRequest;
 import hx.policy.Policy;
 import hx.proxy.Capture;
-import hx.proxy.Denied;
 import hx.proxy.Pending;
 import hx.proxy.ProxyGate;
 import hx.proxy.Recorder;
@@ -19493,7 +19698,7 @@ public class HxExtension implements BurpExtension {
                 // `url` are read into locals inside the try for the same
                 // reason the adapter builds its request inside one: they are
                 // Montoya's code handed a hostile page's bytes, and a throw
-                // out of them while building the Denied would escape this
+                // out of them while building the refusal record would escape
                 // handler entirely.
                 Source source = Source.UNATTRIBUTED;
                 String method = "";
@@ -19534,8 +19739,8 @@ public class HxExtension implements BurpExtension {
                     ProxyRequestReceivedAction refuse =
                             ProxyRequestReceivedAction.drop();
                     try {
-                        capture.offer(new Denied(method, url, verdict.errorClass(),
-                                                 verdict.detail(), source));
+                        capture.offer(recorder.denial(method, url,
+                                verdict.errorClass(), verdict.detail(), source));
                     } catch (Throwable ignored) {
                         // Throwable, and swallowed, and that IS a silent loss
                         // -- the one place in this design where a lost record
@@ -19658,8 +19863,8 @@ public class HxExtension implements BurpExtension {
                     // spent on requests that are actually in flight.
                     try {
                         pending.take(r.messageId());
-                        capture.offer(new Denied(method, url, errorClass,
-                                                 detail, source));
+                        capture.offer(recorder.denial(method, url, errorClass,
+                                                      detail, source));
                     } catch (Throwable ignored) {
                         // See the first callback: the counter is the thing
                         // that threw, so there is nothing left to count with,
