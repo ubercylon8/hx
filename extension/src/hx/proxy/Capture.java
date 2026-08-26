@@ -25,28 +25,52 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * ITS CONVERSE: a drop is never silent. S5 says a run with drops has coverage
  * numbers that are a FLOOR, and nothing on the far side can know that unless
- * it is told. There are FOUR ways this class can hold a record it does not
+ * it is told. There are FIVE ways this class can hold a record it does not
  * pass on, and each one increments {@link #dropped} for the record's own
  * source:
  *
  *   1. EVICTION, when {@link #offer} finds the queue full;
  *   2. REFUSAL, when a record's source has no spelling;
  *   3. AN UNDELIVERED EXCHANGE -- the sink threw, or answered false;
- *   4. {@link #stop}, which throws away whatever is still queued.
+ *   4. {@link #stop}, which throws away whatever is still queued;
+ *   5. AN OFFER THAT ARRIVES AT OR AFTER {@link #stop} -- Burp unloading the
+ *      extension while a proxy thread is still inside {@link #offer}. Such a
+ *      record lands in a queue with no drain behind it, so {@link #offer}
+ *      clears and counts the queue itself once it sees {@link #accepting}
+ *      go false.
  *
- * They are ONE number, not four, because they are one fact: a record hx does
+ * They are ONE number, not five, because they are one fact: a record hx does
  * not have. A frame over MAX_FRAME and a socket that died between two
  * requests differ to whoever is debugging the bridge and not at all to
  * whoever is reading the run's coverage.
  *
- * HOW TO FALSIFY THE FOUR rather than take the list on trust:
- * `incrementAndGet` appears exactly four times in this file, once per path
- * above, and it is the only way `dropped[]` is written. A fifth loss would
- * need a fifth increment or would be a record leaving with none, and either
- * is visible in one grep. What is NOT covered, and cannot be from inside this
- * class: a JVM that dies without reaching {@link #stop} takes the queue with
- * it uncounted. That is Burp crashing, not hx losing a record quietly, and
- * there is no code path left to run at that point.
+ * COUNTING THE INCREMENTS IS NOT A FALSIFIER, and this comment said it was.
+ * It read "`incrementAndGet` appears exactly four times, once per path; a
+ * fifth loss would need a fifth increment or would be a record leaving with
+ * none, and either is visible in one grep." Path 5 was neither: the record
+ * did not leave and nothing was incremented, it simply sat in the queue.
+ * Measured before it was closed -- `stop(); offer(one record);` gave
+ * `delivered=0, dropped()=0, reports=[]`, and 4 paced proxy threads offering
+ * 800 records across a `stop()` gave `4 delivered + 284 dropped of 800`, the
+ * missing 512 being exactly DEFAULT_CAPACITY sitting in a drainless queue.
+ *
+ * WHAT DOES PIN THE FIVE is a count of EXITS, not of increments. A record
+ * enters through {@link #offer} and nowhere else, and it leaves DELIVERED or
+ * as one of 1-5; the four `incrementAndGet` sites are what serve those five,
+ * paths 4 and 5 sharing {@link #discardQueued}. Each of the four was DELETED
+ * on its own and measured: refusal -> 3 FAIL, eviction -> 9, undelivered -> 3,
+ * discard -> 3, every one of them 11 summary lines with named FAIL lines, and
+ * none of them a silent green. `offers racing stop() are every one of them
+ * accounted for` is the test that holds when no single increment does: it
+ * asserts only that delivered + dropped is everything offered, which is the
+ * exits restated.
+ *
+ * WHAT IS NOT COVERED, and cannot be from inside this class: a JVM that dies
+ * without reaching {@link #stop} takes the queue with it uncounted, and so
+ * does one that exits while the drain is still parked in a wedged sink with a
+ * record in hand -- that record is counted when the sink finally answers, or
+ * never. Both are Burp dying, not hx losing a record quietly, and there is no
+ * code path left to run at that point.
  *
  * WHAT IS NOT CLAIMED HERE is that the count reaches the far side. It reaches
  * it when {@link BridgeClient.ExchangeSink#dropped} SAYS it did, by answering
@@ -136,6 +160,20 @@ public final class Capture {
     private volatile Thread drain;
     private volatile boolean running;
 
+    /**
+     * Whether {@link #offer} still has a drain to offer INTO.
+     *
+     * True from construction and false from {@link #stop} until the next
+     * {@link #start}. {@link #running} cannot do this job, and that is not a
+     * naming quibble: `running` is also false BEFORE the first `start()`, and
+     * offering into a Capture that has not started yet is legitimate -- it is
+     * how `stopThenStartDoesNotReReportTheCount` fills the queue, and it is
+     * what the proxy handler does for any record that arrives between
+     * construction and the drain's first poll. Those records have a drain
+     * coming. A record offered after `stop()` does not.
+     */
+    private volatile boolean accepting = true;
+
     public Capture(int capacity, BridgeClient.ExchangeSink sink) {
         this.queue = new ArrayBlockingQueue<>(capacity);
         this.sink = sink;
@@ -185,6 +223,13 @@ public final class Capture {
      * request under a run kind nothing chose, and the request never left in
      * the first place. Counted rather than discarded, because the count is
      * the thing that says hx knows less than it might.
+     *
+     * AND IT NOTICES A CAPTURE THAT HAS STOPPED UNDERNEATH IT. Burp unloads
+     * the extension on its own thread while proxy threads are still in here;
+     * without the check at the bottom those records queued into a drain that
+     * no longer existed, which lost them AND left `run.dropped_total` where
+     * it was -- the coverage floor reading lower than the real loss, which is
+     * the one direction it may never move.
      */
     public void offer(Observed o) {
         if (sourceName(o.source()) == null) {
@@ -198,6 +243,30 @@ public final class Capture {
             Observed evicted = queue.poll();
             if (evicted != null) dropped[evicted.source().ordinal()].incrementAndGet();
         }
+        // AFTER the enqueue, not before, and that ordering is the whole
+        // guarantee. `accepting` is volatile and the queue has a lock of its
+        // own, so the two orderings cover each other: if this read sees TRUE
+        // it precedes stop()'s write of false, so the enqueue above precedes
+        // stop()'s drainTo and stop() counts the record; if it sees FALSE,
+        // stop() may already have drained past the record, so this thread
+        // clears the queue itself. A check BEFORE the enqueue would leave the
+        // window between the two open, which is precisely the window Burp's
+        // unload sits in.
+        if (!accepting) discardQueued();
+    }
+
+    /**
+     * Count everything queued, and keep nothing.
+     *
+     * Called by {@link #stop}, and by an {@link #offer} that found the
+     * capture already stopped. NEVER by the drain: a record taken off the
+     * queue to be DELIVERED is {@link #deliver}'s business, and counting it
+     * here as well would report one loss twice.
+     */
+    private void discardQueued() {
+        List<Observed> left = new ArrayList<>();
+        queue.drainTo(left);
+        for (Observed o : left) dropped[o.source().ordinal()].incrementAndGet();
     }
 
     /**
@@ -212,6 +281,7 @@ public final class Capture {
      */
     public synchronized void start() {
         if (drain != null) return;
+        accepting = true;
         running = true;
         Thread t = new Thread(this::loop, "hx-capture");
         t.setDaemon(true);   // must never hold Burp open
@@ -234,10 +304,20 @@ public final class Capture {
      * record hx cannot pass on is a drop; saying so is the honest half, and
      * it is the half S5 depends on.
      *
-     * Idempotent: a second call finds no drain, an empty queue and nothing
-     * outstanding.
+     * Idempotent, AND A SECOND CALL IS NOT ALWAYS A NO-OP. It finds no drain,
+     * but it finds whatever arrived after the first: a proxy thread inside
+     * {@link #offer} when Burp tore the extension down has counted its record
+     * (path 5) and had nothing left to report it through. The next `stop()`
+     * is what carries that count across the sink. Task 7 owns the choice of
+     * whether there is one -- and this method COUNTING rather than DELIVERING
+     * is the trade it may want to revisit with a deadline-drain of its own
+     * before it calls this.
      */
     public synchronized void stop() {
+        // FIRST, and before the drain is even asked to stop: from this write
+        // on, an offer() that lands in the queue is responsible for counting
+        // itself. See offer()'s closing comment for why that is enough.
+        accepting = false;
         running = false;
         Thread t = drain;
         drain = null;
@@ -249,9 +329,7 @@ public final class Capture {
                 Thread.currentThread().interrupt();
             }
         }
-        List<Observed> left = new ArrayList<>();
-        queue.drainTo(left);
-        for (Observed o : left) dropped[o.source().ordinal()].incrementAndGet();
+        discardQueued();
         // tryLock, never lock: see reportLock. A drain wedged in the sink is
         // holding it, and there is nothing to report through anyway.
         if (reportLock.tryLock()) {

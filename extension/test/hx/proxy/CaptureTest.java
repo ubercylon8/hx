@@ -56,6 +56,10 @@ public class CaptureTest {
           CaptureTest::stopDoesNotHang);
         t("stop() counts and reports what it throws away",
           CaptureTest::stopFlushesWhatItThrowsAway);
+        t("an offer after stop() is counted, not swallowed",
+          CaptureTest::offerAfterStopIsCountedNotSwallowed);
+        t("offers racing stop() are every one of them accounted for",
+          CaptureTest::offersRacingStopAreAllAccountedFor);
         t("stop() then start() does not re-report the cumulative count",
           CaptureTest::stopThenStartDoesNotReReportTheCount);
         t("start() twice leaves one drain and one report",
@@ -586,12 +590,109 @@ public class CaptureTest {
             });
             sink.gate.countDown();           // let stop()'s interrupt through
             c.stop();
-            check("every queued record was counted, not discarded ("
-                  + c.dropped() + " of 200)", c.dropped() == 200);
+            // THE PROPERTY, not the ordering. `c.dropped() == 200` was stable
+            // over forty sequential and twenty-four eight-way-parallel runs,
+            // and it still rests on stop()'s interrupt beating the
+            // gate.countDown() two lines up: lose that race and record 1 is
+            // DELIVERED instead, giving 199 counted of 200 with nothing at all
+            // wrong. What has to hold on both sides of it is that no record is
+            // NEITHER delivered nor counted -- and that at least one was
+            // counted, because an empty queue here would mean this test
+            // measured nothing.
+            check("every queued record was counted or delivered, none lost ("
+                  + sink.seen.size() + " delivered + " + c.dropped()
+                  + " counted, of 200)",
+                  sink.seen.size() + c.dropped() == 200 && c.dropped() >= 1);
             check("and the count crossed the sink (" + reportedTotal(sink)
                   + " reported, " + c.dropped() + " counted)",
                   reportedTotal(sink) == c.dropped());
         } finally { sink.gate.countDown(); c.stop(); }
+    }
+
+    static void offerAfterStopIsCountedNotSwallowed() throws Exception {
+        // MEASURED on the version this replaces: stop(); offer(one record);
+        // -- delivered=0, dropped()=0, reports=[]. offer() was gated on
+        // nothing, so the record went into a queue with no drain behind it and
+        // stayed there, counted nowhere.
+        //
+        // Not a corner case. Burp unloads the extension while proxy threads
+        // are still inside offer(), so those exchanges are lost AND
+        // run.dropped_total does not move -- S5's floor reading LOWER than the
+        // real loss, which is the one direction the counter exists to close.
+        Recording sink = new Recording();
+        Capture c = new Capture(512, sink);
+        c.start();
+        c.stop();
+        c.offer(obs(1));
+        check("a record offered after stop() is counted (" + c.dropped()
+              + " of 1)", c.dropped() == 1);
+        check("...and was not delivered behind the operator's back (" + sink.seen + ")",
+              sink.seen.isEmpty());
+        // Nothing drains after stop(), so the count leaves on the NEXT stop().
+        // That is what "idempotent" means here and it is not "a no-op": a
+        // second call is how a loss during the unload reaches the far side.
+        c.stop();
+        check("...and the next stop() carries it across the sink ("
+              + reportedTotal(sink) + " reported against " + c.dropped()
+              + " counted)", reportedTotal(sink) == c.dropped());
+    }
+
+    static void offersRacingStopAreAllAccountedFor() throws Exception {
+        // The shape above with the timing it actually has: Burp calls stop()
+        // while proxy threads are INSIDE offer(). Nothing here pins which side
+        // of the race any one record lands on -- that is the point. What is
+        // pinned is the invariant that has to hold on both sides: every record
+        // offered either reached the sink or was counted as a drop, and never
+        // neither. Before the fix a record could be neither.
+        Recording sink = new Recording();
+        Capture c = new Capture(512, sink);
+        c.start();
+        int threads = 4, each = 200;
+        CountDownLatch go = new CountDownLatch(1);
+        List<Thread> offerers = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final int base = i * each;
+            Thread w = new Thread(() -> {
+                // Bounded, and a DAEMON: a worker that never releases would
+                // hold the JVM open after this class printed ALL PASS.
+                try {
+                    if (!go.await(5000, TimeUnit.MILLISECONDS)) return;
+                } catch (InterruptedException e) { return; }
+                for (int n = 0; n < each; n++) {
+                    c.offer(obs(base + n));
+                    // PACED, so the offers straddle stop() instead of all
+                    // landing before it. Unpaced, 800 offers are microseconds
+                    // of work and finish inside the 10 ms waitUntil poll
+                    // below -- and the test then passes on a Capture with the
+                    // bug, which is a green measuring the scheduler.
+                    try { Thread.sleep(1); } catch (InterruptedException e) { return; }
+                }
+            });
+            w.setDaemon(true);
+            offerers.add(w);
+            w.start();
+        }
+        try {
+            go.countDown();
+            // stop() has to land WHILE they are still offering, or this
+            // measures a scheduler that happened to finish first: 800 offers
+            // is several times what one drain empties in the time stop() takes,
+            // and one delivered record proves the offerers are running.
+            waitUntil(() -> !sink.seen.isEmpty());
+            c.stop();
+            for (Thread w : offerers)
+                TestSupport.join(w, 5000, "a proxy thread inside offer()");
+            // NO second stop() before the check. A second stop() drains the
+            // queue and counts it, so it makes this pass on a Capture that
+            // strands every post-stop offer -- measured, 11 ALL PASS with the
+            // bug still in. The accounting asserted here has to have been done
+            // by offer() itself.
+            int total = threads * each;
+            check("every record offered across a stop() is delivered or counted"
+                  + " (" + sink.seen.size() + " delivered + " + c.dropped()
+                  + " dropped, of " + total + ")",
+                  sink.seen.size() + c.dropped() == total);
+        } finally { c.stop(); }
     }
 
     static void stopThenStartDoesNotReReportTheCount() throws Exception {
