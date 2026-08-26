@@ -204,14 +204,50 @@ public class HxExtension implements BurpExtension {
         // ordinary code is `listenerPort` below, which takes a String; it is
         // public and ProxyGateTest drives it.
         //
-        // AN ASSUMPTION THIS WIRING RESTS ON AND CANNOT CHECK, written down
-        // for Task 9 to measure rather than left implicit: that a request
-        // issued by the SEND path -- `api.http().sendRequest` in the adapter
-        // below -- does NOT also traverse these proxy handlers. If it did,
-        // every send would be decided twice and, worse, attributed by a
-        // listener port it does not have: UNATTRIBUTED, refused, and the send
-        // path dead. Montoya issues those from Burp's own HTTP stack rather
-        // than through a proxy listener, and nothing here has measured it.
+        // WHAT THIS WIRING RESTS ON AND CANNOT CHECK -- Task 9's list, written
+        // down here rather than left implicit. Every item is a thing a real
+        // Burp settles in minutes and nothing in this repository can settle at
+        // all.
+        //
+        //  1. THAT A SEND-PATH REQUEST DOES NOT TRAVERSE THESE HANDLERS.
+        //     `api.http().sendRequest` in the adapter below issues from Burp's
+        //     own HTTP stack rather than through a proxy listener. If it did
+        //     traverse them, every send would be decided twice and, worse,
+        //     attributed by a listener port it does not have: UNATTRIBUTED,
+        //     refused, and the send path dead. Unmeasured.
+        //  2. THAT THE HANDLER'S VERDICT IS HONOURED. Nothing in the suite
+        //     sees this: `if (!verdict.allow() && false)` forwards every
+        //     refused request and reads 12 summary lines / 0 FAIL / rc=0 --
+        //     measured. THE CONDITION TASK 9 MUST MEET, and it is not
+        //     negotiable: assert a refused request reaches the target ZERO
+        //     times, MEASURED AT THE TARGET -- a request log, a connection
+        //     count -- and NEVER by reading the client's response. Task 1
+        //     measured `drop()` returning 200 OK with ~1529 bytes of Burp's
+        //     own HTML, so a drop and a delivery are indistinguishable by
+        //     status code at the client. A test that reads the client side
+        //     passes on a gate that forwards everything.
+        //  3. THAT `drop()` FROM THE SECOND CALLBACK SENDS NOTHING. Task 1
+        //     measured the drop from `handleRequestReceived` only. Montoya
+        //     documents both actions identically; nobody has watched the wire.
+        //  4. THAT `path()` CARRIES THE QUERY AND `httpService().host()` IS
+        //     THE CONNECTION HOST. Montoya's documented contract, unmeasured
+        //     here. If either is wrong the request is scope_denied by
+        //     Policy.checkScope's host/path agreement test -- fail-closed, but
+        //     it would refuse working traffic.
+        //  5. TWO PROXY BYTE-FLOWS THAT REACH NEITHER CALLBACK, so neither is
+        //     enforced or captured here:
+        //       - WEBSOCKET. After a scope-allowed 101 upgrade, frames
+        //         traverse Burp's separate proxy-WebSocket handlers, and this
+        //         extension registers none. The destination was scope-decided
+        //         at upgrade time, so the engagement boundary itself holds;
+        //         per-message enforcement and ALL capture do not.
+        //       - PER-HOST CERTIFICATE MINTING. Burp connects to the target to
+        //         copy its certificate when minting the CA-signed one for a
+        //         CONNECT, and that happens before any request reaches a
+        //         handler -- so a TLS ClientHello carrying the target's SNI
+        //         can leave for a host these handlers would then refuse.
+        //         Unverified, and exactly the kind of claim a real-Burp
+        //         measurement should settle.
         //
         // 0 is "no crawler configured", which Source.forListenerPort reads as
         // "attribute every request whose own listener port parses to
@@ -274,9 +310,31 @@ public class HxExtension implements BurpExtension {
                             + "the proxy request handler threw: " + e);
                 }
                 if (!verdict.allow()) {
-                    capture.offer(new Denied(method, url, verdict.errorClass(),
-                                             verdict.detail(), source));
-                    return ProxyRequestReceivedAction.drop();
+                    // THE ACTION IS DECIDED AND HELD BEFORE ANYTHING IS
+                    // RECORDED, and it is returned whatever the recording did.
+                    // "Capture never gates enforcement" was true here only
+                    // because Capture.offer documents that it never throws --
+                    // a property worth keeping AND worth not depending on. A
+                    // throw out of this line (a Captured with a null Source
+                    // NPEs at `dropped[o.source().ordinal()]`) would escape the
+                    // handler with drop() never executed, and what Burp does
+                    // with a handler that threw is measured nowhere in this
+                    // repo. Now the refusal cannot be undone by the record.
+                    ProxyRequestReceivedAction refuse =
+                            ProxyRequestReceivedAction.drop();
+                    try {
+                        capture.offer(new Denied(method, url, verdict.errorClass(),
+                                                 verdict.detail(), source));
+                    } catch (Throwable ignored) {
+                        // Throwable, and swallowed, and that IS a silent loss
+                        // -- the one place in this design where a lost record
+                        // is not counted, because the thing that counts is the
+                        // thing that threw. The trade is stated rather than
+                        // hidden: a refusal hx failed to record is a gap in
+                        // the evidence; a refusal hx failed to ENFORCE is
+                        // bytes on the wire.
+                    }
+                    return refuse;
                 }
                 // nanoTime, not the wall clock: this is the origin of a
                 // DURATION, and Instant.now() would measure an NTP step as
@@ -313,16 +371,59 @@ public class HxExtension implements BurpExtension {
              */
             @Override
             public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest r) {
+                // ATTRIBUTED AGAIN, FROM THE LISTENER, and NOT read back out
+                // of `pending`. The entry is there and carries the first
+                // callback's answer, and using it would make ENFORCEMENT
+                // depend on a bounded RECORDING structure: past
+                // DEFAULT_CAPACITY requests in flight the map evicts, the
+                // source reads UNATTRIBUTED, and a request the first callback
+                // allowed is refused here because the capture map overflowed.
+                // S4 is explicit that a full queue changes what hx KNOWS and
+                // never what it ALLOWS, and that has to hold in both
+                // directions. The listener is the same connection either way,
+                // and `listenerInterface()` is measured on requests -- this is
+                // one (docs/burp-proxy-measurements.md, Q1).
+                Source source = Source.UNATTRIBUTED;
                 String method = "";
                 String url = "";
                 boolean allow;
                 String errorClass = null;
                 String detail = null;
                 try {
+                    source = Source.forListenerPort(
+                            listenerPort(r.listenerInterface()), crawlerPort);
                     method = r.method();
                     url = r.url();
                     BridgeClient.Authorisation auth = c.authorisation();
-                    Decision d = policy.decideScopeOnly(proxyRequest(r), auth);
+                    HxRequest edited = proxyRequest(r);
+                    Decision d;
+                    if (source == Source.CRAWLER)
+                        // THE AGENT'S FREE RULES, in S4's order, Gate excluded.
+                        // S4 says the method allowlist and the dangerous-path
+                        // denylist apply to crawler traffic IN FULL, and an
+                        // edit in the Intercept tab can turn `GET /x` into
+                        // `POST /account/delete` after the first callback
+                        // checked the original. decideBeforeGate is scope +
+                        // method + dangerous and spends NOTHING -- its own
+                        // javadoc says so -- so keeping those two across an
+                        // edit is free.
+                        d = policy.decideBeforeGate(edited, auth);
+                    else if (source == Source.OPERATOR)
+                        // Scope, and nothing after it. The operator branch
+                        // drops the other four rules here for the same reason
+                        // ProxyGate drops them at the first callback: applying
+                        // an agent's rules to a human drives them off the
+                        // proxy, and then hx records nothing at all.
+                        d = policy.decideScopeOnly(edited, auth);
+                    else
+                        // "Not one of the two I know", written the way
+                        // ProxyGate writes it, so a constant added to Source
+                        // later is a refusal rather than falling into whichever
+                        // branch it was not named in.
+                        d = Decision.deny("not_configured",
+                                BridgeClient.EXTENSION_FAULT
+                                + "the proxy listener could not be attributed "
+                                + "to the operator or the crawler");
                     allow = d.allowed();
                     errorClass = d.errorClass();
                     detail = d.detail();
@@ -335,16 +436,25 @@ public class HxExtension implements BurpExtension {
                     detail = d.detail();
                 }
                 if (!allow) {
+                    // THE ACTION IS DECIDED AND HELD BEFORE ANYTHING IS
+                    // RECORDED. See the first callback for why this is
+                    // structure rather than tidiness.
+                    ProxyRequestToBeSentAction refuse =
+                            ProxyRequestToBeSentAction.drop();
                     // The entry will never be answered: this request is not
                     // going to the target, so no response can arrive for it.
                     // Taken rather than left to age out, so the map's bound is
-                    // spent on requests that are actually in flight -- and the
-                    // source it carries is the attribution the FIRST callback
-                    // made, which is the only one either callback ever makes.
-                    Pending.Entry e = pending.take(r.messageId());
-                    capture.offer(new Denied(method, url, errorClass, detail,
-                                             e == null ? Source.UNATTRIBUTED : e.source()));
-                    return ProxyRequestToBeSentAction.drop();
+                    // spent on requests that are actually in flight.
+                    try {
+                        pending.take(r.messageId());
+                        capture.offer(new Denied(method, url, errorClass,
+                                                 detail, source));
+                    } catch (Throwable ignored) {
+                        // See the first callback: the counter is the thing
+                        // that threw, so there is nothing left to count with,
+                        // and the refusal below stands regardless.
+                    }
+                    return refuse;
                 }
                 return ProxyRequestToBeSentAction.continueWith(r);
             }
@@ -374,12 +484,17 @@ public class HxExtension implements BurpExtension {
                     // arrays are post-redaction, which makes an Observed
                     // holding raw bytes a live credential sitting in a queue.
                     byte[] reqBytes = r.initiatingRequest().toByteArray().getBytes();
-                    // Empty, because the proxy path injects no identity of its
-                    // own -- but still REQUIRED, and constructed over the same
-                    // array the ranges would have been measured from: Injected
-                    // compares by identity and refuses a different array.
-                    byte[] redactedReq = redactor.redactRequest(
-                            reqBytes, new Redactor.Injected(reqBytes));
+                    // redactObservedRequest, NOT redactRequest, and the
+                    // difference is the whole of §7 on this path. redactRequest
+                    // replaces byte ranges THIS EXTENSION INJECTED; the proxy
+                    // path injects nothing, so the Injected it would be handed
+                    // is empty, and an empty one makes redactRequest a
+                    // `return raw.clone()` -- the operator's live Cookie and
+                    // Authorization headers content-addressed into the blob
+                    // store verbatim. That was the shipped state for one
+                    // commit. Job 4 matches header NAMES, which is all there
+                    // is for traffic hx watched rather than composed.
+                    byte[] redactedReq = redactor.redactObservedRequest(reqBytes);
                     byte[] redactedResp = redactor.redactResponse(
                             r.toByteArray().getBytes());
                     long ms = (System.nanoTime() - e.startNanos()) / 1_000_000L;
@@ -462,17 +577,35 @@ public class HxExtension implements BurpExtension {
      * drops the method allowlist, the dangerous-path denylist, the rate limit
      * and the budget. The refusal is not caught and retried as OPERATOR.
      *
-     * WHAT THIS METHOD DOES NOT DO IS RANGE-CHECK, and that is deliberate
-     * rather than an omission. `70000` parses fine and is handed over as
-     * itself; {@link Source#forListenerPort} answers UNATTRIBUTED for anything
-     * outside 1..65535, and duplicating that test here would add a branch no
-     * input could separate from its absence -- the same finding Source's own
-     * comment records about a `crawlerPort > 0` clause it removed. The
-     * five-digit bound below is NOT that test wearing a disguise: it exists
-     * only because {@code Integer.parseInt} THROWS on a longer run of digits,
-     * and a throw out of here reaches a Burp proxy thread with no answer for
-     * it. `ProxyGateTest.theListenerInterfaceIsParsedOrRefused` pins the
-     * boundary from both sides.
+     * WHAT THIS METHOD DOES NOT DO IS CHECK THE VALUE RANGE, and that is
+     * deliberate rather than an omission. `70000` parses fine and is handed
+     * over as itself; {@link Source#forListenerPort} answers UNATTRIBUTED for
+     * anything outside 1..65535, and duplicating that test here would add a
+     * branch no input could separate from its absence -- the same finding
+     * Source's own comment records about a `crawlerPort > 0` clause it
+     * removed.
+     *
+     * IT DOES BOUND THE DIGIT COUNT, and the earlier version of this paragraph
+     * gave the wrong reason for it. It said the bound "exists only because
+     * {@code Integer.parseInt} THROWS on a longer run of digits" -- true of A
+     * bound, false of THIS bound: nine digits always parse, so `> 5` also
+     * rejects every 6-to-9-digit tail that would have parsed fine. That IS a
+     * range check, on the digit count rather than on the value.
+     *
+     * MEASURED, because the obvious correction was wrong too: it is NOT "any
+     * bound below eleven". {@code Integer.parseInt} takes "999999999" and
+     * "2147483647" and THROWS on "2147483648" -- both ten digits. So the
+     * requirement is a bound of at most NINE, and a `> 10` written in the
+     * belief that ten digits always parse would let a 10-digit tail throw out
+     * of here onto a Burp proxy thread. Five is chosen because no TCP port has
+     * six digits, so nothing this bound rejects could have been a listener,
+     * and it is comfortably inside nine. What no input in this suite separates
+     * is `> 5` from `> 9`: both send a 30-digit tail to NO_PORT and both hand
+     * `70000` over, and the behaviour is identical either way because
+     * `forListenerPort`'s range test comes first.
+     * `ProxyGateTest.theListenerInterfaceIsParsedOrRefused` pins the two ends
+     * -- the 30-digit tail, which separates the bound from its absence, and
+     * `70000`, which separates this method from `Source`.
      *
      * NOT the same thing as an unrecognised port. A port that PARSES and is
      * not the crawler's is the operator, deliberately -- see Source, which

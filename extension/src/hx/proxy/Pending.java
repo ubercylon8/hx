@@ -68,8 +68,21 @@ public final class Pending {
 
     /** Insertion-ordered, which is what makes "evict the oldest" a fact about
      *  this map rather than about whichever entry the iterator happened to
-     *  reach first. Guarded by its own monitor -- every read and every write
-     *  below is inside a {@code synchronized (live)}. */
+     *  reach first.
+     *
+     *  GUARDED BY ITS OWN MONITOR: every read and every write below is inside
+     *  a {@code synchronized (live)}, {@link #evicted} included -- it is a
+     *  non-volatile long, so it is not even atomic to read. HOW MUCH OF THAT
+     *  IS HELD BY A TEST, since the sentence reads as one claim and is two:
+     *  {@link #put} and {@link #take} are separated behaviourally by
+     *  `PendingTest.concurrentPutsAndTakesDoNotLoseOrCrossEntries` (red on 3
+     *  runs of 3 with the monitors removed); {@link #evicted} and
+     *  {@link #size} are read from ONE thread everywhere in this suite, so
+     *  de-synchronizing those two alone was MEASURED at 12 summary lines /
+     *  0 FAIL / rc=0. What holds them is a COUNT --
+     *  `ChokepointTest.theRecordingStructuresHoldTheirMonitors` requires four
+     *  `synchronized (live) {` in this file -- which catches an accessor
+     *  written or edited without one and does not check placement. */
     private final LinkedHashMap<Integer, Entry> live = new LinkedHashMap<>();
 
     private long evicted;

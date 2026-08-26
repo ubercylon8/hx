@@ -48,7 +48,7 @@ import java.util.Set;
  *   /x/..%ef%bc%8flogout  is /x/../logout wherever a wide string reaches an
  *                      ANSI API, because U+FF0F best-fits to `/`
  *   /foo%2fbar/../admin/users  is /admin/users in python's urljoin, node's
- *                      new URL() and java's URI.normalize alike: none of them
+ *                      JavaScript's new URL and java's URI.normalize alike: none of them
  *                      decodes %2f before resolving the `..`, so the `..`
  *                      pops one whole segment called `foo%2fbar`
  *   /a%2fb/%2e%2e/admin/users  is /admin/users on anything that decodes AFTER
@@ -60,7 +60,7 @@ import java.util.Set;
  * involved. For `/a//../admin/users`:
  *
  *   python  urljoin()             -> /a/admin/users
- *   node    new URL().pathname    -> /a/admin/users
+ *   node    new URL .pathname     -> /a/admin/users
  *   java    URI.normalize()       -> /admin/users
  *
  * An earlier round of this class picked ONE reading (merge empty segments,
@@ -1268,7 +1268,7 @@ public final class Policy {
      *
      *   /foo%2fbar/../admin/users
      *     python urljoin()       -> /admin/users
-     *     node   new URL()       -> /admin/users
+     *     node   new URL        -> /admin/users
      *     java   URI.normalize() -> /admin/users
      *     readings()             -> { raw, /foo/admin/users }
      *
@@ -1282,7 +1282,7 @@ public final class Policy {
      *
      *   - the member ITSELF, undecoded. The server routed on the bytes it was
      *     sent and unescaped afterwards, if at all. This is the RFC reading,
-     *     and the one urljoin, new URL() and URI.normalize() give.
+     *     and the one urljoin, JavaScript's new URL and URI.normalize give.
      *   - the member DECODED to a fixed point, with the decoded characters
      *     read as syntax. The server unescaped before it routed, so a %2f is a
      *     separator and a %2e%2e is a dot segment. This was the only base.

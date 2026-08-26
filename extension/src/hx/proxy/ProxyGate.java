@@ -35,10 +35,33 @@ import hx.policy.Policy;
  * OVERSIGHT. S4's decision order puts `halted` second. This class asks
  * {@link Policy}, and Policy does not know about halts -- the send path asks
  * {@link hx.send.HaltSwitch} separately, through
- * `Sender.issuanceHeldReason`. So between an operator hitting stop and Plan 5,
- * THE OPERATOR'S OWN BROWSING IS NOT STOPPED BY THEIR OWN HALT. That is the
- * branch where it matters least -- a human who hit stop can close their
- * browser -- and the crawler, where it would matter, does not exist yet.
+ * `Sender.issuanceHeldReason`. So while the run is HALTED, proxy traffic keeps
+ * flowing and keeps being recorded.
+ *
+ * WHAT THAT ACTUALLY COSTS, stated in full because the comfortable version of
+ * it was wrong. It is not only "a human who hit stop can close their browser".
+ * FOUR things set the halt and only one of them is that human:
+ *
+ *   - a `halt` FRAME the operator sent. This is the comfortable case, and the
+ *     browser is in their hands;
+ *   - the SENTINEL FILE, S4's third kill path -- the one that works when the
+ *     bridge does not. Someone reaching for that has already lost the channel;
+ *   - the AUTO-HALT on target distress. NOT a human decision: S4 aborts the
+ *     whole run above a 20% 5xx rate, above 5x the baseline p50 latency, or
+ *     after 5 consecutive connection errors. hx has decided the target is in
+ *     trouble and the operator's browser is still hitting it;
+ *   - a halt RE-ASSERTED AFTER A RECONNECT, because an operator halt is
+ *     durable and a fresh `hello` does not clear it. The operator may not be
+ *     at the keyboard at all.
+ *
+ * AND IT RUNS THE OTHER WAY TOO: operator browsing feeds nothing into
+ * `Distress`, which is fed from the SEND path's replies only. So operator
+ * traffic can distress a host without ever tripping the auto-halt, and would
+ * not be stopped by it if something else did.
+ *
+ * The ruling stands anyway, for the reason below -- closing the gap without
+ * the row to put the refusal in breaks S4 with the fix for S4 -- and the
+ * crawler, where the four above bite hardest, does not exist yet.
  *
  * WHAT PLAN 5 MUST DO TO CLOSE IT, written here because this is where its
  * implementer will look. Answering `halted` from this class is NOT a one-line
