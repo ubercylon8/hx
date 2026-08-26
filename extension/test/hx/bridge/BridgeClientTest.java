@@ -1415,6 +1415,35 @@ public class BridgeClientTest {
             check("an unspellable source is omitted, not defaulted ("
                   + u.header.get("source") + ")",
                   !u.header.containsKey("source"));
+
+            // A denial: S4's second enforcement point refusing a request.
+            // ONE body slot and it is empty -- the request never left, so
+            // there are no bytes to carry, and `server.py::_capture` splits
+            // two bodies out of an `exchange` frame ONLY. A denial framed
+            // with two would be read as a malformed exchange by the far side
+            // and counted as a drop rather than recorded as the refusal it is.
+            Map<String, Object> dn = new LinkedHashMap<>();
+            dn.put("t", "denial");
+            dn.put("via", "proxy");
+            dn.put("source", "operator");
+            dn.put("method", "POST");
+            dn.put("url", "http://app.test/account/delete");
+            dn.put("error_class", "dangerous_denied");
+            dn.put("detail", "matches dangerous.path /account/delete");
+            check("a delivered denial answers TRUE, which is what lets the "
+                  + "drain not count it as a drop", sink.denial(dn));
+            Frame.Decoded n = read(l.reader, l.peer, "the denial frame");
+            check("the denial frame is the type hx.capture knows ("
+                  + n.header.get("t") + ")", "denial".equals(n.header.get("t")));
+            check("and carries the protocol version (" + n.header.get("v") + ")",
+                  Long.valueOf(BridgeClient.PROTOCOL_VERSION).equals(n.header.get("v")));
+            check("and the class the far side routes on ("
+                  + n.header.get("error_class") + ")",
+                  "dangerous_denied".equals(n.header.get("error_class")));
+            check("and declares ONE body, not two (" + n.header.get(Frame.BODIES_KEY)
+                  + ")", !n.header.containsKey(Frame.BODIES_KEY));
+            check("which is empty (" + n.body.length + " bytes)",
+                  n.body.length == 0 && n.second == null);
         } finally {
             Files.deleteIfExists(dir.resolve("xs.sock")); Files.deleteIfExists(dir);
         }
@@ -1426,8 +1455,8 @@ public class BridgeClientTest {
      *
      * Not raising is the same rule as "offering never blocks", one layer down:
      * an exception out of here lands on Capture's drain thread, and the drain
-     * dying is how a lost record becomes a permanently silent capture. So both
-     * methods swallow.
+     * dying is how a lost record becomes a permanently silent capture. So
+     * every arm of the sink swallows.
      *
      * SWALLOWING IS NOT ENOUGH, and this method's last check used to say it
      * was: "and so was the lost drop report, which is the coverage floor",
@@ -1454,16 +1483,25 @@ public class BridgeClientTest {
                                       "r".getBytes(StandardCharsets.UTF_8),
                                       "s".getBytes(StandardCharsets.UTF_8));
                     anyClaimedDelivery |= sink.dropped(1L, "operator");
+                    anyClaimedDelivery |=
+                        sink.denial(Map.of("t", "denial", "url", "http://a/" + i,
+                                           "error_class", "scope_denied"));
                 }
             } catch (Throwable t) { threw = true; }
-            check("neither half raised into the drain thread", !threw);
-            check("and neither claimed to have delivered anything, which is "
+            check("no arm raised into the drain thread", !threw);
+            check("and none claimed to have delivered anything, which is "
                   + "what keeps the coverage floor countable",
                   !anyClaimedDelivery);
             check("the lost exchange was logged, not swallowed silently",
                   l.log.sawError("exchange frame undeliverable"));
             check("and so was the lost drop report",
                   l.log.sawError("drop report undeliverable"));
+            // The denial is the newest of the three and the easiest to leave
+            // out: a refusal hx recorded nowhere is the one loss that reads,
+            // from the operator's side, exactly like a request that was
+            // allowed.
+            check("and so was the lost denial",
+                  l.log.sawError("denial frame undeliverable"));
         } finally {
             Files.deleteIfExists(dir.resolve("xd.sock")); Files.deleteIfExists(dir);
         }

@@ -31,6 +31,24 @@ import hx.policy.Policy;
  * after scope. Which of the two a request gets is the whole of what
  * {@link Source} buys.
  *
+ * THIS POINT DOES NOT CHECK THE HALT, AND THAT IS A STATED GAP, NOT AN
+ * OVERSIGHT. S4's decision order puts `halted` second. This class asks
+ * {@link Policy}, and Policy does not know about halts -- the send path asks
+ * {@link hx.send.HaltSwitch} separately, through
+ * `Sender.issuanceHeldReason`. So between an operator hitting stop and Plan 5,
+ * THE OPERATOR'S OWN BROWSING IS NOT STOPPED BY THEIR OWN HALT. That is the
+ * branch where it matters least -- a human who hit stop can close their
+ * browser -- and the crawler, where it would matter, does not exist yet.
+ *
+ * WHAT PLAN 5 MUST DO TO CLOSE IT, written here because this is where its
+ * implementer will look. Answering `halted` from this class is NOT a one-line
+ * change: `halted` has to be added to `records.DENIAL_KIND` and to the
+ * `denial.kind` CHECK in schema.sql (with the SCHEMA_VERSION bump that
+ * implies), or `hx.capture`'s denial arm routes it to `row_for(...) is None`,
+ * returns without writing anything, and the refusal VANISHES -- S4's "denials
+ * are never silent" broken by the fix for S4. The condition is therefore:
+ * close the gap and the row at the same time, or not at all.
+ *
  * THERE IS A THIRD ANSWER AND IT IS NEITHER QUESTION. A source this class
  * cannot recognise -- `Source.UNATTRIBUTED`, or a null -- is REFUSED here
  * without asking Policy anything. The lenient branch is chosen for a human

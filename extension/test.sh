@@ -25,6 +25,7 @@ CLASSES=(
     hx.send.SenderTest
     hx.proxy.ProxyGateTest
     hx.proxy.CaptureTest
+    hx.proxy.PendingTest
     hx.ChokepointTest
 )
 

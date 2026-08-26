@@ -11,8 +11,8 @@ import java.util.concurrent.*;
  * The queue, and specifically the two things it must never do: block the
  * caller, and lose a record silently.
  *
- * Hand-rolled runner, like the other ten classes: JUnit would be a dependency,
- * and this jar has none.
+ * Hand-rolled runner, like the other eleven classes: JUnit would be a
+ * dependency, and this jar has none.
  */
 public class CaptureTest {
 
@@ -68,6 +68,14 @@ public class CaptureTest {
           CaptureTest::anUndeliveredExchangeIsCountedAsADrop);
         t("a drop report that answers 'not delivered' is retried in full",
           CaptureTest::aDropReportThatSaysNotDeliveredIsRetriedInFull);
+        t("a denial is a frame of its own, with the keys the consumer reads",
+          CaptureTest::aDenialIsItsOwnFrame);
+        t("a denial the sink would not take is a drop against ITS source",
+          CaptureTest::anUndeliveredDenialIsCountedAgainstItsOwnSource);
+        t("a denial with no spelling is refused, like an exchange with none",
+          CaptureTest::aDeniedRecordWithNoSpellingIsRefusedTheSameWay);
+        t("countLost is charged to the source it is given",
+          CaptureTest::countLostIsChargedToTheSourceItIsGiven);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -84,6 +92,12 @@ public class CaptureTest {
                             ("req" + n).getBytes(), ("resp" + n).getBytes(), s);
     }
 
+    /** One refused request, as the proxy handler offers it. */
+    static Denied den(int n, Source s) {
+        return new Denied("POST", "http://app.test/refused/" + n,
+                          "scope_denied", "detail " + n, s);
+    }
+
     static final class Recording implements BridgeClient.ExchangeSink {
         final List<String> seen = Collections.synchronizedList(new ArrayList<>());
         final List<Long> drops = Collections.synchronizedList(new ArrayList<>());
@@ -91,9 +105,15 @@ public class CaptureTest {
                 Collections.synchronizedList(new ArrayList<>());
         final List<Map<String, Object>> headers =
                 Collections.synchronizedList(new ArrayList<>());
+        /** Denial frames, kept apart from {@link #headers} so a denial routed
+         *  through `exchange(...)` -- the naming lie this interface's third
+         *  method exists to prevent -- cannot satisfy a check about denials. */
+        final List<Map<String, Object>> denials =
+                Collections.synchronizedList(new ArrayList<>());
         volatile CountDownLatch gate;
         volatile boolean throwOnce;
         volatile boolean throwOnDropOnce;
+        volatile boolean refuseDenial;
         /** RETURN false rather than throw -- the production sink's shape.
          *  BridgeClient.exchangeSink catches its own IOException, so "the
          *  sink threw" is the case that never happens on the wire and "the
@@ -121,6 +141,12 @@ public class CaptureTest {
                 drops.add(n);
                 dropSources.add(s);
             }
+            return true;
+        }
+
+        public boolean denial(Map<String, Object> h) {
+            if (refuseDenial) return false;
+            denials.add(new LinkedHashMap<>(h));
             return true;
         }
     }
@@ -158,8 +184,8 @@ public class CaptureTest {
      * finished filling. A leaked parked daemon costs nothing, because a daemon
      * cannot hold the JVM up after main() prints its summary.
      */
-    static void offerAll(Capture c, Observed... records) throws Exception {
-        Thread th = new Thread(() -> { for (Observed o : records) c.offer(o); });
+    static void offerAll(Capture c, Captured... records) throws Exception {
+        Thread th = new Thread(() -> { for (Captured o : records) c.offer(o); });
         th.setDaemon(true);
         th.start();
         th.join(OFFER_DEADLINE_MS);
@@ -800,6 +826,147 @@ public class CaptureTest {
             waitUntil(() -> sink.seen.contains("http://app.test/9"));
             check("and the drain is still delivering exchanges (" + sink.seen + ")",
                   sink.seen.contains("http://app.test/9"));
+        } finally { c.stop(); }
+    }
+
+    // ---- a denial is a record too ----------------------------------------
+
+    static void aDenialIsItsOwnFrame() throws Exception {
+        // `hx/capture.py`'s DENIAL arm reads `t`, `via`, `source`, `method`,
+        // `url`, `error_class` and `detail`, and it refuses an unknown `t`, an
+        // unknown `via` and a missing `url` -- each of which is a ValueError
+        // on the bridge's read thread and NO ROW AT ALL, counted as one more
+        // drop rather than recorded as the refusal it was.
+        //
+        // AND IT IS A DENIAL FRAME, not an exchange with two empty bodies.
+        // `server.py::_capture` splits two bodies out of an `exchange` and
+        // none out of a `denial`; a refusal routed through the exchange arm
+        // arrives as a malformed exchange and is dropped.
+        Recording sink = new Recording();
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, new Denied("POST", "http://app.test/account/delete",
+                                   "dangerous_denied",
+                                   "matches dangerous.path /account/delete",
+                                   Source.CRAWLER));
+            waitUntil(() -> sink.denials.size() == 1);
+            check("it went out as a DENIAL, not through the exchange arm ("
+                  + sink.denials.size() + " denials, " + sink.headers.size()
+                  + " exchanges)",
+                  sink.denials.size() == 1 && sink.headers.isEmpty());
+            Map<String, Object> h = sink.denials.get(0);
+            check("t is the frame type hx.capture.FRAME_TYPES names ("
+                  + h.get("t") + ")", "denial".equals(h.get("t")));
+            check("via is one of records.VIA_VALUES (" + h.get("via") + ")",
+                  "proxy".equals(h.get("via")));
+            check("source is the crawler's spelling (" + h.get("source") + ")",
+                  "crawler".equals(h.get("source")));
+            check("method survives (" + h.get("method") + ")",
+                  "POST".equals(h.get("method")));
+            check("url survives, and it has no default on the far side ("
+                  + h.get("url") + ")",
+                  "http://app.test/account/delete".equals(h.get("url")));
+            check("error_class is what records.row_for routes on ("
+                  + h.get("error_class") + ")",
+                  "dangerous_denied".equals(h.get("error_class")));
+            check("detail is what the operator reads (" + h.get("detail") + ")",
+                  "matches dangerous.path /account/delete".equals(h.get("detail")));
+            // NO EIGHTH KEY. An unknown key is IGNORED on the far side rather
+            // than refused, so a key added here with no reader there is a fact
+            // the operator never sees and a reason to believe it was recorded.
+            // Notably there is no `status`, no `ms` and no `outcome`: a
+            // request that never left has no answer for any of the three.
+            check("and no eighth key (" + h.keySet() + ")", h.size() == 7);
+        } finally { c.stop(); }
+    }
+
+    static void anUndeliveredDenialIsCountedAgainstItsOwnSource() throws Exception {
+        // The same rule as an undelivered exchange, and it needs its own test
+        // because it is served by its own arm of `deliver`: a denial that did
+        // not reach the wire is a record hx does not have, and a refusal hx
+        // recorded nowhere reads -- from the operator's side -- exactly like a
+        // request that was allowed.
+        Recording sink = new Recording();
+        sink.refuseDenial = true;
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, den(1, Source.CRAWLER), den(2, Source.CRAWLER));
+            waitUntil(() -> c.dropped() == 2);
+            check("a denial the sink would not take is counted ("
+                  + c.dropped() + ")", c.dropped() == 2);
+            waitUntil(() -> reported(sink, "crawler") == 2);
+            check("and reported against the crawler, whose refusals they were ("
+                  + sink.drops + " " + sink.dropSources + ")",
+                  reported(sink, "crawler") == 2
+                  && reported(sink, "operator") == 0);
+            check("and nothing was recorded as delivered (" + sink.denials + ")",
+                  sink.denials.isEmpty());
+        } finally { c.stop(); }
+    }
+
+    static void aDeniedRecordWithNoSpellingIsRefusedTheSameWay() throws Exception {
+        // THE REACHABLE ONE, and the reason Capture's offer() comment no
+        // longer says an unattributed record cannot arrive. ProxyGate refuses
+        // Source.UNATTRIBUTED -- that is exactly what it is for -- and the
+        // handler offers the refusal as a Denied carrying that same source. So
+        // this record is the one hx records as a DROP rather than as a denial
+        // row: `hx.capture._run` maps anything that is not "crawler" onto the
+        // operator's browse run, and filing a refusal nobody could attribute
+        // under the operator's own browsing is the failure UNATTRIBUTED exists
+        // to prevent. The bytes did not leave either way.
+        Recording sink = new Recording();
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, den(1, Source.UNATTRIBUTED), den(2, Source.OPERATOR));
+            waitUntil(() -> sink.denials.size() == 1);
+            Thread.sleep(50);
+            check("the attributed refusal was recorded (" + sink.denials.size() + ")",
+                  sink.denials.size() == 1
+                  && "http://app.test/refused/2".equals(sink.denials.get(0).get("url")));
+            check("and the unattributable one was not",
+                  c.dropped() == 1);
+            waitUntil(() -> !sink.drops.isEmpty());
+            check("it was reported with NO spelling, not as the operator ("
+                  + sink.dropSources + ")",
+                  sink.dropSources.contains(null)
+                  && !sink.dropSources.contains("operator"));
+        } finally { c.stop(); }
+    }
+
+    static void countLostIsChargedToTheSourceItIsGiven() throws Exception {
+        // Path 6: a record that never entered the queue at all. The response
+        // handler with no Pending entry has no start time and no attribution,
+        // so it counts the loss instead of recording an exchange with a
+        // guessed duration -- and it must be counted against the source the
+        // CALLER names, because the far side turns that string into a run
+        // KIND. A countLost that always charged the operator would file a
+        // crawler's losses on the operator's browse run.
+        Recording sink = new Recording();
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            c.countLost(Source.CRAWLER);
+            c.countLost(Source.CRAWLER);
+            c.countLost(Source.UNATTRIBUTED);
+            check("all three were counted (" + c.dropped() + ")", c.dropped() == 3);
+            waitUntil(() -> reported(sink, "crawler") == 2
+                            && reported(sink, null) == 1);
+            check("two against the crawler (" + reported(sink, "crawler") + ")",
+                  reported(sink, "crawler") == 2);
+            // The response handler's own miss is charged here: it is the one
+            // place the source is genuinely unknown, and a drop with no run
+            // attached beats a drop filed against a run that was picked.
+            check("and the unattributed one with no spelling at all ("
+                  + sink.dropSources + ")", reported(sink, null) == 1);
+            check("and none against the operator, who lost nothing ("
+                  + reported(sink, "operator") + ")",
+                  reported(sink, "operator") == 0);
+            check("and nothing was delivered as a record (" + sink.seen + " "
+                  + sink.denials + ")",
+                  sink.seen.isEmpty() && sink.denials.isEmpty());
         } finally { c.stop(); }
     }
 }

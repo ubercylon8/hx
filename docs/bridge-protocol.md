@@ -52,7 +52,12 @@ characters JSON requires are escaped: `"` `\\` and the control characters.
   burp -> py   error       {v,t,id,class,detail}
                            plus retry_after_us, on rate_limited only
   burp -> py   halted      {v,t,reason,host,window}   unsolicited; no id.
-  burp -> py   exchange    {v,t,...}   unsolicited; no id. Defined in a later plan.
+  burp -> py   exchange    {v,t,via,source,method,url,status,ms,outcome}
+                           unsolicited; no id. TWO bodies: the redacted request
+                           bytes and the redacted response bytes.
+  burp -> py   denial      {v,t,via,source,method,url,error_class,detail}
+                           unsolicited; no id. ONE body, empty.
+  burp -> py   dropped     {v,t,n,source}   unsolicited; no id. ONE body, empty.
   py -> burp   halt        {v,t,reason}
   py -> burp   resume      {v,t}
 
@@ -215,6 +220,56 @@ stamps those two, and both of these go out through `_send()`: nothing replies
 to a control frame, so there is nothing to correlate and no work to abandon at
 a deadline. This document claimed both fields for them from Plan 2 until Task
 7; the code never sent them.
+
+## The three capture frames
+
+`exchange`, `denial` and `dropped` are what the PROXY -- §4's second
+enforcement point -- reports. All three are unsolicited and carry no `id`:
+nothing on the Python side is waiting for one, and a second implementation
+that routes them through its request/response correlation delivers them to
+nobody. None of them is gated by `maySend()`, because none of them ISSUES
+anything: they report traffic that has already happened, and refusing to
+report it while halted would mean an operator hitting stop also stopped the
+record of what had been seen up to that moment.
+
+**How many bodies each carries is part of the contract, not an implementation
+detail.** `exchange` is the only two-body frame in this protocol: the redacted
+request bytes and the redacted response bytes, split by the `bodies` header
+field (see Framing). They cannot share one opaque body -- the far side
+content-addresses each on its own. `denial` and `dropped` describe something
+that produced NO traffic, so each carries ONE body and it is empty; a consumer
+hands them to its sink as two empty halves. A denial framed with two bodies is
+read as a malformed exchange and recorded as nothing.
+
+    exchange   via          §5's egress point: proxy | crawl | send
+               source       operator | crawler; ABSENT means the operator's run
+               method, url  what was requested; `url` has no default and a
+                            frame without one is refused
+               status       integer, the FINAL status (see result.status above)
+               ms           integer milliseconds, measured by the extension --
+                            neither proxy callback carries timing, so this is
+                            a duration this jar measured or it is not reported
+               outcome      `exchange.outcome`'s vocabulary, unchanged
+
+    denial     via, source, method, url   as above
+               error_class  one of the classes below; the consumer routes it
+                            to a `denial` row through that table, and a class
+                            with nowhere to go is recorded NOWHERE
+               detail       the sentence the operator acts on
+               -- and NO status, ms or outcome: a request that never left has
+               no answer for any of the three.
+
+    dropped    n            integer >= 1, how many records were lost since the
+                            last acknowledged report. It ACCUMULATES on the
+                            far side into `run.dropped_total`, which is what
+                            makes a run's coverage numbers a floor
+               source       as above, and OMITTED rather than defaulted when
+                            the extension has no spelling for it
+
+A `denial` frame is how §4's promise that "denials are never silent" is kept
+at the proxy point. The refused request never left, so there is no exchange to
+record and `run.requests_issued` is NOT bumped for it -- counting a refusal as
+issued would inflate every coverage figure drawn off that column.
 
 `halted` is UNSOLICITED and carries no `id`. An auto-halt is decided by the
 extension -- a host in distress -- so there is no outstanding request to answer

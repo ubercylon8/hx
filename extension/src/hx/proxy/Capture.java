@@ -25,21 +25,27 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * ITS CONVERSE: a drop is never silent. S5 says a run with drops has coverage
  * numbers that are a FLOOR, and nothing on the far side can know that unless
- * it is told. There are FIVE ways this class can hold a record it does not
- * pass on, and each one increments {@link #dropped} for the record's own
+ * it is told. There are SIX ways a record hx might have had does not reach
+ * the far side, and each one increments {@link #dropped} for the record's own
  * source:
  *
  *   1. EVICTION, when {@link #offer} finds the queue full;
  *   2. REFUSAL, when a record's source has no spelling;
- *   3. AN UNDELIVERED EXCHANGE -- the sink threw, or answered false;
+ *   3. AN UNDELIVERED RECORD -- the sink threw, or answered false;
  *   4. {@link #stop}, which throws away whatever is still queued;
  *   5. AN OFFER THAT ARRIVES AT OR AFTER {@link #stop} -- Burp unloading the
  *      extension while a proxy thread is still inside {@link #offer}. Such a
  *      record lands in a queue with no drain behind it, so {@link #offer}
  *      clears and counts the queue itself once it sees {@link #accepting}
  *      go false.
+ *   6. A RECORD THAT NEVER ENTERED THE QUEUE AT ALL, counted through
+ *      {@link #countLost}. The queue is not the only place a record is lost:
+ *      the response handler that finds no {@link Pending} entry for a
+ *      response has an exchange it cannot describe -- no start time, so no
+ *      `ms`, and no attributed source -- and the honest answer is a drop
+ *      rather than a row with a guessed duration on it.
  *
- * They are ONE number, not five, because they are one fact: a record hx does
+ * They are ONE number, not six, because they are one fact: a record hx does
  * not have. A frame over MAX_FRAME and a socket that died between two
  * requests differ to whoever is debugging the bridge and not at all to
  * whoever is reading the run's coverage.
@@ -54,16 +60,32 @@ import java.util.concurrent.locks.ReentrantLock;
  * 800 records across a `stop()` gave `4 delivered + 284 dropped of 800`, the
  * missing 512 being exactly DEFAULT_CAPACITY sitting in a drainless queue.
  *
- * WHAT DOES PIN THE FIVE is a count of EXITS, not of increments. A record
- * enters through {@link #offer} and nowhere else, and it leaves DELIVERED or
- * as one of 1-5; the four `incrementAndGet` sites are what serve those five,
- * paths 4 and 5 sharing {@link #discardQueued}. Each of the four was DELETED
- * on its own and measured: refusal -> 3 FAIL, eviction -> 9, undelivered -> 3,
+ * PATH 6 IS THE SAME LESSON A SECOND TIME, and it is why this paragraph is
+ * amended rather than left standing. Task 7 added TWO `incrementAndGet` sites
+ * to the four -- {@link #countLost} for path 6, and the denial arm of
+ * {@link #deliver} for path 3 -- so the retired grep would now answer "six
+ * sites, six paths" and LOOK right while meaning nothing. MEASURED, by
+ * reading them: the six sites are the refusal (path 2), the eviction (path 1),
+ * {@link #discardQueued} (paths 4 AND 5, one site for two), {@link #countLost}
+ * (path 6), and ONE PER FRAME ARM for path 3 (two sites for one). Two paths
+ * share a site and one path has two; that the totals agree is arithmetic, not
+ * structure. The count of increments has never matched the count of paths in
+ * any way a grep could check, and the moment it appears to is the moment it is
+ * most misleading.
+ *
+ * WHAT DOES PIN THE SIX is a count of EXITS, not of increments. A record
+ * enters this class through {@link #offer} or is counted without entering it
+ * through {@link #countLost}, and nowhere else; it leaves DELIVERED or as one
+ * of 1-6. Each of the first four increments was DELETED on
+ * its own and measured: refusal -> 3 FAIL, eviction -> 9, undelivered -> 3,
  * discard -> 3, every one of them 11 summary lines with named FAIL lines, and
  * none of them a silent green. `offers racing stop() are every one of them
  * accounted for` is the test that holds when no single increment does: it
  * asserts only that delivered + dropped is everything offered, which is the
- * exits restated.
+ * exits restated. {@link #countLost} is outside that identity by
+ * construction -- its record never entered the queue -- so it has a test of
+ * its own, `countLost is charged to the source it is given`, and that test is
+ * the whole of what holds it.
  *
  * WHAT IS NOT COVERED, and cannot be from inside this class: a JVM that dies
  * without reaching {@link #stop} takes the queue with it uncounted, and so
@@ -113,7 +135,7 @@ public final class Capture {
      */
     static final long POLL_MS = 100L;
 
-    private final ArrayBlockingQueue<Observed> queue;
+    private final ArrayBlockingQueue<Captured> queue;
     private final BridgeClient.ExchangeSink sink;
 
     /**
@@ -218,11 +240,23 @@ public final class Capture {
      * do, which is fail to forward the request.
      *
      * A record whose source has no spelling ({@link #sourceName}) is REFUSED
-     * here and counted as a drop. ProxyGate already refuses UNATTRIBUTED, so
-     * one should never arrive; if one does, recording it would file the
-     * request under a run kind nothing chose, and the request never left in
-     * the first place. Counted rather than discarded, because the count is
-     * the thing that says hx knows less than it might.
+     * here and counted as a drop, because recording it would file the request
+     * under a run kind nothing chose. Counted rather than discarded, because
+     * the count is the thing that says hx knows less than it might.
+     *
+     * ONE SUCH RECORD IS REACHABLE, and this comment used to say none was.
+     * It read "ProxyGate already refuses UNATTRIBUTED, so one should never
+     * arrive" -- true while the only thing offered here was an
+     * {@link Observed} from a request the gate had ALLOWED. Task 7 wired the
+     * refusals in as {@link Denied}, and the request the gate refuses BECAUSE
+     * it could not attribute the listener carries exactly that source. So the
+     * denial hx records for it is a DROP and not a `denial` row: the bytes
+     * still did not leave -- the handler answers `drop()` before this is
+     * reached -- and `run.dropped_total` moves instead of `denial`. Stated
+     * rather than fixed, because the alternative is `hx.capture._run` filing
+     * a refusal nobody could attribute under the operator's own browse run,
+     * which is the failure {@link Source#UNATTRIBUTED} exists to prevent.
+     * `aDeniedRecordWithNoSpellingIsRefusedTheSameWay` is what pins it.
      *
      * AND IT NOTICES A CAPTURE THAT HAS STOPPED UNDERNEATH IT. Burp unloads
      * the extension on its own thread while proxy threads are still in here;
@@ -231,7 +265,7 @@ public final class Capture {
      * it was -- the coverage floor reading lower than the real loss, which is
      * the one direction it may never move.
      */
-    public void offer(Observed o) {
+    public void offer(Captured o) {
         if (sourceName(o.source()) == null) {
             dropped[o.source().ordinal()].incrementAndGet();
             return;
@@ -240,7 +274,7 @@ public final class Capture {
             // Evict the oldest and try again. `poll` returning null means
             // another thread drained it first, which is fine -- the retry
             // then succeeds.
-            Observed evicted = queue.poll();
+            Captured evicted = queue.poll();
             if (evicted != null) dropped[evicted.source().ordinal()].incrementAndGet();
         }
         // AFTER the enqueue, not before, and that ordering is the whole
@@ -264,9 +298,32 @@ public final class Capture {
      * here as well would report one loss twice.
      */
     private void discardQueued() {
-        List<Observed> left = new ArrayList<>();
+        List<Captured> left = new ArrayList<>();
         queue.drainTo(left);
-        for (Observed o : left) dropped[o.source().ordinal()].incrementAndGet();
+        for (Captured o : left) dropped[o.source().ordinal()].incrementAndGet();
+    }
+
+    /**
+     * Count one record that never entered the queue. Path 6, and the only
+     * entry point here that is not {@link #offer}.
+     *
+     * The caller is the proxy RESPONSE handler with a response it cannot turn
+     * into a record: {@link Pending} had no entry for its message id, so
+     * there is no start time and no attributed source, and an exchange row
+     * with a guessed duration on it is fabricated evidence. It is also the
+     * response handler's answer to a redaction that threw -- the bytes are
+     * there and cannot be made safe to store, so the record is lost and says
+     * so.
+     *
+     * The source is the CALLER'S to choose and this method does not
+     * second-guess it: a miss is charged to {@link Source#UNATTRIBUTED},
+     * which has no spelling, so the report crosses the bridge with the
+     * `source` key OMITTED and lands on the operator's run the way
+     * `hx.capture` documents an absent source. A record whose run genuinely
+     * is not known must not invent one.
+     */
+    public void countLost(Source s) {
+        dropped[s.ordinal()].incrementAndGet();
     }
 
     /**
@@ -308,10 +365,19 @@ public final class Capture {
      * but it finds whatever arrived after the first: a proxy thread inside
      * {@link #offer} when Burp tore the extension down has counted its record
      * (path 5) and had nothing left to report it through. The next `stop()`
-     * is what carries that count across the sink. Task 7 owns the choice of
-     * whether there is one -- and this method COUNTING rather than DELIVERING
-     * is the trade it may want to revisit with a deadline-drain of its own
-     * before it calls this.
+     * is what carries that count across the sink.
+     *
+     * TASK 7 SETTLED THAT THERE IS ONLY ONE, in the unloading handler that
+     * already closes the bridge, and the cost is written down rather than
+     * argued away: a record offered by a proxy thread that was inside
+     * {@link #offer} when Burp tore the extension down is COUNTED (path 5)
+     * and its count has nothing left to leave through -- the bridge is closed
+     * on the next line. A second call would race the first identically while
+     * the JVM is being torn down, and a record offered DURING `stop()` counts
+     * itself and is in the same position whichever call observes it. So the
+     * loss is real and bounded by however many proxy threads were mid-offer,
+     * and the honest statement is that this class's count is complete up to
+     * the unload and not through it.
      */
     public synchronized void stop() {
         // FIRST, and before the drain is even asked to stop: from this write
@@ -343,7 +409,7 @@ public final class Capture {
 
     private void loop() {
         while (running) {
-            Observed o;
+            Captured o;
             try {
                 o = queue.poll(POLL_MS, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
@@ -359,8 +425,27 @@ public final class Capture {
         }
     }
 
-    /** One record to the sink, or one more drop. */
-    private void deliver(Observed o) {
+    /**
+     * One record to the sink, or one more drop.
+     *
+     * The switch is over a SEALED interface with no `default` arm, so a third
+     * kind of {@link Captured} is a compile error here rather than a record
+     * that reaches no arm and is silently delivered as nothing.
+     *
+     * TWO FRAME TYPES, TWO SINK METHODS, and the denial does NOT go through
+     * `exchange(...)` with two empty byte arrays. That method's name says
+     * what its frame is; a denial routed through it is a naming lie the next
+     * reader inherits, and `server.py::_capture` splits two bodies for an
+     * `exchange` and none for a `denial`.
+     */
+    private void deliver(Captured c) {
+        switch (c) {
+            case Observed o -> deliverExchange(o);
+            case Denied d -> deliverDenial(d);
+        }
+    }
+
+    private void deliverExchange(Observed o) {
         boolean delivered;
         try {
             Map<String, Object> h = new LinkedHashMap<>();
@@ -380,6 +465,37 @@ public final class Capture {
             delivered = false;
         }
         if (!delivered) dropped[o.source().ordinal()].incrementAndGet();
+    }
+
+    /**
+     * A refusal, as the seven keys `hx.capture`'s denial arm reads.
+     *
+     * `t`, `via`, `source`, `method`, `url`, `error_class` and `detail`, and
+     * NO EIGHTH: an unknown key is not refused on the far side, it is
+     * ignored, so a key added here without a reader there is a fact the
+     * operator will never see and a reason to think it was recorded. There is
+     * no `status`, no `ms` and no `outcome`, because none of the three has an
+     * answer for a request that never left.
+     */
+    private void deliverDenial(Denied d) {
+        boolean delivered;
+        try {
+            Map<String, Object> h = new LinkedHashMap<>();
+            h.put("t", "denial");
+            h.put("via", "proxy");
+            h.put("source", sourceName(d.source()));
+            h.put("method", d.method());
+            h.put("url", d.url());
+            h.put("error_class", d.errorClass());
+            h.put("detail", d.detail());
+            delivered = sink.denial(h);
+        } catch (Throwable t) {
+            // Same reasoning as the exchange arm: a sink that throws is
+            // someone else's code failing, and killing the drain would lose
+            // every record after it, silently.
+            delivered = false;
+        }
+        if (!delivered) dropped[d.source().ordinal()].incrementAndGet();
     }
 
     /** Called with {@link #reportLock} held. */

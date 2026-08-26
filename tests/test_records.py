@@ -138,6 +138,97 @@ def test_the_protocol_doc_lists_exactly_the_classes_the_code_emits():
         f"only in the code: {sorted(set(ERROR_CLASSES) - listed)}")
 
 
+def _java_method_body(text: str, signature: str) -> str:
+    """The brace-matched body of one Java method, by its signature line.
+
+    Crude on purpose: it counts braces from the method's opening one. That is
+    wrong for a body containing a brace inside a string or character literal,
+    and none of the three below does -- asserted by the field sets coming out
+    non-empty and the right size, which a truncated body would not.
+    """
+    start = text.index(signature)
+    open_brace = text.index("{", start)
+    depth = 0
+    for i in range(open_brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace:i]
+    raise AssertionError(f"unbalanced braces after {signature!r}")
+
+
+def test_the_protocol_doc_lists_exactly_the_fields_the_capture_frames_carry():
+    """The three unsolicited frames S4's second enforcement point reports.
+
+    A HEADER FIELD IS A VOCABULARY IN TWO PLACES. The Java side puts the keys
+    on the wire; `docs/bridge-protocol.md` is what a second implementation --
+    and the next reader of `hx.capture` -- is written from. They drifted for a
+    whole plan already: the doc said `exchange {v,t,...} unsolicited; no id.
+    Defined in a later plan.` while Tasks 4 and 6 had built and consumed the
+    real thing, and it named neither `dropped` nor `denial` at all.
+
+    THE DIRECTION THAT MATTERS IS A KEY THE DOC DOES NOT NAME. An unknown
+    header key is IGNORED on the Python side, not refused -- so a field added
+    to the Java frame without a reader is a fact the operator never sees and a
+    reason to believe it was recorded. This is the check that makes such a key
+    say so.
+
+    The two sides have independent sources: the doc's own frame table, and the
+    `put("...")` calls in the methods that build each frame. `v` is stamped by
+    the sink rather than by the record's own arm, which is why the exchange
+    and denial sets are unioned with the sink's -- and it is IN the doc,
+    because a frame without it is one `BridgeServer._handle` drops before it
+    looks at `t`.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1]
+    doc = (root / "docs" / "bridge-protocol.md").read_text(encoding="utf-8")
+    documented = {
+        m.group(1): set(m.group(2).split(","))
+        for m in re.finditer(
+            r"^ +burp -> py +(exchange|denial|dropped) +\{([a-z_,]+)\}",
+            doc, re.M)
+    }
+    assert set(documented) == {"exchange", "denial", "dropped"}, (
+        f"the frame table no longer names all three: {sorted(documented)}")
+
+    capture = (root / "extension" / "src" / "hx" / "proxy"
+               / "Capture.java").read_text(encoding="utf-8")
+    bridge = (root / "extension" / "src" / "hx" / "bridge"
+              / "BridgeClient.java").read_text(encoding="utf-8")
+    key = re.compile(r'\.put\(\s*"([a-z_]+)"')
+
+    # `v` is put by the SINK, in the arm that writes each frame; the record's
+    # own arm puts everything else. Both halves are read, so a `v` dropped
+    # from either is a difference here rather than a frame the far side
+    # discards in silence.
+    sink_exchange = set(key.findall(_java_method_body(
+        bridge, "public boolean exchange(Map<String, Object> header, byte[] request,")))
+    sink_denial = set(key.findall(_java_method_body(
+        bridge, "public boolean denial(Map<String, Object> header)")))
+    sink_dropped = set(key.findall(_java_method_body(
+        bridge, "public boolean dropped(long n, String source)")))
+
+    emitted = {
+        "exchange": sink_exchange | set(key.findall(
+            _java_method_body(capture, "private void deliverExchange(Observed o)"))),
+        "denial": sink_denial | set(key.findall(
+            _java_method_body(capture, "private void deliverDenial(Denied d)"))),
+        "dropped": sink_dropped,
+    }
+    # Anti-vacuity: an empty or truncated parse would compare two empty sets
+    # for a frame and pass. Every frame carries `v` and `t` at minimum, and
+    # the doc is what says how many more.
+    for name, fields in emitted.items():
+        assert {"v", "t"} <= fields, f"{name} lost its envelope: {sorted(fields)}"
+    assert emitted == documented, {
+        name: {"only in the doc": sorted(documented[name] - emitted[name]),
+               "only in the code": sorted(emitted[name] - documented[name])}
+        for name in documented if documented[name] != emitted[name]
+    }
+
+
 def test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan():
     """A regex that stopped matching would shrink ERROR_CLASSES quietly, and
     every set-equality test here would then be comparing two small sets.

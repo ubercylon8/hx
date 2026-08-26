@@ -12,4 +12,5 @@ package hx.proxy;
  * not a Montoya object.
  */
 public record Observed(String method, String url, int status, long ms,
-                       byte[] request, byte[] response, Source source) { }
+                       byte[] request, byte[] response, Source source)
+        implements Captured { }

@@ -723,7 +723,7 @@ public final class BridgeClient {
      * a test is not compiled into the jar, so it cannot reintroduce the cycle
      * the guard exists to keep out of it.
      *
-     * BOTH METHODS ANSWER WHETHER THE RECORD REACHED THE WIRE, and neither
+     * EVERY METHOD ANSWERS WHETHER THE RECORD REACHED THE WIRE, and none
      * raises. Not raising is the same rule as "offering never blocks", one
      * layer down: an exception thrown back into the drain thread kills it,
      * and every record after it is lost silently. But "swallow and return"
@@ -750,6 +750,12 @@ public final class BridgeClient {
          *  none. True once the report is on the wire; false leaves the whole
          *  outstanding total with the caller, to go out again. */
         boolean dropped(long n, String source);
+
+        /** A request S4's second enforcement point refused. One body slot,
+         *  empty: `server.py::_capture` hands `denial` and `dropped` to the
+         *  sink as two empty halves. True once the frame is on the wire;
+         *  false means the record is lost and the caller must count it. */
+        boolean denial(Map<String, Object> header);
     }
 
     public ExchangeSink exchangeSink() {
@@ -785,6 +791,23 @@ public final class BridgeClient {
                 } catch (Throwable e) {
                     log.error("hx: drop report undeliverable, coverage floor "
                               + "unrecorded: " + e);
+                    return false;
+                }
+            }
+
+            public boolean denial(Map<String, Object> header) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.putAll(header);
+                try {
+                    // ONE body, and empty. A denial describes a request that
+                    // produced no traffic: there are no bytes to carry, and
+                    // `server.py::_capture` splits two bodies out of an
+                    // `exchange` frame only.
+                    send(f, new byte[0]);
+                    return true;
+                } catch (Throwable e) {
+                    log.error("hx: denial frame undeliverable, record lost: " + e);
                     return false;
                 }
             }
