@@ -3279,68 +3279,190 @@ git commit -m "feat(proxy): the second egress point is wired and counted"
 Do **not** run `scripts/sync_plan_block.py` — see R4.
 ### Task 8: `hx capture` and a grown `hx info`
 
-Two verbs and a report. The CLI is where a human finds out what happened, and §5's rule that a run with drops has coverage numbers that are a floor is only true if something says so out loud.
+Two verbs and a report. The CLI is where a human finds out what happened, and
+§5's rule that a run with drops has coverage numbers which are a **floor** is
+only true if something says so out loud.
+
+**Corrections to this section, made before dispatch. The originals were wrong
+about this repository.**
+
+- **The CLI is `click`, not argparse, and there is no `run_cli` helper.**
+  `src/hx/cli.py` is a `@click.group()` named `main` with two commands, `new`
+  and `info`. Every test in `tests/test_cli.py` drives it with
+  `click.testing.CliRunner().invoke(cli.main, [...])`. Use that; do not invent
+  a wrapper.
+- **None of the three fixtures named below existed.** Existing tests build an
+  engagement inline by invoking `new` with `--root tmp_path`. Write the
+  fixtures; do not assume them.
+- **`hx capture stop` needs to say WHICH run.** There can be more than one
+  live run at a time — `run.current_run` is per-kind, deliberately, because a
+  crawl running while you browse is two runs. Ruled: **`stop` closes every
+  live run of the engagement**, because that is what an operator means by
+  "stop capturing", and reports how many it closed. `--kind` narrows it.
+- **The close is `status='completed'`, `stop_reason='operator'`.**
+  `run.status`'s CHECK is `running|completed|aborted|killed|error`;
+  `stop_reason` is free text. An operator stopping a run is not an `error` and
+  not `aborted` — those mean the harness or the auto-halt ended it.
+- **`current_run` already anticipates this task** and its docstring says so:
+  auto-open is the fallback so that an hour of browsing is never lost to a
+  forgotten command, and `hx capture start` is the deliberately-named path.
+  Do not remove or weaken auto-open.
 
 **Files:**
 - Modify: `src/hx/cli.py`
 - Test: extend `tests/test_cli.py`
 
 **Interfaces:**
-- Consumes: `hx.run` — `open_run`, `close_run`, `current_run`, `reap_stale`; the `surface`, `exchange`, `denial` and `run` tables
-- Produces: `hx capture start [--kind browse]`, `hx capture stop`, and `hx info` grown
+- Consumes: `hx.run` — `open_run`, `close_run`, `current_run`, `reap_stale`,
+  `RUN_KINDS`; `hx.config` for `safety_profile`; the `run`, `surface`,
+  `exchange` and `denial` tables.
+- Produces: `hx capture start [--kind browse]`, `hx capture stop [--kind ...]`,
+  and `hx info` grown. Nothing later in this plan consumes them as Python;
+  Task 9 drives them as a **subprocess**.
 
 - [ ] **Step 1: Write the failing tests**
 
+Three fixtures first, because six tests need them and none exists. Build them
+on top of the `new` command the way the existing tests do, then write rows
+through `hx.run` / `hx.store.records` rather than by hand-rolled SQL — a
+fixture that invents its own INSERT is a second writer of the schema and will
+drift from the real one.
+
+```python
+@pytest.fixture
+def engagement(tmp_path: Path) -> Path:
+    """A real engagement, made the way an operator makes one."""
+    result = CliRunner().invoke(cli.main, [
+        "new", "acme-2026-09", "--client", "Acme Corp",
+        "--scope", "https://app.acme.com/*", "--root", str(tmp_path),
+    ])
+    assert result.exit_code == 0, result.output
+    return tmp_path
+```
+
+`engagement_with_drops` opens a run and calls `run.count_drop(..., n=4)`.
+`engagement_with_stale_run` opens a run and backdates its `heartbeat_us` by
+more than `run.IDLE_CLOSE_US` so `reap_stale` has something to find.
+
 ```python
 def test_capture_start_opens_a_named_run(engagement):
-    result = run_cli(["capture", "start", "--root", str(engagement)])
-    assert result.exit_code == 0
+    result = CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
     assert "browse" in result.output
 
+def test_capture_start_refuses_a_kind_the_schema_will_not_take(engagement):
+    """The vocabulary lives in run.RUN_KINDS and in a CHECK. A bad --kind must
+    be refused by the CLI with a readable message, not by SQLite with
+    `CHECK constraint failed: run`."""
+    result = CliRunner().invoke(cli.main,
+        ["capture", "start", "--kind", "scheduled", "--root", str(engagement)])
+    assert result.exit_code != 0
+    assert "scheduled" in result.output
+
 def test_capture_stop_closes_it(engagement):
-    run_cli(["capture", "start", "--root", str(engagement)])
-    result = run_cli(["capture", "stop", "--root", str(engagement)])
-    assert result.exit_code == 0
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+
+def test_capture_stop_closes_every_live_run(engagement):
+    """Two kinds live at once is the normal case, not the exotic one: a crawl
+    runs while a human browses. An operator typing `stop` means both."""
+    for kind in ("browse", "crawl"):
+        CliRunner().invoke(cli.main,
+            ["capture", "start", "--kind", kind, "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "2" in result.output
+    # ...and assert against the STORE, not the wording: no run of this
+    # engagement is left with status='running'.
 
 def test_capture_stop_with_no_run_says_so_rather_than_failing(engagement):
     """An operator typing stop twice has made no mistake worth an error."""
-    result = run_cli(["capture", "stop", "--root", str(engagement)])
-    assert result.exit_code == 0
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
     assert "no" in result.output.lower()
 
 def test_info_reports_drops_loudly_when_there_are_any(engagement_with_drops):
     """S5: a run with drops has coverage numbers that are a FLOOR, not a
     count. An operator who does not know that reads the surface count as
     complete."""
-    result = run_cli(["info", "--root", str(engagement_with_drops)])
-    assert "incomplete" in result.output.lower()
-    assert "4" in result.output
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement_with_drops)])
+    assert "floor" in result.output.lower()
+    # The COUNT, in its own context. A bare `"4" in output` passes on any
+    # unrelated 4 -- four surfaces, a timestamp digit -- which is the shape of
+    # a test that reads green for the wrong reason.
+    assert "4 dropped" in result.output
 
 def test_info_says_nothing_alarming_when_there_are_no_drops(engagement):
     """The separating case. A warning that is always present is not a
     warning."""
-    result = run_cli(["info", "--root", str(engagement)])
-    assert "incomplete" not in result.output.lower()
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert "floor" not in result.output.lower()
 
 def test_info_reaps_stale_runs_before_reporting(engagement_with_stale_run):
     """Otherwise the first thing an operator sees after a crash is a run that
     claims to be running."""
-    result = run_cli(["info", "--root", str(engagement_with_stale_run)])
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement_with_stale_run)])
     assert "error" in result.output.lower()
 ```
 
-- [ ] **Step 2–4: Implement, run, commit**
+- [ ] **Step 2: Implement**
 
-`hx info` gains: surfaces by kind, exchanges by outcome, denials by kind, and — when any run has `dropped_total > 0` — a line naming the count and saying the numbers above are a floor. It calls `run.reap_stale` first, so a crashed run is reported as `error` rather than as still running.
+`capture` is a `@main.group()` with `start` and `stop` beneath it, matching
+`new` and `info` on `--root`.
+
+- `start` reads the profile from the engagement config, calls
+  `run.current_run` — not `open_run`, so typing `start` twice is idempotent
+  rather than two runs — and prints the kind and the run id.
+- `stop` closes every live run with `status='completed'`,
+  `stop_reason='operator'`, and prints how many it closed.
+- `--kind` is validated against `run.RUN_KINDS` with
+  `click.Choice(sorted(run.RUN_KINDS))`, so the vocabulary is DERIVED and
+  cannot drift from the schema — `tests/test_vocabularies_match_the_schema.py`
+  already pins `RUN_KINDS` against the CHECK, and reaching through it here
+  means this file adds no third copy.
+
+`hx info` gains, in this order:
+
+- `run.reap_stale` **first**, so a crashed run reads `error` rather than
+  `running`;
+- surfaces by `kind`, exchanges by `outcome`, denials by `kind` — three
+  `GROUP BY` counts;
+- and, only when some run has `dropped_total > 0`, a line naming the total and
+  saying the numbers above are a **floor**.
+
+The floor line is the point of the task. Write it so it cannot be skimmed
+past, and so the word the test pins (`floor`) is the word an operator reads.
+
+- [ ] **Step 3: Run, and check the separating case**
 
 ```bash
 .venv/bin/pytest tests/test_cli.py -q
+```
+
+Then the sabotage sweep, judged by the pytest summary line:
+
+| # | Edit | Expect red |
+|---|---|---|
+| A | drop the `reap_stale` call from `info` | the stale-run test |
+| B | print the floor line unconditionally | the no-drops test |
+| C | print it never | the drops test |
+| D | `stop` closes only the newest live run | the every-live-run test |
+| E | `start` calls `open_run` instead of `current_run` | add a test if none reddens: `start` twice must not make two runs |
+| F | `--kind` accepts any string | the bad-kind test |
+
+Row E is the one to watch: if nothing reddens, that is the finding, and the
+test it needs is the one this table names.
+
+- [ ] **Step 4: Commit**
+
+```bash
+.venv/bin/pytest -q
 git add src/hx/cli.py tests/test_cli.py
 git commit -m "feat(cli): capture start/stop, and info that admits its gaps"
 ```
 
 ---
-
 ### Task 9: End to end, against real Burp
 
 Everything before this was fakes and unit tests. This is the task that finds what the fakes agreed to be wrong about — on the previous branch, the equivalent task changed no production code at all and found three tests that wrote **zero frames to the socket** while claiming to prove the invariant.
