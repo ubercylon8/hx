@@ -3467,32 +3467,84 @@ git commit -m "feat(cli): capture start/stop, and info that admits its gaps"
 
 Everything before this was fakes and unit tests. This is the task that finds what the fakes agreed to be wrong about — on the previous branch, the equivalent task changed no production code at all and found three tests that wrote **zero frames to the socket** while claiming to prove the invariant.
 
+**Corrections made before dispatch. Six things this section was wrong or silent about.**
+
+- **`launch_burp` does not pass `-Dhx.crawler_port`, and without it test 5 cannot pass.**
+  Task 7 reads the crawler listener from that property, defaulting to `0`, which
+  `Source.forListenerPort` reads as "no crawler configured" — so **every** request
+  attributes to `OPERATOR` and the operator/crawler split proves nothing. This is
+  precisely the `-Dhx.halt_sentinel` incident that `launch_burp`'s own comment
+  documents: *"Task 6 made it mandatory and this fixture was not updated — the
+  integration tests are deselected from the default run, so nothing said so for a
+  day."* Do not repeat it two tasks later.
+- **`BridgeServer` in the rig is built with NO `on_exchange` sink.** Exchange,
+  denial and dropped frames are read and **discarded**. Install
+  `hx.capture.Capture` as the sink or every assertion below reads an empty
+  database while Burp cheerfully sends frames — and the natural, wrong diagnosis
+  is to blame the extension.
+- **The second listener already exists — in `launch_probe`, not `launch_burp`.**
+  Lift the mechanism, do not reinvent it. It matters *how* it works: **Burp
+  Community has no API for creating a listener**, so the second one comes from a
+  project config file passed with `--config-file`, and **both** listeners are
+  written explicitly — a config naming only the second leaves the first wherever
+  Burp's defaults put it, which is the 8080 `_free_port()` exists to avoid.
+  `proxy_port()` and `second_proxy_port()` read the real ports back.
+- **`loopback_only` is not self-enforcing.** That string was the whole of the
+  protection until `not_loopback_only()` was written, and changing it to
+  `all_interfaces` left the suite green with the proxy bound to `*` — an open
+  relay on whatever network the laptop is attached to. Call
+  `not_loopback_only(pid, ports)` once the new listeners are up, as
+  `test_proxy_facts.py`'s fixture does.
+- **The count is stale.** There are **17** existing integration tests, not 14. The
+  target is **24 passed**, and a run reporting 21 is a run that lost three.
+- **The rig hand-inserts a `manual` run row.** Plan 4 owns run lifecycle now, and
+  `capture.py` auto-opens `browse`/`crawl` runs. `current_run` is per-kind, so the
+  pre-inserted `manual` row will not satisfy a `browse` lookup and a second run
+  opens — which is correct, and is what test 6 asserts. Do not "fix" it.
+
 **Files:**
 - Create: `tests/integration/test_proxy_capture.py`
-- Modify: `tests/integration/burp_fixture.py` (a second proxy listener), `tests/integration/conftest.py` (extend the rig)
+- Modify: `tests/integration/burp_fixture.py` (two listeners on `launch_burp`, and `-Dhx.crawler_port`), `tests/integration/conftest.py` (the capture sink, and the ports on the rig)
 
-- [ ] **Step 1: Write the end-to-end tests**
+- [ ] **Step 1: Extend the rig**
+
+Three changes, each named above:
+
+1. `launch_burp` writes a two-listener project config the way `launch_probe`
+   does, passes `--config-file`, and takes the crawler port so it can pass
+   `-Dhx.crawler_port`. The operator listener is the first; the crawler
+   listener is the second.
+2. `conftest.rig` constructs `hx.capture.Capture` over the engagement's db,
+   blob store and config, and installs it as `BridgeServer(on_exchange=...)`.
+3. `Rig` gains the two ports, so a test can send through either.
+
+Then assert the safety property before any test uses the listeners:
+`not_loopback_only(proc.pid, ports)` must answer `None`.
+
+- [ ] **Step 2: Write the end-to-end tests**
 
 Seven, each proving a claim the unit tests can only assert:
 
 1. **Browsing an in-scope URL through the proxy produces an exchange row**, with both blobs present on disk and readable.
-2. **An out-of-scope URL is dropped**, the second target server — listening throughout — logs **zero** requests, and a `denial` row exists with `via='proxy'`.
+2. **An out-of-scope URL is dropped**, the second target server — listening throughout — logs **zero** requests, and a `denial` row exists with `via='proxy'`. Assert against the TARGET's log, never the client's response: a drop returns `200 OK` with ~1529 bytes of Burp's own HTML, so the client cannot tell a drop from a delivery.
 3. **Two ids under one endpoint produce one surface**, proven against a real normaliser on real captured traffic.
-4. **A `Set-Cookie` in a real response is redacted before it reaches the blob store** — the blob is fetched and searched for the cookie value, which must be absent. §7's rule, on the live path.
+4. **A `Set-Cookie` in a real response is redacted before it reaches the blob store** — the blob is fetched and searched for the cookie value, which must be absent. §7's rule, on the live path. Do the same for a request `Cookie:` header, which is the hole five fix rounds closed.
 5. **The operator listener allows a POST the crawler listener refuses** — the same request, two ports, two answers. This is the §4 split, end to end, and nothing short of two real listeners proves it.
 6. **A run auto-opens on the first exchange** and its `kind` is `browse`.
 7. **Killing the harness mid-browse does not stop the browser.** Stop `BridgeServer`, keep browsing, and assert the requests still reach the target. This is §4's "capture never gates enforcement" on the live path, and it is the one claim in this plan that a unit test structurally cannot make.
 
-- [ ] **Step 2: Run**
+- [ ] **Step 3: Run**
 
 Run: `.venv/bin/pytest -m integration -q`
-Expected: 21 passed (14 existing + 7).
+Expected: **24 passed** (17 existing + 7). Judge by that summary line and the exit code. A run of 21 lost three tests; a run that prints no summary line hung.
 
-- [ ] **Step 3: Report what real Burp disagreed with**
+- [ ] **Step 4: Report what real Burp disagreed with**
 
-Write down every place the fakes and reality differed — timing, ordering, header casing, what `messageId()` did under load, whether `drop()` behaved as Task 1 measured. **A report saying "everything matched" is one to disbelieve without the measurements behind it.**
+Write down every place the fakes and reality differed — timing, ordering, header casing, what `messageId()` did under load, whether `drop()` behaved as Task 1 measured, and whether `drop()` from `handleRequestToBeSent` behaves like the one from `handleRequestReceived` that Task 1 actually measured. **A report saying "everything matched" is one to disbelieve without the measurements behind it.**
 
-- [ ] **Step 4: Commit**
+Also settle P14, which five fix rounds could not: **does the handler HONOUR its verdict?** No unit test can see it — `if (!verdict.allow() && false)` is green in the whole suite. Test 2 is the one that closes it, and only if it reads the target's log.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add tests/integration/
@@ -3500,7 +3552,6 @@ git commit -m "test(proxy): the second enforcement point, proved against real Bu
 ```
 
 ---
-
 ## What this plan does not do
 
 - **The crawler.** Plan 5. This plan builds the listener it will arrive on and the rules that will govern it, so the crawler only has to drive. §9's hard decisions — `active_mutate`, per-run canary tokens, SPA route walking, the dangerous-path interaction — stay open for its own brainstorm.
