@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -169,8 +170,8 @@ public class ChokepointTest {
           ChokepointTest::theRecordingStructuresHoldTheirMonitors);
         t("theGateDecidesBeforeAnythingIsQueued",
           ChokepointTest::theGateDecidesBeforeAnythingIsQueued);
-        t("everyTypeNeedleSurvivesQualification",
-          ChokepointTest::everyTypeNeedleSurvivesQualification);
+        t("theTypeNeedlesCoverEveryConstructionForm",
+          ChokepointTest::theTypeNeedlesCoverEveryConstructionForm);
         t("theRecordIsBuiltByTheRecorderAndNeverInline",
           () -> theRecordIsBuiltByTheRecorderAndNeverInline(sources));
 
@@ -243,7 +244,9 @@ public class ChokepointTest {
      *  fail-safe direction. Rewrite the comment, do not loosen the needle. */
     static void noBatchEgressPath(List<Path> sources) throws IOException {
         int total = 0;
-        for (Path p : sources) total += count(text(p), "sendRequests(");
+        for (Path p : sources)
+            total += count(text(p), "sendRequests(")
+                   + count(text(p), "::sendRequests");
         // Montoya's batch call is a second egress path wearing the first one's
         // name. It was measured working on Community (spec s2), which is
         // exactly why it needs saying no to in writing: one request per
@@ -378,8 +381,14 @@ public class ChokepointTest {
         int epoch = 0, scope = 0;
         for (Path p : sources) {
             String t = text(p);
-            epoch += count(t, ".configEpoch()");
-            scope += count(t, ".scopeConfig()");
+            // BOTH CALL FORMS. A method reference is an invocation, and
+            // `client::configEpoch` contains no `.configEpoch()` -- so the
+            // paren form alone left a must-be-zero check that a two-line
+            // detour walks past, which is the same grammar point the
+            // constructor needles were fixed for. See
+            // theTypeNeedlesCoverEveryConstructionForm.
+            epoch += count(t, ".configEpoch()") + count(t, "::configEpoch");
+            scope += count(t, ".scopeConfig()") + count(t, "::scopeConfig");
         }
         // Two reads of one record, with a commit landing between them:
         // measured wrong in 393/400 trials, and wrong in the unsafe direction
@@ -406,6 +415,10 @@ public class ChokepointTest {
      *  cannot help matching. */
     static final String OBSERVED =
             Path.of("src", "hx", "proxy", "Observed.java").toString();
+
+    /** ...and its sibling, counted for the same reason. */
+    static final String DENIED =
+            Path.of("src", "hx", "proxy", "Denied.java").toString();
 
     /** The one file that turns two raw halves into a redacted record. It has
      *  no burp.* type in it, which is what lets RecorderTest execute it. */
@@ -624,22 +637,29 @@ public class ChokepointTest {
      * So this check is a TRIPWIRE on the shapes a second egress path has
      * actually taken in this repository -- twice now, both found by review
      * rather than by it -- and it is not a proof that none exists. Read it as
-     * that and nothing more.
+     * that and nothing more. It is item 2 of the canonical open list in
+     * {@link hx.proxy.Recorder}'s javadoc, which is the one place this path's
+     * residuals are enumerated.
      */
     static void noSecondEgressFamilyExists(List<Path> sources) throws IOException {
         String[] needles = {
             "Socket(",            // a TCP client socket, straight from the JDK,
                                   // qualified or not -- see the javadoc above
+            "Socket::new",        // ...and the OTHER spelling a constructor has
             "InetSocketAddress",  // ...or the address that turns a channel into one
             "URL(",               // the OBJECT, not one of its doors: see above
+            "URL::new",           // ...in both of its constructor spellings too
             "openConnection(",    // URL -> URLConnection / HttpURLConnection
+            "::openConnection",   // ...and the reference form of the same call
             "openStream(",        // URL.openStream(), the one-liner version
+            "::openStream",       // ...likewise
             "HttpClient",         // java.net.http, the modern one
             "DatagramSocket",     // UDP is egress too
             "InetAddress",        // a DNS lookup is bytes off this machine
             "ProcessBuilder",     // ...and so is `curl`
             "Runtime.getRuntime", // the older spelling of the same thing
             "collaborator()",     // Montoya's OTHER network facility
+            "::collaborator",     // ...reached by reference
         };
         for (String needle : needles) {
             int total = 0;
@@ -707,7 +727,7 @@ public class ChokepointTest {
         int senderBefore = count(sender, ".decideBeforeGate(");
         int senderGate = count(sender, ".checkGate(");
         int entryBefore = count(entry, ".decideBeforeGate(");
-        int entryGate = count(entry, ".checkGate(");
+        int entryGate = count(entry, ".checkGate(") + count(entry, "::checkGate");
 
         check("the issuing path asks the boundary half exactly once ("
               + senderBefore + ")", senderBefore == 1);
@@ -735,7 +755,8 @@ public class ChokepointTest {
         // `policy.decideScopeOnly(` do not match it. ProxyGate's own
         // `policy.decide(` is a different file and is the FIRST callback's
         // paying decision, which is correct.
-        int entryFull = count(entry, "policy.decide(");
+        int entryFull = count(entry, "policy.decide(")
+                      + count(entry, "policy::decide");
         check("and not through policy.decide(), which reaches the Gate without "
               + "naming it (" + entryFull + ")", entryFull == 0);
 
@@ -774,13 +795,15 @@ public class ChokepointTest {
      * count of a CALL nobody writes in prose -- the class javadoc's rule for
      * when that is safe.
      *
-     * WHAT IT DOES NOT SEE, beyond a second Limits: a CONSTRUCTOR REFERENCE.
-     * `Policy::new` contains no `Policy(` and would slip past, exactly as
-     * `Observed::new` did before {@link hx.proxy.Observed} was made
-     * package-private and the compiler took over that job. There is no
-     * equivalent compiler bound available here -- `Policy` is public because
-     * `hx.send` and `hx.proxy` both need it -- so this is a declared residual
-     * and not a closed one.
+     * A NEEDLE AND NOT A COMPILER BOUND, and the difference is worth stating
+     * because {@link hx.proxy.Observed} took the other road. That record is
+     * package-private, so `javac` refuses every construction outside
+     * `hx.proxy` whatever its spelling. `Policy` cannot be: `hx.send.Sender`
+     * and `hx.proxy.ProxyGate` both hold one and `hx.HxExtension` builds it,
+     * so it is public of necessity and a text needle is what there is. What
+     * makes that acceptable is that the needle now covers the CLOSED set of
+     * spellings a construction has -- see the two needles above and
+     * {@link #theTypeNeedlesCoverEveryConstructionForm}.
      *
      * AND NOT A SECOND LIMITS EITHER. `new Limits(` is not counted,
      * because Limits is legitimately constructible for defaults and the
@@ -799,7 +822,16 @@ public class ChokepointTest {
             // check's javadoc says no behavioural test can see. The cost of
             // the wider needle is that Policy's own CONSTRUCTOR DECLARATION
             // matches, so the expected answer is two files.
-            int n = count(code(p), "Policy(");
+            // BOTH CONSTRUCTOR SPELLINGS. `Policy(` alone was blind to
+            // `Policy::new`, and a method reference is a construction: with
+            // `Function<Limits, Policy> mk = Policy::new; mk.apply(limits)` in
+            // the entry point this check read 13 summary lines / 1980 ok /
+            // 0 FAIL / rc=0 -- a second Gate and a second per-run budget for
+            // one run, measured. The Java grammar gives a constructor exactly
+            // two spellings, `new T(` and `T::new`, each optionally qualified;
+            // these two needles cover all four, and the sweep in
+            // theTypeNeedlesCoverEveryConstructionForm asserts that they do.
+            int n = count(code(p), "Policy(") + count(code(p), "Policy::new");
             total += n;
             if (n > 0) hits.add(p + " x" + n);
         }
@@ -1312,9 +1344,13 @@ public class ChokepointTest {
      *     asserted where it can be asserted for real -- by REFLECTION, in
      *     `RecorderTest.theCompilerBoundsConstruction`, which reads the
      *     compiled modifiers and cannot be fooled by how a construction is
-     *     written. The count below is what remains useful AFTER that bound:
-     *     it narrows construction WITHIN the package to one file, and it is
-     *     spelling-bound in the way the compiler is not;
+     *     written. The counts below are what remains AFTER that bound: they
+     *     narrow construction WITHIN the package to one file, and they count
+     *     BOTH spellings a constructor has -- `Observed(` with `Observed::new`
+     *     and `Denied(` with `Denied::new` -- so the reference form that
+     *     defeated the earlier needle is covered here as well.
+     *     {@link #theTypeNeedlesCoverEveryConstructionForm} is what holds that
+     *     pairing in place;
      *   - the proxy path's redaction is on the drivable side of the line.
      *     `.redactObservedRequest(` appears exactly once in extension/src and
      *     it is in Recorder.java, and the entry point CALLS neither redaction
@@ -1348,6 +1384,7 @@ public class ChokepointTest {
 
         // ---- the record is built where the redaction is ---------------------
         List<String> observed = new ArrayList<>();
+        List<String> denied = new ArrayList<>();
         List<String> jobFour = new ArrayList<>();
         for (Path p : sources) {
             String c = code(p);
@@ -1358,14 +1395,24 @@ public class ChokepointTest {
             // arriving a third time: needle the name, not the phrase around
             // it. The cost is that the record's own DECLARATION matches, so
             // the expected answer is two files rather than one.
-            int n = count(c, "Observed(");
+            int n = count(c, "Observed(") + count(c, "Observed::new");
             if (n > 0) observed.add(p + " x" + n);
+            int d = count(c, "Denied(") + count(c, "Denied::new");
+            if (d > 0) denied.add(p + " x" + d);
             int j = count(c, ".redactObservedRequest(");
             if (j > 0) jobFour.add(p + " x" + j);
         }
         check("Observed is DECLARED in one file and CONSTRUCTED in one, and "
               + "the one that constructs it is " + RECORDER + " -- not " + observed,
               observed.equals(List.of(OBSERVED + " x1", RECORDER + " x1")));
+        // The SAME for Denied, and this is what makes the within-package half
+        // of the compiler bound complete rather than half-done: `javac` stops
+        // another package from naming either record, and these two counts stop
+        // a second construction site inside `hx.proxy`, in both spellings a
+        // constructor has.
+        check("and Denied likewise, constructed only in " + RECORDER
+              + " -- not " + denied,
+              denied.equals(List.of(DENIED + " x1", RECORDER + " x1")));
         check("and redacts an observed request in exactly one place, the same "
               + "one -- not " + jobFour,
               jobFour.equals(List.of(RECORDER + " x1")));
@@ -1374,7 +1421,9 @@ public class ChokepointTest {
         // line: put either call back in here and it is red, whatever else the
         // line does.
         int entryRedacts = count(entry, ".redactObservedRequest(")
-                         + count(entry, ".redactResponse(");
+                         + count(entry, ".redactResponse(")
+                         + count(entry, "::redactObservedRequest")
+                         + count(entry, "::redactResponse");
         check("and the entry point redacts nothing itself (" + entryRedacts + ")",
               entryRedacts == 0);
 
@@ -1387,7 +1436,7 @@ public class ChokepointTest {
         // the cost is that Recorder's own constructor declaration matches.
         List<String> recorders = new ArrayList<>();
         for (Path p : sources) {
-            int n = count(code(p), "Recorder(");
+            int n = count(code(p), "Recorder(") + count(code(p), "Recorder::new");
             if (n > 0) recorders.add(p + " x" + n);
         }
         check("Recorder is DECLARED in one file and CONSTRUCTED in one, and the "
@@ -1461,124 +1510,216 @@ public class ChokepointTest {
     }
 
     /**
-     * EVERY NEEDLE THAT NAMES A TYPE MATCHES ITS OWN FULLY-QUALIFIED SPELLING.
+     * EVERY NEEDLE THAT NAMES A TYPE COVERS EVERY WAY THAT TYPE CAN BE WRITTEN
+     * -- and for a CONSTRUCTION that is a closed set of four.
      *
-     * THIS EXISTS BECAUSE THE SAME DEFECT HAS APPEARED SIX TIMES ON ONE TASK,
-     * always in the same shape and always found by a reviewer rather than by
-     * this suite. Each was a needle that matched the spelling someone happened
-     * to write and not the CONSTRUCT it was about:
+     * SEVEN INSTANCES OF ONE DEFECT ON ONE TASK, every one a needle that
+     * matched the spelling someone happened to write rather than the construct
+     * it was about, and every one found by a reviewer rather than by this
+     * suite. Five were WORKING defects measured at a fully green run:
      *
-     *     `new Socket(`     blind to `new java.net.Socket(`
-     *     `new Observed(`   blind to `new hx.proxy.Observed(`
-     *     `Observed(`       blind to `Observed::new`
-     *     `new Policy(`     blind to `new hx.policy.Policy(`   -- a second budget
+     *     `new Socket(`     blind to `new java.net.Socket(`  -- a live TCP egress
+     *     `new Observed(`   blind to `new hx.proxy.Observed(` -- raw credentials queued
+     *     `Observed(`       blind to `Observed::new`          -- raw credentials queued
+     *     `new Policy(`     blind to `new hx.policy.Policy(`  -- a second per-run budget
+     *     `Policy(`         blind to `Policy::new`            -- a second per-run budget
      *     `import burp.`    blind to a fully-qualified Montoya type
-     *     `openConnection(` blind to `URL.getContent()`        -- same family, API side
+     *     `openConnection(` blind to `URL.getContent()`       -- same family, API side
      *
-     * Four of the six were WORKING defects, not hypotheticals: a live TCP
-     * egress, two raw-credential leaks and a second per-run budget, each
-     * measured at a fully green suite.
+     * WHY THIS ONE IS WORTH ENUMERATING WHEN `SocketHandler` WAS NOT, because
+     * the two look alike and are not:
      *
-     * So the property is asserted instead of re-derived by the next reviewer.
-     * For each needle below, a fully-qualified spelling of the same construct
-     * is written out and the needle must match it. No compilation and no
-     * subprocess -- string work over this file's own text, finite, and
-     * directly falsifiable: revert any needle to its `new `-prefixed or
-     * `import `-prefixed form and its row goes red HERE, in the suite, rather
-     * than in the next review. (It DOES read one file: its own source, for the
-     * two anti-vacuity arms below.)
+     *   - the set of TYPE NAMES that can open a socket is UNBOUNDED. No needle
+     *     list closes it, which is why {@link #noSecondEgressFamilyExists}
+     *     declares that exclusion instead of chasing it;
+     *   - the set of CONSTRUCTION SYNTAXES FOR A NAMED TYPE is CLOSED BY THE
+     *     JAVA GRAMMAR. A constructor has exactly two spellings, `new T(...)`
+     *     and `T::new`, and each may be qualified or not. FOUR FORMS, and the
+     *     language defines the list.
      *
-     * ANTI-VACUITY RUNS BOTH WAYS FOR THE ONE FAMILY WHERE IT CAN. The needles
-     * of {@link #noSecondEgressFamilyExists} live in one array literal, so
-     * that array is parsed out of this file's own text and every entry is
-     * required to have a row here -- adding a needle without a row is red. For
-     * the needles scattered across other methods no rule can enumerate them,
-     * so the reverse direction is all there is: every row's needle must appear
-     * verbatim somewhere in this file, which catches a needle renamed out from
-     * under its row but NOT a new needle added elsewhere without one. That
-     * asymmetry is the honest limit of this check and is why the array family
-     * -- the one with a history -- is the one held from both sides.
+     * So the constructed table below is a finite game finished, not an
+     * infinite one played: for each type all four forms are GENERATED, and at
+     * least one of that type's needles must match each. A needle reverted to
+     * `new T(` fails the qualified form; a needle left as `T(` fails the
+     * reference form.
      *
-     * WHAT THIS DOES NOT ASSERT, because qualification is not the only
-     * dimension: a CONSTRUCTOR REFERENCE (`Socket::new`, `Policy::new`) has no
-     * paren and matches no `X(` needle, and a METHOD REFERENCE
-     * (`client::configEpoch`) matches no `.x()` needle. Those are named as
-     * residuals where they arise. The one place that dimension IS closed is
-     * {@link hx.proxy.Observed} and {@link hx.proxy.Denied}, where the answer
-     * was not a better needle but a package-private record and a compiler.
+     * NEEDLE OR COMPILER, and which is which is deliberate. Where a
+     * compiler-enforced bound was available it was taken and is not
+     * re-litigated here: {@link hx.proxy.Observed} and {@link hx.proxy.Denied}
+     * are package-private, so `javac` refuses every construction from another
+     * package whatever its spelling -- verified by a probe class in package
+     * `hx`, which does not compile. Their rows below are what remains, the
+     * bound WITHIN `hx.proxy`, where a needle is all there is. `Policy` gets no
+     * such bound -- `hx.send` and `hx.proxy` both hold one and `hx` builds it,
+     * so it is public of necessity -- and there the needles are the whole of
+     * it.
+     *
+     * ANTI-VACUITY, both directions where they exist. The needles of
+     * {@link #noSecondEgressFamilyExists} live in one array literal, so that
+     * array is parsed out of this file and every entry must appear in a table
+     * here -- adding a needle without a row is red. And every needle in either
+     * table must appear as a literal OUTSIDE the tables, so a row whose needle
+     * was renamed away is red; the tables are cut out of the text first,
+     * because otherwise a row's own literal answers the search for its own
+     * use. For the needles scattered across other methods no rule can
+     * enumerate them, so that second direction is all there is for those, and
+     * it is the honest limit of this check.
+     *
+     * THE METHOD HALF OF THE SAME GRAMMAR POINT IS HERE TOO, and it is here
+     * because the sentence that used to stand in its place was FALSE. That
+     * sentence said the method form was "left open deliberately: the only
+     * needles it would defeat are the two deprecated-accessor ones, and no S4
+     * or S7 property rests on them." MEASURED, against the tree that carried
+     * it: a second Gate charge at the proxy's second callback, written
+     *
+     *     Function<HxRequest, Decision> g = policy::checkGate;
+     *     if (d.allowed()) d = g.apply(edited);
+     *
+     * read 13 summary lines / 2024 ok / 0 FAIL / rc=0. That is a crawler
+     * charged TWO rate tokens and TWO budget slots for one request -- S4's
+     * rate limit and its per-run budget, both, and the exact defect
+     * {@link #theGateIsSpentOnlyWhereTheHalvesArePaired}'s must-be-zero arm
+     * exists to prevent. `client::configEpoch` against the deprecated-accessor
+     * needle was green the same way. So it was a finding rather than a
+     * residual, and the `called` table below is the fix.
+     *
+     * ONLY THE MUST-BE-ZERO NEEDLES ARE LISTED, and that is a decision: for a
+     * needle that must be exactly N, substituting a reference for a call
+     * LOWERS the count and the check fails CLOSED. It is only where the answer
+     * must be zero that a reference buys anything, because there it raises
+     * nothing while the forbidden thing happens.
      */
-    static void everyTypeNeedleSurvivesQualification() throws IOException {
-        // {needle, a fully-qualified spelling of the same construct}
-        String[][] rows = {
-            {"Socket(",           "new java.net.Socket(\"127.0.0.1\", 1)"},
-            {"InetSocketAddress", "new java.net.InetSocketAddress(\"h\", 1)"},
-            {"URL(",              "new java.net.URL(\"http://h/\")"},
+    static void theTypeNeedlesCoverEveryConstructionForm() throws IOException {
+        // {simple name, package, the needles this file uses for that type...}
+        String[][] constructed = {
+            {"Socket",            "java.net",      "Socket(", "Socket::new"},
+            {"URL",               "java.net",      "URL(", "URL::new"},
+            {"InetSocketAddress", "java.net",      "InetSocketAddress"},
+            {"DatagramSocket",    "java.net",      "DatagramSocket"},
+            {"InetAddress",       "java.net",      "InetAddress"},
+            {"HttpClient",        "java.net.http", "HttpClient"},
+            {"ProcessBuilder",    "java.lang",     "ProcessBuilder"},
+            {"Policy",            "hx.policy",     "Policy(", "Policy::new"},
+            {"Recorder",          "hx.proxy",      "Recorder(", "Recorder::new"},
+            {"Observed",          "hx.proxy",      "Observed(", "Observed::new"},
+            {"Denied",            "hx.proxy",      "Denied(", "Denied::new"},
+        };
+        // Needles naming something OTHER than a construction -- a member
+        // access, an instance call, a package. There is no `new` form for
+        // these; what has to hold is that qualifying the type cannot hide them.
+        String[][] referenced = {
             {"openConnection(",   "new java.net.URL(\"http://h/\").openConnection()"},
             {"openStream(",       "new java.net.URL(\"http://h/\").openStream()"},
-            {"HttpClient",        "java.net.http.HttpClient.newHttpClient()"},
-            {"DatagramSocket",    "new java.net.DatagramSocket()"},
-            {"InetAddress",       "java.net.InetAddress.getByName(\"h\")"},
-            {"ProcessBuilder",    "new java.lang.ProcessBuilder(\"curl\")"},
-            {"Runtime.getRuntime", "java.lang.Runtime.getRuntime().exec(\"curl\")"},
             {"collaborator()",    "api.collaborator().createClient()"},
-            {"Policy(",           "new hx.policy.Policy(limits)"},
-            {"Recorder(",         "new hx.proxy.Recorder(redactor)"},
-            {"Observed(",         "new hx.proxy.Observed(m, u, s, ms, q, r, src)"},
-            {MONTOYA,             "burp.api.montoya.core.ByteArray b = null;"},
+            {"Runtime.getRuntime", "java.lang.Runtime.getRuntime().exec(\"curl\")"},
             {"RedirectionMode.",  "burp.api.montoya.http.RedirectionMode.NEVER"},
             {"HttpService.httpService(",
              "burp.api.montoya.http.HttpService.httpService(h, p, s)"},
             {"HttpRequest.httpRequest(",
              "burp.api.montoya.http.message.requests.HttpRequest.httpRequest(s, b)"},
+            {MONTOYA,             "burp.api.montoya.core.ByteArray b = null;"},
             {"hx.proxy",          "hx.proxy.Observed o = null;"},
         };
+
+        // {method name, receiver used in the qualified form, needles...}
+        // A method INVOCATION has two spellings too -- `recv.m(...)` and
+        // `recv::m` -- and the second is an invocation in every sense that
+        // matters: it reaches the same method with the same effects. Only the
+        // MUST-BE-ZERO needles are listed, and that is a decision rather than
+        // an omission: for a needle that must be exactly N, replacing a call
+        // with a reference LOWERS the count and the check fails CLOSED. For a
+        // needle that must be zero it raises nothing, and the check stays
+        // green while the thing it forbids happens.
+        // {method, receiver, the call's argument text, needles...}. The
+        // argument text is spelled rather than generated because ARITY is a
+        // fact about the method, and a needle for a no-argument method
+        // legitimately carries its closing paren -- `.configEpoch()`. The
+        // REFERENCE form is still derived, which is the half that has been
+        // wrong.
+        String[][] called = {
+            {"sendRequests",          "api.http()", "(a)", "sendRequests(", "::sendRequests"},
+            {"configEpoch",           "client",     "()",  ".configEpoch()", "::configEpoch"},
+            {"scopeConfig",           "client",     "()",  ".scopeConfig()", "::scopeConfig"},
+            {"checkGate",             "policy",     "(a)", ".checkGate(", "::checkGate"},
+            {"decide",                "policy",     "(a)", "policy.decide(", "policy::decide"},
+            {"redactObservedRequest", "redactor",   "(a)", ".redactObservedRequest(",
+                                                           "::redactObservedRequest"},
+            {"redactResponse",        "redactor",   "(a)", ".redactResponse(", "::redactResponse"},
+            {"openConnection",        "u",          "()",  "openConnection(", "::openConnection"},
+            {"openStream",            "u",          "()",  "openStream(", "::openStream"},
+            {"collaborator",          "api",        "()",  "collaborator()", "::collaborator"},
+        };
+
+        List<String> every = new ArrayList<>();
+        for (String[] row : constructed) {
+            String simple = row[0], pkg = row[1];
+            String[] needles = Arrays.copyOfRange(row, 2, row.length);
+            for (String n : needles) every.add(n);
+            // THE FOUR FORMS, generated rather than typed out, so the list
+            // cannot be quietly shortened by hand.
+            String[] forms = {
+                "new " + simple + "(a, b)",
+                "new " + pkg + "." + simple + "(a, b)",
+                simple + "::new",
+                pkg + "." + simple + "::new",
+            };
+            for (String form : forms) {
+                boolean matched = false;
+                for (String n : needles) if (count(form, n) >= 1) matched = true;
+                check("`" + form + "` is matched by one of "
+                      + Arrays.toString(needles), matched);
+            }
+        }
+        for (String[] row : referenced) {
+            every.add(row[0]);
+            check("`" + row[0] + "` matches its qualified spelling `" + row[1] + "`",
+                  count(row[1], row[0]) >= 1);
+        }
+        for (String[] row : called) {
+            String method = row[0], recv = row[1], args = row[2];
+            String[] needles = Arrays.copyOfRange(row, 3, row.length);
+            for (String n : needles) every.add(n);
+            String[] forms = { recv + "." + method + args, recv + "::" + method };
+            for (String form : forms) {
+                boolean matched = false;
+                for (String n : needles) if (count(form, n) >= 1) matched = true;
+                check("`" + form + "` is matched by one of "
+                      + Arrays.toString(needles), matched);
+            }
+        }
+
         String self = text(Path.of("test", "hx", "ChokepointTest.java"));
         check("this class can read its own source (" + self.length() + " chars)",
               self.length() > 10_000);
-        // The rows above are string literals in this same file, so a naive
-        // "is this needle still used" search finds the ROW and passes on a
-        // needle nothing else spells any more. The table is cut out first.
-        int rowsAt = self.indexOf("String[][] rows = {");
-        int rowsEnd = self.indexOf("        };", rowsAt);
-        check("the row table was located and excluded (" + rowsAt + ".."
-              + rowsEnd + ")", rowsAt >= 0 && rowsEnd > rowsAt);
-        String elsewhere = rowsEnd > rowsAt
-                ? self.substring(0, rowsAt) + self.substring(rowsEnd) : self;
+        int tablesAt = self.indexOf("String[][] constructed = {");
+        int tablesEnd = self.indexOf("        };",
+                                     self.indexOf("String[][] called = {"));
+        check("the row tables were located and excluded (" + tablesAt + ".."
+              + tablesEnd + ")", tablesAt >= 0 && tablesEnd > tablesAt);
+        String elsewhere = tablesEnd > tablesAt
+                ? self.substring(0, tablesAt) + self.substring(tablesEnd) : self;
+        for (String needle : every)
+            check("`" + needle + "` is a needle this file still uses",
+                  count(elsewhere, "\"" + needle + "\"") >= 1);
 
-        for (String[] row : rows) {
-            check("`" + row[0] + "` matches its qualified spelling `" + row[1] + "`",
-                  count(row[1], row[0]) >= 1);
-            // ...and the needle is one this file actually uses, SOMEWHERE
-            // OTHER THAN THE ROW. A row whose needle has been renamed away is
-            // stale, and a stale row is a green check about nothing.
-            check("...and `" + row[0] + "` is a needle this file still uses",
-                  count(elsewhere, "\"" + row[0] + "\"") >= 1);
-        }
-
-        // The one family that can be enumerated: every needle in
-        // noSecondEgressFamilyExists's array must have a row above.
         int from = self.indexOf("String[] needles = {");
         int to = self.indexOf("};", from);
         check("the egress needle array was found (" + from + ".." + to + ")",
               from >= 0 && to > from);
         List<String> missing = new ArrayList<>();
         String array = to > from ? self.substring(from, to) : "";
-        int at = 0;
-        int found = 0;
+        int at = 0, found = 0;
         while ((at = array.indexOf('"', at)) >= 0) {
-            int end = array.indexOf('"', at + 1);
-            if (end < 0) break;
-            String needle = array.substring(at + 1, end);
+            int close = array.indexOf('"', at + 1);
+            if (close < 0) break;
+            String needle = array.substring(at + 1, close);
             found++;
-            boolean covered = false;
-            for (String[] row : rows) if (row[0].equals(needle)) covered = true;
-            if (!covered) missing.add(needle);
-            at = end + 1;
+            if (!every.contains(needle)) missing.add(needle);
+            at = close + 1;
         }
         check("every egress needle was read out of the array (" + found + ")",
-              found >= 10);
-        check("...and every one of them has a qualified-spelling row " + missing,
-              missing.isEmpty());
+              found >= 12);
+        check("...and every one of them has a row " + missing, missing.isEmpty());
     }
 
     static int count(String haystack, String needle) {

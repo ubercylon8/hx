@@ -42,7 +42,9 @@ import java.util.List;
  * shapes varying size, body presence, framing and encoding -- AND ITS JAVADOC
  * STATES WHAT NO FIXTURE SET CAN DO. A predicate over a property none of these
  * vary still passes. This class is not a proof that no bypass exists; it is a
- * set of inputs that makes the plausible ones fire.
+ * set of inputs that makes the plausible ones fire. That is item 1 of the
+ * canonical open list in {@link Recorder}'s javadoc, which is the one place
+ * this path's residuals are enumerated.
  *
  * Hand-rolled runner, like the other twelve classes: JUnit would be a
  * dependency, and this jar has none.
@@ -358,7 +360,15 @@ public class RecorderTest {
      * ChokepointTest were each defeated by a spelling they did not anticipate;
      * this reads the modifiers `javac` actually emitted and cannot be fooled by
      * how a construction is written. Restoring `public` to either record is
-     * the separating mutation.
+     * the separating mutation, and the bound was confirmed independently by
+     * compiling a probe class in package `hx` that names each record: `javac`
+     * answers "Observed is not public in hx.proxy; cannot be accessed from
+     * outside package". A language rule, not a test that can rot.
+     *
+     * THIS BOUNDS OTHER PACKAGES AND NOT THIS ONE. Inside `hx.proxy` the bound
+     * is `ChokepointTest`'s per-file count, which since round 4 counts BOTH
+     * spellings a constructor has -- so the within-package half is closed too,
+     * and it is no longer on {@link Recorder}'s open list.
      *
      * {@link Captured} STAYS PUBLIC, and that is load-bearing rather than
      * incidental: {@code Capture.offer(Captured)} is called from

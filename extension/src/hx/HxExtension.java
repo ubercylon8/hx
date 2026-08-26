@@ -204,9 +204,11 @@ public class HxExtension implements BurpExtension {
         // public and ProxyGateTest drives it.
         //
         // WHAT THIS WIRING RESTS ON AND CANNOT CHECK -- Task 9's list, written
-        // down here rather than left implicit. Every item is a thing a real
-        // Burp settles in minutes and nothing in this repository can settle at
-        // all.
+        // down here rather than left implicit. It is item 3 of the canonical
+        // open list in Recorder's javadoc, which is the one place this path's
+        // residuals are enumerated; this block is where the CONDITIONS live.
+        // Every item is a thing a real Burp settles in minutes and nothing in
+        // this repository can settle at all.
         //
         //  1. THAT A SEND-PATH REQUEST DOES NOT TRAVERSE THESE HANDLERS.
         //     `api.http().sendRequest` in the adapter below issues from Burp's
