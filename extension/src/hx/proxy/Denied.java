@@ -4,6 +4,13 @@ package hx.proxy;
 /**
  * One request this extension refused at S4's second enforcement point.
  *
+ * PACKAGE-PRIVATE, like {@link Observed}, and for the symmetry rather than
+ * for a leak of its own: a denial carries no bodies, so there is no redaction
+ * here to get wrong. Leaving ONE of the two {@link Captured} kinds
+ * constructible from outside the package would preserve exactly the shape the
+ * other one was closed for -- a second door -- and the symmetry costs two
+ * lines in {@link Recorder}.
+ *
  * NO BODIES, deliberately. `bridge/server.py::_capture` reads `denial` and
  * `dropped` as frames that "describe something that produced no traffic, so
  * they arrive with an empty body" -- one body slot, not two -- and
@@ -23,5 +30,5 @@ package hx.proxy;
  * {@link Observed}; `aDeniedRecordWithNoSpellingIsRefusedTheSameWay` pins it
  * for this type.
  */
-public record Denied(String method, String url, String errorClass,
-                     String detail, Source source) implements Captured { }
+record Denied(String method, String url, String errorClass,
+              String detail, Source source) implements Captured { }

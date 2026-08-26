@@ -67,6 +67,11 @@ public final class Recorder {
     /**
      * The two raw halves in, one redacted {@link Observed} out.
      *
+     * DECLARED AS {@link Captured}, not as {@code Observed}: the concrete type
+     * is package-private, so the entry point cannot name it -- which is the
+     * point. It gets a record it can hand to {@link Capture#offer} and cannot
+     * take apart, cannot rebuild, and cannot construct a rival to.
+     *
      * WHICH FUNCTION GOES WITH WHICH MESSAGE IS THE WHOLE POINT OF THIS
      * METHOD. `redactObservedRequest` matches the three request credential
      * header names; `redactResponse` matches `Set-Cookie`. Each returns a
@@ -87,10 +92,27 @@ public final class Recorder {
      * class has no counter and inventing a fallback would be inventing an
      * unredacted record.
      */
-    public Observed record(String method, String url, int status, long ms,
+    public Captured record(String method, String url, int status, long ms,
                            byte[] rawRequest, byte[] rawResponse, Source source) {
         byte[] request = redactor.redactObservedRequest(rawRequest);
         byte[] response = redactor.redactResponse(rawResponse);
         return new Observed(method, url, status, ms, request, response, source);
+    }
+
+    /**
+     * One refusal, as a record. No bodies and therefore no redaction: the
+     * request never left, so there are no bytes to make safe.
+     *
+     * IT IS HERE FOR THE COMPILER, NOT FOR THE WORK IT DOES. {@link Denied} is
+     * package-private for the same reason {@link Observed} is, and the entry
+     * point lives in another package -- so this method is what lets it record
+     * a refusal at all. Leaving `Denied` public so the entry point could keep
+     * building its own would have left one of the two {@link Captured} kinds
+     * constructible from anywhere, which is precisely the second door the
+     * other one was closed against.
+     */
+    public Captured denial(String method, String url, String errorClass,
+                           String detail, Source source) {
+        return new Denied(method, url, errorClass, detail, source);
     }
 }

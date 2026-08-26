@@ -24,7 +24,6 @@ import hx.policy.Distress;
 import hx.policy.HxRequest;
 import hx.policy.Policy;
 import hx.proxy.Capture;
-import hx.proxy.Denied;
 import hx.proxy.Pending;
 import hx.proxy.ProxyGate;
 import hx.proxy.Recorder;
@@ -288,7 +287,7 @@ public class HxExtension implements BurpExtension {
                 // `url` are read into locals inside the try for the same
                 // reason the adapter builds its request inside one: they are
                 // Montoya's code handed a hostile page's bytes, and a throw
-                // out of them while building the Denied would escape this
+                // out of them while building the refusal record would escape
                 // handler entirely.
                 Source source = Source.UNATTRIBUTED;
                 String method = "";
@@ -329,8 +328,8 @@ public class HxExtension implements BurpExtension {
                     ProxyRequestReceivedAction refuse =
                             ProxyRequestReceivedAction.drop();
                     try {
-                        capture.offer(new Denied(method, url, verdict.errorClass(),
-                                                 verdict.detail(), source));
+                        capture.offer(recorder.denial(method, url,
+                                verdict.errorClass(), verdict.detail(), source));
                     } catch (Throwable ignored) {
                         // Throwable, and swallowed, and that IS a silent loss
                         // -- the one place in this design where a lost record
@@ -453,8 +452,8 @@ public class HxExtension implements BurpExtension {
                     // spent on requests that are actually in flight.
                     try {
                         pending.take(r.messageId());
-                        capture.offer(new Denied(method, url, errorClass,
-                                                 detail, source));
+                        capture.offer(recorder.denial(method, url, errorClass,
+                                                      detail, source));
                     } catch (Throwable ignored) {
                         // See the first callback: the counter is the thing
                         // that threw, so there is nothing left to count with,

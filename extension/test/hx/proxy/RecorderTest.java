@@ -4,8 +4,12 @@ package hx.proxy;
 import hx.TestSupport;
 import hx.send.Redactor;
 
+import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * The pairing of each redactor to its own message, DRIVEN.
@@ -30,6 +34,15 @@ import java.util.Arrays;
  * The real {@link Redactor} is used, not a fake. A fake would move the
  * question -- "is the right function applied to the right message" -- into the
  * fake, which is exactly the class of thing that has been wrong three times.
+ *
+ * AND THE FOURTH TURN WAS A CONDITION, not a wiring mistake at all: with one
+ * fixture per half, `rawResponse.length > 4096 ? rawResponse : redact(...)`
+ * read 13 summary lines / 1900 ok / 0 FAIL / rc=0 and leaked every real
+ * response. {@link #everyShapeOfMessageIsRedacted} answers that with six
+ * shapes varying size, body presence, framing and encoding -- AND ITS JAVADOC
+ * STATES WHAT NO FIXTURE SET CAN DO. A predicate over a property none of these
+ * vary still passes. This class is not a proof that no bypass exists; it is a
+ * set of inputs that makes the plausible ones fire.
  *
  * Hand-rolled runner, like the other twelve classes: JUnit would be a
  * dependency, and this jar has none.
@@ -63,8 +76,12 @@ public class RecorderTest {
           RecorderTest::neitherRawArrayIsTouchedOrAliased);
         t("a record with no credential on either half round-trips",
           RecorderTest::nothingToRedactRoundTrips);
-        t("a RangeError is not swallowed into an unredacted record",
+        t("a RangeError is not swallowed into an unredacted record, on EITHER half",
           RecorderTest::aRangeErrorIsNotSwallowed);
+        t("every shape of message is redacted, not just the small one",
+          RecorderTest::everyShapeOfMessageIsRedacted);
+        t("the COMPILER is what bounds construction, not a needle",
+          RecorderTest::theCompilerBoundsConstruction);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -97,8 +114,13 @@ public class RecorderTest {
                    + "<html></html>");
     }
 
+    /** The cast is the point, not a wart: `record` is declared {@link Captured}
+     *  because {@link Observed} is package-private and the entry point may not
+     *  name it. This class SITS in that package, so it can look inside -- which
+     *  is exactly the asymmetry that lets the compiler bound construction while
+     *  a test still reads the bytes. */
     static Observed record() {
-        return new Recorder(new Redactor())
+        return (Observed) new Recorder(new Redactor())
                 .record("GET", "http://app.example.test/account/settings",
                         200, 42L, rawRequest(), rawResponse(), Source.OPERATOR);
     }
@@ -187,7 +209,7 @@ public class RecorderTest {
         // would corrupt the very exchange the record is evidence of.
         byte[] req = rawRequest(), resp = rawResponse();
         byte[] reqBefore = req.clone(), respBefore = resp.clone();
-        Observed o = new Recorder(new Redactor())
+        Observed o = (Observed) new Recorder(new Redactor())
                 .record("GET", "http://app.example.test/x", 200, 1L,
                         req, resp, Source.CRAWLER);
         check("the raw request is unmodified", Arrays.equals(req, reqBefore));
@@ -203,7 +225,7 @@ public class RecorderTest {
         // walk. Both must come back byte-identical.
         byte[] req = bytes("GET /public/x HTTP/1.1\r\nHost: app.test\r\n\r\n");
         byte[] resp = bytes("HTTP/1.1 204 No Content\r\nServer: nginx\r\n\r\n");
-        Observed o = new Recorder(new Redactor())
+        Observed o = (Observed) new Recorder(new Redactor())
                 .record("GET", "http://app.test/public/x", 204, 3L,
                         req, resp, Source.OPERATOR);
         check("the request came back byte-identical", Arrays.equals(req, o.request()));
@@ -213,16 +235,206 @@ public class RecorderTest {
     static void aRangeErrorIsNotSwallowed() {
         // Recorder has no counter, so it must not invent a fallback: a
         // fallback here is an UNREDACTED record. The caller counts the loss.
-        boolean threw = false;
+        //
+        // BOTH HALVES, and the second case is the one that was missing. This
+        // method drove the REQUEST half only, so `redactObservedRequest` threw
+        // before `redactResponse` was ever reached -- and adding exactly the
+        // fallback Recorder's javadoc forswears, on the response half,
+        // measured 13 summary lines / 1900 ok / 0 FAIL / rc=0. A swallowed
+        // RangeError there is a silent S7 leak: the head could not be walked,
+        // so the Set-Cookie goes to the content-addressed store verbatim.
+        check("a null REQUEST half is a RangeError out of record(), not a record",
+              throwsRangeError(null, rawResponse()));
+        check("and a null RESPONSE half is too, which is the half a fallback "
+              + "would silently keep raw",
+              throwsRangeError(rawRequest(), null));
+    }
+
+    static boolean throwsRangeError(byte[] req, byte[] resp) {
         try {
             new Recorder(new Redactor())
                     .record("GET", "http://app.test/x", 200, 1L,
-                            null, rawResponse(), Source.OPERATOR);
+                            req, resp, Source.OPERATOR);
+            return false;
         } catch (Redactor.RangeError expected) {
-            threw = true;
+            return true;
         }
-        check("a null half is a RangeError out of record(), not a record",
-              threw);
+    }
+
+    /**
+     * ONE FIXTURE PINS BEHAVIOUR ON ONE INPUT, and that is where the hole went
+     * next. Measured, with everything else in this class green:
+     *
+     *     byte[] response = rawResponse.length > 4096
+     *             ? rawResponse
+     *             : redactor.redactResponse(rawResponse);
+     *
+     *     13 summary lines / 1900 ok / 0 FAIL / rc=0
+     *
+     * Every real HTML or JSON response -- i.e. essentially all of them -- then
+     * goes into the content-addressed store with its `Set-Cookie` intact,
+     * while the ~150-byte fixture above never fires the predicate. Nothing
+     * structural sees it either: the call is present, its result is used, and
+     * the right function meets the right message.
+     *
+     * The progression this task has walked is ORDER, then DATAFLOW, then
+     * APPLICATION, now CONDITION -- and condition is the one example-based
+     * testing is structurally weak against. So the fixtures vary in the
+     * dimensions a plausible predicate would branch on: SIZE (one body well
+     * over any threshold anyone would type), PRESENCE of a body at all, a
+     * CHUNKED framing, a HEAD-style response with no body, and a BINARY body
+     * whose bytes are not valid ASCII.
+     *
+     * WHAT THIS DOES NOT CLOSE, and it cannot be closed by adding fixtures: a
+     * predicate over a property NONE of these vary -- a header count, a
+     * content-type test, a `startsWith`, the day of the week -- still passes.
+     * There is no fixture set that makes a conditional bypass impossible; what
+     * there is, is a fixture set that makes the plausible ones fire. Do not
+     * read this method as "no bypass is possible".
+     */
+    static void everyShapeOfMessageIsRedacted() {
+        // 64 KB, comfortably past any threshold a bypass would be written with
+        // -- 4096 and 8192 are the numbers people reach for.
+        byte[] big = filler(64 * 1024);
+        byte[] binary = new byte[512];
+        for (int i = 0; i < binary.length; i++) binary[i] = (byte) i;   // 0x00-0xFF, not UTF-8
+
+        List<Object[]> shapes = new ArrayList<>();
+        shapes.add(new Object[]{"a small body both ways",
+                message(requestHead("POST", "13"), bytes("name=value&x=1")),
+                message(responseHead("200 OK", "Content-Length: 13\r\n"),
+                        bytes("<html></html>"))});
+        shapes.add(new Object[]{"a 64 KB body both ways",
+                message(requestHead("POST", String.valueOf(big.length)), big),
+                message(responseHead("200 OK", "Content-Length: " + big.length + "\r\n"), big)});
+        shapes.add(new Object[]{"no body on either side",
+                message(requestHead("GET", null), new byte[0]),
+                message(responseHead("204 No Content", ""), new byte[0])});
+        shapes.add(new Object[]{"a HEAD-style response, headers promising a body that is absent",
+                message(requestHead("HEAD", null), new byte[0]),
+                message(responseHead("200 OK", "Content-Length: 4096\r\n"), new byte[0])});
+        shapes.add(new Object[]{"chunked framing on both halves",
+                message(requestHead("POST", null) , bytes("5\r\nhello\r\n0\r\n\r\n")),
+                message(responseHead("200 OK", "Transfer-Encoding: chunked\r\n"),
+                        bytes("4\r\nbody\r\n0\r\n\r\n"))});
+        shapes.add(new Object[]{"a binary body that is not valid ASCII",
+                message(requestHead("POST", String.valueOf(binary.length)), binary),
+                message(responseHead("200 OK", "Content-Type: application/octet-stream\r\n"),
+                        binary)});
+
+        for (Object[] shape : shapes) {
+            String name = (String) shape[0];
+            byte[] req = (byte[]) shape[1], resp = (byte[]) shape[2];
+            Observed o = (Observed) new Recorder(new Redactor())
+                    .record("POST", "http://app.example.test/x", 200, 7L,
+                            req, resp, Source.OPERATOR);
+            // Searched over BYTES, not over a String: a binary body is not
+            // valid UTF-8, and decoding it would replace the very bytes a
+            // leak might hide in.
+            check(name + ": the request's cookie is gone",
+                  !holds(o.request(), REQ_COOKIE));
+            check(name + ": the request's bearer token is gone",
+                  !holds(o.request(), REQ_BEARER));
+            check(name + ": the response's Set-Cookie value is gone",
+                  !holds(o.response(), RESP_COOKIE));
+            check(name + ": and the redaction really ran, both halves",
+                  holds(o.request(), "{{observed:cookie}}")
+                  && holds(o.response(), "{{observed:set-cookie}}"));
+            // ...and the evidence survives. A "redactor" that emptied the
+            // message would pass every check above.
+            check(name + ": the body is byte-identical",
+                  Arrays.equals(body(req), body(o.request()))
+                  && Arrays.equals(body(resp), body(o.response())));
+        }
+    }
+
+    /**
+     * The bound that a needle could not give: {@link Observed} and
+     * {@link Denied} are PACKAGE-PRIVATE, so no code outside {@code hx.proxy}
+     * can name either type by ANY spelling -- `new Observed(`,
+     * `new hx.proxy.Observed(`, `Observed::new`, a factory, a lambda.
+     *
+     * READ OFF THE COMPILED CLASS, deliberately. Three text needles in
+     * ChokepointTest were each defeated by a spelling they did not anticipate;
+     * this reads the modifiers `javac` actually emitted and cannot be fooled by
+     * how a construction is written. Restoring `public` to either record is
+     * the separating mutation.
+     *
+     * {@link Captured} STAYS PUBLIC, and that is load-bearing rather than
+     * incidental: {@code Capture.offer(Captured)} is called from
+     * {@code hx.HxExtension}, so the interface must be nameable there while
+     * its two implementations are not. A public sealed interface permitting
+     * package-private records is legal, and this asserts the arrangement
+     * rather than assuming it.
+     */
+    static void theCompilerBoundsConstruction() {
+        check("Observed is not public (" + Modifier.toString(
+                      Observed.class.getModifiers()) + ")",
+              !Modifier.isPublic(Observed.class.getModifiers()));
+        check("Denied is not public (" + Modifier.toString(
+                      Denied.class.getModifiers()) + ")",
+              !Modifier.isPublic(Denied.class.getModifiers()));
+        check("...while Captured IS public, so the entry point can still name "
+              + "what it hands to Capture.offer",
+              Modifier.isPublic(Captured.class.getModifiers()));
+        check("and Captured is sealed, so a third kind of record is a compile "
+              + "error rather than an arm nothing reaches",
+              Captured.class.isSealed());
+    }
+
+    // ---- shape helpers ---------------------------------------------------
+
+    static byte[] filler(int n) {
+        byte[] b = new byte[n];
+        Arrays.fill(b, (byte) 'x');
+        return b;
+    }
+
+    /** A request head carrying both credentials, plus an optional
+     *  Content-Length. `method` and the length are what the shapes vary. */
+    static String requestHead(String method, String contentLength) {
+        return method + " /account/settings HTTP/1.1\r\n"
+             + "Host: app.example.test\r\n"
+             + "Cookie: JSESSIONID=" + REQ_COOKIE + "\r\n"
+             + "Authorization: Bearer " + REQ_BEARER + "\r\n"
+             + (contentLength == null ? "" : "Content-Length: " + contentLength + "\r\n");
+    }
+
+    /** A response head carrying the third credential. */
+    static String responseHead(String status, String extra) {
+        return "HTTP/1.1 " + status + "\r\n"
+             + "Set-Cookie: JSESSIONID=" + RESP_COOKIE + "; Path=/; HttpOnly\r\n"
+             + extra;
+    }
+
+    static byte[] message(String head, byte[] body) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.writeBytes(bytes(head + "\r\n"));
+        out.writeBytes(body);
+        return out.toByteArray();
+    }
+
+    /** Everything after the first blank line, as bytes. */
+    static byte[] body(byte[] message) {
+        for (int i = 0; i + 3 < message.length; i++)
+            if (message[i] == '\r' && message[i + 1] == '\n'
+                    && message[i + 2] == '\r' && message[i + 3] == '\n')
+                return Arrays.copyOfRange(message, i + 4, message.length);
+        return new byte[0];
+    }
+
+    /** Byte-wise substring search, so a binary body is searched as bytes
+     *  rather than decoded into a String that would replace the bytes a leak
+     *  could hide in. */
+    static boolean holds(byte[] hay, String needle) {
+        byte[] n = bytes(needle);
+        outer:
+        for (int i = 0; i + n.length <= hay.length; i++) {
+            for (int k = 0; k < n.length; k++)
+                if (hay[i + k] != n[k]) continue outer;
+            return true;
+        }
+        return false;
     }
 
     /** The first line naming `needle`, for a check's own message: a FAIL that
