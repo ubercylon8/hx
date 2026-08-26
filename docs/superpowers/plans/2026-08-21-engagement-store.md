@@ -2704,6 +2704,7 @@ from click.testing import CliRunner
 from hx import cli
 from hx import engagement as eng_mod
 from hx import run as run_mod
+from hx.store import records as records_mod
 
 
 def test_new_creates_engagement(tmp_path: Path):
@@ -3137,6 +3138,134 @@ def test_capture_start_is_idempotent(engagement):
         assert running == 1
     finally:
         eng.db.close()
+
+
+# --- Fix round 1: four requirements the brief named, correctly implemented,
+# pinned by no test until now. ---
+
+
+def test_capture_stop_writes_completed_status_and_operator_reason(engagement):
+    """F1: the brief is explicit -- 'the close is status=\'completed\',
+    stop_reason=\'operator\''. `status != 'running'` (the existing
+    assertion in test_capture_stop_closes_every_live_run) is satisfied by
+    `aborted`, `killed` or `error` too, and those mean the harness or the
+    auto-halt ended the run, not an operator. Assert against the STORE."""
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    eng = eng_mod.open_(engagement)
+    try:
+        row = eng.db.execute(
+            "SELECT status, stop_reason FROM run WHERE kind='browse'"
+        ).fetchone()
+        assert row["status"] == "completed"
+        assert row["stop_reason"] == "operator"
+    finally:
+        eng.db.close()
+
+
+def test_capture_stop_with_kind_only_closes_that_kind(engagement):
+    """F2: the mirror of test_capture_stop_closes_every_live_run. Two kinds
+    live at once, `stop --kind crawl` must close only the crawl run and
+    leave the browse run untouched -- `hx capture stop --kind crawl`
+    closing a browse run must be visible to something."""
+    for kind in ("browse", "crawl"):
+        CliRunner().invoke(cli.main,
+            ["capture", "start", "--kind", kind, "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main,
+        ["capture", "stop", "--kind", "crawl", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    eng = eng_mod.open_(engagement)
+    try:
+        browse_status = eng.db.execute(
+            "SELECT status FROM run WHERE kind='browse'").fetchone()["status"]
+        crawl_status = eng.db.execute(
+            "SELECT status FROM run WHERE kind='crawl'").fetchone()["status"]
+        assert browse_status == "running"
+        assert crawl_status == "completed"
+    finally:
+        eng.db.close()
+
+
+@pytest.fixture
+def engagement_with_drops_on_two_runs(engagement: Path) -> Path:
+    """Two DIFFERENT runs, each with its own nonzero drop count, so the
+    printed total can be told apart from a single run's count, a MAX, or a
+    last-value written -- none of which `engagement_with_drops` (one run)
+    can separate from a correct SUM."""
+    eng = eng_mod.open_(engagement)
+    try:
+        r1 = run_mod.open_run(
+            eng.db, engagement_id=eng.id, kind="browse",
+            safety_profile=eng.config.safety_profile)
+        run_mod.count_drop(eng.db, run_id=r1, n=4)
+        r2 = run_mod.open_run(
+            eng.db, engagement_id=eng.id, kind="crawl",
+            safety_profile=eng.config.safety_profile)
+        run_mod.count_drop(eng.db, run_id=r2, n=7)
+    finally:
+        eng.db.close()
+    return engagement
+
+
+def test_info_floor_count_sums_drops_across_every_run(engagement_with_drops_on_two_runs):
+    """F3: Q1 in the review asks exactly this -- is the printed total a SUM
+    across runs, or could it be one run's count? `engagement_with_drops`
+    only ever makes one run, so it cannot tell a sum (11) from a max (7) or
+    a last-value (whichever ran last). This fixture makes two, 4 and 7, and
+    the only correct total is their sum, 11."""
+    result = CliRunner().invoke(
+        cli.main, ["info", "--root", str(engagement_with_drops_on_two_runs)])
+    assert result.exit_code == 0, result.output
+    assert "floor" in result.output.lower()
+    assert "11 dropped" in result.output
+
+
+def test_info_breakdown_lines_report_their_own_table(engagement):
+    """F4: each of the three breakdown lines must carry ITS OWN table's
+    counts under its own heading. A row is planted in each of surface,
+    exchange and denial with a value unique to that table (no vocabulary
+    overlaps another table's), so a swapped table argument -- e.g. printing
+    denial counts under 'surfaces' -- is caught by checking each heading's
+    OWN line, not by a bare substring search of the whole page (which would
+    pass even with the values filed under the wrong heading)."""
+    eng = eng_mod.open_(engagement)
+    try:
+        eng.db.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+            " port, path_template, kind, discovered_by, normaliser_version)"
+            " VALUES('s1', ?, 'GET', 'https', 'app.acme.com', 443,"
+            " '/api/widgets', 'state_changing', 'proxy', 1)",
+            (eng.id,))
+        records_mod.record_exchange(
+            eng.db, run_id=None, method="GET", url="https://app.acme.com/x",
+            status=None, req_blob=None, resp_blob=None, ms=0,
+            at_us=eng_mod.now_us(), outcome="timeout")
+        records_mod.record_denial(
+            eng.db, run_id=None, kind="rate", method="GET",
+            url="https://app.acme.com/y", detail="over budget",
+            at_us=eng_mod.now_us())
+    finally:
+        eng.db.close()
+
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    surfaces_line = next(ln for ln in lines if ln.strip().startswith("surfaces"))
+    exchanges_line = next(ln for ln in lines if ln.strip().startswith("exchanges"))
+    denials_line = next(ln for ln in lines if ln.strip().startswith("denials"))
+
+    assert "state_changing=1" in surfaces_line
+    assert "rate=1" not in surfaces_line
+    assert "timeout=1" not in surfaces_line
+
+    assert "timeout=1" in exchanges_line
+    assert "state_changing=1" not in exchanges_line
+    assert "rate=1" not in exchanges_line
+
+    assert "rate=1" in denials_line
+    assert "state_changing=1" not in denials_line
+    assert "timeout=1" not in denials_line
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
