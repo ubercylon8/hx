@@ -26,6 +26,7 @@ CLASSES=(
     hx.proxy.ProxyGateTest
     hx.proxy.CaptureTest
     hx.proxy.PendingTest
+    hx.proxy.RecorderTest
     hx.ChokepointTest
 )
 

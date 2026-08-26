@@ -25,9 +25,9 @@ import hx.policy.HxRequest;
 import hx.policy.Policy;
 import hx.proxy.Capture;
 import hx.proxy.Denied;
-import hx.proxy.Observed;
 import hx.proxy.Pending;
 import hx.proxy.ProxyGate;
+import hx.proxy.Recorder;
 import hx.proxy.Source;
 import hx.send.HaltSwitch;
 import hx.send.Http;
@@ -257,6 +257,12 @@ public class HxExtension implements BurpExtension {
         int crawlerPort = Integer.getInteger("hx.crawler_port", 0);
         ProxyGate gate = new ProxyGate(policy);   // THE SAME Policy -- see above
         Capture capture = new Capture(Capture.DEFAULT_CAPACITY, c.exchangeSink());
+        // The SAME Redactor the send path uses. It holds no per-request state
+        // -- Redactor.Injected exists so that the state which IS per-request
+        // travels with the bytes -- so one instance is right, and a second
+        // would be a second set of redaction rules with nothing comparing
+        // them.
+        Recorder recorder = new Recorder(redactor);
         // ONE number for both bounds, so there is one figure to reason about
         // rather than two. It is NOT a claim that the two overflow together:
         // they count different things -- the queue holds records waiting for
@@ -477,37 +483,40 @@ public class HxExtension implements BurpExtension {
                     return ProxyResponseReceivedAction.continueWith(r);
                 }
                 try {
-                    // REDACTION FIRST, and before anything is queued. S7 makes
-                    // the blob store content-addressed, so a credential that
-                    // reaches the hashing step on the Python side is already
-                    // unrecoverable -- and Observed's own javadoc says its byte
-                    // arrays are post-redaction, which makes an Observed
-                    // holding raw bytes a live credential sitting in a queue.
-                    byte[] reqBytes = r.initiatingRequest().toByteArray().getBytes();
-                    // redactObservedRequest, NOT redactRequest, and the
-                    // difference is the whole of §7 on this path. redactRequest
-                    // replaces byte ranges THIS EXTENSION INJECTED; the proxy
-                    // path injects nothing, so the Injected it would be handed
-                    // is empty, and an empty one makes redactRequest a
-                    // `return raw.clone()` -- the operator's live Cookie and
-                    // Authorization headers content-addressed into the blob
-                    // store verbatim. That was the shipped state for one
-                    // commit. Job 4 matches header NAMES, which is all there
-                    // is for traffic hx watched rather than composed.
-                    byte[] redactedReq = redactor.redactObservedRequest(reqBytes);
-                    byte[] redactedResp = redactor.redactResponse(
-                            r.toByteArray().getBytes());
+                    // THE ONLY THING THIS BLOCK DOES IS READ BYTES OFF MONTOYA
+                    // AND HAND THEM OVER. Redaction, the pairing of each
+                    // redactor to its own message, and the construction of the
+                    // Observed all live in Recorder -- a class with no burp.*
+                    // type in it, which is what makes them drivable. This
+                    // wiring was in here and the same defect was found three
+                    // times: the wrong redactor for the request half, the raw
+                    // locals queued instead of the redacted ones, and the two
+                    // redactors swapped. Each was invisible to the structural
+                    // check written for the one before it, because every one
+                    // of those checks reads the TEXT of a file the suite
+                    // cannot execute. See Recorder's javadoc.
+                    byte[] rawRequest = r.initiatingRequest().toByteArray().getBytes();
+                    byte[] rawResponse = r.toByteArray().getBytes();
                     long ms = (System.nanoTime() - e.startNanos()) / 1_000_000L;
-                    capture.offer(new Observed(r.initiatingRequest().method(),
-                                               r.initiatingRequest().url(),
-                                               r.statusCode(), ms,
-                                               redactedReq, redactedResp,
-                                               e.source()));
+                    // WHICH ARRAY IS WHICH IS THE ONE THING LEFT THAT ONLY THE
+                    // TEXT CAN SAY: both are byte[], so a swap here compiles
+                    // and means the request slot carries the response. That is
+                    // the last survivor of a defect found three times, and it
+                    // is pinned in ChokepointTest -- the two bindings by what
+                    // each names, and their order in this call. Everything
+                    // past this line is RecorderTest's.
+                    capture.offer(recorder.record(r.initiatingRequest().method(),
+                                                  r.initiatingRequest().url(),
+                                                  r.statusCode(), ms,
+                                                  rawRequest, rawResponse,
+                                                  e.source()));
                 } catch (RuntimeException ex) {
                     // Redaction that could not finish, or bytes Montoya would
                     // not hand over. The record is lost either way and says so
                     // -- offering it unredacted is the one answer that is
-                    // worse than losing it.
+                    // worse than losing it. Recorder deliberately does not
+                    // catch its own RangeError: it has no counter, and a
+                    // fallback there would be an unredacted record.
                     capture.countLost(e.source());
                 }
                 return ProxyResponseReceivedAction.continueWith(r);

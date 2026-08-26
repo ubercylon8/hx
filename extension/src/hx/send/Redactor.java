@@ -374,6 +374,21 @@ public final class Redactor {
      * rewriting it would corrupt the evidence a check reads. The head ends at
      * the first empty line.
      *
+     * "EVERY HEAD LINE IS MATCHED AS A FIELD" IS TRUE OF LF-TERMINATED LINES
+     * AND OF NOTHING ELSE. {@link #lineStartAfter} scans for {@code \n}, so a
+     * message using BARE CR as its terminator is one line to this scan, has no
+     * name before its first colon that matches, and is copied through
+     * verbatim. That is a passthrough of a credential, and it is left as one
+     * deliberately: RFC 9112 2.2 requires CRLF and permits a bare LF, and
+     * nothing permits a bare CR -- a server would not parse such a message as
+     * HTTP either, so nothing on the wire reaches this shape. It is named here
+     * because the sentence above would otherwise be a claim wider than the
+     * code, not because a bare-CR parser is wanted. The other four verbatim
+     * passthroughs a review found are the same kind and are named where they
+     * arise: a NUL inside a field name, a fold following a NON-credential
+     * header (per RFC that text is the other header's value), a field name
+     * split across a fold, and a pipelined second request.
+     *
      * NO REQUEST LINE IS RECOGNISED, and that is deliberate rather than an
      * omission. {@link #redactResponse} has to know its status line, because
      * taking the first non-empty line for one whatever it says would let a

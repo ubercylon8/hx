@@ -1089,7 +1089,7 @@ public class RedactorTest {
         check("redactRequest with an empty Injected returns the credential "
               + "VERBATIM -- it is not a redaction of observed traffic",
               viaInjected.contains(COOKIE_SECRET));
-        check("...while job 4 removes it", 
+        check("...while job 4 removes it",
               !text(r.redactObservedRequest(raw)).contains(COOKIE_SECRET));
     }
 
