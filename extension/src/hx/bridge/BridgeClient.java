@@ -714,8 +714,14 @@ public final class BridgeClient {
      * the key.
      *
      * FALSIFIABLE rather than asserted: ChokepointTest's
-     * `theBridgeNamesNothingInTheProxyPackage` counts the needle across every
-     * file in this package and requires zero, comments included.
+     * `theBridgeNamesNothingInTheProxyPackage` counts the needle in every
+     * SHIPPED file of this package and requires zero, comments included.
+     * WHAT IT DOES NOT COVER is this package's tests: `ChokepointTest.sources()`
+     * walks `extension/src` only, and `extension/test` names the other package
+     * freely -- BridgeClientTest does, at the point where it builds a record
+     * to hand this sink. That is the right boundary rather than an oversight:
+     * a test is not compiled into the jar, so it cannot reintroduce the cycle
+     * the guard exists to keep out of it.
      *
      * BOTH METHODS ANSWER WHETHER THE RECORD REACHED THE WIRE, and neither
      * raises. Not raising is the same rule as "offering never blocks", one

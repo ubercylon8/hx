@@ -31,53 +31,27 @@ public final class TestSupport {
     public interface Reporter { void check(String what, boolean ok); }
 
     /**
-     * Run one test method so that a throw out of it is a NAMED FAILURE rather
-     * than the end of the run.
-     *
-     * Without this, any throw -- an NPE on a null a sabotage introduced, an
-     * IOException from a socket -- propagates out of {@code main()}: the
-     * methods after it never run, {@code failures} is never printed, and there
-     * is NO summary line at all. The exit code is still 1, so CI notices, but
-     * every count taken from that run is a count of how far the runner got.
-     * Measured on Policy.java: of 23 compiling single-guard mutants, 13 print
-     * zero FAIL lines, so the summary line is the only thing separating a real
-     * green from a truncation -- and under {@code ./test.sh | grep -c FAIL},
-     * the idiom this project's briefs prescribe, a truncation reads as 0.
-     *
-     * A THROW IS ONLY THE FIRST WAY A CLASS PRINTS NO SUMMARY LINE. The second
-     * is a HANG, and this guard cannot catch it: a test method parked on an
-     * unbounded {@code join()} or {@code await()} never returns, so there is
-     * nothing to catch, the methods after it never run, and test.sh's
-     * {@code timeout 300} kills the class from outside. That run prints one
-     * FEWER summary line and still zero FAIL lines. MEASURED on this repo:
-     * making {@code Limiter.check} PARK instead of denying when rate-limited --
-     * a rate limiter that throttles rather than refuses, which is the §4
-     * violation the proxy layer above it exists to forbid -- wedged
-     * LimiterTest's unbounded {@code raceAgainst} join and produced 10 summary
-     * lines, 10 ALL PASS and 0 FAIL. The exit code was 1, because test.sh
-     * propagates {@code timeout}'s kill; it is the only thing that noticed.
-     * So: JUDGE A RUN BY ITS SUMMARY-LINE COUNT AND ITS EXIT CODE, and give
-     * every wait in a test a bound -- {@link #join} is the one for threads.
-     *
-     * Catching {@link Throwable} rather than {@link Exception} is deliberate:
-     * an {@link AssertionError} or a {@link StackOverflowError} out of a test
-     * method truncates a run exactly as an NPE does.
-     */
-    /**
      * The method currently running, so a HANG can name itself.
      *
-     * The docstring above says the exit code is the only thing that notices a
-     * hang. That is detection; this is diagnosis, and they are different
-     * problems. rc=1 tells you the suite lost a class. It does not tell you
-     * WHICH of that class's methods parked, and the output stops before the
-     * method that hung would have printed anything -- so the last line you see
-     * is the previous method's `ok`, which points at the wrong place.
+     * {@link #t}'s docstring below says the exit code is the only thing that
+     * notices a hang. That is DETECTION; this is DIAGNOSIS, and they are
+     * different problems. rc=1 tells you the suite lost a class. It does not
+     * tell you WHICH of that class's methods parked, and the output stops
+     * before the method that hung would have printed anything -- so the last
+     * line you see is the previous method's `ok`, which points at the wrong
+     * place.
      *
      * `timeout` sends SIGTERM, and the JVM runs shutdown hooks on SIGTERM. So
      * the hook below prints the name that was in flight. It costs one volatile
      * write per test method and prints NOTHING on a healthy run -- a diagnostic
      * that fires unconditionally is noise, and noise is what stops people
      * reading output at all.
+     *
+     * IT HAS ALREADY EARNED ITS PLACE. The sweep that bounded this repo's
+     * joins believed it had found every unbounded wait; this hook named the
+     * one it had missed, `KILLED WHILE RUNNING
+     * checkIsExclusiveWithItselfDeterministically`, on a monitor acquisition
+     * no join bound could ever have covered. See {@link #join}.
      */
     private static volatile String inFlight;
 
@@ -95,6 +69,63 @@ public final class TestSupport {
         }, "hx-inflight-reporter"));
     }
 
+    /**
+     * Run one test method so that a throw out of it is a NAMED FAILURE rather
+     * than the end of the run.
+     *
+     * Without this, any throw -- an NPE on a null a sabotage introduced, an
+     * IOException from a socket -- propagates out of {@code main()}: the
+     * methods after it never run, {@code failures} is never printed, and there
+     * is NO summary line at all. The exit code is still 1, so CI notices, but
+     * every count taken from that run is a count of how far the runner got.
+     * Measured on Policy.java: of 23 compiling single-guard mutants, 13 print
+     * zero FAIL lines, so the summary line is the only thing separating a real
+     * green from a truncation -- and under {@code ./test.sh | grep -c FAIL},
+     * the idiom this project's briefs prescribe, a truncation reads as 0.
+     *
+     * A THROW IS ONLY THE FIRST WAY A CLASS PRINTS NO SUMMARY LINE. The second
+     * is a HANG, and this guard cannot catch it: a test method parked on an
+     * unbounded {@code join()}, {@code await()} or {@code synchronized} call
+     * never returns, so there is nothing to catch, the methods after it never
+     * run, and test.sh's {@code timeout 300} kills the class from outside.
+     * That run prints one FEWER summary line and still zero FAIL lines. So:
+     * JUDGE A RUN BY ITS SUMMARY-LINE COUNT AND ITS EXIT CODE.
+     *
+     * WHAT THE BOUNDS DO CATCH, each mutation applied alone under
+     * {@code timeout 600 ./test.sh}, against a clean 11 summary lines / 0 FAIL
+     * / rc=0:
+     *
+     *   - a {@code Limiter.check} that PARKS a caller it made wait for its own
+     *     monitor instead of refusing it: {@link #join} fires by name -- "...
+     *     had not finished after 10000 ms, so it HUNG" -- giving 11 summary
+     *     lines with a named FAIL and rc=1 instead of a truncation. WHICH of
+     *     LimiterTest's two waits trips first depends on the mutation's own
+     *     timing and both were seen across two runs; the claim here is that
+     *     one of them does, not which;
+     *   - the race's own {@code go.countDown()} deleted, the shape that used
+     *     to hold the JVM open on a non-daemon worker: 11 summary lines,
+     *     2 FAIL, rc=1.
+     *
+     * WHAT THEY DO NOT CATCH, measured the same way and UNCHANGED by every
+     * bound in this file: a {@code Limiter.check} that SLEEPS instead of
+     * denying when rate-limited -- a rate limiter that THROTTLES rather than
+     * REFUSES, the §4 violation the proxy layer above it exists to forbid --
+     * gives 10 summary lines, 10 ALL PASS, 0 FAIL, rc=1. It parks in
+     * {@code theWindowIsExactAtItsBoundaries}, the FIRST of LimiterTest's
+     * fourteen methods and eleven before {@code raceAgainst} is reached, in a
+     * direct call that owns no helper thread and waits on nothing. There is no
+     * wait for {@link #join} to bound, and THE EXIT CODE IS THE ONLY THING
+     * THAT SEES IT -- with the shutdown hook above to say which method it was.
+     * A bound cannot be retrofitted onto a straight-line call from out here;
+     * only a watchdog running each body on its own bounded thread could, and
+     * with 24 methods in a class its per-method share of test.sh's 300 s is
+     * ~12 s, under {@code LimiterTest.RACE_DEADLINE_MS} alone. It would fire
+     * on healthy runs.
+     *
+     * Catching {@link Throwable} rather than {@link Exception} is deliberate:
+     * an {@link AssertionError} or a {@link StackOverflowError} out of a test
+     * method truncates a run exactly as an NPE does.
+     */
     public static void t(Reporter reporter, String name, Body body) {
         inFlight = name;
         try {
@@ -119,15 +150,34 @@ public final class TestSupport {
      *
      * The caller supplies the bound, because only the caller knows what the
      * thread is doing: a millisecond of non-blocking arithmetic and a socket
-     * round trip deserve different numbers. Both callers today pass 10 s
-     * against work their whole test class finishes in well under a second, so
-     * neither can fire on anything but a genuine hang -- and four of them in a
-     * row still sit inside test.sh's 300 s backstop.
+     * round trip deserve different numbers. Every bound passed today is 10 s
+     * or less, against work whose whole test class finishes in well under a
+     * second, so none can fire on anything but a genuine hang. And a class
+     * whose every bound fires still finishes inside test.sh's 300 s backstop:
+     * LimiterTest holds the most of them and its worst case is 8 workers x
+     * 10 s x 2 races, plus 5 s for the exclusivity helper -- 165 s.
      *
      * The thread is NOT interrupted on the deadline. Unparking it would let
      * the assertions after this call run against work the hang had quietly
      * finished, hiding the very thing being reported -- and a leaked DAEMON
      * costs nothing, which is why every caller here makes its helper one.
+     *
+     * THIS IS A BOUND FOR A THREAD AND THERE IS NONE FOR A MONITOR, which is
+     * where the sweep that introduced this method was wrong to call itself
+     * complete. A {@code synchronized} call whose lock is held by a thread
+     * that has parked cannot be bounded, interrupted or timed out from the
+     * outside at all -- {@code Object.wait} takes a timeout, ENTERING a
+     * monitor does not. Measured: with {@code Limiter.check} parking a caller
+     * it made wait for the monitor,
+     * {@code LimiterTest.checkIsExclusiveWithItselfDeterministically} printed
+     * its own FAIL line and then parked forever on {@code limiter.issued()},
+     * a {@code synchronized} accessor the parked helper was still holding --
+     * 10 summary lines and rc=1, the class truncated. The only bound for that
+     * shape is NOT MAKING THE CALL: throw out of the join first, so the line
+     * that would take the monitor is never reached. That is what the call site
+     * does now, and it is what an audit for unbounded waits has to look for
+     * alongside the joins -- a locked accessor after a helper that might not
+     * have released.
      */
     public static void join(Thread t, long ms, String what) throws Exception {
         t.join(ms);

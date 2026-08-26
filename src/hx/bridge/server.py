@@ -159,6 +159,16 @@ class BridgeServer:
         # `dropped` frame `_capture` hands back, because nothing outside
         # tests/ reads either of these and a run cannot get its floor from a
         # number no one looks at.
+        #
+        # `exchange_errors` COUNTS FAILED SINK CALLS, NOT RECORDS LOST, and the
+        # two stopped being the same number when `_count_as_dropped` arrived:
+        # ONE lost record whose `dropped` retry also raises counts TWO, the
+        # original call and the retry. That is the right number for a
+        # diagnostic -- it is how many times the sink misbehaved, which is what
+        # someone debugging the sink wants -- and the wrong one for coverage,
+        # which is exactly why coverage does not come from here.
+        # `run.dropped_total`, fed by the `dropped` frame, is the count of
+        # RECORDS.
         self.exchange_callback_error: BaseException | None = None
         self.exchange_errors = 0
 

@@ -4607,6 +4607,16 @@ class BridgeServer:
         # `dropped` frame `_capture` hands back, because nothing outside
         # tests/ reads either of these and a run cannot get its floor from a
         # number no one looks at.
+        #
+        # `exchange_errors` COUNTS FAILED SINK CALLS, NOT RECORDS LOST, and the
+        # two stopped being the same number when `_count_as_dropped` arrived:
+        # ONE lost record whose `dropped` retry also raises counts TWO, the
+        # original call and the retry. That is the right number for a
+        # diagnostic -- it is how many times the sink misbehaved, which is what
+        # someone debugging the sink wants -- and the wrong one for coverage,
+        # which is exactly why coverage does not come from here.
+        # `run.dropped_total`, fed by the `dropped` frame, is the count of
+        # RECORDS.
         self.exchange_callback_error: BaseException | None = None
         self.exchange_errors = 0
 
@@ -7776,8 +7786,14 @@ public final class BridgeClient {
      * the key.
      *
      * FALSIFIABLE rather than asserted: ChokepointTest's
-     * `theBridgeNamesNothingInTheProxyPackage` counts the needle across every
-     * file in this package and requires zero, comments included.
+     * `theBridgeNamesNothingInTheProxyPackage` counts the needle in every
+     * SHIPPED file of this package and requires zero, comments included.
+     * WHAT IT DOES NOT COVER is this package's tests: `ChokepointTest.sources()`
+     * walks `extension/src` only, and `extension/test` names the other package
+     * freely -- BridgeClientTest does, at the point where it builds a record
+     * to hand this sink. That is the right boundary rather than an oversight:
+     * a test is not compiled into the jar, so it cannot reintroduce the cycle
+     * the guard exists to keep out of it.
      *
      * BOTH METHODS ANSWER WHETHER THE RECORD REACHED THE WIRE, and neither
      * raises. Not raising is the same rule as "offering never blocks", one
