@@ -29,6 +29,14 @@ Neither writer opens a transaction. Each is a single INSERT (or a single
 UPDATE), which is atomic on its own under `db.connect`'s autocommit
 connection; a caller writing an exchange row and its blobs together should
 wrap the pair in `db.transaction` itself.
+
+BOTH WRITERS REDACT THE URL THEY ARE GIVEN. §7 keeps credentials out of the
+store, and until 2026-08-26 its whole mechanism was header names and injected
+byte ranges inside the JVM -- so a credential in the request TARGET
+(`http://user:pass@host/`) reached `exchange.url` and `denial.url` untouched.
+`redact_url` is that boundary, and it is at the WRITER rather than at
+`hx.capture` so that it covers the callers this plan has not written yet. See
+its docstring for the rule, and for the half of the finding it does not close.
 """
 from __future__ import annotations
 
@@ -71,6 +79,82 @@ DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 # form a consumer can test for. `BridgeClient.EXTENSION_FAULT` is the same
 # string on the Java side, and a test pins the pair.
 EXTENSION_FAULT = "extension fault: "
+
+# What `redact_url` writes over a request target's userinfo.
+#
+# THE SAME STRING `Redactor.OBSERVED_USERINFO` writes into the BLOB, byte for
+# byte, and `tests/test_credentials_never_reach_the_store.py` reads it out of
+# the .java file and compares. §7's placeholders are a wire-visible vocabulary:
+# a `url` column saying one thing and the request blob beside it saying another
+# is two spellings of one fact, and a report that joins them shows two.
+#
+# A `str`, not a container, so the module-level vocabulary scan in
+# `tests/test_vocabularies_match_the_schema.py` does not see it -- and it has
+# no schema CHECK to be paired against either, because no column enumerates it.
+# It is pinned against the Java constant instead, which is the copy that can
+# actually drift.
+OBSERVED_USERINFO = "{{observed:userinfo}}"
+
+
+def redact_url(url: str) -> str:
+    """A url with the userinfo of its authority replaced. §7.
+
+    THE COLUMN HALF OF THE SAME FINDING THE EXTENSION'S JOB 5 CLOSES IN THE
+    BLOB. `http://user:pass@app.test/` reached `exchange.url` and `denial.url`
+    verbatim. A column is deletable where a content-addressed blob is not, so
+    this is the lesser half -- but two halves of one request redacted by two
+    different rules is how a report ends up quoting the credential out of the
+    column beside the blob that does not have it.
+
+    THE RULE IS RFC 3986 AND NOTHING ELSE. 3.2: the authority follows `//` and
+    ends at the next `/`, `?` or `#`, or at the end. 3.2.1:
+    `authority = [ userinfo "@" ] host [ ":" port ]`. 2.2: `@` is a gen-delim,
+    and neither a host nor a port may contain one. So an `@` inside an
+    authority IS the userinfo delimiter; nothing here guesses whether what
+    precedes it looks like a secret, because the RFC has already said that is
+    where one goes.
+
+    `urlsplit` is deliberately NOT used. It would parse and this would then
+    have to re-assemble, and `urlunsplit` normalises -- it drops an empty
+    query's `?`, and re-joins a fragment this store has no reason to move.
+    `exchange.url` is EVIDENCE: the only edit it may carry is the one this
+    function is for. So the rule is applied to the string in place, which also
+    makes it the same rule the Java side applies to a request line, character
+    for character. They are compared over one shared vector file.
+
+    THE LAST `@` IN THE AUTHORITY, matching `urlsplit`'s own `rpartition('@')`
+    and the WHATWG URL parser. A conforming userinfo pct-encodes its own `@`,
+    so the two rules differ only on a malformed authority carrying two -- and
+    taking the first would leave the bytes between them verbatim.
+
+    WHAT IT DOES NOT TOUCH, named here because §7's mechanisms are only worth
+    what their exclusions are:
+
+      - A CREDENTIAL IN A QUERY PARAMETER. `?access_token=`, `?api_key=`,
+        `?sig=`. Reaching those needs a list of parameter names -- a
+        vocabulary that drifts silently toward storing a credential -- or a
+        rule that redacts by shape, which rewrites `?id=5` and corrupts the
+        evidence an access-control check reads. Neither is taken here, and
+        the leak is pinned as a leak by a test rather than left unstated.
+      - An `@` in the PATH, the QUERY or the FRAGMENT. RFC 3986 3.3 allows one
+        there and `/users/alice@example.test` is a real path segment.
+      - A url with no `://` at all. There is no authority to find.
+    """
+    scheme = url.find("://")
+    if scheme < 0:
+        return url
+    start = scheme + 3
+    end = start
+    # The authority's own terminators, plus the whitespace that ends a request
+    # target inside a request line. The whitespace half is redundant for a url
+    # column and is here so that this rule and the extension's are ONE rule:
+    # a difference the shared vectors cannot reach is still a difference.
+    while end < len(url) and url[end] not in "/?# \t\r\n":
+        end += 1
+    at = url.rfind("@", start, end)
+    if at < 0:
+        return url
+    return url[:start] + OBSERVED_USERINFO + url[at:]
 
 # Error class (spec S6) -> the `outcome` the exchange table accepts WHEN THE
 # REQUEST WAS ISSUED. Two of the four entries are never issued; the other two
@@ -361,6 +445,11 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
             "records.DENIAL_KIND, and see records.UNRECORDABLE for the "
             "classes that have no row to go in yet."
         )
+    # AT THE WRITER, not at the caller, and for `count_drop`'s reason: this is
+    # where a url becomes a row, so it covers the callers that do not exist
+    # yet. `hx.capture` is the only one today and it hands the raw frame value
+    # straight through.
+    url = redact_url(url)
     row_id = new_id("d")
     conn.execute(
         "INSERT INTO denial(id, run_id, ts_us, kind, method, url, resolved_ip,"
@@ -450,6 +539,10 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
             "is not a fact about anything, and a check reads it later without "
             "the frame it came from."
         )
+    # §7, the same call `record_denial` makes and for the same reason: the two
+    # url columns are one exposure and a rule applied to one of them is a rule
+    # the other drifts away from.
+    url = redact_url(url)
     row_id = new_id("x")
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"

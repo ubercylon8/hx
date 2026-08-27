@@ -93,6 +93,20 @@ public class RedactorTest {
           RedactorTest::anAbsoluteFormRequestLineIsNotMatchedAsAField);
         t("redactObservedRequestRefusesNullBytes",
           RedactorTest::redactObservedRequestRefusesNullBytes);
+        t("theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem",
+          RedactorTest::theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem);
+        t("aUserinfoCredentialNeverReachesTheBlobStore",
+          RedactorTest::aUserinfoCredentialNeverReachesTheBlobStore);
+        t("twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob);
+        t("onlyTheFirstHeadLineIsATarget",
+          RedactorTest::onlyTheFirstHeadLineIsATarget);
+        t("aCredentialFirstLineIsStillRedactedAsAField",
+          RedactorTest::aCredentialFirstLineIsStillRedactedAsAField);
+        t("theRequestBodyIsNeverRewrittenByJobFive",
+          RedactorTest::theRequestBodyIsNeverRewrittenByJobFive);
+        t("aCredentialInTheQUERYIsNamedAsNotCovered",
+          RedactorTest::aCredentialInTheQueryIsNamedAsNotCovered);
         t("theEmptyInjectedPathIsWhyJobFourExists",
           RedactorTest::theEmptyInjectedPathIsWhyJobFourExists);
 
@@ -1073,6 +1087,168 @@ public class RedactorTest {
         // thread and the send path's catch-all alike.
         expectThrows("null bytes are a RangeError", Redactor.RangeError.class,
                      () -> r.redactObservedRequest(null));
+    }
+
+    // ---- job 5: the request TARGET ---------------------------------------
+
+    static final String USERINFO_VECTORS = "userinfo.txt";
+
+    /** The shared vector file, as (input, expected) pairs. Same file the
+     *  Python side reads; see its header for the format and for why one file
+     *  rather than two lists. */
+    static List<String[]> userinfoVectors() throws Exception {
+        java.nio.file.Path p = java.nio.file.Path.of(
+                "..", "tests", "vectors", USERINFO_VECTORS);
+        List<String[]> out = new ArrayList<>();
+        for (String line : java.nio.file.Files.readAllLines(
+                p, StandardCharsets.UTF_8)) {
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            int tab = line.indexOf('\t');
+            if (tab < 0)
+                throw new IllegalArgumentException(
+                        "vector line with no tab: " + line);
+            out.add(new String[] { line.substring(0, tab), line.substring(tab + 1) });
+        }
+        return out;
+    }
+
+    /**
+     * THE ONE PLACE THE TWO IMPLEMENTATIONS ARE COMPARED. `redactObservedRequest`
+     * here and `hx.store.records.redact_url` there are the same RFC 3986 rule
+     * written twice, in two languages, on two sides of a bridge -- which is
+     * exactly the shape `tests/test_vocabularies_match_the_schema.py` exists
+     * to refuse. Neither side restates the cases; both read this file.
+     */
+    static void theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem()
+            throws Exception {
+        Redactor r = new Redactor();
+        List<String[]> vectors = userinfoVectors();
+        // Anti-vacuity. A reader that found no file, or a format change that
+        // made every line a comment, would leave the loop below asserting
+        // nothing at all and printing ALL PASS.
+        check("the shared vector file was read (" + vectors.size() + " cases)",
+              vectors.size() >= 20);
+        boolean sawARedaction = false;
+        for (String[] v : vectors) {
+            String line = "GET " + v[0] + " HTTP/1.1\r\n";
+            String want = "GET " + v[1] + " HTTP/1.1\r\n";
+            String got = text(r.redactObservedRequest(
+                    bytes(line + "Host: app.example.test\r\n\r\n")));
+            check("target " + v[0] + " -> " + v[1]
+                  + " (got " + got.split("\r\n")[0] + ")",
+                  got.startsWith(want));
+            if (!v[0].equals(v[1])) sawARedaction = true;
+        }
+        // The second half of the anti-vacuity check: a file whose every case
+        // is a no-op would pass the loop above with job 5 deleted.
+        check("...and at least one of them is a case job 5 actually changes",
+              sawARedaction);
+    }
+
+    static void aUserinfoCredentialNeverReachesTheBlobStore() {
+        // THE MEASURED FINDING. `http://user:pass@host/` survived verbatim
+        // into a content-addressed blob store, which S7 calls the one item
+        // that cannot be retrofitted -- once written it is in every backup.
+        Redactor r = new Redactor();
+        String secret = "s3cret-live-password";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET http://alice:" + secret + "@app.example.test/orders HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("the password is gone from the copy that crosses the bridge",
+              !out.contains(secret));
+        check("and so is the username, which can BE the token",
+              !out.contains("alice"));
+        check("the placeholder and the @ are what is left ("
+              + out.split("\r\n")[0] + ")",
+              out.startsWith("GET http://{{observed:userinfo}}@app.example.test"
+                             + "/orders HTTP/1.1\r\n"));
+        check("everything after the authority is verbatim",
+              out.contains("/orders HTTP/1.1\r\nHost: app.example.test\r\n\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob() throws Exception {
+        // Job 4's determinism constraint, restated for job 5 because it is the
+        // constraint a fix here is most likely to break: anything that carried
+        // a function of the credential -- a length, a hash, the username --
+        // would give one page browsed under two logins two digests and two
+        // stored copies.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(bytes(
+                "GET http://alice:s3cret@app.example.test/ HTTP/1.1\r\n\r\n"));
+        byte[] b = r.redactObservedRequest(bytes(
+                "GET http://bob:hunter2@app.example.test/ HTTP/1.1\r\n\r\n"));
+        check("two logins, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        check("the inputs genuinely differed", !Arrays.equals(
+                bytes("GET http://alice:s3cret@app.example.test/ HTTP/1.1\r\n\r\n"),
+                bytes("GET http://bob:hunter2@app.example.test/ HTTP/1.1\r\n\r\n")));
+    }
+
+    static void onlyTheFirstHeadLineIsATarget() {
+        // NAMED AS NOT COVERED in redactObservedRequest's javadoc, and pinned
+        // here so the sentence is a measurement rather than a claim. A URI in
+        // a FIELD VALUE keeps its userinfo: job 5 runs on one line, and
+        // running it over arbitrary field text would be the shape rule this
+        // class refuses everywhere else.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /orders HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "Referer: http://user:pass@app.example.test/login\r\n\r\n")));
+        check("the request line has no userinfo to take",
+              out.startsWith("GET /orders HTTP/1.1\r\n"));
+        check("and a Referer's userinfo is left RAW -- the named exclusion",
+              out.contains("Referer: http://user:pass@app.example.test/login"));
+    }
+
+    static void aCredentialFirstLineIsStillRedactedAsAField() {
+        // The interaction between job 4 and job 5. A malformed message whose
+        // FIRST line is a credential field must still be redacted as a field:
+        // job 5 takes the first line, and taking it must not mean skipping the
+        // credential match. Deleting `isFirstLine`'s guard the other way --
+        // running job 5 INSTEAD of the field match -- is what this catches.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a credential on the first line is still redacted (" + out.split("\r\n")[0] + ")",
+              !out.contains(COOKIE_SECRET));
+        check("...as job 4's placeholder, not job 5's",
+              out.startsWith("Cookie: {{observed:cookie}}\r\n"));
+    }
+
+    static void theRequestBodyIsNeverRewrittenByJobFive() {
+        // Job 4's rule, which job 5 inherits by sitting inside the same head
+        // scan: a body may legitimately carry a URI with a userinfo in it -- a
+        // documentation page, an API error dump, a captured request pasted
+        // into a form -- and rewriting it corrupts the evidence a check reads.
+        Redactor r = new Redactor();
+        String body = "curl http://user:pass@internal.example.test/ failed";
+        String out = text(r.redactObservedRequest(bytes(
+                "POST /report HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "Content-Length: " + body.length() + "\r\n\r\n" + body)));
+        check("a URI in the body keeps its userinfo verbatim",
+              out.endsWith(body));
+    }
+
+    static void aCredentialInTheQueryIsNamedAsNotCovered() {
+        // THE HALF THIS DOES NOT CLOSE, pinned as a fact rather than left as
+        // an assumption. `?access_token=` reaches the blob store verbatim. It
+        // is not covered because both available mechanisms are worse than the
+        // leak: a list of parameter names is a vocabulary that drifts silently
+        // toward storing a credential, and a shape rule rewrites `?id=5` and
+        // corrupts the evidence an access-control check reads. If this check
+        // ever goes RED, someone has made that decision -- and it should be a
+        // decision, not a side effect.
+        Redactor r = new Redactor();
+        String token = "eyJhbGciOiJIUzI1NiJ9.live.9f2c";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /cb?access_token=" + token + " HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a bearer token in the query is NOT redacted -- job 5 reaches "
+              + "the userinfo and stops there", out.contains(token));
     }
 
     static void theEmptyInjectedPathIsWhyJobFourExists() {

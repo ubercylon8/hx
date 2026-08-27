@@ -74,6 +74,29 @@ import java.util.Map;
  *     path violated that constraint as well as leaking, because the raw
  *     credential bytes WERE the difference between the two blobs.
  *
+ *  5. WHAT THE TARGET CARRIES. A credential does not have to be in a header.
+ *     {@code GET http://user:pass@app.test/ HTTP/1.1} puts one in the request
+ *     LINE, which jobs 1-4 do not touch: job 1 has no range, job 2 looks only
+ *     at header names, and jobs 3 and 4 match a field name before a colon.
+ *     Measured surviving verbatim into a content-addressed blob store, which
+ *     is the one place S7 says a credential can never be taken back out of.
+ *
+ *     ONLY THE USERINFO, and only because RFC 3986 3.2.1 says exactly where
+ *     it lives: {@code authority = [ userinfo "@" ] host [ ":" port ]}, and
+ *     {@code @} is a gen-delim that no host and no port may contain. So an
+ *     {@code @} inside an authority IS the userinfo delimiter -- a structural
+ *     fact, not a guess about what a string looks like. The userinfo is
+ *     replaced whole with {@link #OBSERVED_USERINFO} and the {@code @} kept,
+ *     by {@link #redactTarget}.
+ *
+ *     A CREDENTIAL IN A QUERY PARAMETER IS NOT COVERED, and that is the
+ *     deliberate half. {@code ?access_token=...} needs either a list of
+ *     parameter names -- a vocabulary that drifts, silently, in the direction
+ *     of storing a credential -- or a rule that redacts by SHAPE, which
+ *     rewrites {@code ?id=5} and corrupts the evidence a check reads. Both
+ *     are worse than saying so. See {@link #redactObservedRequest}'s
+ *     "WHAT THIS EXCLUDES" for the full list of what is left raw.
+ *
  * Redaction runs BEFORE hashing. The blob store is content-addressed: the
  * digest names the bytes it was computed over, so hashing raw bytes and
  * redacting afterwards stores the raw ones under their own digest.
@@ -137,6 +160,27 @@ public final class Redactor {
                      .getBytes(StandardCharsets.US_ASCII);
         return out;
     }
+
+    /**
+     * Job 5's placeholder, replacing a request target's userinfo whole.
+     *
+     * FIXED, for job 4's reason exactly: the blob store is content-addressed,
+     * so two browses of one page under two basic-auth users must hash to one
+     * blob. What that costs is stated rather than hidden -- WHICH user is
+     * lost, because it is a fixed string and not `{{observed:userinfo:<user>}}`.
+     * The username half of a userinfo is not reliably a name: RFC 3986 3.2.1
+     * deprecates the `user:password` form and says nothing requires a colon at
+     * all, and `https://ghp_livetoken@host/` is the commonest real shape --
+     * keeping "the part before the colon" would store that token verbatim.
+     * So the whole subcomponent goes, and the identity of the user is a thing
+     * this placeholder does not carry.
+     *
+     * NOT DERIVED from {@link #CREDENTIAL_HEADERS} like {@link #OBSERVED_CREDENTIAL}
+     * is: this one names a URI subcomponent, not a header, so there is no
+     * entry there it could be paired with.
+     */
+    private static final byte[] OBSERVED_USERINFO =
+        "{{observed:userinfo}}".getBytes(StandardCharsets.US_ASCII);
 
     /** RFC 9112 2.3: the HTTP-name is case-SENSITIVE, so this is a byte match. */
     private static final byte[] HTTP_NAME = "HTTP/".getBytes(StandardCharsets.US_ASCII);
@@ -389,8 +433,10 @@ public final class Redactor {
      * header (per RFC that text is the other header's value), a field name
      * split across a fold, and a pipelined second request.
      *
-     * NO REQUEST LINE IS RECOGNISED, and that is deliberate rather than an
-     * omission. {@link #redactResponse} has to know its status line, because
+     * NO REQUEST LINE IS RECOGNISED AS A LINE, and that is deliberate rather
+     * than an omission -- job 5 below privileges no line either, it only
+     * rewrites a URI's userinfo wherever one appears in the FIRST head line.
+     * {@link #redactResponse} has to know its status line, because
      * taking the first non-empty line for one whatever it says would let a
      * head whose first field is Set-Cookie have that cookie consumed as the
      * status line and copied through raw. Here no line is privileged: every
@@ -405,11 +451,35 @@ public final class Redactor {
      * {@code Cookie: x} is redacted, which is the safe direction and the same
      * answer this method gives that line anywhere else in the head.
      *
+     * THE FIRST HEAD LINE ALSO GOES THROUGH {@link #redactTarget}, which is
+     * job 5. It rewrites the userinfo of a URI appearing in that line and
+     * NOTHING else -- no name is matched, no line is consumed as anything, and
+     * a line with no {@code ://} in it is written through byte for byte. It
+     * runs on the first head line whatever that line turns out to be, so a
+     * malformed message whose first line is a credential FIELD is redacted as
+     * a field (above) and never reaches job 5; the flag is set for it all the
+     * same, because the line after the first is not a request line either.
+     *
      * WHAT THIS EXCLUDES, named rather than left to be discovered:
      *
-     *   - a credential in the request LINE -- {@code /login?token=...} -- and
-     *     in the body. Neither is touched here. The url is a separate exposure
-     *     with a separate column and is a whole-branch item, not this one's;
+     *   - A CREDENTIAL IN A QUERY PARAMETER. {@code /cb?access_token=...},
+     *     {@code ?api_key=}, {@code ?sig=}, a signed URL's signature, a
+     *     password reset token. Job 5 reaches the userinfo and stops there.
+     *     Closing this needs a decision nothing in this class can make: a
+     *     LIST of parameter names is a vocabulary that drifts silently toward
+     *     storing a credential, and a SHAPE rule rewrites {@code ?id=5} and
+     *     corrupts the evidence an access-control check reads. It is a leak
+     *     and it is named as one.
+     *   - A CREDENTIAL IN THE BODY. A login POST's password is in the body
+     *     and stays there, verbatim. S7 keeps payload and request structure
+     *     verbatim on purpose -- "evidence remains defensible" -- and nothing
+     *     here distinguishes a form field from a form field.
+     *   - USERINFO IN A HEADER VALUE: {@code Referer: http://u:p@host/},
+     *     {@code Origin}, a URI inside a custom header. Job 5 runs on the
+     *     first head line only. Running it over every field value would
+     *     rewrite arbitrary text that merely contains {@code ://} and an
+     *     {@code @}, which is the shape rule this class refuses everywhere
+     *     else.
      *   - a credential in a header this list does not name: {@code X-Api-Key},
      *     {@code X-Auth-Token}, a bearer token in a custom header. §6 names
      *     three and {@link #CREDENTIAL_HEADERS} is those three. A fourth name
@@ -434,6 +504,11 @@ public final class Redactor {
         ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
         int i = 0;
         boolean first = true;        // no line of the head has been read yet
+        // Whether the first line of the head has been WRITTEN. `first` cannot
+        // do this job: it is cleared for the fold and credential branches too,
+        // and it is read before those decide anything, so the one line job 5
+        // may touch has to be tracked on its own.
+        boolean targetDone = false;
         int credential = -1;         // index into CREDENTIAL_HEADERS, or -1
         while (i < raw.length) {
             int next = lineStartAfter(raw, i);      // start of the following line
@@ -454,6 +529,11 @@ public final class Redactor {
                 return out.toByteArray();
             }
             first = false;
+            // Taken and cleared HERE, above every branch, so that exactly one
+            // line of the head can be job 5's however that line is handled --
+            // a fold, a credential field or a request line all consume it.
+            boolean isFirstLine = !targetDone;
+            targetDone = true;
             if (raw[i] == ' ' || raw[i] == '\t') {
                 // obs-fold. RFC 9110 says a recipient must reject it and no
                 // real client emits it, but if one does, the folded remainder
@@ -485,7 +565,10 @@ public final class Redactor {
                         break;
                     }
             if (credential < 0) {
-                out.write(raw, i, next - i);
+                // JOB 5, and only on the first line of the head. Everything
+                // else is written through byte for byte, exactly as before.
+                if (isFirstLine) redactTarget(raw, i, next, out);
+                else out.write(raw, i, next - i);
                 i = next;
                 continue;
             }
@@ -651,6 +734,87 @@ public final class Redactor {
     }
 
     // ---- bytes ----------------------------------------------------------
+
+    /**
+     * JOB 5. Write {@code raw[from, to)} through, with the userinfo of a URI
+     * appearing in it replaced by {@link #OBSERVED_USERINFO}.
+     *
+     * STRUCTURAL, not a guess, and this is the whole argument for it being
+     * here at all when a parameter-name list is not:
+     *
+     *   RFC 3986 3.2:   authority is what follows {@code "//"} and runs to the
+     *                   next {@code / ? #} or the end of the URI.
+     *   RFC 3986 3.2.1: {@code authority = [ userinfo "@" ] host [ ":" port ]}.
+     *   RFC 3986 2.2:   {@code @} is a gen-delim. Neither {@code host}
+     *                   (reg-name / IP-literal / IPv4address) nor {@code port}
+     *                   (DIGIT) admits one.
+     *
+     * So an {@code @} inside an authority can only be the userinfo delimiter.
+     * There is no shape being recognised and no name being matched: the
+     * question "is there a credential here" is not asked, because RFC 3986
+     * already answers "this subcomponent is where one goes".
+     *
+     * THE LAST {@code @} IN THE AUTHORITY, not the first. {@code @} is not
+     * legal INSIDE a userinfo either (it is pct-encoded as {@code %40}), so a
+     * conforming authority has exactly one and the two rules agree. They part
+     * only on a malformed authority carrying two, where the last is what
+     * {@code urlsplit} and the WHATWG URL parser both take as the delimiter --
+     * and taking the FIRST there would leave the bytes between the two
+     * verbatim. The Python side is the same rule for the same reason; see
+     * tests/vectors/userinfo.txt, which is the one place the two are compared.
+     *
+     * THE {@code @} IS KEPT. `{{observed:userinfo}}@host` still reads as an
+     * authority, so a reader can see that a credential was carried there --
+     * which is the same trade job 3 makes when it keeps a cookie's name.
+     *
+     * THE FIRST {@code ://} IN THE LINE, and no attempt to find a second. A
+     * request line has one target; the target may itself carry an absolute URI
+     * in a query (`/redirect?to=http://u:p@evil/`) and that is the one this
+     * finds, which is correct -- it is a credential in the target either way.
+     * A line with a userinfo in a SECOND URI and none in the first is not
+     * covered, and no request line has that shape.
+     *
+     * Nothing is written when there is no {@code ://} and no {@code @}: the
+     * line goes through byte for byte, so a message with no userinfo in it is
+     * unchanged by this method and hashes as it did before job 5 existed.
+     */
+    private static void redactTarget(byte[] raw, int from, int to,
+                                     ByteArrayOutputStream out) {
+        int scheme = -1;
+        for (int p = from; p + 2 < to; p++)
+            if (raw[p] == ':' && raw[p + 1] == '/' && raw[p + 2] == '/') {
+                scheme = p;
+                break;
+            }
+        if (scheme < 0) {
+            out.write(raw, from, to - from);
+            return;
+        }
+        int authStart = scheme + 3;
+        int authEnd = authStart;
+        while (authEnd < to) {
+            byte b = raw[authEnd];
+            // The authority's terminators, plus the ones that end the TARGET
+            // inside a request line: SP separates it from the HTTP-version,
+            // and CR/LF/HTAB end the line. Without those a line with no path
+            // at all -- `GET http://u:p@h HTTP/1.1` -- would run the
+            // authority on into ` HTTP/1.1` and find no `@` after it either
+            // way, but a SECOND `@` anywhere later in the line would then be
+            // taken for the delimiter and blank out the version too.
+            if (b == '/' || b == '?' || b == '#' || b == ' ' || b == '\t'
+                    || b == '\r' || b == '\n') break;
+            authEnd++;
+        }
+        int at = -1;
+        for (int p = authStart; p < authEnd; p++) if (raw[p] == '@') at = p;
+        if (at < 0) {
+            out.write(raw, from, to - from);
+            return;
+        }
+        out.write(raw, from, authStart - from);   // through the `://`
+        out.writeBytes(OBSERVED_USERINFO);
+        out.write(raw, at, to - at);              // the `@`, the host, the rest
+    }
 
     /** Index just past this line's terminator, or raw.length. */
     private static int lineStartAfter(byte[] raw, int from) {

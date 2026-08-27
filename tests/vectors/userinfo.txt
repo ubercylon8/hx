@@ -1,0 +1,73 @@
+# Shared userinfo-redaction vectors. BOTH sides run against this file:
+#
+#   Java   hx.send.Redactor.redactObservedRequest, on `GET <in> HTTP/1.1`
+#          -- the request line of a proxy observation, which is what reaches
+#          the content-addressed blob store.
+#   Python hx.store.records.redact_url, on the `url` column of `exchange` and
+#          `denial`.
+#
+# THE RULE IS ONE RULE AND THIS IS THE ONE PLACE IT IS COMPARED. It is RFC
+# 3986 3.2/3.2.1: the authority is what follows `//` and runs to the next
+# `/ ? #` or the end; within it, everything up to and including the LAST `@`
+# is userinfo, because `@` is a gen-delim that no host and no port may carry.
+# Two implementations of that in two languages is exactly the drift this
+# repository has been bitten by twice, so neither side restates the cases.
+#
+# Format: one case per line, `input<TAB>expected`. Blank lines and lines
+# beginning with `#` are comments. No case may contain a tab, a CR or an LF --
+# both readers split on the tab and neither escapes anything.
+#
+# WHAT IS DELIBERATELY ABSENT: a case where a query parameter carries a
+# credential. `?access_token=...` is NOT redacted by either side -- see
+# Redactor's job 5 javadoc for why a parameter-name list and a shape rule were
+# both refused -- and the two cases at the bottom pin that it is left verbatim,
+# so the leak is a measured fact rather than an untested assumption.
+
+# ---- nothing to do: these must come through byte for byte ----------------
+http://app.example.test/orders	http://app.example.test/orders
+https://app.example.test:8443/a/b?c=d	https://app.example.test:8443/a/b?c=d
+/orders?status=open	/orders?status=open
+http://app.example.test/	http://app.example.test/
+http://app.example.test	http://app.example.test
+
+# ---- the finding: userinfo in the authority ------------------------------
+http://user:pass@app.example.test/	http://{{observed:userinfo}}@app.example.test/
+https://user:pass@app.example.test/x?y=1	https://{{observed:userinfo}}@app.example.test/x?y=1
+http://ghp_livetokenwithnocolon@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+http://user:pass@app.example.test:8443/x	http://{{observed:userinfo}}@app.example.test:8443/x
+http://user:pass@app.example.test	http://{{observed:userinfo}}@app.example.test
+http://:pass@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+http://user:@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+http://u%3Ap@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+
+# DETERMINISM. Two browses of one page under two credentials must produce one
+# blob and one url, so these two rows must have the SAME right-hand side as
+# each other and as the first row of this section.
+http://alice:s3cret@app.example.test/	http://{{observed:userinfo}}@app.example.test/
+http://bob:hunter2@app.example.test/	http://{{observed:userinfo}}@app.example.test/
+
+# ---- the last `@` wins ---------------------------------------------------
+# Malformed -- a conforming userinfo pct-encodes its own `@` -- but if one
+# arrives, taking the FIRST would leave the bytes between the two verbatim,
+# which is the half most likely to be the secret.
+http://a@b:c@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+
+# ---- an `@` that is NOT in the authority ---------------------------------
+# It is in the path, and RFC 3986 3.3 allows `@` there. Redacting it would
+# rewrite a real path segment and corrupt the evidence a check reads.
+http://app.example.test/users/alice@example.test	http://app.example.test/users/alice@example.test
+http://app.example.test/x?to=alice@example.test	http://app.example.test/x?to=alice@example.test
+http://app.example.test/#alice@example.test	http://app.example.test/#alice@example.test
+
+# ---- an absolute URI nested in the target's query ------------------------
+# The FIRST `://` in the line is the one scanned. Here it belongs to the
+# nested URI, and that nested URI's userinfo is a credential in the target
+# just as much as the outer one would be.
+/redirect?to=http://user:pass@evil.example.test/	/redirect?to=http://{{observed:userinfo}}@evil.example.test/
+
+# ---- NOT COVERED, and pinned as not covered ------------------------------
+# The measured half of B1 that job 5 does not close. If either side ever
+# starts redacting these, this file is where it will be noticed -- and the
+# decision that got it there needs to be a deliberate one.
+/cb?access_token=eyJhbGciOiJIUzI1NiJ9.live.9f2c	/cb?access_token=eyJhbGciOiJIUzI1NiJ9.live.9f2c
+https://app.example.test/p?api_key=AKIAIOSFODNN7EXAMPLE	https://app.example.test/p?api_key=AKIAIOSFODNN7EXAMPLE
