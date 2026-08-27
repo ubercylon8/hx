@@ -295,15 +295,103 @@ def make_home(workdir: Path) -> Path:
     return home
 
 
+# The project config both launchers hand Burp, and the ports inside it.
+#
+# These three live ABOVE launch_burp because BOTH launchers need them and a
+# second copy is a second set of listener settings free to drift from this one
+# -- `listen_mode: loopback_only` above all, which is written once here and
+# read back by not_loopback_only() for whichever Burp is running. The probe
+# section below is where the mechanism is EXPLAINED (see launch_probe): Burp
+# Community has no API for creating a listener, so a listener comes from a
+# project config file or it does not exist.
+
+PROXY_CONFIG = "proxy-listeners.json"
+
+
+def _free_port() -> int:
+    """A port nothing holds right now, for a listener Burp is about to bind.
+
+    Necessary rather than tidy, and measured the hard way. A first draft of
+    this fixture picked its ports by hand, and every one of them was already
+    taken on this machine: 8080 by a llama.cpp router, 18080 by a node service,
+    18081 by an agent. A taken port does not fail, it SUCCEEDS against the
+    wrong process -- that run got a clean `421` from one and a clean `200` from
+    another, with Burp never involved and the probe file holding nothing but
+    `PROBE READY`. (8080 answers a proxy-style absolute-URI GET with a
+    `404 {"error":...}` and a `Server: llama.cpp` header.)
+
+    The window between this close() and Burp's bind() is a real race and
+    nothing here can close it. The far end is what settles it: a test believes
+    the port is Burp's only once a request through it has reached the probe's
+    own handler -- or, for launch_burp, once an exchange the extension observed
+    on that port has arrived over the bridge -- which nothing but Burp's proxy
+    can arrange.
+    """
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def write_listener_config(workdir: Path, second_port: int = 0) -> list[int]:
+    """Two loopback-only proxy listeners, written where `--config-file` wants
+    them. Returns the ports, first then second.
+
+    BOTH listeners are written, including the first, and that is not
+    redundancy: a config naming only the second leaves the first wherever
+    Burp's defaults put it, which is the 8080 `_free_port()` exists to avoid.
+
+    `loopback_only` is not decoration and it is not self-enforcing. Nothing in
+    this project has ever sent a request off this machine, and a proxy listener
+    on 0.0.0.0 is an open forward relay on whatever network the laptop is
+    attached to. This string was the whole of the protection until
+    not_loopback_only() was written, and changing it to `all_interfaces` left
+    the suite green with the proxy bound to `*`. Every caller must run that
+    check once the listeners are up.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    ports = [_free_port(), second_port or _free_port()]
+    (workdir / PROXY_CONFIG).write_text(json.dumps({"proxy": {
+        "request_listeners": [
+            {"certificate_mode": "per_host", "listen_mode": "loopback_only",
+             "listener_port": port, "running": True}
+            for port in ports
+        ]}}))
+    return ports
+
+
 def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
-                sentinel: Path) -> subprocess.Popen:
+                sentinel: Path, crawler_port: int = 0) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
     buffer fills and the test hangs with no diagnostic. A file also means a
     failing test can quote what Burp actually said.
+
+    TWO PROXY LISTENERS, and the SECOND one is the crawler's. S4 tells the
+    operator and the crawler apart by WHICH LISTENER a request arrived on and
+    by nothing in the traffic itself, so a rig with one listener cannot
+    exercise the split at all -- `Source.forListenerPort` would answer OPERATOR
+    for every request and the two rule sets would never be told apart.
+
+    `-Dhx.crawler_port` IS THE OTHER HALF OF THAT AND IT IS NOT OPTIONAL.
+    `HxExtension` reads it with a default of 0, and `Source.forListenerPort`
+    reads 0 as "no crawler configured" -- so a launch that omits it attributes
+    EVERY request to the operator however many listeners are running, and a
+    test of the split passes while measuring nothing. This is the
+    `-Dhx.halt_sentinel` incident that this function's own comment below
+    records, one plan later; the property is passed from the config file Burp
+    was actually handed, never from the argument, so the number the extension
+    compares against and the number Burp bound cannot drift.
+
+    `crawler_port=0` means "any free port"; read the real ones back with
+    proxy_port() and second_proxy_port().
     """
     home = make_home(workdir)
+    ports = write_listener_config(workdir, crawler_port)
     log = (workdir / "burp.log").open("wb")
     cmd = [
         "java",
@@ -318,10 +406,14 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
         # was not updated -- the integration tests are deselected from the
         # default run, so nothing said so for a day.
         f"-Dhx.halt_sentinel={sentinel}",
+        # Read back out of the config above rather than from `crawler_port`,
+        # which may be the 0 that means "choose one for me".
+        f"-Dhx.crawler_port={ports[1]}",
         *ADD_OPENS,
         "-cp", f"{BURP_JAR}:{EXT_JAR}",
         "burp.StartBurp",
         "--developer-extension-class-name=hx.HxExtension",
+        f"--config-file={workdir / PROXY_CONFIG}",
         "--disable-auto-update",
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
@@ -363,7 +455,11 @@ def wait_for(predicate, timeout: float = 90.0, interval: float = 0.5) -> bool:
 # already have.
 # ---------------------------------------------------------------------------
 
-PROXY_CONFIG = "proxy-listeners.json"
+# PROXY_CONFIG, _free_port and write_listener_config used to live here. They
+# moved above launch_burp when it grew its own second listener, so that the two
+# launchers share ONE spelling of `listen_mode: loopback_only` rather than two
+# free to drift. The explanation of WHY a listener has to come from a config
+# file at all stays in launch_probe's docstring below, where it was measured.
 PROBE_SRC = Path(__file__).resolve().parent / "probe" / "hx" / "proxy" / "Probe.java"
 PROBE_CLASS = "hx.proxy.Probe"
 
@@ -529,32 +625,6 @@ def _compile_probe(workdir: Path) -> Path:
     return classes
 
 
-def _free_port() -> int:
-    """A port nothing holds right now, for a listener Burp is about to bind.
-
-    Necessary rather than tidy, and measured the hard way. A first draft of
-    this fixture picked its ports by hand, and every one of them was already
-    taken on this machine: 8080 by a llama.cpp router, 18080 by a node service,
-    18081 by an agent. A taken port does not fail, it SUCCEEDS against the
-    wrong process -- that run got a clean `421` from one and a clean `200` from
-    another, with Burp never involved and the probe file holding nothing but
-    `PROBE READY`. (8080 answers a proxy-style absolute-URI GET with a
-    `404 {"error":...}` and a `Server: llama.cpp` header.)
-
-    The window between this close() and Burp's bind() is a real race and
-    nothing here can close it. The far end is what settles it: a test believes
-    the port is Burp's only once a request through it has reached the probe's
-    own handler, which nothing but Burp's proxy can arrange.
-    """
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-    finally:
-        s.close()
-
-
 def launch_probe(workdir: Path, out: Path,
                  extra_listener_port: int = 0) -> subprocess.Popen:
     """Burp running hx.proxy.Probe, with a SECOND proxy listener.
@@ -583,13 +653,7 @@ def launch_probe(workdir: Path, out: Path,
     """
     home = make_home(workdir)
     classes = _compile_probe(workdir)
-    ports = [_free_port(), extra_listener_port or _free_port()]
-    (workdir / PROXY_CONFIG).write_text(json.dumps({"proxy": {
-        "request_listeners": [
-            {"certificate_mode": "per_host", "listen_mode": "loopback_only",
-             "listener_port": port, "running": True}
-            for port in ports
-        ]}}))
+    write_listener_config(workdir, extra_listener_port)
     log = (workdir / "burp.log").open("wb")
     cmd = [
         "java", "-Djava.awt.headless=true", f"-Duser.home={home}",
