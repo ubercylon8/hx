@@ -44,6 +44,29 @@ def test_a_check_cannot_express_skipped_or_error_or_pending():
         assert not hasattr(base.Verdict, word)
 
 
+def test_the_raw_constructor_also_refuses_skipped_error_and_pending():
+    """The classmethod test above pins that `Verdict.skipped` etc. don't
+    exist; it says nothing about `Verdict("skipped")` called directly. Fix
+    round 1: that bare constructor call built successfully with no
+    `__post_init__` on `Verdict`, unlike `Candidate` and `Insertion` -- the
+    same bypass that let `Verdict("inconclusive")` skip its required reason.
+    This is the test that separates "the constructor validates state" from
+    "it doesn't": delete `Verdict.__post_init__` and this reddens."""
+    for word in ("skipped", "error", "pending"):
+        with pytest.raises(ValueError, match="state"):
+            base.Verdict(word)
+
+
+def test_the_raw_constructor_also_refuses_an_empty_finding():
+    with pytest.raises(ValueError, match="candidate"):
+        base.Verdict("finding")
+
+
+def test_the_raw_constructor_also_refuses_a_reasonless_inconclusive():
+    with pytest.raises(ValueError, match="reason"):
+        base.Verdict("inconclusive")
+
+
 def test_candidate_defaults_to_surface_scope():
     c = base.Candidate(title="t", severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
@@ -64,3 +87,22 @@ def test_candidate_requires_evidence():
     with pytest.raises(ValueError, match="exchange"):
         base.Candidate(title="t", severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=())
+
+
+def test_an_insertion_names_a_known_kind_and_a_name():
+    """`Insertion.__post_init__` had no test anywhere in the repo before this
+    fix round. A legal one just needs a kind the schema-adjacent
+    `INSERTION_KINDS` set knows and a non-empty name."""
+    i = base.Insertion(kind="query", name="id")
+    assert i.kind == "query"
+    assert i.name == "id"
+
+
+def test_an_insertion_refuses_an_unknown_kind():
+    with pytest.raises(ValueError, match="kind"):
+        base.Insertion(kind="fragment", name="id")
+
+
+def test_an_insertion_refuses_an_empty_name():
+    with pytest.raises(ValueError, match="name"):
+        base.Insertion(kind="query", name="")

@@ -21,7 +21,7 @@ that distinction, and none of them is a check's to give.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 # The schema's own vocabularies, restated NOWHERE ELSE in this package. The
@@ -101,18 +101,50 @@ class Candidate:
             raise ValueError("a candidate must name at least one exchange")
 
 
+# Not scanned by tests/test_vocabularies_match_the_schema.py's enumeration
+# (leading underscore): this is a subset of check_run.verdict chosen by this
+# module's own rule, not a second copy of a schema CHECK, so there is nothing
+# in schema.sql to pair it against.
+_VERDICT_STATES = frozenset({"clean", "finding", "inconclusive"})
+
+
 @dataclass(frozen=True)
 class Verdict:
     """What a check returns. Constructed only through the three classmethods.
 
-    There is deliberately no `Verdict(state=...)` in the public surface: the
-    constructor is reachable, but every call site in this repository uses a
-    named constructor, and `test_a_check_cannot_express_skipped_or_error_or_pending`
-    is what stops a fourth appearing.
+    There is deliberately no *public* `Verdict(state=...)` call site in this
+    repository -- every caller uses a named constructor -- but the raw
+    constructor is still reachable, exactly like `Candidate`'s and
+    `Insertion`'s, so it carries the same kind of `__post_init__` they do:
+    `state` is checked against `_VERDICT_STATES`, `finding` is checked for at
+    least one candidate, and `inconclusive` is checked for a reason. That is
+    what actually stops `Verdict("skipped")`, `Verdict("error")` and
+    `Verdict("pending")` from constructing -- not the classmethods, which a
+    caller can always step around by naming the dataclass directly.
+    `test_a_check_cannot_express_skipped_or_error_or_pending` pins that the
+    classmethods don't exist for those three words;
+    `test_the_raw_constructor_also_refuses_skipped_error_and_pending` pins
+    that the constructor itself refuses them too.
     """
     state: str
     candidates: tuple[Candidate, ...] = ()
     reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in _VERDICT_STATES:
+            raise ValueError(
+                f"unknown verdict state {self.state!r}; a check may only say "
+                f"{sorted(_VERDICT_STATES)} -- pending, skipped and error "
+                f"belong to the runner, never to a check")
+        if self.state == "finding" and not self.candidates:
+            raise ValueError(
+                "a finding verdict needs at least one candidate; an empty one "
+                "is a row claiming a finding with no title and no evidence")
+        if self.state == "inconclusive" and not self.reason:
+            raise ValueError(
+                "inconclusive requires a reason: S10 says a check that cannot "
+                "run says so, and a reason-less one tells the operator "
+                "nothing they can act on")
 
     @classmethod
     def clean(cls) -> "Verdict":
@@ -120,19 +152,10 @@ class Verdict:
 
     @classmethod
     def finding(cls, *candidates: Candidate) -> "Verdict":
-        if not candidates:
-            raise ValueError(
-                "a finding verdict needs at least one candidate; an empty one "
-                "is a row claiming a finding with no title and no evidence")
         return cls("finding", tuple(candidates))
 
     @classmethod
     def inconclusive(cls, reason: str) -> "Verdict":
-        if not reason:
-            raise ValueError(
-                "inconclusive requires a reason: S10 says a check that cannot "
-                "run says so, and a reason-less one tells the operator "
-                "nothing they can act on")
         return cls("inconclusive", (), reason)
 
 
