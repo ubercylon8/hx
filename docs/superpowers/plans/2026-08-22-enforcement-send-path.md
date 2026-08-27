@@ -25358,14 +25358,34 @@ Replace `launch_burp` in `tests/integration/burp_fixture.py` with this:
 ```python
 # tests/integration/burp_fixture.py -- launch_burp gains the halt sentinel
 def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
-                sentinel: Path) -> subprocess.Popen:
+                sentinel: Path, crawler_port: int = 0) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
     buffer fills and the test hangs with no diagnostic. A file also means a
     failing test can quote what Burp actually said.
+
+    TWO PROXY LISTENERS, and the SECOND one is the crawler's. S4 tells the
+    operator and the crawler apart by WHICH LISTENER a request arrived on and
+    by nothing in the traffic itself, so a rig with one listener cannot
+    exercise the split at all -- `Source.forListenerPort` would answer OPERATOR
+    for every request and the two rule sets would never be told apart.
+
+    `-Dhx.crawler_port` IS THE OTHER HALF OF THAT AND IT IS NOT OPTIONAL.
+    `HxExtension` reads it with a default of 0, and `Source.forListenerPort`
+    reads 0 as "no crawler configured" -- so a launch that omits it attributes
+    EVERY request to the operator however many listeners are running, and a
+    test of the split passes while measuring nothing. This is the
+    `-Dhx.halt_sentinel` incident that this function's own comment below
+    records, one plan later; the property is passed from the config file Burp
+    was actually handed, never from the argument, so the number the extension
+    compares against and the number Burp bound cannot drift.
+
+    `crawler_port=0` means "any free port"; read the real ones back with
+    proxy_port() and second_proxy_port().
     """
     home = make_home(workdir)
+    ports = write_listener_config(workdir, crawler_port)
     log = (workdir / "burp.log").open("wb")
     cmd = [
         "java",
@@ -25380,17 +25400,8 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
         # was not updated -- the integration tests are deselected from the
         # default run, so nothing said so for a day.
         f"-Dhx.halt_sentinel={sentinel}",
-        *ADD_OPENS,
-        "-cp", f"{BURP_JAR}:{EXT_JAR}",
-        "burp.StartBurp",
-        "--developer-extension-class-name=hx.HxExtension",
-        "--disable-auto-update",
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
-                            stderr=subprocess.STDOUT, cwd=LAB)
-    proc.stdin.write(b"\n\n")     # bare newline selects Community Edition
-    proc.stdin.flush()
-    return proc
+        # Read back out of the config above rather than from `crawler_port`,
+        # which may be the 0 that means "choose one for me".
 ```
 
 **The block above is now stale in one respect, deliberately left rather than
@@ -25509,9 +25520,12 @@ from typing import Sequence
 
 import pytest
 
+from hx import capture as capture_mod
 from hx import config, engagement
 from hx.bridge import server
 from hx.halt import OperatorHalt
+from hx.store import blobs as blobs_mod
+from hx.store import db as db_mod
 from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer
 
@@ -25595,6 +25609,53 @@ def _announce_skipped(terminalreporter) -> None:
             "trusting this suite.", yellow=True)
 
 
+class ReadThreadCapture:
+    """`hx.capture.Capture`, on a connection belonging to the thread that uses it.
+
+    THE SINK IS CALLED ON THE BRIDGE'S READ THREAD. `BridgeServer.__init__`
+    says so in as many words and adds the consequence: a callback there "may
+    not touch a sqlite3 connection opened elsewhere: it belongs to the thread
+    that created it and raises ProgrammingError anywhere else". `eng.db` is
+    opened by the fixture, on the main thread, so a `Capture(eng.db, ...)`
+    installed here raises on EVERY frame.
+
+    MEASURED, because the failure is silent in the worst way. `_capture`
+    catches everything the sink throws -- deliberately; S4 says a lost record
+    changes what hx KNOWS, never what it ALLOWS -- keeps the exception in
+    `BridgeServer.exchange_callback_error`, and retries the loss as a `dropped`
+    frame, which raises identically. So the observable is a live Burp, a green
+    handshake, traffic flowing to the target, and ZERO rows: exactly the shape
+    whose natural diagnosis is "the extension never sent anything".
+
+        sqlite3.ProgrammingError: SQLite objects created in a thread can only
+        be used in that same thread.
+
+    So the connection is opened LAZILY, on the first call, which happens on the
+    read thread -- and every later call is on that same thread. The main thread
+    keeps reading through `eng.db`; two connections to one WAL database is the
+    ordinary arrangement and each sees the other's commits.
+
+    It is deliberately NOT closed at teardown. `Connection.close()` is thread-
+    affine as well (measured, same exception), so closing it from the fixture's
+    unwind would raise during teardown and replace whatever failed the test.
+    `srv.stop()` joins the read thread first, so nothing is still writing.
+    """
+
+    def __init__(self, root: Path, engagement_id: str, cfg: config.Config):
+        self._root = Path(root)
+        self._engagement_id = engagement_id
+        self._config = cfg
+        self._capture: capture_mod.Capture | None = None
+
+    def __call__(self, header: dict, request: bytes, response: bytes):
+        if self._capture is None:
+            self._capture = capture_mod.Capture(
+                db_mod.connect(self._root / "hx.db"),
+                blobs_mod.BlobStore(self._root / "blobs"),
+                self._engagement_id, self._config)
+        return self._capture.on_exchange(header, request, response)
+
+
 def _reap(proc: subprocess.Popen) -> None:
     proc.kill()
     try:
@@ -25615,6 +25676,14 @@ class Rig:
     halt: OperatorHalt
     run_id: str
     workdir: Path
+    # The two proxy listeners this run's Burp bound, read back from the config
+    # file it was handed rather than kept as a second copy here. S4 tells the
+    # operator and the crawler apart by WHICH of these a request arrived on and
+    # by nothing in the traffic, so a test of that split needs both numbers.
+    # `crawler_port` is also what `-Dhx.crawler_port` carries into the JVM; see
+    # burp_fixture.launch_burp for why passing it is not optional.
+    proxy_port: int
+    crawler_port: int
     last_request: bytes = field(default=b"", init=False)
 
     @property
@@ -25791,22 +25860,58 @@ def rig(tmp_path):
         # writes. The price is that this side now refuses a send of its own
         # accord while that file exists, which is why the halt test sends
         # through Rig.send_unguarded.
+        #
+        # `on_exchange` is Plan 4's proxy traffic arriving UNSOLICITED, and
+        # without a sink installed BridgeServer reads those frames and DISCARDS
+        # them -- its own `_capture` says so. This rig had no sink at all until
+        # Task 9, which is right for the send-path tests (they assert on
+        # `result` frames) and fatal to any assertion about a row: every
+        # exchange, denial and dropped frame would be read off the socket,
+        # thrown away, and the database would answer empty while Burp
+        # cheerfully sent them.
         srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id=eng.id,
-                                  operator_halt=operator_halt)
+                                  operator_halt=operator_halt,
+                                  on_exchange=ReadThreadCapture(
+                                      eng.root, eng.id, cfg))
         stack.callback(srv.stop)
         srv.start()
 
-        proc = bf.launch_burp(srv.socket_path, eng.id, tmp_path / "burp",
+        burpdir = tmp_path / "burp"
+        proc = bf.launch_burp(srv.socket_path, eng.id, burpdir,
                               sentinel=operator_halt.sentinel_path)
         stack.callback(_reap, proc)
 
         if not bf.wait_for(lambda: srv.state == "connected"):
             raise AssertionError(
                 "Burp never completed the hello handshake; see "
-                f"{tmp_path / 'burp' / 'burp.log'}")
+                f"{burpdir / 'burp.log'}")
+
+        # BEFORE any test touches a listener. `listen_mode: loopback_only` goes
+        # into both listeners in `write_listener_config` and is not self-
+        # enforcing: changing that one string to `all_interfaces` left
+        # test_proxy_facts.py reporting `3 passed` with `ss` showing the
+        # listeners bound to `*` -- an open forward proxy on whatever network
+        # this laptop is attached to, for as long as the run lasts.
+        #
+        # Polled, not read once: the handshake says the extension loaded and
+        # says nothing about when Burp bound its listeners. The wait is bounded
+        # at 15 s and costs one `ss` call on the happy path -- waiting cannot
+        # turn a wildcard bind into a loopback one, so the seconds only ever
+        # get spent once the check has already found something.
+        ports = bf.listener_ports(burpdir)
+        violation: str | None = "the loopback check did not run"
+
+        def on_loopback_only() -> bool:
+            nonlocal violation
+            violation = bf.not_loopback_only(proc.pid, ports)
+            return violation is None
+
+        if not bf.wait_for(on_loopback_only, 15):
+            raise AssertionError(violation)
 
         yield Rig(eng=eng, srv=srv, proc=proc, target=target, offside=offside,
-                  halt=operator_halt, run_id=run_id, workdir=tmp_path)
+                  halt=operator_halt, run_id=run_id, workdir=tmp_path,
+                  proxy_port=ports[0], crawler_port=ports[1])
 ```
 
 - [ ] **Step 8: Write the end-to-end test**
