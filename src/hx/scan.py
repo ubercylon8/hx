@@ -235,7 +235,7 @@ def _write_finding(conn, engagement_id, run_id, surface, check, candidate) -> st
         fid = records.upsert_finding(conn, engagement_id=engagement_id,
                                      candidate=candidate, dedupe_key=key,
                                      run_id=run_id, surface_id=surface[0],
-                                     host=host, issue_type_id=check.id)
+                                     host=host, check_id=check.id)
         records.record_observation(
             conn, finding_id=fid, run_id=run_id, observed=True,
             exchange_id=candidate.exchange_ids[0],
@@ -261,9 +261,12 @@ def _mark_unobserved(conn, engagement_id, run_id, seen) -> None:
     so the surface-only version reported a live finding as fixed because the
     check that would have found it again never got a clean answer out at
     all. Requiring the SAME check to have run clean on the SAME surface this
-    run is what "looked and it's gone" actually means; `finding.issue_type_id`
-    (unused before this fix) carries `check.id` for exactly this comparison,
-    written by `_write_finding` via `records.upsert_finding`.
+    run is what "looked and it's gone" actually means; `finding.check_id`
+    (SCHEMA_VERSION 7, added fix round 2 -- NOT `issue_type_id`, which is
+    spec S10/S12's "which of Burp's 183 vendored issue definitions" and a
+    different axis entirely; see schema.sql's comment on both columns)
+    carries `check.id` for exactly this comparison, written by
+    `_write_finding` via `records.upsert_finding`.
 
     A finding whose (surface, check) pair was never clean THIS run --
     because the surface went untested, the check raised, the check went
@@ -287,8 +290,13 @@ def _mark_unobserved(conn, engagement_id, run_id, seen) -> None:
         " WHERE run_id=? AND verdict='clean'", (run_id,))}
     if not clean:
         return
+    # `finding.check_id`, NOT `finding.issue_type_id` -- the two are
+    # different axes (see schema.sql) and this is precisely the read a
+    # future edit swapping them back would get wrong silently, which
+    # `tests/test_scan.py::test_mark_unobserved_reads_check_id_not_issue_type_id`
+    # exists to catch.
     rows = conn.execute(
-        "SELECT id, surface_id, issue_type_id FROM finding WHERE engagement_id=?",
+        "SELECT id, surface_id, check_id FROM finding WHERE engagement_id=?",
         (engagement_id,)).fetchall()
     at = now_us()
     with db_mod.transaction(conn):

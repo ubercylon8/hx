@@ -567,3 +567,44 @@ def test_a_complete_scan_has_no_stop_reason(scan_env):
     row = scan_env["conn"].execute(
         "SELECT stop_reason FROM run WHERE kind='scan'").fetchone()
     assert row[0] is None
+
+
+# --- Fix round 2: `finding.check_id` is its own column, distinct from
+# `finding.issue_type_id` (spec S10/S12's Burp-vendored-issue-type axis).
+# `_mark_unobserved` must read `check_id`, never `issue_type_id`.
+
+
+def test_mark_unobserved_reads_check_id_not_issue_type_id(scan_env):
+    """Separates 'reads finding.check_id' from 'reads finding.issue_type_id'
+    -- a later edit accidentally swapping the column name back (they are the
+    same type, so nothing at the schema level or the type checker would
+    catch it) must redden this, not pass silently.
+
+    Setup deliberately DISAGREES the two columns: after run 1 writes the
+    finding with `check_id='hx.test.finds'` (correct) and `issue_type_id`
+    left `NULL` (its real, unrelated purpose, untouched), directly corrupt
+    the row to the SHAPE a swap-back bug would produce -- `check_id=NULL`,
+    `issue_type_id='hx.test.finds'`. If `_mark_unobserved` ever reads
+    `issue_type_id` instead of `check_id`, run 2's clean re-run of the SAME
+    check on the SAME surface would match against the wrongly-populated
+    column and mark the finding `observed=0`. Reading the real `check_id`
+    column (`NULL` here) cannot match, so the finding stays alone.
+    """
+    _run1_finds(scan_env)
+    conn = scan_env["conn"]
+    assert conn.execute(
+        "SELECT check_id, issue_type_id FROM finding").fetchone() == (
+        "hx.test.finds", None)
+    conn.execute(
+        "UPDATE finding SET check_id=NULL, issue_type_id='hx.test.finds'")
+
+    class FindsThenClean:
+        id, version, klass = "hx.test.finds", "1", "passive"
+        insertion_kinds = frozenset()
+        def on_surface(self, ctx, surface, exchanges):
+            return base.Verdict.clean()
+
+    scan.run(**scan_env, checks=(FindsThenClean(),))
+    rows = [r[0] for r in conn.execute(
+        "SELECT observed FROM finding_observation ORDER BY ts_us")]
+    assert rows == [1]

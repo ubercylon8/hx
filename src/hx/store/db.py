@@ -26,7 +26,17 @@ from hx.store.paths import secure_mkdir
 # rather than failing, which is the guess the DEFAULT was removed to stop.
 # `engagement.open_`'s comparison against this constant is the only thing in
 # the tree that can notice either.
-SCHEMA_VERSION = 6
+#
+# 6 -> 7 (2026-08-27, Task 6 fix round 2): `finding` gained `check_id`,
+# additive and nullable -- no existing row's meaning changes, so this bump
+# exists only to make an old store's absence of the column loud
+# (`engagement.open_`'s version check) rather than something a later reader
+# discovers by getting a `sqlite3.OperationalError: no such column` from a
+# query it had every right to assume would work. See schema.sql's own
+# comment on `finding.check_id` for why the column exists: it is NOT the
+# same axis as `finding.issue_type_id`, and conflating the two was reachable
+# without one.
+SCHEMA_VERSION = 7
 
 TABLES: tuple[str, ...] = (
     "engagement",
