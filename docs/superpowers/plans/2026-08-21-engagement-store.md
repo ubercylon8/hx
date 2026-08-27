@@ -869,7 +869,29 @@ CREATE TABLE IF NOT EXISTS finding (
   id                 TEXT PRIMARY KEY,
   engagement_id      TEXT NOT NULL REFERENCES engagement(id),
   dedupe_key         TEXT NOT NULL,
+  -- TWO DIFFERENT AXES, added at two different times, and the collision
+  -- between them is exactly the thing this comment exists to foreclose.
+  --
+  -- issue_type_id: WHAT KIND OF ISSUE THIS IS. Spec S10/S12: report text,
+  -- severity and CWE mappings come from Burp's 183 vendored issue
+  -- definitions, so a report reads in the same vocabulary a Pro user's
+  -- would. Unwritten by any code in this plan -- that mapping is a later
+  -- plan's job -- and NOT to be used for anything else, including the
+  -- column immediately below.
+  --
+  -- check_id: WHICH hx CHECK FOUND THIS, added at SCHEMA_VERSION 7 (fix
+  -- round 2 of Task 6). `hx.scan._mark_unobserved` needs to know, for a
+  -- retest, whether the SAME check that produced a finding ran clean on the
+  -- SAME surface again this run -- surface alone was measured to mark a
+  -- finding "observed=0" (which a report renders as FIXED) even when the
+  -- check that owns it crashed, went inconclusive, or never ran this run at
+  -- all (F1 of the task-6 review, HIGH). `issue_type_id` briefly carried
+  -- `check.id` for this purpose between fix rounds 1 and 2 -- WRONG, because
+  -- it collides with the axis above the day a later plan starts writing
+  -- real Burp issue-type ids here, with nothing at the schema level to catch
+  -- the two fighting over one column. This column is that catch.
   issue_type_id      TEXT,
+  check_id           TEXT,
   title              TEXT NOT NULL,
   description        TEXT,
   impact             TEXT,
@@ -1103,7 +1125,17 @@ from hx.store.paths import secure_mkdir
 # rather than failing, which is the guess the DEFAULT was removed to stop.
 # `engagement.open_`'s comparison against this constant is the only thing in
 # the tree that can notice either.
-SCHEMA_VERSION = 6
+#
+# 6 -> 7 (2026-08-27, Task 6 fix round 2): `finding` gained `check_id`,
+# additive and nullable -- no existing row's meaning changes, so this bump
+# exists only to make an old store's absence of the column loud
+# (`engagement.open_`'s version check) rather than something a later reader
+# discovers by getting a `sqlite3.OperationalError: no such column` from a
+# query it had every right to assume would work. See schema.sql's own
+# comment on `finding.check_id` for why the column exists: it is NOT the
+# same axis as `finding.issue_type_id`, and conflating the two was reachable
+# without one.
+SCHEMA_VERSION = 7
 
 TABLES: tuple[str, ...] = (
     "engagement",
