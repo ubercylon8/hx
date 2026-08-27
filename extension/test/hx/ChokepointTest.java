@@ -144,6 +144,8 @@ public class ChokepointTest {
         t("oneEgressPath", () -> oneEgressPath(sources));
         t("noBatchEgressPath", () -> noBatchEgressPath(sources));
         t("redirectsAreNotFollowed", ChokepointTest::redirectsAreNotFollowed);
+        t("theBuiltRequestOptionsAreTheOnesIssued",
+          ChokepointTest::theBuiltRequestOptionsAreTheOnesIssued);
         t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
         t("theBridgeNamesNothingInTheProxyPackage",
           () -> theBridgeNamesNothingInTheProxyPackage(sources));
@@ -154,6 +156,9 @@ public class ChokepointTest {
         t("theStripperIsNotVacuousAndDoesNotOverreach",
           ChokepointTest::theStripperIsNotVacuousAndDoesNotOverreach);
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
+        t("theCaptureDrainIsStarted", ChokepointTest::theCaptureDrainIsStarted);
+        t("everyPathThatSpendsTheGateArmsItFirst",
+          ChokepointTest::everyPathThatSpendsTheGateArmsItFirst);
         t("theGateIsSpentOnlyWhereTheHalvesArePaired",
           () -> theGateIsSpentOnlyWhereTheHalvesArePaired(sources));
         t("oneRunHasOnePolicy", () -> oneRunHasOnePolicy(sources));
@@ -327,13 +332,121 @@ public class ChokepointTest {
         check("the mode is set inside the options the adapter KEEPS, not in a "
               + "statement whose return is discarded",
               built.contains("RedirectionMode.NEVER"));
+        // BOTH GRAMMAR FORMS, through calls(). `options::withRedirectionMode`
+        // is an invocation in every sense that matters and this needle counted
+        // one spelling of it -- which is also why the needle now has a row in
+        // theTypeNeedlesCoverEveryConstructionForm's `called` table, where
+        // every COUNTED method needle belongs. The reference form cannot
+        // legally appear inside the built statement, so the sums are the same
+        // numbers on correct code; what changes is that a reference ADDED
+        // elsewhere in the adapter now moves the right-hand count and reddens
+        // this arm instead of sliding past it.
         check("and every withRedirectionMode call is in that same statement ("
-              + count(built, "withRedirectionMode(") + " of "
-              + count(chain, "withRedirectionMode(") + ")",
-              count(built, "withRedirectionMode(") == count(entry, "withRedirectionMode(")
-              && count(chain, "withRedirectionMode(") == 1);
+              + calls(built, "withRedirectionMode(", "::withRedirectionMode")
+              + " of "
+              + calls(chain, "withRedirectionMode(", "::withRedirectionMode") + ")",
+              calls(built, "withRedirectionMode(", "::withRedirectionMode")
+                      == calls(entry, "withRedirectionMode(", "::withRedirectionMode")
+              && calls(chain, "withRedirectionMode(", "::withRedirectionMode") == 1);
         check("and it names exactly one redirection mode, so a second setting "
               + "cannot override it (" + any + ")", any == 1);
+    }
+
+    /**
+     * THE OPTIONS THE ADAPTER BUILDS ARE THE OPTIONS IT ISSUES UNDER.
+     *
+     * PRESENCE IS NOT APPLICATION, one level out from the hole
+     * {@link #redirectsAreNotFollowed} closed. That check pins WHERE the
+     * redirection mode is written and cannot see whether the object the chain
+     * built ever reaches the call. {@code Http.sendRequest} has a
+     * ONE-ARGUMENT OVERLOAD, so dropping the second argument COMPILES, and
+     * both mutations below were measured green against a clean
+     * 13 summary lines / 2200 ok / 0 FAIL / rc=0:
+     *
+     *     rr = api.http().sendRequest(request);
+     *     rr = api.http().sendRequest(request,
+     *              RequestOptions.requestOptions().withResponseTimeout(remainingMs));
+     *
+     * In BOTH, `RedirectionMode.NEVER` is computed and thrown away: `never`
+     * is 1, `any` is 1, the built statement still contains the constant, and
+     * both `withRedirectionMode(` counts are satisfied -- while the request
+     * goes out under Burp's DEFAULT redirection mode. S4: "Not auto-followed.
+     * Each hop is a distinct issuance with its own scope decision and its own
+     * exchange row." Every hop after the first would never cross Policy, which
+     * is S4's third egress path wearing the first one's name. The first
+     * mutation drops `withResponseTimeout` with it, so the deadline stops
+     * being enforced at the transport too -- Sender still answers `timeout` on
+     * its own clock, so that half is a fail-safe loss rather than a hole.
+     *
+     * The SECOND mutation is the realistic one: it still passes AN options
+     * object, so it reads in review as the correct code with the chain
+     * refactored.
+     *
+     * WHAT THIS CHECKS, and it is a DATAFLOW shape rather than a spelling of
+     * the call: the local the builder chain binds is used EXACTLY ONCE in the
+     * whole entry point, and that one use is inside the egress statement. So
+     * a call that takes no options (0 uses), a call handed a freshly built
+     * object (the bound local unused, 1 use), and a rebuild between the two
+     * (3 uses) are all red. Measured results for both of the above are in the
+     * fix-wave report.
+     *
+     * WHAT IT DOES NOT COVER, stated because the family this belongs to is
+     * six instances deep and every one of them was a check that overclaimed:
+     *
+     *   - A THIRD OVERLOAD. `sendRequest(request, options, somethingElse)`
+     *     satisfies every arm here, and if that third argument could override
+     *     the redirection mode this check would not see it. MEASURED rather
+     *     than assumed, because the first draft of this sentence guessed and
+     *     guessed wrong: `javap burp.api.montoya.http.Http` on the jar this
+     *     tree builds against lists FOUR `sendRequest` overloads --
+     *     `(HttpRequest)`, `(HttpRequest, HttpMode)`,
+     *     `(HttpRequest, HttpMode, String)` and `(HttpRequest,
+     *     RequestOptions)`. Only the last takes options at all, so no
+     *     three-argument call can carry them and there is nothing today for
+     *     this gap to be. The `(HttpRequest, HttpMode)` form is a TWO-argument
+     *     call that drops the options entirely, and the arms below do catch
+     *     it -- the bound local goes unread. Nothing here would notice a
+     *     future overload arriving.
+     *   - THE IDENTIFIER'S NAME. `options` is a spelling. Renaming the local
+     *     turns the binding needle and the count red together, so it fails
+     *     CLOSED and the next reader updates two literals -- but this method
+     *     is pinned to a name, not to a type.
+     *   - WHETHER MONTOYA HONOURS THE OBJECT. Nothing in this repository can
+     *     run the builder; that is `docs/burp-proxy-measurements.md`'s job.
+     *   - {@link #statement} ends at the FIRST `;`, so an argument list
+     *     containing one would truncate the span. Today neither does.
+     *
+     * Read from {@link #codeKeepingLiterals} for the same reason
+     * {@link #redirectsAreNotFollowed} is: `statement` stops at a `;` and the
+     * javadoc inside the adapter's own chain contains one, so comments must be
+     * stripped -- while literals are kept, because a literal is not what is
+     * being counted here and blanking one cannot help.
+     */
+    static void theBuiltRequestOptionsAreTheOnesIssued() throws IOException {
+        String chain = codeKeepingLiterals(Path.of(ENTRY_POINT));
+        String built = statement(chain, "RequestOptions options =");
+        String issue = statement(chain, "http().sendRequest(");
+        // Anti-vacuity, both ends: statement() answers "" for a needle that
+        // has been renamed away, and "" satisfies no arm below -- count 0 is
+        // not 1 and "" contains nothing. -1-style vacuity has no equivalent
+        // here, but the two presence checks are stated anyway so a rename
+        // reads as a rename rather than as a dataflow failure.
+        check("the adapter binds its RequestOptions (" + built.trim() + ")",
+              !built.isEmpty());
+        check("and the egress statement was located (" + issue.trim() + ")",
+              !issue.isEmpty());
+        // ONE BINDING, ONE READ, IN THE WHOLE ENTRY POINT. `RequestOptions`
+        // and `requestOptions()` carry a CAPITAL O and do not match this
+        // needle, so the two hits are the declaration and the argument.
+        check("the built options are read exactly once in " + ENTRY_POINT
+              + " (" + count(chain, "options") + ")",
+              count(chain, "options") == 2);
+        check("one of the two is the binding itself (" + count(built, "options") + ")",
+              count(built, "options") == 1);
+        // ...so the other one is here, and this is the arm the two measured
+        // mutations fail.
+        check("and the other is the argument the egress call issues under ("
+              + issue.trim() + ")", issue.contains("options"));
     }
 
     /**
@@ -959,6 +1072,200 @@ public class ChokepointTest {
         check("and the send path is installed (" + handler + ")", handler == 1);
         check("and a configure that would move an armed limit is refused ("
               + guard + ")", guard == 1);
+
+        // ---- ...BEFORE THE DIAL, which is the half the NAME claimed and the
+        // body did not take. Six counts and zero offsets: a reviewer measured
+        // `c.setConfigGuard(...)` moved to after `t.start()` at
+        // 13 / 2200 ok / 0 FAIL / rc=0, and the five `c.set*` wires moved as a
+        // block likewise. Re-measured against THESE arms on the tree that
+        // carries them: the guard alone is 13 / 2257 ok / 1 FAIL / rc=1, and
+        // the five wires plus the poller moved as a block is
+        // 13 / 2251 ok / 7 FAIL / rc=1 (five of these arms, and two from
+        // everyPathThatSpendsTheGateArmsItFirst, which the same move drags the
+        // send-path arming past its decision). The window is a real race and
+        // not a
+        // theoretical one -- the dial runs on a daemon thread that opens a
+        // real socket, and inside the window `BridgeClient.refuseConfigure`
+        // returns null with no guard installed, which ACCEPTS.
+        //
+        // THE ANCHOR IS `t.start()` AND NOT `c.connect()`. The connect call is
+        // textually EARLIER -- it sits inside the Runnable the Thread is
+        // constructed with -- and it does not run until the thread is started,
+        // so anchoring there would refuse correct code. `t.start()` is where
+        // the client becomes live.
+        //
+        // ANTI-VACUITY IS `>= 0` ON EVERY ONE OF THEM, and it is load-bearing
+        // exactly as it is in theGateDecidesBeforeAnythingIsQueued: indexOf
+        // answers -1 for a needle that is absent and -1 is less than every
+        // real offset, so a DELETED wire would satisfy "before the dial"
+        // perfectly. The count arms above are what make each offset the ONLY
+        // occurrence rather than the first of several.
+        //
+        // WHAT IT DOES NOT SEE, and the limitation is the one every
+        // first-occurrence offset in this file carries:
+        //
+        //   - THESE ARE OFFSETS, NOT BRACE NESTING. A wire written inside a
+        //     lambda that runs after the dial, or inside a branch never taken,
+        //     sits at an earlier offset and passes. What it catches is the
+        //     shape that actually happens: a wire MOVED below the dial, or
+        //     added below it.
+        //   - THE DOTTED FORM ONLY. `calls()` above sums both grammar forms,
+        //     so a wire spelled purely as `c::setHaltSink` keeps the count at
+        //     1 while indexOf answers -1 and this arm goes RED. That is
+        //     fail-closed and deliberate: a bare method reference installs
+        //     nothing until something applies it, and the offset check has no
+        //     way to find where that happened.
+        int dial = entry.indexOf("t.start()");
+        check("the dial is where it is expected to be (" + dial + ")", dial >= 0);
+        String[][] wired = {
+            {"the halt sink",     "setHaltSink("},
+            {"the halt source",   "setHaltSource("},
+            {"the halt notifier", "setHaltNotifier("},
+            {"the send handler",  "setSendHandler("},
+            {"the config guard",  "setConfigGuard("},
+            {"the sentinel poller", "haltSwitch.start()"},
+        };
+        for (String[] w : wired) {
+            int at = entry.indexOf(w[1]);
+            check(w[0] + " is installed before the dial (" + at + " < " + dial
+                  + ")", at >= 0 && dial >= 0 && at < dial);
+        }
+    }
+
+    /**
+     * THE DRAIN IS STARTED, and until this method existed nothing in this file
+     * said so.
+     *
+     * `capture.start()` was the ONE wire in {@link #ENTRY_POINT} named by no
+     * `count(`, `calls(` or `indexOf(` anywhere in this class -- verified by
+     * scanning every needle literal in the file, not by reading. Commented
+     * out, it was 13 summary lines / 2200 ok / 0 FAIL / rc=0 against the tree
+     * before this method existed. Re-measured against THIS method on the tree
+     * that carries it: 13 / 2257 ok / 1 FAIL / rc=1, naming this check.
+     *
+     * WHAT THAT COSTS. {@code Capture.accepting} is true at field level and
+     * {@code start()} is what creates the drain thread, so without it every
+     * proxy exchange is offered into a queue NOTHING POLLS. The first
+     * {@code DEFAULT_CAPACITY} records sit there uncounted; after that each
+     * offer evicts one and counts it dropped. The store gets ZERO exchange
+     * rows for the whole run, and `run.dropped_total` -- which S5 presents as
+     * a coverage FLOOR -- under-reports the loss by up to a full queue. A
+     * total outage that reads as a run which just saw little traffic.
+     *
+     * Only `pytest -m integration` could see it behaviourally. This is a
+     * count, and a count is worth more than nothing for the failure that
+     * actually happens: the line deleted, or never written.
+     *
+     * NO ORDERING IS CLAIMED, and the omission is deliberate rather than an
+     * oversight. `capture.start()` sits beside `haltSwitch.start()` and before
+     * the dial today, but nothing breaks if it moves after: an offer made
+     * before the drain runs is queued, not lost, and delivery through the sink
+     * fails until the bridge connects anyway. There is no window here of the
+     * kind {@link #everyKillPathIsWiredBeforeTheDial} exists for, so this
+     * method does not pretend to one. It is a WIRE-EXISTS needle read from
+     * {@link #code}, so neither a comment nor a string literal can supply it.
+     *
+     * WHAT IT DOES NOT SEE: that the thread actually runs, that the sink is
+     * connected, or that anything is ever delivered. All three need Burp.
+     */
+    static void theCaptureDrainIsStarted() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int drain = calls(entry, "capture.start()", "capture::start");
+        check("the capture drain is started, so a queued record has somewhere "
+              + "to go (" + drain + ")", drain == 1);
+    }
+
+    /**
+     * EVERY PATH THAT SPENDS THE GATE ARMS IT FIRST -- counted, because prose
+     * naming the callers is what failed here.
+     *
+     * {@code Limits.arm} had ONE call site, inside `setSendHandler`, and
+     * {@code Limits.check}'s own javadoc said the unarmed branch was
+     * "Unreachable through HxExtension, which calls arm() on the same snapshot
+     * on the line before issue()". THAT WAS TRUE WHEN IT WAS WRITTEN. Task 7
+     * wired S4's second enforcement point, whose CRAWLER branch reaches
+     * `ProxyGate.decide` -> `Policy.decide` -> `Limits.check`, and it did not
+     * arm -- so every crawler request that passed scope, method and
+     * dangerous.path was refused `not_configured` with the detail "the rate
+     * and budget are not armed", until some unrelated `send` happened to arm
+     * it. Fail-closed, and a lie about why: the denial lands under a
+     * `denial.kind` an operator reads as "nobody authorised this run", with no
+     * `EXTENSION_FAULT` prefix to separate a broken jar from an unconfigured
+     * one.
+     *
+     * WHY THIS SUITE DID NOT SEE IT, all three reasons, because each is its
+     * own lesson:
+     *
+     *   - this class counted NOTHING for `.arm(`. Deleting the call outright
+     *     left 13 / 2200 ok / 0 FAIL / rc=0;
+     *   - the only crawler-listener integration test drives a POST, which
+     *     `method.allow` refuses BEFORE the Gate -- the test that existed
+     *     stopped short of the code path;
+     *   - the comment above the branch named its callers. A sentence naming a
+     *     set of callers is falsified by a new caller in another file, and
+     *     nothing makes a noise when that happens.
+     *
+     * So this is a COUNT OF CALL SITES rather than a sentence about them, in
+     * both grammar forms through {@link #calls} -- `limits::arm` is a spelling
+     * -- and it is TWO because there are two points that can consult the Gate.
+     * Deleting either turns it red. So does ADDING a third call site, armed or
+     * not, and that is the point rather than a wart: the number is a fact
+     * about how many places can spend the Gate, and a wave that changes it
+     * must come here and re-derive it.
+     *
+     * ...AND EACH ARMING COMES BEFORE THE DECISION IT ARMS. A call that
+     * happens AFTER `Limits.check` has already answered is a call whose result
+     * arrives too late, which is this codebase's own recurring family: the
+     * count would stay at 2 and the first crawler request would still be
+     * refused. The two offsets are taken as FIRST and LAST, which is exact
+     * only because the count is pinned at 2 immediately above -- with a third
+     * call site the middle one would be unexamined, and the count arm is what
+     * stops there being one.
+     *
+     * WHAT IT DOES NOT SEE:
+     *
+     *   - BRACE NESTING, like every other offset in this file. The send arm's
+     *     `limits.arm(` and `sender.issue(` are inside one lambda and the
+     *     proxy pair inside one handler, and nothing here proves that; a
+     *     `limits.arm(` moved into the WRONG one of the two would keep both
+     *     orderings and go unnoticed.
+     *   - WHETHER THE SNAPSHOT IS THE SAME ONE. Both sites are written
+     *     `limits.arm(auth)` on the line above a decision taken under `auth`,
+     *     and the identifier is not checked here --
+     *     {@link #everyDecisionReadsOneAuthorisationSnapshot} is what holds
+     *     "one read, passed in" for the file as a whole.
+     *   - THAT `arm` IS ARMED-ONCE. That is {@code Limits}'s own contract and
+     *     `LimiterTest`/`PolicyTest` drive it; a second call from a later
+     *     snapshot returns early rather than re-arming, which is why adding
+     *     the proxy call site cannot resupply a spent budget.
+     */
+    static void everyPathThatSpendsTheGateArmsItFirst() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int arms = calls(entry, "limits.arm(", "limits::arm");
+        check("both points that can consult the Gate arm it (" + arms + ")",
+              arms == 2);
+        int firstArm = entry.indexOf("limits.arm(");
+        int lastArm = entry.lastIndexOf("limits.arm(");
+        int issue = entry.indexOf("sender.issue(");
+        int decide = entry.indexOf("gate.decide(");
+        // Anti-vacuity: -1 is less than every real offset, so a deleted needle
+        // would satisfy "comes first" perfectly.
+        check("the send path arms (" + firstArm + ") and issues (" + issue + ")",
+              firstArm >= 0 && issue >= 0);
+        check("and arms before it issues (" + firstArm + " < " + issue + ")",
+              firstArm >= 0 && issue >= 0 && firstArm < issue);
+        check("the proxy path arms (" + lastArm + ") and decides (" + decide + ")",
+              lastArm >= 0 && decide >= 0);
+        check("and arms before it decides (" + lastArm + " < " + decide + ")",
+              lastArm >= 0 && decide >= 0 && lastArm < decide);
+        // The two are DIFFERENT call sites, not one counted twice. Without
+        // this, two arms on the send path and none on the proxy path would
+        // satisfy every arm above -- the count is 2, the first is before
+        // issue(), and the last is still before gate.decide() because both sit
+        // above the proxy handler in the file.
+        check("and they are two distinct call sites (" + firstArm + " != "
+              + lastArm + ")", firstArm >= 0 && lastArm > firstArm && firstArm < issue
+              && lastArm > issue);
     }
 
     /**
@@ -1710,11 +2017,53 @@ public class ChokepointTest {
      *
      * EVERY METHOD NEEDLE THAT IS *COUNTED* IS LISTED, must-be-zero and
      * exactly-N alike -- and the qualifier is load-bearing rather than
-     * hedging. `capture.offer(` and `withRedirectionMode(` are method needles
-     * with no row, because they are read POSITIONALLY (`indexOf`) and never
-     * counted: a second call in the reference form does not move an offset the
-     * way it moves a count. What that leaves open is narrower and is named
-     * where it lives -- an ORDER check cannot see a call it does not spell, so
+     * hedging.
+     *
+     * THAT SENTENCE WAS FALSE WHEN IT WAS WRITTEN, and it named its own
+     * counter-example. It went on to exempt `withRedirectionMode(` as a needle
+     * "read POSITIONALLY (`indexOf`) and never counted". It was counted, three
+     * times, in an exactly-N arm inside {@link #redirectsAreNotFollowed} --
+     * with no `::withRedirectionMode` companion and no row here, so it was the
+     * one counted method needle on this branch whose four-form grammar set was
+     * unfinished. IT IS NOW COUNTED THROUGH {@link #calls} AND HAS A ROW. Note
+     * the shape of the escape, because it is the reason this paragraph is long:
+     * the pairing arm below is driven from PAIRS, which is filled FROM THESE
+     * TABLES, so a needle with no row is never examined at all. The sweep
+     * enforced "every listed needle is used" and "every egress needle has a
+     * row", and NOT the direction its own sentence claimed -- so a false
+     * sentence there was invisible. Control, to prove the pairing arm works
+     * and that table absence was the whole of the escape: rewriting
+     * `calls(entry, "setHaltSink(", "::setHaltSink")` as
+     * `count(entry, "setHaltSink(")` reddens at 2 FAIL.
+     *
+     * SO THE CLAIM IS NOW HALF-MECHANISED, and the half that is not says so.
+     * The arm at the end of this method requires every needle PAIR handed to
+     * {@link #calls} to have a row here, which is the direction that was
+     * enforced by nobody. Writing it found THREE more unlisted pairs beyond
+     * the one a reviewer read out --
+     * `ProxyRequestReceivedAction.drop(`, `ProxyRequestToBeSentAction.drop(`
+     * and the receiver-qualified `policy.decideScopeOnly(` -- which is the
+     * measure of how far prose gets on this.
+     *
+     * WHAT IS STILL PROSE: a needle counted through {@link #count} on ONE
+     * form, and a needle read only by `indexOf`. Neither is mechanised, and
+     * for the second there is nothing to mechanise -- an offset does not sum,
+     * so a positional needle has no second form to forget. FOUR method
+     * needles are read positionally with no row, and they are listed here
+     * because that list is the whole of the guarantee: `capture.offer(`
+     * ({@link #theGateDecidesBeforeAnythingIsQueued},
+     * {@link #theRefusalIsHeldBeforeItIsRecorded}), `logToError`
+     * ({@link #theSecondCallbackObservesAndCannotRefuse}), `sender.issue(`
+     * and `t.start()` ({@link #everyPathThatSpendsTheGateArmsItFirst} and
+     * {@link #everyKillPathIsWiredBeforeTheDial}). The other positionally-read
+     * method needles -- `http().sendRequest(`, `gate.decide(`, `limits.arm(`,
+     * `pending.put(`, `recorder.record(`, `policy.decideScopeOnly(`,
+     * `.authorisation()`, `HttpService.httpService(`,
+     * `HttpRequest.httpRequest(` -- all have rows, because they are counted
+     * somewhere too.
+     *
+     * What the positional exemption leaves open is narrower and is named where
+     * it lives -- an ORDER check cannot see a call it does not spell, so
      * `capture::offer` used before the gate would satisfy
      * {@link #theGateDecidesBeforeAnythingIsQueued}. That is a recording-order
      * failure, not an enforcement one; it is IGNORANCE, not safety. Round 4
@@ -1815,6 +2164,31 @@ public class ChokepointTest {
                                                            "::setSendHandler"},
             {"setConfigGuard",        "c",          "(a)", "setConfigGuard(",
                                                            "::setConfigGuard"},
+            // The needle the sentence above wrongly exempted, plus the two
+            // this fix wave added: the drain that had no check at all, and the
+            // arming call site that had none either.
+            {"withRedirectionMode",   "options",    "(a)", "withRedirectionMode(",
+                                                           "::withRedirectionMode"},
+            {"start",                 "capture",    "()",  "capture.start()",
+                                                           "capture::start"},
+            {"arm",                   "limits",     "(a)", "limits.arm(",
+                                                           "limits::arm"},
+            // ...and the three the false sentence ALSO missed, found by
+            // mechanising the direction it claimed rather than by re-reading
+            // it. Each is a needle PAIR handed to calls() with no row here.
+            // `decideScopeOnly` gets a SECOND row because a needle is a
+            // spelling, not a method: the receiver-qualified pair
+            // theSecondCallbackObservesAndCannotRefuse counts is a different
+            // pair of literals from the bare one above, and the arm below
+            // matches literals.
+            {"decideScopeOnly",       "policy",     "(a)", "policy.decideScopeOnly(",
+                                                           "policy::decideScopeOnly"},
+            {"drop",         "ProxyRequestReceivedAction", "()",
+                                       "ProxyRequestReceivedAction.drop(",
+                                       "ProxyRequestReceivedAction::drop"},
+            {"drop",         "ProxyRequestToBeSentAction", "()",
+                                       "ProxyRequestToBeSentAction.drop(",
+                                       "ProxyRequestToBeSentAction::drop"},
         };
 
         PAIRS.clear();
@@ -1907,6 +2281,48 @@ public class ChokepointTest {
         check("every count of a paired needle sums both grammar forms through "
               + "calls(), not one of them " + single, single.isEmpty());
 
+        // ...AND THE OTHER DIRECTION, which is the one the javadoc above
+        // CLAIMED and which nothing enforced until this wave. Every needle
+        // PAIR handed to calls() must have a row here. Without it a paired
+        // needle can be counted with no row, and the arm above -- driven from
+        // PAIRS, which is filled FROM THESE TABLES -- never examines it: that
+        // is exactly how `withRedirectionMode(` sat in an exactly-N arm on one
+        // grammar form while a sentence twelve lines up named it as never
+        // counted. Three MORE unlisted pairs fell out of writing this, none of
+        // them found by reading.
+        //
+        // Matched on the LITERALS, because a needle is a spelling: the same
+        // method reached through a different receiver-qualified pair is a
+        // different pair of strings and needs its own row.
+        //
+        // The scan takes the FIRST TWO string literals between each `calls(`
+        // and the `;` that ends its statement. That reads a nested
+        // `calls(text(p), "a", "b")` correctly and would misread a first
+        // argument that itself contained a string literal; there is none, and
+        // a new one would show up here as an unlisted pair rather than as
+        // silence. `calls`'s own DECLARATION is skipped because no literal
+        // stands between it and the next `;`.
+        List<String> unlisted = new ArrayList<>();
+        int sites = 0, scan = 0;
+        while ((scan = elsewhere.indexOf("calls(", scan)) >= 0) {
+            int stop = elsewhere.indexOf(";", scan);
+            List<String> lits = stop < 0 ? List.<String>of()
+                    : literals(elsewhere.substring(scan + "calls(".length(), stop));
+            scan += "calls(".length();
+            if (lits.size() < 2) continue;
+            sites++;
+            boolean listed = false;
+            for (String[] row : pairs())
+                if (row.length >= 2 && row[0].equals(lits.get(0))
+                                    && row[1].equals(lits.get(1))) listed = true;
+            if (!listed) unlisted.add(lits.get(0) + " + " + lits.get(1));
+        }
+        // Anti-vacuity: a scan that matched nothing would report no unlisted
+        // pairs and say nothing at all.
+        check("the calls() sites were found (" + sites + ")", sites >= 25);
+        check("and every needle pair counted through calls() has a row here "
+              + unlisted, unlisted.isEmpty());
+
         int from = self.indexOf("String[] needles = {");
         int to = self.indexOf("};", from);
         check("the egress needle array was found (" + from + ".." + to + ")",
@@ -1955,6 +2371,26 @@ public class ChokepointTest {
 
     static int calls(String haystack, String dotted, String reference) {
         return count(haystack, dotted) + count(haystack, reference);
+    }
+
+    /** The string literals in {@code s}, in order, at most two -- enough for
+     *  one {@link #calls} argument pair. Escapes are stepped over so a `\"`
+     *  inside a needle cannot end it early; no needle in this file has one,
+     *  and the loop is written to survive the first that does. */
+    static List<String> literals(String s) {
+        List<String> out = new ArrayList<>();
+        int i = 0;
+        while (out.size() < 2 && (i = s.indexOf('"', i)) >= 0) {
+            int close = i + 1;
+            while (close < s.length() && s.charAt(close) != '"') {
+                if (s.charAt(close) == '\\') close++;
+                close++;
+            }
+            if (close >= s.length()) break;
+            out.add(s.substring(i + 1, close));
+            i = close + 1;
+        }
+        return out;
     }
 
     static int count(String haystack, String needle) {
