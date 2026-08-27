@@ -2186,8 +2186,8 @@ Expected: `Error: No such command 'scan'.`
                    "skipped, never left absent.")
 def scan(root, max_seconds) -> None:
     """Run the enabled check corpus over everything captured so far."""
-    path = _engagement_root(root)
-    eng = engagement.open_(path)
+    path = root or default_root()
+    eng = _open_engagement(path)
     try:
         surfaces = eng.db.execute(
             "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
@@ -2221,10 +2221,21 @@ def scan(root, max_seconds) -> None:
 ```
 
 Add `from hx import scan as scan_mod` and `from hx.checks import registry` to
-the imports, and reuse whatever `_engagement_root` helper `info` and `capture`
-already share — if there is none, they each resolve `--root` the same way and
-this is the third caller, which is the point at which one helper is worth
-having.
+the imports.
+
+**Pre-flight correction P1.** There is no `_engagement_root`. The established
+pattern in this file is `path = root or default_root()` followed by
+`_open_engagement(path)` — a helper that already turns every failure
+(`EngagementError`, `ConfigError`, `sqlite3.Error`, `OSError`) into a clean
+`ClickException` instead of a traceback, and which `info` and both `capture`
+subcommands already share. Use it. Do not invent a third spelling.
+
+**Pre-flight correction P2.** The `engagement_with_surface` fixture this
+task's tests need does not exist. `tests/test_cli.py` has `engagement`,
+`engagement_with_drops`, `engagement_with_stale_run` and
+`engagement_with_drops_on_two_runs`; build the new one on `engagement` the way
+those do, inserting one `surface` row and one `exchange` against it so a
+passive check has something to read.
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -2559,8 +2570,8 @@ def _limits(conn, engagement_id, config) -> list[str]:
               help="Where to write it. Defaults to <engagement>/exports/.")
 def report(root, out) -> None:
     """Render the engagement as one Markdown file."""
-    path = _engagement_root(root)
-    eng = engagement.open_(path)
+    path = root or default_root()
+    eng = _open_engagement(path)
     try:
         text = report_mod.render(eng.db, engagement_id=eng.id,
                                  config=eng.config, blobs=eng.blobs)
