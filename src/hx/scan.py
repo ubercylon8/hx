@@ -67,19 +67,24 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # `(finding_id, run_id)`, so the second call's `record_observation`
     # doesn't add a second row, it OVERWRITES the first run's `observed=1`
     # with the second run's `observed=0` -- the retest's own history erases
-    # itself. `observed` came back `[0]`, one row, never `[1, 0]`. Nothing in
-    # this plan's cli exists yet to close a scan run from outside (unlike
-    # `browse`, which cli.py's `stop` command closes explicitly), so if this
-    # function does not close its own run, no code path ever does until
-    # `reap_stale` finds it stale and marks it `error` -- the wrong status
-    # for a scan that actually finished.
+    # itself. `observed` came back `[0]`, one row, never `[1, 0]`.
+    #
+    # This does NOT mean nothing else can close a scan run -- `hx capture
+    # stop` (cli.py) closes every live run by default, `--kind scan` included
+    # (F6 of the task-6 review: an earlier version of this comment claimed
+    # otherwise, which was false -- MEASURED against cli.py:246-262, whose
+    # default query is `WHERE status='running'` with no kind filter at all).
+    # What nothing else does is close a scan run AUTOMATICALLY AT THE END OF
+    # ITS OWN PASS, which is the sentence this paragraph should have said the
+    # first time: without the close below, a scan that finishes cleanly stays
+    # `running` until an operator's `stop` or `reap_stale`'s idle window
+    # catches up to it.
     try:
         surfaces = conn.execute(
             "SELECT id, method, scheme, host, port, path_template,"
             " exemplar_exchange_id FROM surface WHERE engagement_id=?"
             " ORDER BY host, path_template, method", (engagement_id,)).fetchall()
 
-        tested: set[str] = set()
         seen_findings: set[str] = set()
 
         for surface in surfaces:
@@ -92,33 +97,75 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                                               "budget", summary)
                 continue
             summary.surfaces += 1
-            tested.add(surface[0])
+            # F4 of the task-6 review: `hx.capture` heartbeats on every
+            # exchange precisely so a live run is not mistaken for a dead
+            # harness; `scan.run` heartbeated never. `open_run` stamps
+            # `heartbeat_us` once at the start and nothing refreshed it, so a
+            # scan running longer than `run.reap_stale`'s idle window got
+            # reaped `error` WHILE STILL RUNNING -- MEASURED, with a check
+            # still executing when `reap_stale` ran in another connection --
+            # after which `close_run`'s `WHERE status='running'` silently
+            # no-ops at the end of THIS function, permanently recording a
+            # scan that finished as one that crashed. Per surface is the
+            # obvious granularity: it is the same loop `checks_run` and
+            # `surfaces` already advance in.
+            run_mod.heartbeat(conn, run_id=run_id)
             exchanges = _exchanges_for(conn, surface[0])
 
             for check in checks:
                 row_id = _open_row(conn, run_id, surface, check)
                 summary.checks_run += 1
+                # F2 of the task-6 review: this try used to wrap ONLY
+                # `check.on_surface`, so anything raised while HANDLING the
+                # result -- `verdict.state` on a non-Verdict, `_write_finding`
+                # hitting a purged exchange id -- escaped `scan.run` entirely,
+                # leaving the row `pending` and ending the whole scan. MEASURED
+                # both: a check returning the bare string `"clean"` raised
+                # `AttributeError` reading `.state`; a `Candidate` naming an
+                # exchange id that does not resolve raised `IntegrityError`
+                # out of `record_evidence`. Both now land here instead of
+                # outside it. "One bad check must not end a scan an operator
+                # has already billed for" -- this module's own first test --
+                # was never conditional on WHERE in handling the check went
+                # wrong.
                 try:
                     verdict = check.on_surface(ctx, surface, exchanges)
+                    if verdict is None:
+                        # Silence is not a verdict. A check that forgot to
+                        # return would otherwise render as `tested, clean`.
+                        raise TypeError(
+                            "the check returned None; silence is not a verdict")
+                    if not isinstance(verdict, base.Verdict):
+                        # F3 of the task-6 review: nothing here checked that
+                        # what came back WAS a `Verdict`. MEASURED:
+                        # `SimpleNamespace(state="skipped", reason="I decided
+                        # not to")` produced a `check_run` row of `('skipped',
+                        # 'I decided not to')`, indistinguishable from a real
+                        # budget skip. `Verdict.__post_init__` is the
+                        # enforcement point Task 1 built for exactly this --
+                        # `pending`/`skipped`/`error` are the runner's words,
+                        # never a check's -- but it only fires for an actual
+                        # `Verdict` construction, and this boundary handed the
+                        # guarantee straight back by trusting duck-typed
+                        # input. Rejected the same way as `None`.
+                        raise TypeError(
+                            f"the check returned {verdict!r} "
+                            f"({type(verdict).__name__}), not a "
+                            "hx.checks.base.Verdict; a check may not "
+                            "construct the runner's own vocabulary by hand")
+                    if verdict.state == "finding":
+                        for candidate in verdict.candidates:
+                            fid = _write_finding(conn, engagement_id, run_id,
+                                                 surface, check, candidate)
+                            seen_findings.add(fid)
+                            summary.findings += 1
                 except Exception as exc:                    # noqa: BLE001
                     _close_row(conn, row_id, "error",
                                f"{type(exc).__name__}: {exc}")
                     continue
-                if verdict is None:
-                    # Silence is not a verdict. A check that forgot to
-                    # return would otherwise render as `tested, clean`.
-                    _close_row(conn, row_id, "error",
-                               "the check returned None; silence is not a verdict")
-                    continue
-                if verdict.state == "finding":
-                    for candidate in verdict.candidates:
-                        fid = _write_finding(conn, engagement_id, run_id,
-                                             surface, check, candidate)
-                        seen_findings.add(fid)
-                        summary.findings += 1
                 _close_row(conn, row_id, verdict.state, verdict.reason)
 
-        _mark_unobserved(conn, engagement_id, run_id, tested, seen_findings)
+        _mark_unobserved(conn, engagement_id, run_id, seen_findings)
     except BaseException as exc:
         # Left `running` here would mean the NEXT scan.run() call inherits
         # this one's half-finished state via current_run's reuse window --
@@ -128,7 +175,20 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
         run_mod.close_run(conn, run_id=run_id, status="error",
                           stop_reason=f"scan.run raised: {type(exc).__name__}: {exc}")
         raise
-    run_mod.close_run(conn, run_id=run_id, status="completed")
+    # F7 of the task-6 review: a budget-truncated scan used to close
+    # `('completed', NULL)`, identical at the `run` row to a scan that
+    # covered every surface -- the truncation was recoverable from
+    # `check_run` (`verdict='skipped'`, `reason='budget'`) but not from the
+    # run row alone, and S12's whole subject is telling a complete pass from
+    # an incomplete one apart. `stop_reason` says so when it happened, and
+    # stays `None` -- not some other placeholder -- when it didn't, so a
+    # complete scan is not itself misreported as "truncated for a reason".
+    stop_reason = None
+    if summary.by_reason:
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(summary.by_reason.items()))
+        stop_reason = f"truncated: {parts}"
+    run_mod.close_run(conn, run_id=run_id, status="completed",
+                      stop_reason=stop_reason)
     return summary
 
 
@@ -175,7 +235,7 @@ def _write_finding(conn, engagement_id, run_id, surface, check, candidate) -> st
         fid = records.upsert_finding(conn, engagement_id=engagement_id,
                                      candidate=candidate, dedupe_key=key,
                                      run_id=run_id, surface_id=surface[0],
-                                     host=host)
+                                     host=host, issue_type_id=check.id)
         records.record_observation(
             conn, finding_id=fid, run_id=run_id, observed=True,
             exchange_id=candidate.exchange_ids[0],
@@ -186,39 +246,56 @@ def _write_finding(conn, engagement_id, run_id, surface, check, candidate) -> st
     return fid
 
 
-def _mark_unobserved(conn, engagement_id, run_id, tested, seen) -> None:
-    """`observed = 0` for findings this run looked for and did not see.
+def _mark_unobserved(conn, engagement_id, run_id, seen) -> None:
+    """`observed = 0` for a finding whose OWN CHECK ran, on the finding's OWN
+    surface, THIS run, and came back clean.
 
-    ONLY WHERE THE SURFACE WAS ACTUALLY TESTED. A finding whose surface was
-    never reached gets NO ROW -- because "not observed" would otherwise
-    silently mean "not looked at", which is S12's own failure one layer down.
-    A retest that cannot tell those apart is a retest that cannot say `fixed`.
+    PER CHECK, NOT PER SURFACE. F1 of the task-6 review, HIGH, and the
+    plan's own defect rather than an implementation one -- the brief said
+    "whose surface was actually tested", and that granularity is wrong.
+    MEASURED against the surface-only version: one surface, run 1 finds via
+    check A, run 2 has check A RAISE (or go `inconclusive`, or is simply
+    absent from this run's `checks`, or is skipped by the budget) --
+    `finding_observation.observed` came back `[1, 0]` in every one of those
+    four cases. `observed=0` is the exact datum a retest renders as "fixed",
+    so the surface-only version reported a live finding as fixed because the
+    check that would have found it again never got a clean answer out at
+    all. Requiring the SAME check to have run clean on the SAME surface this
+    run is what "looked and it's gone" actually means; `finding.issue_type_id`
+    (unused before this fix) carries `check.id` for exactly this comparison,
+    written by `_write_finding` via `records.upsert_finding`.
+
+    A finding whose (surface, check) pair was never clean THIS run --
+    because the surface went untested, the check raised, the check went
+    inconclusive, the check was skipped by the budget, or the check was
+    never in this run's `checks` at all -- gets NO ROW, not a zero. "Not
+    observed" would otherwise silently mean "not looked at" (or "looked and
+    failed to look properly"), which is S12's own failure one layer down.
 
     Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
     the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses
     a plain `DELETE FROM surface` the instant anything depends on the row --
     `tests/test_scan.py::test_a_surface_deleted_between_capture_and_scan_is_refused_by_the_schema`
     pins that. Reaching this case at all needs `PRAGMA foreign_keys=OFF`
-    around the delete, the shape a bulk purge/retention job takes.
-
-    Once it happens, `tested` is built from surface ids the scan loop
-    actually iterated THIS run -- from a LIVE `SELECT ... FROM surface`, not
-    from any stored finding's own `surface_id` read back afterwards -- so a
-    dangling id in `finding.surface_id` simply never appears in `tested` and
-    is left alone, not queried, not guessed about. There is no separate
-    id-existence check to get wrong because there is no path here that would
-    ever dereference one.
+    around the delete, the shape a bulk purge/retention job takes. Once it
+    happens, the `clean` set below is built from THIS run's own `check_run`
+    rows -- a vanished surface has none, so it is simply absent, never
+    looked up, never guessed about.
     """
-    if not tested:
+    clean = {(r[0], r[1]) for r in conn.execute(
+        "SELECT surface_id, check_id FROM check_run"
+        " WHERE run_id=? AND verdict='clean'", (run_id,))}
+    if not clean:
         return
-    marks = ", ".join("?" * len(tested))
     rows = conn.execute(
-        f"SELECT id FROM finding WHERE engagement_id=? AND surface_id IN ({marks})",
-        (engagement_id, *tested)).fetchall()
+        "SELECT id, surface_id, issue_type_id FROM finding WHERE engagement_id=?",
+        (engagement_id,)).fetchall()
     at = now_us()
     with db_mod.transaction(conn):
-        for (fid,) in rows:
+        for fid, surface_id, check_id in rows:
             if fid in seen:
+                continue
+            if (surface_id, check_id) not in clean:
                 continue
             records.record_observation(
                 conn, finding_id=fid, run_id=run_id, observed=False,
