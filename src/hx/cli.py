@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import uuid
 from pathlib import Path
 
 import click
@@ -20,6 +21,7 @@ from hx import run as run_mod
 from hx import scan as scan_mod
 from hx.checks import registry
 from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -435,6 +437,48 @@ def scan(root, max_seconds) -> None:
         eng.db.close()
 
 
+def _write_export_secure(path: Path, text: str) -> None:
+    """Atomically write the report at 0o600, never briefly looser.
+
+    Fix round 1, F2: `target.parent.mkdir(parents=True, exist_ok=True)`
+    followed by `write_text` then `chmod` created directories at the ambient
+    umask (`755` under `umask 022`, measured, including directories nested
+    inside the engagement root when `--out` named one) and left the file
+    itself at `0o644` for the window between the write and the chmod, on
+    every invocation. §3 is unconditional -- "engagement directories `0o700`,
+    files `0o600`, never looser" -- and a client report earns no less care
+    than `config.yaml` or the halt sentinel.
+
+    Same shape as `engagement._write_config_secure` and
+    `halt.OperatorHalt._write_sentinel`, for the same reasons: `O_EXCL` at
+    the final mode so the file never exists world-readable even for an
+    instant, and a rename so a reader never sees a partial write. Not a
+    shared import of either -- this codebase's own precedent
+    (`halt._write_sentinel`'s docstring: "Same shape as
+    `engagement._write_config_secure`, for the same reasons") is to
+    duplicate this exact shape per module with a cross-reference, not to
+    import a leading-underscore name across module boundaries.
+    """
+    path = Path(path)
+    tmp = path.parent / f".{uuid.uuid4().hex}.{path.name}"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 @main.command()
 @click.option("--root", type=click.Path(path_type=Path), default=None)
 @click.option("--out", type=click.Path(path_type=Path), default=None,
@@ -447,9 +491,8 @@ def report(root, out) -> None:
         text = report_mod.render(eng.db, engagement_id=eng.id,
                                  config=eng.config, blobs=eng.blobs)
         target = out or (eng.root / "exports" / f"{eng.config.name}.md")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
-        target.chmod(0o600)      # S3: never looser
+        secure_mkdir(target.parent)   # S3: 0o700, never looser, no window
+        _write_export_secure(target, text)   # S3: 0o600, never looser
         click.echo(f"wrote {target}")
     finally:
         eng.db.close()

@@ -854,3 +854,76 @@ def test_scan_max_seconds_reaches_the_runner(engagement_with_surface, monkeypatc
     assert result.exit_code == 0, result.output
     assert "surfaces  0" in result.output
     assert "skipped" in result.output.lower()
+
+
+# --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---
+# --- what that gap already cost -----------------------------------------
+
+def test_report_writes_a_file_and_says_where(engagement_with_surface):
+    result = CliRunner().invoke(cli.main,
+                                ["report", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    assert target.exists()
+    assert str(target) in result.output
+
+
+def test_report_default_export_is_never_looser_than_0o600(engagement_with_surface):
+    """§3, unconditional. F2: `write_text` then `chmod` used to leave the
+    file at `0o644` for the window between them; there is no window left to
+    measure from the outside once the file exists, so this pins the mode
+    the file ends at -- the live end-to-end half of F2's fix, the write-time
+    window itself is what `_write_export_secure`'s O_EXCL-at-final-mode
+    shape (`cli.py`) exists to close."""
+    CliRunner().invoke(cli.main,
+                       ["report", "--root", str(engagement_with_surface)])
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_report_out_creates_new_directories_at_0o700_not_the_umask(engagement_with_surface, tmp_path):
+    """F2's exact measured repro: `--out <somewhere>/nested/report.md`, where
+    neither `nested` directory exists yet. The old
+    `target.parent.mkdir(parents=True, exist_ok=True)` created both at the
+    ambient umask (`755` under `022`, measured in the review) -- including
+    when the path was inside the engagement root, which §3 governs
+    unconditionally. `secure_mkdir` must leave every directory it creates at
+    `0o700`, never looser, with no window."""
+    target = tmp_path / "handoff" / "client" / "acme.md"
+    result = CliRunner().invoke(cli.main, [
+        "report", "--root", str(engagement_with_surface), "--out", str(target),
+    ])
+    assert result.exit_code == 0, result.output
+    assert target.exists()
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    assert oct((tmp_path / "handoff").stat().st_mode & 0o777) == "0o700"
+    assert oct((tmp_path / "handoff" / "client").stat().st_mode & 0o777) == "0o700"
+
+
+def test_report_redacts_a_credential_reaching_the_export(engagement_with_surface):
+    """F1/F12: the export-side redaction the review found missing, exercised
+    through the real CLI command rather than `report.render` directly --
+    F2's own defect was found exactly this way, by driving the command
+    end-to-end rather than trusting the unit-level render tests alone. The
+    finding is hand-inserted rather than written through `records.py`'s own
+    writers, the same way `records.record_exchange`/`record_denial` already
+    redact at write time and would mask the gap this checks for."""
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        eng.db.execute(
+            "INSERT INTO finding(id, engagement_id, dedupe_key, title,"
+            " severity, confidence, created_by, status, scope_level)"
+            " VALUES('f-1', ?, 'k1',"
+            " 'Token leak: https://admin:hunter2@app.acme.com/x?access_token=SECRETTOKEN',"
+            " 'Medium', 'Firm', 'check', 'new', 'surface')",
+            (eng.id,))
+    finally:
+        eng.db.close()
+    result = CliRunner().invoke(cli.main,
+                                ["report", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    text = target.read_text(encoding="utf-8")
+    assert "SECRETTOKEN" not in text
+    assert "hunter2" not in text
+    assert "Token leak" in text
