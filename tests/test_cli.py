@@ -729,3 +729,46 @@ def test_both_refuse_cleanly_when_there_is_no_engagement(tmp_path, command):
     assert result.exit_code != 0
     assert "Traceback" not in result.output
     assert "no engagement" in result.output.lower()
+
+
+def test_deleting_the_sentinel_by_hand_leaves_the_two_sides_disagreeing(engagement):
+    """THE CLAIM I HAD WRONG, as a check rather than a sentence.
+
+    `hx resume`'s docstring said it was "the only thing that lifts a halt".
+    It is not. The extension polls the sentinel FILE and nothing else -- which
+    is exactly what S4 asks of it, "an operator can create it from a shell when
+    the socket is dead" -- and a mechanism that can be created by hand can be
+    removed by hand.
+
+    What that loses is asserted here: no `agent_action` row says the halt was
+    lifted, and a process that reads the store still believes issuance is
+    stopped while the extension has already started again. The two sides
+    disagree, and the disagreement is silent. `hx resume` is what leaves them
+    agreeing and leaves a row behind.
+    """
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "stop", "--root", str(engagement)])
+    (engagement / "HALTED").unlink()
+
+    halted, reason, _ = _halt_state(engagement)
+    assert halted is True, (
+        "the store no longer believes this engagement is halted, so the "
+        "disagreement this test documents does not exist and `hx resume`'s "
+        "docstring should say so")
+    assert reason == "stop"
+
+    eng = eng_mod.open_(engagement)
+    try:
+        tools = [r["tool"] for r in eng.db.execute(
+            "SELECT tool FROM agent_action ORDER BY ts_us")]
+    finally:
+        eng.db.close()
+    assert tools == ["halt"], (
+        "removing the file by hand wrote a resume row, which would make it "
+        "equivalent to `hx resume` and this whole test pointless")
+
+    # And `hx resume` still works from here -- it is the way back to two sides
+    # agreeing, and it does not require the file it is about to remove.
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert _halt_state(engagement)[0] is False

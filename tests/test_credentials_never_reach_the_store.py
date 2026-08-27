@@ -173,3 +173,36 @@ def test_an_ordinary_url_reaches_the_row_byte_for_byte(conn):
                             status=200, req_blob=None, resp_blob=None,
                             ms=1, at_us=1)
     assert conn.execute("SELECT url FROM exchange").fetchone()["url"] == url
+
+
+def test_only_records_py_writes_a_url_into_a_row():
+    """A CHECK THAT COUNTS THE WRITERS, instead of a comment that names them.
+
+    `redact_url` is applied inside `record_exchange` and `record_denial`, so
+    the guarantee is "every url that becomes a row goes through one of those
+    two" -- and that is a statement about INSERT statements, not about
+    callers. A module that grew its own `INSERT INTO exchange` would bypass
+    §7 entirely with every existing test still green, which is the exact shape
+    of the finding this file exists for: a mechanism that covers the paths
+    somebody thought of.
+
+    Deliberately a text scan over `src/`, deliberately not over `tests/`: a
+    test fixture inserting a row by hand is a fixture, and the invariant is
+    about what the SHIPPED code can do.
+    """
+    src = REPO / "src"
+    offenders = []
+    for path in sorted(src.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for table in ("INSERT INTO exchange", "INSERT INTO denial"):
+            if table in text and path != REPO / "src/hx/store/records.py":
+                offenders.append(f"{path.relative_to(REPO)}: {table}")
+    assert not offenders, (
+        "a url reaches a row without passing records.redact_url: "
+        + ", ".join(offenders)
+        + ". Either write through records.record_exchange / record_denial, or "
+        "move the redaction to a boundary that covers this writer too")
+    # Anti-vacuity: the scan really did reach the file that DOES hold them.
+    records_text = (REPO / "src/hx/store/records.py").read_text(encoding="utf-8")
+    assert "INSERT INTO exchange" in records_text
+    assert "INSERT INTO denial" in records_text

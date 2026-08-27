@@ -188,8 +188,8 @@ def info(root) -> None:
     halt_state = _operator_halt(eng)
     if halt_state.halted:
         click.echo(f"  HALTED    {halt_state.reason}")
-        click.echo(f"            issuance is stopped; `hx resume` is what "
-                   f"lifts it ({halt_state.sentinel_path})")
+        click.echo(f"            issuance is stopped; `hx resume` lifts it "
+                   f"and records who did ({halt_state.sentinel_path})")
     # S5: a run with drops has coverage numbers that are a FLOOR, not a
     # complete count -- only said out loud when it is true, so it stays
     # meaningful when it fires.
@@ -343,18 +343,30 @@ def halt(reason, root) -> None:
     click.echo(f"issuance halted: {text}")
     click.echo(f"  sentinel {oh.sentinel_path}")
     click.echo("  the extension polls that file and refuses every send while "
-               "it exists; `hx resume` is the only thing that lifts it")
+               "it exists; `hx resume` is how to lift it -- deleting the file "
+               "by hand also lifts it for the extension, and records nothing")
 
 
 @main.command()
 @click.option("--root", type=click.Path(path_type=Path), default=None)
 def resume(root) -> None:
-    """Re-arm issuance. The only thing that lifts a halt.
+    """Re-arm issuance, and record that it was re-armed.
 
     A `configure` re-authorises SCOPE and never issuance, and a reconnect
-    re-asserts the halt rather than clearing it -- so this command is the
-    single way back, which is what makes refusing to run it on an
+    re-asserts the halt rather than clearing it -- so nothing in the bridge
+    lifts a halt by accident, which is what makes refusing to run this on an
     un-halted engagement safe rather than pedantic.
+
+    IT IS NOT THE ONLY WAY BACK, and an earlier version of this docstring said
+    it was. `rm <engagement>/HALTED` also lifts the halt AS FAR AS THE
+    EXTENSION IS CONCERNED -- the extension polls the file and nothing else,
+    which is precisely what S4 asks of it ("an operator can create it from a
+    shell when the socket is dead"), and a mechanism that can be created by
+    hand can be removed by hand. What that loses is the record: no
+    `agent_action` row says who lifted it, and a harness process that had
+    already read `_armed` from the store goes on refusing sends of its own
+    while the extension issues. This command is the one that leaves both
+    sides agreeing and leaves a row behind.
     """
     path = root or default_root()
     eng = _open_engagement(path)
