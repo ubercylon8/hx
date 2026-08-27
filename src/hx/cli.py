@@ -15,6 +15,7 @@ import click
 from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
 from hx.checks import registry
@@ -430,5 +431,25 @@ def scan(root, max_seconds) -> None:
             if on and not any(c.klass == klass for c in registry.CHECKS):
                 click.echo(f"note      {klass} is enabled but this build "
                            f"ships no checks in it")
+    finally:
+        eng.db.close()
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--out", type=click.Path(path_type=Path), default=None,
+              help="Where to write it. Defaults to <engagement>/exports/.")
+def report(root, out) -> None:
+    """Render the engagement as one Markdown file."""
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        text = report_mod.render(eng.db, engagement_id=eng.id,
+                                 config=eng.config, blobs=eng.blobs)
+        target = out or (eng.root / "exports" / f"{eng.config.name}.md")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        target.chmod(0o600)      # S3: never looser
+        click.echo(f"wrote {target}")
     finally:
         eng.db.close()
