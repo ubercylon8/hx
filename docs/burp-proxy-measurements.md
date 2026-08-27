@@ -477,8 +477,8 @@ pressure. `Pending.evicted()` has no reader outside its own test.
 
 ### There is no failure callback to register
 
-Measured off `montoya-api.jar` (2025-09-23), the jar `extension/build.sh`
-compiles against, with `javap`:
+Measured off `montoya-api.jar` (`Implementation-Version: 2025.10`), the jar
+`extension/build.sh` compiles against, with `javap`:
 
 ```
 ProxyRequestHandler   handleRequestReceived, handleRequestToBeSent          (2)

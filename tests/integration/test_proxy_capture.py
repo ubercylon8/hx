@@ -742,7 +742,8 @@ def test_an_allowed_request_that_cannot_connect_leaves_no_trace_at_all(rig):
     WHY IT IS NOT FIXED HERE, rather than left to look like an oversight:
 
       - THERE IS NO FAILURE CALLBACK TO USE. Measured off the jar this
-        extension compiles against (montoya-api.jar, 2025-09-23):
+        extension compiles against (montoya-api.jar,
+        `Implementation-Version: 2025.10`):
         `ProxyRequestHandler` and `ProxyResponseHandler` declare exactly two
         methods each and `HttpHandler` exactly two, and none of the six is a
         failure or timeout notification. There is nothing to register.
