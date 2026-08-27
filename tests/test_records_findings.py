@@ -1,10 +1,23 @@
 """Identity for findings, and the one place it is computed.
 
 S5's dedupe_key is a single canonical string. Its field ORDER and its
-`-`-for-absent rule are not stylistic: SQLite treats NULLs as distinct in a
-UNIQUE index, so a NULL anywhere in this key silently defeats the constraint
-the whole retest story rests on.
+`-`-for-absent rule are not stylistic. `finding.dedupe_key` is `TEXT NOT
+NULL`, so a bare `None` is rejected loudly -- measured: `INSERT INTO
+finding(...) VALUES(..., NULL, ...)` raises `IntegrityError: NOT NULL
+constraint failed: finding.dedupe_key`, not silence. (F6 of the task-5
+review: this docstring used to say a NULL here "silently defeats the
+constraint", which the measurement above contradicts.) What the `-` rule
+actually forecloses is the SILENT failure mode the loud one is not: SQLite
+treats NULLs as distinct in a UNIQUE index, so a design that let an absent
+PART reach SQL as a real NULL -- a raw column in the composite UNIQUE, or a
+key built by SQL `||` concatenation, where `NULL || anything` is itself
+`NULL` -- would let the same finding insert again on every scan with the
+constraint sitting there looking like it worked. Collapsing every part into
+one Python string with a literal placeholder for an absent part is what
+keeps that failure mode out of reach in the first place.
 """
+import sqlite3
+
 import pytest
 
 from hx.checks import base
@@ -43,8 +56,11 @@ def test_insertion_kind_is_part_of_identity():
 
 
 def test_upsert_is_idempotent_across_runs(engagement_conn):
-    """Two runs seeing one finding produce ONE finding row and TWO
-    observations. That is the whole retest mechanism."""
+    """Two runs seeing one finding produce ONE finding row, not two. Whether
+    each run also produced its own observation is `record_observation`'s
+    concern, not `upsert_finding`'s -- see the `test_record_observation_*`
+    tests below, corrected here in F2 of the task-5 review: this docstring
+    used to claim "TWO observations" while the test below writes none."""
     c = base.Candidate(title="t", severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     a = records.upsert_finding(engagement_conn, engagement_id="e-1",
@@ -156,3 +172,129 @@ def test_evidence_records_a_genuinely_new_exchange_on_a_later_run(engagement_con
         "SELECT seq, exchange_id FROM evidence WHERE finding_id=? ORDER BY seq",
         (fid,)).fetchall()
     assert rows == [(0, "x-1"), (1, "x-9")]
+
+
+def test_evidence_accumulates_one_row_per_genuinely_new_observation(engagement_conn):
+    """F1 of the task-5 review, pinned directly: the claim the old docstring
+    made -- "a chain that does not grow on re-observation" -- is false of the
+    real path, because `record_exchange` mints a fresh `x-<random>` id per
+    row. Two runs, each producing its OWN new exchange (never the same id
+    twice, unlike the re-recording test above), must leave TWO evidence rows,
+    not one. If `record_evidence` were changed to actually implement the
+    false claim -- deduping by finding_id rather than by exchange id, say --
+    this is the test that would catch it.
+    """
+    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+                       insertion=None, exchange_ids=("x-1",))
+    fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                                 candidate=c, dedupe_key=key(), run_id="r-1")
+    records.record_evidence(engagement_conn, finding_id=fid,
+                            exchange_ids=("x-1",), at_us=1)
+    records.record_evidence(engagement_conn, finding_id=fid,
+                            exchange_ids=("x-2",), at_us=2)
+    rows = engagement_conn.execute(
+        "SELECT seq, exchange_id FROM evidence WHERE finding_id=? ORDER BY seq",
+        (fid,)).fetchall()
+    assert rows == [(0, "x-1"), (1, "x-2")]
+
+
+def test_a_mid_loop_failure_leaves_no_partial_chain(engagement_conn):
+    """F5 of the task-5 review: `record_evidence` writes N rows on an
+    autocommit connection unless wrapped in `db.transaction`. A dangling
+    exchange id -- one naming no real `exchange` row -- fails the FOREIGN KEY
+    check on ITS OWN insert, the second of two, so this is a real mid-loop
+    failure, not a mock. Wrapped, the whole call rolls back and neither row
+    survives; unwrapped, the first (`x-1`) would already be committed.
+    """
+    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+                       insertion=None, exchange_ids=("x-1", "x-2"))
+    fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                                 candidate=c, dedupe_key=key(), run_id="r-1")
+    with pytest.raises(sqlite3.IntegrityError):
+        records.record_evidence(engagement_conn, finding_id=fid,
+                                exchange_ids=("x-1", "x-does-not-exist"),
+                                at_us=1)
+    n = engagement_conn.execute(
+        "SELECT COUNT(*) FROM evidence WHERE finding_id=?", (fid,)).fetchone()[0]
+    assert n == 0
+
+
+def test_record_observation_inserts_a_row(engagement_conn):
+    """F2 of the task-5 review: `record_observation` had zero tests -- its
+    entire body could be replaced with `return None` and the suite stayed
+    green. This is the insert path."""
+    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+                       insertion=None, exchange_ids=("x-1",))
+    fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                                 candidate=c, dedupe_key=key(), run_id="r-1")
+    records.record_observation(engagement_conn, finding_id=fid, run_id="r-1",
+                               observed=True, exchange_id="x-1",
+                               severity_at="Low", confidence_at="Firm",
+                               at_us=1)
+    row = engagement_conn.execute(
+        "SELECT finding_id, run_id, observed, exchange_id, severity_at,"
+        " confidence_at FROM finding_observation").fetchone()
+    assert row == (fid, "r-1", 1, "x-1", "Low", "Firm")
+
+
+def test_record_observation_false_is_its_own_case(engagement_conn):
+    """`observed=False` must be stored as `0`, not silently treated the same
+    as `observed=True` by a writer that never looks at the flag."""
+    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+                       insertion=None, exchange_ids=("x-1",))
+    fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                                 candidate=c, dedupe_key=key(), run_id="r-1")
+    records.record_observation(engagement_conn, finding_id=fid, run_id="r-1",
+                               observed=False, exchange_id=None,
+                               severity_at="Low", confidence_at="Firm",
+                               at_us=1)
+    observed = engagement_conn.execute(
+        "SELECT observed FROM finding_observation").fetchone()[0]
+    assert observed == 0
+
+
+def test_record_observation_upserts_on_conflict(engagement_conn):
+    """The `ON CONFLICT(finding_id, run_id)` path: a second call for the same
+    finding and run must UPDATE the one row `finding_observation`'s primary
+    key allows, not raise and not duplicate."""
+    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+                       insertion=None, exchange_ids=("x-1",))
+    fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                                 candidate=c, dedupe_key=key(), run_id="r-1")
+    records.record_observation(engagement_conn, finding_id=fid, run_id="r-1",
+                               observed=True, exchange_id="x-1",
+                               severity_at="Low", confidence_at="Firm",
+                               at_us=1)
+    records.record_observation(engagement_conn, finding_id=fid, run_id="r-1",
+                               observed=False, exchange_id="x-2",
+                               severity_at="Low", confidence_at="Firm",
+                               at_us=2)
+    n = engagement_conn.execute(
+        "SELECT COUNT(*) FROM finding_observation").fetchone()[0]
+    assert n == 1
+    row = engagement_conn.execute(
+        "SELECT observed, exchange_id, ts_us FROM finding_observation").fetchone()
+    assert row == (0, "x-2", 2)
+
+
+def test_record_observation_refreshes_severity_and_confidence_together(engagement_conn):
+    """F7 of the task-5 review: the DO UPDATE used to refresh `observed`,
+    `exchange_id` and `ts_us` but leave `severity_at`/`confidence_at` at the
+    FIRST call's values. A second call in the same run with a changed
+    severity must not leave the row half-updated -- one row is one answer,
+    and all five fields move together or none do."""
+    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+                       insertion=None, exchange_ids=("x-1",))
+    fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                                 candidate=c, dedupe_key=key(), run_id="r-1")
+    records.record_observation(engagement_conn, finding_id=fid, run_id="r-1",
+                               observed=True, exchange_id="x-1",
+                               severity_at="Low", confidence_at="Firm",
+                               at_us=1)
+    records.record_observation(engagement_conn, finding_id=fid, run_id="r-1",
+                               observed=True, exchange_id="x-2",
+                               severity_at="Critical", confidence_at="Certain",
+                               at_us=2)
+    row = engagement_conn.execute(
+        "SELECT severity_at, confidence_at FROM finding_observation").fetchone()
+    assert row == ("Critical", "Certain")

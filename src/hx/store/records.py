@@ -43,6 +43,8 @@ from __future__ import annotations
 import sqlite3
 import uuid
 
+from hx.store.db import transaction
+
 # Error class (spec S6) -> the `kind` value the denial table's CHECK
 # constraint accepts. The vocabulary is Plan 1's and cannot be widened from
 # here: an unrecognised kind is refused by SQLite itself, so this map is the
@@ -706,13 +708,6 @@ def abort_run(conn: sqlite3.Connection, *, run_id: str,
     return False
 
 
-# S5's canonical dedupe key, in its field order. ONE builder, because two
-# spellings of one finding are two rows behind a UNIQUE constraint that was
-# supposed to prevent exactly that.
-_DEDUPE_FIELDS = ("type", "scheme", "host", "port", "method", "path_template",
-                  "insertion_kind", "insertion_name")
-
-
 def dedupe_key(*, type_: str, scheme: str, host: str, port: int | None,
                method: str, path_template: str,
                insertion_kind: str | None, insertion_name: str | None) -> str:
@@ -785,6 +780,17 @@ def record_observation(conn: sqlite3.Connection, *, finding_id: str,
 
     `observed=0` is how a retest says FIXED -- but only where the surface was
     actually tested. The caller owns that distinction; see `hx.scan`.
+
+    A SECOND CALL FOR THE SAME `(finding_id, run_id)` REPLACES THE WHOLE ROW,
+    not a subset of its columns. F7 of the task-5 review: the DO UPDATE used
+    to refresh `observed`, `exchange_id` and `ts_us` but leave `severity_at`
+    and `confidence_at` at whatever the FIRST call in this run wrote, so two
+    calls in one run could leave a row pairing a stale severity with a fresh
+    `observed` -- one row claiming to be "this run's answer" while two of its
+    five fields answered for different moments. This row is not a
+    point-in-time record with its own history; that history is `run_id`
+    itself, one row per run. Within one run there is exactly one current
+    answer, and the last call to name it wins on every column.
     """
     conn.execute(
         "INSERT INTO finding_observation(finding_id, run_id, observed,"
@@ -792,6 +798,8 @@ def record_observation(conn: sqlite3.Connection, *, finding_id: str,
         " VALUES(?,?,?,?,?,?,?)"
         " ON CONFLICT(finding_id, run_id) DO UPDATE SET"
         "   observed=excluded.observed, exchange_id=excluded.exchange_id,"
+        "   severity_at=excluded.severity_at,"
+        "   confidence_at=excluded.confidence_at,"
         "   ts_us=excluded.ts_us",
         (finding_id, run_id, 1 if observed else 0, exchange_id,
          severity_at, confidence_at, at_us))
@@ -799,39 +807,59 @@ def record_observation(conn: sqlite3.Connection, *, finding_id: str,
 
 def record_evidence(conn: sqlite3.Connection, *, finding_id: str,
                     exchange_ids, at_us: int) -> None:
-    """The exchanges behind a finding, appended in order, without duplicates.
+    """Append the given exchanges to this finding's evidence chain, `seq`
+    continuing from what is already there. `seq` is the order S12 renders
+    the chain in.
 
-    `seq` is the order S12 renders the chain in.
+    `evidence` is append-only BY SCHEMA: `trg_evidence_no_update` and
+    `trg_evidence_no_delete` both `RAISE(ABORT, 'evidence is immutable')`,
+    because evidence is what a disputed finding is proven with and must not
+    be alterable after capture. The plan originally specified this function
+    as REPLACE -- `DELETE FROM evidence` then re-insert -- and that raised
+    `IntegrityError` on the second recording of any finding, measured, which
+    is how the trigger was found. This function only ever appends.
 
-    THE PLAN SAID THIS FUNCTION REPLACES. IT CANNOT, AND THE SCHEMA IS RIGHT.
-    `evidence` carries `trg_evidence_no_update` and `trg_evidence_no_delete`,
-    both of which `RAISE(ABORT, 'evidence is immutable')`, for the reason
-    written beside them: evidence is what a disputed finding is proven with
-    and must not be alterable after capture. A `DELETE FROM evidence` here
-    raised `IntegrityError` on the second recording of any finding --
-    measured, which is how this was found -- so re-recording could never have
-    replaced anything. It appends.
+    THE SKIP BELOW DOES ONE THING: it records each EXCHANGE ID once per
+    finding, so calling this twice with the same ids -- a retry, a duplicate
+    dispatch inside one run -- does not double the chain. F1 of the task-5
+    review: an earlier version of this docstring claimed that property as "a
+    chain that does not grow on re-observation" and "a finding seen in three
+    runs would not carry its exchange three times". That is FALSE of the real
+    path. `record_exchange` mints a fresh `x-<random>` id per row
+    (`new_id("x")`), so a later run observing the same finding produces a
+    NEW exchange with a new id every time -- the skip never fires across
+    runs, and a finding seen in N runs genuinely accumulates N evidence rows,
+    one per observation. This function does not and cannot dedupe across
+    runs; it has no stable key to dedupe on that would not also be a claim
+    about identity this module does not own. Per-run persistence -- "how many
+    runs has this been seen in" -- is `finding_observation`'s job, whose
+    primary key is `(finding_id, run_id)`; that is the table that answers it,
+    not this one.
 
-    APPENDING ALONE IS NOT ENOUGH EITHER. A finding seen in three runs would
-    otherwise carry its exchange three times, and S12 renders that chain into
-    the report, where one problem observed once would read as three. So each
-    exchange is recorded ONCE per finding: already-recorded ids are skipped,
-    and `seq` continues from what is there rather than restarting.
+    UNBOUNDED GROWTH IS THE REAL CONSEQUENCE AND IS NOT FIXED HERE: a finding
+    seen in fifty runs holds fifty evidence rows, and a report must not print
+    fifty rows for one problem. §12 renders this chain; bounding what it
+    shows is the renderer's job, not this writer's -- the reader's next
+    question, named rather than solved.
 
-    The result is the property the plan wanted -- a chain that does not grow
-    on re-observation -- reached by the only route the schema permits.
+    Wrapped in `db.transaction` (F5 of the task-5 review): on the autocommit
+    connection `db.connect()` returns, an unwrapped multi-row loop failing
+    partway through leaves the rows already inserted committed -- a partial
+    chain that looks like the whole one until someone counts it.
     """
-    known = {row[0] for row in conn.execute(
-        "SELECT exchange_id FROM evidence WHERE finding_id=?", (finding_id,))}
-    seq = conn.execute(
-        "SELECT COALESCE(MAX(seq) + 1, 0) FROM evidence WHERE finding_id=?",
-        (finding_id,)).fetchone()[0]
-    for exchange_id in exchange_ids:
-        if exchange_id in known:
-            continue
-        conn.execute(
-            "INSERT INTO evidence(id, finding_id, seq, role, kind,"
-            " exchange_id, captured_us) VALUES(?,?,?,'proof','exchange',?,?)",
-            (new_id("ev"), finding_id, seq, exchange_id, at_us))
-        known.add(exchange_id)
-        seq += 1
+    with transaction(conn):
+        known = {row[0] for row in conn.execute(
+            "SELECT exchange_id FROM evidence WHERE finding_id=?",
+            (finding_id,))}
+        seq = conn.execute(
+            "SELECT COALESCE(MAX(seq) + 1, 0) FROM evidence WHERE finding_id=?",
+            (finding_id,)).fetchone()[0]
+        for exchange_id in exchange_ids:
+            if exchange_id in known:
+                continue
+            conn.execute(
+                "INSERT INTO evidence(id, finding_id, seq, role, kind,"
+                " exchange_id, captured_us) VALUES(?,?,?,'proof','exchange',?,?)",
+                (new_id("ev"), finding_id, seq, exchange_id, at_us))
+            known.add(exchange_id)
+            seq += 1
