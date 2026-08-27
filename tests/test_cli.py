@@ -8,6 +8,7 @@ from hx import cli
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
 from hx import run as run_mod
+from hx import scan as scan_mod
 from hx.store import records as records_mod
 
 
@@ -772,3 +773,84 @@ def test_deleting_the_sentinel_by_hand_leaves_the_two_sides_disagreeing(engageme
     result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
     assert result.exit_code == 0, result.output
     assert _halt_state(engagement)[0] is False
+
+
+# --- Task 7: `hx scan` ---
+
+
+@pytest.fixture
+def engagement_with_surface(engagement: Path) -> Path:
+    """One `surface` row and one `exchange` against it, so a passive check --
+    `active_safe`, `active_mutate` and `active_dos` all default to `probes`,
+    not `on_surface`, and this plan ships none of those -- has something to
+    read. Built on `engagement` the way `engagement_with_drops` and
+    `engagement_with_stale_run` are, per P2: this fixture did not exist
+    before this task."""
+    eng = eng_mod.open_(engagement)
+    try:
+        eng.db.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+            " port, path_template, discovered_by, normaliser_version)"
+            " VALUES('s1', ?, 'GET', 'https', 'app.acme.com', 443,"
+            " '/api/widgets', 'proxy', 1)",
+            (eng.id,))
+        records_mod.record_exchange(
+            eng.db, run_id=None, method="GET",
+            url="https://app.acme.com/api/widgets", status=200,
+            req_blob=None, resp_blob=None, ms=0, at_us=eng_mod.now_us(),
+            outcome="ok", surface_id="s1")
+    finally:
+        eng.db.close()
+    return engagement
+
+
+def test_scan_reports_what_it_ran(engagement_with_surface):
+    result = CliRunner().invoke(cli.main,
+                                ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    assert "surfaces" in result.output.lower()
+
+
+def test_scan_names_a_class_that_is_enabled_but_ships_no_checks(engagement_with_surface):
+    """config.DEFAULT_CHECKS turns `active_timing` ON by default and this
+    plan ships no checks in it. An operator reading `active_timing: enabled`
+    and seeing no rows would reasonably conclude it ran and found nothing.
+    The scan says so out loud instead."""
+    result = CliRunner().invoke(cli.main,
+                                ["scan", "--root", str(engagement_with_surface)])
+    assert "active_timing" in result.output
+    assert "no checks" in result.output.lower()
+
+
+def test_scan_with_no_surfaces_says_so_rather_than_reporting_success(engagement):
+    """Nothing captured yet is not the same as nothing found. An operator who
+    forgot to browse must not read `0 findings` as a clean bill."""
+    result = CliRunner().invoke(cli.main, ["scan", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "no surfaces" in result.output.lower()
+
+
+def test_scan_refuses_a_root_that_is_not_an_engagement(tmp_path):
+    result = CliRunner().invoke(cli.main, ["scan", "--root", str(tmp_path)])
+    assert result.exit_code != 0
+    assert result.output.strip()
+
+
+def test_scan_max_seconds_reaches_the_runner(engagement_with_surface, monkeypatch):
+    """Row C of the sweep: none of the tests above ever pass `--max-seconds`,
+    so a CLI that silently dropped it in favour of `max_seconds=None` on the
+    call to `scan.run` would leave every test above green. A deadline already
+    in the past is the input that separates 'wired through' from 'ignored' --
+    it only truncates the scan if the CLI's own option actually reaches
+    `scan.run`. `time.monotonic` is patched the same way
+    `test_budget_exhaustion_writes_skipped_rows_for_the_remaining_surfaces`
+    in `tests/test_scan.py` does it: one call to compute the deadline, one
+    call for the single surface `engagement_with_surface` seeds."""
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(scan_mod.time, "monotonic", lambda: next(ticks))
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface), "--max-seconds", "0",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "surfaces  0" in result.output
+    assert "skipped" in result.output.lower()

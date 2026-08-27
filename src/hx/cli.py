@@ -16,6 +16,8 @@ from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
 from hx import run as run_mod
+from hx import scan as scan_mod
+from hx.checks import registry
 from hx.store import db as db_mod
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -388,3 +390,45 @@ def resume(root) -> None:
             f"resume failed and the halt still stands ({oh.sentinel_path}): {exc}"
         ) from exc
     click.echo(f"issuance resumed; the halt was: {was}")
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--max-seconds", type=int, default=None,
+              help="Stop after this long. Remaining checks are recorded as "
+                   "skipped, never left absent.")
+def scan(root, max_seconds) -> None:
+    """Run the enabled check corpus over everything captured so far."""
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        surfaces = eng.db.execute(
+            "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
+            (eng.id,)).fetchone()[0]
+        if surfaces == 0:
+            # NOT an error, and not silence either. Nothing captured is a
+            # different fact from nothing found, and an operator who forgot
+            # to browse must not read `0 findings` as a clean bill.
+            click.echo("no surfaces captured yet -- browse the target "
+                       "through the proxy first, then scan")
+            return
+
+        summary = scan_mod.run(
+            eng.db, engagement_id=eng.id, blobs=eng.blobs,
+            config=eng.config, max_seconds=max_seconds)
+        click.echo(f"surfaces  {summary.surfaces}")
+        click.echo(f"checks    {summary.checks_run}")
+        click.echo(f"findings  {summary.findings}")
+        if summary.skipped:
+            for reason, n in sorted(summary.by_reason.items()):
+                click.echo(f"skipped   {n} ({reason})")
+
+        # A class the operator enabled that this build ships nothing for.
+        # Without this line, `active_timing: true` plus no rows reads as
+        # "ran, found nothing".
+        for klass, on in sorted(eng.config.checks.items()):
+            if on and not any(c.klass == klass for c in registry.CHECKS):
+                click.echo(f"note      {klass} is enabled but this build "
+                           f"ships no checks in it")
+    finally:
+        eng.db.close()
