@@ -1,0 +1,130 @@
+# Shared request-TARGET redaction vectors. BOTH sides run against this file:
+#
+#   Java   hx.send.Redactor.redactObservedRequest, on `GET <in> HTTP/1.1`
+#          -- the request line of a proxy observation, which is what reaches
+#          the content-addressed blob store.
+#   Python hx.store.records.redact_url, on the `url` column of `exchange` and
+#          `denial`.
+#
+# TWO RULES, ONE FILE, AND THIS IS THE ONE PLACE THEY ARE COMPARED.
+#
+#   USERINFO -- structural. RFC 3986 3.2/3.2.1: the authority is what follows
+#   `//` and runs to the next `/ ? #` or the end; within it, everything up to
+#   and including the LAST `@` is userinfo, because `@` is a gen-delim that no
+#   host and no port may carry. Nothing is guessed.
+#
+#   CREDENTIAL PARAMETERS -- a fixed list of NAMES, matched whole and
+#   case-insensitively (Redactor.CREDENTIAL_PARAMS / records.CREDENTIAL_PARAMS,
+#   compared against each other by their own test). The name and the `=` are
+#   kept and only the value is replaced. Names and never SHAPES: a rule that
+#   redacted what looks opaque would rewrite `?id=1001` and corrupt the exact
+#   evidence an access-control check reads.
+#
+# Two implementations of both, in two languages, is exactly the drift this
+# repository has been bitten by twice, so neither side restates the cases.
+#
+# Format: one case per line, `input<TAB>expected`. Blank lines and lines
+# beginning with `#` are comments. No case may contain a tab, a CR or an LF --
+# both readers split on the tab and neither escapes anything.
+#
+# WHAT THE BOTTOM SECTION IS FOR: the limit of the parameter list, pinned as a
+# fact. A client's own name for a token is NOT caught, and the cases there say
+# so in the only way that cannot quietly rot.
+
+# ---- nothing to do: these must come through byte for byte ----------------
+http://app.example.test/orders	http://app.example.test/orders
+https://app.example.test:8443/a/b?c=d	https://app.example.test:8443/a/b?c=d
+/orders?status=open	/orders?status=open
+http://app.example.test/	http://app.example.test/
+http://app.example.test	http://app.example.test
+
+# ---- the finding: userinfo in the authority ------------------------------
+http://user:pass@app.example.test/	http://{{observed:userinfo}}@app.example.test/
+https://user:pass@app.example.test/x?y=1	https://{{observed:userinfo}}@app.example.test/x?y=1
+http://ghp_livetokenwithnocolon@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+http://user:pass@app.example.test:8443/x	http://{{observed:userinfo}}@app.example.test:8443/x
+http://user:pass@app.example.test	http://{{observed:userinfo}}@app.example.test
+http://:pass@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+http://user:@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+http://u%3Ap@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+
+# DETERMINISM. Two browses of one page under two credentials must produce one
+# blob and one url, so these two rows must have the SAME right-hand side as
+# each other and as the first row of this section.
+http://alice:s3cret@app.example.test/	http://{{observed:userinfo}}@app.example.test/
+http://bob:hunter2@app.example.test/	http://{{observed:userinfo}}@app.example.test/
+
+# ---- the last `@` wins ---------------------------------------------------
+# Malformed -- a conforming userinfo pct-encodes its own `@` -- but if one
+# arrives, taking the FIRST would leave the bytes between the two verbatim,
+# which is the half most likely to be the secret.
+http://a@b:c@app.example.test/x	http://{{observed:userinfo}}@app.example.test/x
+
+# ---- an `@` that is NOT in the authority ---------------------------------
+# It is in the path, and RFC 3986 3.3 allows `@` there. Redacting it would
+# rewrite a real path segment and corrupt the evidence a check reads.
+http://app.example.test/users/alice@example.test	http://app.example.test/users/alice@example.test
+http://app.example.test/x?to=alice@example.test	http://app.example.test/x?to=alice@example.test
+http://app.example.test/#alice@example.test	http://app.example.test/#alice@example.test
+
+# ---- an absolute URI nested in the target's query ------------------------
+# The FIRST `://` in the line is the one scanned. Here it belongs to the
+# nested URI, and that nested URI's userinfo is a credential in the target
+# just as much as the outer one would be.
+/redirect?to=http://user:pass@evil.example.test/	/redirect?to=http://{{observed:userinfo}}@evil.example.test/
+
+# ---- credential PARAMETERS: the value goes, the key stays ----------------
+/cb?access_token=eyJhbGciOiJIUzI1NiJ9.live.9f2c	/cb?access_token={{observed:param}}
+https://app.example.test/p?api_key=AKIAIOSFODNN7EXAMPLE	https://app.example.test/p?api_key={{observed:param}}
+https://app.example.test/p?id=1001&token=live-token&page=2	https://app.example.test/p?id=1001&token={{observed:param}}&page=2
+https://app.example.test/p?password=hunter2	https://app.example.test/p?password={{observed:param}}
+https://app.example.test/p?X-Amz-Signature=deadbeef&X-Amz-Expires=900	https://app.example.test/p?X-Amz-Signature={{observed:param}}&X-Amz-Expires=900
+https://app.example.test/p?sig=abc&signature=def	https://app.example.test/p?sig={{observed:param}}&signature={{observed:param}}
+
+# Matched case-insensitively, the same way the header names are, and the key
+# keeps ITS OWN case -- only the value is touched.
+https://app.example.test/p?Access_Token=live	https://app.example.test/p?Access_Token={{observed:param}}
+https://app.example.test/p?APIKEY=live	https://app.example.test/p?APIKEY={{observed:param}}
+
+# DETERMINISM, again: two requests differing only in the credential VALUE must
+# have the same right-hand side.
+https://app.example.test/cb?access_token=aaaaaaaaaaaa	https://app.example.test/cb?access_token={{observed:param}}
+https://app.example.test/cb?access_token=zzzz	https://app.example.test/cb?access_token={{observed:param}}
+
+# ---- and what the parameter rule must NOT touch --------------------------
+# `?id=1001` is the whole reason this is a list of names and not a shape rule
+# or a blanket redaction: an access-control check needs to read it.
+https://app.example.test/order/1001?id=1001	https://app.example.test/order/1001?id=1001
+https://app.example.test/p?state=xyzzy&code=US&nonce=abc	https://app.example.test/p?state=xyzzy&code=US&nonce=abc
+https://app.example.test/p?tokenizer=fast	https://app.example.test/p?tokenizer=fast
+https://app.example.test/p?my_access_token=live	https://app.example.test/p?my_access_token=live
+
+# A pair with no `=` has no value to redact; an EMPTY value cannot be a
+# credential and a placeholder there would read as an issuance.
+https://app.example.test/p?token	https://app.example.test/p?token
+https://app.example.test/p?token=&next=/home	https://app.example.test/p?token=&next=/home
+
+# The query starts at the first `?` and ends at `#`. An `@` or a `token=` in a
+# FRAGMENT is not in the query.
+https://app.example.test/p?id=1#token=notaquery	https://app.example.test/p?id=1#token=notaquery
+
+# Userinfo and a credential parameter in one target: both, independently.
+http://user:pass@app.example.test/cb?access_token=live&id=7	http://{{observed:userinfo}}@app.example.test/cb?access_token={{observed:param}}&id=7
+
+# NESTING. The parameter value contains a whole URI with its own userinfo, and
+# the parameter is a credential one -- so the value cut swallows the userinfo
+# cut. Emitting both would write the same bytes twice.
+https://app.example.test/cb?access_token=http://u:p@h/	https://app.example.test/cb?access_token={{observed:param}}
+# ...and when the parameter is NOT a credential one, the nested userinfo is
+# still redacted on its own.
+/redirect?next=http://user:pass@evil.example.test/	/redirect?next=http://{{observed:userinfo}}@evil.example.test/
+
+# ---- THE LIMIT, pinned as a measured fact --------------------------------
+# THIS CATCHES A FIXED LIST OF WELL-KNOWN NAMES AND DOES NOT CATCH A CLIENT'S
+# OWN NAME FOR A TOKEN. These reach the column and the blob store VERBATIM. If
+# either side ever starts redacting them, someone has widened the list -- and
+# that should be a decision, taken with the operator-declared config it needs,
+# not a side effect.
+https://app.example.test/p?acme_session=live-session-value	https://app.example.test/p?acme_session=live-session-value
+https://app.example.test/p?%61ccess_token=live	https://app.example.test/p?%61ccess_token=live
+https://app.example.test/p?id=1;token=live	https://app.example.test/p?id=1;token=live

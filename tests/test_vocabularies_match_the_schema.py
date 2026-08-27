@@ -228,6 +228,16 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
         # subject; no column holds the set, and `config.load` refuses a key
         # outside it directly.
         "hx.config.DEFAULT_CHECKS",
+        # §7's credential-parameter names, whose VALUES `redact_url` replaces
+        # in `exchange.url` and `denial.url`. No column enumerates them -- the
+        # column holds a redacted URL, not a vocabulary -- so there is no
+        # CHECK to pair this against. It IS a vocabulary in two places, and it
+        # is compared in one: `tests/test_credentials_never_reach_the_store.py`
+        # reads `CREDENTIAL_PARAMS` out of `extension/src/hx/send/Redactor.java`
+        # and requires the two sets to be equal. The other copy is in another
+        # LANGUAGE, which is why this file's schema-derived scan cannot be the
+        # thing that holds it.
+        "hx.store.records.CREDENTIAL_PARAMS",
     }
     found = set()
     for mod, name in ((run_mod, "hx.run"), (config_mod, "hx.config"),

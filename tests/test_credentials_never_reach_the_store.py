@@ -16,21 +16,30 @@ THE RULE. A VOCABULARY THAT EXISTS IN TWO PLACES MUST BE COMPARED IN ONE --
 out. Here the two places are two LANGUAGES: `Redactor.redactObservedRequest`
 rewrites a request line inside the JVM and `records.redact_url` rewrites a url
 column in Python, and they are the same RFC 3986 rule written twice. So neither
-side owns the cases: both read `tests/vectors/userinfo.txt`, the Java side from
-`RedactorTest.theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem`
+side owns the cases: both read `tests/vectors/request-target.txt`, the Java side from
+`RedactorTest.theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem`
 and this side from `test_the_shared_vectors_are_redacted_the_same_way_java_redacts_them`
 below. The PLACEHOLDER is pinned separately, by reading it out of the .java
 file, because a shared vector file cannot catch two sides that agree with each
 other and disagree with the constant they both quote.
 
-WHAT IS NOT CLOSED is asserted here as loudly as what is: a credential in a
-QUERY PARAMETER reaches both the column and the blob, and
-`test_a_credential_in_the_query_is_not_redacted_and_that_is_the_open_half`
-pins it. Reaching it needs either a list of parameter names -- a vocabulary
-that drifts silently toward storing a credential -- or a rule that redacts by
-shape, which rewrites `?id=5` and corrupts the evidence a check reads. If that
-test ever goes red, someone has chosen one of those, and it should be a
-decision rather than a side effect.
+TWO RULES LIVE HERE NOW. Userinfo is STRUCTURAL -- RFC 3986 says where it is,
+and nothing is guessed. Credential PARAMETERS are a fixed list of NAMES,
+matched whole and case-insensitively, with the key kept and only the value
+replaced. Names and never shapes: a rule that redacted what looks opaque would
+rewrite `?id=1001` and corrupt the exact evidence an access-control check
+reads, which is the finding the redaction was protecting.
+
+WHAT IS NOT CLOSED is asserted here as loudly as what is. The list catches
+well-known names and NOT a client's own name for a token:
+`test_a_clients_own_name_for_a_token_is_not_caught` drives a made-up parameter
+and requires it to survive, so the limit is a measured fact rather than a
+caveat someone can quietly widen. If that test goes red the list grew -- which
+is allowed, but is a DECISION, and the honest version of it is an
+operator-declared list in the engagement config. That needs a config schema
+change AND a `configure` wire key to carry it, and an unrecognised `configure`
+key is a hard `bad_config` today, so there is no wire for it either; both
+halves land together or an operator's list is silently ignored.
 """
 from __future__ import annotations
 
@@ -39,11 +48,12 @@ from pathlib import Path
 
 import pytest
 
+from hx import surface
 from hx.store import db as db_mod
 from hx.store import records
 
 REPO = Path(__file__).resolve().parents[1]
-VECTORS = REPO / "tests" / "vectors" / "userinfo.txt"
+VECTORS = REPO / "tests" / "vectors" / "request-target.txt"
 REDACTOR_JAVA = REPO / "extension" / "src" / "hx" / "send" / "Redactor.java"
 
 
@@ -103,20 +113,127 @@ def test_the_placeholder_is_the_string_the_extension_writes_into_the_blob():
     assert m.group(1) == records.OBSERVED_USERINFO == "{{observed:userinfo}}"
 
 
-def test_a_credential_in_the_query_is_not_redacted_and_that_is_the_open_half():
-    """THE HALF THIS DOES NOT CLOSE, pinned as a fact.
+def test_the_parameter_vocabulary_is_the_extensions_vocabulary():
+    """A VOCABULARY THAT EXISTS IN TWO PLACES, COMPARED IN ONE.
 
-    `?access_token=` reaches `exchange.url` and the blob store verbatim. The
-    reviewer measured it; nothing here fixes it; and an unstated leak is the
-    thing this project keeps finding, so it is stated as a check rather than a
-    sentence. The Java side pins the same input against the blob
-    (`aCredentialInTheQUERYIsNamedAsNotCovered`), so both halves of the
-    exposure are visible from both sides.
+    `Redactor.CREDENTIAL_PARAMS` and `records.CREDENTIAL_PARAMS` are one list
+    written twice, in two languages. The shared vector file catches a
+    BEHAVIOURAL difference on the cases it happens to contain; this catches a
+    name added to one side and not the other, which is the drift that leaks
+    without ever failing a vector -- the column would redact `?api_key=` and
+    the blob beside it would not, and a report joining them shows two
+    different requests.
     """
+    java = REDACTOR_JAVA.read_text(encoding="utf-8")
+    m = re.search(r"CREDENTIAL_PARAMS\s*=\s*\{(.*?)\};", java, re.S)
+    assert m is not None, f"Redactor.CREDENTIAL_PARAMS not found in {REDACTOR_JAVA}"
+    names = set(re.findall(r'"([^"]+)"', m.group(1)))
+    assert names, "parsed an EMPTY name list out of the .java file"
+    assert names == set(records.CREDENTIAL_PARAMS), (
+        "the two credential-parameter lists have drifted. Only in Java: "
+        f"{sorted(names - set(records.CREDENTIAL_PARAMS))}; only in Python: "
+        f"{sorted(set(records.CREDENTIAL_PARAMS) - names)}")
+    # Anti-vacuity and a spot value, so a regex that matched structure but not
+    # content cannot pass.
+    assert "access_token" in names and len(names) >= 20
+
+
+def test_the_parameter_placeholder_is_the_string_the_extension_writes():
+    java = REDACTOR_JAVA.read_text(encoding="utf-8")
+    m = re.search(r'OBSERVED_PARAM\s*=\s*\n?\s*"([^"]*)"', java)
+    assert m is not None, f"Redactor.OBSERVED_PARAM not found in {REDACTOR_JAVA}"
+    assert m.group(1) == records.OBSERVED_PARAM == "{{observed:param}}"
+
+
+def test_every_listed_name_actually_redacts():
+    """The list is only worth what it DOES. A name present in both constants
+    and matched by neither implementation is a vocabulary entry with no
+    behaviour, which is how a list becomes decoration."""
+    for name in sorted(records.CREDENTIAL_PARAMS):
+        url = f"https://app.example.test/p?{name}=live-secret-value"
+        got = records.redact_url(url)
+        assert got == f"https://app.example.test/p?{name}={{{{observed:param}}}}", \
+            f"{name!r} is in the vocabulary and does not redact: {got!r}"
+
+
+def test_a_credential_parameter_loses_its_value_and_keeps_its_key():
+    """Property 1. The key is what `surface.query_key_set` reads."""
     token = "eyJhbGciOiJIUzI1NiJ9.live.9f2c"
-    url = f"https://app.example.test/cb?access_token={token}"
+    got = records.redact_url(
+        f"https://app.example.test/cb?access_token={token}&id=1001")
+    assert token not in got
+    assert got == ("https://app.example.test/cb?access_token="
+                   "{{observed:param}}&id=1001")
+
+
+def test_the_surface_a_request_belongs_to_is_unchanged_by_the_redaction():
+    """PROPERTY 1, VERIFIED AGAINST THE REAL NORMALISER rather than by reading
+    it. `query_key_set` builds its set from `parse_qsl` KEYS, so a redaction
+    that touched only values cannot move it -- but that is an argument, and
+    the thing it is an argument about is which SURFACE a request is filed
+    under. Over-templating merges endpoints the checks then visit once, and
+    §5 says a wrong rule is a permanent hole in the evidence rather than a
+    re-runnable step. So it is driven.
+
+    Today `hx.capture` normalises the RAW url and redacts at the writer, so
+    the two cannot disagree by construction. This is what holds if the
+    redaction ever moves earlier.
+    """
+    raw = ("https://app.example.test/order/1001"
+           "?access_token=eyJ.live.9f2c&id=1001&page=2")
+    kw = dict(preserve=frozenset(), slug_threshold=24)
+    before = surface.normalise("GET", raw, **kw)
+    after = surface.normalise("GET", records.redact_url(raw), **kw)
+    assert before.query_key_set == after.query_key_set
+    assert before.path_template == after.path_template
+    assert before == after, (
+        "redacting a parameter VALUE changed the surface the request belongs "
+        f"to: {before} vs {after}")
+    # Anti-vacuity: the fixture really does carry the keys, so an equality
+    # between two empty key sets cannot be what passed.
+    assert before.query_key_set == "access_token,id,page"
+
+
+def test_an_identifier_parameter_is_never_touched():
+    """Property 2, and the reason the mechanism is a list of NAMES. `?id=1001`
+    is what an IDOR check reads; a shape rule eats exactly this and makes the
+    finding it was protecting unprovable."""
+    url = "https://app.example.test/order/1001?id=1001&state=xyzzy&code=US"
     assert records.redact_url(url) == url
-    assert token in records.redact_url(url)
+
+
+def test_two_urls_differing_only_in_the_credential_are_one_string():
+    """Property 3. The column half of determinism: two rows for one endpoint
+    under two tokens must not differ, or every query grouping by url splits."""
+    a = records.redact_url("https://app.example.test/cb?access_token=aaaa&id=7")
+    b = records.redact_url("https://app.example.test/cb?access_token=z&id=7")
+    assert a == b == ("https://app.example.test/cb?access_token="
+                      "{{observed:param}}&id=7")
+
+
+def test_a_clients_own_name_for_a_token_is_not_caught():
+    """THE LIMIT, AS A MEASURED FACT.
+
+    This catches a fixed list of well-known names and does NOT catch a
+    client's own name for a token. The parameter below is made up on purpose:
+    no list can hold the name an application has not chosen yet, and a
+    javadoc saying so is a caveat that can be quietly widened while this is a
+    check that goes red when someone does.
+
+    The Java side pins the same input against the BLOB
+    (`aClientsOwnNameForATokenIsNotCaught`), so the limit is visible from both
+    halves of the exposure rather than from the deletable one only.
+    """
+    secret = "live-acme-session-value"
+    url = f"https://app.example.test/p?acme_session={secret}"
+    assert records.redact_url(url) == url
+    assert secret in records.redact_url(url)
+    # The two smaller edges, so neither is a claim: the name is matched RAW,
+    # and `;` is not a pair separator.
+    enc = "https://app.example.test/p?%61ccess_token=live"
+    assert records.redact_url(enc) == enc
+    semi = "https://app.example.test/p?id=1;token=live"
+    assert records.redact_url(semi) == semi
 
 
 # ---- the two writers -------------------------------------------------------
@@ -206,3 +323,31 @@ def test_only_records_py_writes_a_url_into_a_row():
     records_text = (REPO / "src/hx/store/records.py").read_text(encoding="utf-8")
     assert "INSERT INTO exchange" in records_text
     assert "INSERT INTO denial" in records_text
+
+
+def test_an_exchange_row_never_holds_a_credential_parameter(conn):
+    """The writer again, for the second of job 5's two rules. `hx.capture`
+    hands `record_exchange` the frame's url unchanged, so a redaction that
+    lived at the caller would cover one caller and no other."""
+    token = "eyJhbGciOiJIUzI1NiJ9.live.9f2c"
+    records.record_exchange(
+        conn, run_id="r-1", method="GET",
+        url=f"https://app.example.test/cb?access_token={token}&id=1001",
+        status=200, req_blob=None, resp_blob=None, ms=1, at_us=1)
+    stored = conn.execute("SELECT url FROM exchange").fetchone()["url"]
+    assert token not in stored
+    assert stored == ("https://app.example.test/cb?access_token="
+                      "{{observed:param}}&id=1001")
+
+
+def test_a_denial_row_never_holds_a_credential_parameter(conn):
+    """`denial.url` is what an operator reads when a request was refused, and
+    a token in the query of a refused request is still a live token."""
+    token = "AKIAIOSFODNN7EXAMPLE"
+    records.record_denial(
+        conn, run_id="r-1", kind="scope", method="GET",
+        url=f"http://offside.example.test/x?api_key={token}",
+        detail="out of scope", at_us=1)
+    stored = conn.execute("SELECT url FROM denial").fetchone()["url"]
+    assert token not in stored
+    assert stored == "http://offside.example.test/x?api_key={{observed:param}}"

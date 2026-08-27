@@ -89,13 +89,20 @@ import java.util.Map;
  *     replaced whole with {@link #OBSERVED_USERINFO} and the {@code @} kept,
  *     by {@link #redactTarget}.
  *
- *     A CREDENTIAL IN A QUERY PARAMETER IS NOT COVERED, and that is the
- *     deliberate half. {@code ?access_token=...} needs either a list of
- *     parameter names -- a vocabulary that drifts, silently, in the direction
- *     of storing a credential -- or a rule that redacts by SHAPE, which
- *     rewrites {@code ?id=5} and corrupts the evidence a check reads. Both
- *     are worse than saying so. See {@link #redactObservedRequest}'s
- *     "WHAT THIS EXCLUDES" for the full list of what is left raw.
+ *     AND THE VALUES OF WELL-KNOWN CREDENTIAL PARAMETERS. A token does not
+ *     have to be in the authority either: {@code /cb?access_token=...} is
+ *     the commonest shape of all. {@link #CREDENTIAL_PARAMS} is matched by
+ *     NAME, whole and case-insensitively, exactly as the header names are;
+ *     the name and the {@code =} are kept and only the value becomes
+ *     {@link #OBSERVED_PARAM}. Names and not SHAPES: a rule that redacted
+ *     what looks opaque would rewrite {@code ?id=1001} and corrupt the
+ *     evidence an access-control check reads, and redacting every value is
+ *     the same corruption with no judgement in it.
+ *
+ *     THAT LIST IS INCOMPLETE BY CONSTRUCTION -- it catches well-known names
+ *     and NOT a client's own name for a token -- and
+ *     {@link #redactObservedRequest}'s "WHAT THIS EXCLUDES" says so in the
+ *     detail it deserves, with the test that pins the limit.
  *
  * Redaction runs BEFORE hashing. The blob store is content-addressed: the
  * digest names the bytes it was computed over, so hashing raw bytes and
@@ -182,10 +189,110 @@ public final class Redactor {
     private static final byte[] OBSERVED_USERINFO =
         "{{observed:userinfo}}".getBytes(StandardCharsets.US_ASCII);
 
+    /**
+     * Query-parameter names whose VALUE is a credential, lower-cased for the
+     * ASCII match, in no significant order.
+     *
+     * A FIXED LIST OF NAMES, AND THAT IS THE WHOLE DESIGN. The two rejected
+     * alternatives are worth keeping written down, because both look like
+     * improvements:
+     *
+     *   BY SHAPE -- "a long opaque-looking value is a secret" -- rewrites
+     *   {@code ?id=1001} and {@code ?order=8f3c...} and corrupts the exact
+     *   evidence an access-control check reads. A redaction that eats the
+     *   identifier makes the finding it was protecting unprovable.
+     *
+     *   EVERY VALUE -- redact the lot -- is the same corruption with no
+     *   judgement in it at all.
+     *
+     * So it is names, matched whole and case-insensitively, exactly the way
+     * {@link #CREDENTIAL_HEADERS} is matched. It is INCOMPLETE BY
+     * CONSTRUCTION and says so in {@link #redactObservedRequest}'s exclusion
+     * list: a client's own spelling for a token is not here and cannot be.
+     * Incomplete is not the same as worthless -- catching {@code access_token}
+     * today is strictly better than a known leak -- but the two are told apart
+     * only by saying plainly which one this is.
+     *
+     * WHAT THE LIST COSTS, said once here rather than left to be discovered:
+     * a few of these names are genuinely ambiguous. {@code key} is a Google
+     * API key and also a sort key; {@code sid} is a session id and also a
+     * store id; {@code auth} and {@code sig} are used for both. Those
+     * parameters lose their values in the evidence. That is the trade the
+     * ambiguity forces, and it runs the safe way: a redacted non-secret is a
+     * gap in a report, a stored secret is in every backup.
+     *
+     * WHAT IS DELIBERATELY ABSENT, with the reason, because an omission
+     * nobody wrote down reads as an oversight:
+     *
+     *   {@code code}   -- an OAuth authorization code IS a credential, and
+     *                     {@code ?code=} is also a country code, an error
+     *                     code, a discount code and a status code. The
+     *                     false-positive rate is the highest on the list by
+     *                     an order of magnitude and it would blank values
+     *                     that are the whole point of the request.
+     *   {@code state}  -- OAuth {@code state} is a CSRF token, not an
+     *                     authenticator: possessing it grants nothing, and a
+     *                     CSRF check needs to read it.
+     *   {@code nonce}, {@code csrf}, {@code _token} -- same argument as
+     *                     {@code state}.
+     *
+     * THE OPERATOR-DECLARED EXTENSION IS THE NEXT STEP AND IT IS NOT A FIX
+     * TO THIS FILE. A per-engagement list -- the client naming
+     * {@code acme_session} themselves -- is reviewable, belongs to the
+     * engagement rather than to this repository's guesswork, and fails in the
+     * direction of the operator knowing what was redacted. It needs a config
+     * schema change AND a `configure` wire key to carry it, and an
+     * unrecognised `configure` key is a hard {@code bad_config} today (see
+     * ConfigBody and S4's note on limit re-arming) -- so there is no wire for
+     * it either. Both halves have to land together or an operator's list is
+     * silently ignored, which is the failure mode S4 spends a paragraph on.
+     */
+    private static final String[] CREDENTIAL_PARAMS = {
+        "access_token", "refresh_token", "id_token", "auth_token", "token",
+        "jwt",
+        "api_key", "apikey", "api-key", "key",
+        "secret", "client_secret",
+        "password", "passwd", "pwd",
+        "auth", "authorization",
+        "sig", "signature",
+        "session", "sessionid", "sid",
+        // AWS SigV4 query authentication. A presigned S3 URL carries a live
+        // credential in exactly these three parameters, it is a shape any web
+        // application test runs into, and none of the generic names above
+        // matches them -- the match is on the WHOLE name.
+        "x-amz-signature", "x-amz-credential", "x-amz-security-token",
+    };
+
+    /**
+     * Job 5's placeholder for a credential parameter's VALUE. The name and the
+     * {@code =} are kept.
+     *
+     * ONE FIXED STRING, not {@code {{observed:<name>}}}, for two reasons.
+     * Determinism is the first: two requests differing only in the credential
+     * must hash to one blob, and while the NAME is not the secret, a
+     * per-name placeholder buys nothing -- the name is still right there in
+     * front of the {@code =}. The second is that the key set is what
+     * {@code surface.query_key_set} reads, and it reads the KEY; the
+     * placeholder never enters that computation at all.
+     */
+    private static final byte[] OBSERVED_PARAM =
+        "{{observed:param}}".getBytes(StandardCharsets.US_ASCII);
+
     /** RFC 9112 2.3: the HTTP-name is case-SENSITIVE, so this is a byte match. */
     private static final byte[] HTTP_NAME = "HTTP/".getBytes(StandardCharsets.US_ASCII);
 
     private record Range(String identityId, int start, int end) { }
+
+    /**
+     * One half-open span of a head line to replace, and what to put there.
+     *
+     * Job 5 makes up to two independent decisions about one line -- the
+     * userinfo and each credential parameter's value -- and they are collected
+     * rather than applied in sequence because they can NEST. Emitting as they
+     * are found writes the same bytes twice for
+     * `?access_token=http://u:p@h/`.
+     */
+    private record Cut(int start, int end, byte[] with) { }
 
     /**
      * The byte ranges this extension injected into ONE serialised request.
@@ -462,14 +569,36 @@ public final class Redactor {
      *
      * WHAT THIS EXCLUDES, named rather than left to be discovered:
      *
-     *   - A CREDENTIAL IN A QUERY PARAMETER. {@code /cb?access_token=...},
-     *     {@code ?api_key=}, {@code ?sig=}, a signed URL's signature, a
-     *     password reset token. Job 5 reaches the userinfo and stops there.
-     *     Closing this needs a decision nothing in this class can make: a
-     *     LIST of parameter names is a vocabulary that drifts silently toward
-     *     storing a credential, and a SHAPE rule rewrites {@code ?id=5} and
-     *     corrupts the evidence an access-control check reads. It is a leak
-     *     and it is named as one.
+     *   - A CREDENTIAL IN A QUERY PARAMETER THIS LIST DOES NOT NAME.
+     *     THIS CATCHES A FIXED LIST OF WELL-KNOWN NAMES AND DOES NOT CATCH A
+     *     CLIENT'S OWN NAME FOR A TOKEN. {@code ?access_token=} is redacted;
+     *     {@code ?acme_session=} is not, and neither is any other spelling an
+     *     application invented for itself. {@link #CREDENTIAL_PARAMS} is the
+     *     whole of what is matched, and the space of names an application may
+     *     choose is unbounded, so no list closes it. Incomplete is not
+     *     worthless -- catching {@code access_token} is strictly better than
+     *     a known leak -- but the two are told apart only by saying which
+     *     this is, and {@code aClientsOwnNameForATokenIsNotCaught} pins it
+     *     with a made-up parameter name so the limit is a MEASURED FACT
+     *     rather than a caveat someone can quietly widen.
+     *
+     *     THE ROUTE OUT is an operator-declared list in the engagement
+     *     config -- reviewable, owned by the engagement rather than by this
+     *     repository's guesswork, and failing in the direction of the
+     *     operator knowing what was redacted. It is NOT a change to this
+     *     file: it needs a config schema change AND a `configure` wire key to
+     *     carry it, and an unrecognised `configure` key is a hard
+     *     {@code bad_config} today, so there is no wire for it either. Both
+     *     halves have to land together or an operator's list is silently
+     *     ignored -- the failure mode S4 spends a paragraph on for limits.
+     *
+     *     Three smaller edges of the same mechanism: a name that is
+     *     PERCENT-ENCODED ({@code %61ccess_token}) is not matched, because
+     *     decoding would mean deciding what a name that decodes two ways IS;
+     *     a pair separated by {@code ;} rather than {@code &} is one pair to
+     *     this scan; and a credential inside another parameter's value
+     *     ({@code ?next=/a%3Ftoken%3Dx}) is inside one opaque value and is
+     *     not reached.
      *   - A CREDENTIAL IN THE BODY. A login POST's password is in the body
      *     and stays there, verbatim. S7 keeps payload and request structure
      *     verbatim on purpose -- "evidence remains defensible" -- and nothing
@@ -780,16 +909,50 @@ public final class Redactor {
      */
     private static void redactTarget(byte[] raw, int from, int to,
                                      ByteArrayOutputStream out) {
+        List<Cut> cuts = new ArrayList<>();
+        addUserinfoCut(raw, from, to, cuts);
+        addCredentialParamCuts(raw, from, to, cuts);
+        if (cuts.isEmpty()) {
+            // The overwhelmingly common line, and it must come through byte
+            // for byte: a request with nothing to redact has to hash exactly
+            // as it did before job 5 existed.
+            out.write(raw, from, to - from);
+            return;
+        }
+        cuts.sort(Comparator.comparingInt(Cut::start));
+        int at = from;
+        for (Cut c : cuts) {
+            // OVERLAP IS DROPPED, NOT MERGED, and one input really produces
+            // it: `?access_token=http://u:p@h/` has a userinfo cut sitting
+            // INSIDE a parameter-value cut. Sorted by start, the parameter
+            // value comes first and swallows the userinfo, so the inner cut
+            // is already gone -- skipping it is correct rather than merely
+            // safe. Without the guard the second write() would be handed a
+            // negative length and throw on a Burp proxy thread.
+            if (c.start() < at) continue;
+            out.write(raw, at, c.start() - at);
+            out.writeBytes(c.with());
+            at = c.end();
+        }
+        out.write(raw, at, to - at);
+    }
+
+    /**
+     * The userinfo of the first URI in {@code raw[from, to)}, as a cut.
+     *
+     * See {@link #redactTarget}'s javadoc for the RFC 3986 argument. The cut
+     * ENDS at the {@code @} rather than past it, so the {@code @} survives and
+     * the result still reads as an authority.
+     */
+    private static void addUserinfoCut(byte[] raw, int from, int to,
+                                       List<Cut> cuts) {
         int scheme = -1;
         for (int p = from; p + 2 < to; p++)
             if (raw[p] == ':' && raw[p + 1] == '/' && raw[p + 2] == '/') {
                 scheme = p;
                 break;
             }
-        if (scheme < 0) {
-            out.write(raw, from, to - from);
-            return;
-        }
+        if (scheme < 0) return;
         int authStart = scheme + 3;
         int authEnd = authStart;
         while (authEnd < to) {
@@ -807,13 +970,72 @@ public final class Redactor {
         }
         int at = -1;
         for (int p = authStart; p < authEnd; p++) if (raw[p] == '@') at = p;
-        if (at < 0) {
-            out.write(raw, from, to - from);
-            return;
+        if (at < 0) return;
+        cuts.add(new Cut(authStart, at, OBSERVED_USERINFO));
+    }
+
+    /**
+     * The VALUES of {@link #CREDENTIAL_PARAMS} in the target's query, as cuts.
+     *
+     * WHERE THE QUERY IS, structurally: RFC 3986 3.4 says the query begins at
+     * the FIRST {@code ?} and runs to the next {@code #} or the end of the
+     * URI. {@code ?} is a gen-delim and is not a {@code pchar}, so it cannot
+     * appear unencoded in a path -- the first one really is the delimiter --
+     * and inside a request LINE the target also ends at the SP before the
+     * HTTP-version, so SP/HTAB/CR/LF end the scan too.
+     *
+     * PAIRS ARE SPLIT ON {@code &} AND NAME FROM VALUE ON THE FIRST
+     * {@code =}. `&` is the form-urlencoded separator every client emits;
+     * `;` was an old alternative, is not accepted here, and is named in
+     * {@link #redactObservedRequest}'s exclusions rather than guessed at --
+     * treating it as a separator would split values that legitimately contain
+     * one.
+     *
+     * A PAIR WITH NO {@code =} IS LEFT ALONE. `?access_token` on its own
+     * carries no value to redact, and a placeholder there would invent one.
+     * An EMPTY value -- `?access_token=&next=/` -- is left alone for the same
+     * reason job 3 leaves a deletion cookie's empty value: an empty value
+     * cannot be a credential, and writing a placeholder over it would read as
+     * an issuance.
+     *
+     * THE NAME IS MATCHED RAW, NOT PERCENT-DECODED. `%61ccess_token` is not
+     * matched, and that is a real bypass rather than an oversight worth
+     * hiding: decoding here would mean deciding what a name that decodes two
+     * different ways IS, and this class's whole discipline is that it does
+     * not guess. It is named in the exclusion list with everything else this
+     * does not catch.
+     */
+    private static void addCredentialParamCuts(byte[] raw, int from, int to,
+                                               List<Cut> cuts) {
+        int q = indexOf(raw, from, to, (byte) '?');
+        if (q < 0) return;
+        int qEnd = q + 1;
+        while (qEnd < to) {
+            byte b = raw[qEnd];
+            if (b == '#' || b == ' ' || b == '\t' || b == '\r' || b == '\n')
+                break;
+            qEnd++;
         }
-        out.write(raw, from, authStart - from);   // through the `://`
-        out.writeBytes(OBSERVED_USERINFO);
-        out.write(raw, at, to - at);              // the `@`, the host, the rest
+        int p = q + 1;
+        while (p < qEnd) {
+            int amp = p;
+            while (amp < qEnd && raw[amp] != '&') amp++;
+            int eq = p;
+            while (eq < amp && raw[eq] != '=') eq++;
+            // eq == amp means no '='; eq + 1 == amp means an empty value.
+            if (eq + 1 < amp && isCredentialParam(raw, p, eq))
+                cuts.add(new Cut(eq + 1, amp, OBSERVED_PARAM));
+            p = amp + 1;
+        }
+    }
+
+    /** Whether {@code raw[from, to)} is one of {@link #CREDENTIAL_PARAMS},
+     *  matched WHOLE and case-insensitively through the same predicate the
+     *  header names use, so the two cannot drift in how they fold case. */
+    private static boolean isCredentialParam(byte[] raw, int from, int to) {
+        for (String name : CREDENTIAL_PARAMS)
+            if (asciiEqualsIgnoreCase(name, raw, from, to)) return true;
+        return false;
     }
 
     /** Index just past this line's terminator, or raw.length. */

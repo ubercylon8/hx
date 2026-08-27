@@ -95,6 +95,45 @@ EXTENSION_FAULT = "extension fault: "
 # actually drift.
 OBSERVED_USERINFO = "{{observed:userinfo}}"
 
+# What `redact_url` writes over a credential parameter's VALUE. The name and
+# the `=` are kept -- `surface.query_key_set` reads the KEY, and a redaction
+# that moved a key would change which surface a request belongs to.
+#
+# `Redactor.OBSERVED_PARAM` is the same string, pinned by the same test that
+# pins OBSERVED_USERINFO.
+OBSERVED_PARAM = "{{observed:param}}"
+
+# Query-parameter names whose VALUE is a credential, lower-cased.
+#
+# A FIXED LIST OF NAMES, MATCHED WHOLE AND CASE-INSENSITIVELY, and the whole
+# design is in `Redactor.CREDENTIAL_PARAMS` -- including which names are
+# deliberately ABSENT (`code`, `state`, `nonce`, `csrf`) and why, and what the
+# ambiguous entries cost. This is the second copy of that vocabulary and it is
+# COMPARED against the first rather than trusted: a test reads the array out of
+# Redactor.java and requires the two sets to be equal. A name added on one side
+# only is a leak on the other, and it is exactly the drift
+# `tests/test_vocabularies_match_the_schema.py` exists to refuse -- one
+# artifact further out, because these two places are two LANGUAGES.
+#
+# IT IS INCOMPLETE BY CONSTRUCTION. It catches well-known names and NOT a
+# client's own name for a token: `?acme_session=` reaches this column and the
+# blob store verbatim, and a test asserts that rather than a comment claiming
+# it. The route out is an operator-declared list in the engagement config,
+# which needs a config schema change AND a `configure` wire key -- an
+# unrecognised `configure` key is a hard `bad_config` today, so there is no
+# wire for it either.
+CREDENTIAL_PARAMS = frozenset({
+    "access_token", "refresh_token", "id_token", "auth_token", "token",
+    "jwt",
+    "api_key", "apikey", "api-key", "key",
+    "secret", "client_secret",
+    "password", "passwd", "pwd",
+    "auth", "authorization",
+    "sig", "signature",
+    "session", "sessionid", "sid",
+    "x-amz-signature", "x-amz-credential", "x-amz-security-token",
+})
+
 
 def redact_url(url: str) -> str:
     """A url with the userinfo of its authority replaced. §7.
@@ -130,19 +169,54 @@ def redact_url(url: str) -> str:
     WHAT IT DOES NOT TOUCH, named here because §7's mechanisms are only worth
     what their exclusions are:
 
-      - A CREDENTIAL IN A QUERY PARAMETER. `?access_token=`, `?api_key=`,
-        `?sig=`. Reaching those needs a list of parameter names -- a
-        vocabulary that drifts silently toward storing a credential -- or a
-        rule that redacts by shape, which rewrites `?id=5` and corrupts the
-        evidence an access-control check reads. Neither is taken here, and
-        the leak is pinned as a leak by a test rather than left unstated.
+      - A CREDENTIAL IN A QUERY PARAMETER THIS LIST DOES NOT NAME. The
+        VALUES of `CREDENTIAL_PARAMS` are replaced -- `?access_token=` is
+        redacted -- and a client's own name for a token is NOT:
+        `?acme_session=` reaches this column verbatim. Names, never shapes: a
+        rule that redacted what looks opaque would rewrite `?id=1001` and
+        corrupt the exact evidence an access-control check reads. The limit
+        is pinned by a test using a made-up parameter name, so it is a
+        measured fact and not a caveat that can be quietly widened.
+      - A NON-CREDENTIAL PARAMETER'S VALUE, which is the point of the list
+        existing at all. `?id=1001` survives byte for byte.
+      - A PERCENT-ENCODED NAME (`%61ccess_token`), a pair separated by `;`
+        rather than `&`, and a credential nested inside another parameter's
+        value. See `Redactor.addCredentialParamCuts` for each.
       - An `@` in the PATH, the QUERY or the FRAGMENT. RFC 3986 3.3 allows one
         there and `/users/alice@example.test` is a real path segment.
       - A url with no `://` at all. There is no authority to find.
     """
+    cuts = _userinfo_cuts(url) + _credential_param_cuts(url)
+    if not cuts:
+        # The common url, returned by identity. Anything with nothing to
+        # redact must come back byte for byte.
+        return url
+    cuts.sort()
+    out = []
+    at = 0
+    for start, end, with_ in cuts:
+        # Overlap is DROPPED, not merged, exactly as the Java side does it and
+        # for the same input: `?access_token=http://u:p@h/` nests a userinfo
+        # cut inside a parameter-value cut, and sorted by start the outer one
+        # has already consumed it.
+        if start < at:
+            continue
+        out.append(url[at:start])
+        out.append(with_)
+        at = end
+    out.append(url[at:])
+    return "".join(out)
+
+
+def _userinfo_cuts(url: str) -> list[tuple[int, int, str]]:
+    """The userinfo of the first URI in `url`, as a (start, end, text) cut.
+
+    The cut ENDS at the `@` rather than past it, so the `@` survives and the
+    result still reads as an authority.
+    """
     scheme = url.find("://")
     if scheme < 0:
-        return url
+        return []
     start = scheme + 3
     end = start
     # The authority's own terminators, plus the whitespace that ends a request
@@ -153,8 +227,46 @@ def redact_url(url: str) -> str:
         end += 1
     at = url.rfind("@", start, end)
     if at < 0:
-        return url
-    return url[:start] + OBSERVED_USERINFO + url[at:]
+        return []
+    return [(start, at, OBSERVED_USERINFO)]
+
+
+def _credential_param_cuts(url: str) -> list[tuple[int, int, str]]:
+    """The VALUES of `CREDENTIAL_PARAMS` in the query, as cuts.
+
+    RFC 3986 3.4: the query begins at the FIRST `?` and runs to the next `#`
+    or the end. `?` is a gen-delim and not a `pchar`, so it cannot appear
+    unencoded in a path and the first one really is the delimiter. Inside a
+    request LINE the target also ends at the SP before the HTTP-version, so
+    whitespace ends the scan too -- the same terminator set the extension
+    uses, because these are one rule in two languages.
+
+    `parse_qsl` is deliberately NOT used, twice over: it DECODES, and this
+    function has to return the byte offsets of the raw text so the rest of the
+    url survives verbatim; and it drops what it cannot parse, which would
+    silently leave a malformed pair carrying a credential untouched.
+
+    A pair with no `=` has no value to redact. An EMPTY value is left alone
+    for the reason job 3 leaves a deletion cookie's empty value: an empty
+    value cannot be a credential, and a placeholder would read as an issuance.
+    """
+    q = url.find("?")
+    if q < 0:
+        return []
+    end = q + 1
+    while end < len(url) and url[end] not in "# \t\r\n":
+        end += 1
+    cuts: list[tuple[int, int, str]] = []
+    p = q + 1
+    while p < end:
+        amp = url.find("&", p, end)
+        if amp < 0:
+            amp = end
+        eq = url.find("=", p, amp)
+        if eq >= 0 and eq + 1 < amp and url[p:eq].lower() in CREDENTIAL_PARAMS:
+            cuts.append((eq + 1, amp, OBSERVED_PARAM))
+        p = amp + 1
+    return cuts
 
 # Error class (spec S6) -> the `outcome` the exchange table accepts WHEN THE
 # REQUEST WAS ISSUED. Two of the four entries are never issued; the other two

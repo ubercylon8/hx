@@ -93,8 +93,8 @@ public class RedactorTest {
           RedactorTest::anAbsoluteFormRequestLineIsNotMatchedAsAField);
         t("redactObservedRequestRefusesNullBytes",
           RedactorTest::redactObservedRequestRefusesNullBytes);
-        t("theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem",
-          RedactorTest::theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem);
+        t("theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem",
+          RedactorTest::theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem);
         t("aUserinfoCredentialNeverReachesTheBlobStore",
           RedactorTest::aUserinfoCredentialNeverReachesTheBlobStore);
         t("twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob",
@@ -105,8 +105,18 @@ public class RedactorTest {
           RedactorTest::aCredentialFirstLineIsStillRedactedAsAField);
         t("theRequestBodyIsNeverRewrittenByJobFive",
           RedactorTest::theRequestBodyIsNeverRewrittenByJobFive);
-        t("aCredentialInTheQUERYIsNamedAsNotCovered",
-          RedactorTest::aCredentialInTheQueryIsNamedAsNotCovered);
+        t("aCredentialParameterLosesItsValueAndKeepsItsKey",
+          RedactorTest::aCredentialParameterLosesItsValueAndKeepsItsKey);
+        t("anIdentifierParameterIsNeverTouched",
+          RedactorTest::anIdentifierParameterIsNeverTouched);
+        t("twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob);
+        t("aClientsOwnNameForATokenIsNotCaught",
+          RedactorTest::aClientsOwnNameForATokenIsNotCaught);
+        t("theParameterNamesAreMatchedWholeAndCaseInsensitively",
+          RedactorTest::theParameterNamesAreMatchedWholeAndCaseInsensitively);
+        t("aNestedCutIsWrittenOnceNotTwice",
+          RedactorTest::aNestedCutIsWrittenOnceNotTwice);
         t("theEmptyInjectedPathIsWhyJobFourExists",
           RedactorTest::theEmptyInjectedPathIsWhyJobFourExists);
 
@@ -1091,14 +1101,14 @@ public class RedactorTest {
 
     // ---- job 5: the request TARGET ---------------------------------------
 
-    static final String USERINFO_VECTORS = "userinfo.txt";
+    static final String TARGET_VECTORS = "request-target.txt";
 
     /** The shared vector file, as (input, expected) pairs. Same file the
      *  Python side reads; see its header for the format and for why one file
      *  rather than two lists. */
-    static List<String[]> userinfoVectors() throws Exception {
+    static List<String[]> targetVectors() throws Exception {
         java.nio.file.Path p = java.nio.file.Path.of(
-                "..", "tests", "vectors", USERINFO_VECTORS);
+                "..", "tests", "vectors", TARGET_VECTORS);
         List<String[]> out = new ArrayList<>();
         for (String line : java.nio.file.Files.readAllLines(
                 p, StandardCharsets.UTF_8)) {
@@ -1119,10 +1129,10 @@ public class RedactorTest {
      * exactly the shape `tests/test_vocabularies_match_the_schema.py` exists
      * to refuse. Neither side restates the cases; both read this file.
      */
-    static void theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem()
+    static void theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem()
             throws Exception {
         Redactor r = new Redactor();
-        List<String[]> vectors = userinfoVectors();
+        List<String[]> vectors = targetVectors();
         // Anti-vacuity. A reader that found no file, or a format change that
         // made every line a comment, would leave the loop below asserting
         // nothing at all and printing ALL PASS.
@@ -1233,22 +1243,120 @@ public class RedactorTest {
               out.endsWith(body));
     }
 
-    static void aCredentialInTheQueryIsNamedAsNotCovered() {
-        // THE HALF THIS DOES NOT CLOSE, pinned as a fact rather than left as
-        // an assumption. `?access_token=` reaches the blob store verbatim. It
-        // is not covered because both available mechanisms are worse than the
-        // leak: a list of parameter names is a vocabulary that drifts silently
-        // toward storing a credential, and a shape rule rewrites `?id=5` and
-        // corrupts the evidence an access-control check reads. If this check
-        // ever goes RED, someone has made that decision -- and it should be a
-        // decision, not a side effect.
+    static void aCredentialParameterLosesItsValueAndKeepsItsKey() {
+        // PROPERTY 1. The key survives and only the value is replaced -- and
+        // the key is what `surface.query_key_set` reads, so a redaction that
+        // moved it would change which SURFACE a request belongs to.
         Redactor r = new Redactor();
         String token = "eyJhbGciOiJIUzI1NiJ9.live.9f2c";
         String out = text(r.redactObservedRequest(bytes(
-                "GET /cb?access_token=" + token + " HTTP/1.1\r\n"
+                "GET /cb?access_token=" + token + "&id=1001 HTTP/1.1\r\n"
                 + "Host: app.example.test\r\n\r\n")));
-        check("a bearer token in the query is NOT redacted -- job 5 reaches "
-              + "the userinfo and stops there", out.contains(token));
+        check("the token is gone (" + out.split("\r\n")[0] + ")",
+              !out.contains(token));
+        check("the KEY survives, so the surface is unchanged",
+              out.contains("access_token={{observed:param}}"));
+        check("and everything around it is verbatim",
+              out.startsWith("GET /cb?access_token={{observed:param}}&id=1001 "
+                             + "HTTP/1.1\r\n"));
+    }
+
+    static void anIdentifierParameterIsNeverTouched() {
+        // PROPERTY 2, and the reason this is a list of NAMES rather than a
+        // shape rule or a blanket redaction. `?id=1001` is what an IDOR check
+        // reads; a redaction that ate it would make the finding it was
+        // protecting unprovable. A shape heuristic eats exactly this.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /order/1001?id=1001&state=xyzzy&code=US HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("an identifier survives byte for byte (" + out.split("\r\n")[0] + ")",
+              out.startsWith("GET /order/1001?id=1001&state=xyzzy&code=US "
+                             + "HTTP/1.1\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob()
+            throws Exception {
+        // PROPERTY 3. The store is content-addressed: anything carrying a
+        // function of the secret -- a length, a hash, a truncation -- gives
+        // one page fetched under two tokens two digests and two stored copies.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(bytes(
+                "GET /cb?access_token=aaaaaaaaaaaaaaaa&id=7 HTTP/1.1\r\n\r\n"));
+        byte[] b = r.redactObservedRequest(bytes(
+                "GET /cb?access_token=z&id=7 HTTP/1.1\r\n\r\n"));
+        check("two tokens, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        check("the inputs genuinely differed", !Arrays.equals(
+                bytes("GET /cb?access_token=aaaaaaaaaaaaaaaa&id=7 HTTP/1.1\r\n\r\n"),
+                bytes("GET /cb?access_token=z&id=7 HTTP/1.1\r\n\r\n")));
+    }
+
+    static void aClientsOwnNameForATokenIsNotCaught() {
+        // THE LIMIT, AS A MEASURED FACT. This catches a fixed list of
+        // well-known names and does NOT catch a client's own name for a token.
+        // The parameter below is made up on purpose: no list can contain the
+        // name an application has not chosen yet, and stating that in a
+        // javadoc is a caveat someone can quietly widen while stating it here
+        // is a check that goes red when they do.
+        //
+        // If this goes RED, the list grew. That is not forbidden -- it is a
+        // DECISION, and the honest version of it is the operator-declared
+        // list in the engagement config, which needs a config schema change
+        // AND a `configure` wire key (an unrecognised key is a hard
+        // `bad_config` today, so there is no wire for it either).
+        Redactor r = new Redactor();
+        String secret = "live-acme-session-value";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /p?acme_session=" + secret + " HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a client's own name for a token reaches the blob store "
+              + "VERBATIM -- the limit of a fixed list of names",
+              out.contains("acme_session=" + secret));
+        // The two smaller edges of the same mechanism, so neither is a claim.
+        String enc = text(r.redactObservedRequest(bytes(
+                "GET /p?%61ccess_token=live HTTP/1.1\r\n\r\n")));
+        check("a percent-encoded NAME is not matched -- the scan does not "
+              + "decode, because a name that decodes two ways has no answer",
+              enc.contains("%61ccess_token=live"));
+        String semi = text(r.redactObservedRequest(bytes(
+                "GET /p?id=1;token=live HTTP/1.1\r\n\r\n")));
+        check("`;` is not a pair separator, so that whole pair is one name",
+              semi.contains("id=1;token=live"));
+    }
+
+    static void theParameterNamesAreMatchedWholeAndCaseInsensitively() {
+        Redactor r = new Redactor();
+        String upper = text(r.redactObservedRequest(bytes(
+                "GET /p?Access_Token=live&APIKEY=live2 HTTP/1.1\r\n\r\n")));
+        check("case-insensitive, the same fold the header names use",
+              upper.startsWith("GET /p?Access_Token={{observed:param}}"
+                               + "&APIKEY={{observed:param}} HTTP/1.1"));
+        check("and the KEY keeps its own case", upper.contains("Access_Token="));
+        // WHOLE, not a substring, in both directions: a name that CONTAINS a
+        // listed one and a listed one that is a PREFIX of the name are the two
+        // ways a substring match leaks or over-redacts.
+        String near = text(r.redactObservedRequest(bytes(
+                "GET /p?tokenizer=fast&my_access_token=live HTTP/1.1\r\n\r\n")));
+        check("a name merely CONTAINING a listed one is not one ("
+              + near.split("\r\n")[0] + ")",
+              near.startsWith("GET /p?tokenizer=fast&my_access_token=live "));
+    }
+
+    static void aNestedCutIsWrittenOnceNotTwice() {
+        // The one input that makes job 5's two rules overlap: a credential
+        // parameter whose VALUE is a URI carrying its own userinfo. The value
+        // cut swallows the userinfo cut, and emitting both would write the
+        // same bytes twice -- or, before the cuts were collected and sorted,
+        // hand write() a negative length on a Burp proxy thread.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /cb?access_token=http://u:p@h/ HTTP/1.1\r\n\r\n")));
+        check("one placeholder, not two (" + out.split("\r\n")[0] + ")",
+              out.startsWith("GET /cb?access_token={{observed:param}} HTTP/1.1"));
+        check("and neither half of the nested credential survives",
+              !out.contains("u:p") && !out.contains("http://"));
     }
 
     static void theEmptyInjectedPathIsWhyJobFourExists() {
