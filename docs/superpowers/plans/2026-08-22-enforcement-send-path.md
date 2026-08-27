@@ -23821,31 +23821,53 @@ def dedupe_key(*, type_: str, scheme: str, host: str, port: int | None,
 
 
 def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
-                   dedupe_key: str, run_id: str) -> str:
+                   dedupe_key: str, run_id: str, surface_id: str | None = None,
+                   host: str | None = None) -> str:
     """Insert the finding, or move `last_seen_run` if it is already known.
 
     WHAT AN UPSERT MUST NOT TOUCH: `status`, and `first_seen_run`. An operator
     who marked something `false_positive` has made a judgement the next scan
     has no standing to reverse, and the run something was FIRST seen in is a
     historical fact. The DO UPDATE clause names exactly what moves.
+
+    `surface_id` AND `host` ARE KEYWORD-ONLY AND DEFAULT TO `None` --
+    BACKWARD COMPATIBLE with every call site that predates Task 6, which
+    is every test in `tests/test_records_findings.py`. They exist because
+    `hx.scan._mark_unobserved` reads them back: `finding.surface_id IN
+    (<tested ids>)` is how a retest tells "this finding's surface was
+    looked at again and it was clean" from "nobody looked". Before this
+    parameter existed, `upsert_finding` never wrote `surface_id` at all --
+    the column stayed NULL forever, no writer set it, and `IN (...)` against
+    an all-NULL column matches ZERO rows. MEASURED: driving `hx.scan.run`
+    twice over one surface, once finding and once clean, through the literal
+    task-6-brief `upsert_finding` call with no `surface_id` argument produced
+    `finding_observation.observed == [1]`, one row, never `[1, 0]` -- the
+    retest half of S12 silently did nothing, on every finding, forever. The
+    fix is here rather than in the runner because `dedupe_key` is already
+    built from surface identity in exactly one place (this module's
+    `dedupe_key`) and a second place deciding `surface_id` would be the same
+    class of drift that function's docstring warns about.
     """
     fid = new_id("f")
     conn.execute(
         "INSERT INTO finding(id, engagement_id, dedupe_key, title, description,"
         " impact, remediation, cwe, severity, confidence, created_by, status,"
-        " insertion_name, insertion_kind, scope_level, payload,"
-        " first_seen_run, last_seen_run)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?, 'check', 'new', ?,?,?,?,?,?)"
+        " insertion_name, insertion_kind, scope_level, payload, surface_id,"
+        " host, first_seen_run, last_seen_run)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?, 'check', 'new', ?,?,?,?,?,?,?,?)"
         " ON CONFLICT(engagement_id, dedupe_key) DO UPDATE SET"
         "   last_seen_run=excluded.last_seen_run,"
         "   severity=excluded.severity,"
-        "   confidence=excluded.confidence",
+        "   confidence=excluded.confidence,"
+        "   surface_id=excluded.surface_id,"
+        "   host=excluded.host",
         (fid, engagement_id, dedupe_key, candidate.title, candidate.description,
          candidate.impact, candidate.remediation, candidate.cwe,
          candidate.severity, candidate.confidence,
          candidate.insertion.name if candidate.insertion else None,
          candidate.insertion.kind if candidate.insertion else None,
-         candidate.scope_level, candidate.payload, run_id, run_id))
+         candidate.scope_level, candidate.payload, surface_id, host,
+         run_id, run_id))
     row = conn.execute(
         "SELECT id FROM finding WHERE engagement_id=? AND dedupe_key=?",
         (engagement_id, dedupe_key)).fetchone()

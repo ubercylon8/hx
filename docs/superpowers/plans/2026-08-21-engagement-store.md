@@ -552,6 +552,92 @@ def test_transaction_rolls_back_on_exception(tmp_path: Path):
             raise RuntimeError("simulated failure mid-transaction")
     count = conn.execute("SELECT COUNT(*) AS n FROM engagement").fetchone()["n"]
     assert count == 0
+
+
+# --- Task 6: transaction() is reentrant. hx.scan composes two already-atomic
+# helpers (`_write_finding`'s own transaction and `records.record_evidence`'s)
+# into one, and a bare `BEGIN` inside an open transaction raises
+# `OperationalError: cannot start a transaction within a transaction` --
+# MEASURED against records.record_evidence before this fix. Both directions
+# of the fix are pinned below rather than only the happy path, per the
+# ruling that a savepoint path swallowing a rollback would be worse than the
+# bug it replaces. ---
+
+
+def test_nested_transaction_inner_failure_rolls_back_only_inner_and_propagates(
+    tmp_path: Path,
+):
+    """A nested `transaction()` call that raises undoes ONLY its own writes
+    -- via SAVEPOINT / ROLLBACK TO SAVEPOINT, not the outer BEGIN -- and the
+    exception still propagates out of the inner `with` block rather than
+    being swallowed. The outer transaction is left alive and can go on to
+    commit its own writes, proving the inner failure did not also doom it."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO engagement(id, name, client, created_us, status)"
+            " VALUES('e1','acme','Acme',1,'active')"
+        )
+        with pytest.raises(RuntimeError, match="inner failure"):
+            with db.transaction(conn):
+                conn.execute(
+                    "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                    " started_us, status)"
+                    " VALUES('r1','e1','manual','production',1,'running')"
+                )
+                raise RuntimeError("inner failure")
+        # The outer transaction is still open: MEASURED by writing again and
+        # letting it commit, rather than assumed.
+        conn.execute(
+            "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+            " started_us, status)"
+            " VALUES('r2','e1','manual','production',2,'running')"
+        )
+    assert conn.execute("SELECT COUNT(*) FROM engagement").fetchone()[0] == 1
+    # r1 (the failed nested INSERT) is gone; r2 (written after, inside the
+    # still-live outer transaction) survived.
+    assert [r[0] for r in conn.execute("SELECT id FROM run ORDER BY id")] == ["r2"]
+
+    # The savepoint stack was left clean, not wedged: an unrelated LATER
+    # transaction on the same connection still commits normally rather than
+    # erroring on a dangling SAVEPOINT name or an unbalanced RELEASE.
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+            " started_us, status)"
+            " VALUES('r3','e1','manual','production',3,'running')"
+        )
+    assert conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 2
+
+
+def test_nested_transaction_outer_failure_rolls_back_everything(tmp_path: Path):
+    """RELEASING a savepoint is not committing: SQLite only durably commits
+    at the outermost COMMIT, so a nested `transaction()` that succeeds and
+    releases cleanly is only provisionally applied. If the OUTER block later
+    fails, its ROLLBACK must undo the released inner work too -- a savepoint
+    path that let committed-looking inner work survive an outer rollback
+    would make a partial write look atomic, which is worse than the bug this
+    replaces."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    with pytest.raises(RuntimeError, match="outer failure"):
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO engagement(id, name, client, created_us, status)"
+                " VALUES('e1','acme','Acme',1,'active')"
+            )
+            with db.transaction(conn):
+                conn.execute(
+                    "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                    " started_us, status)"
+                    " VALUES('r1','e1','manual','production',1,'running')"
+                )
+            # The nested transaction above released cleanly. It must not
+            # have escaped the outer transaction's authority regardless.
+            raise RuntimeError("outer failure")
+    assert conn.execute("SELECT COUNT(*) FROM engagement").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -943,6 +1029,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
@@ -1038,18 +1125,70 @@ def transaction(conn: sqlite3.Connection):
     forgetting. `hx.capture.on_exchange` is the first of those and did forget
     -- it wrote four statements unwrapped, and `upsert_surface` failing left a
     committed exchange row with a NULL `surface_id` behind it.
+
+    REENTRANT, since Task 6. `conn.execute("BEGIN")` against a connection
+    already inside a transaction raises
+    `OperationalError: cannot start a transaction within a transaction` --
+    MEASURED, the first time `hx.scan.run` called `records.record_evidence`
+    (which wraps itself in `transaction(conn)`) from inside its own
+    `_write_finding`, itself wrapped in `transaction(conn)`. A caller
+    composing two already-atomic helpers into one atomic unit is exactly the
+    "more call sites... in later plans" this docstring already predicted, so
+    the helper -- not either call site -- is what learns to nest.
+
+    `conn.in_transaction` decides which path runs. Outermost: a plain
+    `BEGIN`/`COMMIT`/`ROLLBACK`, unchanged from before -- MEASURED against
+    `hx.capture.on_exchange`, the merged, reviewed, non-nested caller, whose
+    own tests (`tests/test_capture.py`) still pass unmodified. Nested: a named
+    `SAVEPOINT`, released on success or rolled back to (then released) on
+    failure, before re-raising -- so an inner failure undoes only the inner
+    block's writes and the exception still propagates, while the OUTER
+    transaction is left exactly as if the inner block had never run, free to
+    retry or to fail on its own account.
+
+    RELEASING A SAVEPOINT IS NOT COMMITTING. SQLite only durably commits at
+    the outermost `COMMIT` -- a `RELEASE` just folds the inner block's writes
+    into the still-open outer transaction, so if the OUTER block later fails,
+    its `ROLLBACK` undoes the released inner work too, not just what the
+    outer block wrote itself. MEASURED both directions below (both are pinned
+    in `tests/test_db.py`):
+
+      * inner raises: the inner INSERT is gone, the exception propagates, and
+        a SEPARATE inner transaction run afterwards on the same connection
+        commits normally -- the savepoint stack was left clean, not wedged.
+      * outer raises, after a nested transaction already ran and released
+        cleanly inside it: the inner block's INSERT is ALSO gone. A savepoint
+        path that let it survive would make a partial write look atomic,
+        which is worse than the bug this replaces.
     """
-    conn.execute("BEGIN")
+    nested = conn.in_transaction
+    if not nested:
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # transaction already gone; do not mask the original error
+            raise
+        else:
+            conn.execute("COMMIT")
+        return
+
+    name = f"sp_{uuid.uuid4().hex}"
+    conn.execute(f"SAVEPOINT {name}")
     try:
         yield conn
     except BaseException:
         try:
-            conn.execute("ROLLBACK")
+            conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            conn.execute(f"RELEASE SAVEPOINT {name}")
         except sqlite3.Error:
-            pass  # transaction already gone; do not mask the original error
+            pass  # savepoint already gone; do not mask the original error
         raise
     else:
-        conn.execute("COMMIT")
+        conn.execute(f"RELEASE SAVEPOINT {name}")
 ```
 
 - [ ] **Step 6: Run tests to verify they pass**
