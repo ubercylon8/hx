@@ -1,6 +1,5 @@
 # Traffic Capture Implementation Plan
 
-<!-- plan-drift: pending -->
 <!-- Remove the marker above in the commit that finishes this plan. Until then
      tests/test_plan_matches_repo.py skips this plan's blocks: every task here
      describes a file that does not exist yet, so its blocks describe the state
@@ -230,11 +229,17 @@ about Burp 2026.7.3 that Plan 4's design rests on, and each test fails if a
 future Burp answers differently -- which is the point. A design built on an
 unmeasured assumption is how the previous branch shipped an auto-halt a peer
 could disarm.
+
+The prose record is `docs/burp-proxy-measurements.md`. These tests and that
+document are one deliverable in two halves: the document says what Burp does
+and the tests say it is still true. Q1's test reads the document back, so the
+two cannot drift apart in silence.
 """
 from __future__ import annotations
 
-import http.client
-import os
+import re
+import socket
+import threading
 import time
 from pathlib import Path
 
@@ -245,12 +250,103 @@ from tests.integration.target_server import TargetServer
 
 pytestmark = pytest.mark.integration
 
+RECORD = Path(__file__).resolve().parents[2] / "docs" / "burp-proxy-measurements.md"
+
+# The accessors on InterceptedRequest that might name the connection a request
+# arrived on, in the order the probe writes them. `listenerPort` is in the list
+# BECAUSE it does not exist: an accessor's absence is a measurement too, and one
+# nobody would think to look for once the code is written around its absence.
+ACCESSORS = ("listenerInterface", "listenerPort", "sourceIpAddress",
+             "destinationIpAddress", "httpService")
+
+# What Burp 2026.7.3 answered, classified. Three outcomes and not two: an
+# accessor that EXISTS and THROWS is the trap here -- destinationIpAddress() is
+# declared on the same InterceptedHttpMessage interface as listenerInterface(),
+# compiles, and raises UnsupportedOperationException("Not yet implemented") the
+# moment it is called. Code written against the interface's declared surface
+# would reach for it as "a property of the connection" and find out at runtime.
+MEASURED = {
+    "listenerInterface": "present",
+    "listenerPort": "absent",
+    "sourceIpAddress": "present",
+    "destinationIpAddress": "throws",
+    "httpService": "present",
+}
+
+# What Burp answers the client whose request was DROPPED. Both halves are
+# measured and each is load-bearing for a different reason.
+#
+# The STATUS is the finding: a delivered request returns 200 too, so a drop and
+# a delivery are indistinguishable by status code and nothing may ever read the
+# client's status as evidence that a request was blocked.
+#
+# The BYTE COUNT is what makes that finding checkable in the DOCUMENT. The
+# document is the deliverable Task 5 acts from, and its whole Q3 client-response
+# section could be deleted with this test still green -- reproduced -- because
+# the document readback this file already had covered the accessor table and
+# nothing else. A number this specific cannot survive in prose that no longer
+# says what it is about. Burp's drop page is static: two drops of very different
+# path lengths measured 1529 bytes each and it echoes nothing of the request, so
+# this is a constant rather than a fingerprint of one URL.
+DROPPED_STATUS = 200
+DROPPED_BYTES = 1529
+
+_FIELDS = ("id", "path", "status", "reqpath") + ACCESSORS
+_SPLIT = re.compile(r" (?=(?:%s)=)" % "|".join(_FIELDS))
+
+
+def fields(line: str) -> dict[str, str]:
+    """The probe's `name=value` fields, split on the NAMES and not on whitespace.
+
+    A value can contain spaces. `destinationIpAddress=<threw java.lang.
+    UnsupportedOperationException: Not yet implemented>` is one field, and
+    line.split() reads it as five -- losing the message, which is the only part
+    of it that says anything about why the accessor cannot be used.
+    """
+    out: dict[str, str] = {}
+    for chunk in _SPLIT.split(line):
+        name, sep, value = chunk.partition("=")
+        if sep and name in _FIELDS:
+            out[name] = value
+    return out
+
+
+def classify(value: str) -> str:
+    if value == "<absent>":
+        return "absent"
+    if value.startswith("<threw "):
+        return "throws"
+    return "present"
+
 
 @pytest.fixture
 def probe(tmp_path):
-    """Real Burp running the probe extension, with a private home."""
-    if bf.missing():
-        pytest.skip(f"missing: {', '.join(bf.missing())}")
+    """Real Burp running the probe extension, with a private home.
+
+    Neither guard after `PROBE READY` is ceremony.
+
+    The control request proves the peer is Burp. Burp is reached over a TCP
+    port, and a port is whatever bound it first: an earlier draft of this
+    fixture chose its ports by hand, and unrelated services on this machine
+    answered `421` and a clean `200` while Burp was never involved and the
+    probe file held nothing but `PROBE READY`. Nothing about a successful HTTP
+    exchange proves the peer was Burp. A line in the probe file does, because
+    only Burp's proxy can put one there.
+
+    The loopback check proves the port is not open to the network. `listen_mode:
+    loopback_only` goes into both listeners and was asserted in three places and
+    checked by nothing: changing that one string to `all_interfaces` left this
+    file reporting `3 passed in 38.03s` with `ss` showing the two listeners on
+    `*:34777` and `*:38399` -- an open forward relay for as long as they run.
+
+    A missing probe source FAILS rather than skips. It is a file this repository
+    ships, not a prerequisite of this machine -- see bf.probe_source_missing().
+    """
+    gone = bf.probe_source_missing()
+    if gone:
+        pytest.fail(gone)
+    if bf.probe_missing():
+        pytest.skip(f"missing: {', '.join(bf.probe_missing())}")
     out = tmp_path / "probe.txt"
     target = TargetServer("127.0.0.1")
     target.start()
@@ -258,7 +354,36 @@ def probe(tmp_path):
     try:
         assert bf.wait_for(lambda: out.exists() and "PROBE READY" in out.read_text()), \
             f"probe never started; burp.log: {tmp_path / 'burp.log'}"
-        yield _Probe(out, target, bf.proxy_port(tmp_path))
+
+        # Polled rather than read once: `PROBE READY` is written when the
+        # extension loads and says nothing about when the listeners bound.
+        # (Measured: all of them were already up at this point on every run
+        # taken here, so the poll has never actually had to wait.)
+        #
+        # It costs one `ss` call on the happy path and the full 15 s on the
+        # unhappy one -- waiting cannot turn a wildcard bind into a loopback
+        # bind, so those seconds buy nothing there. Measured: these three
+        # tests took 38.03 s before this check existed, 39.36 s with it, and
+        # 81.28 s with the mutation in. That is the right way round for a
+        # check that is only ever slow once it has already found something.
+        violation: str | None = "the loopback check did not run"
+
+        def on_loopback_only() -> bool:
+            nonlocal violation
+            violation = bf.not_loopback_only(proc.pid, bf.listener_ports(tmp_path))
+            return violation is None
+
+        assert bf.wait_for(on_loopback_only, 15), violation
+
+        p = _Probe(out, target, bf.proxy_port(tmp_path),
+                   bf.second_proxy_port(tmp_path))
+        p.through_proxy("/health")
+        assert bf.wait_for(lambda: any(l.startswith("REQ ") for l in p.lines()), 30), (
+            f"a request to 127.0.0.1:{p.proxy_port} never reached the probe's "
+            f"handler. Something answered on that port that is not this Burp -- "
+            f"check `ss -tlnp | grep {p.proxy_port}`. burp.log: "
+            f"{tmp_path / 'burp.log'}")
+        yield p
     finally:
         proc.kill()
         proc.wait(timeout=30)
@@ -266,16 +391,54 @@ def probe(tmp_path):
 
 
 class _Probe:
-    def __init__(self, out: Path, target: TargetServer, proxy_port: int):
-        self.out, self.target, self.proxy_port = out, target, proxy_port
+    def __init__(self, out: Path, target: TargetServer,
+                 proxy_port: int, second_port: int):
+        self.out, self.target = out, target
+        self.proxy_port, self.second_port = proxy_port, second_port
 
     def lines(self) -> list[str]:
         return self.out.read_text().splitlines()
 
+    def requests(self) -> list[dict[str, str]]:
+        return [fields(l) for l in self.lines() if l.startswith("REQ ")]
+
+    def responses(self) -> list[dict[str, str]]:
+        return [fields(l) for l in self.lines() if l.startswith("RESP ")]
+
+    def request_for(self, path: str) -> dict[str, str]:
+        found = [r for r in self.requests() if r.get("path") == path]
+        assert len(found) == 1, (
+            f"expected exactly one request for {path}, got {len(found)}: "
+            f"{self.lines()}")
+        return found[0]
+
+    def raw_through_proxy(self, path: str, port: int | None = None) -> bytes:
+        """One proxied request, and the whole response as it came off the wire.
+
+        `http.client` hands back a status and a decoded body. The byte count of
+        the FULL response, head included, is the other half of what Q3 records,
+        and no http.client API exposes it. Reading to EOF is safe for exactly
+        one reason: the response this exists to measure carries
+        `Connection: close`, which is Burp's own doing.
+        """
+        sock = socket.create_connection(("127.0.0.1", port or self.proxy_port),
+                                        timeout=30)
+        try:
+            sock.sendall(f"GET {self.target.origin}{path} HTTP/1.1\r\n"
+                         f"Host: {self.target.host}:{self.target.port}\r\n"
+                         f"Connection: close\r\n\r\n".encode())
+            chunks = []
+            while chunk := sock.recv(65536):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            sock.close()
+
     def through_proxy(self, path: str, port: int | None = None) -> int | None:
         """One request through Burp's proxy. None means the connection died."""
+        import http.client
         conn = http.client.HTTPConnection("127.0.0.1", port or self.proxy_port,
-                                          timeout=10)
+                                          timeout=30)
         try:
             conn.request("GET", f"{self.target.origin}{path}")
             return conn.getresponse().status
@@ -283,6 +446,161 @@ class _Probe:
             return None
         finally:
             conn.close()
+
+
+def test_q1_whether_a_request_names_the_listener_it_arrived_on(probe):
+    """Q1. Plan 4's operator/crawler split rests on this answer.
+
+    Measured answer: YES. `listenerInterface()` returns `host:port` for the
+    listener the request arrived on -- `127.0.0.1:42969` -- and two listeners in
+    one Burp produce two different values for the same request. So the split can
+    be a property of the CONNECTION, which is what spec s4 requires, and no
+    second BridgeClient is needed.
+
+    The two halves below are different claims and both are needed. The
+    classification pins WHICH accessors Burp offers, so a future version that
+    adds, removes or breaks one goes red here rather than in Task 5. The
+    distinctness check pins that the value actually DISCRIMINATES: an accessor
+    that existed and returned the same string for every listener would satisfy
+    the first half completely and answer Q1 no.
+    """
+    assert probe.through_proxy("/api/orders") == 200
+    assert probe.through_proxy("/account/logout", port=probe.second_port) == 200
+
+    observed = {name: classify(probe.requests()[0][name]) for name in ACCESSORS}
+    assert observed == MEASURED, (
+        f"the accessors InterceptedRequest offers have changed: {observed} is "
+        f"not the measured {MEASURED}. This is not necessarily a defect -- it is "
+        "a new measurement. Update MEASURED and docs/burp-proxy-measurements.md "
+        "together, and re-read Task 5's source attribution against the new set.")
+
+    recorded = RECORD.read_text()
+    for name, verdict in MEASURED.items():
+        assert any(name in line and verdict in line
+                   for line in recorded.splitlines()), (
+            f"{name} is {verdict} on InterceptedRequest and no single line of "
+            f"{RECORD.name} says so -- record what Burp offers before designing "
+            "around what it does not")
+
+    primary = probe.request_for("/api/orders")["listenerInterface"]
+    second = probe.request_for("/account/logout")["listenerInterface"]
+    assert primary != second, (
+        f"both listeners report listenerInterface={primary!r}, so the accessor "
+        "exists but tells the two apart from nothing. Q1's answer is NO and "
+        "Task 5 needs the second-BridgeClient fallback.")
+    assert primary.endswith(f":{probe.proxy_port}"), (primary, probe.proxy_port)
+    assert second.endswith(f":{probe.second_port}"), (second, probe.second_port)
+
+
+def test_q2_message_id_correlates_a_response_to_its_request(probe):
+    """Q2. Capture pairs the two halves of an exchange by this id.
+
+    Sequential requests would prove almost nothing: ids that merely count up
+    match by accident when nothing overlaps. So two requests are put in flight
+    at once against a target that answers the first one LAST, and the test
+    requires the responses to arrive in the other order before it believes the
+    pairing means anything.
+
+    Measured answer: YES. Ids are assigned in request order and the response
+    carries the id of ITS request, not of the exchange that finished first.
+    """
+    done: dict[str, int | None] = {}
+
+    def go(name, path):
+        done[name] = probe.through_proxy(path)
+
+    slow = threading.Thread(target=go, args=("slow", "/slow?ms=2500"))
+    fast = threading.Thread(target=go, args=("fast", "/api/orders"))
+    slow.start()
+    time.sleep(0.5)          # the slow exchange is already open
+    fast.start()
+    slow.join(60)
+    fast.join(60)
+    assert done == {"slow": 200, "fast": 200}, done
+
+    reqs = {r["id"]: r for r in probe.requests()}
+    resps = probe.responses()
+    assert resps, "no response reached the handler"
+
+    ids = {r["id"] for r in resps}
+    assert ids <= set(reqs), (
+        f"a response carried an id no request did: {ids - set(reqs)}. Capture "
+        "cannot pair the halves of an exchange by messageId if this is false.")
+    for resp in resps:
+        assert resp["reqpath"] == reqs[resp["id"]]["path"], (
+            f"messageId {resp['id']} is on a response whose initiating request "
+            f"was {resp['reqpath']}, but the request with that id was "
+            f"{reqs[resp['id']]['path']}. The id does not correlate.")
+
+    order = [r["reqpath"] for r in resps]
+    assert order.index("/api/orders") < order.index("/slow?ms=2500"), (
+        f"the responses came back in request order ({order}), so nothing here "
+        "was measured: the two exchanges never actually overlapped. Raise the "
+        "/slow delay or check that the proxy is not serialising connections.")
+    slow_id, fast_id = (probe.request_for("/slow?ms=2500")["id"],
+                        probe.request_for("/api/orders")["id"])
+    assert int(slow_id) < int(fast_id), (slow_id, fast_id)
+
+
+def test_q3_drop_means_the_target_receives_nothing(probe):
+    """Q3. The whole enforcement claim for this egress point.
+
+    The target server is LISTENING throughout. A drop that merely fails to
+    forward is indistinguishable from a connection error unless something on
+    the far side can say it saw nothing -- which is why this asserts on the
+    target's own log rather than on what the client got back.
+
+    Measured answer: YES for egress, and the client-side half is a TRAP. Burp
+    sends the dropping client `HTTP/1.1 200 OK` with its own HTML error page,
+    so a dropped request is indistinguishable from a delivered one by status
+    code alone. Nothing may ever read the client's status as evidence that a
+    request was blocked.
+
+    Three claims, and the third is about the DOCUMENT rather than about Burp.
+    Egress is what the target's log settles. The status and byte count are what
+    the client got. And `docs/burp-proxy-measurements.md` must still record
+    both -- because that document, not this file, is what Task 5's implementer
+    acts from, and the whole "client is told 200 OK" section could be deleted
+    with every test here still green. Reading the two numbers back is the same
+    mechanism Q1 uses for the accessor table, chosen over asserting them here
+    alone for that reason: an assertion in this file keeps the FACT true, and
+    only the readback keeps the DELIVERABLE true.
+    """
+    before = len(probe.target.hits)
+    raw = probe.raw_through_proxy("/drop/secret")
+    time.sleep(0.5)
+    assert len(probe.target.hits) == before, (
+        f"drop() did not prevent egress: the target received "
+        f"{probe.target.hits[before:]}")
+    assert any(l.startswith("DROPPED ") for l in probe.lines()), \
+        "the handler never reached its drop branch; the test proved nothing"
+
+    head = raw.split(b"\r\n", 1)[0]
+    assert head.startswith(b"HTTP/"), (
+        f"a dropped request no longer draws an HTTP response at all: {raw[:120]!r}")
+    status = int(head.split()[1])
+    assert (status, len(raw)) == (DROPPED_STATUS, DROPPED_BYTES), (
+        f"a dropped request now draws {status} in {len(raw)} bytes from Burp, "
+        f"not the measured {DROPPED_STATUS} in {DROPPED_BYTES}. If the status "
+        "changed to something a client can tell apart from a delivery, that is a "
+        "BETTER answer than the measured one and Plan 4 gets easier -- but it is "
+        "a new measurement either way. Update DROPPED_STATUS/DROPPED_BYTES and "
+        "docs/burp-proxy-measurements.md together. First line: "
+        f"{head!r}")
+
+    recorded = RECORD.read_text()
+    assert any(str(DROPPED_BYTES) in line and str(DROPPED_STATUS) in line
+               for line in recorded.splitlines()), (
+        f"no single line of {RECORD.name} records that a dropped request draws "
+        f"a {DROPPED_STATUS} of {DROPPED_BYTES} bytes. That is the most "
+        "consequential finding in this task -- it is why a drop cannot be "
+        "detected by status code -- and the document is what Task 5 is built "
+        "from. Do not delete it from there to satisfy this assertion.")
+    assert "indistinguishable" in recorded, (
+        f"{RECORD.name} no longer says a dropped request is INDISTINGUISHABLE "
+        "from a delivered one. The two numbers above can survive in a document "
+        "that has stopped saying what they mean; this is the sentence that says "
+        "it, and Task 5 reads the document rather than this test.")
 ```
 
 - [ ] **Step 4: Add the probe launcher to the fixture**
@@ -295,17 +613,42 @@ def launch_probe(workdir: Path, out: Path,
 
     The second listener is the whole point of Q1: one Burp, two ports, and the
     question is whether the extension can tell which one a request came in on.
-    Port 0 means the caller does not care which port it gets; read the real one
-    back with proxy_port().
+    `extra_listener_port=0` means the caller does not care which port it gets;
+    read the real ones back with proxy_port() and second_proxy_port().
+
+    Burp Community has no API for creating a listener -- `burp.api.montoya.
+    proxy.Proxy` offers registerRequestHandler, registerResponseHandler,
+    registerWebSocketCreationHandler, history and intercept, and nothing that
+    opens a port. So the second listener comes from a PROJECT CONFIG FILE via
+    `--config-file`, which Community does accept. Both listeners are written
+    explicitly, including the first: a config that named only the second would
+    leave the first wherever Burp's defaults put it, which is the 8080 that
+    _free_port() exists to avoid.
+
+    `loopback_only` is not decoration. Nothing in this project has ever sent a
+    request off this machine, and a proxy listener on 0.0.0.0 is an open relay
+    on whatever network the laptop is attached to. It is also not self-
+    enforcing: this string was the whole of the protection until
+    not_loopback_only() was written, and changing it to `all_interfaces` left
+    the suite green with the proxy bound to `*`. Callers must run that check
+    once the listeners are up -- test_proxy_facts.py's fixture does.
     """
     home = make_home(workdir)
+    classes = _compile_probe(workdir)
+    write_listener_config(workdir, extra_listener_port)
     log = (workdir / "burp.log").open("wb")
     cmd = [
         "java", "-Djava.awt.headless=true", f"-Duser.home={home}",
         f"-Dhx.probe.out={out}",
-        *ADD_OPENS, "-cp", f"{BURP_JAR}:{EXT_JAR}",
+        # The probe's classes in place of the shipped extension jar. Burp
+        # loads exactly the one class named below, so EXT_JAR on the classpath
+        # would not load HxExtension -- it is left off because the probe does
+        # not need it, and because a jar on the path of a measurement run is a
+        # thing a later reader has to rule out.
+        *ADD_OPENS, "-cp", f"{BURP_JAR}:{classes}",
         "burp.StartBurp",
-        "--developer-extension-class-name=hx.proxy.Probe",
+        f"--developer-extension-class-name={PROBE_CLASS}",
+        f"--config-file={workdir / PROXY_CONFIG}",
         "--disable-auto-update",
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
@@ -315,15 +658,8 @@ def launch_probe(workdir: Path, out: Path,
     return proc
 
 
-def proxy_port(workdir: Path) -> int:
-    """Burp Community's default proxy listener port.
-
-    Hard-coded rather than discovered: Community does not expose a listener
-    API and 8080 is its documented default. If a future Burp changes it, every
-    test in test_proxy_facts.py fails at once, which is the correct blast
-    radius for a wrong constant.
-    """
-    return 8080
+def listener_ports(workdir: Path) -> list[int]:
+    """The ports this run's Burp was TOLD to listen on, read back from its config.
 ```
 
 - [ ] **Step 5: Write the three measurement tests**
@@ -333,56 +669,67 @@ def proxy_port(workdir: Path) -> int:
 def test_q1_whether_a_request_names_the_listener_it_arrived_on(probe):
     """Q1. Plan 4's operator/crawler split rests on this answer.
 
-    This test does NOT assert a particular answer -- it RECORDS one, and fails
-    only if the set of available accessors changes. Both answers are workable:
-    if a listener accessor exists, Source.attribute reads it; if not, the
-    fallback is a second BridgeClient on a second socket. What must not happen
-    is building on a guess.
+    Measured answer: YES. `listenerInterface()` returns `host:port` for the
+    listener the request arrived on -- `127.0.0.1:42969` -- and two listeners in
+    one Burp produce two different values for the same request. So the split can
+    be a property of the CONNECTION, which is what spec s4 requires, and no
+    second BridgeClient is needed.
+
+    The two halves below are different claims and both are needed. The
+    classification pins WHICH accessors Burp offers, so a future version that
+    adds, removes or breaks one goes red here rather than in Task 5. The
+    distinctness check pins that the value actually DISCRIMINATES: an accessor
+    that existed and returned the same string for every listener would satisfy
+    the first half completely and answer Q1 no.
     """
-    assert probe.through_proxy("/health") == 200
-    req = [l for l in probe.lines() if l.startswith("REQ ")]
-    assert req, "no request reached the handler"
-    line = req[0]
-    present = {name for name in
-               ("listenerInterface", "listenerPort", "sourceIpAddress",
-                "destinationIpAddress", "httpService")
-               if f"{name}=<absent>" not in line}
-    recorded = Path("docs/burp-proxy-measurements.md").read_text()
-    for name in present:
-        assert name in recorded, (
-            f"{name} is available on InterceptedRequest and is not recorded in "
-            "docs/burp-proxy-measurements.md -- record what Burp offers before "
-            "designing around what it does not")
+    assert probe.through_proxy("/api/orders") == 200
+    assert probe.through_proxy("/account/logout", port=probe.second_port) == 200
+
+    observed = {name: classify(probe.requests()[0][name]) for name in ACCESSORS}
+    assert observed == MEASURED, (
+        f"the accessors InterceptedRequest offers have changed: {observed} is "
+        f"not the measured {MEASURED}. This is not necessarily a defect -- it is "
+        "a new measurement. Update MEASURED and docs/burp-proxy-measurements.md "
+        "together, and re-read Task 5's source attribution against the new set.")
+
+    recorded = RECORD.read_text()
+    for name, verdict in MEASURED.items():
+        assert any(name in line and verdict in line
+                   for line in recorded.splitlines()), (
+            f"{name} is {verdict} on InterceptedRequest and no single line of "
+            f"{RECORD.name} says so -- record what Burp offers before designing "
+            "around what it does not")
+
+    primary = probe.request_for("/api/orders")["listenerInterface"]
+    second = probe.request_for("/account/logout")["listenerInterface"]
+    assert primary != second, (
+        f"both listeners report listenerInterface={primary!r}, so the accessor "
+        "exists but tells the two apart from nothing. Q1's answer is NO and "
+        "Task 5 needs the second-BridgeClient fallback.")
+    assert primary.endswith(f":{probe.proxy_port}"), (primary, probe.proxy_port)
+    assert second.endswith(f":{probe.second_port}"), (second, probe.second_port)
 
 
 def test_q2_message_id_correlates_a_response_to_its_request(probe):
-    """Q2. Capture pairs the two halves of an exchange by this id."""
-    assert probe.through_proxy("/health") == 200
-    assert probe.through_proxy("/echo?x=1") == 200
-    reqs = {l.split()[1] for l in probe.lines() if l.startswith("REQ ")}
-    resps = {l.split()[1] for l in probe.lines() if l.startswith("RESP ")}
-    assert resps, "no response reached the handler"
-    assert resps <= reqs, (
-        f"a response carried an id no request did: {resps - reqs}. Capture "
-        "cannot pair the halves of an exchange by messageId if this is false.")
+    """Q2. Capture pairs the two halves of an exchange by this id.
 
+    Sequential requests would prove almost nothing: ids that merely count up
+    match by accident when nothing overlaps. So two requests are put in flight
+    at once against a target that answers the first one LAST, and the test
+    requires the responses to arrive in the other order before it believes the
+    pairing means anything.
 
-def test_q3_drop_means_the_target_receives_nothing(probe):
-    """Q3. The whole enforcement claim for this egress point.
-
-    The target server is LISTENING throughout. A drop that merely fails to
-    forward is indistinguishable from a connection error unless something on
-    the far side can say it saw nothing -- which is why this asserts on the
-    target's own log rather than on what the client got back.
+    Measured answer: YES. Ids are assigned in request order and the response
+    carries the id of ITS request, not of the exchange that finished first.
     """
-    before = len(probe.target.hits)
-    probe.through_proxy("/drop/secret")
-    time.sleep(0.5)
-    assert len(probe.target.hits) == before, (
-        f"drop() did not prevent egress: the target received "
-        f"{probe.target.hits[before:]}")
-    assert any(l.startswith("DROPPED ") for l in probe.lines()), \
-        "the handler never reached its drop branch; the test proved nothing"
+    done: dict[str, int | None] = {}
+
+    def go(name, path):
+        done[name] = probe.through_proxy(path)
+
+    slow = threading.Thread(target=go, args=("slow", "/slow?ms=2500"))
+    fast = threading.Thread(target=go, args=("fast", "/api/orders"))
+    slow.start()
 ```
 
 - [ ] **Step 6: Run the measurements**
@@ -449,12 +796,17 @@ template.
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from hx import surface
 
 PRESERVE = frozenset({"api", "v1", "v2", "v3"})
 KW = {"preserve": PRESERVE, "slug_threshold": 12}
+
+POLICY_JAVA = Path(__file__).resolve().parents[1] / "extension/src/hx/policy/Policy.java"
 
 
 def t(path: str) -> str:
@@ -476,17 +828,112 @@ class TestNumericSegments:
         assert t("/user/12/order/34") == "/user/{id}/order/{id}"
 
 
+class TestPlaceholderSyntaxCannotBeForged:
+    r"""A segment kept verbatim must not be able to spell a template.
+
+    `{` and `}` are the placeholder syntax, and until NORMALISER_VERSION 2 a
+    literal one was emitted unchanged: `/order/1`, `/order/{id}` and
+    `/order/%7Bid%7D` all produced `/order/{id}`. Same `path_template` means
+    the same row under `UNIQUE (engagement_id, method, scheme, host, port,
+    path_template, query_key_set)`, so an un-interpolated `href="/order/{id}"`
+    on a page -- or anyone sending `GET /order/%7Bid%7D` through the proxy --
+    upserts onto the real `/order/N` row and moves its `last_seen_run` onto a
+    request that never touched the endpoint. Seen FIRST, the forgery is that
+    row's `exemplar_exchange_id` for good: Task 4's planned `DO UPDATE SET`
+    touches only `last_seen_run`, so the exemplar is whatever inserted it.
+
+    `Policy` does not stop it: `checkHostChars` is host-only, there is no path
+    charset, and `{` decodes fully, so the request is allowed.
+    """
+
+    def test_a_literal_placeholder_segment_is_escaped_not_emitted(self):
+        assert t("/order/{id}") == "/order/%7Bid%7D"
+
+    def test_so_it_cannot_share_a_row_with_the_template_it_spells(self):
+        """THE SEPARATING CASE. Both sides were `/order/{id}` before."""
+        assert t("/order/1") == "/order/{id}"
+        assert t("/order/{id}") != t("/order/1")
+
+    def test_and_neither_can_its_encoded_spelling(self):
+        """`%7Bid%7D` decodes to `{id}`, so escaping only the literal would
+        leave the same forgery one percent-escape away."""
+        assert t("/order/%7Bid%7D") == "/order/%7Bid%7D"
+        assert t("/order/%7buuid%7d") == "/order/%7Buuid%7D"
+        assert t("/order/%7buuid%7d") != t("/session/3f2504e0-4f89-11d3-9a0c-0305e82c3301")
+
+    def test_a_segment_with_no_braces_is_untouched_by_the_escaping(self):
+        """Separates the escaping from 'mangle every kept segment'."""
+        assert t("/order/status") == "/order/status"
+
+
 class TestPreservedSegments:
-    def test_a_preserved_segment_is_never_templated(self):
-        """`v1` is digits-adjacent and must survive; this is why the list exists."""
+    r"""The preserve list, and the fact that the DEFAULT list does nothing.
+
+    Deleting the preserve rule entirely reddens nothing that the SHIPPED
+    defaults reach, and the reason is not a missing test -- it is that none of
+    `api`, `v1`, `v2`, `v3` is matched by any shape rule anyway. `_DIGITS` is
+    `\A[0-9]+\Z`, so `v1` never matched it; there is nothing for the list to
+    protect them from. `v1`, `v2` and `v3` become reachable only below
+    `slug_threshold` 3, which templates `/h2`, `/v9` and nearly every short
+    digit-bearing segment -- a configuration that is legal and that nobody
+    runs -- and `api` never becomes reachable at all, having no digit.
+    `config.py` says so where an operator will read it.
+
+    Three claims in the first version of this class asserted otherwise -- that
+    `v1` "is digits-adjacent and must survive, this is why the list exists",
+    that `/v2` would "otherwise match a rule", and that `/v9` "separates the
+    preserve list" (it separates the digits rule). All three were false, and
+    they are the reason the no-op went unnoticed: a class full of confident
+    comments about a rule that was doing nothing.
+
+    The rule is kept because it IS reachable under legal configurations, and
+    the last two tests here are what separate it from its absence.
+    """
+
+    def test_a_preserved_segment_survives_alongside_templated_ones(self):
+        """Not because the list protects it -- nothing threatens `v1` under the
+        defaults -- but because the digits rule must not reach across it."""
         assert t("/api/v1/order/7") == "/api/v1/order/{id}"
 
-    def test_even_when_it_would_otherwise_match_a_rule(self):
+    def test_a_default_preserved_segment_alone_is_unchanged(self):
         assert t("/v2") == "/v2"
 
-    def test_a_segment_not_on_the_list_gets_no_protection(self):
-        """Separates the preserve list from a blanket exemption."""
+    def test_a_segment_not_on_the_list_is_templated_by_the_digits_rule(self):
+        """`/v9` is not on the list, but that is not what templates `7`."""
         assert t("/v9/order/7") == "/v9/order/{id}"
+
+    def test_the_default_entries_are_protected_from_nothing(self):
+        """The claim above, executable: with the list EMPTY and the shipped
+        threshold, every default entry templates to itself anyway."""
+        bare = {"preserve": frozenset(), "slug_threshold": 12}
+        for seg in ("api", "v1", "v2", "v3"):
+            assert surface.path_template("/" + seg, **bare) == "/" + seg
+
+    def test_the_list_is_load_bearing_under_a_config_that_needs_it(self):
+        """A separating case for the rule.
+
+        A numeric path segment that is genuinely a route -- a year, a version,
+        an API generation -- is exactly what an operator puts on this list, and
+        without the rule it templates to `{id}` and merges with every other
+        number in that position. Measured: `/2024/report` becomes
+        `/{id}/report` when the rule is deleted.
+        """
+        kw = {"preserve": frozenset({"2024"}), "slug_threshold": 12}
+        assert surface.path_template("/2024/report", **kw) == "/2024/report"
+        assert surface.path_template("/2025/report", **kw) == "/{id}/report"
+
+    def test_and_it_is_checked_after_decoding_so_one_escape_cannot_defeat_it(self):
+        """THE OTHER SEPARATING CASE, and the ordering bug of version 1.
+
+        `/%32024/report` and `/20%324/report` are the same request to the same
+        server as `/2024/report`. Matched against the RAW spelling, the
+        operator's explicit "this segment is a route" was bypassed by one
+        escape AND the encoded spelling merged into the numeric-id family:
+        both measured `/{id}/report`.
+        """
+        kw = {"preserve": frozenset({"2024"}), "slug_threshold": 12}
+        assert surface.path_template("/%32024/report", **kw) == "/2024/report"
+        assert surface.path_template("/20%324/report", **kw) == "/2024/report"
 
 
 class TestIdentifierShapes:
@@ -530,6 +977,57 @@ class TestPercentEncoding:
     def test_malformed_encoding_is_left_verbatim_rather_than_guessed(self):
         assert t("/order/%zz") == "/order/%zz"
 
+    def test_an_escape_that_is_not_utf8_is_left_verbatim_rather_than_folded(self):
+        """`unquote`'s default `errors="replace"` folds all 128 invalid
+        single-byte escapes to U+FFFD, so `/order/%80` .. `/order/%FF` all
+        measured `/order/�`: byte-level fuzzing through the proxy would
+        record 128 requests as one surface."""
+        assert t("/order/%80") == "/order/%80"
+        assert t("/order/%FF") == "/order/%FF"
+        assert t("/order/%80") != t("/order/%FF")
+
+    def test_but_a_valid_utf8_escape_still_decodes(self):
+        """The separating case for the line above: strictness must not turn
+        into 'never decode anything non-ASCII'."""
+        assert t("/caf%C3%A9") == "/café"
+
+
+class TestDecodingDepth:
+    """Decoding runs to a fixed point, because `Policy` decides on one.
+
+    `Policy.decodeToFixedPoint` unwraps nested escapes until nothing changes;
+    version 1 decoded once. So `/order/%2531` was `/order/1` to the scope
+    decision that authorised the request and `/order/%31` to the row recording
+    it -- the evidence and the authorisation naming different endpoints -- and
+    it split from `/order/1` into a second row besides.
+    """
+
+    def test_a_doubly_encoded_segment_reaches_the_same_template(self):
+        """Measured before: `/order/%2531` -> `/order/%31`."""
+        assert t("/order/%2531") == t("/order/%31") == t("/order/1") == "/order/{id}"
+
+    def test_the_bound_is_the_one_Policy_enforces(self):
+        """The mirror cannot share code across the language boundary, so it is
+        pinned by reading Policy's constant rather than by a comment."""
+        java = POLICY_JAVA.read_text(encoding="utf-8")
+        m = re.search(r"MAX_DECODE_ROUNDS\s*=\s*(\d+)\s*;", java)
+        assert m is not None, f"Policy.MAX_DECODE_ROUNDS not found in {POLICY_JAVA}"
+        assert int(m.group(1)) == surface.MAX_DECODE_ROUNDS == 16
+
+    def test_past_the_bound_the_partial_decode_is_what_is_recorded(self):
+        """Exactly `decodeToFixedPoint`'s behaviour. Policy answers this shape
+        with a DENIAL (`decodesFully`), so it does not reach here through the
+        gate; the two still agree about everything the gate admits."""
+        at_the_bound = "%" + "25" * 15 + "31"    # 16 rounds to reach "1"
+        past_it = "%" + "25" * 16 + "31"         # 17
+        assert t("/order/" + at_the_bound) == "/order/{id}"
+        assert t("/order/" + past_it) == "/order/%31"
+
+    def test_an_encoded_separator_is_refused_however_deeply_it_is_nested(self):
+        """`%252f` decodes to `/` too, so the refusal has to survive the extra
+        rounds or the fixed point would undo it."""
+        assert t("/a%252fb") == "/a%252fb"
+
 
 class TestShape:
     def test_the_root_path_survives(self):
@@ -543,6 +1041,11 @@ class TestShape:
 
     def test_an_empty_path_normalises_to_root(self):
         assert t("") == "/"
+
+    def test_an_empty_interior_segment_survives_as_one(self):
+        """`//` is two empty segments, not one collapsed slash: no rule matches
+        the empty string, so it needs no special case to come back unchanged."""
+        assert t("/a//b") == "/a//b"
 
 
 class TestQueryKeySet:
@@ -560,6 +1063,37 @@ class TestQueryKeySet:
 
     def test_an_empty_query_is_empty(self):
         assert surface.query_key_set("") == ""
+
+    def test_a_key_containing_the_delimiter_is_escaped(self):
+        """THE SEPARATING CASE for the escaping. `a%2Cb=1` is ONE parameter and
+        `a=1&b=2` is two; both measured `a,b`, so a check enumerating inputs
+        off the row would see a different count than the exchange carried."""
+        assert surface.query_key_set("a%2Cb=1") == "a%2Cb"
+        assert surface.query_key_set("a=1&b=2") == "a,b"
+        assert surface.query_key_set("a%2Cb=1") != surface.query_key_set("a=1&b=2")
+
+    def test_and_the_bare_spelling_of_that_key_is_the_same_key(self):
+        """`?a,b` and `?a%2Cb` are one parameter under either spelling."""
+        assert surface.query_key_set("a,b") == surface.query_key_set("a%2Cb=1")
+
+    def test_a_two_key_set_renders_as_two_fields_not_three(self):
+        """Measured before: `a=1&a%2Cb=2` -> `a,a,b`."""
+        assert surface.query_key_set("a=1&a%2Cb=2") == "a,a%2Cb"
+
+    def test_an_empty_key_is_distinguishable_from_no_query_at_all(self):
+        """`GET /x` and `GET /x?=1` are different requests; both measured
+        `""`, so they merged into one row."""
+        assert surface.query_key_set("=1") == "(empty)"
+        assert surface.query_key_set("=1") != surface.query_key_set("")
+
+    def test_and_it_sorts_and_joins_like_any_other_key(self):
+        assert surface.query_key_set("a=2&=1") == "(empty),a"
+
+    def test_a_key_cannot_forge_the_empty_key_token(self):
+        """`(` and `)` are outside what `quote(safe="")` emits, which is what
+        makes `(empty)` unforgeable rather than merely unlikely."""
+        assert surface.query_key_set("(empty)=1") == "%28empty%29"
+        assert surface.query_key_set("(empty)=1") != surface.query_key_set("=1")
 
 
 class TestKind:
@@ -594,20 +1128,61 @@ class TestNormalise:
         assert surface.normalise("GET", "https://app.test/x", **KW).port == 443
         assert surface.normalise("GET", "http://app.test/x", **KW).port == 80
 
+    def test_a_scheme_with_no_default_port_records_zero(self):
+        """The fallback arm of `_DEFAULT_PORT.get`, which nothing reached: it
+        could be any number at all and every test still passed."""
+        assert surface.normalise("GET", "ftp://app.test/x", **KW).port == 0
+
+    def test_an_explicit_port_zero_is_recorded_rather_than_replaced(self):
+        """`parts.port or ...` made this 80 -- a row naming an endpoint nobody
+        addressed. `port` is a UNIQUE-key field, so it is the row's identity."""
+        assert surface.normalise("GET", "http://app.test:0/x", **KW).port == 0
+
     def test_the_host_is_lowercased_and_the_path_is_not(self):
         """Hosts are case-insensitive (RFC 9110 s4.2.3); paths are not.
         Lowercasing a path would merge /Admin and /admin, which on some
-        servers are two different places."""
+        servers are two different places. The fold itself is `urlsplit`'s --
+        this pins the output contract, not an implementation here."""
         n = surface.normalise("GET", "http://APP.Test/Admin", **KW)
         assert n.host == "app.test"
         assert n.path_template == "/Admin"
 
+    def test_the_host_fold_is_urlsplit_s_and_stops_at_a_zone_id(self):
+        """`hostname` lowercases up to the first `%` and leaves the rest,
+        which it reads as an IPv6 zone id. A second `.lower()` here used to
+        fold that tail too -- the only inputs it changed, and `Policy` refuses
+        both (`checkHostChars` allows neither `%` nor a bracket). Recorded as
+        `urlsplit` reports it rather than folded a second time."""
+        n = surface.normalise("GET", "http://[fe80::1%tESt]/x", **KW)
+        assert n.host == "fe80::1%tESt"
 
-def test_the_version_is_an_integer_that_someone_must_bump():
+    def test_a_url_with_no_authority_has_an_empty_host_not_None(self):
+        """`parts.hostname` is None for a relative url, and `host` feeds a NOT
+        NULL column. The `or ""` is the only thing between the two."""
+        assert surface.normalise("GET", "/order/1", **KW).host == ""
+
+    @pytest.mark.parametrize("url", ["http://app.test:99999/x",
+                                     "http://app.test:abc/x",
+                                     "http://[fe80::/x"])
+    def test_normalise_is_not_total_and_says_so(self, url):
+        """A url this cannot parse is one the gate has already refused --
+        `Policy.checkScope` turns exactly these into `scope_denied` -- so
+        swallowing the error would record a surface for a request that had no
+        authority behind it. A caller arriving by another route (`via='send'`,
+        `via='crawl'`) owes the exception a handler."""
+        with pytest.raises(ValueError):
+            surface.normalise("GET", url, **KW)
+
+
+def test_the_version_is_pinned_to_the_ruleset_in_this_file():
     """A rule change without a version bump silently reinterprets history:
-    old rows claim a template the current rules would never produce."""
-    assert isinstance(surface.NORMALISER_VERSION, int)
-    assert surface.NORMALISER_VERSION >= 1
+    old rows claim a template the current rules would never produce.
+
+    Pinned to the EXACT value. `>= 1` was the assertion here while the rules
+    changed underneath it, which left the one field whose whole purpose is
+    saying which ruleset produced a row unpinned by anything.
+    """
+    assert surface.NORMALISER_VERSION == 2
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -634,17 +1209,59 @@ wrong rule is a permanent hole in the evidence rather than a re-runnable step.
 
 So the rules below are deliberately conservative: a segment is templated only
 when its SHAPE says identifier, never merely because it is unfamiliar.
+
+WHERE THIS DIVERGES FROM `Policy` (extension/src/hx/policy/Policy.java), the
+gate that decided the request was allowed at all. A difference between them is
+a difference between what was AUTHORISED and what is RECORDED, so each one is
+named here rather than left to be found in a report:
+
+  - PATH CASE IS KEPT. Policy folds case before matching; merging `/Admin`
+    with `/admin` would be a guess about someone else's router.
+  - `%2f` DOES NOT SPLIT A SEGMENT. Policy reads a path several ways at once
+    and one of them splits; a surface row is a single string and has to pick,
+    and picking "the server split on it" merges two endpoints.
+  - DECODING DEPTH IS MIRRORED -- see `_decode_segment`. This is the one that
+    was a divergence and is now deliberately not one.
+  - DECODING CHARSET DIFFERS. `Policy.decodeOnce` maps each escaped byte to
+    one char with no transcoding; `unquote` here reads the escaped bytes as
+    UTF-8 and leaves the whole segment verbatim when they are not UTF-8. The
+    two agree on every ASCII escape, which is every escape a rule below can
+    match on. They differ in how many CHARACTERS a non-ASCII segment has,
+    which can move it across `slug_threshold`.
+  - THE AUTHORITY IS RECORDED, NOT JUDGED. `Target.parse` and
+    `checkHostChars` refuse userinfo, a leading or trailing dot, an empty
+    label, a non-ASCII host, an IPv6 literal, an empty port and port 0.
+    `normalise` refuses none of them: it says what happened, it does not
+    decide whether it was allowed to. A request carrying one is `scope_denied`
+    at the gate (`Policy.checkScope` turns the parse failure into a denial),
+    so it reaches this module only from a caller that did not go through the
+    gate.
+  - HOST CASE FOLDING DIFFERS IN UNICODE'S CONDITIONAL CASES. Both sides fold
+    U+212A KELVIN SIGN to `k`, so that one is not a divergence. `str.lower()`
+    is Unicode's FULL mapping and `Policy.lower` is the SIMPLE one, so U+0130
+    is two characters here and one there. Only a non-ASCII host can notice,
+    and Policy refuses those.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 # Bump this when any rule below changes. A rule change without a bump silently
 # reinterprets history: rows written yesterday claim a template today's rules
 # would never produce, and nothing can tell the two apart afterwards.
-NORMALISER_VERSION = 1
+#
+# 1 -> 2 (fix round 1): a kept segment now has `{` and `}` percent-encoded so
+# it cannot spell a placeholder; `query_key_set` escapes its own delimiter and
+# distinguishes an empty key from no query; `preserve` is matched AFTER
+# decoding; decoding runs to a fixed point rather than once; a segment whose
+# escapes are not UTF-8 is kept verbatim rather than folded to U+FFFD.
+NORMALISER_VERSION = 2
+
+# Mirrors Policy.MAX_DECODE_ROUNDS. See `_decode_segment`; a test reads the
+# constant out of Policy.java so the two cannot drift apart in silence.
+MAX_DECODE_ROUNDS = 16
 
 _DIGITS = re.compile(r"\A[0-9]+\Z")
 _UUID = re.compile(
@@ -659,6 +1276,12 @@ _STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 _DEFAULT_PORT = {"http": 80, "https": 443}
 
+# What an empty query KEY is written as, so that `?=1` and no query at all are
+# not the same row. Any other spelling of "nothing" would be a key some request
+# could carry: `_encoded_key` emits only unreserved characters and `%XX`, and
+# `(` is neither, so no key can forge this one.
+_EMPTY_KEY = "(empty)"
+
 
 @dataclass(frozen=True)
 class Normalised:
@@ -672,32 +1295,96 @@ class Normalised:
     normaliser_version: int
 
 
+def _decode_once(seg: str) -> str:
+    """One round of percent-decoding, or the input when it cannot be read.
+
+    `errors="strict"` and not the default `"replace"`: `unquote` folds every
+    one of the 128 invalid single-byte escapes to U+FFFD, so `%80` through
+    `%FF` would template to the same segment and 128 distinct requests would
+    be recorded as one surface. Returning the input unchanged instead is the
+    same policy this module already applies to `%zz` -- leave what it cannot
+    read alone rather than invent a URL the client never sent -- and it makes
+    the round a no-op, which stops the fixed-point loop below.
+    """
+    try:
+        return unquote(seg, errors="strict")
+    except UnicodeDecodeError:
+        return seg
+
+
 def _decode_segment(seg: str) -> str:
-    """Percent-decode one segment, but never into a separator.
+    """Percent-decode one segment to a fixed point, but never into a separator.
 
     `/order/%31` and `/order/1` are one endpoint and must template alike.
+
+    TO A FIXED POINT, mirroring `Policy.decodeToFixedPoint`, under the same
+    bound: `Policy` matches its rules against a SET of readings of the path,
+    and one member of that set is the fully-decoded one, so `/order/%2531` is
+    among other things `/order/1` to the gate that authorised it. Decoding
+    once here would record it as `/order/%31` -- the row and the thing that
+    was authorised naming different endpoints -- and would split it from
+    `/order/1` besides.
+    The two cannot share code across the language boundary, so the agreement
+    is pinned by a test that reads Policy's constant.
+
+    Past the bound the partially decoded string is returned, which is what
+    `decodeToFixedPoint` does. Policy turns that case into a DENIAL
+    (`decodesFully`), so a request that needs more than sixteen rounds does
+    not reach this module through the gate.
+
     `/a%2fb` is NOT `/a/b`: whether the server splits on an encoded slash is
     the server's business, and assuming it does would merge two different
     endpoints into one surface. So a decode that would introduce a `/` is
-    refused and the segment stays verbatim.
-
-    A malformed escape is left alone for the same reason -- `unquote` is happy
-    to hand back `%zz` unchanged, and guessing at a repair would be inventing
-    a URL the client never saw.
+    refused and the segment stays verbatim -- and it is refused however deeply
+    the slash was nested, because `%252f` decodes to it too.
     """
-    decoded = unquote(seg)
+    decoded = seg
+    for _ in range(MAX_DECODE_ROUNDS):
+        nxt = _decode_once(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
     if "/" in decoded:
         return seg
     return decoded
 
 
+def _kept_segment(seg: str) -> str:
+    """A segment that survives templating, spelt so it cannot BE a template.
+
+    `{` and `}` are this module's placeholder syntax, so a segment allowed to
+    carry them literally can spell one: `/order/{id}` and `/order/%7Bid%7D`
+    both template to `/order/{id}`, which is the row `/order/1` and
+    `/order/9999` share. Task 4's upsert then moves that row's
+    `last_seen_run` onto a request that never touched the endpoint, and if the
+    forgery is the FIRST sighting it is the row's `exemplar_exchange_id` for
+    good -- the exemplar is written on insert and the planned `DO UPDATE SET`
+    does not touch it. A page shipping an un-interpolated `href="/order/{id}"`
+    is enough.
+
+    Escaping the braces instead of choosing a rarer delimiter is the fix,
+    because a rarer delimiter is the same defect with a longer fuse. It is
+    injective on a segment that REACHED its fixed point: such a segment holds
+    no valid escape, so a `%7B` in the output came from a `{` and from nothing
+    else. Two shapes sit outside that: a segment kept verbatim by the `/`
+    refusal above, where `a{b%2fc` and `a%7Bb%2fc` both give `a%7Bb%2fc` --
+    two spellings of one decoded segment, which is a merge this module makes
+    everywhere else and not a merge of two endpoints -- and a segment still
+    encoded past the round bound, which `Policy` answers with a denial.
+    """
+    return seg.replace("{", "%7B").replace("}", "%7D")
+
+
 def _template_segment(seg: str, preserve: frozenset[str],
                       slug_threshold: int) -> str:
-    if seg in preserve:
-        # Checked BEFORE decoding and before every shape rule: `v1` is
-        # digit-adjacent and `v2` would otherwise survive only by accident.
-        return seg
     decoded = _decode_segment(seg)
+    if decoded in preserve:
+        # Checked AFTER decoding, and that ordering is the point: with
+        # `preserve={"2024"}`, `/%32024/report` is the same request to the same
+        # server as `/2024/report`, and matching the raw spelling let one
+        # escape defeat the operator's explicit "this segment is a route" AND
+        # merge the encoded spelling into the numeric-id family.
+        return _kept_segment(decoded)
     if _DIGITS.match(decoded):
         return "{id}"
     if _UUID.match(decoded):
@@ -709,7 +1396,7 @@ def _template_segment(seg: str, preserve: frozenset[str],
     # `/documentation-index` is a route, not an identifier.
     if len(decoded) >= slug_threshold and _HAS_DIGIT.search(decoded):
         return "{slug}"
-    return decoded
+    return _kept_segment(decoded)
 
 
 def path_template(path: str, *, preserve: frozenset[str],
@@ -719,12 +1406,29 @@ def path_template(path: str, *, preserve: frozenset[str],
         return "/"
     # A trailing slash is significant: `/order/` and `/order` can be different
     # routes, and merging them is a guess about someone else's router. Split
-    # keeps the empty final segment, and join puts it back.
+    # keeps the empty final segment, and join puts it back. An empty segment
+    # needs no special case here: `_template_segment("")` is `""` under every
+    # configuration -- no shape rule matches the empty string, and the one
+    # rule that can (`preserve={""}`) returns it unchanged.
     segments = path.split("/")
     out = [segments[0]]   # always "" for an absolute path
     for seg in segments[1:]:
-        out.append(_template_segment(seg, preserve, slug_threshold) if seg else seg)
+        out.append(_template_segment(seg, preserve, slug_threshold))
     return "/".join(out)
+
+
+def _encoded_key(key: str) -> str:
+    """One query key, spelt so that the join below cannot be misread.
+
+    `,` separates keys, so a key containing one has to be escaped or the field
+    lies about how many inputs the request carried: `a%2Cb=1` is ONE parameter
+    and `a=1&b=2` is two, and both used to render `a,b`. A parameter is an
+    input and an input is where a flaw lives, so a check reading this field
+    would enumerate the wrong ones. `quote(safe="")` escapes `%` as well as
+    `,`, without which `a%2Cb` (the literal key) and `a,b` would collide in
+    turn.
+    """
+    return quote(key, safe="") if key else _EMPTY_KEY
 
 
 def query_key_set(query: str) -> str:
@@ -733,11 +1437,13 @@ def query_key_set(query: str) -> str:
     Two requests to the same endpoint differing only in a value are one
     surface. Two differing in which PARAMETERS they carry are not: a parameter
     is an input, and an input is where a flaw lives.
+
+    No query at all is `""`. A query carrying the empty key -- `?=1` -- is
+    `(empty)`, because `GET /x` and `GET /x?=1` are not the same request and a
+    field that renders both as `""` merges them.
     """
-    if not query:
-        return ""
     keys = {k for k, _ in parse_qsl(query, keep_blank_values=True)}
-    return ",".join(sorted(keys))
+    return ",".join(_encoded_key(k) for k in sorted(keys))
 
 
 def kind_for(method: str) -> str:
@@ -756,14 +1462,40 @@ def kind_for(method: str) -> str:
 
 def normalise(method: str, url: str, *, preserve: frozenset[str],
               slug_threshold: int) -> Normalised:
+    """One request as the surface row it belongs to.
+
+    NOT TOTAL, and the caller owes it a url. `urlsplit` raises `ValueError` on
+    an unterminated IPv6 literal (`http://[fe80::/x`), and `parts.port` raises
+    on a port that is not a number or is out of range (`http://h:abc/x`,
+    `http://h:99999/x`). Nothing here catches those: a url this cannot parse
+    is one the enforcement gate has already refused -- `Policy.checkScope`
+    turns exactly these into `scope_denied` -- so swallowing the error would
+    record a surface for a request that had no authority behind it. A caller
+    reaching this module by some other route (a `via='send'` or `via='crawl'`
+    string that never went through `Policy.Target.parse`) must be prepared for
+    the exception.
+    """
     parts = urlsplit(url)
-    scheme = parts.scheme.lower()
+    # `urlsplit` has already lowercased the scheme, and `parts.hostname` the
+    # host -- everything up to the first `%`, treating whatever follows as an
+    # IPv6 zone id and deliberately leaving its case alone. A second `.lower()`
+    # here was dead for every host that does not carry a `%`, which is the
+    # only thing it could still change -- `[fe80::1%tESt]` and `EX%41MPLE.test`
+    # are what that looks like -- and there it fought that deliberate choice.
+    # `Policy` refuses a `%` and a bracket alike (`checkHostChars`), so it
+    # asserted a normalisation this function does not perform, on inputs that
+    # cannot reach it through the gate.
+    scheme = parts.scheme
     # Hosts are case-insensitive (RFC 9110 s4.2.3); paths are not. Lowercasing
     # a path would merge /Admin and /admin, which on some servers are two
     # different places and on others are one -- and we do not get to decide
     # which server we are talking to.
-    host = (parts.hostname or "").lower()
-    port = parts.port or _DEFAULT_PORT.get(scheme, 0)
+    host = parts.hostname or ""   # None for a url with no authority at all
+    # `is not None` and not `or`: port 0 is falsy, and `or` recorded `http://
+    # h:0/x` on port 80 -- a row naming an endpoint nobody addressed. 0 is
+    # also the port an unknown scheme gets, and scheme is in the UNIQUE key,
+    # so the two cannot collide.
+    port = parts.port if parts.port is not None else _DEFAULT_PORT.get(scheme, 0)
     return Normalised(
         method=method,
         scheme=scheme,
@@ -925,6 +1657,24 @@ class TestAutoOpen:
                                 now_us=1000 + run_mod.IDLE_CLOSE_US)
         assert b == a
 
+    def test_a_closed_run_is_not_handed_back_as_the_current_one(self, conn):
+        """Found by Task 3's mutation sweep, not by the brief: dropping
+        `status='running'` from `current_run`'s lookup reddened NOTHING.
+
+        Every close in the file as written happened inside `current_run` itself,
+        so no test ever asked what `current_run` does when a run was closed
+        deliberately and the idle window has not yet expired. Without the filter
+        it hands the CLOSED run straight back, and every exchange recorded
+        afterwards lands on a run whose `ended_us` is already in the past.
+        """
+        a = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                safety_profile="production", now_us=1000)
+        run_mod.close_run(conn, run_id=a, now_us=2000)
+        b = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                safety_profile="production", now_us=3000)
+        assert b != a
+        assert _status(conn, a) == "completed"
+
     def test_one_microsecond_inside_the_window_is_still_the_same_run(self, conn):
         """Inside the window, well away from the boundary."""
         a = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
@@ -933,6 +1683,54 @@ class TestAutoOpen:
                                 safety_profile="production",
                                 now_us=1000 + run_mod.IDLE_CLOSE_US - 1)
         assert b == a
+
+    def test_a_run_with_no_heartbeat_at_all_is_judged_on_when_it_started(self, conn):
+        """`heartbeat_us` is NULLABLE, and without a COALESCE this RAISES.
+
+        Found in Task 9's fix round, by measurement rather than by reading:
+        a rig that inserts a `run` row by hand -- `INSERT INTO run(id,
+        engagement_id, kind, safety_profile, started_us, status)`, which is a
+        perfectly legal insert against schema.sql's plain `INTEGER` column --
+        made this function raise
+
+            TypeError: unsupported operand type(s) for -: 'int' and 'NoneType'
+
+        `reap_stale` already had the COALESCE and a comment explaining exactly
+        this, four lines further down the same module. `current_run` did not.
+
+        WHY IT MATTERED MORE THAN A TypeError USUALLY DOES: the raise came out
+        of `hx.capture.on_exchange`, which runs on the bridge's READ THREAD,
+        where `BridgeServer._capture` catches everything, files the record as a
+        drop and keeps the channel -- by design, because S4 says a lost record
+        changes what hx KNOWS and never what it ALLOWS. So the whole of the
+        observable was an empty table while Burp went on sending.
+
+        BOTH SIDES OF THE WINDOW, because a COALESCE that fell back to `at`
+        (or to 0) would satisfy one of them and not the other: inside, the run
+        is handed back; outside, it is closed `idle` and a new one opens. That
+        is the same behaviour a row WITH a heartbeat gets, which is the claim.
+        """
+        conn.execute(
+            "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+            " started_us, status) VALUES('r-nohb',?,'browse','production',"
+            "1000,'running')", (ENG,))
+        assert conn.execute("SELECT heartbeat_us FROM run WHERE id='r-nohb'"
+                            ).fetchone()[0] is None, \
+            "this test is about a NULL heartbeat; the column now has a default"
+
+        inside = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                     safety_profile="production",
+                                     now_us=1000 + run_mod.IDLE_CLOSE_US)
+        assert inside == "r-nohb"
+        assert _status(conn, "r-nohb") == "running"
+
+        outside = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                      safety_profile="production",
+                                      now_us=1000 + run_mod.IDLE_CLOSE_US + 1)
+        assert outside != "r-nohb"
+        assert _status(conn, "r-nohb") == "completed"
+        assert conn.execute("SELECT stop_reason FROM run WHERE id='r-nohb'"
+                            ).fetchone()[0] == "idle"
 
 
 class TestStale:
@@ -967,6 +1765,22 @@ class TestStale:
         run_mod.close_run(conn, run_id=rid, now_us=2000)
         assert run_mod.reap_stale(conn, now_us=1000 + HOUR) == []
         assert _status(conn, rid) == "completed"
+
+    def test_a_reaped_run_cannot_be_closed_clean_afterwards(self, conn):
+        """S5's sentence in the other direction, and the sweep found it untested.
+
+        `close_run` guards on `status='running'`. Deleting that guard reddened
+        NOTHING: every close in the file as written ran on a live run. Without
+        it, a late `close_run` -- the harness coming back after the reaper has
+        already filed the run as dead -- rewrites `error` to `completed`, and
+        the aborted run renders as a clean one. That is the exact outcome S5
+        forbids, reached from the opposite direction to the reaper.
+        """
+        rid = run_mod.open_run(conn, engagement_id=ENG, kind="browse",
+                               safety_profile="production", now_us=1000)
+        assert run_mod.reap_stale(conn, now_us=1000 + HOUR) == [rid]
+        run_mod.close_run(conn, run_id=rid, now_us=1000 + 2 * HOUR)
+        assert _status(conn, rid) == "error"
 
     def test_a_run_idle_but_not_yet_stale_is_left_alone(self, conn):
         """The distinction the two windows exist for, and it had no test.
@@ -1007,6 +1821,25 @@ class TestDrops:
         run_mod.count_drop(conn, run_id=rid, n=5)
         assert conn.execute("SELECT dropped_total FROM run WHERE id=?",
                             (rid,)).fetchone()[0] == 7
+
+    def test_an_accumulator_cannot_be_made_to_run_backwards(self, conn):
+        """The floor S5 spends this column on, and it was not a floor.
+
+        `n` arrives off a wire frame -- `int(header["n"])` in `hx.capture` --
+        and a negative one MEASURED `dropped_total = -5`. Two drop reports and
+        one malformed frame could then leave a run whose coverage was
+        incomplete reading as one with no gaps at all, which is the single
+        direction this column exists to prevent. `n=0` goes with it: a drop
+        report of nothing is not a drop report.
+        """
+        rid = run_mod.open_run(conn, engagement_id=ENG, kind="browse",
+                               safety_profile="production", now_us=1000)
+        run_mod.count_drop(conn, run_id=rid, n=4)
+        for bad in (-5, 0):
+            with pytest.raises(ValueError, match="floor"):
+                run_mod.count_drop(conn, run_id=rid, n=bad)
+        assert conn.execute("SELECT dropped_total FROM run WHERE id=?",
+                            (rid,)).fetchone()[0] == 4
 
     def test_a_fresh_run_has_no_drops_rather_than_null(self, conn):
         """NULL would make `dropped_total > 0` quietly false for every run,
@@ -1109,7 +1942,24 @@ def current_run(conn: sqlite3.Connection, *, engagement_id: str, kind: str,
     """
     at = _now_us() if now_us is None else now_us
     row = conn.execute(
-        "SELECT id, heartbeat_us FROM run"
+        # COALESCE, exactly as `reap_stale` does below and for the same
+        # reason: `heartbeat_us` is NULLABLE (schema.sql declares it plain
+        # `INTEGER`, no DEFAULT), and `at - NULL` is not a comparison in
+        # Python -- it is `TypeError: unsupported operand type(s) for -: 'int'
+        # and 'NoneType'`, raised on whichever thread happened to call this.
+        #
+        # FOUND BY MEASUREMENT, in Task 9's fix round, from a rig that inserts
+        # a `run` row by hand without the column. That raised out of
+        # `hx.capture.on_exchange`, which runs on the bridge's READ THREAD,
+        # where `BridgeServer._capture` catches it, files the record as a drop
+        # and keeps the channel -- so the whole of the symptom was an empty
+        # table. `reap_stale` had this COALESCE and a comment explaining it;
+        # this function, four lines up in the same module, did not.
+        #
+        # `started_us` is the fallback and it is NOT NULL, so a run that never
+        # heartbeated is judged on when it started -- which is the honest
+        # reading: nothing has reported on it since it opened.
+        "SELECT id, COALESCE(heartbeat_us, started_us) FROM run"
         " WHERE engagement_id=? AND kind=? AND status='running'"
         " ORDER BY started_us DESC LIMIT 1",
         (engagement_id, kind)).fetchone()
@@ -1162,7 +2012,23 @@ def count_drop(conn: sqlite3.Connection, *, run_id: str, n: int = 1) -> None:
     S5: a run with drops has coverage numbers that are a FLOOR, not a count.
     Accumulates rather than sets, because drops arrive in bursts as the queue
     fills and each burst is real.
+
+    An accumulator only floors anything if it cannot go backwards. `n=-5`
+    measured `dropped_total = -5` here, and a run's own drop reports could
+    then erase the signal that its coverage is incomplete -- one malformed
+    frame turning an incomplete run into a clean-looking one, which is the
+    direction S5 spends this column to prevent. `n=0` is refused with it: a
+    `dropped` frame reporting no drops is a frame that means nothing, and the
+    caller's own `n` is malformed either way. `hx.capture` checks the same
+    bound BEFORE it opens a run, so a stream of these cannot manufacture
+    empty runs; this is the floor at the writer, where it also covers callers
+    that do not exist yet.
     """
+    if n < 1:
+        raise ValueError(
+            f"a drop report of {n!r} is not a drop report; dropped_total is "
+            "an accumulator and S5 makes it the reason a run's coverage "
+            "numbers are a floor, so it must never move backwards")
     conn.execute("UPDATE run SET dropped_total = dropped_total + ? WHERE id=?",
                  (n, run_id))
 ```
@@ -1217,6 +2083,12 @@ every finding that survived eight task reviews was at a join.
 """
 from __future__ import annotations
 
+import hashlib
+import socket
+import sqlite3
+import time
+from pathlib import Path
+
 import pytest
 
 from hx import capture as cap_mod
@@ -1233,19 +2105,40 @@ RESP = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
 
 
 @pytest.fixture
-def cap(tmp_path):
-    root = tmp_path / "engagement"
-    paths_mod.secure_mkdir(root)
-    conn = db_mod.connect(root / "hx.db")
-    db_mod.init_schema(conn)
-    conn.execute("INSERT INTO engagement(id, name, client, created_us, status)"
-                 " VALUES(?,'T','T',1,'active')", (ENG,))
-    cfg = config_mod.Config(name="t", client="t",
-                            scope_include=["http://app.test/*"])
-    c = cap_mod.Capture(conn=conn, blobs=blobs_mod.BlobStore(root / "blobs"),
-                        engagement_id=ENG, config=cfg)
-    yield c
-    conn.close()
+def cap_with(tmp_path):
+    """Build a Capture over a config THE TEST chooses.
+
+    `preserve_segments` and `slug_threshold` reach the normaliser through this
+    call and through nothing else, so a fixture that fixes them leaves the
+    threading unpinned: replacing both with constants reddened no test in the
+    task's own set. A factory is what lets a test separate the operator's
+    value from the default.
+    """
+    opened = []
+
+    def make(**cfg_over):
+        root = tmp_path / f"engagement{len(opened)}"
+        paths_mod.secure_mkdir(root)
+        conn = db_mod.connect(root / "hx.db")
+        db_mod.init_schema(conn)
+        conn.execute("INSERT INTO engagement(id, name, client, created_us,"
+                     " status) VALUES(?,'T','T',1,'active')", (ENG,))
+        opened.append(conn)
+        cfg = config_mod.Config(name="t", client="t",
+                                scope_include=["http://app.test/*"],
+                                **cfg_over)
+        return cap_mod.Capture(conn=conn,
+                               blobs=blobs_mod.BlobStore(root / "blobs"),
+                               engagement_id=ENG, config=cfg)
+
+    yield make
+    for conn in opened:
+        conn.close()
+
+
+@pytest.fixture
+def cap(cap_with):
+    return cap_with()
 
 
 def _header(**over) -> dict:
@@ -1282,6 +2175,130 @@ class TestTheHappyPath:
                                " FROM surface").fetchone()
         assert tuple(row) == ("/order/{id}", "id", "idempotent_read")
 
+    def test_and_the_exchange_names_the_surface_it_belongs_to(self, cap):
+        """The join the whole plan is for, and it was written by nothing.
+
+        `exchange.surface_id` is a column, has its own index
+        (`idx_exchange_surf`), and every coverage figure in a report is a join
+        across it: "which surfaces has anything actually reached". The task
+        brief's consumer computed the surface id and threw it away, which left
+        the column NULL on every row this egress point will ever write -- and
+        a NULL there is not recoverable later without re-deriving the template
+        from the url under whatever the normaliser's rules have become by
+        then, which is the one thing `normaliser_version` exists to say cannot
+        be done.
+        """
+        rid = cap.on_exchange(_header(), REQ, RESP)
+        surface_id, = cap.conn.execute(
+            "SELECT surface_id FROM exchange WHERE id=?", (rid,)).fetchone()
+        assert surface_id is not None
+        assert surface_id == cap.conn.execute(
+            "SELECT id FROM surface").fetchone()[0]
+
+
+class TestWhatTheHeaderSays:
+    """Every header field this module threads into a row, separated from its
+    absence.
+
+    MEASURED before these existed: `resp_len` -> always None, `ms` -> 0,
+    `outcome` -> "ok", the `via` default -> "send", the `method` default ->
+    "GET", and the whole `config` -> `normalise` threading replaced by
+    constants -- six mutations, zero red tests between them. A field nothing
+    checks is a field that can be dropped on the floor without anyone finding
+    out, and the rows are the only evidence this plan produces.
+    """
+
+    def test_the_response_length_is_the_response_it_measured(self, cap):
+        rid = cap.on_exchange(_header(), REQ, RESP)
+        assert cap.conn.execute("SELECT resp_len FROM exchange WHERE id=?",
+                                (rid,)).fetchone()[0] == len(RESP)
+
+    def test_the_elapsed_time_separates_the_two_timestamps(self, cap):
+        """`ms` is the only thing that makes `recv_us` differ from `sent_us`,
+        and hardcoding it to 0 made every exchange look instantaneous."""
+        rid = cap.on_exchange(_header(ms=12), REQ, RESP)
+        sent, recv = cap.conn.execute(
+            "SELECT sent_us, recv_us FROM exchange WHERE id=?", (rid,)).fetchone()
+        assert recv - sent == 12_000
+
+    def test_the_outcome_is_the_frame_s_and_not_an_assumption_of_ok(self, cap):
+        """`ok` is the guessing direction: it claims a response came back.
+
+        `header.get("outcome") or "ok"` turns an absent outcome into that
+        claim, so the value that separates the two is one the frame carries
+        and `"ok"` is not.
+        """
+        rid = cap.on_exchange(_header(outcome="truncated"), REQ, RESP)
+        assert cap.conn.execute("SELECT outcome FROM exchange WHERE id=?",
+                                (rid,)).fetchone()[0] == "truncated"
+
+    def test_a_frame_that_names_no_via_is_proxy_traffic(self, cap):
+        """The default this whole task exists to keep honest.
+
+        `via` tells the two egress points apart -- it is the stated reason
+        `denial` gained the column and SCHEMA_VERSION went to 5. Defaulting to
+        `"send"` instead files proxy observations as send-path traffic, which
+        is exactly the conflation being ended, and no test could see it.
+        """
+        h = _header()
+        del h["via"]
+        rid = cap.on_exchange(h, REQ, RESP)
+        assert cap.conn.execute("SELECT via FROM exchange WHERE id=?",
+                                (rid,)).fetchone()[0] == "proxy"
+
+    def test_a_frame_that_names_no_method_says_so_rather_than_guessing_GET(self, cap):
+        """`""` and `"GET"` are not the same missing value.
+
+        `surface.kind` is derived from the method, and `GET` earns
+        `idempotent_read` -- a check reading that is being told it may replay
+        the request. A method nobody sent must not buy that permission.
+        """
+        h = _header()
+        del h["method"]
+        rid = cap.on_exchange(h, REQ, RESP)
+        assert cap.conn.execute("SELECT method FROM exchange WHERE id=?",
+                                (rid,)).fetchone()[0] == ""
+        assert cap.conn.execute("SELECT kind FROM surface").fetchone()[0] == "unknown"
+
+    def test_the_operator_s_preserve_list_reaches_the_normaliser(self, cap_with):
+        """Task 2 spent a round establishing this rule; the call site can undo
+        it silently. `2024` is digit-shaped, so it templates to `{id}` unless
+        the operator's `preserve` list arrives here and says it is a route."""
+        cap = cap_with(preserve_segments=["2024"])
+        cap.on_exchange(_header(url="http://app.test/2024/report"), REQ, RESP)
+        assert cap.conn.execute(
+            "SELECT path_template FROM surface").fetchone()[0] == "/2024/report"
+
+    def test_and_so_does_the_operator_s_slug_threshold(self, cap_with):
+        """`abc-123-xyz` is 11 characters: a slug at threshold 8, a route at
+        the default 12. Only the config can move that line."""
+        cap = cap_with(slug_threshold=8)
+        cap.on_exchange(_header(url="http://app.test/abc-123-xyz"), REQ, RESP)
+        assert cap.conn.execute(
+            "SELECT path_template FROM surface").fetchone()[0] == "/{slug}"
+
+    def test_the_surface_records_which_egress_point_found_it(self, cap):
+        """`surface.discovered_by`, which lost its DEFAULT in SCHEMA_VERSION
+        6. S5 draws a coverage figure straight off it -- "crawl-discovered
+        surfaces are recorded with discovered_by = 'crawl'" -- so the value a
+        writer that never thought about it used to get was a wrong answer to a
+        question a report asks."""
+        cap.on_exchange(_header(via="proxy"), REQ, RESP)
+        cap.on_exchange(_header(via="crawl", source="crawler",
+                                url="http://app.test/other"), REQ, RESP)
+        rows = dict(cap.conn.execute(
+            "SELECT path_template, discovered_by FROM surface"))
+        assert rows == {"/order/{id}": "proxy", "/other": "crawl"}
+
+    def test_and_the_first_finder_keeps_the_credit(self, cap):
+        """Same family as the exemplar, and the `DO UPDATE` must not touch it:
+        the crawler walking into an endpoint the proxy already recorded does
+        not make it a crawler discovery."""
+        cap.on_exchange(_header(via="proxy"), REQ, RESP)
+        cap.on_exchange(_header(via="crawl", source="crawler"), REQ, RESP)
+        assert cap.conn.execute(
+            "SELECT discovered_by FROM surface").fetchone()[0] == "proxy"
+
 
 class TestDeduplication:
     def test_two_ids_under_one_endpoint_are_one_surface(self, cap):
@@ -1311,6 +2328,41 @@ class TestDeduplication:
                                " FROM surface").fetchone()
         assert row[0] == first
 
+    def test_a_sighting_in_a_LATER_run_moves_last_seen_and_not_first_seen(self, cap):
+        """The input that separates `DO UPDATE` from `INSERT OR IGNORE`.
+
+        The test above cannot: both its sightings land in ONE run, so
+        `last_seen_run` holds the same value whether the conflicting insert
+        updated it or was silently discarded, and it asserts only
+        `first_seen_run` besides. Mutating the upsert to `INSERT OR IGNORE`
+        left it green -- a rule invisible to the test named after it, which is
+        the shape this plan has now found on every task.
+
+        Two runs is what makes the two columns disagree, and both directions
+        matter: `first_seen_run` is when this endpoint entered the assessment
+        and `last_seen_run` is whether it is still there. The exemplar is
+        checked in the same breath, because it is written on insert and the
+        `DO UPDATE` deliberately does not touch it -- a surface's exemplar is
+        the exchange that PROVED it exists, and rewriting it on every sighting
+        would make "show me an example of this endpoint" answer with whatever
+        happened most recently rather than with what was reviewed.
+        """
+        first_x = cap.on_exchange(_header(url="http://app.test/order/1"), REQ, RESP)
+        first_run, exemplar = cap.conn.execute(
+            "SELECT first_seen_run, exemplar_exchange_id FROM surface").fetchone()
+        assert exemplar == first_x
+        run_mod.close_run(cap.conn, run_id=first_run)
+
+        second_x = cap.on_exchange(_header(url="http://app.test/order/2"), REQ, RESP)
+        second_run, = cap.conn.execute(
+            "SELECT run_id FROM exchange WHERE id=?", (second_x,)).fetchone()
+        assert second_run != first_run
+
+        row = cap.conn.execute(
+            "SELECT first_seen_run, last_seen_run, exemplar_exchange_id"
+            " FROM surface").fetchone()
+        assert tuple(row) == (first_run, second_run, first_x)
+
 
 class TestDenials:
     def test_a_dropped_request_writes_a_denial_and_no_exchange(self, cap):
@@ -1325,6 +2377,96 @@ class TestDenials:
         cap.on_exchange(_header(t="denial", error_class="scope_denied", detail="x"),
                         REQ, b"")
         assert cap.conn.execute("SELECT via FROM denial").fetchone()[0] == "proxy"
+
+    def test_a_refused_request_is_not_counted_as_one_that_left(self, cap):
+        """S5's `requests_issued` counts what LEFT.
+
+        A denial is a request that never did, so the counter must not move for
+        it -- counting refusals as issued inflates every coverage figure
+        derived from the column, and a report claiming reach the run never had
+        is the failure this store exists to avoid.
+
+        MEASURED: with only the brief's own tests in the file, moving the bump
+        above the `t == "denial"` branch reddened NOTHING -- the counter was
+        written by the consumer and read by nobody. It now reddens this and
+        `test_each_exchange_is_counted_against_the_run_that_issued_it`, which
+        are the two halves of the rule: bumped there, and not bumped here.
+        """
+        cap.on_exchange(_header(t="denial", error_class="scope_denied", detail="x"),
+                        REQ, b"")
+        assert cap.conn.execute(
+            "SELECT requests_issued FROM run").fetchone()[0] == 0
+
+    def test_a_denial_frame_says_the_request_never_left(self, cap):
+        """`row_for(..., issued=False)`, and it was pinned by nothing.
+
+        `timeout` and `bridge_lost` each name a request that left the JVM AND
+        one that never did, so `row_for` refuses to route either from the
+        class alone. A denial frame is the case where it never did -- that is
+        what makes it a denial -- so this consumer answers False, and
+        `row_for` then writes NO row at all: `denial.kind` has no value for
+        "the caller gave up before we started", and a row filed under a reason
+        that is not the reason is worse than no row.
+
+        Flipping the argument to True was invisible to the whole suite. It is
+        not invisible here: True routes the same frame to ("exchange",
+        "timeout"), which is an exchange row for a request that was never
+        sent -- the one direction every guard in `records` leans against,
+        because it inflates `requests_issued` and every coverage figure drawn
+        from it.
+        """
+        assert cap.on_exchange(
+            _header(t="denial", error_class="timeout",
+                    detail="deadline passed before this frame was decided"),
+            REQ, b"") is None
+        assert cap.conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+        assert cap.conn.execute("SELECT COUNT(*) FROM denial").fetchone()[0] == 0
+
+    def test_a_credential_refusal_is_a_denial_and_not_a_silence(self, cap):
+        """S4 is unconditional and this was the class that escaped it.
+
+        MEASURED at the previous commit: an `unmanaged_credential` denial
+        reaching this egress point produced no row, no counter, no log and no
+        exception, and `on_exchange` returned None -- indistinguishable from a
+        recorded denial and from a drop report. `records.UNRECORDABLE` itself
+        called it "a real denial ... the gap to close first", and the reason
+        it had nowhere to go was that `denial.kind`'s CHECK had no value for
+        it. SCHEMA_VERSION 6 adds one.
+
+        S7's "refused and never persisted" is about the REQUEST BYTES: the row
+        below carries the method, the url and a reason, and no credential.
+        """
+        assert cap.on_exchange(
+            _header(t="denial", error_class="unmanaged_credential",
+                    detail="Authorization header we did not inject"),
+            REQ, b"") is None
+        row = cap.conn.execute("SELECT kind, via, url, reason FROM denial").fetchone()
+        assert tuple(row) == ("credential", "proxy",
+                              "http://app.test/order/7?id=1",
+                              "Authorization header we did not inject")
+        assert cap.conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+
+    def test_an_unrecordable_class_writes_nothing_rather_than_guessing(self, cap):
+        """`records.UNRECORDABLE`: a class with no row to file it under.
+
+        `row_for` answers None, and None must mean no row -- not a row under a
+        reason that is not the reason. `transport_error` is one of the seven
+        left in that set: the request DID leave the JVM, so it belongs in
+        `exchange`, and the extension reports one class for conn_refused,
+        dns_error and tls_error alike, so picking one of the three would put a
+        guess in the evidence store.
+
+        No run either, since the routing decision is now settled above `_run`:
+        a frame that produces nothing must not leave a run behind claiming
+        zero coverage.
+        """
+        assert cap.on_exchange(
+            _header(t="denial", error_class="transport_error",
+                    detail="the connection did not complete"),
+            REQ, b"") is None
+        assert cap.conn.execute("SELECT COUNT(*) FROM denial").fetchone()[0] == 0
+        assert cap.conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+        assert cap.conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
 
 
 class TestDrops:
@@ -1341,6 +2483,34 @@ class TestDrops:
         cap.on_exchange(_header(t="dropped", n=2), b"", b"")
         assert cap.conn.execute("SELECT dropped_total FROM run").fetchone()[0] == 2
 
+    def test_a_saturated_run_is_not_an_idle_one(self, cap):
+        """A harness dropping everything is the opposite of an idle harness.
+
+        MEASURED before the drop path heartbeated: a run receiving only
+        `dropped` frames never moved `heartbeat_us`, so after IDLE_CLOSE_US
+        the next drop report made `current_run` close it
+        `status='completed', stop_reason='idle'` with `dropped_total=100` on
+        it and open a fresh run for the rest. S5, quoted in `run.py`'s own
+        docstring: "an aborted run must never render as a clean one, and
+        neither must one that merely stopped being updated." A run that
+        dropped a hundred exchanges is incomplete coverage by definition, and
+        it read as clean -- while the total fragmented across a chain of runs
+        where no single row showed the drops.
+
+        Each frame here is followed by winding the heartbeat back two thirds
+        of the window. Beating on every drop keeps the age at two thirds
+        forever; not beating accumulates it, and the third frame arrives at
+        four thirds of the window -- which is what makes this two runs rather
+        than one.
+        """
+        for _ in range(3):
+            cap.on_exchange(_header(t="dropped", n=50), b"", b"")
+            cap.conn.execute(
+                "UPDATE run SET heartbeat_us = heartbeat_us - ?"
+                " WHERE status='running'", (run_mod.IDLE_CLOSE_US * 2 // 3,))
+        rows = cap.conn.execute("SELECT status, dropped_total FROM run").fetchall()
+        assert [tuple(r) for r in rows] == [("running", 150)]
+
 
 class TestRefusals:
     def test_an_unknown_via_is_refused(self, cap):
@@ -1350,6 +2520,400 @@ class TestRefusals:
     def test_a_frame_with_no_url_is_refused_rather_than_guessed(self, cap):
         with pytest.raises(ValueError):
             cap.on_exchange(_header(url=None), REQ, RESP)
+
+    def test_a_frame_type_this_version_does_not_know_is_refused(self, cap):
+        """S6 carries an `unknown_frame` class precisely for this.
+
+        MEASURED with no else-arm on `t`: `{"t": "quarantine", ...}` returned
+        a row id and wrote 1 exchange row, 1 surface, 2 blobs and
+        `requests_issued = 1`. Plan 5's crawler, or any later extension build,
+        adds one frame type this side does not know and every such frame
+        becomes observed traffic that never existed -- inflating every
+        coverage figure drawn from that column, in a store whose entire
+        purpose is not to claim reach a run never had.
+        """
+        with pytest.raises(ValueError, match="unknown frame type"):
+            cap.on_exchange(_header(t="quarantine"), REQ, RESP)
+        for table in ("exchange", "surface", "run"):
+            assert cap.conn.execute(
+                f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        assert not cap.blobs.path_for(hashlib.sha256(REQ).hexdigest()).exists()
+
+    def test_a_drop_report_that_would_run_the_counter_backwards_is_refused(self, cap):
+        """`int(header.get("n", 1))` was unchecked and MEASURED
+        `dropped_total = -5`. See `run.count_drop`, which refuses the same
+        bound at the writer; this is the same refusal placed early enough that
+        the malformed frame does not leave a run behind either."""
+        cap.on_exchange(_header(t="dropped", n=3), b"", b"")
+        with pytest.raises(ValueError, match="floor"):
+            cap.on_exchange(_header(t="dropped", n=-5), b"", b"")
+        assert cap.conn.execute(
+            "SELECT dropped_total FROM run").fetchone()[0] == 3
+
+    def test_a_refused_frame_opens_no_run(self, cap):
+        """Each frame below is refused before `current_run` is reached, so a
+        stream of malformed frames manufactures neither runs whose coverage is
+        zero nor blob files nothing will ever name.
+
+        THE LIST IS THE CLAIM; the module's comment deliberately no longer
+        says it is complete. Five of the entries were added after being
+        measured opening a run: the unparseable port (`normalise` is
+        explicitly NOT TOTAL), the unrecognised `error_class` and the empty
+        string `header.get("error_class") or ""` produces, and then `ms="abc"`
+        and `outcome="bogus"`, which raised from INSIDE `record_exchange` --
+        below the blob puts as well. Three frames of either measured 1 run, 0
+        exchanges and 2 orphan blob files: six puts of two distinct bodies
+        into a content-addressed store.
+
+        The blob assertion is why the last two belong here rather than in a
+        test of their own: a refusal that opens no run can still leave files
+        behind, and that is strictly the worse leak of the two -- a run with
+        no exchanges is visible in the store, an orphan blob is not.
+        """
+        bad_frames = (
+            _header(via="carrier-pigeon"),
+            _header(url=None),
+            _header(t="quarantine"),
+            _header(t="dropped", n=-5),
+            _header(url="http://h:abc/x"),
+            _header(t="denial", error_class="no-such-class"),
+            _header(t="denial", error_class=""),
+            _header(ms="abc"),
+            _header(outcome="bogus"),
+        )
+        for bad in bad_frames:
+            with pytest.raises(ValueError):
+                cap.on_exchange(bad, REQ, RESP)
+        assert cap.conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+        assert not cap.blobs.path_for(
+            hashlib.sha256(REQ).hexdigest()).exists()
+
+    def test_a_response_that_came_back_cannot_be_filed_without_a_status(self, cap):
+        """An absent `status` is refused, not written as NULL.
+
+        This module invents a default for nine header fields and for `status`
+        it invents nothing -- so the frame with no `status` key at all had to
+        land somewhere, and for `outcome='truncated'` it landed on disk:
+        MEASURED `ACCEPTED rid=x-...  exchange 1  surface 1
+        requests_issued 1  status NULL`. `record_exchange` guarded only 'ok'
+        and 'status_unreadable'.
+
+        A truncated response is a response that CAME BACK, so that row said a
+        peer answered and declined to say what it answered -- while
+        `status_unreadable` plus the 599 sentinel is the store's whole
+        apparatus for saying exactly that. A NULL status now carries one
+        reading and only one: nothing on the far side ever answered.
+        """
+        header = _header(outcome="truncated")
+        del header["status"]
+        with pytest.raises(ValueError, match="no status"):
+            cap.on_exchange(header, REQ, RESP)
+        assert cap.conn.execute(
+            "SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+
+    def test_the_one_refusal_that_does_leave_a_run_behind(self, cap):
+        """The boundary of the sentence above, pinned from the other side.
+
+        `record_exchange`'s coherence guards belong to the STORE, not to this
+        module, and they fire on a frame whose shape was already accepted --
+        `outcome='ok'` with no status is a frame that says two things which
+        cannot both be true. By then the run exists and has been heartbeated.
+        An empty run is the honest cost: something WAS captured here, and the
+        refusal is about what the row would have claimed rather than about
+        whether the frame could be read at all.
+        """
+        with pytest.raises(ValueError):
+            cap.on_exchange(_header(status=None), REQ, RESP)
+        assert cap.conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 1
+        assert cap.conn.execute(
+            "SELECT requests_issued FROM run").fetchone()[0] == 0
+
+
+class TestTheOrderThingsHappenIn:
+    def test_a_row_that_cannot_be_written_leaves_its_blob_behind(self, cap):
+        """The separating input for "blobs before the row that names them".
+
+        The ordering guards a crash between two statements, and no unit test
+        can crash the interpreter -- so the brief expected this invariant to be
+        unpinned and it very nearly was. What CAN be observed is the same
+        window reached by a different route: `record_exchange`'s own coherence
+        guard refuses `outcome='ok'` with no status, and it refuses at exactly
+        the point a crash would land. Blobs-first therefore leaves an ORPHAN
+        BLOB and no row; blobs-after leaves a row-less store and no blob, which
+        is the same state -- but with the two statements the other way round a
+        successful put followed by a failed row is impossible to reach, so the
+        assertion below is False.
+
+        The asymmetry is the point and is worth saying plainly: an orphan blob
+        is garbage a sweep can collect, and a row naming a blob that was never
+        written is corruption a report reads as evidence.
+        """
+        with pytest.raises(ValueError):
+            cap.on_exchange(_header(status=None), REQ, RESP)
+        assert cap.conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+        assert cap.blobs.path_for(hashlib.sha256(REQ).hexdigest()).exists()
+
+    def test_a_failure_partway_through_leaves_no_half_written_exchange(self, cap):
+        """The four row writes are one unit, and they were four units.
+
+        `db.connect` is autocommit and `records`'s own docstring says so --
+        "a caller writing an exchange row and its blobs together should wrap
+        the pair in `db.transaction` itself". Unwrapped, with `upsert_surface`
+        raising `OperationalError("database is locked")` -- which WAL plus a
+        concurrent writer past `busy_timeout=5000` is enough to produce --
+        this MEASURED an exchange row COMMITTED with `surface_id` NULL, zero
+        surface rows, and `requests_issued = 1`. That NULL is the precise
+        state the back-reference was added to prevent and cannot be repaired
+        afterwards, and the counter is then a phantom issued request.
+
+        Ordering cannot fix this one: the back-reference has to come last
+        because the surface's exemplar is the exchange. Atomicity is the
+        mechanism, and it is a different mechanism from the blob ordering
+        above -- which stays, because the blob store is not in the database
+        and no ROLLBACK reaches it.
+        """
+        def explode(*_a, **_k):
+            raise sqlite3.OperationalError("database is locked")
+
+        cap.upsert_surface = explode
+        with pytest.raises(sqlite3.OperationalError):
+            cap.on_exchange(_header(), REQ, RESP)
+        assert cap.conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+        assert cap.conn.execute("SELECT COUNT(*) FROM surface").fetchone()[0] == 0
+        assert cap.conn.execute(
+            "SELECT requests_issued FROM run").fetchone()[0] == 0
+
+
+class TestTheRunTheFrameBelongsTo:
+    def test_crawler_traffic_is_a_crawl_run_and_not_a_browse_one(self, cap):
+        """`source` decides the kind, and nothing else did.
+
+        MEASURED: collapsing the mapping to a constant `"browse"` reddened no
+        test in the brief's own set. `test_and_opens_a_browse_run_without_
+        being_asked` asserts the branch a constant already satisfies, and it
+        was the only test that looked at `run.kind`. Attributing crawler
+        traffic to a browse run would make the denial rows lie about who was
+        driving, and the enforcement rules differ by exactly that distinction.
+        """
+        cap.on_exchange(_header(source="crawler"), REQ, RESP)
+        assert cap.conn.execute("SELECT kind FROM run").fetchone()[0] == "crawl"
+        cap.on_exchange(_header(source="operator"), REQ, RESP)
+        assert set(r[0] for r in cap.conn.execute("SELECT kind FROM run")) == \
+            {"crawl", "browse"}
+
+    def test_each_exchange_is_counted_against_the_run_that_issued_it(self, cap):
+        cap.on_exchange(_header(), REQ, RESP)
+        cap.on_exchange(_header(url="http://app.test/order/2"), REQ, RESP)
+        assert cap.conn.execute(
+            "SELECT requests_issued FROM run").fetchone()[0] == 2
+
+    def test_a_frame_keeps_its_run_alive(self, cap):
+        """The heartbeat, separated from its absence.
+
+        `run.reap_stale` resolves a run whose heartbeat went stale to `error`
+        -- "its coverage is incomplete" -- so a capture session that beats only
+        when the run is OPENED is one that reports itself as a crash after
+        half an hour of steady browsing. The window below is inside
+        IDLE_CLOSE_US, so `current_run` returns the same run rather than
+        closing it as idle, which is what makes the update observable.
+        """
+        cap.on_exchange(_header(), REQ, RESP)
+        run_id, = cap.conn.execute("SELECT id FROM run").fetchone()
+        stale = cap.conn.execute(
+            "SELECT heartbeat_us FROM run").fetchone()[0] - run_mod.IDLE_CLOSE_US // 2
+        cap.conn.execute("UPDATE run SET heartbeat_us=? WHERE id=?",
+                         (stale, run_id))
+
+        cap.on_exchange(_header(url="http://app.test/order/2"), REQ, RESP)
+        assert cap.conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 1
+        assert cap.conn.execute(
+            "SELECT heartbeat_us FROM run").fetchone()[0] > stale
+
+
+class TestTheAutoHalt:
+    """S4's `halted` frame, as rows.
+
+    Until this class existed `records.abort_run` had zero callers outside
+    tests, nothing in `src/` built a `BridgeServer` with an `on_halted`, and
+    the integration rig wired only `on_hello` and `on_exchange`. So S5's "an
+    aborted run must never render as a clean one" was unenforced BY
+    CONSTRUCTION: the run always closed through one of the three writers that
+    are individually correct and none of which is the truth about a run a
+    target's distress ended.
+    """
+
+    def test_a_halted_frame_aborts_the_run_with_the_distress_as_its_epitaph(self, cap):
+        cap.on_exchange(_header(), REQ, RESP)
+        aborted = cap.on_halted({"t": "halted", "reason": "5xx rate 0.40",
+                                 "host": "app.example.test",
+                                 "window": "50 requests / 37s"})
+        assert len(aborted) == 1
+        row = cap.conn.execute(
+            "SELECT status, stop_reason, ended_us FROM run").fetchone()
+        assert row["status"] == "aborted"
+        assert row["stop_reason"] == ("5xx rate 0.40 on app.example.test "
+                                      "(50 requests / 37s)")
+        assert row["ended_us"] is not None
+
+    def test_one_distressed_host_aborts_every_live_run_and_not_just_its_own(self, cap):
+        """S4, in as many words: "One distressed host aborts the WHOLE run
+        ... not just that host. Distress on one host is often the first sign
+        of something the whole test is causing." A crawl running beside a
+        human browsing is two `run` rows of one test, and leaving the other
+        one `running` is the half a report would read as clean.
+        """
+        cap.on_exchange(_header(source="operator"), REQ, RESP)
+        cap.on_exchange(_header(source="crawler"), REQ, RESP)
+        assert cap.conn.execute(
+            "SELECT COUNT(*) FROM run WHERE status='running'").fetchone()[0] == 2
+
+        assert len(cap.on_halted({"reason": "5 consecutive connection errors",
+                                  "host": "app.example.test",
+                                  "window": "5 requests"})) == 2
+        assert cap.conn.execute(
+            "SELECT COUNT(*) FROM run WHERE status='running'").fetchone()[0] == 0
+        assert set(r[0] for r in cap.conn.execute(
+            "SELECT DISTINCT status FROM run")) == {"aborted"}
+
+    def test_a_second_distressed_host_does_not_replace_the_diagnosis(self, cap):
+        """`abort_run`'s `status='running'` guard, reached from here. Two
+        distressed hosts inside one window is ordinary behaviour for a
+        struggling target, and the FIRST stop_reason is the one that explains
+        what happened -- a symptom arriving second must not overwrite it."""
+        cap.on_exchange(_header(), REQ, RESP)
+        assert len(cap.on_halted({"reason": "5xx rate 0.40",
+                                  "host": "first.example.test"})) == 1
+        assert cap.on_halted({"reason": "p50 latency 12x baseline",
+                              "host": "second.example.test"}) == []
+        assert cap.conn.execute("SELECT stop_reason FROM run").fetchone()[0] \
+            == "5xx rate 0.40 on first.example.test"
+
+    def test_a_halted_frame_with_nothing_recording_opens_no_run(self, cap):
+        """A row for a session that never happened is the thing `FRAME_TYPES`
+        refuses two hundred lines above, and it would be the same defect here:
+        a `run` with no traffic, aborted, inflating nothing but confusing
+        everything. Nothing to abort is an empty list, not an invented row."""
+        assert cap.on_halted({"reason": "5xx rate 0.40",
+                              "host": "app.example.test"}) == []
+        assert cap.conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+
+    def test_a_frame_missing_its_fields_still_produces_a_readable_epitaph(self, cap):
+        """S6 gives the frame `{reason, host, window}` and this side does not
+        get to assume all three arrived. A KeyError here runs on the bridge's
+        READ THREAD, where `BridgeServer._handle`'s halted arm turns a throw
+        into a CLOSED CONNECTION -- so a frame one key short would take the
+        operator's browsing down as well as failing to record the stop."""
+        cap.on_exchange(_header(), REQ, RESP)
+        assert len(cap.on_halted({"t": "halted"})) == 1
+        assert cap.conn.execute("SELECT stop_reason FROM run").fetchone()[0] \
+            == "target distress on an unnamed host"
+
+    def test_an_aborted_run_is_not_reaped_into_something_that_reads_cleaner(self, cap):
+        """The reading S5 asks for, end to end. `reap_stale` resolves a
+        `running` run whose harness died to `error`; `current_run` closes an
+        idle one `completed`. Both are guarded on `status='running'`, so an
+        aborted run keeps its own status and its own reason -- and this is the
+        assertion that would fail if the abort were ever written as a plain
+        `close_run`."""
+        cap.on_exchange(_header(), REQ, RESP)
+        cap.on_halted({"reason": "5xx rate 0.40", "host": "app.example.test"})
+        assert run_mod.reap_stale(cap.conn, now_us=10 ** 18) == []
+        row = cap.conn.execute("SELECT status, stop_reason FROM run").fetchone()
+        assert row["status"] == "aborted"
+        assert row["stop_reason"].startswith("5xx rate 0.40")
+
+
+def test_a_halted_frame_off_a_real_socket_reaches_the_store(tmp_path, cap):
+    """THE WIRING, not the writer.
+
+    Every check above calls `on_halted` directly, which is exactly the shape
+    B2 found: a correct writer nothing calls. This one drives a real `halted`
+    frame down a real `BridgeServer` and asserts the row at the far end, so
+    that removing `on_halted=` from the constructor is a RED test rather than
+    a silent return to a run that never gets its epitaph.
+
+    The callback runs on the bridge's READ THREAD. `cap`'s connection was
+    opened on this one, so this test would raise `sqlite3.ProgrammingError`
+    inside `BridgeServer._handle`'s halted arm -- which closes the connection
+    and records the throw rather than propagating it. The write therefore
+    happens on the read thread's own connection, opened lazily, exactly as
+    `tests/integration/conftest.py::ReadThreadCapture` does it for the same
+    reason.
+    """
+    from hx import halt as halt_mod
+    from hx.bridge import codec, server
+
+    root = Path(cap.blobs.root).parent
+    oh = halt_mod.OperatorHalt(root, cap.conn)
+    read_thread_cap = _ReadThreadCapture(root, cap.engagement_id, cap.config)
+    srv = server.BridgeServer(tmp_path / "halted.sock", engagement_id=ENG,
+                              operator_halt=oh,
+                              on_halted=read_thread_cap.on_halted)
+    srv.start()
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(5)
+    try:
+        c.connect(str(srv.socket_path))
+        cap.on_exchange(_header(), REQ, RESP)
+        run_id, = cap.conn.execute("SELECT id FROM run").fetchone()
+
+        c.sendall(codec.encode({"v": 1, "t": "halted",
+                                "reason": "5xx rate 0.40",
+                                "host": "app.example.test",
+                                "window": "50 requests / 37s"}))
+
+        deadline = time.time() + 5
+        row = None
+        while time.time() < deadline:
+            row = cap.conn.execute(
+                "SELECT status, stop_reason FROM run WHERE id=?",
+                (run_id,)).fetchone()
+            if row["status"] != "running":
+                break
+            time.sleep(0.005)
+        assert srv.halted_callback_error is None, srv.halted_callback_error
+        assert row["status"] == "aborted", (
+            "the halted frame reached the bridge and no run was aborted; "
+            f"state={srv.state!r} last_halted={srv.last_halted!r}")
+        assert row["stop_reason"] == ("5xx rate 0.40 on app.example.test "
+                                      "(50 requests / 37s)")
+        assert srv.state == "halted"
+    finally:
+        c.close()
+        srv.stop()
+        read_thread_cap.close()
+
+
+class _ReadThreadCapture:
+    """`hx.capture.Capture` on a connection belonging to the thread that uses
+    it -- the same shape `tests/integration/conftest.py` installs, and for the
+    same measured reason: a sqlite3 connection raises `ProgrammingError`
+    anywhere but the thread that created it, and `BridgeServer` catches that
+    throw, so the observable would be a green handshake and an empty table."""
+
+    def __init__(self, root, engagement_id, cfg):
+        self._root = Path(root)
+        self._engagement_id = engagement_id
+        self._config = cfg
+        self._capture = None
+
+    def _lazy(self):
+        if self._capture is None:
+            self._capture = cap_mod.Capture(
+                db_mod.connect(self._root / "hx.db"),
+                blobs_mod.BlobStore(self._root / "blobs"),
+                self._engagement_id, self._config)
+        return self._capture
+
+    def on_halted(self, header):
+        return self._lazy().on_halted(header)
+
+    def close(self):
+        # Deliberately not closed: `Connection.close()` is thread-affine too,
+        # so closing it from THIS thread raises during teardown and replaces
+        # whatever failed the test. `srv.stop()` has already joined the read
+        # thread, so nothing is still writing.
+        pass
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -1363,10 +2927,16 @@ In `src/hx/store/records.py`, add near `EXCHANGE_OUTCOMES`:
 
 ```python
 # src/hx/store/records.py -- the via vocabulary
-# S5's `via` vocabulary, and the schema's CHECK enforces the same three. The
-# send path was the only writer until Plan 4; `proxy` and `crawl` are the two
-# other egress points, and a fourth value would mean a fourth path -- which S4
-# forbids outright.
+# S5's `via` vocabulary, and the schema's CHECK enforces the same three.
+# `send` was the only value either writer could produce until Plan 4:
+# record_exchange hardcoded the literal and `denial` had no column to put one
+# in. `proxy` and `crawl` are the two other egress points, and a fourth value
+# would mean a fourth path -- which S4 forbids outright.
+#
+# Both `exchange.via` and `denial.via` carry it, and a test compares this
+# constant against BOTH constraints rather than one: the column was added to
+# `denial` in Plan 4 and two CHECKs spelling the same vocabulary are two
+# places for it to drift.
 VIA_VALUES = frozenset({"proxy", "send", "crawl"})
 ```
 
@@ -1387,12 +2957,42 @@ and thread it into the INSERT in place of the literal `'send'`. The default keep
 
 Three components tested alone meet here, and on the previous branch every
 defect that survived eight task reviews lived at a join like this one. So the
-module is deliberately thin: it validates, it delegates, and it owns no rules
-of its own beyond the order things happen in.
+module is deliberately thin: it validates, and it delegates.
 
-The order is load-bearing. Blobs are written BEFORE the row that names them,
-so a crash between the two leaves an orphan blob rather than a row pointing at
-nothing -- an orphan is garbage, a dangling reference is corruption.
+IT IS NOT RULE-FREE, and saying so was a claim that did not survive its own
+review. The rules it owns, each named where it is written:
+
+  - the frame-type vocabulary (`FRAME_TYPES`), and the refusal of anything
+    else;
+  - `source` -> run KIND, in `_run`;
+  - `via` -> `surface.discovered_by`, in `DISCOVERED_BY`;
+  - what an ABSENT header field means, which is nine separate decisions:
+    `t`, `n`, `source`, `via`, `method`, `error_class`, `detail`, `ms` and
+    `outcome` all have a default here. `url` and `status` have none, and
+    neither is INVENTED: an absent `url` is refused by this module, and an
+    absent `status` is refused by `record_exchange`'s coherence guard for the
+    outcomes that mean a response came back -- `ok`, `truncated` and
+    `status_unreadable`. For the rest the row keeps a NULL, and that NULL is
+    the reading: nothing on the far side ever answered, because the transport
+    failed or the request was refused before it left. It never means a
+    response came back whose status went unrecorded -- `status_unreadable`
+    with its 599 sentinel is how that is said;
+  - the `requests_issued` bump, and that the denial path does not do it;
+  - the whole upsert/conflict policy in `upsert_surface`;
+  - the `exchange.surface_id` back-reference.
+
+TWO GUARANTEES, TWO MECHANISMS, and they are not the same one said twice:
+
+  - ATOMICITY OF THE FOUR ROW WRITES comes from `db.transaction` and from
+    nothing else. The connection is autocommit, so an unwrapped run of
+    statements commits as far as it got -- measured, with `upsert_surface`
+    raising: an exchange row committed with a NULL `surface_id`, no surface,
+    and `requests_issued` bumped for it.
+  - BLOB-BEFORE-ROW ORDERING is about the blob store, which is not in the
+    database and cannot be rolled back with it. A blob written for a row that
+    never commits is garbage a sweep can collect; a committed row naming a
+    blob that was never written is corruption a report reads as evidence. So
+    the puts stay OUTSIDE the transaction and ahead of it.
 """
 from __future__ import annotations
 
@@ -1403,8 +3003,26 @@ from hx import config as config_mod
 from hx import run as run_mod
 from hx import surface as surface_mod
 from hx.engagement import now_us
+from hx.store import db as db_mod
 from hx.store import records
 from hx.store.blobs import BlobStore
+
+# The frame types this version knows. S6 carries an `unknown_frame` error
+# class precisely because a `t` outside this set must be REFUSED: without the
+# refusal, `t` fell through to the exchange arm and a `{"t": "quarantine"}`
+# frame measured 1 exchange row, 1 surface, 2 blobs and `requests_issued=1` --
+# traffic that never happened, inflating every coverage figure drawn from that
+# column. The next frame type Plan 5 adds must be decided about here rather
+# than fabricated into an exchange.
+FRAME_TYPES = frozenset({"exchange", "denial", "dropped"})
+
+# `via` (S5's egress point) -> `surface.discovered_by` (S5's discovery
+# provenance). Two vocabularies, one fact, and they are spelt differently:
+# S5 draws coverage off `discovered_by = 'crawl'`, and `discovered_by` has no
+# 'send' -- an agent's own request is what 'agent' names. The column lost its
+# DEFAULT in SCHEMA_VERSION 6, so this map is not an optimisation: an insert
+# from here without it now fails.
+DISCOVERED_BY = {"proxy": "proxy", "crawl": "crawl", "send": "agent"}
 
 
 @dataclass
@@ -1427,6 +3045,71 @@ class Capture:
             self.conn, engagement_id=self.engagement_id, kind=kind,
             safety_profile=self.config.safety_profile)
 
+    def on_halted(self, header: dict) -> list[str]:
+        """S4's auto-halt, as rows. Returns the run ids this call aborted.
+
+        THE FRAME HAD NO WRITER. `records.abort_run` had zero callers outside
+        tests, nothing in `src/` built a `BridgeServer` with an `on_halted`,
+        and the integration rig wired only `on_hello` and `on_exchange` -- so
+        S4's "one distressed host aborts the WHOLE run" and S5's "an aborted
+        run must never render as a clean one" were unenforced BY
+        CONSTRUCTION. The run then closed through `cli.capture stop`
+        (completed/operator), `run.current_run` (completed/idle) or
+        `run.reap_stale` (error), each of which is individually correct and
+        none of which is the truth about a run a target's distress ended.
+
+        EVERY LIVE RUN OF THE ENGAGEMENT, not the one the distressed host
+        belongs to. S4 is explicit -- "One distressed host aborts the whole
+        run ... not just that host. Distress on one host is often the first
+        sign of something the whole test is causing" -- and a crawl running
+        beside a browse is two runs of one test. `cli.capture stop` takes the
+        same reading for the same reason.
+
+        ONE TRANSACTION, so a store that fails partway leaves no run marked
+        aborted beside another still `running` on the same distress. The
+        connection is autocommit; see this module's header.
+
+        NO RUN IS OPENED. A `halted` frame arriving when nothing is recording
+        aborts nothing and says so by returning `[]`. Manufacturing a run to
+        hold the epitaph would put a row in the store for a session that never
+        happened, which is what `FRAME_TYPES` above refuses for the same
+        reason.
+
+        WHAT THIS DOES NOT MAKE DURABLE, named because a reader will otherwise
+        assume it: the run's epitaph survives, the STOP does not. Issuance is
+        stopped by the extension's own `Distress` state, which lives in the
+        JVM, and `BridgeServer._reset` puts this side back to DENY-ALL when
+        the connection drops -- so a Burp restart plus a fresh `configure`
+        re-arms issuance with nobody having looked. That is measured, in
+        `tests/test_bridge_server.py::test_a_halted_frame_stops_issuance_and_aborts_the_run`,
+        and it is deliberate rather than missed: S4 scopes DURABILITY to an
+        OPERATOR halt, and an operator who has looked has `hx halt` to make it
+        durable. Calling `OperatorHalt.halt()` from here is not available
+        anyway -- it writes to the database and this method runs on the
+        bridge's READ THREAD, where a connection opened elsewhere raises
+        `sqlite3.ProgrammingError`.
+        """
+        reason = str(header.get("reason") or "target distress")
+        host = str(header.get("host") or "an unnamed host")
+        window = str(header.get("window") or "")
+        stop_reason = f"{reason} on {host}"
+        if window:
+            stop_reason += f" ({window})"
+        rows = self.conn.execute(
+            "SELECT id FROM run WHERE engagement_id=? AND status='running'",
+            (self.engagement_id,)).fetchall()
+        aborted: list[str] = []
+        with db_mod.transaction(self.conn):
+            for row in rows:
+                # True only when THIS call stopped it. A second `halted` frame
+                # from another host inside one window is ordinary behaviour
+                # for a struggling target, and the first stop_reason is the
+                # one that explains what happened -- see `abort_run`.
+                if records.abort_run(self.conn, run_id=row[0],
+                                     stop_reason=stop_reason, at_us=now_us()):
+                    aborted.append(row[0])
+        return aborted
+
     def on_exchange(self, header: dict, request: bytes,
                     response: bytes) -> str | None:
         """Handle one frame. Returns the exchange row id, or None.
@@ -1439,12 +3122,46 @@ class Capture:
         that cannot be written to is not a condition to carry on through.
         """
         t = header.get("t", "exchange")
+        if t not in FRAME_TYPES:
+            raise ValueError(
+                f"unknown frame type {t!r}; this version knows "
+                f"{sorted(FRAME_TYPES)}. S6 answers one with the "
+                "`unknown_frame` error class -- one frame refused, the channel "
+                "kept -- and recording it as an exchange would file traffic "
+                "that never happened")
 
         if t == "dropped":
-            n = int(header.get("n", 1))
-            run_mod.count_drop(self.conn,
-                               run_id=self._run(header.get("source", "operator")),
-                               n=n)
+            # Parsed and bounded BEFORE `_run`, so a malformed drop report
+            # cannot manufacture a run whose coverage is zero. `count_drop`
+            # refuses the same bound at the writer; see its docstring for why
+            # a negative n is the one that matters.
+            drops = int(header.get("n", 1))
+            if drops < 1:
+                raise ValueError(
+                    f"a dropped frame reporting n={drops!r} is malformed; "
+                    "run.dropped_total is an accumulator and S5 makes it the "
+                    "reason a run's coverage numbers are a floor")
+            run_id = self._run(header.get("source", "operator"))
+            # The drop path heartbeats too, and that is not decoration. A
+            # saturated harness may be dropping every exchange it sees while
+            # reporting each drop faithfully; without this, `heartbeat_us`
+            # never moved, and after IDLE_CLOSE_US the next drop report made
+            # `current_run` close the run `completed`/`idle` and open another
+            # -- MEASURED at status='completed', stop_reason='idle',
+            # dropped_total=100, with the rest of the total on a second run.
+            # A run that dropped 100 exchanges is the definition of incomplete
+            # coverage and it read as a clean, idle one.
+            #
+            # `idle` STAYS the reason for a genuine idle close, drops or not:
+            # the close is made by a LIVE harness observing a quiet window,
+            # which is what separates it from `reap_stale`'s `error` close for
+            # a harness that is gone. `completed` says the run ENDED cleanly,
+            # never that its coverage is complete -- `dropped_total` on the
+            # same row is what says otherwise, and the heartbeat above is what
+            # keeps that number whole instead of fragmenting it across a chain
+            # of runs where no single row shows the drops.
+            run_mod.heartbeat(self.conn, run_id=run_id, now_us=now_us())
+            run_mod.count_drop(self.conn, run_id=run_id, n=drops)
             return None
 
         via = header.get("via", "proxy")
@@ -1454,18 +3171,60 @@ class Capture:
         if not url:
             raise ValueError("exchange frame has no url")
         method = header.get("method") or ""
-        run_id = self._run(header.get("source", "operator"))
-        at = now_us()
-        run_mod.heartbeat(self.conn, run_id=run_id, now_us=at)
 
+        # READING THE FRAME IS SETTLED ABOVE `_run`, and this paragraph names
+        # what is BELOW rather than claiming the list above is complete:
+        # three successive versions of it claimed completeness and a
+        # counter-example was measured against each. The hoisted refusals so
+        # far are the frame type, `via`, `url`, the drop count `n`, and --
+        # further down this method -- `error_class` through `row_for`, the
+        # template through `normalise`, `ms` through `int()` and `outcome`
+        # against the store's vocabulary. Each of the last four was measured
+        # firing BELOW the run -- one empty run per malformed frame -- and
+        # `ms` and `outcome` fired below the BLOB PUTS as well, leaving the
+        # files for a row that was never written. None of them touches the
+        # database, so hoisting costs nothing and the run is opened once the
+        # frame is known to be readable.
+        #
+        # BELOW `_run` sit `record_exchange`'s COHERENCE GUARDS, deliberately.
+        # They are the STORE's; they fire on a frame this module has already
+        # read successfully; and they are about what the ROW would claim --
+        # the status/outcome pairing -- rather than about whether the frame
+        # could be read at all. That case leaves an empty run and an orphan
+        # blob behind, which is the honest cost of catching a row that would
+        # have lied: `test_the_one_refusal_that_does_leave_a_run_behind` and
+        # `test_a_row_that_cannot_be_written_leaves_its_blob_behind` pin the
+        # boundary from that side, and the second needs this exact window to
+        # exist at all.
         if t == "denial":
             error_class = header.get("error_class") or ""
             # row_for answers ("denial", kind) OR ("exchange", outcome) -- it
             # is the supported way in precisely because reading DENIAL_KIND
             # directly gets the precedence wrong for the two classes that
             # appear in both maps. So the table it names is checked, not
-            # assumed: passing an OUTCOME where a KIND belongs would fail the
-            # denial table's CHECK at the far end of a read thread.
+            # assumed: passing an OUTCOME where a KIND belongs is not a thing
+            # to find out about downstream.
+            #
+            # MEASURED, because the two sentences the brief wrote here were
+            # both claims and both are false. (1) The branch is UNREACHABLE
+            # while `issued=False`, and no input can redden it: `row_for`'s
+            # third arm is the only one that answers ("exchange", ...), and
+            # every key of EXCHANGE_OUTCOME is caught by an earlier arm --
+            # scope_denied and rate_limited by DENIAL_KIND, timeout and
+            # bridge_lost by AMBIGUOUS_ISSUANCE, which answers None when the
+            # request never left. The reachable answers here are
+            # ("denial", kind), None, and ValueError. (2) It would NOT "fail
+            # the denial table's CHECK": `record_denial` checks `kind` against
+            # DENIAL_KINDS itself, so `kind='timeout'` raises ValueError in
+            # Python and never reaches SQLite at all.
+            #
+            # It stays anyway, because (1) is a fact about TODAY'S maps rather
+            # than about this call -- EXCHANGE_OUTCOME gaining one key that
+            # neither DENIAL_KIND nor AMBIGUOUS_ISSUANCE names makes the
+            # branch live -- and because it names the TABLE in its message,
+            # which the check downstream cannot. `issued=False` is the load-
+            # bearing half of the pair and IS pinned; see
+            # test_a_denial_frame_says_the_request_never_left.
             row = records.row_for(error_class, issued=False)
             if row is None:
                 return None
@@ -1475,42 +3234,99 @@ class Capture:
                     f"{error_class!r} routes to {table!r}, not a denial; a "
                     "dropped request that produced no exchange cannot be "
                     "recorded as one")
+            run_id = self._run(header.get("source", "operator"))
+            at = now_us()
+            run_mod.heartbeat(self.conn, run_id=run_id, now_us=at)
             records.record_denial(
                 self.conn, run_id=run_id, kind=value, method=method, url=url,
                 detail=header.get("detail") or "", at_us=at, via=via)
             return None
 
-        n = surface_mod.normalise(
+        # The two exchange-only header fields, read HERE and not at the
+        # `record_exchange` call, which sits below `_run` AND below the blob
+        # puts. Both were measured leaking there, three frames each:
+        #
+        #   ms="abc"          ValueError from int()     1 run, 0 exchanges,
+        #                                               2 orphan blob files
+        #   outcome="bogus"   ValueError from records   1 run, 0 exchanges,
+        #                                               2 orphan blob files
+        #
+        # Six puts, two files: the store is content-addressed and the three
+        # frames carried the same bodies. Distinct bodies would be six.
+        #
+        # A value the frame cannot be read with is the same family as the
+        # unparseable port and the unplaceable error class -- nothing about
+        # the row's claims, everything about the frame -- so it belongs with
+        # them, above anything that opens or writes. `record_exchange` checks
+        # the outcome again at the writer; this one is placed early rather
+        # than instead.
+        ms = int(header.get("ms") or 0)
+        outcome = header.get("outcome") or "ok"
+        if outcome not in records.EXCHANGE_OUTCOMES:
+            raise ValueError(
+                f"unknown outcome {outcome!r}; the exchange table's "
+                f"vocabulary is {sorted(records.EXCHANGE_OUTCOMES)}. Map an "
+                "error class through records.EXCHANGE_OUTCOME rather than "
+                "inventing a value here")
+
+        norm = surface_mod.normalise(
             method, url,
             preserve=frozenset(self.config.preserve_segments),
             slug_threshold=self.config.slug_threshold)
+        run_id = self._run(header.get("source", "operator"))
+        at = now_us()
+        run_mod.heartbeat(self.conn, run_id=run_id, now_us=at)
 
-        # Blobs first: an orphan blob is garbage, a row naming a blob that was
-        # never written is corruption.
+        # Blobs before the transaction, deliberately: the blob store is not in
+        # the database, so a ROLLBACK cannot take a file back. Writing them
+        # first means a failed exchange leaves an orphan blob, which is
+        # garbage a sweep can collect; writing them after a committed row that
+        # names them would leave corruption a report reads as evidence. This
+        # is an ordering argument only -- the four writes below are atomic
+        # because of the transaction, not because of where they sit.
         req_blob, _ = self.blobs.put(request) if request else (None, None)
         resp_blob, resp_len = (self.blobs.put(response) if response
                                else (None, None))
 
-        exchange_id = records.record_exchange(
-            self.conn, run_id=run_id, method=method, url=url,
-            status=header.get("status"), req_blob=req_blob,
-            resp_blob=resp_blob, resp_len=resp_len,
-            ms=int(header.get("ms") or 0), at_us=at,
-            outcome=header.get("outcome") or "ok", via=via)
+        # One unit. `db.connect` is autocommit, so without this each statement
+        # commits on its own: `upsert_surface` failing -- "database is locked"
+        # under WAL past busy_timeout is enough -- MEASURED an exchange row
+        # committed with `surface_id` NULL, no surface row, and
+        # `requests_issued` bumped for it. That NULL is the exact state the
+        # back-reference was added to prevent, and it is unrecoverable
+        # afterwards.
+        with db_mod.transaction(self.conn):
+            exchange_id = records.record_exchange(
+                self.conn, run_id=run_id, method=method, url=url,
+                status=header.get("status"), req_blob=req_blob,
+                resp_blob=resp_blob, resp_len=resp_len,
+                ms=ms, at_us=at, outcome=outcome, via=via)
 
-        # S5's run.requests_issued, which nothing has ever written to. It
-        # counts what LEFT, so it is bumped here and not on the denial path:
-        # a refused request is in `denial`, and counting it as issued would
-        # inflate every coverage figure derived from this column.
-        self.conn.execute(
-            "UPDATE run SET requests_issued = requests_issued + 1 WHERE id=?",
-            (run_id,))
+            # S5's run.requests_issued, which nothing has ever written to. It
+            # counts what LEFT, so it is bumped here and not on the denial
+            # path: a refused request is in `denial`, and counting it as
+            # issued would inflate every coverage figure derived from this
+            # column.
+            self.conn.execute(
+                "UPDATE run SET requests_issued = requests_issued + 1"
+                " WHERE id=?", (run_id,))
 
-        self.upsert_surface(n, exchange_id=exchange_id, run_id=run_id)
+            surface_id = self.upsert_surface(norm, exchange_id=exchange_id,
+                                             run_id=run_id, via=via)
+            # The back-reference, and it cannot be written any earlier: the
+            # surface's exemplar is this exchange, so the exchange row has to
+            # exist before the surface row can name it. `exchange.surface_id`
+            # is what every coverage query joins on -- "which surfaces has
+            # anything actually reached" -- and a NULL here is not recoverable
+            # afterwards except by re-deriving the template under whatever the
+            # normaliser's rules have become by then, which is the one thing
+            # `normaliser_version` exists to say cannot be done.
+            self.conn.execute("UPDATE exchange SET surface_id=? WHERE id=?",
+                              (surface_id, exchange_id))
         return exchange_id
 
     def upsert_surface(self, n: surface_mod.Normalised, *, exchange_id: str,
-                       run_id: str) -> str:
+                       run_id: str, via: str) -> str:
         """Insert or touch the surface this exchange belongs to.
 
         `first_seen_run` is written once and never updated; `last_seen_run`
@@ -1518,17 +3334,25 @@ class Capture:
         exemplar is the first exchange that proved it exists, and rewriting it
         on every sighting would make "show me an example of this endpoint"
         return whatever happened most recently rather than what was reviewed.
+
+        `discovered_by` is in the same family as the exemplar and is likewise
+        untouched by the `DO UPDATE`: it answers WHICH EGRESS POINT FOUND
+        this surface, and the crawler seeing an endpoint the proxy already
+        recorded does not make it a crawler discovery. S5 draws a coverage
+        figure straight off that distinction.
         """
         self.conn.execute(
             "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
-            " path_template, query_key_set, kind, normaliser_version,"
-            " first_seen_run, last_seen_run, exemplar_exchange_id)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " path_template, query_key_set, kind, discovered_by,"
+            " normaliser_version, first_seen_run, last_seen_run,"
+            " exemplar_exchange_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(engagement_id, method, scheme, host, port,"
             "             path_template, query_key_set)"
             " DO UPDATE SET last_seen_run=excluded.last_seen_run",
             (records.new_id("s"), self.engagement_id, n.method, n.scheme,
              n.host, n.port, n.path_template, n.query_key_set, n.kind,
+             DISCOVERED_BY[via],
              n.normaliser_version, run_id, run_id, exchange_id))
         return self.conn.execute(
             "SELECT id FROM surface WHERE engagement_id=? AND method=?"
@@ -1595,6 +3419,8 @@ import hx.policy.Decision;
 import hx.policy.Gate;
 import hx.policy.HxRequest;
 import hx.policy.Policy;
+import hx.policy.TickClock;
+import hx.send.Limits;
 
 import java.util.List;
 import java.util.Map;
@@ -1609,7 +3435,7 @@ import java.util.Map;
  * sabotage table are that split turned off in each direction, and each
  * reddens only its own source's checks: neither is caught by the other's.
  *
- * Hand-rolled runner, like the other nine classes: JUnit would be a
+ * Hand-rolled runner, like the other eleven classes: JUnit would be a
  * dependency, and this jar has none.
  */
 public class ProxyGateTest {
@@ -1649,10 +3475,17 @@ public class ProxyGateTest {
           ProxyGateTest::theOperatorDoesNotSpendTheGate);
         t("but the crawler does (the gate)",
           ProxyGateTest::theCrawlerSpendsTheGate);
-        t("an unconfigured extension refuses both sources",
+        t("an unconfigured extension refuses every source",
           ProxyGateTest::unconfiguredRefusesBoth);
+        t("a source that could not be attributed is refused, not defaulted",
+          ProxyGateTest::anUnattributableSourceIsRefused);
+        t("a crawler request that passes scope, method and dangerous.path "
+          + "REACHES the gate, and an unarmed one refuses it",
+          ProxyGateTest::theCrawlerReachesTheGateAndAnUnarmedOneRefusesIt);
         t("the listener port decides the source",
           ProxyGateTest::theListenerPortDecides);
+        t("a listener interface is parsed or refused, never guessed at",
+          ProxyGateTest::theListenerInterfaceIsParsedOrRefused);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -1773,6 +3606,75 @@ public class ProxyGateTest {
         check("crawling does (" + gate.calls + ")", gate.calls == 1);
     }
 
+    // ---- the gate the crawler actually reaches ---------------------------
+
+    /**
+     * THE TEST THAT DID NOT EXIST, AND ITS ABSENCE IS WHY A LIVE DEFECT SHIPPED.
+     *
+     * Every crawler case above stops SHORT of the Gate.
+     * {@link #theCrawlerIsMethodChecked} drives a POST that `method.allow`
+     * refuses; {@link #theCrawlerIsDangerousPathChecked} drives `/logout`;
+     * {@link #scopeIsAbsoluteForTheCrawler} drives an out-of-scope host.
+     * {@link #theCrawlerSpendsTheGate} does reach it -- against a
+     * {@link CountingGate} that allows everything. The single crawler-listener
+     * INTEGRATION test drives a POST too. So no test anywhere drove a crawler
+     * request through scope, method and dangerous.path into the REAL Gate.
+     *
+     * WHAT THAT HID. {@link hx.send.Limits} is the Gate a real run carries, and
+     * it answers `not_configured` -- "the rate and budget are not armed" --
+     * until {@code arm} has run. `arm` had ONE call site, in the send
+     * handler, so every crawler request that got this far was refused as
+     * unauthorised on a correctly authorised run, until some unrelated `send`
+     * happened to arm it. Fail-closed, and a denial that lies about why.
+     *
+     * SO THE FIXTURE IS THE REAL Limits AND NOT A CountingGate. A fake that
+     * allows everything cannot fail this way, and that is the whole finding:
+     * the gate that exists in production has a state the test double does not
+     * have.
+     *
+     * THE THIRD CASE IS THE CONTROL. The operator gets the same request
+     * through the SAME unarmed Limits and is allowed, because the operator
+     * branch stops before the Gate -- so what the first case pins is the
+     * Gate's state, not the request.
+     *
+     * WHAT THIS DOES NOT PIN: that HxExtension arms it. This class constructs
+     * both objects itself. The wiring is text in a file no test can execute,
+     * and it is counted by
+     * {@code ChokepointTest.everyPathThatSpendsTheGateArmsItFirst}.
+     */
+    static void theCrawlerReachesTheGateAndAnUnarmedOneRefusesIt() {
+        BridgeClient.Authorisation auth = authorised();
+        // GET, in scope, not on the dangerous list: the three checks ahead of
+        // the Gate all pass, so this request reaches it and nothing else does
+        // the refusing.
+        HxRequest allowed = req("GET", "http://app.test/x");
+
+        var unarmed = gateOver(new Limits(new TickClock(1_000_000L), 5, 100))
+                .decide(allowed, auth, Source.CRAWLER);
+        check("an UNARMED gate refuses the crawler (" + unarmed.errorClass() + ")",
+              !unarmed.allow() && "not_configured".equals(unarmed.errorClass()));
+        // The detail is asserted, not just the class: `not_configured` is
+        // shared with DENY-ALL and with an unattributable source, so the class
+        // alone does not say that this is the Gate answering.
+        check("and says the rate and budget are the thing that is missing ("
+              + unarmed.detail() + ")",
+              unarmed.detail() != null
+              && unarmed.detail().contains("not armed"));
+
+        Limits armed = new Limits(new TickClock(1_000_000L), 5, 100);
+        armed.arm(auth);
+        var ok = gateOver(armed).decide(allowed, auth, Source.CRAWLER);
+        check("the SAME request is allowed once the gate is armed ("
+              + ok.errorClass() + ")", ok.allow());
+
+        // The control, and it is what makes the first case about the Gate.
+        var operator = gateOver(new Limits(new TickClock(1_000_000L), 5, 100))
+                .decide(allowed, auth, Source.OPERATOR);
+        check("and the operator is allowed through the same unarmed gate, "
+              + "because that branch never reaches it (" + operator.errorClass()
+              + ")", operator.allow());
+    }
+
     // ---- DENY-ALL --------------------------------------------------------
 
     static void unconfiguredRefusesBoth() {
@@ -1785,10 +3687,15 @@ public class ProxyGateTest {
         }
 
         // The separating input for ProxyGate's OWN epoch guard, and it is not
-        // the four checks above. Policy refuses an epoch-0 authorisation on
-        // both of the paths this class calls, so with ProxyGate's guard
-        // deleted those four printed `ok` and only the two below went red --
-        // measured, row D of this task's sabotage table. The guard adds that
+        // the checks above. Policy refuses an epoch-0 authorisation on both of
+        // the paths this class calls, so with that guard deleted the three
+        // above still print `ok` and the failure is the NPE thrown out of THIS
+        // method the moment the loop below reaches a ProxyGate with no Policy
+        // -- re-measured on this tree, 9 x ALL PASS + 1 FAILURE / 1652 ok, the
+        // one FAIL being this method's name and a NullPointerException. (Row D
+        // of the sabotage table measured it when Source had two constants; the
+        // third constant adds a green check, not a red one, because an
+        // unattributable source is refused either way.) The guard adds that
         // the answer is given BEFORE the
         // Policy is consulted, and a ProxyGate holding no Policy is the one
         // caller that can tell the two apart: with the guard it is a verdict,
@@ -1802,6 +3709,55 @@ public class ProxyGateTest {
         }
     }
 
+    // ---- the third answer ------------------------------------------------
+
+    /**
+     * A source this gate cannot recognise is REFUSED, and both spellings of
+     * one are: `Source.UNATTRIBUTED` and a null.
+     *
+     * Both were ALLOWED before the guard that answers them existed --
+     * measured, and with the whole suite at 10 x ALL PASS, because
+     * `source == Source.CRAWLER` is false for each and the else branch is the
+     * lenient one. The two requests are chosen as the separating inputs: a
+     * POST the allowlist omits, and a GET on a dangerous path. The CONTROL is
+     * that both are still allowed for Source.OPERATOR two methods up, so what
+     * these pin is attribution and not the four rules.
+     *
+     * NOT claimed: that null and UNATTRIBUTED exhaust what this branch
+     * catches. It is written as "neither of the two I know", so a constant
+     * added to Source later lands here too -- and that constant needs its own
+     * check, because this method names two and cannot see a third.
+     */
+    static void anUnattributableSourceIsRefused() {
+        CountingGate gate = new CountingGate();
+        ProxyGate g = gateOver(gate);
+        Source[] unknown = { Source.UNATTRIBUTED, null };
+        for (Source s : unknown) {
+            var post = g.decide(req("POST", "http://app.test/login"), authorised(), s);
+            check("a POST the allowlist omits is refused for " + s + " ("
+                  + post.errorClass() + ")",
+                  !post.allow() && "not_configured".equals(post.errorClass()));
+
+            var logout = g.decide(req("GET", "http://app.test/logout"), authorised(), s);
+            check("and so is a dangerous path for " + s + " ("
+                  + logout.errorClass() + ")",
+                  !logout.allow() && "not_configured".equals(logout.errorClass()));
+
+            // The class is shared with DENY-ALL, so the class alone does not
+            // say which guard answered. The detail does, and the prefix it
+            // starts with is the one records.py declares for itself -- the
+            // marker that separates "this jar is broken" from "the operator
+            // never configured a run", pinned identical on both sides by
+            // test_the_extension_fault_marker_is_the_same_string_on_both_sides.
+            check("with the extension-fault marker on the detail for " + s
+                  + " (" + logout.detail() + ")",
+                  logout.detail() != null
+                  && logout.detail().startsWith(BridgeClient.EXTENSION_FAULT));
+        }
+        check("and refusing an unattributable request spends nothing ("
+              + gate.calls + ")", gate.calls == 0);
+    }
+
     // ---- attribution -----------------------------------------------------
 
     static void theListenerPortDecides() {
@@ -1809,21 +3765,107 @@ public class ProxyGateTest {
               Source.forListenerPort(8081, 8081) == Source.CRAWLER);
         check("any other port attributes to OPERATOR",
               Source.forListenerPort(8080, 8081) == Source.OPERATOR);
-        // The separating case. An unknown port must not become CRAWLER by
-        // accident: crawler attribution is the STRICTER branch, and getting
-        // it by default would silently apply the agent's rules to a human.
-        check("and an unknown port is OPERATOR, not CRAWLER",
+        // A port that PARSED and belongs to no listener hx knows about is the
+        // operator's: they may configure extra listeners, and crawler
+        // attribution is the stricter branch, so getting it by default would
+        // silently apply the agent's rules to a human.
+        check("and an unrecognised but usable port is OPERATOR, not CRAWLER",
               Source.forListenerPort(9999, 8081) == Source.OPERATOR);
-        // ...and the converse, which is the one with teeth: a crawler port
-        // that was never configured (0) must not swallow every request.
+        // Behaviour, not a guard: an unconfigured crawler port must swallow
+        // nothing. This input separates no branch of forListenerPort as it now
+        // stands -- 8080 is in range and 8080 != 0 -- and is kept as a pin on
+        // the answer rather than dressed up as more than it is.
         check("an unconfigured crawler port matches nothing",
               Source.forListenerPort(8080, 0) == Source.OPERATOR);
-        // The line above does NOT separate `crawlerPort > 0` from its absence
-        // -- 8080 != 0 either way. This one does, and it is the only input in
-        // this method that does: two absences, an unreadable port and an
-        // unconfigured crawler, must not agree their way into CRAWLER.
-        check("and two absences do not agree their way into CRAWLER",
-              Source.forListenerPort(0, 0) == Source.OPERATOR);
+
+        // The four inputs that separate the range test, and with it the whole
+        // third answer. Each is a port the caller could not determine, and
+        // each answered OPERATOR -- the branch that drops four of the five
+        // rules -- before the range test existed; measured, all four, against
+        // the committed body. (0, 0) was the sharpest: it answered OPERATOR
+        // only because of a `crawlerPort > 0` clause that existed for that one
+        // pair, and a bare equality made it CRAWLER instead.
+        check("a port that could not be read is UNATTRIBUTED, with a crawler configured",
+              Source.forListenerPort(Source.NO_PORT, 8081) == Source.UNATTRIBUTED);
+        check("and without one",
+              Source.forListenerPort(Source.NO_PORT, 0) == Source.UNATTRIBUTED);
+        check("a negative sentinel is UNATTRIBUTED, not a listener",
+              Source.forListenerPort(-1, 8081) == Source.UNATTRIBUTED);
+        check("and so is a number no TCP port can be",
+              Source.forListenerPort(70000, 8081) == Source.UNATTRIBUTED);
+        // The constant is the spelling Task 7 hands over, and it must be the
+        // value the rule actually treats that way -- a NO_PORT of, say, 1
+        // would make the two lines above pass while every real parse failure
+        // answered OPERATOR.
+        check("and NO_PORT is one of those numbers (" + Source.NO_PORT + ")",
+              Source.NO_PORT < 1 || Source.NO_PORT > 65535);
+    }
+
+    /**
+     * The other half of the attribution, and the only half that touches a
+     * string a Burp handed over.
+     *
+     * {@link Source} takes two ints and does no parsing on purpose. Something
+     * has to turn `listenerInterface()` into one of those ints, and that
+     * something lives in HxExtension -- a file nothing can drive, except this
+     * one static method, which is why it is public. Every failure here has to
+     * answer {@link Source#NO_PORT}, because the alternative is a number that
+     * might land on the crawler's port or on the operator's branch by
+     * accident: a parse that GUESSES is attribution decided by a malformed
+     * string.
+     *
+     * MEASURED FORM, from docs/burp-proxy-measurements.md Q1:
+     * `"127.0.0.1:8080"`, a different port per listener, over plain HTTP and
+     * through a CONNECT tunnel.
+     */
+    static void theListenerInterfaceIsParsedOrRefused() {
+        check("the measured form parses (" + hx.HxExtension.listenerPort("127.0.0.1:8080") + ")",
+              hx.HxExtension.listenerPort("127.0.0.1:8080") == 8080);
+        check("and a different listener gives a different port",
+              hx.HxExtension.listenerPort("127.0.0.1:8081") == 8081);
+        // THE LAST colon, not the first. An IPv6 interface puts colons inside
+        // the address, and splitting on the first would read `:1]:8080` --
+        // non-numeric, so NO_PORT, so UNATTRIBUTED, so every request on an
+        // IPv6 listener REFUSED. Fail-closed, but it would refuse a working
+        // configuration and read as a broken jar.
+        check("the port is taken after the LAST colon, so an IPv6 interface works ("
+              + hx.HxExtension.listenerPort("[::1]:8080") + ")",
+              hx.HxExtension.listenerPort("[::1]:8080") == 8080);
+
+        // Everything else is NO_PORT. Each of these is a shape a caller in
+        // trouble actually produces, and each would otherwise have to be
+        // invented into a number.
+        check("a null interface is NO_PORT",
+              hx.HxExtension.listenerPort(null) == Source.NO_PORT);
+        check("an interface with no colon at all is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1") == Source.NO_PORT);
+        check("an empty tail after the colon is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1:") == Source.NO_PORT);
+        check("a non-numeric tail is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1:http") == Source.NO_PORT);
+        check("and so is a tail that is only PARTLY numeric",
+              hx.HxExtension.listenerPort("127.0.0.1:8080x") == Source.NO_PORT);
+        check("a negative tail is NO_PORT, not a negative port",
+              hx.HxExtension.listenerPort("127.0.0.1:-1") == Source.NO_PORT);
+        check("an empty string is NO_PORT",
+              hx.HxExtension.listenerPort("") == Source.NO_PORT);
+        // THE INPUT THAT SEPARATES THE LENGTH BOUND FROM ITS ABSENCE. Without
+        // it `Integer.parseInt` THROWS on a run of digits past 2^31 -- out of
+        // the handler, on a Burp proxy thread, for a request that would then
+        // be neither allowed nor refused nor recorded. Every other overlong
+        // number is answered by Source's own range test; this one never
+        // reaches it.
+        check("a 30-digit tail is NO_PORT rather than an exception",
+              hx.HxExtension.listenerPort("127.0.0.1:" + "9".repeat(30))
+              == Source.NO_PORT);
+        // And a number that parses but is not a port: handed over as itself,
+        // because Source's range test is the one place that rule lives. Named
+        // here so the boundary between the two files is visible from both
+        // sides -- this method does NOT range-check.
+        check("a 5-digit number out of TCP range is handed over as itself, for "
+              + "Source to refuse (" + hx.HxExtension.listenerPort("127.0.0.1:70000") + ")",
+              hx.HxExtension.listenerPort("127.0.0.1:70000") == 70000
+              && Source.forListenerPort(70000, 8081) == Source.UNATTRIBUTED);
     }
 }
 ```
@@ -1840,15 +3882,16 @@ Expected: a compile failure naming `hx.proxy.Source`.
 package hx.proxy;
 
 /**
- * Who is driving: the operator's own browser, or the crawler.
+ * Who is driving: the operator's own browser, the crawler, or NEITHER -- and
+ * the third is an answer in its own right rather than a synonym for the first.
  *
  * This is a security boundary and it has its own file so the rule can be read
  * without reading anything else.
  *
- * S4: the two are told apart by WHICH PROXY LISTENER the request arrived on,
- * never by anything in the traffic itself. A property of the connection
- * cannot be forged by a hostile page; a header can, and a page that could
- * make its requests look human-driven would dodge the crawler's rules
+ * S4: the two real sources are told apart by WHICH PROXY LISTENER the request
+ * arrived on, never by anything in the traffic itself. A property of the
+ * connection cannot be forged by a hostile page; a header can, and a page that
+ * could make its requests look human-driven would dodge the crawler's rules
  * entirely -- including the dangerous-path denylist that exists so a crawler
  * finding "Delete account" does not click it.
  *
@@ -1857,41 +3900,101 @@ package hx.proxy;
  * listener, measured over plain HTTP and through a CONNECT tunnel -- see
  * docs/burp-proxy-measurements.md, Q1. There is no `listenerPort()`, so the
  * caller parses the port after the last `:` and hands the int here. This enum
- * does no parsing: it is handed two numbers so the attribution rule is the
- * only thing in the file.
+ * does no parsing and imports nothing: it is handed two numbers so the
+ * attribution rule is the only thing in the file, and so nothing that carries
+ * traffic can reach it.
  *
- * The default direction is deliberate and it is not the strict one. An
- * unrecognised port is OPERATOR, because crawler attribution applies the
- * AGENT's rules, and applying them to a human by accident is the failure that
- * drives an operator off the proxy -- at which point their traffic is not
- * recorded at all and the enforcement bought nothing. A crawler mis-attributed
- * as an operator is the safer error: its own harness still refuses what it
- * must, because the crawler is the thing asking.
+ * THE DEFAULT DIRECTION, AND WHY IT IS TWO ANSWERS RATHER THAN ONE.
  *
- * What that default does NOT weaken: scope. ProxyGate applies scope to both
- * sources identically, so a request attributed the wrong way is still refused
- * when it leaves the engagement's boundary.
+ * A port that PARSES and is not the crawler's is OPERATOR. Crawler attribution
+ * applies the AGENT's rules, and applying them to a human by accident is the
+ * failure that drives an operator off the proxy -- at which point their
+ * traffic is not recorded at all and the enforcement bought nothing. An
+ * operator may legitimately configure extra listeners and hx cannot enumerate
+ * them, so "a port I do not recognise" has to mean the human.
+ *
+ * What that costs, stated rather than argued away: ProxyGate asks Policy for
+ * SCOPE ONLY on the OPERATOR branch, so a request attributed that way is not
+ * method-checked, not dangerous-path-checked, spends no rate token and spends
+ * no budget slot -- and NOTHING ELSE IN THIS SYSTEM APPLIES THOSE FOUR RULES
+ * TO IT. S4 puts all four here on purpose ("Rate limiting, method allowlist,
+ * dangerous-path denylist, and per-run budgets all live in the extension"):
+ * the Python side carries `dangerous_paths` and `method.allow` as config to
+ * ship to this jar and as denial-class names to record, and refuses none of
+ * them -- grepped, 2026-08-25, and that grep is how to falsify this sentence:
+ * a refusal appearing on the Python side would make it false, and
+ * hx-design.md:192 is the line saying one should not.
+ *
+ * An earlier version of this comment claimed a crawler mis-attributed as an
+ * operator was the safer error "because its own harness still refuses what it
+ * must". There is no such harness refusal, and that false sentence was the
+ * whole argument for answering OPERATOR to a question this enum could not
+ * actually answer.
+ *
+ * So a port that CANNOT BE DETERMINED is no longer that answer. It is
+ * UNATTRIBUTED, and {@link ProxyGate} REFUSES it: not knowing who is driving
+ * is a code failure or a change in Burp, never a person browsing, and the
+ * permissive branch is the one branch it must not silently become.
+ *
+ * WHAT UNATTRIBUTED COVERS AND WHAT IT EXCLUDES. It is the answer for an int
+ * that is not a usable TCP port -- `port < 1 || port > 65535` -- which is the
+ * shape a caller in trouble actually produces: {@link #NO_PORT} from an unset
+ * field or from a `listenerInterface()` that did not parse, a negative from a
+ * parse that returned a sentinel, a garbage large number from one that read
+ * the wrong digits. It EXCLUDES a port that parsed into range and belongs to
+ * no listener hx knows about: `(9999, 8081)` is OPERATOR, deliberately,
+ * because that is the extra-listener case above and nothing here can tell it
+ * from a typo. ProxyGateTest pins both sides of that line -- `(0, 8081)`,
+ * `(-1, 8081)` and `(70000, 8081)` are UNATTRIBUTED; `(9999, 8081)` and
+ * `(8080, 0)` are OPERATOR.
+ *
+ * What NO attribution weakens, whichever of the three it answers: scope.
+ * ProxyGate applies scope to both real sources identically and refuses the
+ * third outright, so a request attributed the wrong way is still refused when
+ * it leaves the engagement's boundary -- pinned by ProxyGateTest's
+ * out-of-scope checks, one method for each of the two real sources, and by
+ * the refusal checks for the third.
  */
 public enum Source {
     OPERATOR,
-    CRAWLER;
+    CRAWLER,
+    UNATTRIBUTED;
 
     /**
-     * @param port        the listener the request arrived on
+     * What a caller hands over when it has no port to hand over.
+     *
+     * Named so Task 7's parse has something to say "I could not read one"
+     * WITH, rather than reaching for a bare 0 that used to mean the operator.
+     * Any int outside 1..65535 answers the same way, so a caller that forgets
+     * this constant and passes 0, -1 or a failed parse's sentinel still gets
+     * UNATTRIBUTED; the constant is for the reader, not for the rule.
+     */
+    public static final int NO_PORT = 0;
+
+    /**
+     * @param port        the listener the request arrived on, or {@link #NO_PORT}
+     *                    when the caller could not determine one
      * @param crawlerPort the configured crawler listener, or 0 if there is none
      */
     public static Source forListenerPort(int port, int crawlerPort) {
-        // `crawlerPort > 0` is load-bearing, and what separates it from its
-        // absence is narrow: the two arguments AGREEING on a non-positive
-        // port. `forListenerPort(0, 0)` is the case that can actually happen
-        // -- with no crawler configured the field is 0, and a caller that
-        // could not read a port (a `listenerInterface()` that did not parse,
-        // an unset field) has 0 to hand over too -- so a bare equality test
-        // turns that pair into CRAWLER: the agent's rules applied to a human
-        // on the strength of two absences agreeing. `forListenerPort(8080, 0)`
-        // does NOT separate them; it answers OPERATOR either way, measured.
-        // ProxyGateTest pins (0, 0).
-        return (crawlerPort > 0 && port == crawlerPort) ? CRAWLER : OPERATOR;
+        // The range test comes FIRST and is what makes the third answer
+        // reachable: without it, `port == crawlerPort` on two absences (an
+        // unreadable port and an unconfigured crawler, 0 and 0) is CRAWLER,
+        // and every other unreadable port is OPERATOR -- the agent's rules
+        // applied to a human on the strength of two absences agreeing, or the
+        // human's leniency applied to the agent. Both are now refusals.
+        if (port < 1 || port > 65535) return UNATTRIBUTED;
+        // No `crawlerPort > 0` guard here any more, and its absence is
+        // deliberate: with `port` already constrained to 1..65535, a
+        // crawlerPort of 0 or negative cannot equal it, so that clause is
+        // subsumed and NO input in this suite separates it from its absence:
+        // putting it back is 10 x ALL PASS / 1655 ok / 0 FAIL, measured, and
+        // the range test above is why no input can. A guard nothing separates
+        // is the finding this fix round is closing elsewhere; it is not
+        // re-added here. `(8080, 0)` is still pinned in ProxyGateTest
+        // as BEHAVIOUR -- an unconfigured crawler port matches nothing -- and
+        // that check is honest about not separating a guard.
+        return port == crawlerPort ? CRAWLER : OPERATOR;
     }
 }
 ```
@@ -1931,6 +4034,54 @@ import hx.policy.Policy;
  * `Policy.decide` is the full pinned order and `Policy.decideScopeOnly` stops
  * after scope. Which of the two a request gets is the whole of what
  * {@link Source} buys.
+ *
+ * THIS POINT DOES NOT CHECK THE HALT, AND THAT IS A STATED GAP, NOT AN
+ * OVERSIGHT. S4's decision order puts `halted` second. This class asks
+ * {@link Policy}, and Policy does not know about halts -- the send path asks
+ * {@link hx.send.HaltSwitch} separately, through
+ * `Sender.issuanceHeldReason`. So while the run is HALTED, proxy traffic keeps
+ * flowing and keeps being recorded.
+ *
+ * WHAT THAT ACTUALLY COSTS, stated in full because the comfortable version of
+ * it was wrong. It is not only "a human who hit stop can close their browser".
+ * FOUR things set the halt and only one of them is that human:
+ *
+ *   - a `halt` FRAME the operator sent. This is the comfortable case, and the
+ *     browser is in their hands;
+ *   - the SENTINEL FILE, S4's third kill path -- the one that works when the
+ *     bridge does not. Someone reaching for that has already lost the channel;
+ *   - the AUTO-HALT on target distress. NOT a human decision: S4 aborts the
+ *     whole run above a 20% 5xx rate, above 5x the baseline p50 latency, or
+ *     after 5 consecutive connection errors. hx has decided the target is in
+ *     trouble and the operator's browser is still hitting it;
+ *   - a halt RE-ASSERTED AFTER A RECONNECT, because an operator halt is
+ *     durable and a fresh `hello` does not clear it. The operator may not be
+ *     at the keyboard at all.
+ *
+ * AND IT RUNS THE OTHER WAY TOO: operator browsing feeds nothing into
+ * `Distress`, which is fed from the SEND path's replies only. So operator
+ * traffic can distress a host without ever tripping the auto-halt, and would
+ * not be stopped by it if something else did.
+ *
+ * The ruling stands anyway, for the reason below -- closing the gap without
+ * the row to put the refusal in breaks S4 with the fix for S4 -- and the
+ * crawler, where the four above bite hardest, does not exist yet.
+ *
+ * WHAT PLAN 5 MUST DO TO CLOSE IT, written here because this is where its
+ * implementer will look. Answering `halted` from this class is NOT a one-line
+ * change: `halted` has to be added to `records.DENIAL_KIND` and to the
+ * `denial.kind` CHECK in schema.sql (with the SCHEMA_VERSION bump that
+ * implies), or `hx.capture`'s denial arm routes it to `row_for(...) is None`,
+ * returns without writing anything, and the refusal VANISHES -- S4's "denials
+ * are never silent" broken by the fix for S4. The condition is therefore:
+ * close the gap and the row at the same time, or not at all.
+ *
+ * THERE IS A THIRD ANSWER AND IT IS NEITHER QUESTION. A source this class
+ * cannot recognise -- `Source.UNATTRIBUTED`, or a null -- is REFUSED here
+ * without asking Policy anything. The lenient branch is chosen for a human
+ * whose deliberate act it is; "we could not work out who is driving" is a code
+ * failure or a change in Burp, and defaulting it to the branch that drops four
+ * of the five rules is a fail-open dressed as a default.
  */
 public final class ProxyGate {
     private final Policy policy;
@@ -1966,14 +4117,71 @@ public final class ProxyGate {
             // DENY-ALL is the initial and terminal state, at BOTH points, and
             // this copy of it is REDUNDANT with the one inside Policy: both
             // questions below refuse an epoch-0 authorisation on their own, so
-            // with these three lines deleted the four `DENY-ALL holds for`
-            // checks in ProxyGateTest stay green -- measured, row D of this
-            // task's sabotage table. What it changes is WHEN the answer is
-            // given: here, before the Policy reference is touched at all. The
-            // input that separates the two is a ProxyGate holding no Policy,
-            // and ProxyGateTest uses it for exactly that.
+            // with these three lines deleted the three `DENY-ALL holds for`
+            // checks in ProxyGateTest -- one per Source constant -- stay
+            // green. Re-measured on this tree after the third constant was
+            // added: 9 x ALL PASS + 1 FAILURE, 1652 ok, and the single FAIL is
+            // an NPE out of unconfiguredRefusesBoth, not a check saying an
+            // unconfigured extension allowed something. (Row D of this task's
+            // sabotage table measured the same mutation when Source had two
+            // constants.) What these lines change is WHEN the answer is given:
+            // here, before the Policy reference is touched at all. The input
+            // that separates the two is a ProxyGate holding no Policy, which
+            // is where that NPE comes from and what ProxyGateTest uses it for.
+            //
+            // `== 0`, not `< 1`, at BOTH enforcement points (the other copy is
+            // Policy.unusable). That is a REACHABILITY argument and not a
+            // range check: epoch is a long, and a hand-built
+            // `new Authorisation(-1, scope)` is treated as CONFIGURED and
+            // decided under, here and there alike -- measured. Nothing in this
+            // tree can produce one, because BridgeClient's counter is
+            // pre-incremented from 0 and is the only writer of the field, so
+            // the inherited shape is kept and the reachability is written down
+            // rather than left for the next reader to re-derive.
             return new Verdict(false, "not_configured",
                                "no configure frame acknowledged yet");
+        }
+        if (source != Source.OPERATOR && source != Source.CRAWLER) {
+            // UNATTRIBUTED, null, and anything a later constant adds. Written
+            // as "not one of the two I know" rather than as
+            // `source == Source.UNATTRIBUTED`, because the enum is CLOSED and
+            // a fourth constant added later would otherwise fall into
+            // whichever branch it was not named in -- and the operator branch
+            // is the one it would fall into.
+            //
+            // Two separating inputs, both in ProxyGateTest and both ALLOWED
+            // before this guard existed, measured: `POST /login` (no
+            // method_denied on the operator branch) and `GET /logout` (no
+            // dangerous_denied), each with source UNATTRIBUTED and again with
+            // a null. The control is that the same two requests are still
+            // allowed for Source.OPERATOR -- theOperatorIsNotMethodChecked and
+            // theOperatorIsNotDangerousPathChecked -- so what these pin is
+            // attribution, not the rules.
+            //
+            // The CLASS is `not_configured`, reusing S6's documented overload
+            // rather than minting a wire class from a call site that does not
+            // exist yet. The detail carries BridgeClient.EXTENSION_FAULT --
+            // the prefix records.py declares as its own constant, pinned
+            // byte-identical across the two languages by
+            // test_the_extension_fault_marker_is_the_same_string_on_both_sides
+            // -- because "this jar could not tell who was driving" is the same
+            // kind of thing as "this jar has no send handler" and not the same
+            // kind as "the operator never configured a run".
+            //
+            // A class of its own is Task 7's to settle when it wires the
+            // recording: a new class needs a row to go in
+            // (tests/test_records.py) and there is nothing to record from
+            // here yet. Worth knowing before minting one HERE, and it is not
+            // an argument for doing so: that test derives the class set by
+            // scanning for `Decision.deny("...")` and `error(f, "...")`, and
+            // this file's spelling is `new Verdict(false, "...")` -- which it
+            // does not scan, for this line or for the epoch-0 one above. A
+            // class introduced here would be invisible to the check that
+            // exists to catch a denial with nowhere to go.
+            return new Verdict(false, "not_configured",
+                               BridgeClient.EXTENSION_FAULT
+                               + "the proxy listener could not be attributed "
+                               + "to the operator or the crawler");
         }
         if (source == Source.CRAWLER) {
             // The agent's rules, in S4's pinned order, Gate included.
@@ -2069,6 +4277,7 @@ The bounded queue, and the frame that carries an exchange's two halves.
 package hx.proxy;
 
 import hx.TestSupport;
+import hx.bridge.BridgeClient;
 
 import java.util.*;
 import java.util.concurrent.*;
@@ -2077,8 +4286,8 @@ import java.util.concurrent.*;
  * The queue, and specifically the two things it must never do: block the
  * caller, and lose a record silently.
  *
- * Hand-rolled runner, like the other ten classes: JUnit would be a dependency,
- * and this jar has none.
+ * Hand-rolled runner, like the other eleven classes: JUnit would be a
+ * dependency, and this jar has none.
  */
 public class CaptureTest {
 
@@ -2113,12 +4322,37 @@ public class CaptureTest {
           CaptureTest::anUnattributedRecordIsRefusedAndCounted);
         t("the header says what the harness reads",
           CaptureTest::theHeaderCarriesWhatTheConsumerReads);
+        t("the outcome comes from the record, not from a literal",
+          CaptureTest::theOutcomeComesFromTheRecord);
         t("a sink that throws does not kill the drain thread",
           CaptureTest::aThrowingSinkDoesNotKillTheDrain);
         t("a drop report that throws does not kill it either",
           CaptureTest::aThrowingDropReportDoesNotKillTheDrain);
         t("the drain thread is a daemon", CaptureTest::theDrainIsADaemon);
-        t("stop() does not hang on a wedged sink", CaptureTest::stopDoesNotHang);
+        t("stop() does not hang on a wedged sink, and ends the drain",
+          CaptureTest::stopDoesNotHang);
+        t("stop() counts and reports what it throws away",
+          CaptureTest::stopFlushesWhatItThrowsAway);
+        t("an offer after stop() is counted, not swallowed",
+          CaptureTest::offerAfterStopIsCountedNotSwallowed);
+        t("offers racing stop() are every one of them accounted for",
+          CaptureTest::offersRacingStopAreAllAccountedFor);
+        t("stop() then start() does not re-report the cumulative count",
+          CaptureTest::stopThenStartDoesNotReReportTheCount);
+        t("start() twice leaves one drain and one report",
+          CaptureTest::startTwiceLeavesOneDrain);
+        t("an exchange the sink would not take is a drop",
+          CaptureTest::anUndeliveredExchangeIsCountedAsADrop);
+        t("a drop report that answers 'not delivered' is retried in full",
+          CaptureTest::aDropReportThatSaysNotDeliveredIsRetriedInFull);
+        t("a denial is a frame of its own, with the keys the consumer reads",
+          CaptureTest::aDenialIsItsOwnFrame);
+        t("a denial the sink would not take is a drop against ITS source",
+          CaptureTest::anUndeliveredDenialIsCountedAgainstItsOwnSource);
+        t("a denial with no spelling is refused, like an exchange with none",
+          CaptureTest::aDeniedRecordWithNoSpellingIsRefusedTheSameWay);
+        t("countLost is charged to the source it is given",
+          CaptureTest::countLostIsChargedToTheSourceItIsGiven);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -2131,30 +4365,51 @@ public class CaptureTest {
     }
 
     static Observed obs(int n, Source s) {
-        return new Observed("GET", "http://app.test/" + n, 200, 5L,
+        return new Observed("GET", "http://app.test/" + n, 200, "ok", 5L,
                             ("req" + n).getBytes(), ("resp" + n).getBytes(), s);
     }
 
-    static final class Recording implements Capture.ExchangeSink {
+    /** One refused request, as the proxy handler offers it. */
+    static Denied den(int n, Source s) {
+        return new Denied("POST", "http://app.test/refused/" + n,
+                          "scope_denied", "detail " + n, s);
+    }
+
+    static final class Recording implements BridgeClient.ExchangeSink {
         final List<String> seen = Collections.synchronizedList(new ArrayList<>());
         final List<Long> drops = Collections.synchronizedList(new ArrayList<>());
-        final List<Source> dropSources =
+        final List<String> dropSources =
                 Collections.synchronizedList(new ArrayList<>());
         final List<Map<String, Object>> headers =
+                Collections.synchronizedList(new ArrayList<>());
+        /** Denial frames, kept apart from {@link #headers} so a denial routed
+         *  through `exchange(...)` -- the naming lie this interface's third
+         *  method exists to prevent -- cannot satisfy a check about denials. */
+        final List<Map<String, Object>> denials =
                 Collections.synchronizedList(new ArrayList<>());
         volatile CountDownLatch gate;
         volatile boolean throwOnce;
         volatile boolean throwOnDropOnce;
+        volatile boolean refuseDenial;
+        /** RETURN false rather than throw -- the production sink's shape.
+         *  BridgeClient.exchangeSink catches its own IOException, so "the
+         *  sink threw" is the case that never happens on the wire and "the
+         *  sink returned without delivering" is the case that always does. */
+        volatile boolean refuseExchange;
+        volatile boolean refuseDropOnce;
 
-        public void exchange(Map<String, Object> h, byte[] req, byte[] resp) {
-            if (gate != null) { try { gate.await(); } catch (InterruptedException e) { return; } }
+        public boolean exchange(Map<String, Object> h, byte[] req, byte[] resp) {
+            if (gate != null) { try { gate.await(); } catch (InterruptedException e) { return false; } }
             if (throwOnce) { throwOnce = false; throw new RuntimeException("sink"); }
+            if (refuseExchange) return false;
             headers.add(new LinkedHashMap<>(h));
             seen.add(String.valueOf(h.get("url")));
+            return true;
         }
 
-        public void dropped(long n, Source s) {
+        public boolean dropped(long n, String s) {
             if (throwOnDropOnce) { throwOnDropOnce = false; throw new RuntimeException("drop"); }
+            if (refuseDropOnce) { refuseDropOnce = false; return false; }
             // Both lists appended under ONE monitor, and read back under the
             // same one: `reported()` pairs them by index, and two independent
             // synchronized lists let a reader see a count whose source has not
@@ -2163,6 +4418,13 @@ public class CaptureTest {
                 drops.add(n);
                 dropSources.add(s);
             }
+            return true;
+        }
+
+        public boolean denial(Map<String, Object> h) {
+            if (refuseDenial) return false;
+            denials.add(new LinkedHashMap<>(h));
+            return true;
         }
     }
 
@@ -2199,8 +4461,8 @@ public class CaptureTest {
      * finished filling. A leaked parked daemon costs nothing, because a daemon
      * cannot hold the JVM up after main() prints its summary.
      */
-    static void offerAll(Capture c, Observed... records) throws Exception {
-        Thread th = new Thread(() -> { for (Observed o : records) c.offer(o); });
+    static void offerAll(Capture c, Captured... records) throws Exception {
+        Thread th = new Thread(() -> { for (Captured o : records) c.offer(o); });
         th.setDaemon(true);
         th.start();
         th.join(OFFER_DEADLINE_MS);
@@ -2234,21 +4496,50 @@ public class CaptureTest {
         }
     }
 
-    /** Everything the sink was told was dropped, for one source. */
-    static long reported(Recording sink, Source s) {
+    /** Everything the sink was told was dropped, for one source -- named by
+     *  the spelling that crosses the bridge, `null` for a source that has
+     *  none. */
+    static long reported(Recording sink, String s) {
         long total = 0;
         synchronized (sink.drops) {
             for (int i = 0; i < sink.drops.size(); i++)
-                if (sink.dropSources.get(i) == s) total += sink.drops.get(i);
+                if (Objects.equals(sink.dropSources.get(i), s))
+                    total += sink.drops.get(i);
         }
         return total;
     }
 
-    /** The live drain, found by the name {@link Capture#start} gives it. */
+    /** Everything the sink was told was dropped, whatever the source. */
+    static long reportedTotal(Recording sink) {
+        long total = 0;
+        synchronized (sink.drops) {
+            for (Long n : sink.drops) total += n;
+        }
+        return total;
+    }
+
+    /**
+     * The live drain, found by the name {@link Capture#start} gives it.
+     *
+     * BY NAME, so it cannot tell a leaked drain from the live one -- which is
+     * why every assertion about a STOPPED drain below is made against a
+     * captured thread's IDENTITY (`!found.isAlive()`) and not against this.
+     * A test that leaks a wedged daemon hands the next one a thread that
+     * answers here; `stopDoesNotHang` used to be that test.
+     */
     static Thread drainThread() {
         for (Thread th : Thread.getAllStackTraces().keySet())
             if ("hx-capture".equals(th.getName())) return th;
         return null;
+    }
+
+    /** How many live threads carry that name. One is correct; two is a leak,
+     *  and drainThread() above cannot tell the difference. */
+    static int drainCount() {
+        int n = 0;
+        for (Thread th : Thread.getAllStackTraces().keySet())
+            if ("hx-capture".equals(th.getName()) && th.isAlive()) n++;
+        return n;
     }
 
     // ---- the tests ------------------------------------------------------
@@ -2370,9 +4661,9 @@ public class CaptureTest {
             // this half stays green under `take()`, and is kept as a pin on
             // the answer rather than dressed up as more than it is.
             offerAll(c, obs(3), obs(4), obs(5), obs(6), obs(7), obs(8));
-            waitUntil(() -> c.dropped() > 1 && reported(sink, Source.OPERATOR) > 0);
+            waitUntil(() -> c.dropped() > 1 && reported(sink, "operator") > 0);
             check("and an evicted record's drop is reported as well ("
-                  + sink.drops + ")", reported(sink, Source.OPERATOR) > 0);
+                  + sink.drops + ")", reported(sink, "operator") > 0);
         } finally { c.stop(); }
     }
 
@@ -2399,14 +4690,14 @@ public class CaptureTest {
               c.dropped() == 8);
         c.start();
         try {
-            waitUntil(() -> sink.dropSources.contains(Source.OPERATOR)
-                            && sink.dropSources.contains(Source.CRAWLER));
+            waitUntil(() -> sink.dropSources.contains("operator")
+                            && sink.dropSources.contains("crawler"));
             check("the operator's five were reported against the operator ("
-                  + reported(sink, Source.OPERATOR) + ")",
-                  reported(sink, Source.OPERATOR) == 5);
+                  + reported(sink, "operator") + ")",
+                  reported(sink, "operator") == 5);
             check("and the crawler's three against the crawler ("
-                  + reported(sink, Source.CRAWLER) + ")",
-                  reported(sink, Source.CRAWLER) == 3);
+                  + reported(sink, "crawler") + ")",
+                  reported(sink, "crawler") == 3);
         } finally { c.stop(); }
     }
 
@@ -2430,10 +4721,14 @@ public class CaptureTest {
             waitUntil(() -> !sink.drops.isEmpty());
             check("refused is not discarded: it was counted (" + c.dropped() + ")",
                   c.dropped() == 1);
-            check("and reported as UNATTRIBUTED, not as the operator ("
+            // A NULL source, not the operator's spelling. The sink now takes a
+            // String, so "no spelling" travels as null -- and null must not
+            // become "operator" on this side of the interface any more than it
+            // was allowed to on the other.
+            check("and reported with NO spelling, not as the operator ("
                   + sink.dropSources + ")",
-                  sink.dropSources.contains(Source.UNATTRIBUTED)
-                  && !sink.dropSources.contains(Source.OPERATOR));
+                  sink.dropSources.contains(null)
+                  && !sink.dropSources.contains("operator"));
             check("and sourceName has no spelling for it",
                   Capture.sourceName(Source.UNATTRIBUTED) == null);
         } finally { c.stop(); }
@@ -2448,8 +4743,8 @@ public class CaptureTest {
         Capture c = new Capture(8, sink);
         c.start();
         try {
-            offerAll(c, new Observed("POST", "http://app.test/login", 302, 41L,
-                                     "req".getBytes(), "resp".getBytes(),
+            offerAll(c, new Observed("POST", "http://app.test/login", 302, "ok",
+                                     41L, "req".getBytes(), "resp".getBytes(),
                                      Source.CRAWLER));
             waitUntil(() -> sink.headers.size() == 1);
             Map<String, Object> h = sink.headers.get(0);
@@ -2470,6 +4765,52 @@ public class CaptureTest {
                   Long.valueOf(41L).equals(h.get("ms")));
             check("outcome is in records.EXCHANGE_OUTCOMES (" + h.get("outcome") + ")",
                   "ok".equals(h.get("outcome")));
+        } finally { c.stop(); }
+    }
+
+    /**
+     * THE OUTCOME IS THE RECORD'S, NOT A LITERAL THIS CLASS WRITES.
+     *
+     * `deliverExchange` hardcoded `h.put("outcome", "ok")` -- the ONLY
+     * `outcome` write on the whole proxy path -- so every proxy exchange was
+     * filed healthy whatever its bytes said. The method above cannot see that:
+     * its fixture is a healthy 302, so `"ok"` is the right answer for the
+     * wrong reason and a hardcoded literal passes it.
+     *
+     * THE SEPARATING INPUT IS AN UNHEALTHY RECORD, and it is S5's shape:
+     * `status=599` with `outcome='status_unreadable'`, which is what
+     * {@link Recorder} produces for a `103 Early Hints` in front of a dead
+     * origin. With the literal back, this method reads `ok` on a 599 -- the
+     * pair `record_exchange`'s coherence guard exists to refuse, and the pair
+     * that hands S4's auto-halt a healthy sample for a failing request.
+     *
+     * The 599 goes on `status` too, so the two travel as one answer: S5 makes
+     * `status_unreadable` legal only beside 599, and a row carrying one
+     * without the other is refused on the far side rather than written wrong.
+     *
+     * WHAT THIS DOES NOT PIN: that the SCAN is right, or that it runs. This
+     * class builds the record by hand.
+     * `RecorderTest.theStatusIsScannedOutOfTheBytesWithItsOutcome` drives the
+     * scan over real bytes; between them the answer is computed from the bytes
+     * and carried to the wire unchanged.
+     */
+    static void theOutcomeComesFromTheRecord() throws Exception {
+        Recording sink = new Recording();
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, new Observed("GET", "http://app.test/slow", 599,
+                                     "status_unreadable", 12L,
+                                     "req".getBytes(), "resp".getBytes(),
+                                     Source.OPERATOR));
+            waitUntil(() -> sink.headers.size() == 1);
+            Map<String, Object> h = sink.headers.get(0);
+            check("an unreadable exchange is NOT filed as healthy ("
+                  + h.get("outcome") + ")",
+                  "status_unreadable".equals(h.get("outcome")));
+            check("and it carries the sentinel S5 pairs that outcome with ("
+                  + h.get("status") + ")",
+                  Long.valueOf(599L).equals(h.get("status")));
         } finally { c.stop(); }
     }
 
@@ -2529,27 +4870,427 @@ public class CaptureTest {
 
     static void stopDoesNotHang() throws Exception {
         Recording sink = new Recording();
-        sink.gate = new CountDownLatch(1);   // never released
+        sink.gate = new CountDownLatch(1);
         Capture c = new Capture(8, sink);
         c.start();
-        offerAll(c, obs(1));
-        // The drain has to be INSIDE the wedged sink before stop() is called.
-        // Without this the queue may still be undrained, stop() returns in
-        // microseconds, and the check passes against a drain that was never
-        // wedged at all -- a green that measures the scheduler.
-        waitUntil(() -> {
-            Thread d = drainThread();
-            // WAITING and not TIMED_WAITING: an untaken record leaves the
-            // drain in `queue.poll(POLL_MS, ...)`, which is TIMED_WAITING.
-            // Only the wedged sink's `gate.await()` is WAITING.
-            return d != null && d.getState() == Thread.State.WAITING;
-        });
-        long start = System.nanoTime();
+        Thread found;
+        try {
+            offerAll(c, obs(1));
+            // The drain has to be INSIDE the wedged sink before stop() is
+            // called. Without this the queue may still be undrained, stop()
+            // returns in microseconds, and the check passes against a drain
+            // that was never wedged at all -- a green that measures the
+            // scheduler.
+            waitUntil(() -> {
+                Thread d = drainThread();
+                // WAITING and not TIMED_WAITING: an untaken record leaves the
+                // drain in `queue.poll(POLL_MS, ...)`, which is TIMED_WAITING.
+                // Only the wedged sink's `gate.await()` is WAITING.
+                return d != null && d.getState() == Thread.State.WAITING;
+            });
+            found = drainThread();
+            long start = System.nanoTime();
+            c.stop();
+            long ms = (System.nanoTime() - start) / 1_000_000;
+            // Unloading the extension must not hang Burp. Same bound and same
+            // reason as HaltSwitch.STOP_JOIN_MS.
+            check("stop() returned in " + ms + " ms", ms < 4000);
+            // AND THE DRAIN IS GONE, which is the half `ms < 4000` cannot see:
+            // `join(STOP_JOIN_MS)` returns after two seconds whether or not
+            // the thread ever died, so deleting `t.interrupt()` from stop()
+            // left this class fully green -- 11 ALL PASS, 0 FAIL -- with one
+            // live `hx-capture` daemon per call, each polling a queue and
+            // calling into a torn-down BridgeClient. Inside Burp that is one
+            // per extension reload. Asserted on the CAPTURED thread rather
+            // than on drainThread(), which matches by name and so cannot tell
+            // a leak from the live one.
+            check("...and the drain thread is actually gone",
+                  found != null && !found.isAlive());
+        } finally {
+            // RELEASED, unlike the version this replaced. A gate left closed
+            // leaks a wedged daemon named `hx-capture` into every test that
+            // runs after it.
+            sink.gate.countDown();
+            c.stop();
+        }
+    }
+
+    // ---- what stop() throws away, and what a restart re-reports ----------
+
+    static void stopFlushesWhatItThrowsAway() throws Exception {
+        // MEASURED on the version this replaces: 200 records queued into a
+        // 512-slot Capture behind a slow sink, then stop() -- delivered=0,
+        // dropped()=0, reports=[]. Two hundred exchanges lost and counted as
+        // ZERO, on every extension unload and at the end of every run, with
+        // run.dropped_total still reading 0. S5 makes that number the reason
+        // a run's coverage is a floor; a floor of zero is a claim of
+        // completeness.
+        Recording sink = new Recording();
+        sink.gate = new CountDownLatch(1);   // the drain wedges on record 1
+        Capture c = new Capture(512, sink);
+        c.start();
+        try {
+            offerRange(c, 200);
+            // The drain has to be inside the wedged sink, or stop() may find
+            // an empty queue and this measures nothing.
+            waitUntil(() -> {
+                Thread d = drainThread();
+                return d != null && d.getState() == Thread.State.WAITING;
+            });
+            sink.gate.countDown();           // let stop()'s interrupt through
+            c.stop();
+            // THE PROPERTY, not the ordering. `c.dropped() == 200` was stable
+            // over forty sequential and twenty-four eight-way-parallel runs,
+            // and it still rests on stop()'s interrupt beating the
+            // gate.countDown() two lines up: lose that race and record 1 is
+            // DELIVERED instead, giving 199 counted of 200 with nothing at all
+            // wrong. What has to hold on both sides of it is that no record is
+            // NEITHER delivered nor counted -- and that at least one was
+            // counted, because an empty queue here would mean this test
+            // measured nothing.
+            check("every queued record was counted or delivered, none lost ("
+                  + sink.seen.size() + " delivered + " + c.dropped()
+                  + " counted, of 200)",
+                  sink.seen.size() + c.dropped() == 200 && c.dropped() >= 1);
+            check("and the count crossed the sink (" + reportedTotal(sink)
+                  + " reported, " + c.dropped() + " counted)",
+                  reportedTotal(sink) == c.dropped());
+        } finally { sink.gate.countDown(); c.stop(); }
+    }
+
+    static void offerAfterStopIsCountedNotSwallowed() throws Exception {
+        // MEASURED on the version this replaces: stop(); offer(one record);
+        // -- delivered=0, dropped()=0, reports=[]. offer() was gated on
+        // nothing, so the record went into a queue with no drain behind it and
+        // stayed there, counted nowhere.
+        //
+        // Not a corner case. Burp unloads the extension while proxy threads
+        // are still inside offer(), so those exchanges are lost AND
+        // run.dropped_total does not move -- S5's floor reading LOWER than the
+        // real loss, which is the one direction the counter exists to close.
+        Recording sink = new Recording();
+        Capture c = new Capture(512, sink);
+        c.start();
         c.stop();
-        long ms = (System.nanoTime() - start) / 1_000_000;
-        // Unloading the extension must not hang Burp. Same bound and same
-        // reason as HaltSwitch.STOP_JOIN_MS.
-        check("stop() returned in " + ms + " ms", ms < 4000);
+        c.offer(obs(1));
+        check("a record offered after stop() is counted (" + c.dropped()
+              + " of 1)", c.dropped() == 1);
+        check("...and was not delivered behind the operator's back (" + sink.seen + ")",
+              sink.seen.isEmpty());
+        // Nothing drains after stop(), so the count leaves on the NEXT stop().
+        // That is what "idempotent" means here and it is not "a no-op": a
+        // second call is how a loss during the unload reaches the far side.
+        c.stop();
+        check("...and the next stop() carries it across the sink ("
+              + reportedTotal(sink) + " reported against " + c.dropped()
+              + " counted)", reportedTotal(sink) == c.dropped());
+    }
+
+    static void offersRacingStopAreAllAccountedFor() throws Exception {
+        // The shape above with the timing it actually has: Burp calls stop()
+        // while proxy threads are INSIDE offer(). Nothing here pins which side
+        // of the race any one record lands on -- that is the point. What is
+        // pinned is the invariant that has to hold on both sides: every record
+        // offered either reached the sink or was counted as a drop, and never
+        // neither. Before the fix a record could be neither.
+        Recording sink = new Recording();
+        Capture c = new Capture(512, sink);
+        c.start();
+        int threads = 4, each = 200;
+        CountDownLatch go = new CountDownLatch(1);
+        List<Thread> offerers = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final int base = i * each;
+            Thread w = new Thread(() -> {
+                // Bounded, and a DAEMON: a worker that never releases would
+                // hold the JVM open after this class printed ALL PASS.
+                try {
+                    if (!go.await(5000, TimeUnit.MILLISECONDS)) return;
+                } catch (InterruptedException e) { return; }
+                for (int n = 0; n < each; n++) {
+                    c.offer(obs(base + n));
+                    // PACED, so the offers straddle stop() instead of all
+                    // landing before it. Unpaced, 800 offers are microseconds
+                    // of work and finish inside the 10 ms waitUntil poll
+                    // below -- and the test then passes on a Capture with the
+                    // bug, which is a green measuring the scheduler.
+                    try { Thread.sleep(1); } catch (InterruptedException e) { return; }
+                }
+            });
+            w.setDaemon(true);
+            offerers.add(w);
+            w.start();
+        }
+        try {
+            go.countDown();
+            // stop() has to land WHILE they are still offering, or this
+            // measures a scheduler that happened to finish first: 800 offers
+            // is several times what one drain empties in the time stop() takes,
+            // and one delivered record proves the offerers are running.
+            waitUntil(() -> !sink.seen.isEmpty());
+            c.stop();
+            for (Thread w : offerers)
+                TestSupport.join(w, 5000, "a proxy thread inside offer()");
+            // NO second stop() before the check. A second stop() drains the
+            // queue and counts it, so it makes this pass on a Capture that
+            // strands every post-stop offer -- measured, 11 ALL PASS with the
+            // bug still in. The accounting asserted here has to have been done
+            // by offer() itself.
+            int total = threads * each;
+            check("every record offered across a stop() is delivered or counted"
+                  + " (" + sink.seen.size() + " delivered + " + c.dropped()
+                  + " dropped, of " + total + ")",
+                  sink.seen.size() + c.dropped() == total);
+        } finally { c.stop(); }
+    }
+
+    static void stopThenStartDoesNotReReportTheCount() throws Exception {
+        // `reported[]` was a LOCAL in loop() and `dropped[]` a field, so every
+        // restart re-reported the whole cumulative total from zero. Measured:
+        // 3 real drops -> [3]; stop(); start(); -> [3, 3], SIX reported
+        // against three that happened. `count_drop` accumulates and only
+        // refuses n < 1, so the Python side cannot catch it: run.dropped_total
+        // inflates without bound across reconnects.
+        Recording sink = new Recording();
+        Capture c = new Capture(1, sink);
+        offerRange(c, 4);                              // 3 evicted
+        c.start();
+        try {
+            waitUntil(() -> reportedTotal(sink) == 3);
+            check("three drops, reported once (" + sink.drops + ")",
+                  reportedTotal(sink) == 3 && c.dropped() == 3);
+            c.stop();
+            c.start();
+            offerAll(c, obs(9));                       // wake the new drain
+            waitUntil(() -> sink.seen.contains("http://app.test/9"));
+            Thread.sleep(3 * POLL_SETTLE_MS);
+            check("the restart re-reported nothing (" + sink.drops
+                  + ", " + reportedTotal(sink) + " reported against "
+                  + c.dropped() + " counted)",
+                  reportedTotal(sink) == c.dropped());
+        } finally { c.stop(); }
+    }
+
+    static void startTwiceLeavesOneDrain() throws Exception {
+        // A leaked thread rather than an inflated count: the second start()
+        // overwrote `drain`, so stop() could never reach the first again -- N
+        // extension reloads, N live `hx-capture` daemons, each polling a queue
+        // and calling into a torn-down BridgeClient. Counted, not found by
+        // name: drainThread() matches on the name they all share, so it
+        // answers just as confidently with two of them alive.
+        Recording sink = new Recording();
+        Capture c = new Capture(4, sink);
+        c.start();
+        try {
+            waitUntil(() -> drainCount() == 1);
+            check("one drain to begin with (" + drainCount() + ")",
+                  drainCount() == 1);
+            c.start();                                 // the second call
+            Thread.sleep(3 * POLL_SETTLE_MS);
+            check("start() twice is still ONE drain (" + drainCount() + ")",
+                  drainCount() == 1);
+            offerAll(c, obs(1));
+            waitUntil(() -> sink.seen.contains("http://app.test/1"));
+            check("and that drain is the one still delivering (" + sink.seen + ")",
+                  sink.seen.contains("http://app.test/1"));
+        } finally { c.stop(); }
+    }
+
+    // ---- the sink says "not delivered" without throwing ------------------
+
+    /** Three drain cycles' worth of settling, for the checks that assert a
+     *  report did NOT happen. A negative needs a bound: nothing to wait for
+     *  means nothing waitUntil can watch. */
+    static final long POLL_SETTLE_MS = Capture.POLL_MS;
+
+    static void anUndeliveredExchangeIsCountedAsADrop() throws Exception {
+        // The third way a record is lost, and it used to touch no counter at
+        // all: a frame over MAX_FRAME -- a 64 MB download through the proxy --
+        // or a socket that died between two requests took
+        // `catch (Throwable) { log.error(...) }` and vanished. hx then reported
+        // complete coverage for a run that had lost them.
+        Recording sink = new Recording();
+        sink.refuseExchange = true;
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, obs(1), obs(2), obs(3));
+            waitUntil(() -> c.dropped() == 3);
+            check("a record the sink would not take is counted ("
+                  + c.dropped() + ")", c.dropped() == 3);
+            waitUntil(() -> reportedTotal(sink) == 3);
+            check("and reported, against its own source ("
+                  + sink.drops + " " + sink.dropSources + ")",
+                  reported(sink, "operator") == 3);
+            check("and nothing was recorded as delivered (" + sink.seen + ")",
+                  sink.seen.isEmpty());
+        } finally { c.stop(); }
+    }
+
+    static void aDropReportThatSaysNotDeliveredIsRetriedInFull() throws Exception {
+        // THE PRODUCTION SHAPE, and the one aThrowingDropReportDoesNotKillTheDrain
+        // could not reach. BridgeClient.exchangeSink catches its own
+        // IOException, logs and returns -- so the only sink that ever SIGNALLED
+        // failure was the test's, and against the real one the drain read a
+        // failed write as success and advanced `reported` past it. Scenario:
+        // the queue saturates while the Python harness restarts, 5,000 drops
+        // are counted, the write fails, one line lands in Burp's log, the
+        // bridge reconnects, and run.dropped_total reads 0.
+        Recording sink = new Recording();
+        sink.refuseDropOnce = true;
+        Capture c = new Capture(1, sink);
+        offerRange(c, 4);                             // 3 dropped
+        c.start();
+        try {
+            waitUntil(() -> !sink.drops.isEmpty());
+            check("the report that answered false was retried in full ("
+                  + sink.drops + ")", reportedTotal(sink) == 3);
+            offerAll(c, obs(9));
+            waitUntil(() -> sink.seen.contains("http://app.test/9"));
+            check("and the drain is still delivering exchanges (" + sink.seen + ")",
+                  sink.seen.contains("http://app.test/9"));
+        } finally { c.stop(); }
+    }
+
+    // ---- a denial is a record too ----------------------------------------
+
+    static void aDenialIsItsOwnFrame() throws Exception {
+        // `hx/capture.py`'s DENIAL arm reads `t`, `via`, `source`, `method`,
+        // `url`, `error_class` and `detail`, and it refuses an unknown `t`, an
+        // unknown `via` and a missing `url` -- each of which is a ValueError
+        // on the bridge's read thread and NO ROW AT ALL, counted as one more
+        // drop rather than recorded as the refusal it was.
+        //
+        // AND IT IS A DENIAL FRAME, not an exchange with two empty bodies.
+        // `server.py::_capture` splits two bodies out of an `exchange` and
+        // none out of a `denial`; a refusal routed through the exchange arm
+        // arrives as a malformed exchange and is dropped.
+        Recording sink = new Recording();
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, new Denied("POST", "http://app.test/account/delete",
+                                   "dangerous_denied",
+                                   "matches dangerous.path /account/delete",
+                                   Source.CRAWLER));
+            waitUntil(() -> sink.denials.size() == 1);
+            check("it went out as a DENIAL, not through the exchange arm ("
+                  + sink.denials.size() + " denials, " + sink.headers.size()
+                  + " exchanges)",
+                  sink.denials.size() == 1 && sink.headers.isEmpty());
+            Map<String, Object> h = sink.denials.get(0);
+            check("t is the frame type hx.capture.FRAME_TYPES names ("
+                  + h.get("t") + ")", "denial".equals(h.get("t")));
+            check("via is one of records.VIA_VALUES (" + h.get("via") + ")",
+                  "proxy".equals(h.get("via")));
+            check("source is the crawler's spelling (" + h.get("source") + ")",
+                  "crawler".equals(h.get("source")));
+            check("method survives (" + h.get("method") + ")",
+                  "POST".equals(h.get("method")));
+            check("url survives, and it has no default on the far side ("
+                  + h.get("url") + ")",
+                  "http://app.test/account/delete".equals(h.get("url")));
+            check("error_class is what records.row_for routes on ("
+                  + h.get("error_class") + ")",
+                  "dangerous_denied".equals(h.get("error_class")));
+            check("detail is what the operator reads (" + h.get("detail") + ")",
+                  "matches dangerous.path /account/delete".equals(h.get("detail")));
+            // NO EIGHTH KEY. An unknown key is IGNORED on the far side rather
+            // than refused, so a key added here with no reader there is a fact
+            // the operator never sees and a reason to believe it was recorded.
+            // Notably there is no `status`, no `ms` and no `outcome`: a
+            // request that never left has no answer for any of the three.
+            check("and no eighth key (" + h.keySet() + ")", h.size() == 7);
+        } finally { c.stop(); }
+    }
+
+    static void anUndeliveredDenialIsCountedAgainstItsOwnSource() throws Exception {
+        // The same rule as an undelivered exchange, and it needs its own test
+        // because it is served by its own arm of `deliver`: a denial that did
+        // not reach the wire is a record hx does not have, and a refusal hx
+        // recorded nowhere reads -- from the operator's side -- exactly like a
+        // request that was allowed.
+        Recording sink = new Recording();
+        sink.refuseDenial = true;
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, den(1, Source.CRAWLER), den(2, Source.CRAWLER));
+            waitUntil(() -> c.dropped() == 2);
+            check("a denial the sink would not take is counted ("
+                  + c.dropped() + ")", c.dropped() == 2);
+            waitUntil(() -> reported(sink, "crawler") == 2);
+            check("and reported against the crawler, whose refusals they were ("
+                  + sink.drops + " " + sink.dropSources + ")",
+                  reported(sink, "crawler") == 2
+                  && reported(sink, "operator") == 0);
+            check("and nothing was recorded as delivered (" + sink.denials + ")",
+                  sink.denials.isEmpty());
+        } finally { c.stop(); }
+    }
+
+    static void aDeniedRecordWithNoSpellingIsRefusedTheSameWay() throws Exception {
+        // THE REACHABLE ONE, and the reason Capture's offer() comment no
+        // longer says an unattributed record cannot arrive. ProxyGate refuses
+        // Source.UNATTRIBUTED -- that is exactly what it is for -- and the
+        // handler offers the refusal as a Denied carrying that same source. So
+        // this record is the one hx records as a DROP rather than as a denial
+        // row: `hx.capture._run` maps anything that is not "crawler" onto the
+        // operator's browse run, and filing a refusal nobody could attribute
+        // under the operator's own browsing is the failure UNATTRIBUTED exists
+        // to prevent. The bytes did not leave either way.
+        Recording sink = new Recording();
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, den(1, Source.UNATTRIBUTED), den(2, Source.OPERATOR));
+            waitUntil(() -> sink.denials.size() == 1);
+            Thread.sleep(50);
+            check("the attributed refusal was recorded (" + sink.denials.size() + ")",
+                  sink.denials.size() == 1
+                  && "http://app.test/refused/2".equals(sink.denials.get(0).get("url")));
+            check("and the unattributable one was not",
+                  c.dropped() == 1);
+            waitUntil(() -> !sink.drops.isEmpty());
+            check("it was reported with NO spelling, not as the operator ("
+                  + sink.dropSources + ")",
+                  sink.dropSources.contains(null)
+                  && !sink.dropSources.contains("operator"));
+        } finally { c.stop(); }
+    }
+
+    static void countLostIsChargedToTheSourceItIsGiven() throws Exception {
+        // Path 6: a record that never entered the queue at all. The response
+        // handler with no Pending entry has no start time and no attribution,
+        // so it counts the loss instead of recording an exchange with a
+        // guessed duration -- and it must be counted against the source the
+        // CALLER names, because the far side turns that string into a run
+        // KIND. A countLost that always charged the operator would file a
+        // crawler's losses on the operator's browse run.
+        Recording sink = new Recording();
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            c.countLost(Source.CRAWLER);
+            c.countLost(Source.CRAWLER);
+            c.countLost(Source.UNATTRIBUTED);
+            check("all three were counted (" + c.dropped() + ")", c.dropped() == 3);
+            waitUntil(() -> reported(sink, "crawler") == 2
+                            && reported(sink, null) == 1);
+            check("two against the crawler (" + reported(sink, "crawler") + ")",
+                  reported(sink, "crawler") == 2);
+            // The response handler's own miss is charged here: it is the one
+            // place the source is genuinely unknown, and a drop with no run
+            // attached beats a drop filed against a run that was picked.
+            check("and the unattributed one with no spelling at all ("
+                  + sink.dropSources + ")", reported(sink, null) == 1);
+            check("and none against the operator, who lost nothing ("
+                  + reported(sink, "operator") + ")",
+                  reported(sink, "operator") == 0);
+            check("and nothing was delivered as a record (" + sink.seen + " "
+                  + sink.denials + ")",
+                  sink.seen.isEmpty() && sink.denials.isEmpty());
+        } finally { c.stop(); }
     }
 }
 ```
@@ -2568,6 +5309,34 @@ package hx.proxy;
 /**
  * One observed exchange, REDACTED, on its way to the harness.
  *
+ * PACKAGE-PRIVATE, AND THAT IS THE WHOLE OF WHAT KEEPS ITS BYTES REDACTED.
+ * A text scan cannot bound construction: `new Observed(` missed
+ * `new hx.proxy.Observed(` and the widened `Observed(` missed `Observed::new`
+ * -- both measured green, both leaking -- and a third needle would miss a
+ * fourth spelling. The COMPILER bounds it instead: no code in another PACKAGE
+ * can name this type by any spelling, so the only code that can build one is
+ * code sitting next to {@link Recorder}, which is the class that redacts.
+ * `RecorderTest.theCompilerBoundsConstruction` reads the compiled modifiers,
+ * and adding `public` back here is the mutation that reopens it.
+ *
+ * WHAT PACKAGE-PRIVATE IS AND IS NOT. It is a COMPILE-TIME discipline over
+ * this source tree, not a JVM boundary: anything that declares itself
+ * {@code package hx.proxy;} gets in, which is precisely how `CaptureTest` and
+ * `RecorderTest` build these records. That is the right bound for the defect
+ * it closes -- someone in another package writing a fifth spelling of a
+ * construction -- and it is not a claim that the type is unreachable.
+ *
+ * `status` AND `outcome` TRAVEL TOGETHER AND ARE BOTH THE SCAN'S. S5 makes
+ * them one answer: `outcome='status_unreadable'` is legal only with
+ * `status=599`, and the pair is what stops an unreadable head being filed as a
+ * healthy sample. The proxy path shipped without the second half -- Montoya's
+ * `statusCode()` passed through raw and a hardcoded `"ok"` written in
+ * {@link Capture} -- so a `103 Early Hints` in front of a dead origin landed
+ * `status=103, outcome=ok`, which is the pair S5 measured thirty of and the
+ * one the send path needed five fix rounds to stop producing. Both fields are
+ * now filled by {@link Recorder} from `hx.send.Sender.scanStatus`, the SAME
+ * scan the send path uses, and there is no second implementation of it.
+ *
  * `request` and `response` are post-redaction bytes. That is not a
  * convention: S7 says the blob store is content-addressed, so a credential
  * that reaches the hashing step is already unrecoverable, and the hashing
@@ -2575,19 +5344,25 @@ package hx.proxy;
  * an Observed exists at all -- which is why the constructor takes bytes and
  * not a Montoya object.
  */
-public record Observed(String method, String url, int status, long ms,
-                       byte[] request, byte[] response, Source source) { }
+record Observed(String method, String url, int status, String outcome, long ms,
+                byte[] request, byte[] response, Source source)
+        implements Captured { }
 ```
 
 ```java
 // extension/src/hx/proxy/Capture.java
 package hx.proxy;
 
+import hx.bridge.BridgeClient;
+
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * The bounded queue between the proxy handler and the bridge.
@@ -2600,10 +5375,85 @@ import java.util.concurrent.atomic.AtomicLong;
  * on the client's application. That would turn a harness bug into an
  * incident.
  *
- * ITS CONVERSE: a drop is never silent. Every eviction is counted and the
- * count crosses the bridge, because S5 says a run with drops has coverage
- * numbers that are a FLOOR and nothing on the far side can know that unless
- * it is told.
+ * ITS CONVERSE: a drop is never silent. S5 says a run with drops has coverage
+ * numbers that are a FLOOR, and nothing on the far side can know that unless
+ * it is told. There are SIX ways a record hx might have had does not reach
+ * the far side, and each one increments {@link #dropped} for the record's own
+ * source:
+ *
+ *   1. EVICTION, when {@link #offer} finds the queue full;
+ *   2. REFUSAL, when a record's source has no spelling;
+ *   3. AN UNDELIVERED RECORD -- the sink threw, or answered false;
+ *   4. {@link #stop}, which throws away whatever is still queued;
+ *   5. AN OFFER THAT ARRIVES AT OR AFTER {@link #stop} -- Burp unloading the
+ *      extension while a proxy thread is still inside {@link #offer}. Such a
+ *      record lands in a queue with no drain behind it, so {@link #offer}
+ *      clears and counts the queue itself once it sees {@link #accepting}
+ *      go false.
+ *   6. A RECORD THAT NEVER ENTERED THE QUEUE AT ALL, counted through
+ *      {@link #countLost}. The queue is not the only place a record is lost:
+ *      the response handler that finds no {@link Pending} entry for a
+ *      response has an exchange it cannot describe -- no start time, so no
+ *      `ms`, and no attributed source -- and the honest answer is a drop
+ *      rather than a row with a guessed duration on it.
+ *
+ * They are ONE number, not six, because they are one fact: a record hx does
+ * not have. A frame over MAX_FRAME and a socket that died between two
+ * requests differ to whoever is debugging the bridge and not at all to
+ * whoever is reading the run's coverage.
+ *
+ * COUNTING THE INCREMENTS IS NOT A FALSIFIER, and this comment said it was.
+ * It read "`incrementAndGet` appears exactly four times, once per path; a
+ * fifth loss would need a fifth increment or would be a record leaving with
+ * none, and either is visible in one grep." Path 5 was neither: the record
+ * did not leave and nothing was incremented, it simply sat in the queue.
+ * Measured before it was closed -- `stop(); offer(one record);` gave
+ * `delivered=0, dropped()=0, reports=[]`, and 4 paced proxy threads offering
+ * 800 records across a `stop()` gave `4 delivered + 284 dropped of 800`, the
+ * missing 512 being exactly DEFAULT_CAPACITY sitting in a drainless queue.
+ *
+ * PATH 6 IS THE SAME LESSON A SECOND TIME, and it is why this paragraph is
+ * amended rather than left standing. Task 7 added TWO `incrementAndGet` sites
+ * to the four -- {@link #countLost} for path 6, and the denial arm of
+ * {@link #deliver} for path 3 -- so the retired grep would now answer "six
+ * sites, six paths" and LOOK right while meaning nothing. MEASURED, by
+ * reading them: the six sites are the refusal (path 2), the eviction (path 1),
+ * {@link #discardQueued} (paths 4 AND 5, one site for two), {@link #countLost}
+ * (path 6), and ONE PER FRAME ARM for path 3 (two sites for one). Two paths
+ * share a site and one path has two; that the totals agree is arithmetic, not
+ * structure. The count of increments has never matched the count of paths in
+ * any way a grep could check, and the moment it appears to is the moment it is
+ * most misleading.
+ *
+ * WHAT DOES PIN THE SIX is a count of EXITS, not of increments. A record
+ * enters this class through {@link #offer} or is counted without entering it
+ * through {@link #countLost}, and nowhere else; it leaves DELIVERED or as one
+ * of 1-6. Each of the first four increments was DELETED on
+ * its own and measured: refusal -> 3 FAIL, eviction -> 9, undelivered -> 3,
+ * discard -> 3, every one of them 11 summary lines with named FAIL lines, and
+ * none of them a silent green. `offers racing stop() are every one of them
+ * accounted for` is the test that holds when no single increment does: it
+ * asserts only that delivered + dropped is everything offered, which is the
+ * exits restated. {@link #countLost} is outside that identity by
+ * construction -- its record never entered the queue -- so it has a test of
+ * its own, `countLost is charged to the source it is given`, and that test is
+ * the whole of what holds it.
+ *
+ * WHAT IS NOT COVERED, and cannot be from inside this class: a JVM that dies
+ * without reaching {@link #stop} takes the queue with it uncounted, and so
+ * does one that exits while the drain is still parked in a wedged sink with a
+ * record in hand -- that record is counted when the sink finally answers, or
+ * never. Both are Burp dying, not hx losing a record quietly, and there is no
+ * code path left to run at that point.
+ *
+ * WHAT IS NOT CLAIMED HERE is that the count reaches the far side. It reaches
+ * it when {@link BridgeClient.ExchangeSink#dropped} SAYS it did, by answering
+ * true; a report that answers false leaves {@link #reported} where it was and
+ * the whole outstanding total goes out on the next attempt. That distinction
+ * is the entire point of the boolean: the production sink catches its own
+ * IOException, and before it answered, a write that failed advanced the
+ * counter anyway -- 5,000 drops became one line in Burp's log and
+ * `run.dropped_total = 0`. A log line is not the coverage floor.
  *
  * Oldest-first eviction, deliberately. The recent requests are the ones an
  * operator is currently looking at; the old ones are already reasoned about.
@@ -2619,11 +5469,6 @@ public final class Capture {
      * to overflow, it is not allowed to block, and every overflow is counted.
      */
     public static final int DEFAULT_CAPACITY = 512;
-
-    public interface ExchangeSink {
-        void exchange(Map<String, Object> header, byte[] request, byte[] response);
-        void dropped(long n, Source source);
-    }
 
     /** Same bound and same reason as HaltSwitch.STOP_JOIN_MS: unloading the
      *  extension must not hang Burp. */
@@ -2642,8 +5487,8 @@ public final class Capture {
      */
     static final long POLL_MS = 100L;
 
-    private final ArrayBlockingQueue<Observed> queue;
-    private final ExchangeSink sink;
+    private final ArrayBlockingQueue<Captured> queue;
+    private final BridgeClient.ExchangeSink sink;
 
     /**
      * Drops COUNTED PER SOURCE, because the report carries a source and the
@@ -2655,10 +5500,55 @@ public final class Capture {
      * coverage.
      */
     private final AtomicLong[] dropped = new AtomicLong[Source.values().length];
+
+    /**
+     * How much of {@link #dropped} the far side has ACKNOWLEDGED, per source.
+     *
+     * A FIELD, and it used to be a local in `loop()`. Measured with it local:
+     * three real drops reported `[OPERATOR:3]`, then `stop(); start();`
+     * reported `[OPERATOR:3, OPERATOR:3]` -- six reported against three that
+     * happened. `hx.capture` only refuses `n < 1` and `count_drop`
+     * ACCUMULATES, so nothing on the Python side can catch an inflated
+     * report: `run.dropped_total` climbs without bound across reconnects, and
+     * the number that exists to say "coverage is a floor" becomes a number
+     * that is wrong in the direction of alarm.
+     *
+     * Guarded by {@link #reportLock}, which is what lets {@link #stop} report
+     * the flush without racing a drain that outlived its join.
+     */
+    private final long[] reported = new long[Source.values().length];
+
+    /**
+     * Held across one whole reporting pass.
+     *
+     * `stop()` reports too, and a drain that did not die inside STOP_JOIN_MS
+     * is still reporting. Two passes over the same `reported[]` would each
+     * read the same outstanding total and each send it -- E3's bug with two
+     * threads instead of two runs. `stop()` takes it with `tryLock` and never
+     * waits: a drain wedged INSIDE the sink holds this, and a stop() that
+     * blocked on it would hang Burp's unload, which is the one thing
+     * STOP_JOIN_MS exists to prevent.
+     */
+    private final ReentrantLock reportLock = new ReentrantLock();
+
     private volatile Thread drain;
     private volatile boolean running;
 
-    public Capture(int capacity, ExchangeSink sink) {
+    /**
+     * Whether {@link #offer} still has a drain to offer INTO.
+     *
+     * True from construction and false from {@link #stop} until the next
+     * {@link #start}. {@link #running} cannot do this job, and that is not a
+     * naming quibble: `running` is also false BEFORE the first `start()`, and
+     * offering into a Capture that has not started yet is legitimate -- it is
+     * how `stopThenStartDoesNotReReportTheCount` fills the queue, and it is
+     * what the proxy handler does for any record that arrives between
+     * construction and the drain's first poll. Those records have a drain
+     * coming. A record offered after `stop()` does not.
+     */
+    private volatile boolean accepting = true;
+
+    public Capture(int capacity, BridgeClient.ExchangeSink sink) {
         this.queue = new ArrayBlockingQueue<>(capacity);
         this.sink = sink;
         for (int i = 0; i < dropped.length; i++) dropped[i] = new AtomicLong();
@@ -2682,6 +5572,11 @@ public final class Capture {
      * two explicit answers rather than `s == CRAWLER ? "crawler" : "operator"`,
      * so a constant added to {@link Source} later is a null here and a refused
      * record, not a silent promotion to the operator's run.
+     *
+     * It lives HERE, and the sink takes the STRING it produces. `hx.bridge`
+     * knowing how to spell an `hx.proxy` enum was a package cycle and a
+     * second place the decision could drift; a `null` crossing to the sink
+     * means "no spelling", and the sink's only job with it is to omit the key.
      */
     public static String sourceName(Source s) {
         if (s == Source.CRAWLER) return "crawler";
@@ -2697,13 +5592,32 @@ public final class Capture {
      * do, which is fail to forward the request.
      *
      * A record whose source has no spelling ({@link #sourceName}) is REFUSED
-     * here and counted as a drop. ProxyGate already refuses UNATTRIBUTED, so
-     * one should never arrive; if one does, recording it would file the
-     * request under a run kind nothing chose, and the request never left in
-     * the first place. Counted rather than discarded, because the count is
-     * the thing that says hx knows less than it might.
+     * here and counted as a drop, because recording it would file the request
+     * under a run kind nothing chose. Counted rather than discarded, because
+     * the count is the thing that says hx knows less than it might.
+     *
+     * ONE SUCH RECORD IS REACHABLE, and this comment used to say none was.
+     * It read "ProxyGate already refuses UNATTRIBUTED, so one should never
+     * arrive" -- true while the only thing offered here was an
+     * {@link Observed} from a request the gate had ALLOWED. Task 7 wired the
+     * refusals in as {@link Denied}, and the request the gate refuses BECAUSE
+     * it could not attribute the listener carries exactly that source. So the
+     * denial hx records for it is a DROP and not a `denial` row: the bytes
+     * still did not leave -- the handler answers `drop()` before this is
+     * reached -- and `run.dropped_total` moves instead of `denial`. Stated
+     * rather than fixed, because the alternative is `hx.capture._run` filing
+     * a refusal nobody could attribute under the operator's own browse run,
+     * which is the failure {@link Source#UNATTRIBUTED} exists to prevent.
+     * `aDeniedRecordWithNoSpellingIsRefusedTheSameWay` is what pins it.
+     *
+     * AND IT NOTICES A CAPTURE THAT HAS STOPPED UNDERNEATH IT. Burp unloads
+     * the extension on its own thread while proxy threads are still in here;
+     * without the check at the bottom those records queued into a drain that
+     * no longer existed, which lost them AND left `run.dropped_total` where
+     * it was -- the coverage floor reading lower than the real loss, which is
+     * the one direction it may never move.
      */
-    public void offer(Observed o) {
+    public void offer(Captured o) {
         if (sourceName(o.source()) == null) {
             dropped[o.source().ordinal()].incrementAndGet();
             return;
@@ -2712,12 +5626,71 @@ public final class Capture {
             // Evict the oldest and try again. `poll` returning null means
             // another thread drained it first, which is fine -- the retry
             // then succeeds.
-            Observed evicted = queue.poll();
+            Captured evicted = queue.poll();
             if (evicted != null) dropped[evicted.source().ordinal()].incrementAndGet();
         }
+        // AFTER the enqueue, not before, and that ordering is the whole
+        // guarantee. `accepting` is volatile and the queue has a lock of its
+        // own, so the two orderings cover each other: if this read sees TRUE
+        // it precedes stop()'s write of false, so the enqueue above precedes
+        // stop()'s drainTo and stop() counts the record; if it sees FALSE,
+        // stop() may already have drained past the record, so this thread
+        // clears the queue itself. A check BEFORE the enqueue would leave the
+        // window between the two open, which is precisely the window Burp's
+        // unload sits in.
+        if (!accepting) discardQueued();
     }
 
-    public void start() {
+    /**
+     * Count everything queued, and keep nothing.
+     *
+     * Called by {@link #stop}, and by an {@link #offer} that found the
+     * capture already stopped. NEVER by the drain: a record taken off the
+     * queue to be DELIVERED is {@link #deliver}'s business, and counting it
+     * here as well would report one loss twice.
+     */
+    private void discardQueued() {
+        List<Captured> left = new ArrayList<>();
+        queue.drainTo(left);
+        for (Captured o : left) dropped[o.source().ordinal()].incrementAndGet();
+    }
+
+    /**
+     * Count one record that never entered the queue. Path 6, and the only
+     * entry point here that is not {@link #offer}.
+     *
+     * The caller is the proxy RESPONSE handler with a response it cannot turn
+     * into a record: {@link Pending} had no entry for its message id, so
+     * there is no start time and no attributed source, and an exchange row
+     * with a guessed duration on it is fabricated evidence. It is also the
+     * response handler's answer to a redaction that threw -- the bytes are
+     * there and cannot be made safe to store, so the record is lost and says
+     * so.
+     *
+     * The source is the CALLER'S to choose and this method does not
+     * second-guess it: a miss is charged to {@link Source#UNATTRIBUTED},
+     * which has no spelling, so the report crosses the bridge with the
+     * `source` key OMITTED and lands on the operator's run the way
+     * `hx.capture` documents an absent source. A record whose run genuinely
+     * is not known must not invent one.
+     */
+    public void countLost(Source s) {
+        dropped[s.ordinal()].incrementAndGet();
+    }
+
+    /**
+     * Start the drain, or do nothing if it is already running.
+     *
+     * IDEMPOTENT, and that is not tidiness. Called twice, the previous
+     * version started a second `hx-capture` thread over the first -- two
+     * drains on one queue, and `drain` naming only the second, so `stop()`
+     * could never reach the first again. Inside Burp that is one leaked
+     * daemon per extension reload, each polling a queue and calling into a
+     * torn-down BridgeClient.
+     */
+    public synchronized void start() {
+        if (drain != null) return;
+        accepting = true;
         running = true;
         Thread t = new Thread(this::loop, "hx-capture");
         t.setDaemon(true);   // must never hold Burp open
@@ -2725,9 +5698,47 @@ public final class Capture {
         t.start();
     }
 
-    public void stop() {
+    /**
+     * Stop the drain, and account for what is still queued.
+     *
+     * THE FLUSH IS THE POINT. Measured on the previous version: 200 records
+     * queued into a 512-slot Capture behind a slow sink, then `stop()` --
+     * `delivered=0, dropped()=0, reports=[]`. Two hundred exchanges gone and
+     * counted as zero, on every extension unload and at the end of every run.
+     *
+     * The queue is COUNTED, not delivered. Delivering it would mean pushing
+     * up to DEFAULT_CAPACITY frames into a sink that may be exactly as wedged
+     * as the one that let the queue fill, on the thread Burp is unloading the
+     * extension on -- an unbounded wait where STOP_JOIN_MS is the bound. A
+     * record hx cannot pass on is a drop; saying so is the honest half, and
+     * it is the half S5 depends on.
+     *
+     * Idempotent, AND A SECOND CALL IS NOT ALWAYS A NO-OP. It finds no drain,
+     * but it finds whatever arrived after the first: a proxy thread inside
+     * {@link #offer} when Burp tore the extension down has counted its record
+     * (path 5) and had nothing left to report it through. The next `stop()`
+     * is what carries that count across the sink.
+     *
+     * TASK 7 SETTLED THAT THERE IS ONLY ONE, in the unloading handler that
+     * already closes the bridge, and the cost is written down rather than
+     * argued away: a record offered by a proxy thread that was inside
+     * {@link #offer} when Burp tore the extension down is COUNTED (path 5)
+     * and its count has nothing left to leave through -- the bridge is closed
+     * on the next line. A second call would race the first identically while
+     * the JVM is being torn down, and a record offered DURING `stop()` counts
+     * itself and is in the same position whichever call observes it. So the
+     * loss is real and bounded by however many proxy threads were mid-offer,
+     * and the honest statement is that this class's count is complete up to
+     * the unload and not through it.
+     */
+    public synchronized void stop() {
+        // FIRST, and before the drain is even asked to stop: from this write
+        // on, an offer() that lands in the queue is responsible for counting
+        // itself. See offer()'s closing comment for why that is enough.
+        accepting = false;
         running = false;
         Thread t = drain;
+        drain = null;
         if (t != null) {
             t.interrupt();
             try {
@@ -2736,48 +5747,136 @@ public final class Capture {
                 Thread.currentThread().interrupt();
             }
         }
-        drain = null;
+        discardQueued();
+        // tryLock, never lock: see reportLock. A drain wedged in the sink is
+        // holding it, and there is nothing to report through anyway.
+        if (reportLock.tryLock()) {
+            try {
+                reportOutstanding();
+            } finally {
+                reportLock.unlock();
+            }
+        }
     }
 
     private void loop() {
-        long[] reported = new long[dropped.length];
         while (running) {
-            Observed o;
+            Captured o;
             try {
                 o = queue.poll(POLL_MS, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 return;
             }
-            if (o != null) {
-                try {
-                    Map<String, Object> h = new LinkedHashMap<>();
-                    h.put("t", "exchange");
-                    h.put("via", "proxy");
-                    h.put("source", sourceName(o.source()));
-                    h.put("method", o.method());
-                    h.put("url", o.url());
-                    h.put("status", (long) o.status());
-                    h.put("ms", o.ms());
-                    h.put("outcome", "ok");
-                    sink.exchange(h, o.request(), o.response());
-                } catch (Throwable t) {
-                    // A sink that throws is someone else's code failing. Losing
-                    // this record is bad; losing every record after it because
-                    // the drain thread died is worse, and silent.
-                }
+            if (o != null) deliver(o);
+            reportLock.lock();
+            try {
+                reportOutstanding();
+            } finally {
+                reportLock.unlock();
             }
-            for (Source s : Source.values()) {
-                int i = s.ordinal();
-                long now = dropped[i].get();
-                if (now == reported[i]) continue;
-                try {
-                    sink.dropped(now - reported[i], s);
-                    reported[i] = now;
-                } catch (Throwable t) {
-                    // Same reasoning; the count is cumulative, so the next
-                    // successful report catches up.
-                }
+        }
+    }
+
+    /**
+     * One record to the sink, or one more drop.
+     *
+     * The switch is over a SEALED interface with no `default` arm, so a third
+     * kind of {@link Captured} is a compile error here rather than a record
+     * that reaches no arm and is silently delivered as nothing.
+     *
+     * TWO FRAME TYPES, TWO SINK METHODS, and the denial does NOT go through
+     * `exchange(...)` with two empty byte arrays. That method's name says
+     * what its frame is; a denial routed through it is a naming lie the next
+     * reader inherits, and `server.py::_capture` splits two bodies for an
+     * `exchange` and none for a `denial`.
+     */
+    private void deliver(Captured c) {
+        switch (c) {
+            case Observed o -> deliverExchange(o);
+            case Denied d -> deliverDenial(d);
+        }
+    }
+
+    private void deliverExchange(Observed o) {
+        boolean delivered;
+        try {
+            Map<String, Object> h = new LinkedHashMap<>();
+            h.put("t", "exchange");
+            h.put("via", "proxy");
+            h.put("source", sourceName(o.source()));
+            h.put("method", o.method());
+            h.put("url", o.url());
+            h.put("status", (long) o.status());
+            h.put("ms", o.ms());
+            // THE RECORD'S, NOT A LITERAL. This line read `"ok"` and was the
+            // only `outcome` write on the proxy path, so every proxy exchange
+            // was filed healthy whatever its bytes said -- including the
+            // `103 Early Hints` shape S5 measured thirty of. The answer is
+            // computed in Recorder by the SAME scan the send path uses, and
+            // arrives here already paired with the `status` above: S5 accepts
+            // `status_unreadable` only alongside 599, and Recorder is the one
+            // place that pairing is made.
+            h.put("outcome", o.outcome());
+            delivered = sink.exchange(h, o.request(), o.response());
+        } catch (Throwable t) {
+            // A sink that throws is someone else's code failing. Losing
+            // this record is bad; losing every record after it because
+            // the drain thread died is worse, and silent.
+            delivered = false;
+        }
+        if (!delivered) dropped[o.source().ordinal()].incrementAndGet();
+    }
+
+    /**
+     * A refusal, as the seven keys `hx.capture`'s denial arm reads.
+     *
+     * `t`, `via`, `source`, `method`, `url`, `error_class` and `detail`, and
+     * NO EIGHTH: an unknown key is not refused on the far side, it is
+     * ignored, so a key added here without a reader there is a fact the
+     * operator will never see and a reason to think it was recorded. There is
+     * no `status`, no `ms` and no `outcome`, because none of the three has an
+     * answer for a request that never left.
+     */
+    private void deliverDenial(Denied d) {
+        boolean delivered;
+        try {
+            Map<String, Object> h = new LinkedHashMap<>();
+            h.put("t", "denial");
+            h.put("via", "proxy");
+            h.put("source", sourceName(d.source()));
+            h.put("method", d.method());
+            h.put("url", d.url());
+            h.put("error_class", d.errorClass());
+            h.put("detail", d.detail());
+            delivered = sink.denial(h);
+        } catch (Throwable t) {
+            // Same reasoning as the exchange arm: a sink that throws is
+            // someone else's code failing, and killing the drain would lose
+            // every record after it, silently.
+            delivered = false;
+        }
+        if (!delivered) dropped[d.source().ordinal()].incrementAndGet();
+    }
+
+    /** Called with {@link #reportLock} held. */
+    private void reportOutstanding() {
+        for (Source s : Source.values()) {
+            int i = s.ordinal();
+            long now = dropped[i].get();
+            if (now == reported[i]) continue;
+            boolean told;
+            try {
+                told = sink.dropped(now - reported[i], sourceName(s));
+            } catch (Throwable t) {
+                // Same reasoning as deliver(): a sink that throws must not
+                // kill the drain.
+                told = false;
             }
+            // ONLY on an acknowledged report. The count is cumulative, so the
+            // next attempt carries the whole outstanding total -- and the
+            // previous version advanced on a sink that had merely RETURNED,
+            // which the production one does after logging its own IOException.
+            if (told) reported[i] = now;
         }
     }
 }
@@ -2955,16 +6054,37 @@ public sealed interface Captured permits Observed, Denied {
 // extension/src/hx/proxy/Denied.java
 package hx.proxy;
 
-/** One request this extension refused at S4's second enforcement point.
+/**
+ * One request this extension refused at S4's second enforcement point.
  *
- *  NO BODIES, deliberately. `bridge/server.py::_capture` reads `denial` and
- *  `dropped` as frames that "describe something that produced no traffic, so
- *  they arrive with an empty body" -- one body slot, not two -- and
- *  `capture.py`'s denial arm writes a `denial` row with no blobs. Carrying
- *  the refused request's bytes here would put a body on the wire nothing
- *  reads and S7 never cleared for the store. */
-public record Denied(String method, String url, String errorClass,
-                     String detail, Source source) implements Captured { }
+ * PACKAGE-PRIVATE, like {@link Observed}, and for the symmetry rather than
+ * for a leak of its own: a denial carries no bodies, so there is no redaction
+ * here to get wrong. Leaving ONE of the two {@link Captured} kinds
+ * constructible from outside the package would preserve exactly the shape the
+ * other one was closed for -- a second door -- and the symmetry costs two
+ * lines in {@link Recorder}.
+ *
+ * NO BODIES, deliberately. `bridge/server.py::_capture` reads `denial` and
+ * `dropped` as frames that "describe something that produced no traffic, so
+ * they arrive with an empty body" -- one body slot, not two -- and
+ * `capture.py`'s denial arm writes a `denial` row with no blobs. Carrying
+ * the refused request's bytes here would put a body on the wire nothing
+ * reads and S7 never cleared for the store.
+ *
+ * WHAT A Denied IS NOT: proof that a denial row exists on the far side. A
+ * Denied whose {@link Source} has no spelling is REFUSED by
+ * {@link Capture#offer} and counted as a drop instead -- which is exactly
+ * what happens to the request the gate refused BECAUSE it could not be
+ * attributed. That is the honest reading and not an oversight: the bytes
+ * still did not leave, and `hx.capture._run` would otherwise file the
+ * refusal under the operator's run, which is the one thing
+ * {@link Source#UNATTRIBUTED} exists to stop. CaptureTest's
+ * `anUnattributedRecordIsRefusedAndCounted` pins the refusal for an
+ * {@link Observed}; `aDeniedRecordWithNoSpellingIsRefusedTheSameWay` pins it
+ * for this type.
+ */
+record Denied(String method, String url, String errorClass,
+              String detail, Source source) implements Captured { }
 ```
 
 `Observed` gains `implements Captured` and nothing else — its `source()`
