@@ -2368,6 +2368,7 @@ git commit -m "feat(bridge): zero-dependency Java codec, tested against the shar
 
 ```python
 # tests/test_bridge_server.py
+import logging
 import os
 import socket
 import stat
@@ -4435,6 +4436,129 @@ def test_an_exchange_frame_with_no_sink_installed_keeps_the_channel(tmp_path, ha
         c.close()
     finally:
         s.stop()
+
+
+def _reject_next_peer(monkeypatch):
+    """Make SO_PEERCRED report a foreign uid, the way
+    `test_so_peercred_rejects_a_foreign_uid` does. A test cannot connect as
+    another account, and the branch worth covering is the one that only
+    another account can reach."""
+    real_getsockopt = socket.socket.getsockopt
+
+    def fake_getsockopt(self, level, optname, buflen=0):
+        if optname == socket.SO_PEERCRED:
+            return struct.pack("3i", 4242, os.getuid() + 1, os.getgid())
+        return real_getsockopt(self, level, optname, buflen)
+
+    monkeypatch.setattr(socket.socket, "getsockopt", fake_getsockopt)
+
+
+def test_a_refused_peer_is_counted_and_logged_rather_than_dropped_in_silence(
+        srv, monkeypatch, caplog):
+    """S6's uid check left NO TRACE, and it is the one connection event on
+    this socket that is a security event rather than a misconfiguration.
+
+    `rejected_hellos` sits four lines of code away and has been counted since
+    Plan 2 -- a wrong engagement_id, which is an operator pointing a harness
+    at the wrong store. Another UID on this machine reaching for a capability
+    that can send arbitrary HTTP into a client's production estate got a bare
+    `return`: no counter, no log line, no row. An attempt nobody can see is
+    indistinguishable from no attempt.
+
+    Both halves are asserted. The counter is what a caller can read; the log
+    line is what an operator sees at the time, and `hx` installs no handler,
+    so the LEVEL is load-bearing -- under Python's default configuration a
+    WARNING reaches lastResort on stderr and an INFO does not.
+    """
+    _reject_next_peer(monkeypatch)
+    before = srv.rejected_peers
+    with caplog.at_level(logging.WARNING, logger="hx.bridge.server"):
+        c = _client(srv.socket_path)
+        try:
+            hello = codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                  "pid": os.getpid(), "burp_version": "x",
+                                  "instance_id": "i-1", "engagement_id": "e-1"})
+            assert _never_served(c, hello) == b""
+            _await(lambda: srv.rejected_peers > before,
+                   "a peer was refused by SO_PEERCRED and nothing counted it")
+        finally:
+            c.close()
+
+    assert srv.rejected_peers == before + 1
+    assert srv.last_rejected_peer["uid"] == os.getuid() + 1
+    assert srv.last_rejected_peer["pid"] == 4242
+    assert "exe" in srv.last_rejected_peer
+
+    warnings_ = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings_, (
+        "the refusal was counted and not logged. The counter is read by "
+        "whoever thinks to look; the log line is what reaches an operator who "
+        "does not know to")
+    text = warnings_[-1].getMessage()
+    assert str(os.getuid() + 1) in text and "4242" in text, text
+
+
+def test_a_refused_peer_is_still_refused_and_none_of_this_serves_it(
+        srv, monkeypatch):
+    """The counter must not be the only thing that changed. A diagnostic that
+    also opened the door would be worse than no diagnostic, and the two
+    fields the uid check `return`s in front of are what say the connection was
+    REFUSED rather than merely quiet."""
+    _reject_next_peer(monkeypatch)
+    c = _client(srv.socket_path)
+    try:
+        assert _never_served(c, codec.encode(
+            {"v": 1, "t": "hello", "ext_version": "0.1", "pid": os.getpid(),
+             "burp_version": "x", "instance_id": "i-1",
+             "engagement_id": "e-1"})) == b""
+        _await(lambda: srv.rejected_peers == 1, "the refusal was not counted")
+        assert (srv.peer_uid, srv.peer_pid, srv.peer_exe) == (None, None, None)
+        assert srv.state == "waiting"
+        assert srv.hello is None
+    finally:
+        c.close()
+
+
+def test_the_accepted_peers_executable_is_resolved_and_recorded(srv):
+    """S6: "peer credentials are checked and the connecting pid's executable
+    is logged." Nothing resolved it, on either path. This is a real pid -- the
+    test's own -- so the readlink succeeds and the value is the interpreter
+    running this suite, which is what makes the assertion a real one rather
+    than a check that some string was stored."""
+    c = _connected(srv)
+    try:
+        assert srv.peer_pid == os.getpid()
+        assert srv.peer_exe == os.readlink(f"/proc/{os.getpid()}/exe")
+    finally:
+        c.close()
+
+
+def test_an_unresolvable_executable_says_which_kind_of_unresolvable(monkeypatch):
+    """`peer_exe` NEVER RAISES and never answers "unknown".
+
+    It runs inside `_serve` on the accept-loop thread, where a throw takes the
+    connection down -- and a diagnostic that can refuse a peer is not a
+    diagnostic. The three answers are also deliberately different strings: for
+    a peer running as ANOTHER uid, which is exactly the peer this exists to
+    describe, `/proc/<pid>/exe` needs PTRACE_MODE_READ and the kernel refuses
+    it unless hx is root. "unknown" would read as "no executable" rather than
+    "not permitted to look", and the difference is the whole diagnostic.
+    """
+    def raiser(exc):
+        def go(_path):
+            raise exc
+        return go
+
+    monkeypatch.setattr(server.os, "readlink", raiser(PermissionError(13, "x")))
+    assert "permission denied" in server.peer_exe(1).lower()
+    monkeypatch.setattr(server.os, "readlink", raiser(FileNotFoundError(2, "x")))
+    assert "gone" in server.peer_exe(1)
+    monkeypatch.setattr(server.os, "readlink", raiser(OSError(5, "EIO")))
+    assert server.peer_exe(1).startswith("<unreadable:")
+    # A pid this process cannot possibly be resolving, through the REAL
+    # readlink: the answer is still a string and still not an exception.
+    monkeypatch.undo()
+    assert isinstance(server.peer_exe(0x7FFFFFFF), str)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -4458,6 +4582,7 @@ unconfigured until a configure frame is acknowledged.
 """
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import socket
@@ -4467,6 +4592,46 @@ import time
 from pathlib import Path
 
 from hx.bridge import codec
+
+# The first logger in `src/`, and it is deliberately a plain module logger with
+# no handler and no configuration: a library that installs a handler decides
+# for its embedder where the operator's diagnostics go. `hx` has no logging
+# setup yet, so under Python's default these records reach lastResort at
+# WARNING -- which is the level the refusal below uses, and is why the refusal
+# is visible on a bare `python -c` while the accept is not.
+_log = logging.getLogger(__name__)
+
+
+def peer_exe(pid: int) -> str:
+    """What `/proc/<pid>/exe` points at, or why it could not be read. S6.
+
+    A DIAGNOSTIC, NEVER A CHECK, and the distinction is the whole reason this
+    is a separate function with a docstring rather than an inline readlink.
+    Between the `getsockopt` that produced this pid and this call, the peer
+    can have exited and the pid can have been reused -- so the answer names a
+    process that may not be the one that connected. S6 says the executable is
+    LOGGED and says the credentials are CHECKED, and those are two different
+    sentences about two different facts: the uid is what authorises, and this
+    is what a human reads afterwards.
+    """
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except PermissionError:
+        # THE COMMON CASE FOR THE PATH THAT MATTERS, and it is stated rather
+        # than pretended around. Reading this link needs PTRACE_MODE_READ, so
+        # for a peer running as ANOTHER uid -- exactly the peer this is most
+        # worth knowing about -- the kernel refuses it unless hx is root. The
+        # uid, the pid and the refusal itself are still recorded; the program
+        # name is the part that is not available, and saying "unknown" would
+        # read as "no executable" rather than "not permitted to look".
+        return "<unreadable: permission denied (needs PTRACE_MODE_READ)>"
+    except FileNotFoundError:
+        return "<gone: the process exited before it could be resolved>"
+    except OSError as exc:
+        # Never raises. This runs inside `_serve`, on the accept-loop thread,
+        # where a throw would take the connection down -- and a diagnostic
+        # that can refuse a peer is not a diagnostic.
+        return f"<unreadable: {exc}>"
 
 
 class BridgeError(Exception):
@@ -4624,8 +4789,19 @@ class BridgeServer:
         self.config_epoch = 0
         self.peer_uid: int | None = None
         self.peer_pid: int | None = None
+        self.peer_exe: str | None = None
         self.hello: dict | None = None
         self.rejected_hellos = 0
+        # Peers refused by SO_PEERCRED, i.e. another UID on this machine
+        # reaching for this socket. It sits beside `rejected_hellos`
+        # deliberately: the two are the same kind of number and one of them
+        # existed while the other -- the one that is a security event rather
+        # than a misconfiguration -- did not.
+        self.rejected_peers = 0
+        # The last one, for whoever is looking. Kept rather than only logged,
+        # because `hx` installs no logging handler and a library that did
+        # would be deciding for its embedder where diagnostics go.
+        self.last_rejected_peer: dict | None = None
 
         self._srv: socket.socket | None = None
         self._conn: socket.socket | None = None
@@ -4722,8 +4898,33 @@ class BridgeServer:
             if uid != os.getuid():
                 # The socket authenticates a uid, not a program; a different
                 # uid has no business here at all.
+                #
+                # COUNTED AND LOGGED, and it used to be a bare `return`. This
+                # is the one security-relevant connection event on this socket
+                # -- another account on this machine reaching for a capability
+                # that can send arbitrary HTTP into a client's production
+                # estate -- and it left no counter, no log line and no row, in
+                # contrast with `rejected_hellos` four lines of code away. An
+                # attempt nobody can see is indistinguishable from no attempt,
+                # and the refusal is exactly the thing worth knowing happened.
+                self.rejected_peers += 1
+                self.last_rejected_peer = {"pid": pid, "uid": uid,
+                                           "exe": peer_exe(pid)}
+                _log.warning(
+                    "hx bridge: refused a peer on %s -- uid %d is not %d "
+                    "(pid %d, exe %s). The socket authenticates a UID; a "
+                    "different one has no business here at all.",
+                    self.socket_path, uid, os.getuid(), pid, peer_exe(pid))
                 return
             self.peer_pid, self.peer_uid = pid, uid
+            # S6: "peer credentials are checked and the connecting pid's
+            # executable is LOGGED". Nothing resolved it, so the second half
+            # of that sentence was unmet on the path that succeeds as well as
+            # on the one that refuses. It is a diagnostic and never a check --
+            # see `peer_exe` for why it cannot be one.
+            self.peer_exe = peer_exe(pid)
+            _log.info("hx bridge: peer accepted on %s -- uid %d, pid %d, "
+                      "exe %s", self.socket_path, uid, pid, self.peer_exe)
 
             reader = codec.FrameReader(conn)
             while not self._stopping.is_set():

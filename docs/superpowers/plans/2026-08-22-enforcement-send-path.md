@@ -9996,6 +9996,20 @@ public class RedactorTest {
           RedactorTest::anAbsoluteFormRequestLineIsNotMatchedAsAField);
         t("redactObservedRequestRefusesNullBytes",
           RedactorTest::redactObservedRequestRefusesNullBytes);
+        t("theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem",
+          RedactorTest::theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem);
+        t("aUserinfoCredentialNeverReachesTheBlobStore",
+          RedactorTest::aUserinfoCredentialNeverReachesTheBlobStore);
+        t("twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob);
+        t("onlyTheFirstHeadLineIsATarget",
+          RedactorTest::onlyTheFirstHeadLineIsATarget);
+        t("aCredentialFirstLineIsStillRedactedAsAField",
+          RedactorTest::aCredentialFirstLineIsStillRedactedAsAField);
+        t("theRequestBodyIsNeverRewrittenByJobFive",
+          RedactorTest::theRequestBodyIsNeverRewrittenByJobFive);
+        t("aCredentialInTheQUERYIsNamedAsNotCovered",
+          RedactorTest::aCredentialInTheQueryIsNamedAsNotCovered);
         t("theEmptyInjectedPathIsWhyJobFourExists",
           RedactorTest::theEmptyInjectedPathIsWhyJobFourExists);
 
@@ -10978,6 +10992,168 @@ public class RedactorTest {
                      () -> r.redactObservedRequest(null));
     }
 
+    // ---- job 5: the request TARGET ---------------------------------------
+
+    static final String USERINFO_VECTORS = "userinfo.txt";
+
+    /** The shared vector file, as (input, expected) pairs. Same file the
+     *  Python side reads; see its header for the format and for why one file
+     *  rather than two lists. */
+    static List<String[]> userinfoVectors() throws Exception {
+        java.nio.file.Path p = java.nio.file.Path.of(
+                "..", "tests", "vectors", USERINFO_VECTORS);
+        List<String[]> out = new ArrayList<>();
+        for (String line : java.nio.file.Files.readAllLines(
+                p, StandardCharsets.UTF_8)) {
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            int tab = line.indexOf('\t');
+            if (tab < 0)
+                throw new IllegalArgumentException(
+                        "vector line with no tab: " + line);
+            out.add(new String[] { line.substring(0, tab), line.substring(tab + 1) });
+        }
+        return out;
+    }
+
+    /**
+     * THE ONE PLACE THE TWO IMPLEMENTATIONS ARE COMPARED. `redactObservedRequest`
+     * here and `hx.store.records.redact_url` there are the same RFC 3986 rule
+     * written twice, in two languages, on two sides of a bridge -- which is
+     * exactly the shape `tests/test_vocabularies_match_the_schema.py` exists
+     * to refuse. Neither side restates the cases; both read this file.
+     */
+    static void theSharedUserinfoVectorsAreRedactedTheSameWayPythonRedactsThem()
+            throws Exception {
+        Redactor r = new Redactor();
+        List<String[]> vectors = userinfoVectors();
+        // Anti-vacuity. A reader that found no file, or a format change that
+        // made every line a comment, would leave the loop below asserting
+        // nothing at all and printing ALL PASS.
+        check("the shared vector file was read (" + vectors.size() + " cases)",
+              vectors.size() >= 20);
+        boolean sawARedaction = false;
+        for (String[] v : vectors) {
+            String line = "GET " + v[0] + " HTTP/1.1\r\n";
+            String want = "GET " + v[1] + " HTTP/1.1\r\n";
+            String got = text(r.redactObservedRequest(
+                    bytes(line + "Host: app.example.test\r\n\r\n")));
+            check("target " + v[0] + " -> " + v[1]
+                  + " (got " + got.split("\r\n")[0] + ")",
+                  got.startsWith(want));
+            if (!v[0].equals(v[1])) sawARedaction = true;
+        }
+        // The second half of the anti-vacuity check: a file whose every case
+        // is a no-op would pass the loop above with job 5 deleted.
+        check("...and at least one of them is a case job 5 actually changes",
+              sawARedaction);
+    }
+
+    static void aUserinfoCredentialNeverReachesTheBlobStore() {
+        // THE MEASURED FINDING. `http://user:pass@host/` survived verbatim
+        // into a content-addressed blob store, which S7 calls the one item
+        // that cannot be retrofitted -- once written it is in every backup.
+        Redactor r = new Redactor();
+        String secret = "s3cret-live-password";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET http://alice:" + secret + "@app.example.test/orders HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("the password is gone from the copy that crosses the bridge",
+              !out.contains(secret));
+        check("and so is the username, which can BE the token",
+              !out.contains("alice"));
+        check("the placeholder and the @ are what is left ("
+              + out.split("\r\n")[0] + ")",
+              out.startsWith("GET http://{{observed:userinfo}}@app.example.test"
+                             + "/orders HTTP/1.1\r\n"));
+        check("everything after the authority is verbatim",
+              out.contains("/orders HTTP/1.1\r\nHost: app.example.test\r\n\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob() throws Exception {
+        // Job 4's determinism constraint, restated for job 5 because it is the
+        // constraint a fix here is most likely to break: anything that carried
+        // a function of the credential -- a length, a hash, the username --
+        // would give one page browsed under two logins two digests and two
+        // stored copies.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(bytes(
+                "GET http://alice:s3cret@app.example.test/ HTTP/1.1\r\n\r\n"));
+        byte[] b = r.redactObservedRequest(bytes(
+                "GET http://bob:hunter2@app.example.test/ HTTP/1.1\r\n\r\n"));
+        check("two logins, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        check("the inputs genuinely differed", !Arrays.equals(
+                bytes("GET http://alice:s3cret@app.example.test/ HTTP/1.1\r\n\r\n"),
+                bytes("GET http://bob:hunter2@app.example.test/ HTTP/1.1\r\n\r\n")));
+    }
+
+    static void onlyTheFirstHeadLineIsATarget() {
+        // NAMED AS NOT COVERED in redactObservedRequest's javadoc, and pinned
+        // here so the sentence is a measurement rather than a claim. A URI in
+        // a FIELD VALUE keeps its userinfo: job 5 runs on one line, and
+        // running it over arbitrary field text would be the shape rule this
+        // class refuses everywhere else.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /orders HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "Referer: http://user:pass@app.example.test/login\r\n\r\n")));
+        check("the request line has no userinfo to take",
+              out.startsWith("GET /orders HTTP/1.1\r\n"));
+        check("and a Referer's userinfo is left RAW -- the named exclusion",
+              out.contains("Referer: http://user:pass@app.example.test/login"));
+    }
+
+    static void aCredentialFirstLineIsStillRedactedAsAField() {
+        // The interaction between job 4 and job 5. A malformed message whose
+        // FIRST line is a credential field must still be redacted as a field:
+        // job 5 takes the first line, and taking it must not mean skipping the
+        // credential match. Deleting `isFirstLine`'s guard the other way --
+        // running job 5 INSTEAD of the field match -- is what this catches.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a credential on the first line is still redacted (" + out.split("\r\n")[0] + ")",
+              !out.contains(COOKIE_SECRET));
+        check("...as job 4's placeholder, not job 5's",
+              out.startsWith("Cookie: {{observed:cookie}}\r\n"));
+    }
+
+    static void theRequestBodyIsNeverRewrittenByJobFive() {
+        // Job 4's rule, which job 5 inherits by sitting inside the same head
+        // scan: a body may legitimately carry a URI with a userinfo in it -- a
+        // documentation page, an API error dump, a captured request pasted
+        // into a form -- and rewriting it corrupts the evidence a check reads.
+        Redactor r = new Redactor();
+        String body = "curl http://user:pass@internal.example.test/ failed";
+        String out = text(r.redactObservedRequest(bytes(
+                "POST /report HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "Content-Length: " + body.length() + "\r\n\r\n" + body)));
+        check("a URI in the body keeps its userinfo verbatim",
+              out.endsWith(body));
+    }
+
+    static void aCredentialInTheQueryIsNamedAsNotCovered() {
+        // THE HALF THIS DOES NOT CLOSE, pinned as a fact rather than left as
+        // an assumption. `?access_token=` reaches the blob store verbatim. It
+        // is not covered because both available mechanisms are worse than the
+        // leak: a list of parameter names is a vocabulary that drifts silently
+        // toward storing a credential, and a shape rule rewrites `?id=5` and
+        // corrupts the evidence an access-control check reads. If this check
+        // ever goes RED, someone has made that decision -- and it should be a
+        // decision, not a side effect.
+        Redactor r = new Redactor();
+        String token = "eyJhbGciOiJIUzI1NiJ9.live.9f2c";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /cb?access_token=" + token + " HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a bearer token in the query is NOT redacted -- job 5 reaches "
+              + "the userinfo and stops there", out.contains(token));
+    }
+
     static void theEmptyInjectedPathIsWhyJobFourExists() {
         // THE FINDING, kept as a test so it cannot come back quietly. This is
         // not a complaint about redactRequest -- an empty Injected returning
@@ -11127,6 +11303,29 @@ import java.util.Map;
  *     path violated that constraint as well as leaking, because the raw
  *     credential bytes WERE the difference between the two blobs.
  *
+ *  5. WHAT THE TARGET CARRIES. A credential does not have to be in a header.
+ *     {@code GET http://user:pass@app.test/ HTTP/1.1} puts one in the request
+ *     LINE, which jobs 1-4 do not touch: job 1 has no range, job 2 looks only
+ *     at header names, and jobs 3 and 4 match a field name before a colon.
+ *     Measured surviving verbatim into a content-addressed blob store, which
+ *     is the one place S7 says a credential can never be taken back out of.
+ *
+ *     ONLY THE USERINFO, and only because RFC 3986 3.2.1 says exactly where
+ *     it lives: {@code authority = [ userinfo "@" ] host [ ":" port ]}, and
+ *     {@code @} is a gen-delim that no host and no port may contain. So an
+ *     {@code @} inside an authority IS the userinfo delimiter -- a structural
+ *     fact, not a guess about what a string looks like. The userinfo is
+ *     replaced whole with {@link #OBSERVED_USERINFO} and the {@code @} kept,
+ *     by {@link #redactTarget}.
+ *
+ *     A CREDENTIAL IN A QUERY PARAMETER IS NOT COVERED, and that is the
+ *     deliberate half. {@code ?access_token=...} needs either a list of
+ *     parameter names -- a vocabulary that drifts, silently, in the direction
+ *     of storing a credential -- or a rule that redacts by SHAPE, which
+ *     rewrites {@code ?id=5} and corrupts the evidence a check reads. Both
+ *     are worse than saying so. See {@link #redactObservedRequest}'s
+ *     "WHAT THIS EXCLUDES" for the full list of what is left raw.
+ *
  * Redaction runs BEFORE hashing. The blob store is content-addressed: the
  * digest names the bytes it was computed over, so hashing raw bytes and
  * redacting afterwards stores the raw ones under their own digest.
@@ -11190,6 +11389,27 @@ public final class Redactor {
                      .getBytes(StandardCharsets.US_ASCII);
         return out;
     }
+
+    /**
+     * Job 5's placeholder, replacing a request target's userinfo whole.
+     *
+     * FIXED, for job 4's reason exactly: the blob store is content-addressed,
+     * so two browses of one page under two basic-auth users must hash to one
+     * blob. What that costs is stated rather than hidden -- WHICH user is
+     * lost, because it is a fixed string and not `{{observed:userinfo:<user>}}`.
+     * The username half of a userinfo is not reliably a name: RFC 3986 3.2.1
+     * deprecates the `user:password` form and says nothing requires a colon at
+     * all, and `https://ghp_livetoken@host/` is the commonest real shape --
+     * keeping "the part before the colon" would store that token verbatim.
+     * So the whole subcomponent goes, and the identity of the user is a thing
+     * this placeholder does not carry.
+     *
+     * NOT DERIVED from {@link #CREDENTIAL_HEADERS} like {@link #OBSERVED_CREDENTIAL}
+     * is: this one names a URI subcomponent, not a header, so there is no
+     * entry there it could be paired with.
+     */
+    private static final byte[] OBSERVED_USERINFO =
+        "{{observed:userinfo}}".getBytes(StandardCharsets.US_ASCII);
 
     /** RFC 9112 2.3: the HTTP-name is case-SENSITIVE, so this is a byte match. */
     private static final byte[] HTTP_NAME = "HTTP/".getBytes(StandardCharsets.US_ASCII);
@@ -11442,8 +11662,10 @@ public final class Redactor {
      * header (per RFC that text is the other header's value), a field name
      * split across a fold, and a pipelined second request.
      *
-     * NO REQUEST LINE IS RECOGNISED, and that is deliberate rather than an
-     * omission. {@link #redactResponse} has to know its status line, because
+     * NO REQUEST LINE IS RECOGNISED AS A LINE, and that is deliberate rather
+     * than an omission -- job 5 below privileges no line either, it only
+     * rewrites a URI's userinfo wherever one appears in the FIRST head line.
+     * {@link #redactResponse} has to know its status line, because
      * taking the first non-empty line for one whatever it says would let a
      * head whose first field is Set-Cookie have that cookie consumed as the
      * status line and copied through raw. Here no line is privileged: every
@@ -11458,11 +11680,35 @@ public final class Redactor {
      * {@code Cookie: x} is redacted, which is the safe direction and the same
      * answer this method gives that line anywhere else in the head.
      *
+     * THE FIRST HEAD LINE ALSO GOES THROUGH {@link #redactTarget}, which is
+     * job 5. It rewrites the userinfo of a URI appearing in that line and
+     * NOTHING else -- no name is matched, no line is consumed as anything, and
+     * a line with no {@code ://} in it is written through byte for byte. It
+     * runs on the first head line whatever that line turns out to be, so a
+     * malformed message whose first line is a credential FIELD is redacted as
+     * a field (above) and never reaches job 5; the flag is set for it all the
+     * same, because the line after the first is not a request line either.
+     *
      * WHAT THIS EXCLUDES, named rather than left to be discovered:
      *
-     *   - a credential in the request LINE -- {@code /login?token=...} -- and
-     *     in the body. Neither is touched here. The url is a separate exposure
-     *     with a separate column and is a whole-branch item, not this one's;
+     *   - A CREDENTIAL IN A QUERY PARAMETER. {@code /cb?access_token=...},
+     *     {@code ?api_key=}, {@code ?sig=}, a signed URL's signature, a
+     *     password reset token. Job 5 reaches the userinfo and stops there.
+     *     Closing this needs a decision nothing in this class can make: a
+     *     LIST of parameter names is a vocabulary that drifts silently toward
+     *     storing a credential, and a SHAPE rule rewrites {@code ?id=5} and
+     *     corrupts the evidence an access-control check reads. It is a leak
+     *     and it is named as one.
+     *   - A CREDENTIAL IN THE BODY. A login POST's password is in the body
+     *     and stays there, verbatim. S7 keeps payload and request structure
+     *     verbatim on purpose -- "evidence remains defensible" -- and nothing
+     *     here distinguishes a form field from a form field.
+     *   - USERINFO IN A HEADER VALUE: {@code Referer: http://u:p@host/},
+     *     {@code Origin}, a URI inside a custom header. Job 5 runs on the
+     *     first head line only. Running it over every field value would
+     *     rewrite arbitrary text that merely contains {@code ://} and an
+     *     {@code @}, which is the shape rule this class refuses everywhere
+     *     else.
      *   - a credential in a header this list does not name: {@code X-Api-Key},
      *     {@code X-Auth-Token}, a bearer token in a custom header. §6 names
      *     three and {@link #CREDENTIAL_HEADERS} is those three. A fourth name
@@ -11487,6 +11733,11 @@ public final class Redactor {
         ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
         int i = 0;
         boolean first = true;        // no line of the head has been read yet
+        // Whether the first line of the head has been WRITTEN. `first` cannot
+        // do this job: it is cleared for the fold and credential branches too,
+        // and it is read before those decide anything, so the one line job 5
+        // may touch has to be tracked on its own.
+        boolean targetDone = false;
         int credential = -1;         // index into CREDENTIAL_HEADERS, or -1
         while (i < raw.length) {
             int next = lineStartAfter(raw, i);      // start of the following line
@@ -11507,6 +11758,11 @@ public final class Redactor {
                 return out.toByteArray();
             }
             first = false;
+            // Taken and cleared HERE, above every branch, so that exactly one
+            // line of the head can be job 5's however that line is handled --
+            // a fold, a credential field or a request line all consume it.
+            boolean isFirstLine = !targetDone;
+            targetDone = true;
             if (raw[i] == ' ' || raw[i] == '\t') {
                 // obs-fold. RFC 9110 says a recipient must reject it and no
                 // real client emits it, but if one does, the folded remainder
@@ -11538,7 +11794,10 @@ public final class Redactor {
                         break;
                     }
             if (credential < 0) {
-                out.write(raw, i, next - i);
+                // JOB 5, and only on the first line of the head. Everything
+                // else is written through byte for byte, exactly as before.
+                if (isFirstLine) redactTarget(raw, i, next, out);
+                else out.write(raw, i, next - i);
                 i = next;
                 continue;
             }
@@ -11704,6 +11963,87 @@ public final class Redactor {
     }
 
     // ---- bytes ----------------------------------------------------------
+
+    /**
+     * JOB 5. Write {@code raw[from, to)} through, with the userinfo of a URI
+     * appearing in it replaced by {@link #OBSERVED_USERINFO}.
+     *
+     * STRUCTURAL, not a guess, and this is the whole argument for it being
+     * here at all when a parameter-name list is not:
+     *
+     *   RFC 3986 3.2:   authority is what follows {@code "//"} and runs to the
+     *                   next {@code / ? #} or the end of the URI.
+     *   RFC 3986 3.2.1: {@code authority = [ userinfo "@" ] host [ ":" port ]}.
+     *   RFC 3986 2.2:   {@code @} is a gen-delim. Neither {@code host}
+     *                   (reg-name / IP-literal / IPv4address) nor {@code port}
+     *                   (DIGIT) admits one.
+     *
+     * So an {@code @} inside an authority can only be the userinfo delimiter.
+     * There is no shape being recognised and no name being matched: the
+     * question "is there a credential here" is not asked, because RFC 3986
+     * already answers "this subcomponent is where one goes".
+     *
+     * THE LAST {@code @} IN THE AUTHORITY, not the first. {@code @} is not
+     * legal INSIDE a userinfo either (it is pct-encoded as {@code %40}), so a
+     * conforming authority has exactly one and the two rules agree. They part
+     * only on a malformed authority carrying two, where the last is what
+     * {@code urlsplit} and the WHATWG URL parser both take as the delimiter --
+     * and taking the FIRST there would leave the bytes between the two
+     * verbatim. The Python side is the same rule for the same reason; see
+     * tests/vectors/userinfo.txt, which is the one place the two are compared.
+     *
+     * THE {@code @} IS KEPT. `{{observed:userinfo}}@host` still reads as an
+     * authority, so a reader can see that a credential was carried there --
+     * which is the same trade job 3 makes when it keeps a cookie's name.
+     *
+     * THE FIRST {@code ://} IN THE LINE, and no attempt to find a second. A
+     * request line has one target; the target may itself carry an absolute URI
+     * in a query (`/redirect?to=http://u:p@evil/`) and that is the one this
+     * finds, which is correct -- it is a credential in the target either way.
+     * A line with a userinfo in a SECOND URI and none in the first is not
+     * covered, and no request line has that shape.
+     *
+     * Nothing is written when there is no {@code ://} and no {@code @}: the
+     * line goes through byte for byte, so a message with no userinfo in it is
+     * unchanged by this method and hashes as it did before job 5 existed.
+     */
+    private static void redactTarget(byte[] raw, int from, int to,
+                                     ByteArrayOutputStream out) {
+        int scheme = -1;
+        for (int p = from; p + 2 < to; p++)
+            if (raw[p] == ':' && raw[p + 1] == '/' && raw[p + 2] == '/') {
+                scheme = p;
+                break;
+            }
+        if (scheme < 0) {
+            out.write(raw, from, to - from);
+            return;
+        }
+        int authStart = scheme + 3;
+        int authEnd = authStart;
+        while (authEnd < to) {
+            byte b = raw[authEnd];
+            // The authority's terminators, plus the ones that end the TARGET
+            // inside a request line: SP separates it from the HTTP-version,
+            // and CR/LF/HTAB end the line. Without those a line with no path
+            // at all -- `GET http://u:p@h HTTP/1.1` -- would run the
+            // authority on into ` HTTP/1.1` and find no `@` after it either
+            // way, but a SECOND `@` anywhere later in the line would then be
+            // taken for the delimiter and blank out the version too.
+            if (b == '/' || b == '?' || b == '#' || b == ' ' || b == '\t'
+                    || b == '\r' || b == '\n') break;
+            authEnd++;
+        }
+        int at = -1;
+        for (int p = authStart; p < authEnd; p++) if (raw[p] == '@') at = p;
+        if (at < 0) {
+            out.write(raw, from, to - from);
+            return;
+        }
+        out.write(raw, from, authStart - from);   // through the `://`
+        out.writeBytes(OBSERVED_USERINFO);
+        out.write(raw, at, to - at);              // the `@`, the host, the rest
+    }
 
     /** Index just past this line's terminator, or raw.length. */
     private static int lineStartAfter(byte[] raw, int from) {
@@ -22439,6 +22779,14 @@ Neither writer opens a transaction. Each is a single INSERT (or a single
 UPDATE), which is atomic on its own under `db.connect`'s autocommit
 connection; a caller writing an exchange row and its blobs together should
 wrap the pair in `db.transaction` itself.
+
+BOTH WRITERS REDACT THE URL THEY ARE GIVEN. §7 keeps credentials out of the
+store, and until 2026-08-26 its whole mechanism was header names and injected
+byte ranges inside the JVM -- so a credential in the request TARGET
+(`http://user:pass@host/`) reached `exchange.url` and `denial.url` untouched.
+`redact_url` is that boundary, and it is at the WRITER rather than at
+`hx.capture` so that it covers the callers this plan has not written yet. See
+its docstring for the rule, and for the half of the finding it does not close.
 """
 from __future__ import annotations
 
@@ -22481,6 +22829,82 @@ DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 # form a consumer can test for. `BridgeClient.EXTENSION_FAULT` is the same
 # string on the Java side, and a test pins the pair.
 EXTENSION_FAULT = "extension fault: "
+
+# What `redact_url` writes over a request target's userinfo.
+#
+# THE SAME STRING `Redactor.OBSERVED_USERINFO` writes into the BLOB, byte for
+# byte, and `tests/test_credentials_never_reach_the_store.py` reads it out of
+# the .java file and compares. §7's placeholders are a wire-visible vocabulary:
+# a `url` column saying one thing and the request blob beside it saying another
+# is two spellings of one fact, and a report that joins them shows two.
+#
+# A `str`, not a container, so the module-level vocabulary scan in
+# `tests/test_vocabularies_match_the_schema.py` does not see it -- and it has
+# no schema CHECK to be paired against either, because no column enumerates it.
+# It is pinned against the Java constant instead, which is the copy that can
+# actually drift.
+OBSERVED_USERINFO = "{{observed:userinfo}}"
+
+
+def redact_url(url: str) -> str:
+    """A url with the userinfo of its authority replaced. §7.
+
+    THE COLUMN HALF OF THE SAME FINDING THE EXTENSION'S JOB 5 CLOSES IN THE
+    BLOB. `http://user:pass@app.test/` reached `exchange.url` and `denial.url`
+    verbatim. A column is deletable where a content-addressed blob is not, so
+    this is the lesser half -- but two halves of one request redacted by two
+    different rules is how a report ends up quoting the credential out of the
+    column beside the blob that does not have it.
+
+    THE RULE IS RFC 3986 AND NOTHING ELSE. 3.2: the authority follows `//` and
+    ends at the next `/`, `?` or `#`, or at the end. 3.2.1:
+    `authority = [ userinfo "@" ] host [ ":" port ]`. 2.2: `@` is a gen-delim,
+    and neither a host nor a port may contain one. So an `@` inside an
+    authority IS the userinfo delimiter; nothing here guesses whether what
+    precedes it looks like a secret, because the RFC has already said that is
+    where one goes.
+
+    `urlsplit` is deliberately NOT used. It would parse and this would then
+    have to re-assemble, and `urlunsplit` normalises -- it drops an empty
+    query's `?`, and re-joins a fragment this store has no reason to move.
+    `exchange.url` is EVIDENCE: the only edit it may carry is the one this
+    function is for. So the rule is applied to the string in place, which also
+    makes it the same rule the Java side applies to a request line, character
+    for character. They are compared over one shared vector file.
+
+    THE LAST `@` IN THE AUTHORITY, matching `urlsplit`'s own `rpartition('@')`
+    and the WHATWG URL parser. A conforming userinfo pct-encodes its own `@`,
+    so the two rules differ only on a malformed authority carrying two -- and
+    taking the first would leave the bytes between them verbatim.
+
+    WHAT IT DOES NOT TOUCH, named here because §7's mechanisms are only worth
+    what their exclusions are:
+
+      - A CREDENTIAL IN A QUERY PARAMETER. `?access_token=`, `?api_key=`,
+        `?sig=`. Reaching those needs a list of parameter names -- a
+        vocabulary that drifts silently toward storing a credential -- or a
+        rule that redacts by shape, which rewrites `?id=5` and corrupts the
+        evidence an access-control check reads. Neither is taken here, and
+        the leak is pinned as a leak by a test rather than left unstated.
+      - An `@` in the PATH, the QUERY or the FRAGMENT. RFC 3986 3.3 allows one
+        there and `/users/alice@example.test` is a real path segment.
+      - A url with no `://` at all. There is no authority to find.
+    """
+    scheme = url.find("://")
+    if scheme < 0:
+        return url
+    start = scheme + 3
+    end = start
+    # The authority's own terminators, plus the whitespace that ends a request
+    # target inside a request line. The whitespace half is redundant for a url
+    # column and is here so that this rule and the extension's are ONE rule:
+    # a difference the shared vectors cannot reach is still a difference.
+    while end < len(url) and url[end] not in "/?# \t\r\n":
+        end += 1
+    at = url.rfind("@", start, end)
+    if at < 0:
+        return url
+    return url[:start] + OBSERVED_USERINFO + url[at:]
 
 # Error class (spec S6) -> the `outcome` the exchange table accepts WHEN THE
 # REQUEST WAS ISSUED. Two of the four entries are never issued; the other two
@@ -22771,6 +23195,11 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
             "records.DENIAL_KIND, and see records.UNRECORDABLE for the "
             "classes that have no row to go in yet."
         )
+    # AT THE WRITER, not at the caller, and for `count_drop`'s reason: this is
+    # where a url becomes a row, so it covers the callers that do not exist
+    # yet. `hx.capture` is the only one today and it hands the raw frame value
+    # straight through.
+    url = redact_url(url)
     row_id = new_id("d")
     conn.execute(
         "INSERT INTO denial(id, run_id, ts_us, kind, method, url, resolved_ip,"
@@ -22860,6 +23289,10 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
             "is not a fact about anything, and a check reads it later without "
             "the frame it came from."
         )
+    # §7, the same call `record_denial` makes and for the same reason: the two
+    # url columns are one exposure and a rule applied to one of them is a rule
+    # the other drifts away from.
+    url = redact_url(url)
     row_id = new_id("x")
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
@@ -24569,8 +25002,19 @@ so the block can be pasted whole.
         self.config_epoch = 0
         self.peer_uid: int | None = None
         self.peer_pid: int | None = None
+        self.peer_exe: str | None = None
         self.hello: dict | None = None
         self.rejected_hellos = 0
+        # Peers refused by SO_PEERCRED, i.e. another UID on this machine
+        # reaching for this socket. It sits beside `rejected_hellos`
+        # deliberately: the two are the same kind of number and one of them
+        # existed while the other -- the one that is a security event rather
+        # than a misconfiguration -- did not.
+        self.rejected_peers = 0
+        # The last one, for whoever is looking. Kept rather than only logged,
+        # because `hx` installs no logging handler and a library that did
+        # would be deciding for its embedder where diagnostics go.
+        self.last_rejected_peer: dict | None = None
 
         self._srv: socket.socket | None = None
         self._conn: socket.socket | None = None
@@ -24586,6 +25030,19 @@ so the block can be pasted whole.
         # _deliver() that wakes the _request() waiting on the very frame being
         # written.
         self._send_lock = threading.Lock()
+
+    # ---- lifecycle ---------------------------------------------------
+
+    def start(self) -> None:
+        if self.socket_path.exists():
+            raise BridgeError(
+                f"socket path already exists: {self.socket_path}. Refusing to "
+                "start rather than adopt a path another process may own."
+            )
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.socket_path.parent, 0o700)
+
+        self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 ```
 
 In `_handle()`, the hello arm gains the re-assert immediately before the
@@ -26253,13 +26710,35 @@ class ReadThreadCapture:
         self._config = cfg
         self._capture: capture_mod.Capture | None = None
 
-    def __call__(self, header: dict, request: bytes, response: bytes):
+    def _lazy(self) -> capture_mod.Capture:
         if self._capture is None:
             self._capture = capture_mod.Capture(
                 db_mod.connect(self._root / "hx.db"),
                 blobs_mod.BlobStore(self._root / "blobs"),
                 self._engagement_id, self._config)
-        return self._capture.on_exchange(header, request, response)
+        return self._capture
+
+    def __call__(self, header: dict, request: bytes, response: bytes):
+        return self._lazy().on_exchange(header, request, response)
+
+    def on_halted(self, header: dict):
+        """S4's auto-halt, on the same connection and the same thread.
+
+        This rig wired `on_hello` and `on_exchange` and NOT this one, which was
+        half of why `records.abort_run` had no caller outside tests: S4's "one
+        distressed host aborts the whole run" reached the wire, reached
+        `BridgeServer.last_halted`, and stopped there. A real Burp really does
+        emit this frame -- `test_five_hundreds_from_the_slow_route_abort_the_
+        whole_run` drives ten 500s and reads it off the socket -- so wiring it
+        here is what makes the ROW the thing a real auto-halt produces rather
+        than something a test wrote by hand beside it.
+
+        The connection is this class's own, opened lazily on the read thread,
+        for the reason the class docstring gives: `BridgeServer` catches the
+        `ProgrammingError` a foreign connection raises, so the observable of
+        getting this wrong is a green run and an empty table.
+        """
+        return self._lazy().on_halted(header)
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -26475,10 +26954,15 @@ def rig(tmp_path):
         # exchange, denial and dropped frame would be read off the socket,
         # thrown away, and the database would answer empty while Burp
         # cheerfully sent them.
+        # ONE sink object for both callbacks, so both run on ONE connection
+        # opened on the read thread. Two objects would open two, and the
+        # second would be as thread-affine as the first with nothing making
+        # that obvious.
+        sink = ReadThreadCapture(eng.root, eng.id, cfg)
         srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id=eng.id,
                                   operator_halt=operator_halt,
-                                  on_exchange=ReadThreadCapture(
-                                      eng.root, eng.id, cfg))
+                                  on_exchange=sink,
+                                  on_halted=sink.on_halted)
         stack.callback(srv.stop)
         srv.start()
 
@@ -27386,37 +27870,61 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
     """
     rig.configure()
 
-    frames: list[dict] = []
-    # Appended, not acted on. This callback runs on the bridge's read-loop
-    # thread, and sqlite3 connections are single-thread by default, so the
-    # store write below belongs to the thread that owns the run.
-    rig.srv.on_halted = frames.append
-
+    # THE RIG'S OWN HANDLER IS LEFT IN PLACE, and that is the change this test
+    # exists to hold. It used to replace it with `frames.append` and then call
+    # `records.abort_run` itself, three lines below the assertion -- so the row
+    # this test proved was the row the TEST wrote, and `abort_run` had no
+    # caller anywhere but a test. S5's "an aborted run must never render as a
+    # clean one" was unenforced by construction, and this was the test that
+    # looked like it was enforcing it.
+    #
+    # `last_halted` is what a harness with no callback installed reads, so the
+    # frame is still observable without taking the callback away from the
+    # thing that acts on it.
     seen = _issue_until(rig, "/slow?ms=40&status=500", want="halted")
     assert seen.count(500) >= 10, \
         f"the 5xx rule needs ten answered samples before it may trip; got {seen}"
     assert seen[-1] == "halted"
 
-    assert bf.wait_for(lambda: bool(frames), timeout=10), (
+    assert bf.wait_for(lambda: rig.srv.last_halted is not None, timeout=10), (
         "auto-halt is extension-initiated, so there is no outstanding id to "
         "answer: without an unsolicited `halted` frame it is invisible until "
         "the next send fails and run.status has no stop_reason to record")
-    frame = frames[0]
+    frame = rig.srv.last_halted
     assert frame["t"] == "halted"
     assert "5xx rate" in frame["reason"], frame
     assert frame["host"] == rig.target.host, frame
     assert frame["window"], frame
 
-    assert records.abort_run(
-        rig.eng.db, run_id=rig.run_id,
-        stop_reason=f"{frame['reason']} on {frame['host']}",
-        at_us=engagement.now_us()) is True
+    # THE ROW THE HANDLER WROTE. The rig's `on_halted` runs on the bridge's
+    # read thread with a connection of its own, so this main-thread connection
+    # sees the commit rather than making it -- two connections to one WAL
+    # database, which is the ordinary arrangement here.
+    def aborted():
+        return rig.eng.db.execute(
+            "SELECT status FROM run WHERE id=?", (rig.run_id,)
+        ).fetchone()["status"] == "aborted"
+
+    assert bf.wait_for(aborted, timeout=10), (
+        "the `halted` frame arrived and no run was aborted. `hx.capture."
+        "Capture.on_halted` is the writer and the rig installs it; without "
+        "it the run closes `completed`/`idle` or `error` later and S5's "
+        f"reading is lost. srv.halted_callback_error={rig.srv.halted_callback_error!r}")
     row = rig.eng.db.execute(
         "SELECT status, stop_reason, ended_us FROM run WHERE id=?",
         (rig.run_id,)).fetchone()
-    assert row["status"] == "aborted"
     assert "5xx rate" in row["stop_reason"]
+    assert rig.target.host in row["stop_reason"]
     assert row["ended_us"] is not None
+    # And it really was the HANDLER, not this test: a second abort of a run
+    # already stopped answers False. `abort_run` is guarded on
+    # `status='running'` precisely so the first diagnosis survives.
+    assert records.abort_run(
+        rig.eng.db, run_id=rig.run_id, stop_reason="a symptom arriving second",
+        at_us=engagement.now_us()) is False
+    assert rig.eng.db.execute(
+        "SELECT stop_reason FROM run WHERE id=?",
+        (rig.run_id,)).fetchone()["stop_reason"] == row["stop_reason"]
 
     # One distressed host aborts the WHOLE run, and a human decides when it
     # restarts. `resume` lifts an operator halt; it does not undo distress.

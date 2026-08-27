@@ -2703,6 +2703,7 @@ from click.testing import CliRunner
 
 from hx import cli
 from hx import engagement as eng_mod
+from hx import halt as halt_mod
 from hx import run as run_mod
 from hx.store import records as records_mod
 
@@ -3266,6 +3267,208 @@ def test_info_breakdown_lines_report_their_own_table(engagement):
     assert "rate=1" in denials_line
     assert "state_changing=1" not in denials_line
     assert "timeout=1" not in denials_line
+
+
+# --- B5: `hx halt` / `hx resume`, S4's kill switch reachable by a human -----
+
+
+def _halt_state(engagement: Path):
+    """Read the halt back through a FRESH OperatorHalt, the way the harness
+    and the next process do. Reading the CLI's own object would only prove it
+    remembered its own call; the whole point of a durable halt is that another
+    process sees it."""
+    eng = eng_mod.open_(engagement)
+    try:
+        oh = halt_mod.OperatorHalt(eng.root, eng.db)
+        return oh.halted, oh.reason, oh.sentinel_path
+    finally:
+        eng.db.close()
+
+
+def test_halt_stops_issuance_and_writes_the_file_the_extension_polls(engagement):
+    """S4's third kill path, reachable by a person for the first time.
+
+    Two of the three §4 promises had no way in: `BridgeServer.halt()` and
+    `resume()` are correct and durable and had no CLI and no production
+    driver, and the suite-tab STOP button is unbuilt. Only "create the
+    sentinel by hand" was something an operator could do -- and §4's whole
+    argument is the redundancy, not any one path.
+
+    THE FILE IS THE ASSERTION. `-Dhx.halt_sentinel` is what the extension
+    polls, and `burp_fixture.launch_burp` passes `OperatorHalt.sentinel_path`
+    for it -- so a CLI that stopped issuance by some other means would report
+    success while the extension kept sending.
+    """
+    result = CliRunner().invoke(cli.main, [
+        "halt", "--reason", "the client asked us to stop",
+        "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    halted, reason, sentinel = _halt_state(engagement)
+    assert halted is True
+    assert reason == "the client asked us to stop"
+    assert sentinel == engagement / "HALTED"
+    assert sentinel.exists()
+    assert "the client asked us to stop" in result.output
+    assert str(sentinel) in result.output
+
+
+def test_halt_writes_the_audit_row_as_well_as_the_file(engagement):
+    """Durable is the row AND the file: the file is what stops the extension,
+    the row is what explains the stop afterwards. A halt nobody can account
+    for at the end of an engagement is the half `agent_action` exists for."""
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "target wobbling", "--root", str(engagement)])
+    eng = eng_mod.open_(engagement)
+    try:
+        rows = eng.db.execute(
+            "SELECT actor, tool, why FROM agent_action ORDER BY ts_us"
+        ).fetchall()
+    finally:
+        eng.db.close()
+    assert [(r["actor"], r["tool"]) for r in rows] == [("operator", "halt")]
+    assert rows[0]["why"] == "target wobbling"
+
+
+def test_halt_needs_no_reason_because_it_is_a_kill_switch(engagement):
+    """`--reason` is OPTIONAL on purpose, and this pins the decision. The
+    moment this command is used is the moment something is going wrong on a
+    client's production system; a required argument is friction in front of a
+    stop. What is NOT optional is that the recorded reason still says who
+    stopped it and how, which is the part nobody can reconstruct later."""
+    result = CliRunner().invoke(cli.main, ["halt", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    halted, reason, _ = _halt_state(engagement)
+    assert halted is True
+    assert "command line" in reason
+
+
+def test_resume_is_the_only_thing_that_lifts_it(engagement):
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "stop", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    halted, reason, sentinel = _halt_state(engagement)
+    assert halted is False
+    assert reason is None
+    assert not sentinel.exists()
+    assert "stop" in result.output
+
+
+def test_resume_clears_a_sentinel_nobody_recorded(engagement):
+    """§4 names the by-hand path explicitly -- an operator can `touch` the
+    sentinel from a shell when the socket is dead -- and such a halt has no
+    row behind it. `OperatorHalt.halted` is a UNION for that reason, and this
+    is the case that would strand an engagement halted forever if `resume`
+    consulted the row instead."""
+    (engagement / "HALTED").write_text("stopped by hand at 02:00\n")
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert not (engagement / "HALTED").exists()
+    assert _halt_state(engagement)[0] is False
+
+
+def test_resume_on_an_un_halted_engagement_writes_nothing(engagement):
+    """An audit trail whose entries do not correspond to events is worse than
+    a short one, and `resume()` would append a resume row for a stop that
+    never happened. Refusing is safe here rather than pedantic: the direction
+    that matters is that nothing accidentally re-arms issuance."""
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "nothing to resume" in result.output
+    eng = eng_mod.open_(engagement)
+    try:
+        assert eng.db.execute(
+            "SELECT COUNT(*) AS n FROM agent_action").fetchone()["n"] == 0
+    finally:
+        eng.db.close()
+
+
+def test_halting_an_already_halted_engagement_says_so_and_still_halts(engagement):
+    """Idempotent, and it SAYS what it found. An operator typing `halt` twice
+    during an incident must not be told nothing happened, and must not be left
+    wondering whether the second reason replaced the first."""
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "first reason", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, [
+        "halt", "--reason", "second reason", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "already halted: first reason" in result.output
+    halted, reason, _ = _halt_state(engagement)
+    assert halted is True
+    assert reason == "second reason"
+
+
+def test_info_says_so_when_issuance_is_halted(engagement):
+    """Where an operator looks first. §4 makes the sentinel something a
+    DIFFERENT person can create from a shell with no harness running, so an
+    operator can arrive at a halted engagement they did not halt -- and until
+    this line nothing in the CLI would tell them."""
+    before = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert "HALTED" not in before.output, (
+        "the halt line must appear only when there IS one, or it stops "
+        "meaning anything")
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "the client asked us to stop",
+        "--root", str(engagement)])
+    after = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert after.exit_code == 0, after.output
+    assert "HALTED" in after.output
+    assert "the client asked us to stop" in after.output
+    assert "hx resume" in after.output
+
+
+@pytest.mark.parametrize("command", [["halt"], ["resume"]])
+def test_both_refuse_cleanly_when_there_is_no_engagement(tmp_path, command):
+    """`hx capture`'s shape: a missing engagement is a ClickException with a
+    sentence in it, never a traceback. A kill switch that answers with a
+    stack trace is one an operator does not trust the next time."""
+    result = CliRunner().invoke(cli.main, command + ["--root", str(tmp_path)])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "no engagement" in result.output.lower()
+
+
+def test_deleting_the_sentinel_by_hand_leaves_the_two_sides_disagreeing(engagement):
+    """THE CLAIM I HAD WRONG, as a check rather than a sentence.
+
+    `hx resume`'s docstring said it was "the only thing that lifts a halt".
+    It is not. The extension polls the sentinel FILE and nothing else -- which
+    is exactly what S4 asks of it, "an operator can create it from a shell when
+    the socket is dead" -- and a mechanism that can be created by hand can be
+    removed by hand.
+
+    What that loses is asserted here: no `agent_action` row says the halt was
+    lifted, and a process that reads the store still believes issuance is
+    stopped while the extension has already started again. The two sides
+    disagree, and the disagreement is silent. `hx resume` is what leaves them
+    agreeing and leaves a row behind.
+    """
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "stop", "--root", str(engagement)])
+    (engagement / "HALTED").unlink()
+
+    halted, reason, _ = _halt_state(engagement)
+    assert halted is True, (
+        "the store no longer believes this engagement is halted, so the "
+        "disagreement this test documents does not exist and `hx resume`'s "
+        "docstring should say so")
+    assert reason == "stop"
+
+    eng = eng_mod.open_(engagement)
+    try:
+        tools = [r["tool"] for r in eng.db.execute(
+            "SELECT tool FROM agent_action ORDER BY ts_us")]
+    finally:
+        eng.db.close()
+    assert tools == ["halt"], (
+        "removing the file by hand wrote a resume row, which would make it "
+        "equivalent to `hx resume` and this whole test pointless")
+
+    # And `hx resume` still works from here -- it is the way back to two sides
+    # agreeing, and it does not require the file it is about to remove.
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert _halt_state(engagement)[0] is False
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3293,6 +3496,7 @@ import click
 
 from hx import config as config_mod
 from hx import engagement as eng_mod
+from hx import halt as halt_mod
 from hx import run as run_mod
 from hx.store import db as db_mod
 
@@ -3452,6 +3656,22 @@ def info(root) -> None:
     click.echo(f"  surfaces  {surfaces_by_kind}")
     click.echo(f"  exchanges {exchanges_by_outcome}")
     click.echo(f"  denials   {denials_by_kind}")
+    # THE HALT, and only when there is one -- the same rule the drop warning
+    # below follows, so a line that appears means something. S4 makes the
+    # sentinel a path an operator can take from a shell with no harness
+    # running, which means an operator can also arrive at a halted engagement
+    # they did not halt themselves. `info` is where they look first, and until
+    # this line nothing in the CLI could tell them issuance was stopped.
+    #
+    # Read through OperatorHalt rather than by testing for the file, so this
+    # sees a halt recorded in the store as well as one on disk -- `halted` is
+    # a union, and the two can disagree when a harness died between the two
+    # writes.
+    halt_state = _operator_halt(eng)
+    if halt_state.halted:
+        click.echo(f"  HALTED    {halt_state.reason}")
+        click.echo(f"            issuance is stopped; `hx resume` lifts it "
+                   f"and records who did ({halt_state.sentinel_path})")
     # S5: a run with drops has coverage numbers that are a FLOOR, not a
     # complete count -- only said out loud when it is true, so it stays
     # meaningful when it fires.
@@ -3532,6 +3752,124 @@ def capture_stop(kind, root) -> None:
     except sqlite3.Error as exc:
         raise click.ClickException(f"cannot write to the database at {path}: {exc}") from exc
     click.echo(f"stopped {len(rows)} run(s)")
+
+
+def _operator_halt(eng: eng_mod.Engagement) -> halt_mod.OperatorHalt:
+    """The SAME `OperatorHalt` the extension polls, built the same way.
+
+    S4 gives the kill switch three independent paths and the whole argument is
+    "any one works when the others are wedged". Two of the three were
+    unreachable by a human before these commands existed: `BridgeServer.halt()`
+    and `resume()` are correct and durable and had no CLI and no production
+    driver, and the STOP button in the Burp suite tab is unbuilt and stated as
+    such. So of the three, only "create the sentinel file from a shell" was
+    something an operator could actually do -- and the path §4 argues for is
+    the redundancy, not any one of them.
+
+    NOT A SECOND PATH. An operator halt is durable, and durable means the row
+    AND the file: `OperatorHalt.halt` writes the sentinel FIRST so a failure to
+    explain cannot become a failure to stop, and `resume` writes the row first
+    so a failure to record cannot lift a halt silently. A CLI that touched the
+    file itself would have neither ordering and no audit trail. The path is
+    `<engagement>/HALTED`, which is what `burp_fixture.launch_burp` passes as
+    `-Dhx.halt_sentinel` -- so the file this writes is the file the extension
+    polls, and there is no third spelling of it anywhere.
+
+    NO FRAME IS SENT, and that is not an omission. The bridge lives in the
+    harness process, not this one; the sentinel is the path that works when
+    the bridge does not, and the extension polls it directly. A harness that
+    IS running re-reads the same file: `OperatorHalt.halted` is a union of the
+    armed flag and a stat(), so a halt written from another process is seen by
+    `BridgeServer.send` on its next call and re-asserted after any hello.
+    """
+    try:
+        return halt_mod.OperatorHalt(eng.root, eng.db)
+    except halt_mod.HaltError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(
+            f"cannot read the halt state at {eng.root}: {exc}") from exc
+
+
+@main.command()
+@click.option("--reason", default=None,
+              help="Why issuance is being stopped. Recorded in the audit trail "
+                   "and written into the sentinel file for whoever finds it.")
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def halt(reason, root) -> None:
+    """Stop issuance for an engagement, durably.
+
+    `--reason` is OPTIONAL on purpose. This is a kill switch, and the moment
+    it is used is the moment something is going wrong on a client's
+    production system; a required argument is friction in front of a stop.
+    The default says who stopped it and how, which is the part a later reader
+    cannot reconstruct.
+    """
+    path = root or default_root()
+    eng = _open_engagement(path)
+    oh = _operator_halt(eng)
+    was = oh.reason if oh.halted else None
+    text = reason or f"halted from the command line by {os.environ.get('USER', 'unknown')}"
+    try:
+        oh.halt(text)
+    except (sqlite3.Error, OSError) as exc:
+        # The sentinel is written before the row, so a failure here may mean
+        # the halt IS in force and only its audit line is missing. Say which
+        # rather than leaving the operator to guess, because the guess that
+        # matters is "did it stop".
+        raise click.ClickException(
+            f"halt failed after {'writing' if oh.sentinel_path.exists() else 'failing to write'} "
+            f"{oh.sentinel_path}: {exc}") from exc
+    if was is not None:
+        click.echo(f"already halted: {was}")
+    click.echo(f"issuance halted: {text}")
+    click.echo(f"  sentinel {oh.sentinel_path}")
+    click.echo("  the extension polls that file and refuses every send while "
+               "it exists; `hx resume` is how to lift it -- deleting the file "
+               "by hand also lifts it for the extension, and records nothing")
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def resume(root) -> None:
+    """Re-arm issuance, and record that it was re-armed.
+
+    A `configure` re-authorises SCOPE and never issuance, and a reconnect
+    re-asserts the halt rather than clearing it -- so nothing in the bridge
+    lifts a halt by accident, which is what makes refusing to run this on an
+    un-halted engagement safe rather than pedantic.
+
+    IT IS NOT THE ONLY WAY BACK, and an earlier version of this docstring said
+    it was. `rm <engagement>/HALTED` also lifts the halt AS FAR AS THE
+    EXTENSION IS CONCERNED -- the extension polls the file and nothing else,
+    which is precisely what S4 asks of it ("an operator can create it from a
+    shell when the socket is dead"), and a mechanism that can be created by
+    hand can be removed by hand. What that loses is the record: no
+    `agent_action` row says who lifted it, and a harness process that had
+    already read `_armed` from the store goes on refusing sends of its own
+    while the extension issues. This command is the one that leaves both
+    sides agreeing and leaves a row behind.
+    """
+    path = root or default_root()
+    eng = _open_engagement(path)
+    oh = _operator_halt(eng)
+    if not oh.halted:
+        # Nothing is written. `resume()` would append a resume row for a stop
+        # that never happened, and an audit trail whose entries do not
+        # correspond to events is worse than a short one.
+        click.echo("not halted; nothing to resume")
+        return
+    was = oh.reason
+    try:
+        oh.resume()
+    except (sqlite3.Error, OSError) as exc:
+        # The row goes first, so a failure here leaves the sentinel in place
+        # and the halt STANDING -- which is the direction S4 asks for, and is
+        # worth saying out loud rather than reporting a bare error.
+        raise click.ClickException(
+            f"resume failed and the halt still stands ({oh.sentinel_path}): {exc}"
+        ) from exc
+    click.echo(f"issuance resumed; the halt was: {was}")
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
