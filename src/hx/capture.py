@@ -91,6 +91,71 @@ class Capture:
             self.conn, engagement_id=self.engagement_id, kind=kind,
             safety_profile=self.config.safety_profile)
 
+    def on_halted(self, header: dict) -> list[str]:
+        """S4's auto-halt, as rows. Returns the run ids this call aborted.
+
+        THE FRAME HAD NO WRITER. `records.abort_run` had zero callers outside
+        tests, nothing in `src/` built a `BridgeServer` with an `on_halted`,
+        and the integration rig wired only `on_hello` and `on_exchange` -- so
+        S4's "one distressed host aborts the WHOLE run" and S5's "an aborted
+        run must never render as a clean one" were unenforced BY
+        CONSTRUCTION. The run then closed through `cli.capture stop`
+        (completed/operator), `run.current_run` (completed/idle) or
+        `run.reap_stale` (error), each of which is individually correct and
+        none of which is the truth about a run a target's distress ended.
+
+        EVERY LIVE RUN OF THE ENGAGEMENT, not the one the distressed host
+        belongs to. S4 is explicit -- "One distressed host aborts the whole
+        run ... not just that host. Distress on one host is often the first
+        sign of something the whole test is causing" -- and a crawl running
+        beside a browse is two runs of one test. `cli.capture stop` takes the
+        same reading for the same reason.
+
+        ONE TRANSACTION, so a store that fails partway leaves no run marked
+        aborted beside another still `running` on the same distress. The
+        connection is autocommit; see this module's header.
+
+        NO RUN IS OPENED. A `halted` frame arriving when nothing is recording
+        aborts nothing and says so by returning `[]`. Manufacturing a run to
+        hold the epitaph would put a row in the store for a session that never
+        happened, which is what `FRAME_TYPES` above refuses for the same
+        reason.
+
+        WHAT THIS DOES NOT MAKE DURABLE, named because a reader will otherwise
+        assume it: the run's epitaph survives, the STOP does not. Issuance is
+        stopped by the extension's own `Distress` state, which lives in the
+        JVM, and `BridgeServer._reset` puts this side back to DENY-ALL when
+        the connection drops -- so a Burp restart plus a fresh `configure`
+        re-arms issuance with nobody having looked. That is measured, in
+        `tests/test_bridge_server.py::test_a_halted_frame_stops_issuance_and_aborts_the_run`,
+        and it is deliberate rather than missed: S4 scopes DURABILITY to an
+        OPERATOR halt, and an operator who has looked has `hx halt` to make it
+        durable. Calling `OperatorHalt.halt()` from here is not available
+        anyway -- it writes to the database and this method runs on the
+        bridge's READ THREAD, where a connection opened elsewhere raises
+        `sqlite3.ProgrammingError`.
+        """
+        reason = str(header.get("reason") or "target distress")
+        host = str(header.get("host") or "an unnamed host")
+        window = str(header.get("window") or "")
+        stop_reason = f"{reason} on {host}"
+        if window:
+            stop_reason += f" ({window})"
+        rows = self.conn.execute(
+            "SELECT id FROM run WHERE engagement_id=? AND status='running'",
+            (self.engagement_id,)).fetchall()
+        aborted: list[str] = []
+        with db_mod.transaction(self.conn):
+            for row in rows:
+                # True only when THIS call stopped it. A second `halted` frame
+                # from another host inside one window is ordinary behaviour
+                # for a struggling target, and the first stop_reason is the
+                # one that explains what happened -- see `abort_run`.
+                if records.abort_run(self.conn, run_id=row[0],
+                                     stop_reason=stop_reason, at_us=now_us()):
+                    aborted.append(row[0])
+        return aborted
+
     def on_exchange(self, header: dict, request: bytes,
                     response: bytes) -> str | None:
         """Handle one frame. Returns the exchange row id, or None.

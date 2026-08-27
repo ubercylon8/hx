@@ -860,37 +860,61 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
     """
     rig.configure()
 
-    frames: list[dict] = []
-    # Appended, not acted on. This callback runs on the bridge's read-loop
-    # thread, and sqlite3 connections are single-thread by default, so the
-    # store write below belongs to the thread that owns the run.
-    rig.srv.on_halted = frames.append
-
+    # THE RIG'S OWN HANDLER IS LEFT IN PLACE, and that is the change this test
+    # exists to hold. It used to replace it with `frames.append` and then call
+    # `records.abort_run` itself, three lines below the assertion -- so the row
+    # this test proved was the row the TEST wrote, and `abort_run` had no
+    # caller anywhere but a test. S5's "an aborted run must never render as a
+    # clean one" was unenforced by construction, and this was the test that
+    # looked like it was enforcing it.
+    #
+    # `last_halted` is what a harness with no callback installed reads, so the
+    # frame is still observable without taking the callback away from the
+    # thing that acts on it.
     seen = _issue_until(rig, "/slow?ms=40&status=500", want="halted")
     assert seen.count(500) >= 10, \
         f"the 5xx rule needs ten answered samples before it may trip; got {seen}"
     assert seen[-1] == "halted"
 
-    assert bf.wait_for(lambda: bool(frames), timeout=10), (
+    assert bf.wait_for(lambda: rig.srv.last_halted is not None, timeout=10), (
         "auto-halt is extension-initiated, so there is no outstanding id to "
         "answer: without an unsolicited `halted` frame it is invisible until "
         "the next send fails and run.status has no stop_reason to record")
-    frame = frames[0]
+    frame = rig.srv.last_halted
     assert frame["t"] == "halted"
     assert "5xx rate" in frame["reason"], frame
     assert frame["host"] == rig.target.host, frame
     assert frame["window"], frame
 
-    assert records.abort_run(
-        rig.eng.db, run_id=rig.run_id,
-        stop_reason=f"{frame['reason']} on {frame['host']}",
-        at_us=engagement.now_us()) is True
+    # THE ROW THE HANDLER WROTE. The rig's `on_halted` runs on the bridge's
+    # read thread with a connection of its own, so this main-thread connection
+    # sees the commit rather than making it -- two connections to one WAL
+    # database, which is the ordinary arrangement here.
+    def aborted():
+        return rig.eng.db.execute(
+            "SELECT status FROM run WHERE id=?", (rig.run_id,)
+        ).fetchone()["status"] == "aborted"
+
+    assert bf.wait_for(aborted, timeout=10), (
+        "the `halted` frame arrived and no run was aborted. `hx.capture."
+        "Capture.on_halted` is the writer and the rig installs it; without "
+        "it the run closes `completed`/`idle` or `error` later and S5's "
+        f"reading is lost. srv.halted_callback_error={rig.srv.halted_callback_error!r}")
     row = rig.eng.db.execute(
         "SELECT status, stop_reason, ended_us FROM run WHERE id=?",
         (rig.run_id,)).fetchone()
-    assert row["status"] == "aborted"
     assert "5xx rate" in row["stop_reason"]
+    assert rig.target.host in row["stop_reason"]
     assert row["ended_us"] is not None
+    # And it really was the HANDLER, not this test: a second abort of a run
+    # already stopped answers False. `abort_run` is guarded on
+    # `status='running'` precisely so the first diagnosis survives.
+    assert records.abort_run(
+        rig.eng.db, run_id=rig.run_id, stop_reason="a symptom arriving second",
+        at_us=engagement.now_us()) is False
+    assert rig.eng.db.execute(
+        "SELECT stop_reason FROM run WHERE id=?",
+        (rig.run_id,)).fetchone()["stop_reason"] == row["stop_reason"]
 
     # One distressed host aborts the WHOLE run, and a human decides when it
     # restarts. `resume` lifts an operator halt; it does not undo distress.

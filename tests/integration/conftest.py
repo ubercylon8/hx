@@ -156,13 +156,35 @@ class ReadThreadCapture:
         self._config = cfg
         self._capture: capture_mod.Capture | None = None
 
-    def __call__(self, header: dict, request: bytes, response: bytes):
+    def _lazy(self) -> capture_mod.Capture:
         if self._capture is None:
             self._capture = capture_mod.Capture(
                 db_mod.connect(self._root / "hx.db"),
                 blobs_mod.BlobStore(self._root / "blobs"),
                 self._engagement_id, self._config)
-        return self._capture.on_exchange(header, request, response)
+        return self._capture
+
+    def __call__(self, header: dict, request: bytes, response: bytes):
+        return self._lazy().on_exchange(header, request, response)
+
+    def on_halted(self, header: dict):
+        """S4's auto-halt, on the same connection and the same thread.
+
+        This rig wired `on_hello` and `on_exchange` and NOT this one, which was
+        half of why `records.abort_run` had no caller outside tests: S4's "one
+        distressed host aborts the whole run" reached the wire, reached
+        `BridgeServer.last_halted`, and stopped there. A real Burp really does
+        emit this frame -- `test_five_hundreds_from_the_slow_route_abort_the_
+        whole_run` drives ten 500s and reads it off the socket -- so wiring it
+        here is what makes the ROW the thing a real auto-halt produces rather
+        than something a test wrote by hand beside it.
+
+        The connection is this class's own, opened lazily on the read thread,
+        for the reason the class docstring gives: `BridgeServer` catches the
+        `ProgrammingError` a foreign connection raises, so the observable of
+        getting this wrong is a green run and an empty table.
+        """
+        return self._lazy().on_halted(header)
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -378,10 +400,15 @@ def rig(tmp_path):
         # exchange, denial and dropped frame would be read off the socket,
         # thrown away, and the database would answer empty while Burp
         # cheerfully sent them.
+        # ONE sink object for both callbacks, so both run on ONE connection
+        # opened on the read thread. Two objects would open two, and the
+        # second would be as thread-affine as the first with nothing making
+        # that obvious.
+        sink = ReadThreadCapture(eng.root, eng.id, cfg)
         srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id=eng.id,
                                   operator_halt=operator_halt,
-                                  on_exchange=ReadThreadCapture(
-                                      eng.root, eng.id, cfg))
+                                  on_exchange=sink,
+                                  on_halted=sink.on_halted)
         stack.callback(srv.stop)
         srv.start()
 

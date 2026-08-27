@@ -7,7 +7,10 @@ every finding that survived eight task reviews was at a join.
 from __future__ import annotations
 
 import hashlib
+import socket
 import sqlite3
+import time
+from pathlib import Path
 
 import pytest
 
@@ -648,3 +651,189 @@ class TestTheRunTheFrameBelongsTo:
         assert cap.conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 1
         assert cap.conn.execute(
             "SELECT heartbeat_us FROM run").fetchone()[0] > stale
+
+
+class TestTheAutoHalt:
+    """S4's `halted` frame, as rows.
+
+    Until this class existed `records.abort_run` had zero callers outside
+    tests, nothing in `src/` built a `BridgeServer` with an `on_halted`, and
+    the integration rig wired only `on_hello` and `on_exchange`. So S5's "an
+    aborted run must never render as a clean one" was unenforced BY
+    CONSTRUCTION: the run always closed through one of the three writers that
+    are individually correct and none of which is the truth about a run a
+    target's distress ended.
+    """
+
+    def test_a_halted_frame_aborts_the_run_with_the_distress_as_its_epitaph(self, cap):
+        cap.on_exchange(_header(), REQ, RESP)
+        aborted = cap.on_halted({"t": "halted", "reason": "5xx rate 0.40",
+                                 "host": "app.example.test",
+                                 "window": "50 requests / 37s"})
+        assert len(aborted) == 1
+        row = cap.conn.execute(
+            "SELECT status, stop_reason, ended_us FROM run").fetchone()
+        assert row["status"] == "aborted"
+        assert row["stop_reason"] == ("5xx rate 0.40 on app.example.test "
+                                      "(50 requests / 37s)")
+        assert row["ended_us"] is not None
+
+    def test_one_distressed_host_aborts_every_live_run_and_not_just_its_own(self, cap):
+        """S4, in as many words: "One distressed host aborts the WHOLE run
+        ... not just that host. Distress on one host is often the first sign
+        of something the whole test is causing." A crawl running beside a
+        human browsing is two `run` rows of one test, and leaving the other
+        one `running` is the half a report would read as clean.
+        """
+        cap.on_exchange(_header(source="operator"), REQ, RESP)
+        cap.on_exchange(_header(source="crawler"), REQ, RESP)
+        assert cap.conn.execute(
+            "SELECT COUNT(*) FROM run WHERE status='running'").fetchone()[0] == 2
+
+        assert len(cap.on_halted({"reason": "5 consecutive connection errors",
+                                  "host": "app.example.test",
+                                  "window": "5 requests"})) == 2
+        assert cap.conn.execute(
+            "SELECT COUNT(*) FROM run WHERE status='running'").fetchone()[0] == 0
+        assert set(r[0] for r in cap.conn.execute(
+            "SELECT DISTINCT status FROM run")) == {"aborted"}
+
+    def test_a_second_distressed_host_does_not_replace_the_diagnosis(self, cap):
+        """`abort_run`'s `status='running'` guard, reached from here. Two
+        distressed hosts inside one window is ordinary behaviour for a
+        struggling target, and the FIRST stop_reason is the one that explains
+        what happened -- a symptom arriving second must not overwrite it."""
+        cap.on_exchange(_header(), REQ, RESP)
+        assert len(cap.on_halted({"reason": "5xx rate 0.40",
+                                  "host": "first.example.test"})) == 1
+        assert cap.on_halted({"reason": "p50 latency 12x baseline",
+                              "host": "second.example.test"}) == []
+        assert cap.conn.execute("SELECT stop_reason FROM run").fetchone()[0] \
+            == "5xx rate 0.40 on first.example.test"
+
+    def test_a_halted_frame_with_nothing_recording_opens_no_run(self, cap):
+        """A row for a session that never happened is the thing `FRAME_TYPES`
+        refuses two hundred lines above, and it would be the same defect here:
+        a `run` with no traffic, aborted, inflating nothing but confusing
+        everything. Nothing to abort is an empty list, not an invented row."""
+        assert cap.on_halted({"reason": "5xx rate 0.40",
+                              "host": "app.example.test"}) == []
+        assert cap.conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+
+    def test_a_frame_missing_its_fields_still_produces_a_readable_epitaph(self, cap):
+        """S6 gives the frame `{reason, host, window}` and this side does not
+        get to assume all three arrived. A KeyError here runs on the bridge's
+        READ THREAD, where `BridgeServer._handle`'s halted arm turns a throw
+        into a CLOSED CONNECTION -- so a frame one key short would take the
+        operator's browsing down as well as failing to record the stop."""
+        cap.on_exchange(_header(), REQ, RESP)
+        assert len(cap.on_halted({"t": "halted"})) == 1
+        assert cap.conn.execute("SELECT stop_reason FROM run").fetchone()[0] \
+            == "target distress on an unnamed host"
+
+    def test_an_aborted_run_is_not_reaped_into_something_that_reads_cleaner(self, cap):
+        """The reading S5 asks for, end to end. `reap_stale` resolves a
+        `running` run whose harness died to `error`; `current_run` closes an
+        idle one `completed`. Both are guarded on `status='running'`, so an
+        aborted run keeps its own status and its own reason -- and this is the
+        assertion that would fail if the abort were ever written as a plain
+        `close_run`."""
+        cap.on_exchange(_header(), REQ, RESP)
+        cap.on_halted({"reason": "5xx rate 0.40", "host": "app.example.test"})
+        assert run_mod.reap_stale(cap.conn, now_us=10 ** 18) == []
+        row = cap.conn.execute("SELECT status, stop_reason FROM run").fetchone()
+        assert row["status"] == "aborted"
+        assert row["stop_reason"].startswith("5xx rate 0.40")
+
+
+def test_a_halted_frame_off_a_real_socket_reaches_the_store(tmp_path, cap):
+    """THE WIRING, not the writer.
+
+    Every check above calls `on_halted` directly, which is exactly the shape
+    B2 found: a correct writer nothing calls. This one drives a real `halted`
+    frame down a real `BridgeServer` and asserts the row at the far end, so
+    that removing `on_halted=` from the constructor is a RED test rather than
+    a silent return to a run that never gets its epitaph.
+
+    The callback runs on the bridge's READ THREAD. `cap`'s connection was
+    opened on this one, so this test would raise `sqlite3.ProgrammingError`
+    inside `BridgeServer._handle`'s halted arm -- which closes the connection
+    and records the throw rather than propagating it. The write therefore
+    happens on the read thread's own connection, opened lazily, exactly as
+    `tests/integration/conftest.py::ReadThreadCapture` does it for the same
+    reason.
+    """
+    from hx import halt as halt_mod
+    from hx.bridge import codec, server
+
+    root = Path(cap.blobs.root).parent
+    oh = halt_mod.OperatorHalt(root, cap.conn)
+    read_thread_cap = _ReadThreadCapture(root, cap.engagement_id, cap.config)
+    srv = server.BridgeServer(tmp_path / "halted.sock", engagement_id=ENG,
+                              operator_halt=oh,
+                              on_halted=read_thread_cap.on_halted)
+    srv.start()
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(5)
+    try:
+        c.connect(str(srv.socket_path))
+        cap.on_exchange(_header(), REQ, RESP)
+        run_id, = cap.conn.execute("SELECT id FROM run").fetchone()
+
+        c.sendall(codec.encode({"v": 1, "t": "halted",
+                                "reason": "5xx rate 0.40",
+                                "host": "app.example.test",
+                                "window": "50 requests / 37s"}))
+
+        deadline = time.time() + 5
+        row = None
+        while time.time() < deadline:
+            row = cap.conn.execute(
+                "SELECT status, stop_reason FROM run WHERE id=?",
+                (run_id,)).fetchone()
+            if row["status"] != "running":
+                break
+            time.sleep(0.005)
+        assert srv.halted_callback_error is None, srv.halted_callback_error
+        assert row["status"] == "aborted", (
+            "the halted frame reached the bridge and no run was aborted; "
+            f"state={srv.state!r} last_halted={srv.last_halted!r}")
+        assert row["stop_reason"] == ("5xx rate 0.40 on app.example.test "
+                                      "(50 requests / 37s)")
+        assert srv.state == "halted"
+    finally:
+        c.close()
+        srv.stop()
+        read_thread_cap.close()
+
+
+class _ReadThreadCapture:
+    """`hx.capture.Capture` on a connection belonging to the thread that uses
+    it -- the same shape `tests/integration/conftest.py` installs, and for the
+    same measured reason: a sqlite3 connection raises `ProgrammingError`
+    anywhere but the thread that created it, and `BridgeServer` catches that
+    throw, so the observable would be a green handshake and an empty table."""
+
+    def __init__(self, root, engagement_id, cfg):
+        self._root = Path(root)
+        self._engagement_id = engagement_id
+        self._config = cfg
+        self._capture = None
+
+    def _lazy(self):
+        if self._capture is None:
+            self._capture = cap_mod.Capture(
+                db_mod.connect(self._root / "hx.db"),
+                blobs_mod.BlobStore(self._root / "blobs"),
+                self._engagement_id, self._config)
+        return self._capture
+
+    def on_halted(self, header):
+        return self._lazy().on_halted(header)
+
+    def close(self):
+        # Deliberately not closed: `Connection.close()` is thread-affine too,
+        # so closing it from THIS thread raises during teardown and replaces
+        # whatever failed the test. `srv.stop()` has already joined the read
+        # thread, so nothing is still writing.
+        pass
