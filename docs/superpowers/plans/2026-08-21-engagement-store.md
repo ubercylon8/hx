@@ -3818,6 +3818,79 @@ def test_scan_max_seconds_reaches_the_runner(engagement_with_surface, monkeypatc
     assert result.exit_code == 0, result.output
     assert "surfaces  0" in result.output
     assert "skipped" in result.output.lower()
+
+
+# --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---
+# --- what that gap already cost -----------------------------------------
+
+def test_report_writes_a_file_and_says_where(engagement_with_surface):
+    result = CliRunner().invoke(cli.main,
+                                ["report", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    assert target.exists()
+    assert str(target) in result.output
+
+
+def test_report_default_export_is_never_looser_than_0o600(engagement_with_surface):
+    """§3, unconditional. F2: `write_text` then `chmod` used to leave the
+    file at `0o644` for the window between them; there is no window left to
+    measure from the outside once the file exists, so this pins the mode
+    the file ends at -- the live end-to-end half of F2's fix, the write-time
+    window itself is what `_write_export_secure`'s O_EXCL-at-final-mode
+    shape (`cli.py`) exists to close."""
+    CliRunner().invoke(cli.main,
+                       ["report", "--root", str(engagement_with_surface)])
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_report_out_creates_new_directories_at_0o700_not_the_umask(engagement_with_surface, tmp_path):
+    """F2's exact measured repro: `--out <somewhere>/nested/report.md`, where
+    neither `nested` directory exists yet. The old
+    `target.parent.mkdir(parents=True, exist_ok=True)` created both at the
+    ambient umask (`755` under `022`, measured in the review) -- including
+    when the path was inside the engagement root, which §3 governs
+    unconditionally. `secure_mkdir` must leave every directory it creates at
+    `0o700`, never looser, with no window."""
+    target = tmp_path / "handoff" / "client" / "acme.md"
+    result = CliRunner().invoke(cli.main, [
+        "report", "--root", str(engagement_with_surface), "--out", str(target),
+    ])
+    assert result.exit_code == 0, result.output
+    assert target.exists()
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    assert oct((tmp_path / "handoff").stat().st_mode & 0o777) == "0o700"
+    assert oct((tmp_path / "handoff" / "client").stat().st_mode & 0o777) == "0o700"
+
+
+def test_report_redacts_a_credential_reaching_the_export(engagement_with_surface):
+    """F1/F12: the export-side redaction the review found missing, exercised
+    through the real CLI command rather than `report.render` directly --
+    F2's own defect was found exactly this way, by driving the command
+    end-to-end rather than trusting the unit-level render tests alone. The
+    finding is hand-inserted rather than written through `records.py`'s own
+    writers, the same way `records.record_exchange`/`record_denial` already
+    redact at write time and would mask the gap this checks for."""
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        eng.db.execute(
+            "INSERT INTO finding(id, engagement_id, dedupe_key, title,"
+            " severity, confidence, created_by, status, scope_level)"
+            " VALUES('f-1', ?, 'k1',"
+            " 'Token leak: https://admin:hunter2@app.acme.com/x?access_token=SECRETTOKEN',"
+            " 'Medium', 'Firm', 'check', 'new', 'surface')",
+            (eng.id,))
+    finally:
+        eng.db.close()
+    result = CliRunner().invoke(cli.main,
+                                ["report", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    text = target.read_text(encoding="utf-8")
+    assert "SECRETTOKEN" not in text
+    assert "hunter2" not in text
+    assert "Token leak" in text
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3839,6 +3912,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import uuid
 from pathlib import Path
 
 import click
@@ -3851,6 +3925,7 @@ from hx import run as run_mod
 from hx import scan as scan_mod
 from hx.checks import registry
 from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -4266,6 +4341,48 @@ def scan(root, max_seconds) -> None:
         eng.db.close()
 
 
+def _write_export_secure(path: Path, text: str) -> None:
+    """Atomically write the report at 0o600, never briefly looser.
+
+    Fix round 1, F2: `target.parent.mkdir(parents=True, exist_ok=True)`
+    followed by `write_text` then `chmod` created directories at the ambient
+    umask (`755` under `umask 022`, measured, including directories nested
+    inside the engagement root when `--out` named one) and left the file
+    itself at `0o644` for the window between the write and the chmod, on
+    every invocation. §3 is unconditional -- "engagement directories `0o700`,
+    files `0o600`, never looser" -- and a client report earns no less care
+    than `config.yaml` or the halt sentinel.
+
+    Same shape as `engagement._write_config_secure` and
+    `halt.OperatorHalt._write_sentinel`, for the same reasons: `O_EXCL` at
+    the final mode so the file never exists world-readable even for an
+    instant, and a rename so a reader never sees a partial write. Not a
+    shared import of either -- this codebase's own precedent
+    (`halt._write_sentinel`'s docstring: "Same shape as
+    `engagement._write_config_secure`, for the same reasons") is to
+    duplicate this exact shape per module with a cross-reference, not to
+    import a leading-underscore name across module boundaries.
+    """
+    path = Path(path)
+    tmp = path.parent / f".{uuid.uuid4().hex}.{path.name}"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 @main.command()
 @click.option("--root", type=click.Path(path_type=Path), default=None)
 @click.option("--out", type=click.Path(path_type=Path), default=None,
@@ -4278,9 +4395,8 @@ def report(root, out) -> None:
         text = report_mod.render(eng.db, engagement_id=eng.id,
                                  config=eng.config, blobs=eng.blobs)
         target = out or (eng.root / "exports" / f"{eng.config.name}.md")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
-        target.chmod(0o600)      # S3: never looser
+        secure_mkdir(target.parent)   # S3: 0o700, never looser, no window
+        _write_export_secure(target, text)   # S3: 0o600, never looser
         click.echo(f"wrote {target}")
     finally:
         eng.db.close()
