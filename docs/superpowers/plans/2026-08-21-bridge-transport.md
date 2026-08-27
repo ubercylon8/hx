@@ -217,6 +217,7 @@ The `hex` field is left empty for all but the first vector deliberately: Step 5 
 ```python
 # tests/test_bridge_codec.py
 import json
+import re
 import socket
 from pathlib import Path
 
@@ -504,6 +505,161 @@ def test_encode_refuses_an_integer_outside_signed_64_bit_range():
     # The boundary values themselves must still be accepted.
     codec.encode({"v": 1, "t": "send", "deadline_us": 2 ** 63 - 1})
     codec.encode({"v": 1, "t": "send", "deadline_us": -(2 ** 63)})
+
+
+# ---- the two-body form -------------------------------------------------
+#
+# Plan 4's `exchange` frame carries a request AND a response, and they cannot
+# share one opaque body: the far side content-addresses each on its own. The
+# form declares itself in the header under `codec.BODIES_KEY` and packs the
+# body slot as [len(first)][first][len(second)][second], leaving the OUTER
+# frame -- length prefix, header, newline, body slot -- exactly as it was.
+
+
+# The SAME literal CodecTest.java records for the same inputs. Two codecs that
+# only round-trip against themselves can disagree forever, which is why the
+# golden vectors exist at all; this is that pin for the two-body form. It is a
+# literal here rather than a row in frames.json because every consumer of that
+# file calls the ONE-body encoder.
+TWO_BODY_HEX = (
+    "0000004f7b2276223a312c2274223a2265786368616e6765222c2275726c223a"
+    "22687474703a2f2f6170702e746573742f78222c22626f64696573223a327d0a"
+    "0000000352455100000008524553504f4e5345"
+)
+
+
+def _exchange_header():
+    return {"v": 1, "t": "exchange", "url": "http://app.test/x"}
+
+
+def test_the_two_body_wire_form_is_the_same_on_both_sides():
+    raw = codec.encode_two(_exchange_header(), b"REQ", b"RESPONSE")
+    assert raw.hex() == TWO_BODY_HEX
+    header, body, _ = codec.decode(bytes.fromhex(TWO_BODY_HEX))
+    assert codec.split_bodies(header, body) == (b"REQ", b"RESPONSE")
+
+
+def test_two_bodies_round_trip_and_stay_apart():
+    """A first half whose own bytes look like a length prefix, and an empty
+    second half: the pair that separates real length prefixes from a scan."""
+    first, second = b"\x00\x00\x00\x08x", b""
+    header, body, _ = codec.decode(codec.encode_two(_exchange_header(), first, second))
+    assert codec.split_bodies(header, body) == (first, second)
+
+    big = bytes(range(256)) * 300
+    header, body, _ = codec.decode(codec.encode_two(_exchange_header(), big, big))
+    assert codec.split_bodies(header, body) == (big, big)
+
+
+def test_the_one_body_form_is_untouched_by_the_two_body_form():
+    """Every existing frame goes through `encode`, and the golden vectors pin
+    their bytes. This says it from the other side: a one-body frame declares
+    no `bodies`, so nothing can read its payload as two halves."""
+    header, body, _ = codec.decode(codec.encode(_exchange_header(), b"BODY"))
+    assert codec.BODIES_KEY not in header
+    assert body == b"BODY"
+    with pytest.raises(codec.FrameError, match="one body, not two"):
+        codec.split_bodies(header, body)
+
+
+def test_encode_two_has_no_caller_outside_the_tests():
+    """The bound the split-point asymmetry rests on, made falsifiable.
+
+    `codec.decode` deliberately does NOT split the two bodies and Java's
+    `Frame.decode` does; the note at `split_bodies` says the asymmetry "is
+    bounded: two-body frames travel Burp -> Python only". Nothing enforced
+    that. Java pins its half -- `Frame.encode(` has exactly two call sites in
+    `extension/src`, both in BridgeClient, and the golden vectors redden if a
+    third appears -- and this is the matching pin: the only encoder of a
+    two-body frame on this side has no production caller, so this side emits
+    none.
+
+    A search over `src/`, not an import graph: a call reached through
+    `getattr` or a re-export would slip past the latter, and the string is
+    what a reviewer greps for anyway.
+    """
+    src = Path(__file__).resolve().parents[1] / "src"
+    callers = sorted(
+        f"{p.relative_to(src).as_posix()}:{n}"
+        for p in src.rglob("*.py")
+        for n, line in enumerate(p.read_text().splitlines(), 1)
+        if "encode_two(" in line and not line.lstrip().startswith("def ")
+    )
+    assert callers == [], (
+        "encode_two now has production callers "
+        f"({callers}); two-body frames travel Burp -> Python only, and the "
+        "note at codec.split_bodies rests on that. Python -> Burp two-body "
+        "traffic means Java's eager split CLOSES the connection where this "
+        "side counts and continues -- DENY-ALL, and the halt path with it."
+    )
+
+
+def test_two_bodies_over_max_frame_are_refused_before_they_are_joined():
+    """Mirrors `Frame.encode(header, a, b)`, which checks first for the same
+    reason: a bound on how much one frame may make the process allocate is
+    lost if it is enforced after the allocation."""
+    half = b"x" * (codec.MAX_FRAME // 2 + 16)
+    with pytest.raises(codec.FrameError, match="exceed MAX_FRAME"):
+        codec.encode_two(_exchange_header(), half, half)
+
+
+def test_encoding_two_bodies_does_not_stamp_the_callers_header():
+    """Or the next frame that header builds silently declares two bodies it
+    has not got."""
+    header = _exchange_header()
+    codec.encode_two(header, b"a", b"b")
+    assert codec.BODIES_KEY not in header
+
+
+@pytest.mark.parametrize("payload,why", [
+    (b"\x00\x00", "no length prefix for its first body"),
+    (b"\x00\x00\x00\x63a", "declares a first body of 99"),
+    (b"\x00\x00\x00\x01a\x00\x00\x00\x63", "declares bodies of 1 \\+ 99"),
+    (b"\x00\x00\x00\x01a\x00\x00\x00\x01bX", "do not fill"),
+])
+def test_a_malformed_two_body_payload_is_refused(payload, why):
+    """Each is a payload a lenient reader would accept by guessing, and each
+    guess is a different pair of halves than the writer meant. EXACT FIT is
+    required: the lengths are on the wire so neither side has to guess."""
+    raw = codec.encode({**_exchange_header(), codec.BODIES_KEY: 2}, payload)
+    header, body, _ = codec.decode(raw)
+    with pytest.raises(codec.FrameError, match=why):
+        codec.split_bodies(header, body)
+
+
+@pytest.mark.parametrize("declared", [1, 3, 0, True])
+def test_a_bodies_count_this_version_does_not_know_is_refused(declared):
+    """`bodies` is a declaration, not a hint. `True` is in this list because
+    `True == 1` in Python and a header may legitimately carry bools, so an
+    `== 2` test written the obvious way on a future version that accepted 1
+    would let it through."""
+    raw = codec.encode({**_exchange_header(), codec.BODIES_KEY: declared}, b"abc")
+    header, body, _ = codec.decode(raw)
+    with pytest.raises(codec.FrameError, match="reads 2 and no other value"):
+        codec.split_bodies(header, body)
+
+
+def test_the_java_side_rejects_the_same_malformed_two_body_payloads():
+    """The same payloads are refused on both sides, at different POINTS.
+
+    Java's `Frame.decode` splits eagerly and raises there. This side splits at
+    `split_bodies`, so a mis-packed capture frame is counted by BridgeServer
+    rather than closing the control channel -- see the note in `decode`. What
+    is shared is the four payloads, the unknown-count case, and the bytes
+    below; what differs is which call raises.
+
+    The Java half is CodecTest.malformedTwoBodyPayloadsAreRefused. Named here
+    so a change to one is a change someone can find in the other; there is no
+    JVM in this suite to run it from.
+    """
+    java = Path(__file__).parents[1] / "extension" / "test" / "hx" / "bridge" / "CodecTest.java"
+    text = java.read_text()
+    assert "malformedTwoBodyPayloadsAreRefused" in text
+    # The literal itself, reassembled from the Java string concatenation, so a
+    # drift in either file's expected bytes reddens here rather than waiting
+    # for someone to run the other suite.
+    declaration = text.split("TWO_BODY_HEX =", 1)[1].split(";", 1)[0]
+    assert "".join(re.findall(r'"([0-9a-f]*)"', declaration)) == TWO_BODY_HEX
 ```
 
 - [ ] **Step 4: Run tests to verify they fail**
@@ -534,6 +690,22 @@ import struct
 PROTOCOL_VERSION = 1
 MAX_FRAME = 64 * 1024 * 1024        # a length prefix is attacker-influenced input
 _LEN = struct.Struct(">I")
+
+# The header key that says the body slot holds TWO length-prefixed bodies:
+#
+#     [4-byte BE len(first)][first][4-byte BE len(second)][second]
+#
+# Plan 4's `exchange` frame carries a request and a response, and they cannot
+# share one opaque body: each is content-addressed into the blob store on its
+# own. The OUTER frame is unchanged -- same length prefix, header, newline and
+# body slot -- so every one-body frame is byte-identical to what it was, which
+# tests/vectors/frames.json pins for both codecs.
+#
+# In the HEADER rather than inferred from `t`: this module has no business
+# knowing the frame vocabulary, and a reader that guessed from `t == "exchange"`
+# would mis-parse the first two-body frame type someone adds without teaching it.
+# `Frame.BODIES_KEY` is the same string on the Java side.
+BODIES_KEY = "bodies"
 
 CONFIG_KEYS = frozenset(
     {
@@ -602,6 +774,96 @@ def encode(header: dict, body: bytes = b"") -> bytes:
     return _LEN.pack(len(payload)) + payload
 
 
+def encode_two(header: dict, first: bytes, second: bytes) -> bytes:
+    """One frame carrying two bodies. Mirrors `Frame.encode(header, a, b)`.
+
+    The header is COPIED and stamped here rather than trusted from the caller,
+    so the declaration on the wire cannot disagree with the shape of the bytes:
+    a caller that forgot the key would produce a frame whose second body is
+    read as trailing bytes of the first.
+
+    The size is checked BEFORE the two bodies are joined, the same way and for
+    the same reason as the Java side: MAX_FRAME exists so one frame cannot make
+    the process allocate arbitrarily, and a check that runs after the
+    allocation it bounds has already lost. This used to build the whole
+    concatenation and let `encode` check afterwards -- the opposite of what the
+    comment in `Frame.encode` says the two files do -- which is harmless here
+    only because nothing in `src/` calls this. `test_encode_two_has_no_caller
+    _outside_the_tests` is what makes that "only" a fact rather than a habit.
+    """
+    total = _LEN.size + len(first) + _LEN.size + len(second)
+    if total > MAX_FRAME:
+        raise FrameError(
+            f"two bodies of {len(first)} + {len(second)} bytes exceed "
+            f"MAX_FRAME {MAX_FRAME}"
+        )
+    payload = (_LEN.pack(len(first)) + first
+               + _LEN.pack(len(second)) + second)
+    return encode({**header, BODIES_KEY: 2}, payload)
+
+
+def _declares_two_bodies(header: dict) -> bool:
+    """Whether the header says the body slot holds two bodies.
+
+    `2` and no other value. A `bodies` this version does not know is a frame
+    it cannot read, not one to guess at -- and `bodies` is checked against a
+    bool separately because `True == 1` in Python and a header is allowed to
+    carry bools, so `bodies: True` would otherwise sail past an `== 1` test on
+    a future version that accepted one.
+    """
+    if BODIES_KEY not in header:
+        return False
+    value = header[BODIES_KEY]
+    if value == 2 and not isinstance(value, bool):
+        return True
+    raise FrameError(
+        f"header declares {BODIES_KEY}={value!r}; this version reads 2 and no "
+        "other value"
+    )
+
+
+def _body_spans(payload: bytes) -> tuple[int, int, int, int]:
+    """(start, end) of each body, or FrameError.
+
+    EXACT FIT is required: the two declared lengths must consume the payload to
+    its last byte. Bytes left over are bytes the two implementations would read
+    differently, and the lengths are on the wire precisely so neither side has
+    to guess where a half ends.
+    """
+    if len(payload) < _LEN.size:
+        raise FrameError("two-body frame has no length prefix for its first body")
+    (n1,) = _LEN.unpack_from(payload, 0)
+    if len(payload) < _LEN.size + n1 + _LEN.size:
+        raise FrameError(
+            f"two-body frame declares a first body of {n1} but holds "
+            f"{len(payload)} bytes"
+        )
+    (n2,) = _LEN.unpack_from(payload, _LEN.size + n1)
+    if len(payload) != 2 * _LEN.size + n1 + n2:
+        raise FrameError(
+            f"two-body frame declares bodies of {n1} + {n2}, which do not fill "
+            f"its {len(payload)} bytes"
+        )
+    first = _LEN.size
+    second = 2 * _LEN.size + n1
+    return first, first + n1, second, second + n2
+
+
+def split_bodies(header: dict, payload: bytes) -> tuple[bytes, bytes]:
+    """The two halves of a two-body frame. Mirrors `Frame.Decoded.second`.
+
+    Raises FrameError when the header does not declare the two-body form: a
+    caller asking for two halves of a one-body frame has misread the frame, and
+    handing it `(payload, b"")` would turn that into a silently empty response.
+    """
+    if not _declares_two_bodies(header):
+        raise FrameError(
+            f"frame does not declare {BODIES_KEY}=2, so it has one body, not two"
+        )
+    a, b, c, d = _body_spans(payload)
+    return payload[a:b], payload[c:d]
+
+
 def decode(buf: bytes) -> tuple[dict, bytes, int]:
     if len(buf) < _LEN.size:
         raise Incomplete("need a length prefix")
@@ -626,6 +888,19 @@ def decode(buf: bytes) -> tuple[dict, bytes, int]:
     # bound what the far side may produce, so this is the one place that can
     # actually defend it against a peer that ignores the contract.
     _check_header(header)
+    # THE TWO-BODY SPLIT IS NOT DONE HERE, and that is a decision rather than
+    # an omission. `decode` raising FrameError is how `_serve` learns the
+    # stream is unreadable, and it answers by CLOSING -- which drops the far
+    # side to DENY-ALL and takes the `halt` path down with it. The outer frame
+    # is well-formed here; only the packing INSIDE the body slot is wrong, and
+    # a capture frame that was packed wrong must not cost the operator their
+    # control channel (S4: a lost record changes what hx knows, never what it
+    # allows). So the split happens at `split_bodies`, which `BridgeServer`
+    # calls where the failure can be counted and contained.
+    #
+    # Java's `Frame.decode` DOES split eagerly. The asymmetry is real and it
+    # is bounded: two-body frames travel Burp -> Python only, so that path is
+    # exercised by CodecTest's own round trip and by nothing on the wire.
     return header, payload[nl + 1 : end], end
 
 
@@ -871,6 +1146,12 @@ public class CodecTest {
         t("malformedInputsAreRejected", CodecTest::malformedInputsAreRejected);
         t("invalidUtf8HeaderIsRejected", CodecTest::invalidUtf8HeaderIsRejected);
         t("pairedSurrogateEqualsRawSupplementaryCharacter", CodecTest::pairedSurrogateEqualsRawSupplementaryCharacter);
+        t("twoBodiesRoundTripAndStayApart", CodecTest::twoBodiesRoundTripAndStayApart);
+        t("theOneBodyFormIsUntouchedByTheTwoBodyForm",
+          CodecTest::theOneBodyFormIsUntouchedByTheTwoBodyForm);
+        t("malformedTwoBodyPayloadsAreRefused", CodecTest::malformedTwoBodyPayloadsAreRefused);
+        t("theTwoBodyWireFormIsTheSameOnBothSides",
+          CodecTest::theTwoBodyWireFormIsTheSameOnBothSides);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -1149,6 +1430,122 @@ public class CodecTest {
         raw[2] = (byte) (len >>> 8);  raw[3] = (byte) len;
         System.arraycopy(payload, 0, raw, 4, len);
         return raw;
+    }
+
+    // ---- the two-body form ---------------------------------------------
+
+    /**
+     * The SAME bytes tests/test_bridge_codec.py records for the same inputs.
+     *
+     * A frame both codecs merely round-trip against THEMSELVES is a frame two
+     * implementations can disagree about forever: the existing golden vectors
+     * exist for exactly that reason, and the two-body form needs its own,
+     * because none of them declares `bodies`. Written as a literal in both
+     * files rather than added to frames.json, whose every consumer calls the
+     * ONE-body encoder.
+     */
+    static final String TWO_BODY_HEX =
+        "0000004f7b2276223a312c2274223a2265786368616e6765222c2275726c223a"
+      + "22687474703a2f2f6170702e746573742f78222c22626f64696573223a327d0a"
+      + "0000000352455100000008524553504f4e5345";
+
+    static Map<String, Object> exchangeHeader() {
+        Map<String, Object> h = new LinkedHashMap<>();
+        h.put("v", 1L);
+        h.put("t", "exchange");
+        h.put("url", "http://app.test/x");
+        return h;
+    }
+
+    static void theTwoBodyWireFormIsTheSameOnBothSides() {
+        byte[] raw = Frame.encode(exchangeHeader(),
+                                  "REQ".getBytes(StandardCharsets.UTF_8),
+                                  "RESPONSE".getBytes(StandardCharsets.UTF_8));
+        check("the two-body frame is byte-for-byte what Python writes ("
+              + hex(raw) + ")", TWO_BODY_HEX.equals(hex(raw)));
+        Frame.Decoded d = Frame.decode(unhex(TWO_BODY_HEX));
+        check("and Python's bytes decode here to the same request half",
+              "REQ".equals(new String(d.body, StandardCharsets.UTF_8)));
+        check("and to the same response half",
+              d.second != null
+              && "RESPONSE".equals(new String(d.second, StandardCharsets.UTF_8)));
+    }
+
+    static void twoBodiesRoundTripAndStayApart() {
+        // Two EMPTY halves, and a first half whose bytes are a plausible
+        // length prefix of their own: the case that separates real length
+        // prefixes from a delimiter scan.
+        byte[] first = new byte[] {0, 0, 0, 8, 'x'};
+        byte[] second = new byte[0];
+        Frame.Decoded d = Frame.decode(Frame.encode(exchangeHeader(), first, second));
+        check("a first half that looks like a length prefix survives whole",
+              Arrays.equals(first, d.body));
+        check("an EMPTY second half is an empty array, not a null -- an "
+              + "exchange with no response is not a one-body frame",
+              d.second != null && d.second.length == 0);
+
+        byte[] big = new byte[70000];
+        for (int i = 0; i < big.length; i++) big[i] = (byte) i;
+        Frame.Decoded e = Frame.decode(Frame.encode(exchangeHeader(), big, big));
+        check("a body larger than one read chunk round-trips as the first half",
+              Arrays.equals(big, e.body));
+        check("and as the second", Arrays.equals(big, e.second));
+    }
+
+    static void theOneBodyFormIsUntouchedByTheTwoBodyForm() {
+        // Item 5 of this task: every existing frame goes through Frame, and
+        // the golden vectors pin their bytes. This says the same thing from
+        // the other side -- a one-body frame decodes with NO second body, so
+        // nothing that reads `second` can mistake a payload for two halves.
+        Map<String, Object> h = exchangeHeader();
+        byte[] raw = Frame.encode(h, "BODY".getBytes(StandardCharsets.UTF_8));
+        Frame.Decoded d = Frame.decode(raw);
+        check("a one-body frame has no second body", d.second == null);
+        check("and its body is the whole payload",
+              "BODY".equals(new String(d.body, StandardCharsets.UTF_8)));
+        check("and its header carries no " + Frame.BODIES_KEY + " key",
+              !d.header.containsKey(Frame.BODIES_KEY));
+        // The stamp goes on a COPY: a caller's map must not come back mutated,
+        // or the next frame it builds silently declares two bodies it has not
+        // got.
+        Frame.encode(h, "a".getBytes(StandardCharsets.UTF_8),
+                     "b".getBytes(StandardCharsets.UTF_8));
+        check("and encoding two bodies did not stamp the caller's header",
+              !h.containsKey(Frame.BODIES_KEY));
+    }
+
+    static void malformedTwoBodyPayloadsAreRefused() {
+        // Each case is a payload a lenient reader would accept by guessing,
+        // and each guess is a different pair of halves than the writer meant.
+        expectThrows("a payload too short to hold a first length prefix",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(new byte[] {0, 0})));
+        expectThrows("a first length that runs past the payload",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(new byte[] {0, 0, 0, 99, 'a'})));
+        expectThrows("a second length that runs past the payload",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(
+                         new byte[] {0, 0, 0, 1, 'a', 0, 0, 0, 99})));
+        expectThrows("bodies that leave trailing bytes behind them",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(
+                         new byte[] {0, 0, 0, 1, 'a', 0, 0, 0, 1, 'b', 'X'})));
+        // `bodies` is a declaration, not a hint: a value this version does not
+        // know is a frame it cannot read, and reading it as one body would
+        // hand the far side a request with a response spliced onto it.
+        Map<String, Object> three = exchangeHeader();
+        three.put(Frame.BODIES_KEY, 3L);
+        expectThrows("a bodies count this version does not know",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(Frame.encode(three, new byte[] {1, 2, 3})));
+    }
+
+    /** A frame declaring two bodies over a payload chosen by the caller. */
+    static byte[] twoBodyFrame(byte[] payload) {
+        Map<String, Object> h = exchangeHeader();
+        h.put(Frame.BODIES_KEY, 2L);
+        return Frame.encode(h, payload);
     }
 
     static String hex(byte[] b) {
@@ -1527,10 +1924,44 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Map;
 
-/** [4-byte BE length][header JSON]\n[body bytes] */
+/**
+ * [4-byte BE length][header JSON]\n[body bytes]
+ *
+ * TWO BODIES, when a frame carries a request AND a response. Plan 4's
+ * `exchange` frame has two halves and they cannot share one opaque body: the
+ * far side content-addresses each independently. The two-body form declares
+ * itself in the HEADER, under {@link #BODIES_KEY}, and packs the body slot as
+ *
+ *     [4-byte BE len(first)][first][4-byte BE len(second)][second]
+ *
+ * so the OUTER frame is unchanged: same length prefix, same header, same
+ * newline, same opaque body slot. Every frame this jar wrote before -- hello,
+ * configured, result, error, halted -- still goes through the one-body
+ * {@link #encode(Map, byte[])} and is byte-identical to what it was.
+ *
+ * HOW TO FALSIFY THAT rather than take it on trust: `Frame.encode(` appears
+ * exactly twice in extension/src, both inside BridgeClient's two `send`
+ * overloads, and the three-argument one is reached only from
+ * `BridgeClient.exchangeSink()`. A third call site, or a `send` that started
+ * routing control frames through the two-body form, would make the sentence
+ * false -- and would also redden CodecTest.goldenVectors and Python's
+ * test_vectors_match_their_recorded_hex, which assert the same recorded bytes
+ * from opposite sides of the bridge.
+ */
 public final class Frame {
 
     public static final int MAX_FRAME = 64 * 1024 * 1024;
+
+    /**
+     * The header key that says the body slot holds two length-prefixed bodies.
+     *
+     * In the HEADER rather than inferred from `t`, deliberately: the codec has
+     * no business knowing the frame vocabulary, and a reader that guessed from
+     * `t == "exchange"` would silently mis-parse the first frame type someone
+     * adds with two bodies and forgets to teach it about. `codec.BODIES_KEY`
+     * is the same string on the Python side.
+     */
+    public static final String BODIES_KEY = "bodies";
 
     /** The buffer holds less than one whole frame. Normal on a stream socket. */
     public static class Incomplete extends RuntimeException {
@@ -1545,9 +1976,19 @@ public final class Frame {
     public static final class Decoded {
         public final Map<String, Object> header;
         public final byte[] body;
+        /** The SECOND body, or null when the frame carries one. Null and
+         *  zero-length are different answers: a two-body frame whose response
+         *  half is empty decodes to an empty array here, and reading that as
+         *  "there was no second half" is how an exchange with no response
+         *  would come to look like an ordinary one-body frame. */
+        public final byte[] second;
         public final int consumed;
         Decoded(Map<String, Object> header, byte[] body, int consumed) {
-            this.header = header; this.body = body; this.consumed = consumed;
+            this(header, body, null, consumed);
+        }
+        Decoded(Map<String, Object> header, byte[] body, byte[] second, int consumed) {
+            this.header = header; this.body = body;
+            this.second = second; this.consumed = consumed;
         }
     }
 
@@ -1564,6 +2005,80 @@ public final class Frame {
         out[4 + head.length] = '\n';
         System.arraycopy(body, 0, out, 5 + head.length, body.length);
         return out;
+    }
+
+    /**
+     * The two-body form: one frame carrying a request and a response.
+     *
+     * The header is COPIED and stamped with {@link #BODIES_KEY} here rather
+     * than trusted from the caller, so the declaration on the wire and the
+     * shape of the bytes cannot disagree -- a caller that forgot the key would
+     * otherwise produce a frame whose second body is silently read as trailing
+     * bytes of the first. The frame is then built by the one-body encoder
+     * above, which is what keeps the outer form identical.
+     */
+    public static byte[] encode(Map<String, Object> header, byte[] first, byte[] second) {
+        long total = 4L + first.length + 4L + second.length;
+        // Checked before the arrays are joined, not after: MAX_FRAME exists so
+        // one frame cannot make this JVM allocate arbitrarily, and a check that
+        // runs after the allocation it is bounding has already lost.
+        if (total > MAX_FRAME)
+            throw new FrameError("two bodies of " + first.length + " + "
+                                 + second.length + " exceed MAX_FRAME " + MAX_FRAME);
+        byte[] payload = new byte[(int) total];
+        putInt(payload, 0, first.length);
+        System.arraycopy(first, 0, payload, 4, first.length);
+        putInt(payload, 4 + first.length, second.length);
+        System.arraycopy(second, 0, payload, 8 + first.length, second.length);
+        Map<String, Object> stamped = new java.util.LinkedHashMap<>(header);
+        stamped.put(BODIES_KEY, 2L);
+        return encode(stamped, payload);
+    }
+
+    private static void putInt(byte[] out, int at, int v) {
+        out[at] = (byte) (v >>> 24); out[at + 1] = (byte) (v >>> 16);
+        out[at + 2] = (byte) (v >>> 8); out[at + 3] = (byte) v;
+    }
+
+    private static long getInt(byte[] b, int at) {
+        return ((long) (b[at] & 0xff) << 24) | ((b[at + 1] & 0xff) << 16)
+             | ((b[at + 2] & 0xff) << 8) | (b[at + 3] & 0xff);
+    }
+
+    /** Whether the header declares the two-body form. `2L` and nothing else:
+     *  Json.parse yields Long for every integer, and a `bodies` this version
+     *  does not know is a frame it cannot read, not one to guess at. */
+    private static boolean declaresTwoBodies(Map<String, Object> header) {
+        Object b = header.get(BODIES_KEY);
+        if (b == null) return false;
+        if (Long.valueOf(2L).equals(b)) return true;
+        throw new FrameError("header declares " + BODIES_KEY + "=" + b
+                             + "; this version reads 2 and no other value");
+    }
+
+    /**
+     * Split a declared two-body payload. EXACT FIT is required: the two
+     * declared lengths must consume the payload to its last byte. A payload
+     * with bytes left over is a frame this side and the other side would read
+     * differently, and the whole reason the lengths are on the wire at all is
+     * so neither has to guess where the halves end.
+     */
+    private static byte[][] splitBodies(byte[] payload) {
+        if (payload.length < 4)
+            throw new FrameError("two-body frame has no length prefix for its first body");
+        long n1 = getInt(payload, 0);
+        if (payload.length < 4 + n1 + 4)
+            throw new FrameError("two-body frame declares a first body of " + n1
+                                 + " but holds " + payload.length + " bytes");
+        long n2 = getInt(payload, (int) (4 + n1));
+        if (payload.length != 8 + n1 + n2)
+            throw new FrameError("two-body frame declares bodies of " + n1 + " + "
+                                 + n2 + ", which do not fill its " + payload.length
+                                 + " bytes");
+        return new byte[][] {
+            Arrays.copyOfRange(payload, 4, (int) (4 + n1)),
+            Arrays.copyOfRange(payload, (int) (8 + n1), (int) (8 + n1 + n2)),
+        };
     }
 
     public static Decoded decode(byte[] buf) {
@@ -1597,7 +2112,12 @@ public final class Frame {
         } catch (Json.JsonError e) {
             throw new FrameError("header is not valid JSON: " + e.getMessage());
         }
-        return new Decoded(header, Arrays.copyOfRange(buf, nl + 1, end), end);
+        byte[] payload = Arrays.copyOfRange(buf, nl + 1, end);
+        if (declaresTwoBodies(header)) {
+            byte[][] two = splitBodies(payload);
+            return new Decoded(header, two[0], two[1], end);
+        }
+        return new Decoded(header, payload, end);
     }
 
     /** Peer closed the connection. Distinct from Incomplete, which means
@@ -1848,6 +2368,7 @@ git commit -m "feat(bridge): zero-dependency Java codec, tested against the shar
 
 ```python
 # tests/test_bridge_server.py
+import logging
 import os
 import socket
 import stat
@@ -3692,6 +4213,352 @@ def test_send_refuses_a_reply_that_is_not_a_result_or_an_error(srv_with_halt):
         assert out["err"].error_class is None
     finally:
         c.close()
+
+
+# ---- Plan 4's unsolicited proxy traffic ---------------------------------
+#
+# `exchange`, `denial` and `dropped` frames answer no request: nothing is
+# waiting on an id, so `_deliver` would drop them on the floor. They go to
+# `on_exchange`, on the READ THREAD, with the same discipline `on_hello` and
+# `on_halted` carry -- and with one deliberate difference, which the first two
+# tests below are about.
+
+
+def _exchange_server(tmp_path, halt, sink):
+    s = server.BridgeServer(tmp_path / "x.sock", engagement_id="e-1",
+                            operator_halt=halt, on_exchange=sink)
+    s.start()
+    return s
+
+
+def _push(c, frame: bytes, srv, predicate, timeout=5.0):
+    """Write an unsolicited frame and wait for the read thread to act on it."""
+    c.sendall(frame)
+    deadline = time.time() + timeout
+    while time.time() < deadline and not predicate():
+        time.sleep(0.005)
+    return predicate()
+
+
+def test_an_exchange_frame_reaches_the_sink_with_both_halves(tmp_path, halt):
+    seen = []
+    s = _exchange_server(tmp_path, halt,
+                         lambda h, req, resp: seen.append((h, req, resp)))
+    try:
+        c = _connected(s)
+        frame = codec.encode_two(
+            {"v": 1, "t": "exchange", "via": "proxy", "source": "operator",
+             "method": "GET", "url": "http://app.test/x", "status": 200,
+             "ms": 12, "outcome": "ok"},
+            b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\nhi")
+        assert _push(c, frame, s, lambda: len(seen) == 1)
+        header, request, response = seen[0]
+        assert header["url"] == "http://app.test/x"
+        # The two halves arrive APART. Spliced, the far side would hash one
+        # blob for what S5 stores as two, and every request digest in the
+        # engagement would carry its response's bytes.
+        assert request == b"GET / HTTP/1.1\r\n\r\n"
+        assert response == b"HTTP/1.1 200 OK\r\n\r\nhi"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_dropped_frame_reaches_the_sink_and_does_not_close_the_channel(tmp_path, halt):
+    """Before this arm existed a `dropped` frame fell through `_handle` to
+    `return False`: the drop report -- the one thing that says a run's coverage
+    is a floor -- closed the connection that carried it, and DENY-ALL is where
+    a closed connection lands."""
+    seen = []
+    s = _exchange_server(tmp_path, halt,
+                         lambda h, req, resp: seen.append(h))
+    try:
+        c = _connected(s)
+        assert _push(c, codec.encode({"v": 1, "t": "dropped", "n": 7,
+                                      "source": "crawler"}),
+                     s, lambda: len(seen) == 1)
+        assert seen[0]["n"] == 7
+        assert seen[0]["source"] == "crawler"
+        # Still live: another frame gets through on the same connection.
+        assert _push(c, codec.encode({"v": 1, "t": "denial", "via": "proxy",
+                                      "url": "http://app.test/y",
+                                      "error_class": "scope_denied"}),
+                     s, lambda: len(seen) == 2)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_sink_that_throws_does_not_take_the_connection_down(tmp_path, halt):
+    """The one callback whose throw is NOT fatal, and S4 is why: a wedged
+    harness or a lost record changes what hx KNOWS, never what it ALLOWS. A
+    bookkeeping bug closing the channel would drop the extension to DENY-ALL
+    and stop the operator's browsing -- the failure turned into an outage.
+
+    `on_halted` is the opposite case and stays that way: a stop nothing wrote
+    down is a stop that did not happen.
+    """
+    calls = []
+
+    def sink(header, request, response):
+        calls.append(header)
+        raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        # TWO calls for one frame: the exchange, and the `dropped` frame that
+        # says the exchange was lost. The retry is attempted ONCE and only for
+        # a frame that was not itself a drop report, so a sink that raises on
+        # everything costs one extra call and not a recursion.
+        assert _push(c, frame, s, lambda: len(calls) == 2)
+        assert calls[0]["t"] == "exchange"
+        assert calls[1] == {"v": 1, "t": "dropped", "n": 1}
+        assert isinstance(s.exchange_callback_error, RuntimeError)
+        assert s.exchange_errors == 2      # the exchange, and the retry
+        # ...and the NEXT one still arrives, which is what "not fatal" means.
+        assert _push(c, frame, s, lambda: len(calls) == 4)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_lost_exchange_is_handed_back_as_a_drop(tmp_path, halt):
+    """The coverage floor, on this side of the bridge.
+
+    `exchange_callback_error` and `exchange_errors` are kept, and nothing
+    outside tests/ reads either -- so a run whose every exchange frame was
+    malformed reported COMPLETE coverage. That is the Java side's "a Burp log
+    line is not the coverage floor" wearing a different hat. `run.dropped_total`
+    is the number S5 makes the floor, and the only way a loss here reaches it
+    is a `dropped` frame.
+    """
+    seen = []
+
+    def sink(header, request, response):
+        seen.append(header)
+        if header.get("t") != "dropped":
+            raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange", "via": "proxy",
+                                  "source": "crawler",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        assert _push(c, frame, s, lambda: len(seen) == 2)
+        assert seen[1]["t"] == "dropped" and seen[1]["n"] == 1
+        # Against the CRAWLER's run, not the operator's. `hx.capture._run`
+        # turns this string into a run KIND, and filing the crawler's lost
+        # exchange against the operator inflates the wrong row's floor.
+        assert seen[1]["source"] == "crawler"
+        assert s.exchange_errors == 1      # the retry succeeded
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_lost_drop_report_is_not_re_reported_as_another_drop(tmp_path, halt):
+    """One extra call, never a recursion -- and never a count of its own.
+
+    A `dropped` frame the sink could not record is already the coverage floor
+    failing to land; answering it with a second `dropped` frame would be a
+    number this side invented, and a sink that refuses every drop report would
+    invent one per frame forever.
+    """
+    seen = []
+
+    def sink(header, request, response):
+        seen.append(header)
+        raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        assert _push(c, codec.encode({"v": 1, "t": "dropped", "n": 5}),
+                     s, lambda: s.exchange_errors == 1)
+        time.sleep(0.05)
+        assert len(seen) == 1 and seen[0]["n"] == 5
+        assert s.exchange_errors == 1
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_malformed_two_body_payload_is_counted_not_raised(tmp_path, halt):
+    """`_serve` closes the connection on a FrameError, so a split that raised
+    out of `_handle` would be the same outage by another route."""
+    seen = []
+    s = _exchange_server(tmp_path, halt, lambda h, q, r: seen.append(h))
+    try:
+        c = _connected(s)
+        # Declares two bodies; the payload holds one truncated length prefix.
+        bad = codec.encode({"v": 1, "t": "exchange", "url": "http://app.test/x",
+                            codec.BODIES_KEY: 2}, b"\x00\x00")
+        assert _push(c, bad, s, lambda: s.exchange_errors == 1)
+        assert isinstance(s.exchange_callback_error, codec.FrameError)
+        # The frame never became an exchange row -- and it did not vanish
+        # either. A payload that could not be split is a record hx does not
+        # have, so it reaches the sink as a drop instead.
+        assert seen == [{"v": 1, "t": "dropped", "n": 1}]
+        good = codec.encode_two({"v": 1, "t": "exchange",
+                                 "url": "http://app.test/y"}, b"a", b"b")
+        assert _push(c, good, s, lambda: len(seen) == 2)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_an_exchange_frame_with_no_sink_installed_keeps_the_channel(tmp_path, halt):
+    """A harness that has not wired capture up yet is a harness that loses the
+    records, not one that loses the connection."""
+    s = server.BridgeServer(tmp_path / "n.sock", engagement_id="e-1",
+                            operator_halt=halt)
+    s.start()
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        c.sendall(frame)
+        c.sendall(codec.encode({"v": 1, "t": "dropped", "n": 1}))
+        # Nothing to observe on the sink, so observe the channel instead: a
+        # hello over the same connection still lands.
+        assert _push(c, codec.encode({"v": 1, "t": "halted", "reason": "x",
+                                      "host": "h", "window": "w"}),
+                     s, lambda: s.last_halted is not None)
+        c.close()
+    finally:
+        s.stop()
+
+
+def _reject_next_peer(monkeypatch):
+    """Make SO_PEERCRED report a foreign uid, the way
+    `test_so_peercred_rejects_a_foreign_uid` does. A test cannot connect as
+    another account, and the branch worth covering is the one that only
+    another account can reach."""
+    real_getsockopt = socket.socket.getsockopt
+
+    def fake_getsockopt(self, level, optname, buflen=0):
+        if optname == socket.SO_PEERCRED:
+            return struct.pack("3i", 4242, os.getuid() + 1, os.getgid())
+        return real_getsockopt(self, level, optname, buflen)
+
+    monkeypatch.setattr(socket.socket, "getsockopt", fake_getsockopt)
+
+
+def test_a_refused_peer_is_counted_and_logged_rather_than_dropped_in_silence(
+        srv, monkeypatch, caplog):
+    """S6's uid check left NO TRACE, and it is the one connection event on
+    this socket that is a security event rather than a misconfiguration.
+
+    `rejected_hellos` sits four lines of code away and has been counted since
+    Plan 2 -- a wrong engagement_id, which is an operator pointing a harness
+    at the wrong store. Another UID on this machine reaching for a capability
+    that can send arbitrary HTTP into a client's production estate got a bare
+    `return`: no counter, no log line, no row. An attempt nobody can see is
+    indistinguishable from no attempt.
+
+    Both halves are asserted. The counter is what a caller can read; the log
+    line is what an operator sees at the time, and `hx` installs no handler,
+    so the LEVEL is load-bearing -- under Python's default configuration a
+    WARNING reaches lastResort on stderr and an INFO does not.
+    """
+    _reject_next_peer(monkeypatch)
+    before = srv.rejected_peers
+    with caplog.at_level(logging.WARNING, logger="hx.bridge.server"):
+        c = _client(srv.socket_path)
+        try:
+            hello = codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                  "pid": os.getpid(), "burp_version": "x",
+                                  "instance_id": "i-1", "engagement_id": "e-1"})
+            assert _never_served(c, hello) == b""
+            _await(lambda: srv.rejected_peers > before,
+                   "a peer was refused by SO_PEERCRED and nothing counted it")
+        finally:
+            c.close()
+
+    assert srv.rejected_peers == before + 1
+    assert srv.last_rejected_peer["uid"] == os.getuid() + 1
+    assert srv.last_rejected_peer["pid"] == 4242
+    assert "exe" in srv.last_rejected_peer
+
+    warnings_ = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings_, (
+        "the refusal was counted and not logged. The counter is read by "
+        "whoever thinks to look; the log line is what reaches an operator who "
+        "does not know to")
+    text = warnings_[-1].getMessage()
+    assert str(os.getuid() + 1) in text and "4242" in text, text
+
+
+def test_a_refused_peer_is_still_refused_and_none_of_this_serves_it(
+        srv, monkeypatch):
+    """The counter must not be the only thing that changed. A diagnostic that
+    also opened the door would be worse than no diagnostic, and the two
+    fields the uid check `return`s in front of are what say the connection was
+    REFUSED rather than merely quiet."""
+    _reject_next_peer(monkeypatch)
+    c = _client(srv.socket_path)
+    try:
+        assert _never_served(c, codec.encode(
+            {"v": 1, "t": "hello", "ext_version": "0.1", "pid": os.getpid(),
+             "burp_version": "x", "instance_id": "i-1",
+             "engagement_id": "e-1"})) == b""
+        _await(lambda: srv.rejected_peers == 1, "the refusal was not counted")
+        assert (srv.peer_uid, srv.peer_pid, srv.peer_exe) == (None, None, None)
+        assert srv.state == "waiting"
+        assert srv.hello is None
+    finally:
+        c.close()
+
+
+def test_the_accepted_peers_executable_is_resolved_and_recorded(srv):
+    """S6: "peer credentials are checked and the connecting pid's executable
+    is logged." Nothing resolved it, on either path. This is a real pid -- the
+    test's own -- so the readlink succeeds and the value is the interpreter
+    running this suite, which is what makes the assertion a real one rather
+    than a check that some string was stored."""
+    c = _connected(srv)
+    try:
+        assert srv.peer_pid == os.getpid()
+        assert srv.peer_exe == os.readlink(f"/proc/{os.getpid()}/exe")
+    finally:
+        c.close()
+
+
+def test_an_unresolvable_executable_says_which_kind_of_unresolvable(monkeypatch):
+    """`peer_exe` NEVER RAISES and never answers "unknown".
+
+    It runs inside `_serve` on the accept-loop thread, where a throw takes the
+    connection down -- and a diagnostic that can refuse a peer is not a
+    diagnostic. The three answers are also deliberately different strings: for
+    a peer running as ANOTHER uid, which is exactly the peer this exists to
+    describe, `/proc/<pid>/exe` needs PTRACE_MODE_READ and the kernel refuses
+    it unless hx is root. "unknown" would read as "no executable" rather than
+    "not permitted to look", and the difference is the whole diagnostic.
+    """
+    def raiser(exc):
+        def go(_path):
+            raise exc
+        return go
+
+    monkeypatch.setattr(server.os, "readlink", raiser(PermissionError(13, "x")))
+    assert "permission denied" in server.peer_exe(1).lower()
+    monkeypatch.setattr(server.os, "readlink", raiser(FileNotFoundError(2, "x")))
+    assert "gone" in server.peer_exe(1)
+    monkeypatch.setattr(server.os, "readlink", raiser(OSError(5, "EIO")))
+    assert server.peer_exe(1).startswith("<unreadable:")
+    # A pid this process cannot possibly be resolving, through the REAL
+    # readlink: the answer is still a string and still not an exception.
+    monkeypatch.undo()
+    assert isinstance(server.peer_exe(0x7FFFFFFF), str)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3715,6 +4582,7 @@ unconfigured until a configure frame is acknowledged.
 """
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import socket
@@ -3724,6 +4592,46 @@ import time
 from pathlib import Path
 
 from hx.bridge import codec
+
+# The first logger in `src/`, and it is deliberately a plain module logger with
+# no handler and no configuration: a library that installs a handler decides
+# for its embedder where the operator's diagnostics go. `hx` has no logging
+# setup yet, so under Python's default these records reach lastResort at
+# WARNING -- which is the level the refusal below uses, and is why the refusal
+# is visible on a bare `python -c` while the accept is not.
+_log = logging.getLogger(__name__)
+
+
+def peer_exe(pid: int) -> str:
+    """What `/proc/<pid>/exe` points at, or why it could not be read. S6.
+
+    A DIAGNOSTIC, NEVER A CHECK, and the distinction is the whole reason this
+    is a separate function with a docstring rather than an inline readlink.
+    Between the `getsockopt` that produced this pid and this call, the peer
+    can have exited and the pid can have been reused -- so the answer names a
+    process that may not be the one that connected. S6 says the executable is
+    LOGGED and says the credentials are CHECKED, and those are two different
+    sentences about two different facts: the uid is what authorises, and this
+    is what a human reads afterwards.
+    """
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except PermissionError:
+        # THE COMMON CASE FOR THE PATH THAT MATTERS, and it is stated rather
+        # than pretended around. Reading this link needs PTRACE_MODE_READ, so
+        # for a peer running as ANOTHER uid -- exactly the peer this is most
+        # worth knowing about -- the kernel refuses it unless hx is root. The
+        # uid, the pid and the refusal itself are still recorded; the program
+        # name is the part that is not available, and saying "unknown" would
+        # read as "no executable" rather than "not permitted to look".
+        return "<unreadable: permission denied (needs PTRACE_MODE_READ)>"
+    except FileNotFoundError:
+        return "<gone: the process exited before it could be resolved>"
+    except OSError as exc:
+        # Never raises. This runs inside `_serve`, on the accept-loop thread,
+        # where a throw would take the connection down -- and a diagnostic
+        # that can refuse a peer is not a diagnostic.
+        return f"<unreadable: {exc}>"
 
 
 class BridgeError(Exception):
@@ -3784,7 +4692,7 @@ class BridgeServer:
                                      "engagement_id"})
 
     def __init__(self, socket_path: Path, engagement_id: str, operator_halt,
-                 on_hello=None, on_halted=None):
+                 on_hello=None, on_halted=None, on_exchange=None):
         """
         `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
         module keeps no dependency on the store, and tests can attach anything
@@ -3812,11 +4720,26 @@ class BridgeServer:
         sentinel in a directory of its own, which is exactly the discipline
         the Java side imposes on itself.
 
-        `on_hello` and `on_halted` are both called ON THE READ THREAD, so
-        neither may touch a sqlite3 connection opened elsewhere: it belongs to
-        the thread that created it and raises ProgrammingError anywhere else
-        (tests/test_halt.py demonstrates it). Hand the work to the thread that
-        owns the store instead.
+        `on_hello`, `on_halted` and `on_exchange` are ALL called ON THE READ
+        THREAD, so none may touch a sqlite3 connection opened elsewhere: it
+        belongs to the thread that created it and raises ProgrammingError
+        anywhere else (tests/test_halt.py demonstrates it). Hand the work to
+        the thread that owns the store instead.
+
+        `on_exchange(header, request, response)` takes Plan 4's proxy traffic:
+        `exchange`, `denial` and `dropped` frames, which are UNSOLICITED --
+        nothing is waiting on an id, so without a sink installed they are read
+        and discarded. `hx.capture.Capture.on_exchange` has this shape.
+
+        IT IS THE ONE CALLBACK WHOSE THROW IS NOT FATAL. `on_halted` returning
+        an exception closes the connection, because a stop nothing wrote down
+        is a stop that did not happen. Capture is the opposite case and S4 says
+        so: a wedged harness or a lost record changes what hx KNOWS, never what
+        it ALLOWS, so a bookkeeping failure here must not become an outage on
+        the operator's browser. The exception is kept in
+        `exchange_callback_error`, the channel is kept with it, and the lost
+        record is handed back as a `dropped` frame so the run's coverage floor
+        moves -- see `_capture`, which explains why keeping it was not enough.
         """
         if operator_halt is None:
             # The signature already refuses an OMITTED argument. This refuses
@@ -3835,18 +4758,50 @@ class BridgeServer:
         self.engagement_id = engagement_id
         self.on_hello = on_hello
         self.on_halted = on_halted
+        self.on_exchange = on_exchange
         self.operator_halt = operator_halt
         # The last unsolicited `halted` frame, kept so a harness with no
         # on_halted callback installed can still see why issuance stopped.
         self.last_halted: dict | None = None
         self.halted_callback_error: BaseException | None = None
+        # The last thing an `on_exchange` frame failed on -- a malformed
+        # two-body payload, or a throw out of the sink. Recorded rather than
+        # raised: see the note on the constructor's `on_exchange`. These two
+        # are DIAGNOSTICS, read by tests and by whoever is debugging the
+        # bridge; the coverage consequence of the same failure travels the
+        # `dropped` frame `_capture` hands back, because nothing outside
+        # tests/ reads either of these and a run cannot get its floor from a
+        # number no one looks at.
+        #
+        # `exchange_errors` COUNTS FAILED SINK CALLS, NOT RECORDS LOST, and the
+        # two stopped being the same number when `_count_as_dropped` arrived:
+        # ONE lost record whose `dropped` retry also raises counts TWO, the
+        # original call and the retry. That is the right number for a
+        # diagnostic -- it is how many times the sink misbehaved, which is what
+        # someone debugging the sink wants -- and the wrong one for coverage,
+        # which is exactly why coverage does not come from here.
+        # `run.dropped_total`, fed by the `dropped` frame, is the count of
+        # RECORDS.
+        self.exchange_callback_error: BaseException | None = None
+        self.exchange_errors = 0
 
         self.state = "waiting"
         self.config_epoch = 0
         self.peer_uid: int | None = None
         self.peer_pid: int | None = None
+        self.peer_exe: str | None = None
         self.hello: dict | None = None
         self.rejected_hellos = 0
+        # Peers refused by SO_PEERCRED, i.e. another UID on this machine
+        # reaching for this socket. It sits beside `rejected_hellos`
+        # deliberately: the two are the same kind of number and one of them
+        # existed while the other -- the one that is a security event rather
+        # than a misconfiguration -- did not.
+        self.rejected_peers = 0
+        # The last one, for whoever is looking. Kept rather than only logged,
+        # because `hx` installs no logging handler and a library that did
+        # would be deciding for its embedder where diagnostics go.
+        self.last_rejected_peer: dict | None = None
 
         self._srv: socket.socket | None = None
         self._conn: socket.socket | None = None
@@ -3943,8 +4898,33 @@ class BridgeServer:
             if uid != os.getuid():
                 # The socket authenticates a uid, not a program; a different
                 # uid has no business here at all.
+                #
+                # COUNTED AND LOGGED, and it used to be a bare `return`. This
+                # is the one security-relevant connection event on this socket
+                # -- another account on this machine reaching for a capability
+                # that can send arbitrary HTTP into a client's production
+                # estate -- and it left no counter, no log line and no row, in
+                # contrast with `rejected_hellos` four lines of code away. An
+                # attempt nobody can see is indistinguishable from no attempt,
+                # and the refusal is exactly the thing worth knowing happened.
+                self.rejected_peers += 1
+                self.last_rejected_peer = {"pid": pid, "uid": uid,
+                                           "exe": peer_exe(pid)}
+                _log.warning(
+                    "hx bridge: refused a peer on %s -- uid %d is not %d "
+                    "(pid %d, exe %s). The socket authenticates a UID; a "
+                    "different one has no business here at all.",
+                    self.socket_path, uid, os.getuid(), pid, peer_exe(pid))
                 return
             self.peer_pid, self.peer_uid = pid, uid
+            # S6: "peer credentials are checked and the connecting pid's
+            # executable is LOGGED". Nothing resolved it, so the second half
+            # of that sentence was unmet on the path that succeeds as well as
+            # on the one that refuses. It is a diagnostic and never a check --
+            # see `peer_exe` for why it cannot be one.
+            self.peer_exe = peer_exe(pid)
+            _log.info("hx bridge: peer accepted on %s -- uid %d, pid %d, "
+                      "exe %s", self.socket_path, uid, pid, self.peer_exe)
 
             reader = codec.FrameReader(conn)
             while not self._stopping.is_set():
@@ -4032,15 +5012,109 @@ class BridgeServer:
                     return False
             return True
 
+        if t in ("exchange", "denial", "dropped"):
+            # `exchange` USED TO BE IN THE `_deliver` TUPLE BELOW and is not any
+            # more, which is deliberate rather than an oversight. `_deliver`
+            # answers a WAITER by `id`; these three are UNSOLICITED -- nothing
+            # holds an id for them -- so `_deliver` had nothing to wake and the
+            # frame reached no one. Nothing regressed on the send path when it
+            # moved: no solicited `exchange` reply exists in either
+            # implementation, and no `_request` waits on one.
+            self._capture(t, header, body)
+            return True
+
         if t == "configured":
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error", "exchange"):
+        if t in ("result", "error"):
             self._deliver(header, body)
             return True
 
         return False
+
+    def _capture(self, t: str, header: dict, body: bytes) -> None:
+        """Plan 4's unsolicited proxy traffic, handed to the sink.
+
+        NOTHING RAISES OUT OF HERE. `_serve` closes the connection on a
+        FrameError, and DENY-ALL is where a closed connection lands -- so a
+        malformed body or a sink that threw would take the operator's browsing
+        down with it, and the `halt` path with it. S4: a lost record changes
+        what hx knows, never what it allows. `codec.decode` leaves the two-body
+        split to `split_bodies` for exactly this reason; see the note there.
+
+        THE FAILURE IS KEPT *AND* COUNTED WHERE COVERAGE IS READ. Keeping it in
+        `exchange_callback_error` / `exchange_errors` was the whole of it, and
+        nothing outside `tests/` ever read either -- so a run whose every
+        exchange frame was malformed reported COMPLETE coverage, which is the
+        Java side's "a Burp log line is not the coverage floor" wearing a
+        different hat. A frame that could not be recorded is a record hx does
+        not have, so it goes back to the sink as a one-record `dropped` frame:
+        `run.dropped_total` is the number S5 makes the floor, and this is how a
+        loss on THIS side reaches it.
+
+        The retry is attempted ONCE and only for a frame that was not itself a
+        drop report, so a sink that raises on everything costs one extra call
+        and not a recursion; if that call fails too, the count stands and the
+        channel is still kept.
+
+        AND THAT LAST CASE LOSES THE COVERAGE FLOOR TOO -- named here because
+        it is the same lesson one layer up, and MEASURED in Task 9 against a
+        real Burp: with a sink that raises on every frame, three browsed
+        requests produced `exchange_errors = 6` (three exchanges and their
+        three `dropped` retries), no exchange rows, and `run.dropped_total`
+        STILL 0. The three requests reached the target and were served, which
+        is right -- S4 is unconditional -- but a reader of that run sees
+        complete coverage over an hour in which nothing was recorded at all.
+        `exchange_errors` is the only thing on this side that says otherwise
+        and NOTHING OUTSIDE tests/ READS IT, which is precisely the criticism
+        this method's own paragraph above makes of the version before it.
+        The floor moves only for a sink that fails on exchanges and SUCCEEDS on
+        `dropped` frames -- the saturated-queue case it was built for, where
+        the far side is slow rather than broken.
+
+        Not fixed here, and the reason is that there is nowhere honest to put
+        it: `run.dropped_total` is a column in the store, the store is what the
+        sink writes to, and a sink that cannot be written to cannot record that
+        it could not be written to. It needs a channel that is not the sink --
+        an operator-facing warning at `hx info`, or a harness-side log -- and
+        that is a decision about the CLI, not about this method.
+
+        Only `exchange` carries two bodies. `denial` and `dropped` describe
+        something that produced no traffic, so they arrive with an empty body
+        and are passed on as two empty halves -- which is what the far side's
+        `Capture.on_exchange` reads for them anyway.
+        """
+        if self.on_exchange is None:
+            return
+        try:
+            if t == "exchange":
+                request, response = codec.split_bodies(header, body)
+            else:
+                request, response = b"", b""
+            self.on_exchange(header, request, response)
+        except Exception as exc:
+            self.exchange_callback_error = exc
+            self.exchange_errors += 1
+            self._count_as_dropped(t, header)
+
+    def _count_as_dropped(self, t: str, header: dict) -> None:
+        """Tell the sink one record was lost. See `_capture`.
+
+        The `source` is carried across so the loss lands on the run the frame
+        belonged to; `hx.capture` reads an absent one as the operator's, which
+        is the same answer it gives an omitted key on the wire.
+        """
+        if t == "dropped":
+            return
+        drop = {"v": codec.PROTOCOL_VERSION, "t": "dropped", "n": 1}
+        if isinstance(header.get("source"), str):
+            drop["source"] = header["source"]
+        try:
+            self.on_exchange(drop, b"", b"")
+        except Exception as exc:
+            self.exchange_callback_error = exc
+            self.exchange_errors += 1
 
     def _reassert_halt(self) -> bool:
         """Tell a freshly connected peer it is still halted. False to close.
@@ -4874,6 +5948,10 @@ public class BridgeClientTest {
               BridgeClientTest::aThrowingSendArmBothDeniesAndStopsTheLoop);
             t("anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives",
               BridgeClientTest::anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives);
+            t("theExchangeSinkFramesBothHalves",
+              BridgeClientTest::theExchangeSinkFramesBothHalves);
+            t("theExchangeSinkNeverRaisesIntoCapture",
+              BridgeClientTest::theExchangeSinkNeverRaisesIntoCapture);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -6069,6 +7147,159 @@ public class BridgeClientTest {
         }
     }
 
+    /**
+     * The capture sink, on the wire: one frame, two bodies, version stamped.
+     *
+     * The two halves cannot share one opaque body -- the far side
+     * content-addresses each on its own -- and a `v` this side forgets is a
+     * frame BridgeServer._handle drops before it looks at `t` at all.
+     */
+    static void theExchangeSinkFramesBothHalves() throws Exception {
+        Path dir = Files.createTempDirectory("hxbridge-x");
+        try (Live l = live(dir, "xs.sock")) {
+            BridgeClient.ExchangeSink sink = l.client.exchangeSink();
+            Map<String, Object> h = new LinkedHashMap<>();
+            h.put("t", "exchange");
+            h.put("via", "proxy");
+            h.put("source", "operator");
+            h.put("url", "http://app.test/x");
+            check("a delivered exchange answers TRUE, which is what lets the "
+                  + "drain not count it as a drop",
+                  sink.exchange(h, "REQ".getBytes(StandardCharsets.UTF_8),
+                                "RESPONSE".getBytes(StandardCharsets.UTF_8)));
+            Frame.Decoded f = read(l.reader, l.peer, "the exchange frame");
+            check("the frame is an exchange (" + f.header.get("t") + ")",
+                  "exchange".equals(f.header.get("t")));
+            check("and carries the protocol version (" + f.header.get("v") + ")",
+                  Long.valueOf(BridgeClient.PROTOCOL_VERSION).equals(f.header.get("v")));
+            check("and declares two bodies (" + f.header.get(Frame.BODIES_KEY) + ")",
+                  Long.valueOf(2L).equals(f.header.get(Frame.BODIES_KEY)));
+            check("the request half arrived intact ("
+                  + new String(f.body, StandardCharsets.UTF_8) + ")",
+                  "REQ".equals(new String(f.body, StandardCharsets.UTF_8)));
+            check("and the response half separately, not spliced onto it ("
+                  + (f.second == null ? "null"
+                     : new String(f.second, StandardCharsets.UTF_8)) + ")",
+                  f.second != null
+                  && "RESPONSE".equals(new String(f.second, StandardCharsets.UTF_8)));
+
+            // A drop report the far side can add to run.dropped_total.
+            check("a delivered drop report answers TRUE, which is what lets "
+                  + "the drain advance its cumulative counter",
+                  sink.dropped(4L, "crawler"));
+            Frame.Decoded d = read(l.reader, l.peer, "the drop report");
+            check("the drop frame is the type hx.capture knows ("
+                  + d.header.get("t") + ")", "dropped".equals(d.header.get("t")));
+            check("and carries n as an integer (" + d.header.get("n") + ")",
+                  Long.valueOf(4L).equals(d.header.get("n")));
+            check("and names the source whose run it belongs to ("
+                  + d.header.get("source") + ")",
+                  "crawler".equals(d.header.get("source")));
+
+            // A source with no spelling gets no key, rather than the operator's.
+            // hx/capture.py documents what an ABSENT source means and answers
+            // the operator's run for it; a second place writing "operator" is a
+            // second place that decision can drift. NULL is how "no spelling"
+            // reaches here now: `Capture.sourceName` answers it for a Source
+            // this side has no string for, and this file no longer knows what
+            // an hx.proxy enum is at all.
+            sink.dropped(1L, null);
+            Frame.Decoded u = read(l.reader, l.peer, "the unattributed drop report");
+            check("an unspellable source is omitted, not defaulted ("
+                  + u.header.get("source") + ")",
+                  !u.header.containsKey("source"));
+
+            // A denial: S4's second enforcement point refusing a request.
+            // ONE body slot and it is empty -- the request never left, so
+            // there are no bytes to carry, and `server.py::_capture` splits
+            // two bodies out of an `exchange` frame ONLY. A denial framed
+            // with two would be read as a malformed exchange by the far side
+            // and counted as a drop rather than recorded as the refusal it is.
+            Map<String, Object> dn = new LinkedHashMap<>();
+            dn.put("t", "denial");
+            dn.put("via", "proxy");
+            dn.put("source", "operator");
+            dn.put("method", "POST");
+            dn.put("url", "http://app.test/account/delete");
+            dn.put("error_class", "dangerous_denied");
+            dn.put("detail", "matches dangerous.path /account/delete");
+            check("a delivered denial answers TRUE, which is what lets the "
+                  + "drain not count it as a drop", sink.denial(dn));
+            Frame.Decoded n = read(l.reader, l.peer, "the denial frame");
+            check("the denial frame is the type hx.capture knows ("
+                  + n.header.get("t") + ")", "denial".equals(n.header.get("t")));
+            check("and carries the protocol version (" + n.header.get("v") + ")",
+                  Long.valueOf(BridgeClient.PROTOCOL_VERSION).equals(n.header.get("v")));
+            check("and the class the far side routes on ("
+                  + n.header.get("error_class") + ")",
+                  "dangerous_denied".equals(n.header.get("error_class")));
+            check("and declares ONE body, not two (" + n.header.get(Frame.BODIES_KEY)
+                  + ")", !n.header.containsKey(Frame.BODIES_KEY));
+            check("which is empty (" + n.body.length + " bytes)",
+                  n.body.length == 0 && n.second == null);
+        } finally {
+            Files.deleteIfExists(dir.resolve("xs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A dead socket loses the records. It must not ALSO stop the browser, and
+     * it must not read as success.
+     *
+     * Not raising is the same rule as "offering never blocks", one layer down:
+     * an exception out of here lands on Capture's drain thread, and the drain
+     * dying is how a lost record becomes a permanently silent capture. So
+     * every arm of the sink swallows.
+     *
+     * SWALLOWING IS NOT ENOUGH, and this method's last check used to say it
+     * was: "and so was the lost drop report, which is the coverage floor",
+     * about a line in Burp's log. It is not the coverage floor.
+     * `run.dropped_total` is, and nothing reads Burp's log into it. Because
+     * these methods returned normally after logging, the drain read a failed
+     * write as an acknowledged report and advanced its cumulative counter past
+     * it: 5,000 drops counted while the harness restarts, one log line, a
+     * reconnect, and `run.dropped_total = 0`. The boolean is what the far side
+     * can act on.
+     */
+    static void theExchangeSinkNeverRaisesIntoCapture() throws Exception {
+        Path dir = Files.createTempDirectory("hxbridge-xd");
+        try (Live l = live(dir, "xd.sock")) {
+            BridgeClient.ExchangeSink sink = l.client.exchangeSink();
+            l.peer.close();
+            l.client.close();          // the channel is gone; writes must fail
+            boolean threw = false;
+            boolean anyClaimedDelivery = false;
+            try {
+                for (int i = 0; i < 5; i++) {
+                    anyClaimedDelivery |=
+                        sink.exchange(Map.of("t", "exchange", "url", "http://a/" + i),
+                                      "r".getBytes(StandardCharsets.UTF_8),
+                                      "s".getBytes(StandardCharsets.UTF_8));
+                    anyClaimedDelivery |= sink.dropped(1L, "operator");
+                    anyClaimedDelivery |=
+                        sink.denial(Map.of("t", "denial", "url", "http://a/" + i,
+                                           "error_class", "scope_denied"));
+                }
+            } catch (Throwable t) { threw = true; }
+            check("no arm raised into the drain thread", !threw);
+            check("and none claimed to have delivered anything, which is "
+                  + "what keeps the coverage floor countable",
+                  !anyClaimedDelivery);
+            check("the lost exchange was logged, not swallowed silently",
+                  l.log.sawError("exchange frame undeliverable"));
+            check("and so was the lost drop report",
+                  l.log.sawError("drop report undeliverable"));
+            // The denial is the newest of the three and the easiest to leave
+            // out: a refusal hx recorded nowhere is the one loss that reads,
+            // from the operator's side, exactly like a request that was
+            // allowed.
+            check("and so was the lost denial",
+                  l.log.sawError("denial frame undeliverable"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("xd.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
     static final byte[] CFG =
             "scope.include\thttps://RACE/*\n".getBytes(StandardCharsets.UTF_8);
 
@@ -6788,6 +8019,134 @@ public final class BridgeClient {
         out.flush();
     }
 
+    /** The two-body write, on the SAME monitor as the one-body one. Frames are
+     *  built whole and written under one lock precisely so two threads cannot
+     *  splice their bytes together -- and this one is written by the capture
+     *  drain while the read loop may be answering a send. */
+    private synchronized void send(Map<String, Object> header, byte[] first,
+                                   byte[] second) throws IOException {
+        out.write(Frame.encode(header, first, second));
+        out.flush();
+    }
+
+    /**
+     * Where the capture drain pushes what it has recorded.
+     *
+     * DECLARED HERE, like {@link HaltSink} and {@link SendHandler}, and for
+     * the same reason: the package that CALLS the bridge depends on the
+     * bridge, never the other way round. Returning a proxy-package type from
+     * this class made the two packages import each other -- a cycle javac
+     * does not mind and a reader does.
+     *
+     * SOURCE-AGNOSTIC, which is the half that actually breaks it. A
+     * `dropped(long, Source)` still names the other package in its signature,
+     * and an implementation of it still has to know how that enum is spelled.
+     * So the caller does the spelling -- `Capture.sourceName`, where it
+     * already lived -- and hands over a STRING, with `null` meaning "this
+     * source has no spelling". The sink's whole job with a null is to omit
+     * the key.
+     *
+     * FALSIFIABLE rather than asserted: ChokepointTest's
+     * `theBridgeNamesNothingInTheProxyPackage` counts the needle in every
+     * SHIPPED file of this package and requires zero, comments included.
+     * WHAT IT DOES NOT COVER is this package's tests: `ChokepointTest.sources()`
+     * walks `extension/src` only, and `extension/test` names the other package
+     * freely -- BridgeClientTest does, at the point where it builds a record
+     * to hand this sink. That is the right boundary rather than an oversight:
+     * a test is not compiled into the jar, so it cannot reintroduce the cycle
+     * the guard exists to keep out of it.
+     *
+     * EVERY METHOD ANSWERS WHETHER THE RECORD REACHED THE WIRE, and none
+     * raises. Not raising is the same rule as "offering never blocks", one
+     * layer down: an exception thrown back into the drain thread kills it,
+     * and every record after it is lost silently. But "swallow and return"
+     * alone was a second silence -- the drain read a normal return as
+     * success and advanced its cumulative counter past drops that never left
+     * the process. Measured shape: the queue saturates while the Python
+     * harness restarts, 5,000 drops are counted, the write fails, one line
+     * lands in Burp's log, the bridge reconnects, and `run.dropped_total`
+     * reads 0. A BURP LOG LINE IS NOT THE COVERAGE FLOOR. False is.
+     *
+     * NOT A SEND, and not gated like one. `maySend()` answers "may this
+     * extension ISSUE a request", and an exchange frame issues nothing: it
+     * reports traffic that has ALREADY happened, through the proxy, under
+     * S4's other enforcement point. Refusing to report it while halted would
+     * mean an operator hitting stop also stopped the record of what had been
+     * seen up to that moment -- the halt erasing its own evidence.
+     */
+    public interface ExchangeSink {
+        /** True once the frame is on the wire. False means the record is
+         *  lost and the caller is the only thing that can count it. */
+        boolean exchange(Map<String, Object> header, byte[] request, byte[] response);
+
+        /** `source` is the far side's spelling, or null for a source that has
+         *  none. True once the report is on the wire; false leaves the whole
+         *  outstanding total with the caller, to go out again. */
+        boolean dropped(long n, String source);
+
+        /** A request S4's second enforcement point refused. One body slot,
+         *  empty: `server.py::_capture` hands `denial` and `dropped` to the
+         *  sink as two empty halves. True once the frame is on the wire;
+         *  false means the record is lost and the caller must count it. */
+        boolean denial(Map<String, Object> header);
+    }
+
+    public ExchangeSink exchangeSink() {
+        return new ExchangeSink() {
+            public boolean exchange(Map<String, Object> header, byte[] request,
+                                    byte[] response) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.putAll(header);
+                try {
+                    send(f, request, response);
+                    return true;
+                } catch (Throwable e) {
+                    log.error("hx: exchange frame undeliverable, record lost: " + e);
+                    return false;
+                }
+            }
+
+            public boolean dropped(long n, String source) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.put("t", "dropped");
+                f.put("n", n);
+                // OMITTED, not defaulted, when the source has no spelling.
+                // `hx.capture` documents what an absent `source` means and
+                // answers the operator's run for it; writing "operator" here
+                // would make this file a second, quieter place that decision
+                // is taken, and the two would drift.
+                if (source != null) f.put("source", source);
+                try {
+                    send(f, new byte[0]);
+                    return true;
+                } catch (Throwable e) {
+                    log.error("hx: drop report undeliverable, coverage floor "
+                              + "unrecorded: " + e);
+                    return false;
+                }
+            }
+
+            public boolean denial(Map<String, Object> header) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.putAll(header);
+                try {
+                    // ONE body, and empty. A denial describes a request that
+                    // produced no traffic: there are no bytes to carry, and
+                    // `server.py::_capture` splits two bodies out of an
+                    // `exchange` frame only.
+                    send(f, new byte[0]);
+                    return true;
+                } catch (Throwable e) {
+                    log.error("hx: denial frame undeliverable, record lost: " + e);
+                    return false;
+                }
+            }
+        };
+    }
+
     public void close() {
         synchronized (commitLock) {
             closed = true;           // sticky: checked by connect() and handle()
@@ -7059,8 +8418,11 @@ Everything here was established empirically, most of it the hard way:
 """
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -7111,6 +8473,106 @@ def missing() -> list[str]:
         return _missing()
     except OSError as exc:
         return [f"prerequisites under {LAB} could not be checked: {exc}"]
+
+
+def _jar_problem() -> str | None:
+    """The ONE place the jar's state is judged: "missing", "stale", "future", None.
+
+    One function because the first version of this split had two, and they had
+    already diverged in the commit that created them: `_missing()` special-
+    cased a future-dated source and `unbuilt()` did not. That is not a
+    cosmetic drift. A future mtime cannot be cleared by rebuilding -- no jar
+    can be stamped later than a source dated years ahead -- and `_missing()`'s
+    own comment records it being reproduced ("two honest rebuilds, still
+    reported stale both times"). Routing it to a hard FAIL told the operator
+    to run a script that provably cannot help, permanently.
+
+    So the three outcomes are distinguished HERE, once, and routed by who can
+    fix them: "missing" and "stale" are build.sh's, "future" is the clock's.
+    """
+    if not EXT_JAR.exists():
+        return "missing"
+    newest = _newest_source_mtime()
+    if newest > time.time() + 60:
+        return "future"
+    if newest > _jar_mtime():
+        return "stale"
+    return None
+
+
+def unbuilt() -> list[str]:
+    """Build products of THIS repo that are absent or stale. These must FAIL.
+
+    `missing()` answers "can this machine run Burp at all" -- a question whose
+    honest answer on someone else's laptop is no, and a skip. This one answers
+    "did you run build.sh", whose answer is always yes-or-you-forgot, and a
+    skip there is the failure mode this project keeps finding: a missing
+    artefact turns into a silent green.
+
+    It is not hypothetical. Task 1's fix round inherited a tree whose jar was
+    stale, `-m integration` reported all 17 tests SKIPPED, and the baseline
+    recorded one commit earlier as "integration 17 passed" was not
+    reproducible as committed. The same shape had just been fixed one level
+    down for the probe source; it was still open here.
+
+    Kept separate from `missing()` rather than merged into it because the two
+    have opposite correct behaviours, and a single list forces one of them to
+    be wrong.
+
+    Returns EMPTY when the machine cannot build at all. `build.sh` needs the
+    montoya jar from the same lab `_environment_missing()` reports and exits 1
+    without it, so telling a contributor with no lab to "run extension/build.sh"
+    sends them to a script that cannot succeed. A build product is only
+    independent of the machine when the machine can build it.
+
+    Wrapped for the same reason `missing()` is: this runs at IMPORT TIME
+    through test_real_burp's skipif, and an exception here is not a skipped
+    test, it is `Interrupted: 1 error during collection` for the entire
+    repository -- 396 fast tests reporting nothing. That was measured against
+    a lab directory at mode 000, and `missing()`'s docstring already records
+    the same hazard biting twice before.
+    """
+    try:
+        if _environment_missing():
+            return []
+        problem = _jar_problem()
+        if problem == "missing":
+            return [f"extension jar is missing (run extension/build.sh): {EXT_JAR}"]
+        if problem == "stale":
+            return ["extension jar is older than its sources (run extension/build.sh)"]
+        return []
+    except OSError as exc:
+        return []
+
+
+def _environment_missing() -> list[str]:
+    """Prerequisites this MACHINE may legitimately not have. Never the jar.
+
+    Split out so a caller can take the subset it actually depends on.
+    `probe_missing()` is the reason: the probe compiles its own class and
+    launches with `--developer-extension-class-name=hx.proxy.Probe`, so it
+    never loads the extension jar -- yet it inherited the jar's rows through
+    missing() and a STALE JAR silenced all three of Task 1's measurements.
+    A prerequisite that is not one is still a skip, and a skip still reports
+    green.
+    """
+    try:
+        return _environment_missing_unguarded()
+    except OSError as exc:
+        return [f"prerequisites under {LAB} could not be checked: {exc}"]
+
+
+def _environment_missing_unguarded() -> list[str]:
+    absent = []
+    if not BURP_JAR.exists():
+        absent.append(f"burp jar: {BURP_JAR}")
+    if not (SEED_HOME / ".java").is_dir():
+        absent.append(f"seed burp home: {SEED_HOME / '.java'}")
+    elif not _eula_accepted():
+        absent.append(f"burp.eula not accepted in {SEED_HOME / '.java'}")
+    if not (SEED_HOME / ".BurpSuite").is_dir():
+        absent.append(f"seed burp home: {SEED_HOME / '.BurpSuite'}")
+    return absent
 
 
 def _missing() -> list[str]:
@@ -7236,15 +8698,103 @@ def make_home(workdir: Path) -> Path:
     return home
 
 
+# The project config both launchers hand Burp, and the ports inside it.
+#
+# These three live ABOVE launch_burp because BOTH launchers need them and a
+# second copy is a second set of listener settings free to drift from this one
+# -- `listen_mode: loopback_only` above all, which is written once here and
+# read back by not_loopback_only() for whichever Burp is running. The probe
+# section below is where the mechanism is EXPLAINED (see launch_probe): Burp
+# Community has no API for creating a listener, so a listener comes from a
+# project config file or it does not exist.
+
+PROXY_CONFIG = "proxy-listeners.json"
+
+
+def _free_port() -> int:
+    """A port nothing holds right now, for a listener Burp is about to bind.
+
+    Necessary rather than tidy, and measured the hard way. A first draft of
+    this fixture picked its ports by hand, and every one of them was already
+    taken on this machine: 8080 by a llama.cpp router, 18080 by a node service,
+    18081 by an agent. A taken port does not fail, it SUCCEEDS against the
+    wrong process -- that run got a clean `421` from one and a clean `200` from
+    another, with Burp never involved and the probe file holding nothing but
+    `PROBE READY`. (8080 answers a proxy-style absolute-URI GET with a
+    `404 {"error":...}` and a `Server: llama.cpp` header.)
+
+    The window between this close() and Burp's bind() is a real race and
+    nothing here can close it. The far end is what settles it: a test believes
+    the port is Burp's only once a request through it has reached the probe's
+    own handler -- or, for launch_burp, once an exchange the extension observed
+    on that port has arrived over the bridge -- which nothing but Burp's proxy
+    can arrange.
+    """
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def write_listener_config(workdir: Path, second_port: int = 0) -> list[int]:
+    """Two loopback-only proxy listeners, written where `--config-file` wants
+    them. Returns the ports, first then second.
+
+    BOTH listeners are written, including the first, and that is not
+    redundancy: a config naming only the second leaves the first wherever
+    Burp's defaults put it, which is the 8080 `_free_port()` exists to avoid.
+
+    `loopback_only` is not decoration and it is not self-enforcing. Nothing in
+    this project has ever sent a request off this machine, and a proxy listener
+    on 0.0.0.0 is an open forward relay on whatever network the laptop is
+    attached to. This string was the whole of the protection until
+    not_loopback_only() was written, and changing it to `all_interfaces` left
+    the suite green with the proxy bound to `*`. Every caller must run that
+    check once the listeners are up.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    ports = [_free_port(), second_port or _free_port()]
+    (workdir / PROXY_CONFIG).write_text(json.dumps({"proxy": {
+        "request_listeners": [
+            {"certificate_mode": "per_host", "listen_mode": "loopback_only",
+             "listener_port": port, "running": True}
+            for port in ports
+        ]}}))
+    return ports
+
+
 def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
-                sentinel: Path) -> subprocess.Popen:
+                sentinel: Path, crawler_port: int = 0) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
     buffer fills and the test hangs with no diagnostic. A file also means a
     failing test can quote what Burp actually said.
+
+    TWO PROXY LISTENERS, and the SECOND one is the crawler's. S4 tells the
+    operator and the crawler apart by WHICH LISTENER a request arrived on and
+    by nothing in the traffic itself, so a rig with one listener cannot
+    exercise the split at all -- `Source.forListenerPort` would answer OPERATOR
+    for every request and the two rule sets would never be told apart.
+
+    `-Dhx.crawler_port` IS THE OTHER HALF OF THAT AND IT IS NOT OPTIONAL.
+    `HxExtension` reads it with a default of 0, and `Source.forListenerPort`
+    reads 0 as "no crawler configured" -- so a launch that omits it attributes
+    EVERY request to the operator however many listeners are running, and a
+    test of the split passes while measuring nothing. This is the
+    `-Dhx.halt_sentinel` incident that this function's own comment below
+    records, one plan later; the property is passed from the config file Burp
+    was actually handed, never from the argument, so the number the extension
+    compares against and the number Burp bound cannot drift.
+
+    `crawler_port=0` means "any free port"; read the real ones back with
+    proxy_port() and second_proxy_port().
     """
     home = make_home(workdir)
+    ports = write_listener_config(workdir, crawler_port)
     log = (workdir / "burp.log").open("wb")
     cmd = [
         "java",
@@ -7259,10 +8809,14 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
         # was not updated -- the integration tests are deselected from the
         # default run, so nothing said so for a day.
         f"-Dhx.halt_sentinel={sentinel}",
+        # Read back out of the config above rather than from `crawler_port`,
+        # which may be the 0 that means "choose one for me".
+        f"-Dhx.crawler_port={ports[1]}",
         *ADD_OPENS,
         "-cp", f"{BURP_JAR}:{EXT_JAR}",
         "burp.StartBurp",
         "--developer-extension-class-name=hx.HxExtension",
+        f"--config-file={workdir / PROXY_CONFIG}",
         "--disable-auto-update",
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
@@ -7279,6 +8833,278 @@ def wait_for(predicate, timeout: float = 90.0, interval: float = 0.5) -> bool:
             return True
         time.sleep(interval)
     return False
+
+
+# ---------------------------------------------------------------------------
+# The probe launcher, for docs/burp-proxy-measurements.md and the tests that
+# keep it true. Everything below is about one question: which proxy listener
+# did this request arrive on?
+#
+# WHY THE PROBE'S SOURCE IS UNDER tests/ AND NOT UNDER extension/src.
+# It is a second BurpExtension, and it registers a second proxy request
+# handler. Two structural checks forbid that in the shipped tree, both
+# rightly: ChokepointTest asserts burp.* is imported by HxExtension.java and
+# nothing else, and Plan 4's Task 7 asserts there is exactly one
+# registerRequestHandler. It was written under extension/src to take the
+# measurements and deleted from there in the same task.
+#
+# Deleting it outright would have left test_proxy_facts.py skipping forever,
+# and a test that can only skip is not the "goes red when Burp changes" half
+# of that deliverable -- it is the silence this repository keeps removing. So
+# the source lives beside the test that needs it and is compiled into a
+# throwaway directory per run, against the Burp jar itself: Burp ships the
+# whole Montoya API inside burpsuite_desktop_v2026.7.3.jar (997 entries under
+# burp/api/montoya/), so this adds no prerequisite that -m integration did not
+# already have.
+# ---------------------------------------------------------------------------
+
+# PROXY_CONFIG, _free_port and write_listener_config used to live here. They
+# moved above launch_burp when it grew its own second listener, so that the two
+# launchers share ONE spelling of `listen_mode: loopback_only` rather than two
+# free to drift. The explanation of WHY a listener has to come from a config
+# file at all stays in launch_probe's docstring below, where it was measured.
+PROBE_SRC = Path(__file__).resolve().parent / "probe" / "hx" / "proxy" / "Probe.java"
+PROBE_CLASS = "hx.proxy.Probe"
+
+
+def probe_missing() -> list[str]:
+    """What the probe needs FROM THIS MACHINE beyond what missing() covers.
+
+    Environment facts only, and the split is not tidiness. PROBE_SRC used to
+    be in this list, which made an absent probe a SKIP: renaming
+    tests/integration/probe/ produced `3 skipped in 0.03s` -- no error, no
+    diagnostic -- and the default run's summary line announces DESELECTED
+    integration tests, not skipped ones. So the three facts eight tasks rest
+    on stopped being checked with nothing red anywhere.
+
+    A Burp jar and a JDK are things a machine may legitimately not have. A
+    file this repository ships is not one of those. See probe_source_missing().
+
+    Kept out of missing() deliberately. That function runs at import time for
+    the whole repository and its contract is that nothing escapes it; this one
+    is called by a single fixture and may be as ordinary as it likes.
+    """
+    absent = _environment_missing()
+    if shutil.which("javac") is None:
+        absent.append("javac (a JDK, not just a JRE) to compile the probe")
+    return absent
+
+
+def probe_source_missing() -> str | None:
+    """Why the probe cannot be compiled at all -- or None when its source is here.
+
+    Separate from probe_missing() so the caller can treat it differently, and
+    the caller must: this is a FAILURE, not a skip. The scenario is specific
+    enough to answer in the message -- somebody reads Task 1's brief, sees
+    "Step 8: Delete the probe", and deletes the wrong copy.
+    """
+    if PROBE_SRC.exists():
+        return None
+    return (
+        f"the probe's source is gone: {PROBE_SRC}. This is not a missing "
+        "environment prerequisite, it is a file this repository ships, and "
+        "without it the three measurements in test_proxy_facts.py -- the only "
+        "check that Burp's proxy still behaves the way Plan 4 was designed "
+        "around -- cannot run at all. If it was deleted because Task 1's brief "
+        "says Step 8 deletes the probe: that step removed it from "
+        "extension/src, where a second registerRequestHandler breaks "
+        "ChokepointTest and Task 7. It belongs here. Restore it with "
+        "`git checkout tests/integration/probe/`."
+    )
+
+
+# --- F1: loopback_only, checked ------------------------------------------
+
+def _listening_sockets(pid: int) -> list[str]:
+    """Every local `address:port` this pid holds a LISTENING socket on.
+
+    `ss -ltnpH`: -l listening, -t tcp, -n numeric (a resolved `localhost`
+    would defeat the address parsing below), -p with the owning process, -H
+    without the header row. The process column reads
+    `users:(("java",pid=123,fd=8))`, so the pid is matched with its trailing
+    comma -- a bare `pid=123` also matches pid 1234.
+    """
+    out = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True,
+                         check=True).stdout
+    return [line.split()[3] for line in out.splitlines()
+            if f"pid={pid}," in line]
+
+
+def _is_loopback(local: str) -> bool:
+    """Is this `ss` local-address field on 127.0.0.0/8 or ::1?
+
+    The forms that actually turn up here, all measured on this machine:
+    `127.0.0.1:8080`, `[::1]:631`, `[::ffff:127.0.0.1]:40421` (what Burp's own
+    listeners look like), `0.0.0.0:8443`, `*:8444` and `127.0.0.53%lo:53`.
+
+    Anything unparseable -- `*` above all -- is NOT loopback. That direction
+    matters: `*` is the wildcard bind this whole check exists to catch, and a
+    parser that fell through to True for what it did not understand would
+    report an open relay as safe.
+    """
+    host = local.rsplit(":", 1)[0].strip("[]").split("%")[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    # Both halves, and the second is not redundant belt-and-braces. Whether
+    # IPv6Address.is_loopback answers True for an IPv4-MAPPED address is a
+    # property of the interpreter: the 3.12.13 running this suite says True
+    # (measured), and CPython has not always. `::ffff:127.0.0.1` is the form
+    # EVERY Burp listener takes here, so an interpreter that answered False
+    # would fail every honest run. The explicit test costs nothing and does
+    # not depend on which CPython this is.
+    return bool(addr.is_loopback or (mapped is not None and mapped.is_loopback))
+
+
+def not_loopback_only(pid: int, ports: list[int]) -> str | None:
+    """Why this Burp is not listening on loopback alone -- or None when it is.
+
+    `listen_mode: loopback_only` is written into every listener launch_probe
+    configures, three places in this tree call it non-optional, and until this
+    function existed NOTHING checked it. Changing that one string to
+    `all_interfaces` left `test_proxy_facts.py` reporting `3 passed in 38.03s`
+    while `ss` showed the two configured listeners bound to `*:34777` and
+    `*:38399` -- a forward proxy open to whatever network this laptop is
+    attached to, for the 38 s those three tests take. Reproduced here.
+
+    Two claims, because either one alone passes while the other is false:
+
+      - every port the config named is LISTENING for this pid, so the check
+        cannot pass vacuously against a Burp that bound nothing at all;
+      - every socket this pid listens on is on a loopback address, INCLUDING
+        the ones the config did not ask for. Burp opens a third listener of
+        its own on an ephemeral loopback port every run -- measured: it
+        answers `HTTP/1.1 204 No Content` to an absolute-URI GET, `200
+        Connection established` to a CONNECT and `204` again inside the
+        tunnel, forwards nothing to the target, and never reaches the
+        extension's handler. Harmless, and it must not fail this check; but a
+        check written only against the configured ports would also miss a
+        future listener that is not harmless.
+    """
+    try:
+        sockets = _listening_sockets(pid)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # NOT a pass. A guard that evaporates when its tool is missing is the
+        # defect this function was written to fix, one level down.
+        return (f"the listening sockets of burp pid {pid} could not be read, so "
+                f"`listen_mode: loopback_only` is unverified: {exc}")
+    if not sockets:
+        return (f"`ss -ltnpH` attributes no listening socket to burp pid {pid}, "
+                "so nothing here can say whether its proxy is on loopback. Burp "
+                "is running and its extension has loaded -- `PROBE READY` is on "
+                "disk -- so read this as a broken check before reading it as a "
+                "Burp that bound nothing.")
+    unbound = [port for port in ports
+               if not any(sock.endswith(f":{port}") for sock in sockets)]
+    if unbound:
+        return (f"burp pid {pid} was configured to listen on {unbound} and is "
+                f"not: it holds {sockets}. A check for `loopback_only` against "
+                "a port nothing bound would pass without measuring anything.")
+    off = [sock for sock in sockets if not _is_loopback(sock)]
+    if off:
+        return (f"burp pid {pid} is listening on {off}, which is not loopback. "
+                "A proxy listener on a wildcard or routable address is an open "
+                "forward relay on whatever network this machine is attached to, "
+                "for as long as the run lasts. Check `listen_mode` in "
+                f"{PROXY_CONFIG}: it must be loopback_only.")
+    return None
+
+
+def _compile_probe(workdir: Path) -> Path:
+    """The probe's classes, built fresh per run into a directory nothing keeps.
+
+    Compiled against BURP_JAR rather than montoya-api.jar so that the only
+    prerequisite is the one the integration suite already has. --release 21
+    matches extension/build.sh: Burp loads this class into the same JVM.
+    """
+    classes = workdir / "probe-classes"
+    classes.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["javac", "--release", "21", "-nowarn", "-Xlint:-options",
+         "-cp", str(BURP_JAR), "-d", str(classes), str(PROBE_SRC)],
+        check=True, capture_output=True, text=True)
+    return classes
+
+
+def launch_probe(workdir: Path, out: Path,
+                 extra_listener_port: int = 0) -> subprocess.Popen:
+    """Burp running hx.proxy.Probe, with a SECOND proxy listener.
+
+    The second listener is the whole point of Q1: one Burp, two ports, and the
+    question is whether the extension can tell which one a request came in on.
+    `extra_listener_port=0` means the caller does not care which port it gets;
+    read the real ones back with proxy_port() and second_proxy_port().
+
+    Burp Community has no API for creating a listener -- `burp.api.montoya.
+    proxy.Proxy` offers registerRequestHandler, registerResponseHandler,
+    registerWebSocketCreationHandler, history and intercept, and nothing that
+    opens a port. So the second listener comes from a PROJECT CONFIG FILE via
+    `--config-file`, which Community does accept. Both listeners are written
+    explicitly, including the first: a config that named only the second would
+    leave the first wherever Burp's defaults put it, which is the 8080 that
+    _free_port() exists to avoid.
+
+    `loopback_only` is not decoration. Nothing in this project has ever sent a
+    request off this machine, and a proxy listener on 0.0.0.0 is an open relay
+    on whatever network the laptop is attached to. It is also not self-
+    enforcing: this string was the whole of the protection until
+    not_loopback_only() was written, and changing it to `all_interfaces` left
+    the suite green with the proxy bound to `*`. Callers must run that check
+    once the listeners are up -- test_proxy_facts.py's fixture does.
+    """
+    home = make_home(workdir)
+    classes = _compile_probe(workdir)
+    write_listener_config(workdir, extra_listener_port)
+    log = (workdir / "burp.log").open("wb")
+    cmd = [
+        "java", "-Djava.awt.headless=true", f"-Duser.home={home}",
+        f"-Dhx.probe.out={out}",
+        # The probe's classes in place of the shipped extension jar. Burp
+        # loads exactly the one class named below, so EXT_JAR on the classpath
+        # would not load HxExtension -- it is left off because the probe does
+        # not need it, and because a jar on the path of a measurement run is a
+        # thing a later reader has to rule out.
+        *ADD_OPENS, "-cp", f"{BURP_JAR}:{classes}",
+        "burp.StartBurp",
+        f"--developer-extension-class-name={PROBE_CLASS}",
+        f"--config-file={workdir / PROXY_CONFIG}",
+        "--disable-auto-update",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
+                            stderr=subprocess.STDOUT, cwd=LAB)
+    proc.stdin.write(b"\n\n")
+    proc.stdin.flush()
+    return proc
+
+
+def listener_ports(workdir: Path) -> list[int]:
+    """The ports this run's Burp was TOLD to listen on, read back from its config.
+
+    Discovered rather than hard-coded, and from the file Burp itself was handed
+    rather than from a variable this module kept -- so the number a test dials
+    is the number Burp was asked for, with nothing in between that could drift.
+    """
+    cfg = json.loads((workdir / PROXY_CONFIG).read_text())
+    return [listener["listener_port"]
+            for listener in cfg["proxy"]["request_listeners"]]
+
+
+def proxy_port(workdir: Path) -> int:
+    """Burp's first proxy listener for this run.
+
+    NOT 8080. Burp Community does default to 8080, but a default is where a
+    listener goes when nobody says otherwise, and this fixture says otherwise
+    precisely because 8080 on a developer's machine is whatever else claimed it
+    first -- here, the local LLM router. See _free_port().
+    """
+    return listener_ports(workdir)[0]
+
+
+def second_proxy_port(workdir: Path) -> int:
+    """Burp's second proxy listener -- the other side of Q1's question."""
+    return listener_ports(workdir)[1]
 ```
 
 - [ ] **Step 3: Write the failing test**
@@ -7294,6 +9120,21 @@ from hx.bridge import server
 from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
 from tests.integration import burp_fixture as bf
+
+
+@pytest.fixture(autouse=True)
+def _built():
+    """An unbuilt or stale extension jar is a FAILURE here, not a skip.
+
+    These two tests exist to certify the bridge against a real JVM. Run
+    against a jar older than its sources they certify an artefact that no
+    longer matches the code -- and the skip that used to hide that reported
+    green. Measured: a stale jar skipped all 17 integration tests while the
+    commit that caused it recorded them as passing.
+    """
+    problems = bf.unbuilt()
+    if problems:
+        pytest.fail("unbuilt: " + ", ".join(problems))
 
 pytestmark = pytest.mark.integration
 
@@ -7338,8 +9179,8 @@ def _operator_halt(workdir, engagement_id):
     return halt_mod.OperatorHalt(root, conn)
 
 
-@pytest.mark.skipif(not bf.burp_available(),
-                    reason=f"missing: {', '.join(bf.missing())}")
+@pytest.mark.skipif(bool(bf._environment_missing()) and not bf.unbuilt(),
+                    reason=f"missing: {', '.join(bf._environment_missing())}")
 def test_real_burp_dials_in_and_handshakes(tmp_path):
     """The whole point of this plan, proved against the real container.
 
@@ -7389,8 +9230,8 @@ def test_real_burp_dials_in_and_handshakes(tmp_path):
         srv.stop()
 
 
-@pytest.mark.skipif(not bf.burp_available(),
-                    reason=f"missing: {', '.join(bf.missing())}")
+@pytest.mark.skipif(bool(bf._environment_missing()) and not bf.unbuilt(),
+                    reason=f"missing: {', '.join(bf._environment_missing())}")
 def test_burp_restart_returns_the_bridge_to_deny_all(tmp_path):
     """A Burp restart is a reconnect, not an outage -- and the reconnected
     extension knows nothing, because extensionData does not survive.

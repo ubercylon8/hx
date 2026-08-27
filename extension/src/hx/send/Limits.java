@@ -79,11 +79,37 @@ public final class Limits implements Gate {
     public Decision check(HxRequest req) {
         Limiter l = limiter;
         if (l == null)
-            // Unreachable through HxExtension, which calls arm() on the same
-            // snapshot on the line before issue(): epoch 0 returns early from
-            // arm() but is refused by Sender before Policy consults a Gate,
-            // and every epoch >= 1 either arms this or throws. A gate that
-            // does not know its budget still has to answer no.
+            // A gate that does not know its budget still has to answer no.
+            //
+            // THIS COMMENT USED TO SAY THE BRANCH WAS UNREACHABLE, and the
+            // sentence was "Unreachable through HxExtension, which calls arm()
+            // on the same snapshot on the line before issue()". IT WAS TRUE
+            // WHEN IT WAS WRITTEN AND A LATER TASK FALSIFIED IT IN SILENCE.
+            // {@code arm} had ONE caller, the send handler; Task 7 wired s4's
+            // SECOND enforcement point, whose CRAWLER branch reaches
+            // Policy.decide and therefore this Gate, and it did not arm. Every
+            // crawler request that passed scope, method and dangerous.path was
+            // refused here -- measured -- while this comment told the reader
+            // the branch could not fire. A claim about the set of callers is
+            // exactly the kind of claim a new caller falsifies without
+            // touching the file the claim is written in.
+            //
+            // SO IT IS NOW COUNTED RATHER THAN ASSERTED. Both entry points arm
+            // from the snapshot they then decide under -- the send handler
+            // before {@code Sender.issue}, the proxy request handler before
+            // {@code ProxyGate.decide} -- and
+            // {@code ChokepointTest.everyPathThatSpendsTheGateArmsItFirst}
+            // counts the arming call sites in both grammar forms and reddens
+            // if either is deleted -- and reddens again if a THIRD path
+            // appears at all, armed or not, which is the prompt to come back
+            // and re-derive the number. Do not restore a sentence here naming
+            // the callers; the count is the thing that stays true.
+            //
+            // WHAT IS STILL TRUE ABOUT REACHABILITY: epoch 0 returns early
+            // from arm(), and epoch 0 is refused by Sender before Policy
+            // consults a Gate and by ProxyGate before it consults Policy at
+            // all, so an unconfigured run does not arrive here. Every epoch
+            // >= 1 either arms this or throws.
             //
             // THIS BRANCH IS NOT ONE OF THE DENY-ALL GUARDS, and a fix wave on
             // this branch recorded that it was, so the correction is written

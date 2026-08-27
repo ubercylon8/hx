@@ -266,18 +266,28 @@ def test_agent_can_set_other_statuses(tmp_path: Path):
 
 
 def test_dangling_first_seen_run_rejected(tmp_path: Path):
-    """A dangling first_seen_run reference is rejected by FK constraint."""
+    """A dangling first_seen_run reference is rejected by FK constraint.
+
+    MEASURED: this raised `NOT NULL constraint failed:
+    surface.normaliser_version` -- and later `surface.discovered_by` -- and
+    never reached the foreign key at all. Both columns are deliberately
+    DEFAULT-less, so an INSERT that names neither fails before SQLite looks at
+    the reference, and `pytest.raises(IntegrityError)` could not tell the two
+    apart. The row below is complete except for the one thing under test, and
+    the match is on the constraint's own name.
+    """
     conn = db.connect(tmp_path / "hx.db")
     db.init_schema(conn)
     conn.execute(
         "INSERT INTO engagement(id, name, client, created_us, status)"
         " VALUES('e1','acme','Acme',1,'active')"
     )
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
         conn.execute(
             "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
-            " path_template, first_seen_run)"
-            " VALUES('s1','e1','GET','https','app.acme.com',443,'/api/users','NO_SUCH_RUN')"
+            " path_template, discovered_by, normaliser_version, first_seen_run)"
+            " VALUES('s1','e1','GET','https','app.acme.com',443,'/api/users',"
+            "'proxy',1,'NO_SUCH_RUN')"
         )
 
 
@@ -602,7 +612,14 @@ CREATE TABLE IF NOT EXISTS authorization (
 CREATE TABLE IF NOT EXISTS run (
   id               TEXT PRIMARY KEY,
   engagement_id    TEXT NOT NULL REFERENCES engagement(id),
-  kind             TEXT NOT NULL CHECK (kind IN ('manual','scheduled','retest')),
+  -- Amended 2026-08-24 with SCHEMA_VERSION 4. S5's vocabulary is
+  -- browse | crawl | manual | scan, and this CHECK still named
+  -- ('manual','scheduled','retest') -- values from before the proxy existed.
+  -- The spec text was amended for Plan 4 and the constraint was not, which is
+  -- exactly the drift the spec amendment itself warns about: a spec that
+  -- disagrees with its implementation stops being consulted. Found by Task 3
+  -- refusing to start rather than working around it.
+  kind             TEXT NOT NULL CHECK (kind IN ('browse','crawl','manual','scan')),
   safety_profile   TEXT NOT NULL CHECK (safety_profile IN ('production','staging')),
   scope_version_id TEXT REFERENCES scope_version(id),
   started_us       INTEGER NOT NULL,
@@ -627,9 +644,22 @@ CREATE TABLE IF NOT EXISTS surface (
   query_key_set       TEXT NOT NULL DEFAULT '',
   kind                TEXT NOT NULL DEFAULT 'unknown'
                       CHECK (kind IN ('idempotent_read','state_changing','unknown')),
-  discovered_by       TEXT NOT NULL DEFAULT 'proxy'
+  -- NO DEFAULT, amended 2026-08-25 with SCHEMA_VERSION 6, on the same
+  -- argument `normaliser_version` lost its own and `denial.via` was never
+  -- given one. This column answers "which egress point found this surface",
+  -- and S5 draws a coverage figure straight off it -- "crawl-discovered
+  -- surfaces are recorded with discovered_by = 'crawl'". DEFAULT 'proxy'
+  -- answered that question for any writer who did not ask it, so every
+  -- crawler-discovered surface would have been labelled `proxy` with nothing
+  -- to tell afterwards. An omission must fail loudly instead.
+  discovered_by       TEXT NOT NULL
                       CHECK (discovered_by IN ('proxy','crawl','import','agent')),
-  normaliser_version  INTEGER NOT NULL DEFAULT 1,
+  -- NO DEFAULT, amended 2026-08-24. This column answers "which ruleset
+  -- produced this row", and a default answers it with a guess. It read
+  -- DEFAULT 1 while the ruleset moved to 2 in Plan 4's Task 2, so an insert
+  -- omitting it would have stamped rows with a ruleset that no longer exists
+  -- and nothing could tell afterwards. An omission must fail loudly instead.
+  normaliser_version  INTEGER NOT NULL,
   first_seen_run      TEXT REFERENCES run(id),
   last_seen_run       TEXT REFERENCES run(id),
   exemplar_exchange_id TEXT REFERENCES exchange(id),
@@ -722,6 +752,14 @@ CREATE TABLE IF NOT EXISTS finding (
   scope_level        TEXT NOT NULL
                      CHECK (scope_level IN ('engagement','host','surface','insertion')),
   payload            TEXT,
+  -- Still DEFAULT 1, deliberately and temporarily. The same argument as
+  -- surface.normaliser_version applies -- a column answering "which ruleset
+  -- produced this row" should not answer it with a guess -- but nothing
+  -- produces a finding until Plan 6, so the default is not yet WRONG here,
+  -- only premature. Removing it now costs 11 fixture rewrites in a merged
+  -- plan's test file, in a commit whose job is unblocking Task 3. Take it in
+  -- the plan that first writes a finding, and take it BEFORE that plan writes
+  -- one.
   normaliser_version INTEGER NOT NULL DEFAULT 1,
   first_seen_run     TEXT REFERENCES run(id),
   last_seen_run      TEXT REFERENCES run(id),
@@ -844,13 +882,37 @@ CREATE TABLE IF NOT EXISTS denial (
   id               TEXT PRIMARY KEY,
   run_id           TEXT REFERENCES run(id),
   ts_us            INTEGER NOT NULL,
+  -- `credential` added 2026-08-25 with SCHEMA_VERSION 6. S4 is
+  -- unconditional -- "Any denial produces a `denial` row and a distinct error
+  -- class. Denials are never silent" -- and `unmanaged_credential` was a
+  -- denial this vocabulary had no value for, so it reached the proxy's egress
+  -- point and vanished: no row, no counter, no exception. S7 refuses the
+  -- request and never persists it; that is a fact about the REQUEST BYTES,
+  -- and it never meant the refusal itself goes unrecorded. The row carries
+  -- method, url and a reason, never the credential.
   kind             TEXT NOT NULL
                    CHECK (kind IN ('scope','method','dangerous','rate','budget',
-                                   'not_configured')),
+                                   'not_configured','credential')),
   method           TEXT,
   url              TEXT,
   resolved_ip      TEXT,
   reason           TEXT,
+  -- Added 2026-08-25 with SCHEMA_VERSION 5. `exchange` has carried `via`
+  -- since Plan 1 and `denial` never did, which cost nothing while `send` was
+  -- the only value either could hold. Plan 4 makes the proxy a second egress
+  -- point, and `SELECT kind, COUNT(*) FROM denial` would then answer for two
+  -- at once with no way to tell them apart -- so "the crawler is being
+  -- refused everywhere" and "my browsing is being refused everywhere" become
+  -- one number, and they are opposite instructions.
+  --
+  -- The same three values as exchange.via, deliberately: a fourth would mean
+  -- a fourth egress path, which S4 forbids outright. NOT NULL with no
+  -- DEFAULT, for the reason surface.normaliser_version lost its own.
+  -- `records.record_denial` does default the PARAMETER to 'send', which is a
+  -- documented fact about which callers exist; a DEFAULT here would be a
+  -- different thing -- the answer a raw INSERT gets without being asked, and
+  -- a raw INSERT is exactly the shape a future writer takes.
+  via              TEXT NOT NULL CHECK (via IN ('proxy','send','crawl')),
   scope_version_id TEXT REFERENCES scope_version(id)
 );
 
@@ -887,7 +949,18 @@ from pathlib import Path
 
 from hx.store.paths import secure_mkdir
 
-SCHEMA_VERSION = 3
+# 5 -> 6 (2026-08-25): `denial.kind` gained 'credential' and
+# `surface.discovered_by` lost its DEFAULT. Both land inside Plan 4's branch,
+# on top of the 4 -> 5 bump that added `denial.via` a commit earlier -- and
+# reusing 5 for them would have made two INCOMPATIBLE schemas share one
+# version number, since a database created at that earlier commit already
+# exists on disk. Such a file refuses every `credential` denial this code now
+# writes: its CHECK has no such value, so SQLite rejects the INSERT. It also
+# still answers 'proxy' for any writer that omits `surface.discovered_by`
+# rather than failing, which is the guess the DEFAULT was removed to stop.
+# `engagement.open_`'s comparison against this constant is the only thing in
+# the tree that can notice either.
+SCHEMA_VERSION = 6
 
 TABLES: tuple[str, ...] = (
     "engagement",
@@ -960,9 +1033,11 @@ def transaction(conn: sqlite3.Connection):
     any multi-statement write that is not wrapped in an explicit
     BEGIN/COMMIT is not atomic -- a failure partway through leaves whatever
     already ran committed. Exactly one place in this codebase remembered
-    that on its own before this helper existed; two more call sites are
-    coming in later plans, and this is cheap insurance against one of them
-    forgetting.
+    that on its own before this helper existed; more call sites were expected
+    in later plans, and this is cheap insurance against one of them
+    forgetting. `hx.capture.on_exchange` is the first of those and did forget
+    -- it wrote four statements unwrapped, and `upsert_surface` failing left a
+    committed exchange row with a NULL `surface_id` behind it.
     """
     conn.execute("BEGIN")
     try:
@@ -1685,6 +1760,14 @@ class Config:
     rate_limit_rps: int = 5
     max_concurrency: int = 2
     identities: dict[str, dict] = field(default_factory=dict)
+    # `preserve_segments` names path segments the normaliser must NOT template.
+    # THE DEFAULT PROTECTS NOTHING, and an operator who leaves it alone should
+    # know that: no rule in `hx.surface` matches `api`, `v1`, `v2` or `v3` at
+    # any threshold above 2, so the list changes no template until you put
+    # something in it that a rule would otherwise reach. That is a numeric
+    # segment which is really a route -- a year, an API generation, a tenant
+    # number -- which is what the field is for. `["2024", "2025"]` is a list
+    # that does something; the shipped one is a placeholder.
     preserve_segments: list[str] = field(default_factory=lambda: ["api", "v1", "v2", "v3"])
     slug_threshold: int = 12
 
@@ -2619,6 +2702,10 @@ import pytest
 from click.testing import CliRunner
 
 from hx import cli
+from hx import engagement as eng_mod
+from hx import halt as halt_mod
+from hx import run as run_mod
+from hx.store import records as records_mod
 
 
 def test_new_creates_engagement(tmp_path: Path):
@@ -2902,6 +2989,486 @@ def test_new_reports_a_clean_error_when_root_is_not_a_directory(tmp_path: Path):
     )
     assert result.exit_code != 0
     assert "Traceback" not in result.output
+
+
+# --- Task 8: `hx capture start/stop`, and `hx info` that admits its gaps ---
+
+
+@pytest.fixture
+def engagement(tmp_path: Path) -> Path:
+    """A real engagement, made the way an operator makes one.
+
+    Returns the ENGAGEMENT directory itself (`tmp_path / name`), not the
+    engagements root `new --root` takes. `info` and `capture` both open a
+    single engagement directly (`eng_mod.open_` checks for `hx.db` right at
+    the path it is given), the same way `test_info_reports_engagement` above
+    passes `tmp_path / "acme"` -- the child directory, never `tmp_path`
+    itself -- to `info --root`.
+    """
+    result = CliRunner().invoke(cli.main, [
+        "new", "acme-2026-09", "--client", "Acme Corp",
+        "--scope", "https://app.acme.com/*", "--root", str(tmp_path),
+    ])
+    assert result.exit_code == 0, result.output
+    return tmp_path / "acme-2026-09"
+
+
+@pytest.fixture
+def engagement_with_drops(engagement: Path) -> Path:
+    """A run recorded 4 dropped exchanges, through `hx.run`, not raw SQL."""
+    eng = eng_mod.open_(engagement)
+    try:
+        run_id = run_mod.open_run(
+            eng.db, engagement_id=eng.id, kind="browse",
+            safety_profile=eng.config.safety_profile)
+        run_mod.count_drop(eng.db, run_id=run_id, n=4)
+    finally:
+        eng.db.close()
+    return engagement
+
+
+@pytest.fixture
+def engagement_with_stale_run(engagement: Path) -> Path:
+    """A run whose heartbeat is old enough for `reap_stale` to find it.
+
+    `reap_stale`'s own default window is `IDLE_CLOSE_US * 2`, not
+    `IDLE_CLOSE_US` -- the two windows are deliberately different (idle vs.
+    dead-harness), per `run.reap_stale`'s docstring. Backdating by a single
+    `IDLE_CLOSE_US` would not clear reap_stale's own default threshold, so
+    this backdates well past it.
+    """
+    eng = eng_mod.open_(engagement)
+    try:
+        run_id = run_mod.open_run(
+            eng.db, engagement_id=eng.id, kind="browse",
+            safety_profile=eng.config.safety_profile)
+        stale_at = eng_mod.now_us() - (run_mod.IDLE_CLOSE_US * 3)
+        run_mod.heartbeat(eng.db, run_id=run_id, now_us=stale_at)
+    finally:
+        eng.db.close()
+    return engagement
+
+
+def test_capture_start_opens_a_named_run(engagement):
+    result = CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "browse" in result.output
+
+
+def test_capture_start_refuses_a_kind_the_schema_will_not_take(engagement):
+    """The vocabulary lives in run.RUN_KINDS and in a CHECK. A bad --kind must
+    be refused by the CLI with a readable message, not by SQLite with
+    `CHECK constraint failed: run`."""
+    result = CliRunner().invoke(cli.main,
+        ["capture", "start", "--kind", "scheduled", "--root", str(engagement)])
+    assert result.exit_code != 0
+    assert "scheduled" in result.output
+
+
+def test_capture_stop_closes_it(engagement):
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+
+
+def test_capture_stop_closes_every_live_run(engagement):
+    """Two kinds live at once is the normal case, not the exotic one: a crawl
+    runs while a human browses. An operator typing `stop` means both."""
+    for kind in ("browse", "crawl"):
+        CliRunner().invoke(cli.main,
+            ["capture", "start", "--kind", kind, "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "2" in result.output
+    # ...and assert against the STORE, not the wording: no run of this
+    # engagement is left with status='running'.
+    eng = eng_mod.open_(engagement)
+    try:
+        still_running = eng.db.execute(
+            "SELECT COUNT(*) AS n FROM run WHERE status='running'").fetchone()["n"]
+        assert still_running == 0
+    finally:
+        eng.db.close()
+
+
+def test_capture_stop_with_no_run_says_so_rather_than_failing(engagement):
+    """An operator typing stop twice has made no mistake worth an error."""
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "no" in result.output.lower()
+
+
+def test_info_reports_drops_loudly_when_there_are_any(engagement_with_drops):
+    """S5: a run with drops has coverage numbers that are a FLOOR, not a
+    count. An operator who does not know that reads the surface count as
+    complete."""
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement_with_drops)])
+    assert "floor" in result.output.lower()
+    # The COUNT, in its own context. A bare `"4" in output` passes on any
+    # unrelated 4 -- four surfaces, a timestamp digit -- which is the shape of
+    # a test that reads green for the wrong reason.
+    assert "4 dropped" in result.output
+
+
+def test_info_says_nothing_alarming_when_there_are_no_drops(engagement):
+    """The separating case. A warning that is always present is not a
+    warning."""
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert "floor" not in result.output.lower()
+
+
+def test_info_reaps_stale_runs_before_reporting(engagement_with_stale_run):
+    """Otherwise the first thing an operator sees after a crash is a run that
+    claims to be running."""
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement_with_stale_run)])
+    assert "error" in result.output.lower()
+
+
+def test_capture_start_is_idempotent(engagement):
+    """`start` calls `current_run`, not `open_run`: typing `start` twice must
+    resume the one live run of that kind, not open a second one. Row E of the
+    Task 8 sabotage table -- if `start` called `open_run` instead, nothing
+    else here would catch it."""
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    eng = eng_mod.open_(engagement)
+    try:
+        running = eng.db.execute(
+            "SELECT COUNT(*) AS n FROM run WHERE status='running' AND kind='browse'"
+        ).fetchone()["n"]
+        assert running == 1
+    finally:
+        eng.db.close()
+
+
+# --- Fix round 1: four requirements the brief named, correctly implemented,
+# pinned by no test until now. ---
+
+
+def test_capture_stop_writes_completed_status_and_operator_reason(engagement):
+    """F1: the brief is explicit -- 'the close is status=\'completed\',
+    stop_reason=\'operator\''. `status != 'running'` (the existing
+    assertion in test_capture_stop_closes_every_live_run) is satisfied by
+    `aborted`, `killed` or `error` too, and those mean the harness or the
+    auto-halt ended the run, not an operator. Assert against the STORE."""
+    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    eng = eng_mod.open_(engagement)
+    try:
+        row = eng.db.execute(
+            "SELECT status, stop_reason FROM run WHERE kind='browse'"
+        ).fetchone()
+        assert row["status"] == "completed"
+        assert row["stop_reason"] == "operator"
+    finally:
+        eng.db.close()
+
+
+def test_capture_stop_with_kind_only_closes_that_kind(engagement):
+    """F2: the mirror of test_capture_stop_closes_every_live_run. Two kinds
+    live at once, `stop --kind crawl` must close only the crawl run and
+    leave the browse run untouched -- `hx capture stop --kind crawl`
+    closing a browse run must be visible to something."""
+    for kind in ("browse", "crawl"):
+        CliRunner().invoke(cli.main,
+            ["capture", "start", "--kind", kind, "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main,
+        ["capture", "stop", "--kind", "crawl", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    eng = eng_mod.open_(engagement)
+    try:
+        browse_status = eng.db.execute(
+            "SELECT status FROM run WHERE kind='browse'").fetchone()["status"]
+        crawl_status = eng.db.execute(
+            "SELECT status FROM run WHERE kind='crawl'").fetchone()["status"]
+        assert browse_status == "running"
+        assert crawl_status == "completed"
+    finally:
+        eng.db.close()
+
+
+@pytest.fixture
+def engagement_with_drops_on_two_runs(engagement: Path) -> Path:
+    """Two DIFFERENT runs, each with its own nonzero drop count, so the
+    printed total can be told apart from a single run's count, a MAX, or a
+    last-value written -- none of which `engagement_with_drops` (one run)
+    can separate from a correct SUM."""
+    eng = eng_mod.open_(engagement)
+    try:
+        r1 = run_mod.open_run(
+            eng.db, engagement_id=eng.id, kind="browse",
+            safety_profile=eng.config.safety_profile)
+        run_mod.count_drop(eng.db, run_id=r1, n=4)
+        r2 = run_mod.open_run(
+            eng.db, engagement_id=eng.id, kind="crawl",
+            safety_profile=eng.config.safety_profile)
+        run_mod.count_drop(eng.db, run_id=r2, n=7)
+    finally:
+        eng.db.close()
+    return engagement
+
+
+def test_info_floor_count_sums_drops_across_every_run(engagement_with_drops_on_two_runs):
+    """F3: Q1 in the review asks exactly this -- is the printed total a SUM
+    across runs, or could it be one run's count? `engagement_with_drops`
+    only ever makes one run, so it cannot tell a sum (11) from a max (7) or
+    a last-value (whichever ran last). This fixture makes two, 4 and 7, and
+    the only correct total is their sum, 11."""
+    result = CliRunner().invoke(
+        cli.main, ["info", "--root", str(engagement_with_drops_on_two_runs)])
+    assert result.exit_code == 0, result.output
+    assert "floor" in result.output.lower()
+    assert "11 dropped" in result.output
+
+
+def test_info_breakdown_lines_report_their_own_table(engagement):
+    """F4: each of the three breakdown lines must carry ITS OWN table's
+    counts under its own heading. A row is planted in each of surface,
+    exchange and denial with a value unique to that table (no vocabulary
+    overlaps another table's), so a swapped table argument -- e.g. printing
+    denial counts under 'surfaces' -- is caught by checking each heading's
+    OWN line, not by a bare substring search of the whole page (which would
+    pass even with the values filed under the wrong heading)."""
+    eng = eng_mod.open_(engagement)
+    try:
+        eng.db.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+            " port, path_template, kind, discovered_by, normaliser_version)"
+            " VALUES('s1', ?, 'GET', 'https', 'app.acme.com', 443,"
+            " '/api/widgets', 'state_changing', 'proxy', 1)",
+            (eng.id,))
+        records_mod.record_exchange(
+            eng.db, run_id=None, method="GET", url="https://app.acme.com/x",
+            status=None, req_blob=None, resp_blob=None, ms=0,
+            at_us=eng_mod.now_us(), outcome="timeout")
+        records_mod.record_denial(
+            eng.db, run_id=None, kind="rate", method="GET",
+            url="https://app.acme.com/y", detail="over budget",
+            at_us=eng_mod.now_us())
+    finally:
+        eng.db.close()
+
+    result = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    surfaces_line = next(ln for ln in lines if ln.strip().startswith("surfaces"))
+    exchanges_line = next(ln for ln in lines if ln.strip().startswith("exchanges"))
+    denials_line = next(ln for ln in lines if ln.strip().startswith("denials"))
+
+    assert "state_changing=1" in surfaces_line
+    assert "rate=1" not in surfaces_line
+    assert "timeout=1" not in surfaces_line
+
+    assert "timeout=1" in exchanges_line
+    assert "state_changing=1" not in exchanges_line
+    assert "rate=1" not in exchanges_line
+
+    assert "rate=1" in denials_line
+    assert "state_changing=1" not in denials_line
+    assert "timeout=1" not in denials_line
+
+
+# --- B5: `hx halt` / `hx resume`, S4's kill switch reachable by a human -----
+
+
+def _halt_state(engagement: Path):
+    """Read the halt back through a FRESH OperatorHalt, the way the harness
+    and the next process do. Reading the CLI's own object would only prove it
+    remembered its own call; the whole point of a durable halt is that another
+    process sees it."""
+    eng = eng_mod.open_(engagement)
+    try:
+        oh = halt_mod.OperatorHalt(eng.root, eng.db)
+        return oh.halted, oh.reason, oh.sentinel_path
+    finally:
+        eng.db.close()
+
+
+def test_halt_stops_issuance_and_writes_the_file_the_extension_polls(engagement):
+    """S4's third kill path, reachable by a person for the first time.
+
+    Two of the three §4 promises had no way in: `BridgeServer.halt()` and
+    `resume()` are correct and durable and had no CLI and no production
+    driver, and the suite-tab STOP button is unbuilt. Only "create the
+    sentinel by hand" was something an operator could do -- and §4's whole
+    argument is the redundancy, not any one path.
+
+    THE FILE IS THE ASSERTION. `-Dhx.halt_sentinel` is what the extension
+    polls, and `burp_fixture.launch_burp` passes `OperatorHalt.sentinel_path`
+    for it -- so a CLI that stopped issuance by some other means would report
+    success while the extension kept sending.
+    """
+    result = CliRunner().invoke(cli.main, [
+        "halt", "--reason", "the client asked us to stop",
+        "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    halted, reason, sentinel = _halt_state(engagement)
+    assert halted is True
+    assert reason == "the client asked us to stop"
+    assert sentinel == engagement / "HALTED"
+    assert sentinel.exists()
+    assert "the client asked us to stop" in result.output
+    assert str(sentinel) in result.output
+
+
+def test_halt_writes_the_audit_row_as_well_as_the_file(engagement):
+    """Durable is the row AND the file: the file is what stops the extension,
+    the row is what explains the stop afterwards. A halt nobody can account
+    for at the end of an engagement is the half `agent_action` exists for."""
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "target wobbling", "--root", str(engagement)])
+    eng = eng_mod.open_(engagement)
+    try:
+        rows = eng.db.execute(
+            "SELECT actor, tool, why FROM agent_action ORDER BY ts_us"
+        ).fetchall()
+    finally:
+        eng.db.close()
+    assert [(r["actor"], r["tool"]) for r in rows] == [("operator", "halt")]
+    assert rows[0]["why"] == "target wobbling"
+
+
+def test_halt_needs_no_reason_because_it_is_a_kill_switch(engagement):
+    """`--reason` is OPTIONAL on purpose, and this pins the decision. The
+    moment this command is used is the moment something is going wrong on a
+    client's production system; a required argument is friction in front of a
+    stop. What is NOT optional is that the recorded reason still says who
+    stopped it and how, which is the part nobody can reconstruct later."""
+    result = CliRunner().invoke(cli.main, ["halt", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    halted, reason, _ = _halt_state(engagement)
+    assert halted is True
+    assert "command line" in reason
+
+
+def test_resume_is_the_only_thing_that_lifts_it(engagement):
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "stop", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    halted, reason, sentinel = _halt_state(engagement)
+    assert halted is False
+    assert reason is None
+    assert not sentinel.exists()
+    assert "stop" in result.output
+
+
+def test_resume_clears_a_sentinel_nobody_recorded(engagement):
+    """§4 names the by-hand path explicitly -- an operator can `touch` the
+    sentinel from a shell when the socket is dead -- and such a halt has no
+    row behind it. `OperatorHalt.halted` is a UNION for that reason, and this
+    is the case that would strand an engagement halted forever if `resume`
+    consulted the row instead."""
+    (engagement / "HALTED").write_text("stopped by hand at 02:00\n")
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert not (engagement / "HALTED").exists()
+    assert _halt_state(engagement)[0] is False
+
+
+def test_resume_on_an_un_halted_engagement_writes_nothing(engagement):
+    """An audit trail whose entries do not correspond to events is worse than
+    a short one, and `resume()` would append a resume row for a stop that
+    never happened. Refusing is safe here rather than pedantic: the direction
+    that matters is that nothing accidentally re-arms issuance."""
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "nothing to resume" in result.output
+    eng = eng_mod.open_(engagement)
+    try:
+        assert eng.db.execute(
+            "SELECT COUNT(*) AS n FROM agent_action").fetchone()["n"] == 0
+    finally:
+        eng.db.close()
+
+
+def test_halting_an_already_halted_engagement_says_so_and_still_halts(engagement):
+    """Idempotent, and it SAYS what it found. An operator typing `halt` twice
+    during an incident must not be told nothing happened, and must not be left
+    wondering whether the second reason replaced the first."""
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "first reason", "--root", str(engagement)])
+    result = CliRunner().invoke(cli.main, [
+        "halt", "--reason", "second reason", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "already halted: first reason" in result.output
+    halted, reason, _ = _halt_state(engagement)
+    assert halted is True
+    assert reason == "second reason"
+
+
+def test_info_says_so_when_issuance_is_halted(engagement):
+    """Where an operator looks first. §4 makes the sentinel something a
+    DIFFERENT person can create from a shell with no harness running, so an
+    operator can arrive at a halted engagement they did not halt -- and until
+    this line nothing in the CLI would tell them."""
+    before = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert "HALTED" not in before.output, (
+        "the halt line must appear only when there IS one, or it stops "
+        "meaning anything")
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "the client asked us to stop",
+        "--root", str(engagement)])
+    after = CliRunner().invoke(cli.main, ["info", "--root", str(engagement)])
+    assert after.exit_code == 0, after.output
+    assert "HALTED" in after.output
+    assert "the client asked us to stop" in after.output
+    assert "hx resume" in after.output
+
+
+@pytest.mark.parametrize("command", [["halt"], ["resume"]])
+def test_both_refuse_cleanly_when_there_is_no_engagement(tmp_path, command):
+    """`hx capture`'s shape: a missing engagement is a ClickException with a
+    sentence in it, never a traceback. A kill switch that answers with a
+    stack trace is one an operator does not trust the next time."""
+    result = CliRunner().invoke(cli.main, command + ["--root", str(tmp_path)])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "no engagement" in result.output.lower()
+
+
+def test_deleting_the_sentinel_by_hand_leaves_the_two_sides_disagreeing(engagement):
+    """THE CLAIM I HAD WRONG, as a check rather than a sentence.
+
+    `hx resume`'s docstring said it was "the only thing that lifts a halt".
+    It is not. The extension polls the sentinel FILE and nothing else -- which
+    is exactly what S4 asks of it, "an operator can create it from a shell when
+    the socket is dead" -- and a mechanism that can be created by hand can be
+    removed by hand.
+
+    What that loses is asserted here: no `agent_action` row says the halt was
+    lifted, and a process that reads the store still believes issuance is
+    stopped while the extension has already started again. The two sides
+    disagree, and the disagreement is silent. `hx resume` is what leaves them
+    agreeing and leaves a row behind.
+    """
+    CliRunner().invoke(cli.main, [
+        "halt", "--reason", "stop", "--root", str(engagement)])
+    (engagement / "HALTED").unlink()
+
+    halted, reason, _ = _halt_state(engagement)
+    assert halted is True, (
+        "the store no longer believes this engagement is halted, so the "
+        "disagreement this test documents does not exist and `hx resume`'s "
+        "docstring should say so")
+    assert reason == "stop"
+
+    eng = eng_mod.open_(engagement)
+    try:
+        tools = [r["tool"] for r in eng.db.execute(
+            "SELECT tool FROM agent_action ORDER BY ts_us")]
+    finally:
+        eng.db.close()
+    assert tools == ["halt"], (
+        "removing the file by hand wrote a resume row, which would make it "
+        "equivalent to `hx resume` and this whole test pointless")
+
+    # And `hx resume` still works from here -- it is the way back to two sides
+    # agreeing, and it does not require the file it is about to remove.
+    result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert _halt_state(engagement)[0] is False
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2929,6 +3496,9 @@ import click
 
 from hx import config as config_mod
 from hx import engagement as eng_mod
+from hx import halt as halt_mod
+from hx import run as run_mod
+from hx.store import db as db_mod
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -2938,6 +3508,23 @@ def default_root() -> Path:
     if env:
         return Path(env)
     return Path.home() / "hx" / "engagements"
+
+
+def _open_engagement(path: Path) -> eng_mod.Engagement:
+    """`eng_mod.open_`, with every failure turned into a `ClickException`
+    instead of a traceback. Shared by `info` and both `capture` subcommands,
+    which all open an existing engagement the same way `info` always has.
+    """
+    try:
+        return eng_mod.open_(path)
+    except eng_mod.EngagementError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except config_mod.ConfigError as exc:
+        raise click.ClickException(f"invalid config at {path}: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot read the database at {path}: {exc}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"cannot access the engagement at {path}: {exc}") from exc
 
 
 @click.group()
@@ -3019,25 +3606,43 @@ def new(name, client, scope, exclude, profile, root, author) -> None:
     click.echo(f"  scope   {', '.join(cfg.scope_include)}")
 
 
+def _group_counts(conn, table: str, column: str) -> str:
+    """`SELECT column, COUNT(*) FROM table GROUP BY column`, rendered as
+    `value=n  value=n`. The database holds exactly one engagement (I5), so
+    no WHERE clause is needed -- the same assumption `info`'s row counts
+    below have always made."""
+    rows = conn.execute(
+        f"SELECT {column} AS k, COUNT(*) AS n FROM {table} GROUP BY {column}"
+    ).fetchall()
+    return "  ".join(f"{r['k']}={r['n']}" for r in rows) or "none"
+
+
 @main.command()
 @click.option("--root", type=click.Path(path_type=Path), default=None)
 def info(root) -> None:
     """Show an engagement's configuration and current counts."""
     path = root or default_root()
+    eng = _open_engagement(path)
     try:
-        eng = eng_mod.open_(path)
+        # First, so a run whose harness died reads `error` rather than a
+        # `running` that has not been true for a while -- otherwise the
+        # first thing an operator sees after a crash is a run that claims
+        # to still be live.
+        run_mod.reap_stale(eng.db)
+
         counts = {
             t: eng.db.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
             for t in ("run", "surface", "exchange", "finding", "check_run")
         }
-    except eng_mod.EngagementError as exc:
-        raise click.ClickException(str(exc)) from exc
-    except config_mod.ConfigError as exc:
-        raise click.ClickException(f"invalid config at {path}: {exc}") from exc
+        runs_by_status = _group_counts(eng.db, "run", "status")
+        surfaces_by_kind = _group_counts(eng.db, "surface", "kind")
+        exchanges_by_outcome = _group_counts(eng.db, "exchange", "outcome")
+        denials_by_kind = _group_counts(eng.db, "denial", "kind")
+        dropped_total = eng.db.execute(
+            "SELECT COALESCE(SUM(dropped_total), 0) AS n FROM run"
+        ).fetchone()["n"]
     except sqlite3.Error as exc:
         raise click.ClickException(f"cannot read the database at {path}: {exc}") from exc
-    except OSError as exc:
-        raise click.ClickException(f"cannot access the engagement at {path}: {exc}") from exc
 
     click.echo(f"engagement {eng.config.name} ({eng.id})")
     click.echo(f"  client   {eng.config.client}")
@@ -3047,6 +3652,224 @@ def info(root) -> None:
         click.echo(f"  exclude  {', '.join(eng.config.scope_exclude)}")
     click.echo(f"  root     {eng.root}")
     click.echo("  counts   " + "  ".join(f"{k}={v}" for k, v in counts.items()))
+    click.echo(f"  runs      {runs_by_status}")
+    click.echo(f"  surfaces  {surfaces_by_kind}")
+    click.echo(f"  exchanges {exchanges_by_outcome}")
+    click.echo(f"  denials   {denials_by_kind}")
+    # THE HALT, and only when there is one -- the same rule the drop warning
+    # below follows, so a line that appears means something. S4 makes the
+    # sentinel a path an operator can take from a shell with no harness
+    # running, which means an operator can also arrive at a halted engagement
+    # they did not halt themselves. `info` is where they look first, and until
+    # this line nothing in the CLI could tell them issuance was stopped.
+    #
+    # Read through OperatorHalt rather than by testing for the file, so this
+    # sees a halt recorded in the store as well as one on disk -- `halted` is
+    # a union, and the two can disagree when a harness died between the two
+    # writes.
+    halt_state = _operator_halt(eng)
+    if halt_state.halted:
+        click.echo(f"  HALTED    {halt_state.reason}")
+        click.echo(f"            issuance is stopped; `hx resume` lifts it "
+                   f"and records who did ({halt_state.sentinel_path})")
+    # S5: a run with drops has coverage numbers that are a FLOOR, not a
+    # complete count -- only said out loud when it is true, so it stays
+    # meaningful when it fires.
+    if dropped_total > 0:
+        click.echo(
+            f"  WARNING   {dropped_total} dropped: the surface and exchange "
+            "counts above are a FLOOR, not the whole picture -- the "
+            "extension could not hand over every exchange."
+        )
+
+
+@main.group()
+def capture() -> None:
+    """Start or stop traffic capture for an engagement."""
+
+
+@capture.command("start")
+@click.option(
+    "--kind",
+    type=click.Choice(sorted(run_mod.RUN_KINDS)),
+    default="browse",
+    show_default=True,
+    help="Run kind. The vocabulary is derived from the schema, not restated.",
+)
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def capture_start(kind, root) -> None:
+    """Open the live run of KIND, the deliberately-named path.
+
+    This is `run.current_run`, not `run.open_run`: typing `start` twice
+    resumes the one live run of that kind rather than opening a second one.
+    """
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        run_id = run_mod.current_run(
+            eng.db, engagement_id=eng.id, kind=kind,
+            safety_profile=eng.config.safety_profile)
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot write to the database at {path}: {exc}") from exc
+    click.echo(f"{kind} run {run_id} is live")
+
+
+@capture.command("stop")
+@click.option(
+    "--kind",
+    type=click.Choice(sorted(run_mod.RUN_KINDS)),
+    default=None,
+    help="Close only runs of this kind. Default: every live run.",
+)
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def capture_stop(kind, root) -> None:
+    """Close every live run of the engagement (`--kind` narrows it to one).
+
+    An operator typing `stop` means every kind currently recording, because
+    a crawl can run while a human browses and those are two runs -- "stop
+    capturing" means both. Closed with status='completed',
+    stop_reason='operator': an operator ending a run on purpose is neither
+    an `error` nor `aborted`, which mean the harness or the auto-halt ended
+    it instead.
+    """
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        query = "SELECT id FROM run WHERE status='running'"
+        params: list[str] = []
+        if kind is not None:
+            query += " AND kind=?"
+            params.append(kind)
+        rows = eng.db.execute(query, params).fetchall()
+        if not rows:
+            suffix = f" of kind {kind}" if kind else ""
+            click.echo(f"no live runs{suffix} to stop")
+            return
+        with db_mod.transaction(eng.db):
+            for row in rows:
+                run_mod.close_run(eng.db, run_id=row["id"], status="completed",
+                                  stop_reason="operator")
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot write to the database at {path}: {exc}") from exc
+    click.echo(f"stopped {len(rows)} run(s)")
+
+
+def _operator_halt(eng: eng_mod.Engagement) -> halt_mod.OperatorHalt:
+    """The SAME `OperatorHalt` the extension polls, built the same way.
+
+    S4 gives the kill switch three independent paths and the whole argument is
+    "any one works when the others are wedged". Two of the three were
+    unreachable by a human before these commands existed: `BridgeServer.halt()`
+    and `resume()` are correct and durable and had no CLI and no production
+    driver, and the STOP button in the Burp suite tab is unbuilt and stated as
+    such. So of the three, only "create the sentinel file from a shell" was
+    something an operator could actually do -- and the path §4 argues for is
+    the redundancy, not any one of them.
+
+    NOT A SECOND PATH. An operator halt is durable, and durable means the row
+    AND the file: `OperatorHalt.halt` writes the sentinel FIRST so a failure to
+    explain cannot become a failure to stop, and `resume` writes the row first
+    so a failure to record cannot lift a halt silently. A CLI that touched the
+    file itself would have neither ordering and no audit trail. The path is
+    `<engagement>/HALTED`, which is what `burp_fixture.launch_burp` passes as
+    `-Dhx.halt_sentinel` -- so the file this writes is the file the extension
+    polls, and there is no third spelling of it anywhere.
+
+    NO FRAME IS SENT, and that is not an omission. The bridge lives in the
+    harness process, not this one; the sentinel is the path that works when
+    the bridge does not, and the extension polls it directly. A harness that
+    IS running re-reads the same file: `OperatorHalt.halted` is a union of the
+    armed flag and a stat(), so a halt written from another process is seen by
+    `BridgeServer.send` on its next call and re-asserted after any hello.
+    """
+    try:
+        return halt_mod.OperatorHalt(eng.root, eng.db)
+    except halt_mod.HaltError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(
+            f"cannot read the halt state at {eng.root}: {exc}") from exc
+
+
+@main.command()
+@click.option("--reason", default=None,
+              help="Why issuance is being stopped. Recorded in the audit trail "
+                   "and written into the sentinel file for whoever finds it.")
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def halt(reason, root) -> None:
+    """Stop issuance for an engagement, durably.
+
+    `--reason` is OPTIONAL on purpose. This is a kill switch, and the moment
+    it is used is the moment something is going wrong on a client's
+    production system; a required argument is friction in front of a stop.
+    The default says who stopped it and how, which is the part a later reader
+    cannot reconstruct.
+    """
+    path = root or default_root()
+    eng = _open_engagement(path)
+    oh = _operator_halt(eng)
+    was = oh.reason if oh.halted else None
+    text = reason or f"halted from the command line by {os.environ.get('USER', 'unknown')}"
+    try:
+        oh.halt(text)
+    except (sqlite3.Error, OSError) as exc:
+        # The sentinel is written before the row, so a failure here may mean
+        # the halt IS in force and only its audit line is missing. Say which
+        # rather than leaving the operator to guess, because the guess that
+        # matters is "did it stop".
+        raise click.ClickException(
+            f"halt failed after {'writing' if oh.sentinel_path.exists() else 'failing to write'} "
+            f"{oh.sentinel_path}: {exc}") from exc
+    if was is not None:
+        click.echo(f"already halted: {was}")
+    click.echo(f"issuance halted: {text}")
+    click.echo(f"  sentinel {oh.sentinel_path}")
+    click.echo("  the extension polls that file and refuses every send while "
+               "it exists; `hx resume` is how to lift it -- deleting the file "
+               "by hand also lifts it for the extension, and records nothing")
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def resume(root) -> None:
+    """Re-arm issuance, and record that it was re-armed.
+
+    A `configure` re-authorises SCOPE and never issuance, and a reconnect
+    re-asserts the halt rather than clearing it -- so nothing in the bridge
+    lifts a halt by accident, which is what makes refusing to run this on an
+    un-halted engagement safe rather than pedantic.
+
+    IT IS NOT THE ONLY WAY BACK, and an earlier version of this docstring said
+    it was. `rm <engagement>/HALTED` also lifts the halt AS FAR AS THE
+    EXTENSION IS CONCERNED -- the extension polls the file and nothing else,
+    which is precisely what S4 asks of it ("an operator can create it from a
+    shell when the socket is dead"), and a mechanism that can be created by
+    hand can be removed by hand. What that loses is the record: no
+    `agent_action` row says who lifted it, and a harness process that had
+    already read `_armed` from the store goes on refusing sends of its own
+    while the extension issues. This command is the one that leaves both
+    sides agreeing and leaves a row behind.
+    """
+    path = root or default_root()
+    eng = _open_engagement(path)
+    oh = _operator_halt(eng)
+    if not oh.halted:
+        # Nothing is written. `resume()` would append a resume row for a stop
+        # that never happened, and an audit trail whose entries do not
+        # correspond to events is worse than a short one.
+        click.echo("not halted; nothing to resume")
+        return
+    was = oh.reason
+    try:
+        oh.resume()
+    except (sqlite3.Error, OSError) as exc:
+        # The row goes first, so a failure here leaves the sentinel in place
+        # and the halt STANDING -- which is the direction S4 asks for, and is
+        # worth saying out loud rather than reporting a bare error.
+        raise click.ClickException(
+            f"resume failed and the halt still stands ({oh.sentinel_path}): {exc}"
+        ) from exc
+    click.echo(f"issuance resumed; the halt was: {was}")
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**

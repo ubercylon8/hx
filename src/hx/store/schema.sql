@@ -48,7 +48,14 @@ CREATE TABLE IF NOT EXISTS authorization (
 CREATE TABLE IF NOT EXISTS run (
   id               TEXT PRIMARY KEY,
   engagement_id    TEXT NOT NULL REFERENCES engagement(id),
-  kind             TEXT NOT NULL CHECK (kind IN ('manual','scheduled','retest')),
+  -- Amended 2026-08-24 with SCHEMA_VERSION 4. S5's vocabulary is
+  -- browse | crawl | manual | scan, and this CHECK still named
+  -- ('manual','scheduled','retest') -- values from before the proxy existed.
+  -- The spec text was amended for Plan 4 and the constraint was not, which is
+  -- exactly the drift the spec amendment itself warns about: a spec that
+  -- disagrees with its implementation stops being consulted. Found by Task 3
+  -- refusing to start rather than working around it.
+  kind             TEXT NOT NULL CHECK (kind IN ('browse','crawl','manual','scan')),
   safety_profile   TEXT NOT NULL CHECK (safety_profile IN ('production','staging')),
   scope_version_id TEXT REFERENCES scope_version(id),
   started_us       INTEGER NOT NULL,
@@ -73,9 +80,22 @@ CREATE TABLE IF NOT EXISTS surface (
   query_key_set       TEXT NOT NULL DEFAULT '',
   kind                TEXT NOT NULL DEFAULT 'unknown'
                       CHECK (kind IN ('idempotent_read','state_changing','unknown')),
-  discovered_by       TEXT NOT NULL DEFAULT 'proxy'
+  -- NO DEFAULT, amended 2026-08-25 with SCHEMA_VERSION 6, on the same
+  -- argument `normaliser_version` lost its own and `denial.via` was never
+  -- given one. This column answers "which egress point found this surface",
+  -- and S5 draws a coverage figure straight off it -- "crawl-discovered
+  -- surfaces are recorded with discovered_by = 'crawl'". DEFAULT 'proxy'
+  -- answered that question for any writer who did not ask it, so every
+  -- crawler-discovered surface would have been labelled `proxy` with nothing
+  -- to tell afterwards. An omission must fail loudly instead.
+  discovered_by       TEXT NOT NULL
                       CHECK (discovered_by IN ('proxy','crawl','import','agent')),
-  normaliser_version  INTEGER NOT NULL DEFAULT 1,
+  -- NO DEFAULT, amended 2026-08-24. This column answers "which ruleset
+  -- produced this row", and a default answers it with a guess. It read
+  -- DEFAULT 1 while the ruleset moved to 2 in Plan 4's Task 2, so an insert
+  -- omitting it would have stamped rows with a ruleset that no longer exists
+  -- and nothing could tell afterwards. An omission must fail loudly instead.
+  normaliser_version  INTEGER NOT NULL,
   first_seen_run      TEXT REFERENCES run(id),
   last_seen_run       TEXT REFERENCES run(id),
   exemplar_exchange_id TEXT REFERENCES exchange(id),
@@ -168,6 +188,14 @@ CREATE TABLE IF NOT EXISTS finding (
   scope_level        TEXT NOT NULL
                      CHECK (scope_level IN ('engagement','host','surface','insertion')),
   payload            TEXT,
+  -- Still DEFAULT 1, deliberately and temporarily. The same argument as
+  -- surface.normaliser_version applies -- a column answering "which ruleset
+  -- produced this row" should not answer it with a guess -- but nothing
+  -- produces a finding until Plan 6, so the default is not yet WRONG here,
+  -- only premature. Removing it now costs 11 fixture rewrites in a merged
+  -- plan's test file, in a commit whose job is unblocking Task 3. Take it in
+  -- the plan that first writes a finding, and take it BEFORE that plan writes
+  -- one.
   normaliser_version INTEGER NOT NULL DEFAULT 1,
   first_seen_run     TEXT REFERENCES run(id),
   last_seen_run      TEXT REFERENCES run(id),
@@ -290,13 +318,37 @@ CREATE TABLE IF NOT EXISTS denial (
   id               TEXT PRIMARY KEY,
   run_id           TEXT REFERENCES run(id),
   ts_us            INTEGER NOT NULL,
+  -- `credential` added 2026-08-25 with SCHEMA_VERSION 6. S4 is
+  -- unconditional -- "Any denial produces a `denial` row and a distinct error
+  -- class. Denials are never silent" -- and `unmanaged_credential` was a
+  -- denial this vocabulary had no value for, so it reached the proxy's egress
+  -- point and vanished: no row, no counter, no exception. S7 refuses the
+  -- request and never persists it; that is a fact about the REQUEST BYTES,
+  -- and it never meant the refusal itself goes unrecorded. The row carries
+  -- method, url and a reason, never the credential.
   kind             TEXT NOT NULL
                    CHECK (kind IN ('scope','method','dangerous','rate','budget',
-                                   'not_configured')),
+                                   'not_configured','credential')),
   method           TEXT,
   url              TEXT,
   resolved_ip      TEXT,
   reason           TEXT,
+  -- Added 2026-08-25 with SCHEMA_VERSION 5. `exchange` has carried `via`
+  -- since Plan 1 and `denial` never did, which cost nothing while `send` was
+  -- the only value either could hold. Plan 4 makes the proxy a second egress
+  -- point, and `SELECT kind, COUNT(*) FROM denial` would then answer for two
+  -- at once with no way to tell them apart -- so "the crawler is being
+  -- refused everywhere" and "my browsing is being refused everywhere" become
+  -- one number, and they are opposite instructions.
+  --
+  -- The same three values as exchange.via, deliberately: a fourth would mean
+  -- a fourth egress path, which S4 forbids outright. NOT NULL with no
+  -- DEFAULT, for the reason surface.normaliser_version lost its own.
+  -- `records.record_denial` does default the PARAMETER to 'send', which is a
+  -- documented fact about which callers exist; a DEFAULT here would be a
+  -- different thing -- the answer a raw INSERT gets without being asked, and
+  -- a raw INSERT is exactly the shape a future writer takes.
+  via              TEXT NOT NULL CHECK (via IN ('proxy','send','crawl')),
   scope_version_id TEXT REFERENCES scope_version(id)
 );
 

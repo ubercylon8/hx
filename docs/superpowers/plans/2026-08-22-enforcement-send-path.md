@@ -398,6 +398,8 @@ public class PolicyTest {
         t("theVerdictTypeCarriesItsClassAndItsHint", PolicyTest::theVerdictTypeCarriesItsClassAndItsHint);
         t("aRequestFieldThatIsNullIsARejectedFrameNotANullPointer", PolicyTest::aRequestFieldThatIsNullIsARejectedFrameNotANullPointer);
         t("epochZeroIsNotConfigured", PolicyTest::epochZeroIsNotConfigured);
+        t("scopeOnlyFailsClosedWithoutHelpFromItsCaller",
+          PolicyTest::scopeOnlyFailsClosedWithoutHelpFromItsCaller);
         t("anInScopeRequestIsAllowed", PolicyTest::anInScopeRequestIsAllowed);
         t("scopeMatchesSchemeHostPortAndPath", PolicyTest::scopeMatchesSchemeHostPortAndPath);
         t("anEmptyScopeIncludeIsAnsweredByItsOwnGuard", PolicyTest::anEmptyScopeIncludeIsAnsweredByItsOwnGuard);
@@ -463,6 +465,12 @@ public class PolicyTest {
 
     /** A request in the shape Sender.parse produces: the url built from the
      *  frame's target_host and the origin-form target, the parts split out. */
+    /** The long, cheap-to-read fixture: same byte volume as the costly one,
+     *  two readings instead of sixteen. Used as the reference for the cost
+     *  ratio AND as the benign case, deliberately the same literal so a change
+     *  to one cannot silently diverge from the other. */
+    static final String LONG_BENIGN = "/sso/saml/" + "QUJD".repeat(2000);
+
     static HxRequest req(String method, String url, String host, String path, String query) {
         Map<String, List<String>> headers = new LinkedHashMap<>();
         headers.put("Host", List.of(host));
@@ -599,6 +607,52 @@ public class PolicyTest {
                "not_configured");
         denies("a null Authorisation is not_configured, not a crash",
                p, orders(), null, "not_configured");
+    }
+
+    /**
+     * decideScopeOnly's `not_configured` preamble, with the inputs that
+     * separate it from its absence.
+     *
+     * It had none. Deleting `unusable(auth)` from decideScopeOnly -- leaving
+     * `return checkScope(req, auth.scope());` -- was 10 x ALL PASS / 1637 ok /
+     * 0 FAIL, measured: the only caller is ProxyGate, whose own epoch-0 guard
+     * answers before this method is reached, and nothing drove a
+     * malformed-but-non-zero-epoch authorisation down the operator path. A
+     * guard is only tested by the input that separates it from its absence,
+     * and that rule is not for other people's guards.
+     *
+     * So both calls below are DIRECT -- `p.decideScopeOnly(...)`, not through
+     * ProxyGate -- which is also the caller the javadoc's promise is about.
+     * The two inputs are the two arms of Policy.unusable: epoch 0, and a
+     * readable epoch with a scope that cannot be read. With the preamble gone
+     * the first answers `scope_denied` (the empty-include guard) and the
+     * second throws three frames down, which the per-method guard turns into a
+     * named FAIL.
+     *
+     * NOT claimed: that these two exhaust what decideScopeOnly refuses. They
+     * are the two arms of unusable() as it stands; a third arm added there
+     * needs its own check here, and this one will not notice.
+     */
+    static void scopeOnlyFailsClosedWithoutHelpFromItsCaller() {
+        CountingGate gate = new CountingGate();
+        Policy p = new Policy(gate);
+
+        Decision none = p.decideScopeOnly(orders(), denyAll());
+        check("epoch 0 asked scope-only is not_configured (got "
+              + (none.allowed() ? "ALLOWED" : none.errorClass()) + ")",
+              !none.allowed() && "not_configured".equals(none.errorClass()));
+
+        Decision unreadable =
+                p.decideScopeOnly(orders(), new BridgeClient.Authorisation(EPOCH, null));
+        check("and an authorisation carrying no scope is too (got "
+              + (unreadable.allowed() ? "ALLOWED" : unreadable.errorClass()) + ")",
+              !unreadable.allowed()
+              && "not_configured".equals(unreadable.errorClass()));
+
+        // The question stops before the Gate for the same reason decide() does
+        // not reach it on a refusal: a request refused for having no usable
+        // authorisation must not spend the run's budget.
+        check("neither refusal spent the gate (" + gate.calls + " call(s))", gate.calls == 0);
     }
 
     // ---- scope -----------------------------------------------------------
@@ -2297,9 +2351,17 @@ public class PolicyTest {
         long dotStart = System.nanoTime();
         Decision dotVerdict = p.decide(dottedReq, APP);
         long dotMs = (System.nanoTime() - dotStart) / 1_000_000;
-        check("a path of " + (Policy.MAX_TARGET_CHARS - 1) + " U+0130 characters is "
-              + "decided in " + dotMs + " ms (was 99 ms, and allowed)",
-              dotMs < 30 && dotVerdict != null);
+        // The bound is the READING COUNT, with the milliseconds printed but not
+        // asserted on -- amended 2026-08-24. The `dotMs < 30` this replaces
+        // measured 8 ms quiescent and FAILED at 32 and 35 ms under 24 and 48
+        // busy threads: 3.75x headroom on a machine whose absolute figures
+        // move 5x, which is a check that goes red for reasons unrelated to the
+        // code. What "was 99 ms" actually measured was a fold deriving one
+        // reading per code point; the count is that fact directly.
+        int dottedReadings = Policy.readings(dotted, Policy.readingBudget(dotted.length())).size();
+        check("a path of " + (Policy.MAX_TARGET_CHARS - 1) + " U+0130 characters reads "
+              + dottedReadings + " ways and is decided (" + dotMs + " ms, was 99 ms and allowed)",
+              dottedReadings <= 4 && dotVerdict != null);
 
         char[] alphabet = ("ab/./..;\\ %2e2f5c%c0%aeADMIN" + '\0'
                 + "\u00c0\u00ae\uff0f\uff0e\u0130\u2215\ufe52").toCharArray();
@@ -3066,6 +3128,22 @@ public class PolicyTest {
               + ") in " + ms + " ms",
               !big.allowed() && "scope_denied".equals(big.errorClass()) && ms < 60);
 
+        // AND THE COUNT, WHICH IS THE THING THAT ACTUALLY MOVES -- added
+        // 2026-08-24 after a reviewer reintroduced the defect these checks
+        // exist for (the reading bound moved from construction back to
+        // matching) and found the timing checks BOTH still green: this one at
+        // 44 ms against its 60 ms ceiling, and the ratio check below at an
+        // unchanged 54x. The set went 17 members -> 50. So the explosion was
+        // caught by nothing, while two checks written to catch it passed.
+        //
+        // Time was always a proxy for the count, and a bad one: it moves with
+        // the machine, and the previous ceiling on this file went red at load
+        // with no code change. The count moves only with the code.
+        int worstReadings = Policy.readings(worst, Policy.readingBudget(worst.length())).size();
+        check("and its reading set is bounded at " + worstReadings + " members, "
+              + "not the 50 an unbounded derivation builds",
+              worstReadings <= 24);
+
         // The costliest target a hill climb over the trigger alphabet could
         // build, tiled to the length bound. It is UNDER the reading bound and
         // so it is DECIDED rather than refused -- which is the point: nothing
@@ -3099,6 +3177,43 @@ public class PolicyTest {
         // round and the fold did not move it. The measurement below is a MEDIAN
         // of five rather than a single sample, so the check answers "is this
         // code slow" rather than "was the machine busy for one sample".
+        // MEASURED AGAINST THE MACHINE, NOT AGAINST A STOPWATCH -- amended
+        // 2026-08-24, and the reason is in the paragraph above rather than in
+        // this one. That paragraph already recorded that a saturated machine
+        // fails an absolute ceiling ("24 busy threads 89 ms -- over the
+        // ceiling"), and shipped the absolute ceiling anyway. It duly went red
+        // at 105 ms on a machine running a Windows VM at 158% CPU, with no
+        // code change, at the start of the next plan.
+        //
+        // A permanently-red check is worse than a missing one. Rule 1 of this
+        // project is to judge a run by its summary line, and a check that is
+        // red for reasons unrelated to the code trains every reader to look
+        // past exactly the line they must not look past.
+        //
+        // So the bound is now a RATIO against the same function on the same
+        // byte volume with a cheap reading count, measured microseconds apart
+        // in the same loop. Load hits both halves equally, so the ratio does
+        // not move with it: measured 54 on two consecutive runs at load 3-4.6,
+        // where the absolute figures were 108 ms and 109 ms against a
+        // quiescent 40 ms. The ceiling of 100 is roughly 2x the measured
+        // ratio. The first version of this comment also claimed the defect
+        // this check exists for "sits near 200-400 on the same scale". THAT
+        // NUMBER WAS NEVER MEASURED, in a comment whose whole argument is
+        // measure-do-not-assume, and a reviewer who did measure it found the
+        // opposite: with the reading bound removed the ratio reads an
+        // unchanged 54x. The ratio does not catch that defect. THE READING
+        // COUNT ABOVE DOES, and it is where that guarantee now lives.
+        //
+        // What this ratio catches is a change that makes the EXPENSIVE path
+        // disproportionately worse. What it cannot see is a UNIFORM slowdown:
+        // if every decide() got 5x slower both halves scale together, the
+        // ratio holds, and only the printed milliseconds would say so. The old
+        // absolute ceiling did catch that, and this trade is deliberate --
+        // a uniform slowdown is visible in the suite's wall time, while a
+        // load-dependent ceiling is red for reasons no reader can act on.
+        //
+        // The absolute figures are still PRINTED, because a reader chasing a
+        // slow suite wants the milliseconds even when the ratio is fine.
         String costly = "/\u2215\u2170\ufe52/D\uff0f2\u2216;%c2/.\u2170\u29f89\u0269/\uff05";
         StringBuilder costlyTiled = new StringBuilder();
         while (costlyTiled.length() + costly.length() <= Policy.MAX_TARGET_CHARS)
@@ -3106,26 +3221,43 @@ public class PolicyTest {
         String costlyPath = costlyTiled.toString();
         HxRequest costlyReq = req("GET", "https://app.example.test" + costlyPath,
                                   "app.example.test", costlyPath, "");
+        // Same byte volume, cheap to read. ONE literal, shared with the benign
+        // check below -- it is hoisted rather than repeated because the first
+        // version of this comment claimed the sharing while declaring a second
+        // identical literal forty lines down, which is a guarantee asserted
+        // and not provided.
+        String refPath = LONG_BENIGN;
+        HxRequest refReq = req("GET", "https://app.example.test" + refPath,
+                               "app.example.test", refPath, "");
         p.decide(costlyReq, APP);
-        long[] samples = new long[5];
+        p.decide(refReq, APP);
+        long[] samples = new long[9];
+        long[] refSamples = new long[9];
         Decision cVerdict = null;
         for (int i = 0; i < samples.length; i++) {
+            // Interleaved, so a load spike lands on both rather than on one.
             long cStart = System.nanoTime();
             cVerdict = p.decide(costlyReq, APP);
-            samples[i] = (System.nanoTime() - cStart) / 1_000_000;
+            samples[i] = System.nanoTime() - cStart;
+            long rStart = System.nanoTime();
+            p.decide(refReq, APP);
+            refSamples[i] = System.nanoTime() - rStart;
         }
         Arrays.sort(samples);
-        long cMs = samples[samples.length / 2];
+        Arrays.sort(refSamples);
+        long cNs = samples[samples.length / 2];
+        long rNs = Math.max(1L, refSamples[refSamples.length / 2]);
+        long ratio = cNs / rNs;
         check("the costliest target a hill climb could build (" + costlyPath.length()
               + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath.length())).size()
               + " readings) is answered " + (cVerdict.allowed() ? "allow" : cVerdict.errorClass())
-              + " in " + cMs + " ms (median of " + samples.length + ", "
-              + Arrays.toString(samples) + ")",
-              cMs < 80 && cVerdict != null);
+              + " at " + ratio + "x the cost of the same volume read cheaply ("
+              + (cNs / 1_000_000) + " ms vs " + (rNs / 1_000_000) + " ms)",
+              ratio < 100 && cVerdict != null);
 
         // ...while a long BENIGN target is decided rather than refused: the
         // size bound must not turn into a length bound of its own.
-        String longBenign = "/sso/saml/" + "QUJD".repeat(2000);
+        String longBenign = LONG_BENIGN;
         check("the long benign fixture is near the length bound and reads "
               + Policy.readings(longBenign).size() + " ways",
               longBenign.length() > 4096 && Policy.readings(longBenign).size() <= 2);
@@ -4132,7 +4264,7 @@ import java.util.Set;
  *   /x/..%ef%bc%8flogout  is /x/../logout wherever a wide string reaches an
  *                      ANSI API, because U+FF0F best-fits to `/`
  *   /foo%2fbar/../admin/users  is /admin/users in python's urljoin, node's
- *                      new URL() and java's URI.normalize alike: none of them
+ *                      JavaScript's new URL and java's URI.normalize alike: none of them
  *                      decodes %2f before resolving the `..`, so the `..`
  *                      pops one whole segment called `foo%2fbar`
  *   /a%2fb/%2e%2e/admin/users  is /admin/users on anything that decodes AFTER
@@ -4144,7 +4276,7 @@ import java.util.Set;
  * involved. For `/a//../admin/users`:
  *
  *   python  urljoin()             -> /a/admin/users
- *   node    new URL().pathname    -> /a/admin/users
+ *   node    new URL .pathname     -> /a/admin/users
  *   java    URI.normalize()       -> /admin/users
  *
  * An earlier round of this class picked ONE reading (merge empty segments,
@@ -4330,21 +4462,10 @@ public final class Policy {
      * exactly that reason, and there is one of each.
      */
     public Decision decideBeforeGate(HxRequest req, BridgeClient.Authorisation auth) {
-        // Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before
-        // any configure and after every disconnect; epochCounter is
-        // pre-incremented, so a real commit is >= 1 and there is no other way
-        // to observe a 0. A null snapshot is a caller bug, and the fail-closed
-        // reading of a caller bug is the same one.
-        if (auth == null || auth.epoch() == 0)
-            return Decision.deny("not_configured", "no configure frame acknowledged yet");
+        Decision unusable = unusable(auth);
+        if (unusable != null) return unusable;
 
         Map<String, List<String>> scope = auth.scope();
-        // An Authorisation that cannot be read is answered the same way as one
-        // that was never committed. See malformation().
-        String malformed = malformation(scope);
-        if (malformed != null)
-            return Decision.deny("not_configured", malformed);
-
         Decision scoped = checkScope(req, scope);
         if (!scoped.allowed()) return scoped;
 
@@ -4387,6 +4508,77 @@ public final class Policy {
                                 req.target() + " matches dangerous.path " + pattern);
 
         return Decision.allow();
+    }
+
+    /**
+     * Scope, and nothing after it.
+     *
+     * Separate method rather than a boolean parameter on {@link #decide},
+     * because a boolean at a call site reads as a mode and this is a different
+     * QUESTION: "is this inside the client's boundary", asked without asking
+     * any of the four rules that constrain an agent. Spec s4 draws that line
+     * for the proxy's operator branch -- a human clicking a form is a
+     * deliberate act by the person legally responsible for the engagement, and
+     * their login POST is not the crawler's `method.allow` to refuse. Scope is
+     * the one nobody may spend, so it is the one this still asks.
+     *
+     * NOT a partial {@link #decideBeforeGate}, and callers may not treat it as
+     * one: an `allowed()` from here has passed scope alone. ChokepointTest
+     * counts `.decideBeforeGate(` and `.checkGate(` and requires one of each
+     * because that pair IS the send path's whole decision; this method is not
+     * in that pair and issuing on its answer would issue past method,
+     * dangerous-path, the rate limit and the budget at once.
+     *
+     * It fails closed on its own -- epoch 0 and an unreadable scope are
+     * `not_configured` here exactly as in {@link #decideBeforeGate}, from the
+     * same helper -- so a future caller that reaches for it directly cannot
+     * get an allow out of an authorisation nobody committed. That preamble is
+     * pinned by PolicyTest.scopeOnlyFailsClosedWithoutHelpFromItsCaller, which
+     * calls THIS method directly with the two inputs that separate it from its
+     * absence: `new Authorisation(0, Map.of())` -- which ProxyGate's own epoch
+     * guard would otherwise answer for it -- and `new Authorisation(7, null)`,
+     * which nothing else on the operator path exercises. Without those two the
+     * preamble could be deleted with the whole suite green; it was, and it
+     * could.
+     */
+    public Decision decideScopeOnly(HxRequest req, BridgeClient.Authorisation auth) {
+        Decision unusable = unusable(auth);
+        if (unusable != null) return unusable;
+        return checkScope(req, auth.scope());
+    }
+
+    /**
+     * Why this Authorisation cannot be decided under at all, or null when it
+     * can. The `not_configured` preamble both public questions above share.
+     *
+     * Extracted rather than written twice. A second copy is where a fail-open
+     * drifts in: the two would be edited at different times, and the one that
+     * was not edited answers `allowed()` for an authorisation the other
+     * refuses -- with nothing comparing them.
+     *
+     * Epoch 0 is the DENY-ALL Authorisation BridgeClient publishes before any
+     * configure and after every disconnect; epochCounter is pre-incremented,
+     * so a real commit is >= 1 and there is no other way to observe a 0.
+     *
+     * `== 0`, not `< 1`, and the same shape is in ProxyGate's own copy of this
+     * guard. That is a REACHABILITY argument rather than a range check: epoch
+     * is a long, and a hand-built `new Authorisation(-1, scope)` is treated as
+     * CONFIGURED and decided under at both enforcement points -- measured.
+     * BridgeClient's pre-incremented counter is the only writer of the field,
+     * so nothing in this tree can produce one; the inherited shape is kept and
+     * the reachability is written down rather than left to be re-derived.
+     *
+     * A null snapshot is a caller bug, and the fail-closed reading of a caller
+     * bug is the same one. An Authorisation that cannot be READ is answered
+     * the same way as one that was never committed -- see malformation().
+     */
+    private static Decision unusable(BridgeClient.Authorisation auth) {
+        if (auth == null || auth.epoch() == 0)
+            return Decision.deny("not_configured", "no configure frame acknowledged yet");
+        String malformed = malformation(auth.scope());
+        if (malformed != null)
+            return Decision.deny("not_configured", malformed);
+        return null;
     }
 
     /**
@@ -5292,7 +5484,7 @@ public final class Policy {
      *
      *   /foo%2fbar/../admin/users
      *     python urljoin()       -> /admin/users
-     *     node   new URL()       -> /admin/users
+     *     node   new URL        -> /admin/users
      *     java   URI.normalize() -> /admin/users
      *     readings()             -> { raw, /foo/admin/users }
      *
@@ -5306,7 +5498,7 @@ public final class Policy {
      *
      *   - the member ITSELF, undecoded. The server routed on the bytes it was
      *     sent and unescaped afterwards, if at all. This is the RFC reading,
-     *     and the one urljoin, new URL() and URI.normalize() give.
+     *     and the one urljoin, JavaScript's new URL and URI.normalize give.
      *   - the member DECODED to a fixed point, with the decoded characters
      *     read as syntax. The server unescaped before it routed, so a %2f is a
      *     separator and a %2e%2e is a dot segment. This was the only base.
@@ -7147,6 +7339,45 @@ public final class TestSupport {
     public interface Reporter { void check(String what, boolean ok); }
 
     /**
+     * The method currently running, so a HANG can name itself.
+     *
+     * {@link #t}'s docstring below says the exit code is the only thing that
+     * notices a hang. That is DETECTION; this is DIAGNOSIS, and they are
+     * different problems. rc=1 tells you the suite lost a class. It does not
+     * tell you WHICH of that class's methods parked, and the output stops
+     * before the method that hung would have printed anything -- so the last
+     * line you see is the previous method's `ok`, which points at the wrong
+     * place.
+     *
+     * `timeout` sends SIGTERM, and the JVM runs shutdown hooks on SIGTERM. So
+     * the hook below prints the name that was in flight. It costs one volatile
+     * write per test method and prints NOTHING on a healthy run -- a diagnostic
+     * that fires unconditionally is noise, and noise is what stops people
+     * reading output at all.
+     *
+     * IT HAS ALREADY EARNED ITS PLACE. The sweep that bounded this repo's
+     * joins believed it had found every unbounded wait; this hook named the
+     * one it had missed, `KILLED WHILE RUNNING
+     * checkIsExclusiveWithItselfDeterministically`, on a monitor acquisition
+     * no join bound could ever have covered. See {@link #join}.
+     */
+    private static volatile String inFlight;
+
+    static {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            String name = inFlight;
+            if (name != null) {
+                // stderr, not stdout: a killed run's stdout may be mid-buffer,
+                // and this line has to survive to be worth writing.
+                System.err.println("hx: KILLED WHILE RUNNING " + name
+                        + " -- this class printed no summary line because the "
+                        + "method never returned. Bound the wait.");
+                System.err.flush();
+            }
+        }, "hx-inflight-reporter"));
+    }
+
+    /**
      * Run one test method so that a throw out of it is a NAMED FAILURE rather
      * than the end of the run.
      *
@@ -7160,16 +7391,109 @@ public final class TestSupport {
      * green from a truncation -- and under {@code ./test.sh | grep -c FAIL},
      * the idiom this project's briefs prescribe, a truncation reads as 0.
      *
+     * A THROW IS ONLY THE FIRST WAY A CLASS PRINTS NO SUMMARY LINE. The second
+     * is a HANG, and this guard cannot catch it: a test method parked on an
+     * unbounded {@code join()}, {@code await()} or {@code synchronized} call
+     * never returns, so there is nothing to catch, the methods after it never
+     * run, and test.sh's {@code timeout 300} kills the class from outside.
+     * That run prints one FEWER summary line and still zero FAIL lines. So:
+     * JUDGE A RUN BY ITS SUMMARY-LINE COUNT AND ITS EXIT CODE.
+     *
+     * WHAT THE BOUNDS DO CATCH, each mutation applied alone under
+     * {@code timeout 600 ./test.sh}, against a clean 11 summary lines / 0 FAIL
+     * / rc=0:
+     *
+     *   - a {@code Limiter.check} that PARKS a caller it made wait for its own
+     *     monitor instead of refusing it: {@link #join} fires by name -- "...
+     *     had not finished after 10000 ms, so it HUNG" -- giving 11 summary
+     *     lines with a named FAIL and rc=1 instead of a truncation. WHICH of
+     *     LimiterTest's two waits trips first depends on the mutation's own
+     *     timing and both were seen across two runs; the claim here is that
+     *     one of them does, not which;
+     *   - the race's own {@code go.countDown()} deleted, the shape that used
+     *     to hold the JVM open on a non-daemon worker: 11 summary lines,
+     *     2 FAIL, rc=1.
+     *
+     * WHAT THEY DO NOT CATCH, measured the same way and UNCHANGED by every
+     * bound in this file: a {@code Limiter.check} that SLEEPS instead of
+     * denying when rate-limited -- a rate limiter that THROTTLES rather than
+     * REFUSES, the §4 violation the proxy layer above it exists to forbid --
+     * gives 10 summary lines, 10 ALL PASS, 0 FAIL, rc=1. It parks in
+     * {@code theWindowIsExactAtItsBoundaries}, the FIRST of LimiterTest's
+     * fourteen methods and eleven before {@code raceAgainst} is reached, in a
+     * direct call that owns no helper thread and waits on nothing. There is no
+     * wait for {@link #join} to bound, and THE EXIT CODE IS THE ONLY THING
+     * THAT SEES IT -- with the shutdown hook above to say which method it was.
+     * A bound cannot be retrofitted onto a straight-line call from out here;
+     * only a watchdog running each body on its own bounded thread could, and
+     * with 24 methods in a class its per-method share of test.sh's 300 s is
+     * ~12 s, under {@code LimiterTest.RACE_DEADLINE_MS} alone. It would fire
+     * on healthy runs.
+     *
      * Catching {@link Throwable} rather than {@link Exception} is deliberate:
      * an {@link AssertionError} or a {@link StackOverflowError} out of a test
      * method truncates a run exactly as an NPE does.
      */
     public static void t(Reporter reporter, String name, Body body) {
+        inFlight = name;
         try {
             body.run();
         } catch (Throwable e) {
             reporter.check(name + " threw " + e, false);
+        } finally {
+            // Cleared in a finally, so a THROWN method does not leave its name
+            // in flight and get blamed for a later method's hang.
+            inFlight = null;
         }
+    }
+
+    /**
+     * Join a helper thread with a BOUND, or fail by name.
+     *
+     * `t.join()` with no argument is the second truncation described on
+     * {@link #t}: it cannot fail, only hang, and a hung class prints no
+     * summary line. This throws instead, which {@link #t} turns into a named
+     * FAIL against the class's own counter -- the difference between "the
+     * suite lost a class" and "this named property is broken".
+     *
+     * The caller supplies the bound, because only the caller knows what the
+     * thread is doing: a millisecond of non-blocking arithmetic and a socket
+     * round trip deserve different numbers. Every bound passed today is 10 s
+     * or less, against work whose whole test class finishes in well under a
+     * second, so none can fire on anything but a genuine hang. And a class
+     * whose every bound fires still finishes inside test.sh's 300 s backstop:
+     * LimiterTest holds the most of them and its worst case is 8 workers x
+     * 10 s x 2 races, plus 5 s for the exclusivity helper -- 165 s.
+     *
+     * The thread is NOT interrupted on the deadline. Unparking it would let
+     * the assertions after this call run against work the hang had quietly
+     * finished, hiding the very thing being reported -- and a leaked DAEMON
+     * costs nothing, which is why every caller here makes its helper one.
+     *
+     * THIS IS A BOUND FOR A THREAD AND THERE IS NONE FOR A MONITOR, which is
+     * where the sweep that introduced this method was wrong to call itself
+     * complete. A {@code synchronized} call whose lock is held by a thread
+     * that has parked cannot be bounded, interrupted or timed out from the
+     * outside at all -- {@code Object.wait} takes a timeout, ENTERING a
+     * monitor does not. Measured: with {@code Limiter.check} parking a caller
+     * it made wait for the monitor,
+     * {@code LimiterTest.checkIsExclusiveWithItselfDeterministically} printed
+     * its own FAIL line and then parked forever on {@code limiter.issued()},
+     * a {@code synchronized} accessor the parked helper was still holding --
+     * 10 summary lines and rc=1, the class truncated. The only bound for that
+     * shape is NOT MAKING THE CALL: throw out of the join first, so the line
+     * that would take the monitor is never reached. That is what the call site
+     * does now, and it is what an audit for unbounded waits has to look for
+     * alongside the joins -- a locked accessor after a helper that might not
+     * have released.
+     */
+    public static void join(Thread t, long ms, String what) throws Exception {
+        t.join(ms);
+        if (t.isAlive())
+            throw new AssertionError(
+                what + " had not finished after " + ms + " ms, so it HUNG. An "
+                + "unbounded join here would have printed no summary line at "
+                + "all and read as zero failures");
     }
 
     /**
@@ -7231,6 +7555,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
@@ -7610,6 +7935,40 @@ public class LimiterTest {
               3 == raceAgainst(new Limiter(new TickClock(T0), 10_000, 3)));
     }
 
+    /**
+     * How long 1600 non-blocking calls get before the race is called HUNG.
+     *
+     * `check` takes a monitor and does arithmetic; 1600 of them across eight
+     * threads is a fraction of the well-under-a-second this whole class takes
+     * to run. Ten seconds cannot fire on anything but a genuine park -- and a
+     * genuine park is the whole reason it exists.
+     *
+     * WHAT IT CATCHES, measured on this file one mutation at a time against a
+     * clean 11 summary lines / 0 FAIL / rc=0: a `check` that PARKS a caller it
+     * made wait for its own monitor -- a rate limiter that THROTTLES the
+     * caller rather than REFUSING it, the same §4 violation the capture layer
+     * above exists to forbid, one layer down -- parked all eight workers, and
+     * this bound turned that into a named FAIL against this class's own
+     * counter: "a concurrent caller of Limiter.check had not finished after
+     * 10000 ms, so it HUNG". Whether that mutation trips HERE or in
+     * checkIsExclusiveWithItselfDeterministically below depends on its own
+     * timing -- both were seen -- and the point is that both waits are bounded,
+     * not which one goes first. Deleting this method's own `go.countDown()` is
+     * caught too, by the matching bound on `go.await`: 11 summary lines,
+     * 2 FAIL, rc=1. Both were 10 lines / 0 FAIL / rc=1 before the bounds.
+     *
+     * WHAT IT DOES NOT CATCH, and this docstring asserted the opposite until
+     * it was measured: a `check` that SLEEPS instead of returning
+     * `rateLimited` never reaches this method at all. It parks in
+     * `theWindowIsExactAtItsBoundaries`, the FIRST of this class's fourteen
+     * methods and eleven before `raceAgainst`, in a direct call with no helper
+     * thread to join -- 10 summary lines, 10 ALL PASS, 0 FAIL, rc=1, and no
+     * worker is ever constructed. Unchanged by every bound in this file. The
+     * EXIT CODE is the only thing that sees it, with `TestSupport`'s shutdown
+     * hook to name the method. See {@link hx.TestSupport#t}.
+     */
+    static final long RACE_DEADLINE_MS = 10_000L;
+
     static int raceAgainst(Limiter l) throws Exception {
         int threads = 8, callsEach = 200;
         AtomicInteger allowed = new AtomicInteger();
@@ -7617,21 +7976,40 @@ public class LimiterTest {
         List<Thread> workers = new ArrayList<>();
         for (int t = 0; t < threads; t++) {
             Thread w = new Thread(() -> {
-                try { go.await(); } catch (InterruptedException e) { return; }
+                try {
+                    // Bounded, and the workers are DAEMONS. A non-daemon
+                    // worker that never releases holds the JVM up AFTER
+                    // main() has printed ALL PASS: eleven green summary lines
+                    // and a suite that still blocks to the backstop.
+                    if (!go.await(RACE_DEADLINE_MS, TimeUnit.MILLISECONDS)) return;
+                } catch (InterruptedException e) { return; }
                 for (int i = 0; i < callsEach; i++)
                     if (l.check(ACCOUNT).allowed()) allowed.incrementAndGet();
             });
+            w.setDaemon(true);
             workers.add(w);
             w.start();
         }
         go.countDown();
-        for (Thread w : workers) w.join();
+        for (Thread w : workers)
+            TestSupport.join(w, RACE_DEADLINE_MS,
+                             "a concurrent caller of Limiter.check");
         // issued() is the limiter's own count; allowed is the callers'. They
         // must agree, or one of the two is not counting what it claims to.
         if (l.issued() != allowed.get())
             check("issued() disagrees with the callers: " + l.issued() + " vs " + allowed.get(), false);
         return allowed.get();
     }
+
+    /** How long the helper below gets to finish one non-blocking `check` once
+     *  the monitor is free. Half of RACE_DEADLINE_MS against a thousandth of
+     *  the work, and a HANG bound rather than a timing assertion.
+     *
+     *  Declared ABOVE the next method's docstring rather than between it and
+     *  the method. Two javadoc comments in a row and javac attaches only the
+     *  second: the first documents nothing, which is how this file's sibling
+     *  in hx.TestSupport silently lost the paragraph explaining hangs. */
+    static final long HELPER_RELEASE_MS = 5_000L;
 
     /**
      * The mutual-exclusion guard on check(), deterministically -- the guard
@@ -7654,6 +8032,20 @@ public class LimiterTest {
      * checks: a thread parked on some unrelated lock -- a class-init monitor,
      * say -- is also BLOCKED, and accepting that would pass a Limiter with no
      * lock on check() at all, for the wrong reason.
+     *
+     * THE JOIN BELOW IS BOUNDED AND THROWS, and that is load-bearing rather
+     * than tidy. `limiter.issued()` after it is a `synchronized` accessor, so
+     * a helper still parked INSIDE check() is still holding the monitor that
+     * call needs -- and entering a monitor cannot be bounded, interrupted or
+     * timed out from here. Measured with the exact mutation this method exists
+     * to catch, a `check` that parks a caller it made wait for the monitor:
+     * on a plain `helper.join(5000)` this method printed its FAIL and then
+     * parked on `issued()` forever, taking LimiterTest from ELEVEN summary
+     * lines to TEN with rc=1 as the only signal -- the very truncation the
+     * bounds in this file were added to remove, wearing a second shape and
+     * missed by the sweep that added them. `TestSupport.join` throwing means
+     * `issued()` is never reached: the only bound available for a monitor is
+     * not making the call.
      */
     static void checkIsExclusiveWithItselfDeterministically() throws Exception {
         TickClock clock = new TickClock(T0);
@@ -7667,7 +8059,8 @@ public class LimiterTest {
             check("a concurrent check() is parked on Limiter's own monitor",
                   waitUntilBlockedOn(helper, limiter));
         }
-        helper.join(5000);
+        TestSupport.join(helper, HELPER_RELEASE_MS,
+                         "the concurrent check(), after limiter's monitor was released");
         check("...and proceeds once the monitor is released", !helper.isAlive());
         check("...and its issuance was actually counted", limiter.issued() == 1L);
     }
@@ -9579,6 +9972,57 @@ public class RedactorTest {
         t("aHeadWhoseFirstLineIsAFieldIsStillRedacted", RedactorTest::aHeadWhoseFirstLineIsAFieldIsStillRedacted);
         t("theResponseBodyIsNeverRewritten", RedactorTest::theResponseBodyIsNeverRewritten);
 
+        t("anObservedCookieIsReplacedAndItsNameKept",
+          RedactorTest::anObservedCookieIsReplacedAndItsNameKept);
+        t("anObservedAuthorizationIsReplaced",
+          RedactorTest::anObservedAuthorizationIsReplaced);
+        t("anObservedProxyAuthorizationIsReplaced",
+          RedactorTest::anObservedProxyAuthorizationIsReplaced);
+        t("twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob);
+        t("anObservedCredentialNameIsMatchedWhateverItsCase",
+          RedactorTest::anObservedCredentialNameIsMatchedWhateverItsCase);
+        t("aCookieInTheREQUESTBodyIsNeverRewritten",
+          RedactorTest::aCookieInTheRequestBodyIsNeverRewritten);
+        t("aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases",
+          RedactorTest::aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases);
+        t("aFoldedContinuationOfAnObservedCredentialIsRedacted",
+          RedactorTest::aFoldedContinuationOfAnObservedCredentialIsRedacted);
+        t("whitespaceBeforeTheColonDoesNotHideAnObservedCredential",
+          RedactorTest::whitespaceBeforeTheColonDoesNotHideAnObservedCredential);
+        t("aBlankLineBeforeTheRequestLineDoesNotEndTheHead",
+          RedactorTest::aBlankLineBeforeTheRequestLineDoesNotEndTheHead);
+        t("anAbsoluteFormRequestLineIsNotMatchedAsAField",
+          RedactorTest::anAbsoluteFormRequestLineIsNotMatchedAsAField);
+        t("redactObservedRequestRefusesNullBytes",
+          RedactorTest::redactObservedRequestRefusesNullBytes);
+        t("theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem",
+          RedactorTest::theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem);
+        t("aUserinfoCredentialNeverReachesTheBlobStore",
+          RedactorTest::aUserinfoCredentialNeverReachesTheBlobStore);
+        t("twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob);
+        t("onlyTheFirstHeadLineIsATarget",
+          RedactorTest::onlyTheFirstHeadLineIsATarget);
+        t("aCredentialFirstLineIsStillRedactedAsAField",
+          RedactorTest::aCredentialFirstLineIsStillRedactedAsAField);
+        t("theRequestBodyIsNeverRewrittenByJobFive",
+          RedactorTest::theRequestBodyIsNeverRewrittenByJobFive);
+        t("aCredentialParameterLosesItsValueAndKeepsItsKey",
+          RedactorTest::aCredentialParameterLosesItsValueAndKeepsItsKey);
+        t("anIdentifierParameterIsNeverTouched",
+          RedactorTest::anIdentifierParameterIsNeverTouched);
+        t("twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob);
+        t("aClientsOwnNameForATokenIsNotCaught",
+          RedactorTest::aClientsOwnNameForATokenIsNotCaught);
+        t("theParameterNamesAreMatchedWholeAndCaseInsensitively",
+          RedactorTest::theParameterNamesAreMatchedWholeAndCaseInsensitively);
+        t("aNestedCutIsWrittenOnceNotTwice",
+          RedactorTest::aNestedCutIsWrittenOnceNotTwice);
+        t("theEmptyInjectedPathIsWhyJobFourExists",
+          RedactorTest::theEmptyInjectedPathIsWhyJobFourExists);
+
         t("redactionHappensBeforeHashing", RedactorTest::redactionHappensBeforeHashing);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
@@ -9857,8 +10301,14 @@ public class RedactorTest {
         injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
         String[] fromWorker = new String[1];
         Thread worker = new Thread(() -> fromWorker[0] = text(r.redactRequest(raw, injected)));
+        // Daemon and bounded, for the reason on TestSupport.t: an unbounded
+        // `worker.join()` here turns any `redactRequest` that ever takes a
+        // lock into a class that prints NO summary line and no FAIL line, and
+        // a non-daemon worker holds the JVM open past ALL PASS. Ten seconds
+        // against a single in-memory byte-copy.
+        worker.setDaemon(true);
         worker.start();
-        worker.join();
+        TestSupport.join(worker, 10_000L, "the worker thread doing the redaction");
         check("a range registered on the read loop is applied by the worker that redacts",
               fromWorker[0].contains("Authorization: {{identity:ident-admin:authz}}\r\n")
               && !fromWorker[0].contains(TOKEN));
@@ -10326,6 +10776,510 @@ public class RedactorTest {
               text(hashedFirst.get(sha256(raw))).contains(TOKEN));
     }
 
+    // ---- job 4: a request hx OBSERVED, not one it composed -----------------
+    //
+    // Every method below drives redactObservedRequest, which is the ONLY
+    // mechanism between an operator's live session cookie and a
+    // content-addressed blob store. Deleting the header-name match from that
+    // method has to redden here or the finding it was written for is back.
+
+    static final String COOKIE_SECRET = "3f9a1c77e5b24d0e8a1b6c4d2f7e9013";
+    static final String BEARER_SECRET = "eyJhbGciOiJIUzI1NiJ9.b3BlcmF0b3I.7d1a";
+
+    /** What the operator's browser sends through the proxy: a credential this
+     *  extension did not compose, cannot refuse, and must not store. */
+    static byte[] browsedRequest(String cookieValue) {
+        return bytes("GET /account/settings HTTP/1.1\r\n"
+                   + "Host: app.example.test\r\n"
+                   + "User-Agent: Mozilla/5.0\r\n"
+                   + "Cookie: JSESSIONID=" + cookieValue + "; theme=dark\r\n"
+                   + "Accept: text/html\r\n"
+                   + "\r\n");
+    }
+
+    static void anObservedCookieIsReplacedAndItsNameKept() {
+        Redactor r = new Redactor();
+        byte[] raw = browsedRequest(COOKIE_SECRET);
+        byte[] wire = raw.clone();
+        String out = text(r.redactObservedRequest(raw));
+        // THE CHECK WHOSE ABSENCE WAS THE WHOLE FINDING. With redactRequest
+        // and an empty Injected -- the shipped state for one commit -- this
+        // line is the operator's live session cookie, verbatim, on its way
+        // into a content-addressed store.
+        check("the live session cookie is GONE (" + out.replace("\r\n", " | ") + ")",
+              !out.contains(COOKIE_SECRET));
+        check("the header name and colon survive, so the evidence still shows "
+              + "a credential was sent",
+              out.contains("Cookie: {{observed:cookie}}\r\n"));
+        // THE WHOLE VALUE, not a parsed part of it. `theme=dark` is inside the
+        // Cookie header and goes with it: a per-pair rule here would have to
+        // decide which cookie names are secrets, and the browser's own
+        // `JSESSIONID=` tells a check nothing the response's Set-Cookie did
+        // not already say.
+        check("and the whole value went, not just the pair that looked secret",
+              !out.contains("theme=dark"));
+        check("every other header is verbatim",
+              out.contains("GET /account/settings HTTP/1.1\r\n")
+              && out.contains("Host: app.example.test\r\n")
+              && out.contains("User-Agent: Mozilla/5.0\r\n")
+              && out.contains("Accept: text/html\r\n"));
+        check("and the argument is not modified", Arrays.equals(raw, wire));
+    }
+
+    static void anObservedAuthorizationIsReplaced() {
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /api/me HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Authorization: Bearer " + BEARER_SECRET + "\r\n"
+                         + "\r\n");
+        String out = text(r.redactObservedRequest(raw));
+        check("the bearer token is gone", !out.contains(BEARER_SECRET));
+        check("...and so is the scheme that carried it, because the whole "
+              + "value is the secret",
+              out.contains("Authorization: {{observed:authorization}}\r\n"));
+    }
+
+    static void anObservedProxyAuthorizationIsReplaced() {
+        // The third of §6's three names, and the one a reader is likeliest to
+        // assume is covered because the other two are.
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /x HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Proxy-Authorization: Basic b3A6cDRzc3cwcmQ=\r\n"
+                         + "\r\n");
+        String out = text(r.redactObservedRequest(raw));
+        check("the proxy credential is gone", !out.contains("b3A6cDRzc3cwcmQ="));
+        check("and its name is kept",
+              out.contains("Proxy-Authorization: {{observed:proxy-authorization}}\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob() throws Exception {
+        // THE DETERMINISM CONSTRAINT, and it is not a style point. The plan's
+        // Global Constraints require redaction to be deterministic -- "two
+        // requests differing only in credential bytes must produce the same
+        // blob" -- and the store is CONTENT-ADDRESSED, so a hash, a length or
+        // any other function of the secret would give one page browsed under
+        // two sessions two digests and two stored copies. Before job 4 existed
+        // the proxy path broke this as well as leaking, because the raw
+        // credential bytes WERE the difference between the two blobs.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(browsedRequest(COOKIE_SECRET));
+        byte[] b = r.redactObservedRequest(
+                browsedRequest("00000000000000000000000000000000"));
+        check("two sessions, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        // And the control: the raw bytes really did differ, so the equality
+        // above is the redaction's doing and not the fixture's.
+        check("the inputs genuinely differed",
+              !Arrays.equals(browsedRequest(COOKIE_SECRET),
+                             browsedRequest("00000000000000000000000000000000")));
+    }
+
+    static void anObservedCredentialNameIsMatchedWhateverItsCase() {
+        // A browser may send any case it likes; HTTP field names are
+        // case-insensitive. A match that folded only one way would store the
+        // credential of every client that spells it differently.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "COOKIE: sid=" + COOKIE_SECRET + "\r\n"
+                    + "authorization: Bearer " + BEARER_SECRET + "\r\n"
+                    + "\r\n")));
+        check("an upper-case Cookie is matched", !out.contains(COOKIE_SECRET));
+        check("a lower-case Authorization is matched", !out.contains(BEARER_SECRET));
+        check("and the names are echoed as the client wrote them",
+              out.contains("COOKIE: {{observed:cookie}}\r\n")
+              && out.contains("authorization: {{observed:authorization}}\r\n"));
+    }
+
+    static void aCookieInTheRequestBodyIsNeverRewritten() {
+        // Only the head is scanned, for job 3's reason exactly: a body may
+        // legitimately carry the text. A form that posts a captured request,
+        // a bug report, an API doc -- rewriting those corrupts the evidence a
+        // check reads, and the body is not where a live credential is sent.
+        Redactor r = new Redactor();
+        String body = "report=Cookie: JSESSIONID=abc123; and it did not work";
+        String out = text(r.redactObservedRequest(
+                bytes("POST /support HTTP/1.1\r\n"
+                    + "Host: app.example.test\r\n"
+                    + "Content-Type: application/x-www-form-urlencoded\r\n"
+                    + "\r\n"
+                    + body)));
+        check("the body is byte-identical (" + out.substring(out.indexOf("\r\n\r\n") + 4) + ")",
+              out.endsWith(body));
+        check("and no placeholder was written into it",
+              !out.substring(out.indexOf("\r\n\r\n")).contains("{{observed:"));
+    }
+
+    static void aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases() {
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /public/index.html HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Accept: text/html\r\n"
+                         + "\r\n");
+        byte[] out = r.redactObservedRequest(raw);
+        check("a request with nothing to redact comes back byte-identical",
+              Arrays.equals(raw, out));
+        // The same rule redactRequest's `raw.clone()` comment insists on: the
+        // returned array must never alias the array that goes on the wire, or
+        // a later in-place fix-up to one silently edits the other.
+        check("...and is a DIFFERENT array, not the one that goes on the wire",
+              raw != out);
+    }
+
+    static void aFoldedContinuationOfAnObservedCredentialIsRedacted() {
+        // obs-fold. RFC 9110 says a recipient must reject it and no real
+        // client emits it -- but if one does, the folded remainder of a
+        // credential is credential bytes. Same trade as job 3's fold branch:
+        // lose the continuation rather than store it.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\tcontinued=" + BEARER_SECRET + "\r\n"
+                    + "Accept: text/html\r\n"
+                    + "\r\n")));
+        check("the first line's value is gone", !out.contains(COOKIE_SECRET));
+        check("and so is the folded continuation", !out.contains(BEARER_SECRET));
+        check("the fold's leading whitespace is kept, so the message still "
+              + "parses the way it arrived",
+              out.contains("\r\n\t{{observed:cookie}}\r\n"));
+        check("and the header after the fold is untouched",
+              out.contains("Accept: text/html\r\n"));
+    }
+
+    static void whitespaceBeforeTheColonDoesNotHideAnObservedCredential() {
+        // RFC 9110 requires a recipient to reject `Cookie : v`, but name
+        // matching is all job 4 has, and a name we fail to match passes a live
+        // credential through verbatim. The same trim job 3 does.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "Cookie : JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\r\n")));
+        check("the credential is still gone (" + out.replace("\r\n", " | ") + ")",
+              !out.contains(COOKIE_SECRET));
+    }
+
+    static void aBlankLineBeforeTheRequestLineDoesNotEndTheHead() {
+        // RFC 9112 2.2: a recipient MAY ignore an empty line before the
+        // request line, so one can reach us. Stopping there would end the head
+        // before a single field was read and copy the WHOLE request through as
+        // "body" -- every credential raw. Same guard, same reason, as job 3's.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("\r\n"
+                    + "GET /x HTTP/1.1\r\n"
+                    + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\r\n")));
+        check("the leading blank line did not end the head",
+              !out.contains(COOKIE_SECRET));
+        check("and it is still there, verbatim", out.startsWith("\r\nGET /x"));
+    }
+
+    static void anAbsoluteFormRequestLineIsNotMatchedAsAField() {
+        // No line is privileged here -- every head line is matched as a field
+        // -- so the one line that is NOT a field has to survive that match. An
+        // absolute-form target carries a colon, which is the only way a
+        // request line can look like `name: value` at all.
+        Redactor r = new Redactor();
+        String line = "GET http://app.example.test:8080/x HTTP/1.1\r\n";
+        String out = text(r.redactObservedRequest(
+                bytes(line + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n\r\n")));
+        check("the request line is verbatim (" + out.replace("\r\n", " | ") + ")",
+              out.startsWith(line));
+        check("and the credential after it is still redacted",
+              !out.contains(COOKIE_SECRET));
+    }
+
+    static void redactObservedRequestRefusesNullBytes() {
+        Redactor r = new Redactor();
+        // A RangeError, not the NPE it would otherwise be, for the reason the
+        // other two entry points give: an NPE out of here reaches a Burp proxy
+        // thread and the send path's catch-all alike.
+        expectThrows("null bytes are a RangeError", Redactor.RangeError.class,
+                     () -> r.redactObservedRequest(null));
+    }
+
+    // ---- job 5: the request TARGET ---------------------------------------
+
+    static final String TARGET_VECTORS = "request-target.txt";
+
+    /** The shared vector file, as (input, expected) pairs. Same file the
+     *  Python side reads; see its header for the format and for why one file
+     *  rather than two lists. */
+    static List<String[]> targetVectors() throws Exception {
+        java.nio.file.Path p = java.nio.file.Path.of(
+                "..", "tests", "vectors", TARGET_VECTORS);
+        List<String[]> out = new ArrayList<>();
+        for (String line : java.nio.file.Files.readAllLines(
+                p, StandardCharsets.UTF_8)) {
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            int tab = line.indexOf('\t');
+            if (tab < 0)
+                throw new IllegalArgumentException(
+                        "vector line with no tab: " + line);
+            out.add(new String[] { line.substring(0, tab), line.substring(tab + 1) });
+        }
+        return out;
+    }
+
+    /**
+     * THE ONE PLACE THE TWO IMPLEMENTATIONS ARE COMPARED. `redactObservedRequest`
+     * here and `hx.store.records.redact_url` there are the same RFC 3986 rule
+     * written twice, in two languages, on two sides of a bridge -- which is
+     * exactly the shape `tests/test_vocabularies_match_the_schema.py` exists
+     * to refuse. Neither side restates the cases; both read this file.
+     */
+    static void theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem()
+            throws Exception {
+        Redactor r = new Redactor();
+        List<String[]> vectors = targetVectors();
+        // Anti-vacuity. A reader that found no file, or a format change that
+        // made every line a comment, would leave the loop below asserting
+        // nothing at all and printing ALL PASS.
+        check("the shared vector file was read (" + vectors.size() + " cases)",
+              vectors.size() >= 20);
+        boolean sawARedaction = false;
+        for (String[] v : vectors) {
+            String line = "GET " + v[0] + " HTTP/1.1\r\n";
+            String want = "GET " + v[1] + " HTTP/1.1\r\n";
+            String got = text(r.redactObservedRequest(
+                    bytes(line + "Host: app.example.test\r\n\r\n")));
+            check("target " + v[0] + " -> " + v[1]
+                  + " (got " + got.split("\r\n")[0] + ")",
+                  got.startsWith(want));
+            if (!v[0].equals(v[1])) sawARedaction = true;
+        }
+        // The second half of the anti-vacuity check: a file whose every case
+        // is a no-op would pass the loop above with job 5 deleted.
+        check("...and at least one of them is a case job 5 actually changes",
+              sawARedaction);
+    }
+
+    static void aUserinfoCredentialNeverReachesTheBlobStore() {
+        // THE MEASURED FINDING. `http://user:pass@host/` survived verbatim
+        // into a content-addressed blob store, which S7 calls the one item
+        // that cannot be retrofitted -- once written it is in every backup.
+        Redactor r = new Redactor();
+        String secret = "s3cret-live-password";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET http://alice:" + secret + "@app.example.test/orders HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("the password is gone from the copy that crosses the bridge",
+              !out.contains(secret));
+        check("and so is the username, which can BE the token",
+              !out.contains("alice"));
+        check("the placeholder and the @ are what is left ("
+              + out.split("\r\n")[0] + ")",
+              out.startsWith("GET http://{{observed:userinfo}}@app.example.test"
+                             + "/orders HTTP/1.1\r\n"));
+        check("everything after the authority is verbatim",
+              out.contains("/orders HTTP/1.1\r\nHost: app.example.test\r\n\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob() throws Exception {
+        // Job 4's determinism constraint, restated for job 5 because it is the
+        // constraint a fix here is most likely to break: anything that carried
+        // a function of the credential -- a length, a hash, the username --
+        // would give one page browsed under two logins two digests and two
+        // stored copies.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(bytes(
+                "GET http://alice:s3cret@app.example.test/ HTTP/1.1\r\n\r\n"));
+        byte[] b = r.redactObservedRequest(bytes(
+                "GET http://bob:hunter2@app.example.test/ HTTP/1.1\r\n\r\n"));
+        check("two logins, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        check("the inputs genuinely differed", !Arrays.equals(
+                bytes("GET http://alice:s3cret@app.example.test/ HTTP/1.1\r\n\r\n"),
+                bytes("GET http://bob:hunter2@app.example.test/ HTTP/1.1\r\n\r\n")));
+    }
+
+    static void onlyTheFirstHeadLineIsATarget() {
+        // NAMED AS NOT COVERED in redactObservedRequest's javadoc, and pinned
+        // here so the sentence is a measurement rather than a claim. A URI in
+        // a FIELD VALUE keeps its userinfo: job 5 runs on one line, and
+        // running it over arbitrary field text would be the shape rule this
+        // class refuses everywhere else.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /orders HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "Referer: http://user:pass@app.example.test/login\r\n\r\n")));
+        check("the request line has no userinfo to take",
+              out.startsWith("GET /orders HTTP/1.1\r\n"));
+        check("and a Referer's userinfo is left RAW -- the named exclusion",
+              out.contains("Referer: http://user:pass@app.example.test/login"));
+    }
+
+    static void aCredentialFirstLineIsStillRedactedAsAField() {
+        // The interaction between job 4 and job 5. A malformed message whose
+        // FIRST line is a credential field must still be redacted as a field:
+        // job 5 takes the first line, and taking it must not mean skipping the
+        // credential match. Deleting `isFirstLine`'s guard the other way --
+        // running job 5 INSTEAD of the field match -- is what this catches.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a credential on the first line is still redacted (" + out.split("\r\n")[0] + ")",
+              !out.contains(COOKIE_SECRET));
+        check("...as job 4's placeholder, not job 5's",
+              out.startsWith("Cookie: {{observed:cookie}}\r\n"));
+    }
+
+    static void theRequestBodyIsNeverRewrittenByJobFive() {
+        // Job 4's rule, which job 5 inherits by sitting inside the same head
+        // scan: a body may legitimately carry a URI with a userinfo in it -- a
+        // documentation page, an API error dump, a captured request pasted
+        // into a form -- and rewriting it corrupts the evidence a check reads.
+        Redactor r = new Redactor();
+        String body = "curl http://user:pass@internal.example.test/ failed";
+        String out = text(r.redactObservedRequest(bytes(
+                "POST /report HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "Content-Length: " + body.length() + "\r\n\r\n" + body)));
+        check("a URI in the body keeps its userinfo verbatim",
+              out.endsWith(body));
+    }
+
+    static void aCredentialParameterLosesItsValueAndKeepsItsKey() {
+        // PROPERTY 1. The key survives and only the value is replaced -- and
+        // the key is what `surface.query_key_set` reads, so a redaction that
+        // moved it would change which SURFACE a request belongs to.
+        Redactor r = new Redactor();
+        String token = "eyJhbGciOiJIUzI1NiJ9.live.9f2c";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /cb?access_token=" + token + "&id=1001 HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("the token is gone (" + out.split("\r\n")[0] + ")",
+              !out.contains(token));
+        check("the KEY survives, so the surface is unchanged",
+              out.contains("access_token={{observed:param}}"));
+        check("and everything around it is verbatim",
+              out.startsWith("GET /cb?access_token={{observed:param}}&id=1001 "
+                             + "HTTP/1.1\r\n"));
+    }
+
+    static void anIdentifierParameterIsNeverTouched() {
+        // PROPERTY 2, and the reason this is a list of NAMES rather than a
+        // shape rule or a blanket redaction. `?id=1001` is what an IDOR check
+        // reads; a redaction that ate it would make the finding it was
+        // protecting unprovable. A shape heuristic eats exactly this.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /order/1001?id=1001&state=xyzzy&code=US HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("an identifier survives byte for byte (" + out.split("\r\n")[0] + ")",
+              out.startsWith("GET /order/1001?id=1001&state=xyzzy&code=US "
+                             + "HTTP/1.1\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob()
+            throws Exception {
+        // PROPERTY 3. The store is content-addressed: anything carrying a
+        // function of the secret -- a length, a hash, a truncation -- gives
+        // one page fetched under two tokens two digests and two stored copies.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(bytes(
+                "GET /cb?access_token=aaaaaaaaaaaaaaaa&id=7 HTTP/1.1\r\n\r\n"));
+        byte[] b = r.redactObservedRequest(bytes(
+                "GET /cb?access_token=z&id=7 HTTP/1.1\r\n\r\n"));
+        check("two tokens, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        check("the inputs genuinely differed", !Arrays.equals(
+                bytes("GET /cb?access_token=aaaaaaaaaaaaaaaa&id=7 HTTP/1.1\r\n\r\n"),
+                bytes("GET /cb?access_token=z&id=7 HTTP/1.1\r\n\r\n")));
+    }
+
+    static void aClientsOwnNameForATokenIsNotCaught() {
+        // THE LIMIT, AS A MEASURED FACT. This catches a fixed list of
+        // well-known names and does NOT catch a client's own name for a token.
+        // The parameter below is made up on purpose: no list can contain the
+        // name an application has not chosen yet, and stating that in a
+        // javadoc is a caveat someone can quietly widen while stating it here
+        // is a check that goes red when they do.
+        //
+        // If this goes RED, the list grew. That is not forbidden -- it is a
+        // DECISION, and the honest version of it is the operator-declared
+        // list in the engagement config, which needs a config schema change
+        // AND a `configure` wire key (an unrecognised key is a hard
+        // `bad_config` today, so there is no wire for it either).
+        Redactor r = new Redactor();
+        String secret = "live-acme-session-value";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /p?acme_session=" + secret + " HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a client's own name for a token reaches the blob store "
+              + "VERBATIM -- the limit of a fixed list of names",
+              out.contains("acme_session=" + secret));
+        // The two smaller edges of the same mechanism, so neither is a claim.
+        String enc = text(r.redactObservedRequest(bytes(
+                "GET /p?%61ccess_token=live HTTP/1.1\r\n\r\n")));
+        check("a percent-encoded NAME is not matched -- the scan does not "
+              + "decode, because a name that decodes two ways has no answer",
+              enc.contains("%61ccess_token=live"));
+        String semi = text(r.redactObservedRequest(bytes(
+                "GET /p?id=1;token=live HTTP/1.1\r\n\r\n")));
+        check("`;` is not a pair separator, so that whole pair is one name",
+              semi.contains("id=1;token=live"));
+    }
+
+    static void theParameterNamesAreMatchedWholeAndCaseInsensitively() {
+        Redactor r = new Redactor();
+        String upper = text(r.redactObservedRequest(bytes(
+                "GET /p?Access_Token=live&APIKEY=live2 HTTP/1.1\r\n\r\n")));
+        check("case-insensitive, the same fold the header names use",
+              upper.startsWith("GET /p?Access_Token={{observed:param}}"
+                               + "&APIKEY={{observed:param}} HTTP/1.1"));
+        check("and the KEY keeps its own case", upper.contains("Access_Token="));
+        // WHOLE, not a substring, in both directions: a name that CONTAINS a
+        // listed one and a listed one that is a PREFIX of the name are the two
+        // ways a substring match leaks or over-redacts.
+        String near = text(r.redactObservedRequest(bytes(
+                "GET /p?tokenizer=fast&my_access_token=live HTTP/1.1\r\n\r\n")));
+        check("a name merely CONTAINING a listed one is not one ("
+              + near.split("\r\n")[0] + ")",
+              near.startsWith("GET /p?tokenizer=fast&my_access_token=live "));
+    }
+
+    static void aNestedCutIsWrittenOnceNotTwice() {
+        // The one input that makes job 5's two rules overlap: a credential
+        // parameter whose VALUE is a URI carrying its own userinfo. The value
+        // cut swallows the userinfo cut, and emitting both would write the
+        // same bytes twice -- or, before the cuts were collected and sorted,
+        // hand write() a negative length on a Burp proxy thread.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /cb?access_token=http://u:p@h/ HTTP/1.1\r\n\r\n")));
+        check("one placeholder, not two (" + out.split("\r\n")[0] + ")",
+              out.startsWith("GET /cb?access_token={{observed:param}} HTTP/1.1"));
+        check("and neither half of the nested credential survives",
+              !out.contains("u:p") && !out.contains("http://"));
+    }
+
+    static void theEmptyInjectedPathIsWhyJobFourExists() {
+        // THE FINDING, kept as a test so it cannot come back quietly. This is
+        // not a complaint about redactRequest -- an empty Injected returning
+        // the bytes unchanged is CORRECT for the send path, where job 2
+        // refuses any credential job 1 did not inject. It is only wrong as the
+        // whole of a path's redaction, and this pins the difference so that
+        // routing the proxy path back through redactRequest is visibly a leak
+        // rather than a plausible simplification.
+        Redactor r = new Redactor();
+        byte[] raw = browsedRequest(COOKIE_SECRET);
+        String viaInjected = text(r.redactRequest(raw, new Redactor.Injected(raw)));
+        check("redactRequest with an empty Injected returns the credential "
+              + "VERBATIM -- it is not a redaction of observed traffic",
+              viaInjected.contains(COOKIE_SECRET));
+        check("...while job 4 removes it",
+              !text(r.redactObservedRequest(raw)).contains(COOKIE_SECRET));
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     static byte[] bytes(String s) { return s.getBytes(StandardCharsets.UTF_8); }
@@ -10396,8 +11350,25 @@ import java.util.Map;
 /**
  * Credential redaction for the copy of an exchange that crosses the bridge.
  *
- * Three jobs, and they are three because a credential reaches disk by three
- * different routes (§7):
+ * FOUR jobs, and they are four because a credential reaches disk by four
+ * different routes (§7). WHICH JOB COVERS WHICH PATH is the thing to read
+ * first, because getting that wrong is how a path ends up with no mechanism at
+ * all -- which is exactly what happened to the proxy path's request half
+ * between Task 7 and its first fix round, and it stored the operator's live
+ * session cookies verbatim in a content-addressed store:
+ *
+ *   SEND path, request   -- jobs 1 and 2, which cover each other. A credential
+ *                           this extension injected has a known byte range
+ *                           (job 1); one the harness supplied is REFUSED
+ *                           before issuance (job 2), so it never reaches the
+ *                           store at all.
+ *   SEND path, response  -- job 3.
+ *   PROXY path, request  -- job 4, and ONLY job 4. Job 1 has nothing
+ *                           registered, because this extension composed
+ *                           nothing; job 2 cannot apply, because §4
+ *                           deliberately does not rule-check the operator's
+ *                           own browsing and refusing it is not on the table.
+ *   PROXY path, response -- job 3, the same call the send path makes.
  *
  *  1. What WE injected. The extension knows the exact byte range it wrote, so
  *     it replaces that range with {@code {{identity:<id>:authz}}}. Byte ranges,
@@ -10422,6 +11393,53 @@ import java.util.Map;
  *     Header-name matching is all there is, so cookie VALUES are replaced with
  *     {@code {{observed:set-cookie}}} and the cookie name and its attributes
  *     are kept, so session-fixation and cookie-flag checks still read.
+ *
+ *  4. What we merely WATCHED GO PAST. {@link #redactObservedRequest} is job 3
+ *     pointed at a request instead of a response: the operator's browser sends
+ *     its own {@code Cookie} and {@code Authorization} headers through the
+ *     proxy, this extension composed none of them, and it may not refuse them
+ *     either. Header-name matching is again all there is, so the three
+ *     {@link #CREDENTIAL_HEADERS} values are replaced with
+ *     {@code {{observed:<name>}}} and the names are kept.
+ *
+ *     THE PLACEHOLDER IS FIXED, and that is a second requirement rather than a
+ *     stylistic choice. The plan's Global Constraints require redaction to be
+ *     DETERMINISTIC -- "two requests differing only in credential bytes must
+ *     produce the same blob" -- and the blob store is content-addressed, so a
+ *     hash or a length here would give one page browsed under two sessions two
+ *     different digests and two stored copies. Before job 4 existed the proxy
+ *     path violated that constraint as well as leaking, because the raw
+ *     credential bytes WERE the difference between the two blobs.
+ *
+ *  5. WHAT THE TARGET CARRIES. A credential does not have to be in a header.
+ *     {@code GET http://user:pass@app.test/ HTTP/1.1} puts one in the request
+ *     LINE, which jobs 1-4 do not touch: job 1 has no range, job 2 looks only
+ *     at header names, and jobs 3 and 4 match a field name before a colon.
+ *     Measured surviving verbatim into a content-addressed blob store, which
+ *     is the one place S7 says a credential can never be taken back out of.
+ *
+ *     ONLY THE USERINFO, and only because RFC 3986 3.2.1 says exactly where
+ *     it lives: {@code authority = [ userinfo "@" ] host [ ":" port ]}, and
+ *     {@code @} is a gen-delim that no host and no port may contain. So an
+ *     {@code @} inside an authority IS the userinfo delimiter -- a structural
+ *     fact, not a guess about what a string looks like. The userinfo is
+ *     replaced whole with {@link #OBSERVED_USERINFO} and the {@code @} kept,
+ *     by {@link #redactTarget}.
+ *
+ *     AND THE VALUES OF WELL-KNOWN CREDENTIAL PARAMETERS. A token does not
+ *     have to be in the authority either: {@code /cb?access_token=...} is
+ *     the commonest shape of all. {@link #CREDENTIAL_PARAMS} is matched by
+ *     NAME, whole and case-insensitively, exactly as the header names are;
+ *     the name and the {@code =} are kept and only the value becomes
+ *     {@link #OBSERVED_PARAM}. Names and not SHAPES: a rule that redacted
+ *     what looks opaque would rewrite {@code ?id=1001} and corrupt the
+ *     evidence an access-control check reads, and redacting every value is
+ *     the same corruption with no judgement in it.
+ *
+ *     THAT LIST IS INCOMPLETE BY CONSTRUCTION -- it catches well-known names
+ *     and NOT a client's own name for a token -- and
+ *     {@link #redactObservedRequest}'s "WHAT THIS EXCLUDES" says so in the
+ *     detail it deserves, with the test that pins the limit.
  *
  * Redaction runs BEFORE hashing. The blob store is content-addressed: the
  * digest names the bytes it was computed over, so hashing raw bytes and
@@ -10466,10 +11484,152 @@ public final class Redactor {
     private static final byte[] OBSERVED_COOKIE =
         "{{observed:set-cookie}}".getBytes(StandardCharsets.US_ASCII);
 
+    /**
+     * Job 4's placeholders, one per {@link #CREDENTIAL_HEADERS} entry and in
+     * the same order.
+     *
+     * DERIVED from that array rather than written out beside it. A fourth
+     * credential header added there gets a placeholder here for free; a second
+     * hand-kept list would be a vocabulary in two places, and the drift that
+     * matters is silent -- a name matched with no placeholder to write is an
+     * {@code ArrayIndexOutOfBoundsException} on a Burp proxy thread, and a
+     * placeholder with no name is dead bytes nobody notices.
+     */
+    private static final byte[][] OBSERVED_CREDENTIAL = observedPlaceholders();
+
+    private static byte[][] observedPlaceholders() {
+        byte[][] out = new byte[CREDENTIAL_HEADERS.length][];
+        for (int i = 0; i < out.length; i++)
+            out[i] = ("{{observed:" + CREDENTIAL_HEADERS[i] + "}}")
+                     .getBytes(StandardCharsets.US_ASCII);
+        return out;
+    }
+
+    /**
+     * Job 5's placeholder, replacing a request target's userinfo whole.
+     *
+     * FIXED, for job 4's reason exactly: the blob store is content-addressed,
+     * so two browses of one page under two basic-auth users must hash to one
+     * blob. What that costs is stated rather than hidden -- WHICH user is
+     * lost, because it is a fixed string and not `{{observed:userinfo:<user>}}`.
+     * The username half of a userinfo is not reliably a name: RFC 3986 3.2.1
+     * deprecates the `user:password` form and says nothing requires a colon at
+     * all, and `https://ghp_livetoken@host/` is the commonest real shape --
+     * keeping "the part before the colon" would store that token verbatim.
+     * So the whole subcomponent goes, and the identity of the user is a thing
+     * this placeholder does not carry.
+     *
+     * NOT DERIVED from {@link #CREDENTIAL_HEADERS} like {@link #OBSERVED_CREDENTIAL}
+     * is: this one names a URI subcomponent, not a header, so there is no
+     * entry there it could be paired with.
+     */
+    private static final byte[] OBSERVED_USERINFO =
+        "{{observed:userinfo}}".getBytes(StandardCharsets.US_ASCII);
+
+    /**
+     * Query-parameter names whose VALUE is a credential, lower-cased for the
+     * ASCII match, in no significant order.
+     *
+     * A FIXED LIST OF NAMES, AND THAT IS THE WHOLE DESIGN. The two rejected
+     * alternatives are worth keeping written down, because both look like
+     * improvements:
+     *
+     *   BY SHAPE -- "a long opaque-looking value is a secret" -- rewrites
+     *   {@code ?id=1001} and {@code ?order=8f3c...} and corrupts the exact
+     *   evidence an access-control check reads. A redaction that eats the
+     *   identifier makes the finding it was protecting unprovable.
+     *
+     *   EVERY VALUE -- redact the lot -- is the same corruption with no
+     *   judgement in it at all.
+     *
+     * So it is names, matched whole and case-insensitively, exactly the way
+     * {@link #CREDENTIAL_HEADERS} is matched. It is INCOMPLETE BY
+     * CONSTRUCTION and says so in {@link #redactObservedRequest}'s exclusion
+     * list: a client's own spelling for a token is not here and cannot be.
+     * Incomplete is not the same as worthless -- catching {@code access_token}
+     * today is strictly better than a known leak -- but the two are told apart
+     * only by saying plainly which one this is.
+     *
+     * WHAT THE LIST COSTS, said once here rather than left to be discovered:
+     * a few of these names are genuinely ambiguous. {@code key} is a Google
+     * API key and also a sort key; {@code sid} is a session id and also a
+     * store id; {@code auth} and {@code sig} are used for both. Those
+     * parameters lose their values in the evidence. That is the trade the
+     * ambiguity forces, and it runs the safe way: a redacted non-secret is a
+     * gap in a report, a stored secret is in every backup.
+     *
+     * WHAT IS DELIBERATELY ABSENT, with the reason, because an omission
+     * nobody wrote down reads as an oversight:
+     *
+     *   {@code code}   -- an OAuth authorization code IS a credential, and
+     *                     {@code ?code=} is also a country code, an error
+     *                     code, a discount code and a status code. The
+     *                     false-positive rate is the highest on the list by
+     *                     an order of magnitude and it would blank values
+     *                     that are the whole point of the request.
+     *   {@code state}  -- OAuth {@code state} is a CSRF token, not an
+     *                     authenticator: possessing it grants nothing, and a
+     *                     CSRF check needs to read it.
+     *   {@code nonce}, {@code csrf}, {@code _token} -- same argument as
+     *                     {@code state}.
+     *
+     * THE OPERATOR-DECLARED EXTENSION IS THE NEXT STEP AND IT IS NOT A FIX
+     * TO THIS FILE. A per-engagement list -- the client naming
+     * {@code acme_session} themselves -- is reviewable, belongs to the
+     * engagement rather than to this repository's guesswork, and fails in the
+     * direction of the operator knowing what was redacted. It needs a config
+     * schema change AND a `configure` wire key to carry it, and an
+     * unrecognised `configure` key is a hard {@code bad_config} today (see
+     * ConfigBody and S4's note on limit re-arming) -- so there is no wire for
+     * it either. Both halves have to land together or an operator's list is
+     * silently ignored, which is the failure mode S4 spends a paragraph on.
+     */
+    private static final String[] CREDENTIAL_PARAMS = {
+        "access_token", "refresh_token", "id_token", "auth_token", "token",
+        "jwt",
+        "api_key", "apikey", "api-key", "key",
+        "secret", "client_secret",
+        "password", "passwd", "pwd",
+        "auth", "authorization",
+        "sig", "signature",
+        "session", "sessionid", "sid",
+        // AWS SigV4 query authentication. A presigned S3 URL carries a live
+        // credential in exactly these three parameters, it is a shape any web
+        // application test runs into, and none of the generic names above
+        // matches them -- the match is on the WHOLE name.
+        "x-amz-signature", "x-amz-credential", "x-amz-security-token",
+    };
+
+    /**
+     * Job 5's placeholder for a credential parameter's VALUE. The name and the
+     * {@code =} are kept.
+     *
+     * ONE FIXED STRING, not {@code {{observed:<name>}}}, for two reasons.
+     * Determinism is the first: two requests differing only in the credential
+     * must hash to one blob, and while the NAME is not the secret, a
+     * per-name placeholder buys nothing -- the name is still right there in
+     * front of the {@code =}. The second is that the key set is what
+     * {@code surface.query_key_set} reads, and it reads the KEY; the
+     * placeholder never enters that computation at all.
+     */
+    private static final byte[] OBSERVED_PARAM =
+        "{{observed:param}}".getBytes(StandardCharsets.US_ASCII);
+
     /** RFC 9112 2.3: the HTTP-name is case-SENSITIVE, so this is a byte match. */
     private static final byte[] HTTP_NAME = "HTTP/".getBytes(StandardCharsets.US_ASCII);
 
     private record Range(String identityId, int start, int end) { }
+
+    /**
+     * One half-open span of a head line to replace, and what to put there.
+     *
+     * Job 5 makes up to two independent decisions about one line -- the
+     * userinfo and each credential parameter's value -- and they are collected
+     * rather than applied in sequence because they can NEST. Emitting as they
+     * are found writes the same bytes twice for
+     * `?access_token=http://u:p@h/`.
+     */
+    private record Cut(int start, int end, byte[] with) { }
 
     /**
      * The byte ranges this extension injected into ONE serialised request.
@@ -10678,6 +11838,224 @@ public final class Redactor {
     }
 
     /**
+     * The bytes of a request hx merely OBSERVED, with every credential header
+     * VALUE replaced. The argument is not modified.
+     *
+     * JOB 4. See the class javadoc for which job covers which path; the short
+     * version is that this is the ONLY mechanism standing between an
+     * operator's live session cookie and a content-addressed blob store, and
+     * {@link #redactRequest} is not a substitute for it. Handed an empty
+     * {@link Injected} -- which is what the proxy path has, because it
+     * composed nothing -- {@code redactRequest} returns {@code raw.clone()},
+     * i.e. the credential verbatim. That was the shipped state of the proxy
+     * path for one commit and it is the reason this method exists.
+     *
+     * NAME KEPT, VALUE REPLACED, exactly as job 3 does it: the evidence still
+     * shows that a credential WAS sent and which kind, which is what an
+     * auth-boundary check reads, while the bytes that would still authenticate
+     * are gone. The placeholder is FIXED -- see {@link #OBSERVED_CREDENTIAL}
+     * -- so two browses of one page under two sessions produce one blob.
+     *
+     * ONLY THE HEAD IS SCANNED, for job 3's reason exactly: a body may
+     * legitimately carry the text {@code Cookie: sid=...} -- a documentation
+     * page, an API error dump, a captured request pasted into a form -- and
+     * rewriting it would corrupt the evidence a check reads. The head ends at
+     * the first empty line.
+     *
+     * "EVERY HEAD LINE IS MATCHED AS A FIELD" IS TRUE OF LF-TERMINATED LINES
+     * AND OF NOTHING ELSE. {@link #lineStartAfter} scans for {@code \n}, so a
+     * message using BARE CR as its terminator is one line to this scan, has no
+     * name before its first colon that matches, and is copied through
+     * verbatim. That is a passthrough of a credential, and it is left as one
+     * deliberately: RFC 9112 2.2 requires CRLF and permits a bare LF, and
+     * nothing permits a bare CR -- a server would not parse such a message as
+     * HTTP either, so nothing on the wire reaches this shape. It is named here
+     * because the sentence above would otherwise be a claim wider than the
+     * code, not because a bare-CR parser is wanted. The other four verbatim
+     * passthroughs a review found are the same kind and are named where they
+     * arise: a NUL inside a field name, a fold following a NON-credential
+     * header (per RFC that text is the other header's value), a field name
+     * split across a fold, and a pipelined second request.
+     *
+     * NO REQUEST LINE IS RECOGNISED AS A LINE, and that is deliberate rather
+     * than an omission -- job 5 below privileges no line either, it only
+     * rewrites a URI's userinfo wherever one appears in the FIRST head line.
+     * {@link #redactResponse} has to know its status line, because
+     * taking the first non-empty line for one whatever it says would let a
+     * head whose first field is Set-Cookie have that cookie consumed as the
+     * status line and copied through raw. Here no line is privileged: every
+     * head line is matched as a field, and a request line survives that match
+     * because the name before its first colon always begins with the method
+     * token and a space -- {@code GET /x HTTP/1.1} has no colon at all, and
+     * {@code GET http://h:8080/x HTTP/1.1} gives the name {@code GET http},
+     * neither of which is one of the three. That holds for a SYNTACTICALLY
+     * VALID request line and is not claimed beyond one: ':' is not a tchar, so
+     * no method token can carry one, and the trim below takes whitespace off
+     * the ENDS only. A malformed first line that genuinely reads
+     * {@code Cookie: x} is redacted, which is the safe direction and the same
+     * answer this method gives that line anywhere else in the head.
+     *
+     * THE FIRST HEAD LINE ALSO GOES THROUGH {@link #redactTarget}, which is
+     * job 5. It rewrites the userinfo of a URI appearing in that line and
+     * NOTHING else -- no name is matched, no line is consumed as anything, and
+     * a line with no {@code ://} in it is written through byte for byte. It
+     * runs on the first head line whatever that line turns out to be, so a
+     * malformed message whose first line is a credential FIELD is redacted as
+     * a field (above) and never reaches job 5; the flag is set for it all the
+     * same, because the line after the first is not a request line either.
+     *
+     * WHAT THIS EXCLUDES, named rather than left to be discovered:
+     *
+     *   - A CREDENTIAL IN A QUERY PARAMETER THIS LIST DOES NOT NAME.
+     *     THIS CATCHES A FIXED LIST OF WELL-KNOWN NAMES AND DOES NOT CATCH A
+     *     CLIENT'S OWN NAME FOR A TOKEN. {@code ?access_token=} is redacted;
+     *     {@code ?acme_session=} is not, and neither is any other spelling an
+     *     application invented for itself. {@link #CREDENTIAL_PARAMS} is the
+     *     whole of what is matched, and the space of names an application may
+     *     choose is unbounded, so no list closes it. Incomplete is not
+     *     worthless -- catching {@code access_token} is strictly better than
+     *     a known leak -- but the two are told apart only by saying which
+     *     this is, and {@code aClientsOwnNameForATokenIsNotCaught} pins it
+     *     with a made-up parameter name so the limit is a MEASURED FACT
+     *     rather than a caveat someone can quietly widen.
+     *
+     *     THE ROUTE OUT is an operator-declared list in the engagement
+     *     config -- reviewable, owned by the engagement rather than by this
+     *     repository's guesswork, and failing in the direction of the
+     *     operator knowing what was redacted. It is NOT a change to this
+     *     file: it needs a config schema change AND a `configure` wire key to
+     *     carry it, and an unrecognised `configure` key is a hard
+     *     {@code bad_config} today, so there is no wire for it either. Both
+     *     halves have to land together or an operator's list is silently
+     *     ignored -- the failure mode S4 spends a paragraph on for limits.
+     *
+     *     Three smaller edges of the same mechanism: a name that is
+     *     PERCENT-ENCODED ({@code %61ccess_token}) is not matched, because
+     *     decoding would mean deciding what a name that decodes two ways IS;
+     *     a pair separated by {@code ;} rather than {@code &} is one pair to
+     *     this scan; and a credential inside another parameter's value
+     *     ({@code ?next=/a%3Ftoken%3Dx}) is inside one opaque value and is
+     *     not reached.
+     *   - A CREDENTIAL IN THE BODY. A login POST's password is in the body
+     *     and stays there, verbatim. S7 keeps payload and request structure
+     *     verbatim on purpose -- "evidence remains defensible" -- and nothing
+     *     here distinguishes a form field from a form field.
+     *   - USERINFO IN A HEADER VALUE: {@code Referer: http://u:p@host/},
+     *     {@code Origin}, a URI inside a custom header. Job 5 runs on the
+     *     first head line only. Running it over every field value would
+     *     rewrite arbitrary text that merely contains {@code ://} and an
+     *     {@code @}, which is the shape rule this class refuses everywhere
+     *     else.
+     *   - a credential in a header this list does not name: {@code X-Api-Key},
+     *     {@code X-Auth-Token}, a bearer token in a custom header. §6 names
+     *     three and {@link #CREDENTIAL_HEADERS} is those three. A fourth name
+     *     added there is covered here automatically, which is why the
+     *     placeholders are derived from it;
+     *   - a 1xx-style interim head. There is no such thing in a request, so
+     *     unlike {@link #redactResponse} this scan does not look for one --
+     *     and if a pipelined SECOND request followed the first in one array,
+     *     its head would be treated as body and go through raw. This class is
+     *     handed one message at a time by contract (Montoya's
+     *     {@code initiatingRequest().toByteArray()}), and that contract is
+     *     UNMEASURED here, like everything else this file's proxy caller
+     *     assumes about Burp -- see HxExtension's assumption block.
+     *
+     * A null {@code raw} is a {@link RangeError}, the same as the other two
+     * entry points, and for the same reason: an NPE out of here reaches a Burp
+     * proxy thread and the send path's catch-all alike.
+     */
+    public byte[] redactObservedRequest(byte[] raw) {
+        if (raw == null)
+            throw new RangeError("redactObservedRequest needs the request bytes");
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int i = 0;
+        boolean first = true;        // no line of the head has been read yet
+        // Whether the first line of the head has been WRITTEN. `first` cannot
+        // do this job: it is cleared for the fold and credential branches too,
+        // and it is read before those decide anything, so the one line job 5
+        // may touch has to be tracked on its own.
+        boolean targetDone = false;
+        int credential = -1;         // index into CREDENTIAL_HEADERS, or -1
+        while (i < raw.length) {
+            int next = lineStartAfter(raw, i);      // start of the following line
+            int content = contentEnd(raw, i, next); // this line without its CR/LF
+
+            if (content == i) {                     // an empty line
+                if (first) {
+                    // RFC 9112 2.2: a recipient MAY ignore an empty line
+                    // before the request line, so one can reach us. Stopping
+                    // here would end the head before a single field was read
+                    // and copy the WHOLE request through as "body", every
+                    // credential raw. Keep it verbatim and keep looking.
+                    out.write(raw, i, next - i);
+                    i = next;
+                    continue;
+                }
+                out.write(raw, i, raw.length - i);  // the head really is over
+                return out.toByteArray();
+            }
+            first = false;
+            // Taken and cleared HERE, above every branch, so that exactly one
+            // line of the head can be job 5's however that line is handled --
+            // a fold, a credential field or a request line all consume it.
+            boolean isFirstLine = !targetDone;
+            targetDone = true;
+            if (raw[i] == ' ' || raw[i] == '\t') {
+                // obs-fold. RFC 9110 says a recipient must reject it and no
+                // real client emits it, but if one does, the folded remainder
+                // of a credential is credential bytes -- so the whole
+                // continuation goes. Same trade as job 3's fold branch.
+                if (credential >= 0) {
+                    int ws = i;
+                    while (ws < content && (raw[ws] == ' ' || raw[ws] == '\t')) ws++;
+                    out.write(raw, i, ws - i);
+                    out.writeBytes(OBSERVED_CREDENTIAL[credential]);
+                    out.write(raw, content, next - content);
+                } else {
+                    out.write(raw, i, next - i);
+                }
+                i = next;
+                continue;
+            }
+            int colon = indexOf(raw, i, content, (byte) ':');
+            // Whitespace off the NAME before matching, through the same
+            // predicate job 3 uses, so the two cannot drift: a name this side
+            // lets through is a live credential stored verbatim.
+            int nameEnd = colon;
+            while (nameEnd > i && isOws((char) (raw[nameEnd - 1] & 0xff))) nameEnd--;
+            credential = -1;
+            if (colon > i)
+                for (int k = 0; k < CREDENTIAL_HEADERS.length; k++)
+                    if (asciiEqualsIgnoreCase(CREDENTIAL_HEADERS[k], raw, i, nameEnd)) {
+                        credential = k;
+                        break;
+                    }
+            if (credential < 0) {
+                // JOB 5, and only on the first line of the head. Everything
+                // else is written through byte for byte, exactly as before.
+                if (isFirstLine) redactTarget(raw, i, next, out);
+                else out.write(raw, i, next - i);
+                i = next;
+                continue;
+            }
+            out.write(raw, i, colon + 1 - i);             // the name and colon
+            int v = colon + 1;
+            while (v < content && (raw[v] == ' ' || raw[v] == '\t')) v++;
+            out.write(raw, colon + 1, v - (colon + 1));   // the OWS, verbatim
+            // THE WHOLE VALUE, not a parsed part of it. Job 3 keeps a cookie's
+            // NAME because `sid=` is what a session-fixation check reads and
+            // it is not a secret. Here the whole value is the secret --
+            // `Bearer eyJ...`, `sid=...; other=...` -- and a cookie NAME sent
+            // by the browser tells a check nothing the response's Set-Cookie
+            // did not already say.
+            out.writeBytes(OBSERVED_CREDENTIAL[credential]);
+            out.write(raw, content, next - content);      // the CRLF
+            i = next;
+        }
+        return out.toByteArray();
+    }
+
+    /**
      * The response bytes with every Set-Cookie VALUE replaced, name and
      * attributes kept. The argument is not modified.
      *
@@ -10822,6 +12200,180 @@ public final class Redactor {
     }
 
     // ---- bytes ----------------------------------------------------------
+
+    /**
+     * JOB 5. Write {@code raw[from, to)} through, with the userinfo of a URI
+     * appearing in it replaced by {@link #OBSERVED_USERINFO}.
+     *
+     * STRUCTURAL, not a guess, and this is the whole argument for it being
+     * here at all when a parameter-name list is not:
+     *
+     *   RFC 3986 3.2:   authority is what follows {@code "//"} and runs to the
+     *                   next {@code / ? #} or the end of the URI.
+     *   RFC 3986 3.2.1: {@code authority = [ userinfo "@" ] host [ ":" port ]}.
+     *   RFC 3986 2.2:   {@code @} is a gen-delim. Neither {@code host}
+     *                   (reg-name / IP-literal / IPv4address) nor {@code port}
+     *                   (DIGIT) admits one.
+     *
+     * So an {@code @} inside an authority can only be the userinfo delimiter.
+     * There is no shape being recognised and no name being matched: the
+     * question "is there a credential here" is not asked, because RFC 3986
+     * already answers "this subcomponent is where one goes".
+     *
+     * THE LAST {@code @} IN THE AUTHORITY, not the first. {@code @} is not
+     * legal INSIDE a userinfo either (it is pct-encoded as {@code %40}), so a
+     * conforming authority has exactly one and the two rules agree. They part
+     * only on a malformed authority carrying two, where the last is what
+     * {@code urlsplit} and the WHATWG URL parser both take as the delimiter --
+     * and taking the FIRST there would leave the bytes between the two
+     * verbatim. The Python side is the same rule for the same reason; see
+     * tests/vectors/userinfo.txt, which is the one place the two are compared.
+     *
+     * THE {@code @} IS KEPT. `{{observed:userinfo}}@host` still reads as an
+     * authority, so a reader can see that a credential was carried there --
+     * which is the same trade job 3 makes when it keeps a cookie's name.
+     *
+     * THE FIRST {@code ://} IN THE LINE, and no attempt to find a second. A
+     * request line has one target; the target may itself carry an absolute URI
+     * in a query (`/redirect?to=http://u:p@evil/`) and that is the one this
+     * finds, which is correct -- it is a credential in the target either way.
+     * A line with a userinfo in a SECOND URI and none in the first is not
+     * covered, and no request line has that shape.
+     *
+     * Nothing is written when there is no {@code ://} and no {@code @}: the
+     * line goes through byte for byte, so a message with no userinfo in it is
+     * unchanged by this method and hashes as it did before job 5 existed.
+     */
+    private static void redactTarget(byte[] raw, int from, int to,
+                                     ByteArrayOutputStream out) {
+        List<Cut> cuts = new ArrayList<>();
+        addUserinfoCut(raw, from, to, cuts);
+        addCredentialParamCuts(raw, from, to, cuts);
+        if (cuts.isEmpty()) {
+            // The overwhelmingly common line, and it must come through byte
+            // for byte: a request with nothing to redact has to hash exactly
+            // as it did before job 5 existed.
+            out.write(raw, from, to - from);
+            return;
+        }
+        cuts.sort(Comparator.comparingInt(Cut::start));
+        int at = from;
+        for (Cut c : cuts) {
+            // OVERLAP IS DROPPED, NOT MERGED, and one input really produces
+            // it: `?access_token=http://u:p@h/` has a userinfo cut sitting
+            // INSIDE a parameter-value cut. Sorted by start, the parameter
+            // value comes first and swallows the userinfo, so the inner cut
+            // is already gone -- skipping it is correct rather than merely
+            // safe. Without the guard the second write() would be handed a
+            // negative length and throw on a Burp proxy thread.
+            if (c.start() < at) continue;
+            out.write(raw, at, c.start() - at);
+            out.writeBytes(c.with());
+            at = c.end();
+        }
+        out.write(raw, at, to - at);
+    }
+
+    /**
+     * The userinfo of the first URI in {@code raw[from, to)}, as a cut.
+     *
+     * See {@link #redactTarget}'s javadoc for the RFC 3986 argument. The cut
+     * ENDS at the {@code @} rather than past it, so the {@code @} survives and
+     * the result still reads as an authority.
+     */
+    private static void addUserinfoCut(byte[] raw, int from, int to,
+                                       List<Cut> cuts) {
+        int scheme = -1;
+        for (int p = from; p + 2 < to; p++)
+            if (raw[p] == ':' && raw[p + 1] == '/' && raw[p + 2] == '/') {
+                scheme = p;
+                break;
+            }
+        if (scheme < 0) return;
+        int authStart = scheme + 3;
+        int authEnd = authStart;
+        while (authEnd < to) {
+            byte b = raw[authEnd];
+            // The authority's terminators, plus the ones that end the TARGET
+            // inside a request line: SP separates it from the HTTP-version,
+            // and CR/LF/HTAB end the line. Without those a line with no path
+            // at all -- `GET http://u:p@h HTTP/1.1` -- would run the
+            // authority on into ` HTTP/1.1` and find no `@` after it either
+            // way, but a SECOND `@` anywhere later in the line would then be
+            // taken for the delimiter and blank out the version too.
+            if (b == '/' || b == '?' || b == '#' || b == ' ' || b == '\t'
+                    || b == '\r' || b == '\n') break;
+            authEnd++;
+        }
+        int at = -1;
+        for (int p = authStart; p < authEnd; p++) if (raw[p] == '@') at = p;
+        if (at < 0) return;
+        cuts.add(new Cut(authStart, at, OBSERVED_USERINFO));
+    }
+
+    /**
+     * The VALUES of {@link #CREDENTIAL_PARAMS} in the target's query, as cuts.
+     *
+     * WHERE THE QUERY IS, structurally: RFC 3986 3.4 says the query begins at
+     * the FIRST {@code ?} and runs to the next {@code #} or the end of the
+     * URI. {@code ?} is a gen-delim and is not a {@code pchar}, so it cannot
+     * appear unencoded in a path -- the first one really is the delimiter --
+     * and inside a request LINE the target also ends at the SP before the
+     * HTTP-version, so SP/HTAB/CR/LF end the scan too.
+     *
+     * PAIRS ARE SPLIT ON {@code &} AND NAME FROM VALUE ON THE FIRST
+     * {@code =}. `&` is the form-urlencoded separator every client emits;
+     * `;` was an old alternative, is not accepted here, and is named in
+     * {@link #redactObservedRequest}'s exclusions rather than guessed at --
+     * treating it as a separator would split values that legitimately contain
+     * one.
+     *
+     * A PAIR WITH NO {@code =} IS LEFT ALONE. `?access_token` on its own
+     * carries no value to redact, and a placeholder there would invent one.
+     * An EMPTY value -- `?access_token=&next=/` -- is left alone for the same
+     * reason job 3 leaves a deletion cookie's empty value: an empty value
+     * cannot be a credential, and writing a placeholder over it would read as
+     * an issuance.
+     *
+     * THE NAME IS MATCHED RAW, NOT PERCENT-DECODED. `%61ccess_token` is not
+     * matched, and that is a real bypass rather than an oversight worth
+     * hiding: decoding here would mean deciding what a name that decodes two
+     * different ways IS, and this class's whole discipline is that it does
+     * not guess. It is named in the exclusion list with everything else this
+     * does not catch.
+     */
+    private static void addCredentialParamCuts(byte[] raw, int from, int to,
+                                               List<Cut> cuts) {
+        int q = indexOf(raw, from, to, (byte) '?');
+        if (q < 0) return;
+        int qEnd = q + 1;
+        while (qEnd < to) {
+            byte b = raw[qEnd];
+            if (b == '#' || b == ' ' || b == '\t' || b == '\r' || b == '\n')
+                break;
+            qEnd++;
+        }
+        int p = q + 1;
+        while (p < qEnd) {
+            int amp = p;
+            while (amp < qEnd && raw[amp] != '&') amp++;
+            int eq = p;
+            while (eq < amp && raw[eq] != '=') eq++;
+            // eq == amp means no '='; eq + 1 == amp means an empty value.
+            if (eq + 1 < amp && isCredentialParam(raw, p, eq))
+                cuts.add(new Cut(eq + 1, amp, OBSERVED_PARAM));
+            p = amp + 1;
+        }
+    }
+
+    /** Whether {@code raw[from, to)} is one of {@link #CREDENTIAL_PARAMS},
+     *  matched WHOLE and case-insensitively through the same predicate the
+     *  header names use, so the two cannot drift in how they fold case. */
+    private static boolean isCredentialParam(byte[] raw, int from, int to) {
+        for (String name : CREDENTIAL_PARAMS)
+            if (asciiEqualsIgnoreCase(name, raw, from, to)) return true;
+        return false;
+    }
 
     /** Index just past this line's terminator, or raw.length. */
     private static int lineStartAfter(byte[] raw, int from) {
@@ -13904,12 +15456,14 @@ public class SenderTest {
      *   dangerous-path AND unmanaged Cookie  -> unmanaged_credential
      *   wrong method AND unmanaged Cookie    -> unmanaged_credential
      *
-     * `unmanaged_credential` is in `records.UNRECORDABLE`: there is no
-     * `denial` row for it and no `kind` to file one under. So a scope
+     * `unmanaged_credential` was in `records.UNRECORDABLE` when this moved:
+     * no `denial` row for it and no `kind` to file one under. So a scope
      * violation carrying a Cookie produced NO ROW ANYWHERE, and an error class
      * naming the credential rather than the boundary crossed. s4: "Any denial
      * produces a `denial` row and a distinct error class. Denials are never
-     * silent."
+     * silent." SCHEMA_VERSION 6 gave the class `kind='credential'`, which
+     * settles the row half; the WRONG-CLASS half is what this ordering fixes
+     * and it is unaffected.
      *
      * WHY THAT WAS NOT A THEORETICAL SHAPE. Until Plan 5 ships identity
      * injection, the natural agent action is replaying a request lifted from
@@ -15575,11 +17129,37 @@ public final class Limits implements Gate {
     public Decision check(HxRequest req) {
         Limiter l = limiter;
         if (l == null)
-            // Unreachable through HxExtension, which calls arm() on the same
-            // snapshot on the line before issue(): epoch 0 returns early from
-            // arm() but is refused by Sender before Policy consults a Gate,
-            // and every epoch >= 1 either arms this or throws. A gate that
-            // does not know its budget still has to answer no.
+            // A gate that does not know its budget still has to answer no.
+            //
+            // THIS COMMENT USED TO SAY THE BRANCH WAS UNREACHABLE, and the
+            // sentence was "Unreachable through HxExtension, which calls arm()
+            // on the same snapshot on the line before issue()". IT WAS TRUE
+            // WHEN IT WAS WRITTEN AND A LATER TASK FALSIFIED IT IN SILENCE.
+            // {@code arm} had ONE caller, the send handler; Task 7 wired s4's
+            // SECOND enforcement point, whose CRAWLER branch reaches
+            // Policy.decide and therefore this Gate, and it did not arm. Every
+            // crawler request that passed scope, method and dangerous.path was
+            // refused here -- measured -- while this comment told the reader
+            // the branch could not fire. A claim about the set of callers is
+            // exactly the kind of claim a new caller falsifies without
+            // touching the file the claim is written in.
+            //
+            // SO IT IS NOW COUNTED RATHER THAN ASSERTED. Both entry points arm
+            // from the snapshot they then decide under -- the send handler
+            // before {@code Sender.issue}, the proxy request handler before
+            // {@code ProxyGate.decide} -- and
+            // {@code ChokepointTest.everyPathThatSpendsTheGateArmsItFirst}
+            // counts the arming call sites in both grammar forms and reddens
+            // if either is deleted -- and reddens again if a THIRD path
+            // appears at all, armed or not, which is the prompt to come back
+            // and re-derive the number. Do not restore a sentence here naming
+            // the callers; the count is the thing that stays true.
+            //
+            // WHAT IS STILL TRUE ABOUT REACHABILITY: epoch 0 returns early
+            // from arm(), and epoch 0 is refused by Sender before Policy
+            // consults a Gate and by ProxyGate before it consults Policy at
+            // all, so an unconfigured run does not arrive here. Every epoch
+            // >= 1 either arms this or throws.
             //
             // THIS BRANCH IS NOT ONE OF THE DENY-ALL GUARDS, and a fix wave on
             // this branch recorded that it was, so the correction is written
@@ -15756,11 +17336,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   4. Policy, first half    scope -> method -> dangerous. None of them spends
  *                            anything, so they cost nothing to run early.
  *   5. unmanaged_credential  BETWEEN the two halves. Before the Gate for the
- *                            same reason as 1; after 4 because this class has
- *                            no `denial` row (records.UNRECORDABLE), so
- *                            running it first made an out-of-scope request
- *                            carrying a Cookie into a credential error with
- *                            the scope violation recorded nowhere.
+ *                            same reason as 1; after 4 because running it
+ *                            first made an out-of-scope request carrying a
+ *                            Cookie into a credential error, naming the
+ *                            credential rather than the boundary crossed.
+ *                            (The class had no `denial` row at all until
+ *                            SCHEMA_VERSION 6 gave it `kind='credential'`, so
+ *                            the scope violation was then recorded nowhere;
+ *                            the ordering stands on the first reason alone.)
  *   6. Policy, second half   the Gate: rate -> budget.
  *
  * Steps 2-6 hold the pinned order -- not_configured, halted, scope_denied,
@@ -15959,10 +17542,11 @@ public final class Sender {
         // that placement have different reasons. Before the Gate, for the same
         // reason as guard 1: Limits.check() spends a rate token and a budget
         // slot on a request that is about to be refused. After scope, method
-        // and dangerous, because this class is in records.UNRECORDABLE -- there
-        // is no `denial` row for it -- so running it first turned every
-        // out-of-scope request CARRYING A COOKIE into a credential error with
-        // no row anywhere. MEASURED before this moved:
+        // and dangerous, because running it first turned every out-of-scope
+        // request CARRYING A COOKIE into a credential error naming the
+        // credential rather than the boundary crossed -- and while the class
+        // was in records.UNRECORDABLE, which it was until SCHEMA_VERSION 6,
+        // with no row anywhere either. MEASURED before this moved:
         //
         //   out-of-scope AND unmanaged Cookie    -> unmanaged_credential
         //   out-of-scope, no cookie              -> scope_denied
@@ -16365,7 +17949,7 @@ public final class Sender {
      * out" is not a licence to report the interim head, and for why 101 is the
      * one 1xx where there was never a later head to run out of.
      */
-    static StatusScan scanStatus(byte[] raw, int reported) {
+    public static StatusScan scanStatus(byte[] raw, int reported) {
         // Not an interim status: the transport's answer IS the final one, and
         // re-reading the bytes behind it would let a peer's leading head
         // overrule a status the exchange really produced.
@@ -16449,13 +18033,27 @@ public final class Sender {
      * theDeprecatedAccessorsAreUnusedEverywhere, which makes the rule
      * explicit -- fix the javadoc, do not widen the needle.
      *
+     * PUBLIC, ALONG WITH {@link #scanStatus}, BECAUSE THERE IS ONE SCAN AND NOT
+     * TWO. The PROXY path emits the same two wire values -- `status` and
+     * `outcome` -- and shipped them as `r.statusCode()` raw and the literal
+     * `"ok"`, with no scan behind either: a `103 Early Hints` in front of a
+     * dead origin filed `status=103, outcome=ok`, which is the exact pair S5
+     * measured thirty of and the pair that leaves S4's auto-halt a healthy
+     * sample for every failing request. {@link #finalStatus} was already
+     * public and is NOT enough for that caller: it throws the provenance away,
+     * and deriving "was that unreadable" from the code alone gets a genuine
+     * 599 read out of the bytes behind a 103 exactly backwards. So the caller
+     * gets the whole answer rather than half of it and a second copy of this
+     * loop. `hx.proxy` -> `hx.send` is the edge {@link Redactor} already
+     * crosses in that direction; the reverse is the one to refuse.
+     *
      * @param code       what goes on the evidence line and into Distress
      * @param unreadable true when {@code code} is {@link #STATUS_UNREADABLE}
      *                   BECAUSE no final status line could be read behind a
      *                   reported 1xx, rather than because anything in the
      *                   exchange said 599
      */
-    record StatusScan(int code, boolean unreadable) { }
+    public record StatusScan(int code, boolean unreadable) { }
 
     /**
      * The three-digit code of a status line, or -1 for a line that is not
@@ -16664,6 +18262,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -16734,6 +18333,38 @@ import java.util.stream.Stream;
  * {@link #ENTRY_POINT} alone -- see {@link #redirectsAreNotFollowed} -- and
  * assert the whole family appears once there, so a second setting cannot hide
  * behind the first.
+ *
+ * WHAT EVERY CHECK IN THIS FILE IS, AND THEREFORE WHAT NONE OF THEM CAN DO.
+ * They are TEXT SCANS. They see NAMES, not VALUES. That single sentence is a
+ * better guide than any list of shapes, and the list is why: this class has
+ * enumerated its own blind spot three times and been wrong about it twice.
+ *
+ *   - Round 1 said the checks pin that the calls happen in the right ORDER. A
+ *     value computed and then not used defeated that: both redaction calls
+ *     left exactly where they were and the queued record's two byte arguments
+ *     changed to the RAW locals -- one identifier each -- measured at 12
+ *     summary lines / 0 FAIL / rc=0 with raw bytes going into a
+ *     content-addressed store, every offset still correct.
+ *   - Round 2 pinned DATAFLOW: each local bound once, read once, the consuming
+ *     expression delimited and searched for the names it must not contain. It
+ *     declared its residual to be "an identity function". That was too narrow
+ *     in the direction that flatters the check. The real residual is ANY CALL
+ *     WRAPPING THE VALUE AT ITS USE SITE, whatever that call returns -- a
+ *     helper that DISCARDS its redacted argument and re-fetches the raw bytes
+ *     is not an identity function and reads 12 / 0 FAIL / rc=0, so a reader
+ *     taking the old sentence as the boundary would judge it covered.
+ *   - And dataflow is not APPLICATION. Swapping two same-typed functions
+ *     between two same-typed arguments leaves every name, every count and
+ *     every offset intact: measured at 12 / 1880 ok / 0 FAIL / rc=0 with both
+ *     halves of an exchange leaking.
+ *
+ * So: A TEXT SCAN CANNOT SEE THROUGH A CALL, and it cannot tell which VALUE a
+ * name holds. Do not write a check here whose property depends on either, and
+ * when one is the only thing holding a property, say so and name the layer
+ * that actually holds it. For the redaction that layer is now
+ * `RecorderTest`, which asserts over BYTES -- see
+ * {@link #theRecordIsBuiltByTheRecorderAndNeverInline} for what was moved out
+ * of the text's reach and why.
  */
 public class ChokepointTest {
 
@@ -16767,19 +18398,43 @@ public class ChokepointTest {
         t("oneEgressPath", () -> oneEgressPath(sources));
         t("noBatchEgressPath", () -> noBatchEgressPath(sources));
         t("redirectsAreNotFollowed", ChokepointTest::redirectsAreNotFollowed);
+        t("theBuiltRequestOptionsAreTheOnesIssued",
+          ChokepointTest::theBuiltRequestOptionsAreTheOnesIssued);
         t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
+        t("theBridgeNamesNothingInTheProxyPackage",
+          () -> theBridgeNamesNothingInTheProxyPackage(sources));
         t("theDeprecatedAccessorsAreUnusedEverywhere",
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
-        t("theAuthorisationSnapshotIsReadInExactlyOnePlace",
-          () -> theAuthorisationSnapshotIsReadInExactlyOnePlace(sources));
+        t("everyDecisionReadsOneAuthorisationSnapshot",
+          () -> everyDecisionReadsOneAuthorisationSnapshot(sources));
         t("theStripperIsNotVacuousAndDoesNotOverreach",
           ChokepointTest::theStripperIsNotVacuousAndDoesNotOverreach);
         t("everyKillPathIsWiredBeforeTheDial", ChokepointTest::everyKillPathIsWiredBeforeTheDial);
-        t("bothHalvesOfTheDecisionAreAskedAndOnlyOnce",
-          () -> bothHalvesOfTheDecisionAreAskedAndOnlyOnce(sources));
+        t("theCaptureDrainIsStarted", ChokepointTest::theCaptureDrainIsStarted);
+        t("everyPathThatSpendsTheGateArmsItFirst",
+          ChokepointTest::everyPathThatSpendsTheGateArmsItFirst);
+        t("theGateIsSpentOnlyWhereTheHalvesArePaired",
+          () -> theGateIsSpentOnlyWhereTheHalvesArePaired(sources));
+        t("oneRunHasOnePolicy", () -> oneRunHasOnePolicy(sources));
         t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
+        t("theSecondEnforcementPointIsRegisteredAndAsksTheGate",
+          ChokepointTest::theSecondEnforcementPointIsRegisteredAndAsksTheGate);
+        t("theSecondCallbackObservesAndCannotRefuse",
+          ChokepointTest::theSecondCallbackObservesAndCannotRefuse);
+        t("theRefusalIsHeldBeforeItIsRecorded",
+          ChokepointTest::theRefusalIsHeldBeforeItIsRecorded);
+        t("theClockAndTheAttributionAreWrittenDownAndTakenBack",
+          ChokepointTest::theClockAndTheAttributionAreWrittenDownAndTakenBack);
+        t("theRecordingStructuresHoldTheirMonitors",
+          ChokepointTest::theRecordingStructuresHoldTheirMonitors);
+        t("theGateDecidesBeforeAnythingIsQueued",
+          ChokepointTest::theGateDecidesBeforeAnythingIsQueued);
+        t("theTypeNeedlesCoverEveryConstructionForm",
+          ChokepointTest::theTypeNeedlesCoverEveryConstructionForm);
+        t("theRecordIsBuiltByTheRecorderAndNeverInline",
+          () -> theRecordIsBuiltByTheRecorderAndNeverInline(sources));
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -16828,10 +18483,10 @@ public class ChokepointTest {
         List<String> handleHits = new ArrayList<>();
         for (Path p : sources) {
             String t = code(p);
-            int n = count(t, "http().sendRequest");
+            int n = calls(t, "http().sendRequest", "::sendRequest");
             total += n;
             if (n > 0) hits.add(p + " x" + n);
-            int h = count(t, ".http()");
+            int h = calls(t, ".http()", "::http");
             handles += h;
             if (h > 0) handleHits.add(p + " x" + h);
         }
@@ -16850,7 +18505,8 @@ public class ChokepointTest {
      *  fail-safe direction. Rewrite the comment, do not loosen the needle. */
     static void noBatchEgressPath(List<Path> sources) throws IOException {
         int total = 0;
-        for (Path p : sources) total += count(text(p), "sendRequests(");
+        for (Path p : sources)
+            total += calls(text(p), "sendRequests(", "::sendRequests");
         // Montoya's batch call is a second egress path wearing the first one's
         // name. It was measured working on Community (spec s2), which is
         // exactly why it needs saying no to in writing: one request per
@@ -16887,7 +18543,10 @@ public class ChokepointTest {
      * whole family is counted: exactly one RedirectionMode is named in the
      * adapter, and it is NEVER.
      *
-     * WHAT IT DOES NOT SEE: a DISCARDED BUILDER RETURN. Montoya's options
+     * A DISCARDED BUILDER RETURN USED TO BE INVISIBLE HERE and is not any
+     * more; the two checks that close it are below and the measurement is
+     * beside them. The paragraph that follows is what the gap WAS, kept
+     * because it is the clearest statement of the shape: Montoya's options
      * builder returns a new object rather than mutating, so
      * `options.withRedirectionMode(RedirectionMode.NEVER);` written as a bare
      * statement -- return value dropped, the built options never carrying it
@@ -16902,22 +18561,212 @@ public class ChokepointTest {
         int never = count(entry, "RedirectionMode.NEVER");
         int any = count(entry, "RedirectionMode.");
         check("the egress call disables redirect following (" + never + ")", never == 1);
+        // ...AND THE BUILDER RETURN IS KEPT. Montoya's options builder returns
+        // a NEW object rather than mutating, so
+        // `options.withRedirectionMode(RedirectionMode.NEVER);` as a bare
+        // statement compiles, does nothing, and reads identically to the
+        // correct code. MEASURED with exactly that edit: 13 summary lines /
+        // 2067 ok / 0 FAIL / rc=0, with redirects FOLLOWED inside Burp -- each
+        // hop then a request that never crossed Policy, which is S4's third
+        // egress path wearing the first one's name. Presence is not
+        // application, one level over into a fluent chain.
+        //
+        // Delimited to the statement that BINDS `options`, so a call whose
+        // result is dropped on the floor sits outside the span. It is a text
+        // scan and it pins WHERE the setting is written, not what the built
+        // object holds; nothing here can run the builder.
+        // Read with COMMENTS STRIPPED, deliberately: `statement` ends at the
+        // first `;`, and the javadoc inside this very chain contains one
+        // ("...on sendRequest today;"). With `text` the span stopped before the
+        // builder call and this check failed against CORRECT code -- measured.
+        // Literals are kept, because `RedirectionMode.NEVER` is what is being
+        // looked for and is not one.
+        String chain = codeKeepingLiterals(Path.of(ENTRY_POINT));
+        String built = statement(chain, "RequestOptions options =");
+        check("the mode is set inside the options the adapter KEEPS, not in a "
+              + "statement whose return is discarded",
+              built.contains("RedirectionMode.NEVER"));
+        // BOTH GRAMMAR FORMS, through calls(). `options::withRedirectionMode`
+        // is an invocation in every sense that matters and this needle counted
+        // one spelling of it -- which is also why the needle now has a row in
+        // theTypeNeedlesCoverEveryConstructionForm's `called` table, where
+        // every COUNTED method needle belongs. The reference form cannot
+        // legally appear inside the built statement, so the sums are the same
+        // numbers on correct code; what changes is that a reference ADDED
+        // elsewhere in the adapter now moves the right-hand count and reddens
+        // this arm instead of sliding past it.
+        check("and every withRedirectionMode call is in that same statement ("
+              + calls(built, "withRedirectionMode(", "::withRedirectionMode")
+              + " of "
+              + calls(chain, "withRedirectionMode(", "::withRedirectionMode") + ")",
+              calls(built, "withRedirectionMode(", "::withRedirectionMode")
+                      == calls(entry, "withRedirectionMode(", "::withRedirectionMode")
+              && calls(chain, "withRedirectionMode(", "::withRedirectionMode") == 1);
         check("and it names exactly one redirection mode, so a second setting "
               + "cannot override it (" + any + ")", any == 1);
     }
 
-    /** A MUST-BE-ZERO-ELSEWHERE needle: it reads {@link #text}, so a comment
-     *  spelling `import burp.` in another file turns this red rather than
-     *  passing. Fail-safe, and deliberately so. */
+    /**
+     * THE OPTIONS THE ADAPTER BUILDS ARE THE OPTIONS IT ISSUES UNDER.
+     *
+     * PRESENCE IS NOT APPLICATION, one level out from the hole
+     * {@link #redirectsAreNotFollowed} closed. That check pins WHERE the
+     * redirection mode is written and cannot see whether the object the chain
+     * built ever reaches the call. {@code Http.sendRequest} has a
+     * ONE-ARGUMENT OVERLOAD, so dropping the second argument COMPILES, and
+     * both mutations below were measured green against a clean
+     * 13 summary lines / 2200 ok / 0 FAIL / rc=0:
+     *
+     *     rr = api.http().sendRequest(request);
+     *     rr = api.http().sendRequest(request,
+     *              RequestOptions.requestOptions().withResponseTimeout(remainingMs));
+     *
+     * In BOTH, `RedirectionMode.NEVER` is computed and thrown away: `never`
+     * is 1, `any` is 1, the built statement still contains the constant, and
+     * both `withRedirectionMode(` counts are satisfied -- while the request
+     * goes out under Burp's DEFAULT redirection mode. S4: "Not auto-followed.
+     * Each hop is a distinct issuance with its own scope decision and its own
+     * exchange row." Every hop after the first would never cross Policy, which
+     * is S4's third egress path wearing the first one's name. The first
+     * mutation drops `withResponseTimeout` with it, so the deadline stops
+     * being enforced at the transport too -- Sender still answers `timeout` on
+     * its own clock, so that half is a fail-safe loss rather than a hole.
+     *
+     * The SECOND mutation is the realistic one: it still passes AN options
+     * object, so it reads in review as the correct code with the chain
+     * refactored.
+     *
+     * WHAT THIS CHECKS, and it is a DATAFLOW shape rather than a spelling of
+     * the call: the local the builder chain binds is used EXACTLY ONCE in the
+     * whole entry point, and that one use is inside the egress statement. So
+     * a call that takes no options (0 uses), a call handed a freshly built
+     * object (the bound local unused, 1 use), and a rebuild between the two
+     * (3 uses) are all red. Measured results for both of the above are in the
+     * fix-wave report.
+     *
+     * WHAT IT DOES NOT COVER, stated because the family this belongs to is
+     * six instances deep and every one of them was a check that overclaimed:
+     *
+     *   - A THIRD OVERLOAD. `sendRequest(request, options, somethingElse)`
+     *     satisfies every arm here, and if that third argument could override
+     *     the redirection mode this check would not see it. MEASURED rather
+     *     than assumed, because the first draft of this sentence guessed and
+     *     guessed wrong: `javap burp.api.montoya.http.Http` on the jar this
+     *     tree builds against lists FOUR `sendRequest` overloads --
+     *     `(HttpRequest)`, `(HttpRequest, HttpMode)`,
+     *     `(HttpRequest, HttpMode, String)` and `(HttpRequest,
+     *     RequestOptions)`. Only the last takes options at all, so no
+     *     three-argument call can carry them and there is nothing today for
+     *     this gap to be. The `(HttpRequest, HttpMode)` form is a TWO-argument
+     *     call that drops the options entirely, and the arms below do catch
+     *     it -- the bound local goes unread. Nothing here would notice a
+     *     future overload arriving.
+     *   - THE IDENTIFIER'S NAME. `options` is a spelling. Renaming the local
+     *     turns the binding needle and the count red together, so it fails
+     *     CLOSED and the next reader updates two literals -- but this method
+     *     is pinned to a name, not to a type.
+     *   - WHETHER MONTOYA HONOURS THE OBJECT. Nothing in this repository can
+     *     run the builder; that is `docs/burp-proxy-measurements.md`'s job.
+     *   - {@link #statement} ends at the FIRST `;`, so an argument list
+     *     containing one would truncate the span. Today neither does.
+     *
+     * Read from {@link #codeKeepingLiterals} for the same reason
+     * {@link #redirectsAreNotFollowed} is: `statement` stops at a `;` and the
+     * javadoc inside the adapter's own chain contains one, so comments must be
+     * stripped -- while literals are kept, because a literal is not what is
+     * being counted here and blanking one cannot help.
+     */
+    static void theBuiltRequestOptionsAreTheOnesIssued() throws IOException {
+        String chain = codeKeepingLiterals(Path.of(ENTRY_POINT));
+        String built = statement(chain, "RequestOptions options =");
+        String issue = statement(chain, "http().sendRequest(");
+        // Anti-vacuity, both ends: statement() answers "" for a needle that
+        // has been renamed away, and "" satisfies no arm below -- count 0 is
+        // not 1 and "" contains nothing. -1-style vacuity has no equivalent
+        // here, but the two presence checks are stated anyway so a rename
+        // reads as a rename rather than as a dataflow failure.
+        check("the adapter binds its RequestOptions (" + built.trim() + ")",
+              !built.isEmpty());
+        check("and the egress statement was located (" + issue.trim() + ")",
+              !issue.isEmpty());
+        // ONE BINDING, ONE READ, IN THE WHOLE ENTRY POINT. `RequestOptions`
+        // and `requestOptions()` carry a CAPITAL O and do not match this
+        // needle, so the two hits are the declaration and the argument.
+        check("the built options are read exactly once in " + ENTRY_POINT
+              + " (" + count(chain, "options") + ")",
+              count(chain, "options") == 2);
+        check("one of the two is the binding itself (" + count(built, "options") + ")",
+              count(built, "options") == 1);
+        // ...so the other one is here, and this is the arm the two measured
+        // mutations fail.
+        check("and the other is the argument the egress call issues under ("
+              + issue.trim() + ")", issue.contains("options"));
+    }
+
+    /**
+     * A MUST-BE-ZERO-ELSEWHERE needle: it reads {@link #text}, so a comment
+     * naming a Montoya type in another file turns this red rather than
+     * passing. Fail-safe, and deliberately so.
+     *
+     * THE NEEDLE WAS `import burp.` AND THAT WAS NOT THE PROPERTY. Measured:
+     * a fully-qualified `burp.api.montoya.core.ByteArray` in
+     * `hx/proxy/Recorder.java`, with no import line, compiles (test.sh puts
+     * the jar on the classpath) and read 13 summary lines / 1900 ok / 0 FAIL
+     * / rc=0. The invariant held; the check did not. That matters more than
+     * usual here, because "Recorder names no Montoya type" is what makes
+     * Recorder drivable, and this check is one of the four layers
+     * {@link #noSecondEgressFamilyExists} names as what closes ITS gap.
+     *
+     * `burp.api.` and not `burp.`, and the reason is measured rather than
+     * aesthetic: the jar has exactly ONE package root, `burp/api/`, so every
+     * reference to a Montoya type -- imported, statically imported or written
+     * out in full -- contains this string, while `burp.` alone also matches
+     * the legitimate system-property NAME `"hx.burp.version"` in
+     * `BridgeClient`. A needle that forces a real property to be renamed is a
+     * needle that will be loosened by the next person in a hurry.
+     */
     static void montoyaIsConfinedToTheEntryPoint(List<Path> sources) throws IOException {
-        List<String> importers = new ArrayList<>();
+        List<String> namers = new ArrayList<>();
         for (Path p : sources)
-            if (count(text(p), "import burp.") > 0) importers.add(p.toString());
+            if (count(text(p), MONTOYA) > 0) namers.add(p.toString());
         // Stronger than the plan's global constraint, and deliberately so.
-        // With Http as an interface, hx.send.Sender needs no burp.* type at
+        // With Http as an interface, hx.send.Sender needs no Montoya type at
         // all -- which is what makes the refusal tests able to count calls.
-        check("burp.* is imported only by " + ENTRY_POINT + ", not by " + importers,
-              importers.equals(List.of(ENTRY_POINT)));
+        check("Montoya is named only by " + ENTRY_POINT + ", not by " + namers,
+              namers.equals(List.of(ENTRY_POINT)));
+    }
+
+    /**
+     * The dependency runs one way: hx.proxy -> hx.bridge, and never back.
+     *
+     * `HaltSink` and `SendHandler` are declared in BridgeClient precisely so
+     * the packages that call the bridge need no compile-time dependency the
+     * other way. `ExchangeSink` was declared in `Capture` instead, and
+     * `exchangeSink()` returned it -- so the bridge imported the proxy package
+     * while the proxy package already imported the bridge. javac does not mind
+     * a cycle, because it sees every source at once; a reader trying to work
+     * out which of two files is the authority on a drop's spelling does.
+     *
+     * MOVING THE INTERFACE ALONE WOULD NOT HAVE FIXED IT: its second method
+     * was `dropped(long, Source)` and its body called `Capture.sourceName`,
+     * both of which survive the move. Making the callback source-agnostic --
+     * a String, null for "no spelling" -- is what actually cut it, and this
+     * counts the needle rather than trusting that.
+     *
+     * A MUST-BE-ZERO needle, so a COMMENT counts too. That is the same rule
+     * as the deprecated-accessor check below and it has the same answer: a
+     * javadoc that needs to talk about the other package says "the proxy
+     * package", not the dotted name. Fix the prose, do not widen the needle.
+     */
+    static void theBridgeNamesNothingInTheProxyPackage(List<Path> sources)
+            throws IOException {
+        List<String> naming = new ArrayList<>();
+        for (Path p : sources) {
+            if (!p.toString().contains("hx/bridge/")) continue;
+            if (count(text(p), "hx.proxy") > 0) naming.add(p.toString());
+        }
+        check("no file in hx.bridge names hx.proxy (" + naming + ")",
+              naming.isEmpty());
     }
 
     /**
@@ -16933,8 +18782,14 @@ public class ChokepointTest {
         int epoch = 0, scope = 0;
         for (Path p : sources) {
             String t = text(p);
-            epoch += count(t, ".configEpoch()");
-            scope += count(t, ".scopeConfig()");
+            // BOTH CALL FORMS. A method reference is an invocation, and
+            // `client::configEpoch` contains no `.configEpoch()` -- so the
+            // paren form alone left a must-be-zero check that a two-line
+            // detour walks past, which is the same grammar point the
+            // constructor needles were fixed for. See
+            // theTypeNeedlesCoverEveryConstructionForm.
+            epoch += calls(t, ".configEpoch()", "::configEpoch");
+            scope += calls(t, ".scopeConfig()", "::scopeConfig");
         }
         // Two reads of one record, with a commit landing between them:
         // measured wrong in 393/400 trials, and wrong in the unsafe direction
@@ -16946,23 +18801,146 @@ public class ChokepointTest {
               scope == 0);
     }
 
+    static final String BRIDGE_CLIENT =
+            Path.of("src", "hx", "bridge", "BridgeClient.java").toString();
+
+    /** Every reference to a Montoya type contains this: the API jar has one
+     *  package root, `burp/api/`, measured. */
+    static final String MONTOYA = "burp.api.";
+
+    /** Policy declares the constructor its count cannot help matching. */
+    static final String POLICY =
+            Path.of("src", "hx", "policy", "Policy.java").toString();
+
+    /** The record itself, which declares the constructor the count below
+     *  cannot help matching. */
+    static final String OBSERVED =
+            Path.of("src", "hx", "proxy", "Observed.java").toString();
+
+    /** ...and its sibling, counted for the same reason. */
+    static final String DENIED =
+            Path.of("src", "hx", "proxy", "Denied.java").toString();
+
+    /** The one file that turns two raw halves into a redacted record. It has
+     *  no burp.* type in it, which is what lets RecorderTest execute it. */
+    static final String RECORDER =
+            Path.of("src", "hx", "proxy", "Recorder.java").toString();
+
+    /** The issuing path: the one file that interleaves S7's credential refusal
+     *  between Policy's two halves. */
+    static final String SENDER =
+            Path.of("src", "hx", "send", "Sender.java").toString();
+
     /**
-     * A WIRE-EXISTS needle -- it proves a READ happens -- so it reads
-     * {@link #code} and a commented-out `this.authorisation()` cannot supply
-     * the one it is looking for.
+     * ONE READ PER DECIDING CALLBACK, AND NO READ THAT IS NOT ONE'S.
      *
-     * BridgeClient's send arm writes `this.authorisation()` with an explicit
-     * receiver precisely so this count can be taken. A bare `authorisation()`
-     * there reads as zero here and turns this check red -- which is the
-     * correct failure, not a false alarm to be quietened by loosening the
-     * needle.
+     * This check counted ONE read in the whole of extension/src until Task 7,
+     * and one was right while the send arm was the only thing deciding.
+     * Wiring the second enforcement point makes it THREE: the send arm, the
+     * proxy request handler, and the scope observation before the bytes
+     * leave.
+     *
+     * THE NUMBER IS NOT WHAT MATTERS AND WIDENING IT TO 3 WOULD PIN NOTHING.
+     * `configEpoch()` and `scopeConfig()` are two reads of one record and can
+     * straddle a commit -- measured wrong in 393/400 trials, and wrong in the
+     * unsafe direction. What that costs is a decision assembled from two
+     * halves of two authorisations, and the shape of that bug is A SECOND READ
+     * INSIDE ONE DECISION, which a bare total of 3 cannot tell from one
+     * decision moved to another file. So the reads are pinned to the things
+     * that make them, DERIVED rather than restated:
+     *
+     *   - BridgeClient reads once, for the send arm;
+     *   - the entry point reads exactly as many times as it has DECIDING
+     *     CALLBACKS, which is the equality that turns a second read inside
+     *     either handler red;
+     *   - each read comes BEFORE the question it feeds, in order, so the
+     *     equality cannot be satisfied by two reads in one callback and none
+     *     in the other;
+     *   - and nothing else in extension/src reads it at all.
+     *
+     * DERIVED FROM THE QUESTIONS -- `gate.decide(` + `decideScopeOnly(` -- and
+     * that is a restoration. Fix round 1 moved it to counting CALLBACK
+     * DECLARATIONS, because the second callback had gained a SECOND question
+     * (`decideBeforeGate` for the crawler, `decideScopeOnly` for the operator)
+     * and counting questions would have read three against two reads and gone
+     * red on correct code. Task 9 measured that the second callback cannot
+     * refuse anything -- `ProxyRequestToBeSentAction.drop()` does not prevent
+     * egress on Burp 2026.7.3 -- so it no longer branches by source and no
+     * longer decides: it asks ONE question, `decideScopeOnly`, and logs.
+     *
+     * Questions are the stronger unit whenever it is available, and this is
+     * why it is taken back: a callback that grows a SECOND question without a
+     * second snapshot read is exactly the two-halves-of-two-authorisations bug
+     * this method exists for, and a count of DECLARATIONS cannot see it.
+     *
+     * The two questions are not the same kind of thing and the equality does
+     * not claim they are: `gate.decide(` DECIDES and `decideScopeOnly(`
+     * OBSERVES. What both need, and what is counted, is that each was answered
+     * under an authorisation fetched for THIS request -- an observation
+     * assembled from two halves of two authorisations is a log line an
+     * operator acts on at 02:00 and it must not be a guess either.
+     *
+     * THE WITNESS FOR THE EQUALITY, in the shape
+     * `test_vocabularies_match_the_schema.py` uses for its own: it is vacuous
+     * if both sides are zero -- a file with no reads and no questions
+     * satisfies it -- so the question count is asserted to be 2 outright.
+     *
+     * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
+     * `this.authorisation()` cannot supply one. BridgeClient's send arm writes
+     * `this.authorisation()` with an explicit receiver precisely so the count
+     * can be taken; a bare `authorisation()` there reads as zero and turns
+     * this red, which is the correct failure rather than a reason to loosen
+     * the needle.
      */
-    static void theAuthorisationSnapshotIsReadInExactlyOnePlace(List<Path> sources)
+    static void everyDecisionReadsOneAuthorisationSnapshot(List<Path> sources)
             throws IOException {
         int total = 0;
-        for (Path p : sources) total += count(code(p), ".authorisation()");
-        check("the whole extension reads the Authorisation snapshot in exactly one "
-              + "place, not " + total, total == 1);
+        List<String> elsewhere = new ArrayList<>();
+        for (Path p : sources) {
+            int n = calls(code(p), ".authorisation()", "::authorisation");
+            total += n;
+            if (n > 0 && !p.toString().equals(BRIDGE_CLIENT)
+                      && !p.toString().equals(ENTRY_POINT))
+                elsewhere.add(p + " x" + n);
+        }
+        String bridge = code(Path.of(BRIDGE_CLIENT));
+        String entry = code(Path.of(ENTRY_POINT));
+        int inBridge = calls(bridge, ".authorisation()", "::authorisation");
+        int inEntry = calls(entry, ".authorisation()", "::authorisation");
+        // The two questions the entry point asks of a request: the gate call
+        // that DECIDES, and the pre-send scope call that only OBSERVES. A
+        // response handler asks neither and must read nothing, which is what
+        // the totals below enforce.
+        int questions = calls(entry, "gate.decide(", "gate::decide")
+                      + calls(entry, "decideScopeOnly(", "::decideScopeOnly");
+
+        check("the send arm reads the Authorisation snapshot once (" + inBridge + ")",
+              inBridge == 1);
+        check("the entry point asks two questions -- the proxy gate and the "
+              + "pre-send scope observation (" + questions + ")",
+              questions == 2);
+        check("and reads the snapshot exactly once per question ("
+              + inEntry + " reads, " + questions + " questions)",
+              inEntry == questions);
+        check("nothing else in extension/src reads it at all " + elsewhere,
+              elsewhere.isEmpty());
+        check("so the whole extension reads it " + (1 + questions) + " times, "
+              + "once per question (" + total + ")", total == 1 + questions);
+
+        // Each read AHEAD of the question it feeds. Without this, two reads in
+        // one callback and none in the other satisfies the equality above --
+        // and "none in the other" is an answer taken under an authorisation
+        // fetched for a different request.
+        int read1 = entry.indexOf(".authorisation()");
+        int gate = entry.indexOf("gate.decide(");
+        int read2 = entry.indexOf(".authorisation()", read1 + 1);
+        int observation = entry.indexOf("policy.decideScopeOnly(", read2);
+        check("the request handler reads before it asks the gate (" + read1
+              + " < " + gate + ")", read1 >= 0 && read1 < gate);
+        check("and the pre-send observation reads its own, after that gate "
+              + "call and before its own question (" + gate + " < " + read2
+              + " < " + observation + ")",
+              read2 > gate && observation > read2);
     }
 
     /**
@@ -16992,15 +18970,107 @@ public class ChokepointTest {
      * `ServerSocketChannel`, neither of which contains `Socket(`. The one
      * that does the most work is `InetSocketAddress` -- a SocketChannel is
      * harmless until something gives it a network address to connect to.
+     *
+     * THE FIRST NEEDLE WAS `new Socket(` AND IT WAS BLIND TO A QUALIFIED NAME,
+     * measured on 2026-08-25 as Task 7's row G. This class's own javadoc above
+     * says the family "needs no import line to become possible"; the needle
+     * then required the one spelling that DOES need one. Three runs, each a
+     * single edit to `Pending.size()`, against a clean 12 summary lines / 0
+     * FAIL / rc=0:
+     *
+     *     new java.net.Socket()                       12 lines, 0 FAIL, rc=0
+     *     new java.net.Socket("127.0.0.1", 1).close() 12 lines, 0 FAIL, rc=0
+     *     new Socket("127.0.0.1", 1) + the import     12 lines, 1 FAIL, rc=1
+     *
+     * The middle one is a WORKING TCP egress -- the two-argument constructor
+     * connects, so it needs no `InetSocketAddress` either -- sitting in
+     * extension/src with every check green. The needle is `Socket(` now, which
+     * catches the qualified and unqualified spellings alike and `new
+     * ServerSocket(` with them. It cost nothing to tighten: `Socket(` appears
+     * ZERO times in extension/src today, measured across all 25 sources, for
+     * the reason the paragraph above gives -- the unix-domain path spells
+     * `SocketChannel.open(` and `ServerSocketChannel`, and neither has the
+     * paren against the word.
+     *
+     * QUALIFICATION WAS NOT THE ONLY HOLE, and the sentence that used to stand
+     * here -- "the other five needles have no such blind spot" -- was FALSE.
+     * Two reviewers found it independently, and each measured its probe as a
+     * single added line in `extension/src` against a clean 12 / 0 FAIL / rc=0:
+     *
+     *     new java.net.URL("http://127.0.0.1:1/").getContent()  12 / 0 / rc=0
+     *     new ProcessBuilder("curl", ...).start()               12 / 0 / rc=0
+     *     java.net.InetAddress.getByName(...)                   12 / 0 / rc=0
+     *     api.collaborator().createClient()...                  12 / 0 / rc=0
+     *     new java.net.URL("http://127.0.0.1:1/").openStream()  12 / 1 / rc=1
+     *
+     * The last is the control: the needle works for the door it names. The
+     * first is the lesson -- `getContent()` is a THIRD door on the very object
+     * `openConnection(` and `openStream(` guard, so the list was enumerating
+     * SPELLINGS where the capability was the thing to name. The needle is now
+     * the object (`URL(`), which no method on it can get past.
+     *
+     * `URL(` WAS NOT FREE, and the four occurrences it collided with were
+     * PROSE: comments in `Policy.java` discussing JavaScript's `new URL()` for
+     * path normalisation. These needles read {@link #text}, so prose counts,
+     * and this class's own rule for a must-be-zero needle applies -- rewrite
+     * the comment, do not loosen the needle. The four were rewritten to say
+     * `new URL` without the paren, which says the same thing, and `URL(` is 0.
+     * The other four additions were 0 to begin with.
+     *
+     * WHAT THIS LIST EXCLUDES IS EVERY SPELLING NOT IN IT, and that is the
+     * whole of it. The bullets that used to stand here read as a survey of the
+     * gap and were not one -- the first named `uri.toURL().getContent()` as an
+     * escape, and it is CAUGHT, because `toURL(` contains `URL(`. A list of
+     * exclusions that under-states the check's reach in one bullet and
+     * over-states it in the shape it misses is worse than no list, which is
+     * this class's own Rule 4 turned on itself for the third time.
+     *
+     * The measured escape is not exotic and its type IS fully spelled:
+     *
+     *     new java.util.logging.SocketHandler("127.0.0.1", 9999);
+     *
+     * One line, one JDK TCP connection, and 12 summary lines / 1880 ok /
+     * 0 FAIL / rc=0. `SocketHandler(` does not contain `Socket(` and no other
+     * needle touches it. IT IS DELIBERATELY NOT ADDED: enumerating spellings
+     * is the error F4 was raised about, one more name does not change what a
+     * text scan can do, and the JDK has more classes that open a socket than
+     * anyone will finish listing -- a logging handler is only the funniest.
+     *
+     * WHAT DOES CLOSE IT is not a longer list. It is the layers below and
+     * above this one: {@link #montoyaIsConfinedToTheEntryPoint} keeps `burp.*`
+     * to one file, {@link #oneEgressPath} keeps Montoya's HTTP API to one
+     * reach inside it, `extension/build.sh` compiles `src` alone against the
+     * Montoya API so there is no third party to hide in -- and, for anything
+     * the JDK can still do, an end-to-end run that WATCHES THE WIRE. That is
+     * Task 9's, and it is the only layer that can answer "did bytes leave"
+     * rather than "is this spelling present".
+     *
+     * So this check is a TRIPWIRE on the shapes a second egress path has
+     * actually taken in this repository -- twice now, both found by review
+     * rather than by it -- and it is not a proof that none exists. Read it as
+     * that and nothing more. It is item 2 of the canonical open list in
+     * {@link hx.proxy.Recorder}'s javadoc, which is the one place this path's
+     * residuals are enumerated.
      */
     static void noSecondEgressFamilyExists(List<Path> sources) throws IOException {
         String[] needles = {
-            "new Socket(",        // a TCP client socket, straight from the JDK
+            "Socket(",            // a TCP client socket, straight from the JDK,
+                                  // qualified or not -- see the javadoc above
+            "Socket::new",        // ...and the OTHER spelling a constructor has
             "InetSocketAddress",  // ...or the address that turns a channel into one
+            "URL(",               // the OBJECT, not one of its doors: see above
+            "URL::new",           // ...in both of its constructor spellings too
             "openConnection(",    // URL -> URLConnection / HttpURLConnection
+            "::openConnection",   // ...and the reference form of the same call
             "openStream(",        // URL.openStream(), the one-liner version
+            "::openStream",       // ...likewise
             "HttpClient",         // java.net.http, the modern one
             "DatagramSocket",     // UDP is egress too
+            "InetAddress",        // a DNS lookup is bytes off this machine
+            "ProcessBuilder",     // ...and so is `curl`
+            "Runtime.getRuntime", // the older spelling of the same thing
+            "collaborator()",     // Montoya's OTHER network facility
+            "::collaborator",     // ...reached by reference
         };
         for (String needle : needles) {
             int total = 0;
@@ -17011,46 +19081,177 @@ public class ChokepointTest {
     }
 
     /**
-     * Policy is asked in two halves, and both halves are asked exactly once.
+     * WHEREVER THE PAID HALF IS SPENT, THE FREE HALF WENT BEFORE IT -- and the
+     * paid half is spent in exactly one place.
      *
-     * `decide()` was split so spec s7's credential refusal could sit BETWEEN
-     * them: it must run before the Gate (which spends a rate token and a
-     * budget slot) and after scope/method/dangerous (whose classes have
-     * `denial` rows, where `unmanaged_credential` has none). Policy cannot
-     * make that check itself -- it is decided by its arguments alone and must
-     * not reach into hx.send for a Redactor -- so the interleaving lives in
-     * Sender.
+     * `Policy.decide()` was split so spec s7's credential refusal could sit
+     * BETWEEN the halves: it must run before the Gate (which spends a rate
+     * token and a budget slot) and after scope/method/dangerous, whose classes
+     * name the boundary crossed rather than the credential carried. Policy
+     * cannot make that check itself -- it is decided by its arguments alone
+     * and must not reach into hx.send for a Redactor -- so the interleaving
+     * lives in Sender.
      *
-     * The split is what this guards. `decideBeforeGate` answering `allowed()`
-     * is NOT permission to issue: the Gate has not run. A second issue path
-     * that called only the first half would issue past the rate limit and past
-     * the run's budget, with every behavioural test green, because every one
-     * of them drives the path that does call both.
+     * `decideBeforeGate` answering `allowed()` is NOT permission to issue: the
+     * Gate has not run. A second ISSUE path that called only the first half
+     * would issue past the rate limit and past the run's budget, with every
+     * behavioural test green, because every one of them drives the path that
+     * does call both.
+     *
+     * THE WHOLE-TREE PAIR `before == 1 && gate == 1 && before == gate` IS
+     * BACK, and its round trip is worth recording. Task 7's fix round 1 gave
+     * the proxy path's second callback a re-DECISION that asked
+     * `decideBeforeGate`, which made the whole-tree count 2 and forced this
+     * check into a per-file form. Task 9 measured that
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3, so that callback cannot refuse anything and no longer tries:
+     * it asks `decideScopeOnly` and LOGS. `decideBeforeGate` therefore has one
+     * caller again -- the issuing path -- and the original assertion is the
+     * true one.
+     *
+     * What the check says, DERIVED per file rather than restated as a total:
+     *
+     *   - the ISSUING path (Sender) asks both halves, the same number of
+     *     times, and that number is one. This is the original pair assertion,
+     *     narrowed to the file where the interleaving actually lives -- so a
+     *     deleted `.checkGate(` there is still red;
+     *   - NO OTHER FILE IN THE TREE ASKS EITHER HALF, the entry point
+     *     included. A must-be-zero, which is the strongest shape this class
+     *     has. A third caller of `decideBeforeGate` is a path that might issue
+     *     on a half-decision, and it has to be looked at by a human rather
+     *     than absorbed into a total;
+     *   - and the entry point does not reach the Gate through the FRONT DOOR
+     *     either. Kept from fix round 1 and it is not about the deleted
+     *     decision: `policy.decide(` runs both halves inside Policy without
+     *     ever spelling `.checkGate(` here, which is the shape a double charge
+     *     would actually be written in, and the sweep above cannot see it.
      *
      * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
      * `.checkGate(` beside a live `.decideBeforeGate(` would otherwise keep
-     * both counts at 1 and the pair assertion below satisfied, with the Gate
-     * never asked.
+     * the counts satisfied with the Gate never asked.
      *
-     * Counting is all this can do, and one of each is what the send path
-     * needs. `decide(` is not counted: it remains correct for a caller with
-     * nothing to interleave, and PolicyTest drives every rule through it.
+     * `decide(` is not counted: it remains correct for a caller with nothing
+     * to interleave -- the proxy path's FIRST callback reaches it through
+     * `ProxyGate` -- and PolicyTest drives every rule through it.
      */
-    static void bothHalvesOfTheDecisionAreAskedAndOnlyOnce(List<Path> sources)
+    static void theGateIsSpentOnlyWhereTheHalvesArePaired(List<Path> sources)
             throws IOException {
-        int before = 0, gate = 0;
+        String sender = code(Path.of(SENDER));
+        String entry = code(Path.of(ENTRY_POINT));
+        int senderBefore = calls(sender, ".decideBeforeGate(", "::decideBeforeGate");
+        int senderGate = calls(sender, ".checkGate(", "::checkGate");
+
+        check("the issuing path asks the boundary half exactly once ("
+              + senderBefore + ")", senderBefore == 1);
+        check("and the Gate half exactly once with it (" + senderGate + ")",
+              senderGate == 1);
+        // The pair, not the two counts separately: what makes an allowed first
+        // half safe is that a second half follows it.
+        check("so the issuing path never takes one without the other",
+              senderBefore == senderGate);
+
+        // ...and not through the front door either. `policy.decide(` runs both
+        // halves INSIDE Policy, so it reaches the Gate without ever spelling
+        // `.checkGate(` here -- which is the shape a double charge would
+        // actually be written in, and the count above cannot see it. The
+        // needle takes the paren, so `policy.decideBeforeGate(` and
+        // `policy.decideScopeOnly(` do not match it. ProxyGate's own
+        // `policy.decide(` is a different file and is the FIRST callback's
+        // paying decision, which is correct.
+        int entryFull = calls(entry, "policy.decide(", "policy::decide");
+        check("and not through policy.decide(), which reaches the Gate without "
+              + "naming it (" + entryFull + ")", entryFull == 0);
+
+        // THE ENTRY POINT IS NO LONGER EXCLUDED. It was, while its second
+        // callback asked `decideBeforeGate`; that call is gone, so the entry
+        // point is swept like every other file and a re-added one is red here
+        // rather than needing a count of its own.
+        List<String> elsewhere = new ArrayList<>();
         for (Path p : sources) {
-            String t = code(p);
-            before += count(t, ".decideBeforeGate(");
-            gate += count(t, ".checkGate(");
+            if (p.toString().equals(SENDER)) continue;
+            String c = code(p);
+            // BOTH FORMS on BOTH halves. The round-4 report claimed every
+            // must-be-zero method needle counted both; this arm did not, so a
+            // `policy::checkGate` in ProxyGate's operator branch was invisible
+            // to it and went red only through ProxyGateTest's budget check --
+            // a different check catching it by luck of coverage.
+            int n = calls(c, ".decideBeforeGate(", "::decideBeforeGate")
+                  + calls(c, ".checkGate(", "::checkGate");
+            if (n > 0) elsewhere.add(p + " x" + n);
         }
-        check("the boundary half of the decision is asked exactly once (" + before + ")",
-              before == 1);
-        check("and the Gate half exactly once with it (" + gate + ")", gate == 1);
-        // The pair, not the two counts separately: what makes an allowed
-        // first half safe is that a second half follows it.
-        check("so no path in extension/src takes one without the other",
-              before == gate);
+        check("and no other file in extension/src asks either half -- the "
+              + "entry point included " + elsewhere, elsewhere.isEmpty());
+    }
+
+    /**
+     * The extension builds ONE Policy, and the second enforcement point is
+     * handed that one.
+     *
+     * Policy owns the Gate, and the Gate is where the rate limit and the
+     * per-run budget live. Two Policy objects sharing one Limits would be
+     * harmless -- this is NOT a claim that a second Policy is wrong in
+     * itself. It is a tripwire on the shape a second one arrives in: the
+     * natural way to give the proxy path a Policy, when the send path's was
+     * built inline at its call site, is to write another
+     * `new Policy(new Limits(...))` -- and that is a SECOND per-run budget for
+     * one run, which no behavioural test can see because each half of it is
+     * internally consistent. {@link #theGateIsSpentOnlyWhereTheHalvesArePaired}
+     * cannot see it either: it counts `.decideBeforeGate(` and `.checkGate(`,
+     * not constructions.
+     *
+     * A WIRE-EXISTS needle, so it reads {@link #code}: prose cannot construct
+     * anything. That is not theoretical here -- the entry point's own comment
+     * spells `new Policy(new Limits(...))` to explain the hazard, and this
+     * count is 1 with that comment in place, which is the measurement that
+     * this needle is blind to prose. Whole-tree, because the answer is a fixed
+     * count of a CALL nobody writes in prose -- the class javadoc's rule for
+     * when that is safe.
+     *
+     * A NEEDLE AND NOT A COMPILER BOUND, and the difference is worth stating
+     * because {@link hx.proxy.Observed} took the other road. That record is
+     * package-private, so `javac` refuses every construction outside
+     * `hx.proxy` whatever its spelling. `Policy` cannot be: `hx.send.Sender`
+     * and `hx.proxy.ProxyGate` both hold one and `hx.HxExtension` builds it,
+     * so it is public of necessity and a text needle is what there is. What
+     * makes that acceptable is that the needle now covers the CLOSED set of
+     * spellings a construction has -- see the two needles above and
+     * {@link #theTypeNeedlesCoverEveryConstructionForm}.
+     *
+     * AND NOT A SECOND LIMITS EITHER. `new Limits(` is not counted,
+     * because Limits is legitimately constructible for defaults and the
+     * damage is done by the Policy that takes it. If this count ever needs to
+     * be two, say which Limits the second one shares before changing the
+     * number.
+     */
+    static void oneRunHasOnePolicy(List<Path> sources) throws IOException {
+        int total = 0;
+        List<String> hits = new ArrayList<>();
+        for (Path p : sources) {
+            // `Policy(` and not `new Policy(`: a QUALIFIED construction,
+            // `new hx.policy.Policy(limits)`, slipped past the `new ` spelling
+            // and read 13 summary lines / 1900 ok / 0 FAIL / rc=0 -- a second
+            // per-run budget for one run, which is the exact failure this
+            // check's javadoc says no behavioural test can see. The cost of
+            // the wider needle is that Policy's own CONSTRUCTOR DECLARATION
+            // matches, so the expected answer is two files.
+            // BOTH CONSTRUCTOR SPELLINGS. `Policy(` alone was blind to
+            // `Policy::new`, and a method reference is a construction: with
+            // `Function<Limits, Policy> mk = Policy::new; mk.apply(limits)` in
+            // the entry point this check read 13 summary lines / 1980 ok /
+            // 0 FAIL / rc=0 -- a second Gate and a second per-run budget for
+            // one run, measured. The Java grammar gives a constructor exactly
+            // two spellings, `new T(` and `T::new`, each optionally qualified;
+            // these two needles cover all four, and the sweep in
+            // theTypeNeedlesCoverEveryConstructionForm asserts that they do.
+            int n = calls(code(p), "Policy(", "Policy::new");
+            total += n;
+            if (n > 0) hits.add(p + " x" + n);
+        }
+        check("Policy is DECLARED in one file and CONSTRUCTED in one, and the "
+              + "one that constructs it is " + ENTRY_POINT + " -- not " + hits,
+              hits.equals(List.of(ENTRY_POINT + " x1", POLICY + " x1")));
+        check("so extension/src builds exactly one Policy (" + (total - 1)
+              + " constructions + 1 declaration = " + total + ")", total == 2);
     }
 
     /**
@@ -17107,19 +19308,218 @@ public class ChokepointTest {
      */
     static void everyKillPathIsWiredBeforeTheDial() throws IOException {
         String entry = code(Path.of(ENTRY_POINT));
+        // Each wire counted in BOTH grammar forms -- see calls(). A local per
+        // wire, because the pair does not fit twice on a line.
+        int sink = calls(entry, "setHaltSink(", "::setHaltSink");
+        int source = calls(entry, "setHaltSource(", "::setHaltSource");
+        int poller = calls(entry, "haltSwitch.start()", "haltSwitch::start");
+        int notifier = calls(entry, "setHaltNotifier(", "::setHaltNotifier");
+        int handler = calls(entry, "setSendHandler(", "::setSendHandler");
+        int guard = calls(entry, "setConfigGuard(", "::setConfigGuard");
         check("a halt frame is routed to the switch the send path asks ("
-              + count(entry, "setHaltSink(") + ")", count(entry, "setHaltSink(") == 1);
-        check("and maySend() asks that same authority back ("
-              + count(entry, "setHaltSource(") + ")", count(entry, "setHaltSource(") == 1);
-        check("the sentinel poller is started (" + count(entry, "haltSwitch.start()") + ")",
-              count(entry, "haltSwitch.start()") == 1);
-        check("an auto-halt has somewhere to announce itself ("
-              + count(entry, "setHaltNotifier(") + ")", count(entry, "setHaltNotifier(") == 1);
-        check("and the send path is installed (" + count(entry, "setSendHandler(") + ")",
-              count(entry, "setSendHandler(") == 1);
+              + sink + ")", sink == 1);
+        check("and maySend() asks that same authority back (" + source + ")",
+              source == 1);
+        check("the sentinel poller is started (" + poller + ")", poller == 1);
+        check("an auto-halt has somewhere to announce itself (" + notifier + ")",
+              notifier == 1);
+        check("and the send path is installed (" + handler + ")", handler == 1);
         check("and a configure that would move an armed limit is refused ("
-              + count(entry, "setConfigGuard(") + ")",
-              count(entry, "setConfigGuard(") == 1);
+              + guard + ")", guard == 1);
+
+        // ---- ...BEFORE THE DIAL, which is the half the NAME claimed and the
+        // body did not take. Six counts and zero offsets: a reviewer measured
+        // `c.setConfigGuard(...)` moved to after `t.start()` at
+        // 13 / 2200 ok / 0 FAIL / rc=0, and the five `c.set*` wires moved as a
+        // block likewise. Re-measured against THESE arms on the tree that
+        // carries them: the guard alone is 13 / 2257 ok / 1 FAIL / rc=1, and
+        // the five wires plus the poller moved as a block is
+        // 13 / 2251 ok / 7 FAIL / rc=1 (five of these arms, and two from
+        // everyPathThatSpendsTheGateArmsItFirst, which the same move drags the
+        // send-path arming past its decision). The window is a real race and
+        // not a
+        // theoretical one -- the dial runs on a daemon thread that opens a
+        // real socket, and inside the window `BridgeClient.refuseConfigure`
+        // returns null with no guard installed, which ACCEPTS.
+        //
+        // THE ANCHOR IS `t.start()` AND NOT `c.connect()`. The connect call is
+        // textually EARLIER -- it sits inside the Runnable the Thread is
+        // constructed with -- and it does not run until the thread is started,
+        // so anchoring there would refuse correct code. `t.start()` is where
+        // the client becomes live.
+        //
+        // ANTI-VACUITY IS `>= 0` ON EVERY ONE OF THEM, and it is load-bearing
+        // exactly as it is in theGateDecidesBeforeAnythingIsQueued: indexOf
+        // answers -1 for a needle that is absent and -1 is less than every
+        // real offset, so a DELETED wire would satisfy "before the dial"
+        // perfectly. The count arms above are what make each offset the ONLY
+        // occurrence rather than the first of several.
+        //
+        // WHAT IT DOES NOT SEE, and the limitation is the one every
+        // first-occurrence offset in this file carries:
+        //
+        //   - THESE ARE OFFSETS, NOT BRACE NESTING. A wire written inside a
+        //     lambda that runs after the dial, or inside a branch never taken,
+        //     sits at an earlier offset and passes. What it catches is the
+        //     shape that actually happens: a wire MOVED below the dial, or
+        //     added below it.
+        //   - THE DOTTED FORM ONLY. `calls()` above sums both grammar forms,
+        //     so a wire spelled purely as `c::setHaltSink` keeps the count at
+        //     1 while indexOf answers -1 and this arm goes RED. That is
+        //     fail-closed and deliberate: a bare method reference installs
+        //     nothing until something applies it, and the offset check has no
+        //     way to find where that happened.
+        int dial = entry.indexOf("t.start()");
+        check("the dial is where it is expected to be (" + dial + ")", dial >= 0);
+        String[][] wired = {
+            {"the halt sink",     "setHaltSink("},
+            {"the halt source",   "setHaltSource("},
+            {"the halt notifier", "setHaltNotifier("},
+            {"the send handler",  "setSendHandler("},
+            {"the config guard",  "setConfigGuard("},
+            {"the sentinel poller", "haltSwitch.start()"},
+        };
+        for (String[] w : wired) {
+            int at = entry.indexOf(w[1]);
+            check(w[0] + " is installed before the dial (" + at + " < " + dial
+                  + ")", at >= 0 && dial >= 0 && at < dial);
+        }
+    }
+
+    /**
+     * THE DRAIN IS STARTED, and until this method existed nothing in this file
+     * said so.
+     *
+     * `capture.start()` was the ONE wire in {@link #ENTRY_POINT} named by no
+     * `count(`, `calls(` or `indexOf(` anywhere in this class -- verified by
+     * scanning every needle literal in the file, not by reading. Commented
+     * out, it was 13 summary lines / 2200 ok / 0 FAIL / rc=0 against the tree
+     * before this method existed. Re-measured against THIS method on the tree
+     * that carries it: 13 / 2257 ok / 1 FAIL / rc=1, naming this check.
+     *
+     * WHAT THAT COSTS. {@code Capture.accepting} is true at field level and
+     * {@code start()} is what creates the drain thread, so without it every
+     * proxy exchange is offered into a queue NOTHING POLLS. The first
+     * {@code DEFAULT_CAPACITY} records sit there uncounted; after that each
+     * offer evicts one and counts it dropped. The store gets ZERO exchange
+     * rows for the whole run, and `run.dropped_total` -- which S5 presents as
+     * a coverage FLOOR -- under-reports the loss by up to a full queue. A
+     * total outage that reads as a run which just saw little traffic.
+     *
+     * Only `pytest -m integration` could see it behaviourally. This is a
+     * count, and a count is worth more than nothing for the failure that
+     * actually happens: the line deleted, or never written.
+     *
+     * NO ORDERING IS CLAIMED, and the omission is deliberate rather than an
+     * oversight. `capture.start()` sits beside `haltSwitch.start()` and before
+     * the dial today, but nothing breaks if it moves after: an offer made
+     * before the drain runs is queued, not lost, and delivery through the sink
+     * fails until the bridge connects anyway. There is no window here of the
+     * kind {@link #everyKillPathIsWiredBeforeTheDial} exists for, so this
+     * method does not pretend to one. It is a WIRE-EXISTS needle read from
+     * {@link #code}, so neither a comment nor a string literal can supply it.
+     *
+     * WHAT IT DOES NOT SEE: that the thread actually runs, that the sink is
+     * connected, or that anything is ever delivered. All three need Burp.
+     */
+    static void theCaptureDrainIsStarted() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int drain = calls(entry, "capture.start()", "capture::start");
+        check("the capture drain is started, so a queued record has somewhere "
+              + "to go (" + drain + ")", drain == 1);
+    }
+
+    /**
+     * EVERY PATH THAT SPENDS THE GATE ARMS IT FIRST -- counted, because prose
+     * naming the callers is what failed here.
+     *
+     * {@code Limits.arm} had ONE call site, inside `setSendHandler`, and
+     * {@code Limits.check}'s own javadoc said the unarmed branch was
+     * "Unreachable through HxExtension, which calls arm() on the same snapshot
+     * on the line before issue()". THAT WAS TRUE WHEN IT WAS WRITTEN. Task 7
+     * wired S4's second enforcement point, whose CRAWLER branch reaches
+     * `ProxyGate.decide` -> `Policy.decide` -> `Limits.check`, and it did not
+     * arm -- so every crawler request that passed scope, method and
+     * dangerous.path was refused `not_configured` with the detail "the rate
+     * and budget are not armed", until some unrelated `send` happened to arm
+     * it. Fail-closed, and a lie about why: the denial lands under a
+     * `denial.kind` an operator reads as "nobody authorised this run", with no
+     * `EXTENSION_FAULT` prefix to separate a broken jar from an unconfigured
+     * one.
+     *
+     * WHY THIS SUITE DID NOT SEE IT, all three reasons, because each is its
+     * own lesson:
+     *
+     *   - this class counted NOTHING for `.arm(`. Deleting the call outright
+     *     left 13 / 2200 ok / 0 FAIL / rc=0;
+     *   - the only crawler-listener integration test drives a POST, which
+     *     `method.allow` refuses BEFORE the Gate -- the test that existed
+     *     stopped short of the code path;
+     *   - the comment above the branch named its callers. A sentence naming a
+     *     set of callers is falsified by a new caller in another file, and
+     *     nothing makes a noise when that happens.
+     *
+     * So this is a COUNT OF CALL SITES rather than a sentence about them, in
+     * both grammar forms through {@link #calls} -- `limits::arm` is a spelling
+     * -- and it is TWO because there are two points that can consult the Gate.
+     * Deleting either turns it red. So does ADDING a third call site, armed or
+     * not, and that is the point rather than a wart: the number is a fact
+     * about how many places can spend the Gate, and a wave that changes it
+     * must come here and re-derive it.
+     *
+     * ...AND EACH ARMING COMES BEFORE THE DECISION IT ARMS. A call that
+     * happens AFTER `Limits.check` has already answered is a call whose result
+     * arrives too late, which is this codebase's own recurring family: the
+     * count would stay at 2 and the first crawler request would still be
+     * refused. The two offsets are taken as FIRST and LAST, which is exact
+     * only because the count is pinned at 2 immediately above -- with a third
+     * call site the middle one would be unexamined, and the count arm is what
+     * stops there being one.
+     *
+     * WHAT IT DOES NOT SEE:
+     *
+     *   - BRACE NESTING, like every other offset in this file. The send arm's
+     *     `limits.arm(` and `sender.issue(` are inside one lambda and the
+     *     proxy pair inside one handler, and nothing here proves that; a
+     *     `limits.arm(` moved into the WRONG one of the two would keep both
+     *     orderings and go unnoticed.
+     *   - WHETHER THE SNAPSHOT IS THE SAME ONE. Both sites are written
+     *     `limits.arm(auth)` on the line above a decision taken under `auth`,
+     *     and the identifier is not checked here --
+     *     {@link #everyDecisionReadsOneAuthorisationSnapshot} is what holds
+     *     "one read, passed in" for the file as a whole.
+     *   - THAT `arm` IS ARMED-ONCE. That is {@code Limits}'s own contract and
+     *     `LimiterTest`/`PolicyTest` drive it; a second call from a later
+     *     snapshot returns early rather than re-arming, which is why adding
+     *     the proxy call site cannot resupply a spent budget.
+     */
+    static void everyPathThatSpendsTheGateArmsItFirst() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int arms = calls(entry, "limits.arm(", "limits::arm");
+        check("both points that can consult the Gate arm it (" + arms + ")",
+              arms == 2);
+        int firstArm = entry.indexOf("limits.arm(");
+        int lastArm = entry.lastIndexOf("limits.arm(");
+        int issue = entry.indexOf("sender.issue(");
+        int decide = entry.indexOf("gate.decide(");
+        // Anti-vacuity: -1 is less than every real offset, so a deleted needle
+        // would satisfy "comes first" perfectly.
+        check("the send path arms (" + firstArm + ") and issues (" + issue + ")",
+              firstArm >= 0 && issue >= 0);
+        check("and arms before it issues (" + firstArm + " < " + issue + ")",
+              firstArm >= 0 && issue >= 0 && firstArm < issue);
+        check("the proxy path arms (" + lastArm + ") and decides (" + decide + ")",
+              lastArm >= 0 && decide >= 0);
+        check("and arms before it decides (" + lastArm + " < " + decide + ")",
+              lastArm >= 0 && decide >= 0 && lastArm < decide);
+        // The two are DIFFERENT call sites, not one counted twice. Without
+        // this, two arms on the send path and none on the proxy path would
+        // satisfy every arm above -- the count is 2, the first is before
+        // issue(), and the last is still before gate.decide() because both sit
+        // above the proxy handler in the file.
+        check("and they are two distinct call sites (" + firstArm + " != "
+              + lastArm + ")", firstArm >= 0 && lastArm > firstArm && firstArm < issue
+              && lastArm > issue);
     }
 
     /**
@@ -17282,6 +19682,971 @@ public class ChokepointTest {
               egress > guard);
     }
 
+    /**
+     * S4's SECOND enforcement point exists, once, and the gate is inside it.
+     *
+     * A handler that forwards without asking is a third egress path wearing
+     * the second one's name -- and unlike the send path there is nothing
+     * behind it: the proxy is Burp's own socket, so a request the handler
+     * passes through has crossed no rule of ours at all.
+     *
+     * THERE WAS A FOURTH COUNT AND IT IS GONE. It read "scope is re-decided
+     * before the request is sent (`decideScopeOnly(` == 1)", and it pinned a
+     * DECISION that Task 9 measured cannot exist: a refusal at the second
+     * callback does not stop the request, because
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3. A check that pins a decision nothing can act on is a check
+     * that certifies a hole as closed. The question is still asked and is now
+     * an OBSERVATION -- see
+     * {@link #theSecondCallbackObservesAndCannotRefuse}, which pins what is
+     * actually true of it, including the must-be-zero that stops the refusal
+     * being re-added.
+     *
+     * WIRE-EXISTS needles, all three, so they read {@link #code}: prose cannot
+     * register a handler or ask a question. Taken in {@link #ENTRY_POINT},
+     * which is the only file allowed to name burp.* at all -- see
+     * {@link #montoyaIsConfinedToTheEntryPoint}, which is what makes that
+     * narrowing safe rather than convenient.
+     *
+     * WHAT THESE DO NOT SEE: whether the handler HONOURS the verdict.
+     * `if (!verdict.allow() && false)` forwards every refused request to the
+     * target and reads 13 ALL PASS / 2198 ok / 0 FAIL / rc=0 -- re-measured on
+     * this tree. `gate.decide(` is still called once, the offer is still
+     * textually after it, and every count here is satisfied. Task 9 closed it
+     * from outside: `tests/integration/test_proxy_capture.py` asserts a
+     * refused request reaches the OUT-OF-SCOPE TARGET zero times, measured at
+     * the target's own log and never by reading the client's response --
+     * `drop()` answers the client 200 OK with 1529 bytes of Burp's own HTML
+     * and is indistinguishable from a delivery by status code. That mutation
+     * turns three integration tests red and no check here.
+     *
+     * The two position checks below cover the orderings; this one covers
+     * existence.
+     */
+    static void theSecondEnforcementPointIsRegisteredAndAsksTheGate()
+            throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int n1 = calls(entry, "registerRequestHandler(", "::registerRequestHandler");
+        int n2 = calls(entry, "registerResponseHandler(", "::registerResponseHandler");
+        int n3 = calls(entry, "gate.decide(", "gate::decide");
+        check("registerRequestHandler appears exactly once (" + n1 + ")", n1 == 1);
+        check("registerResponseHandler appears exactly once (" + n2 + ")", n2 == 1);
+        check("the proxy handler asks the gate (" + n3 + ")", n3 == 1);
+    }
+
+    /**
+     * THE SECOND CALLBACK OBSERVES, LOGS, AND CANNOT REFUSE.
+     *
+     * MEASURED, Task 9, with the probe dropping at the second callback:
+     *
+     *     TBSDROP id=0 path=/tbs/secret          <- drop() WAS returned
+     *     Hit(method='GET', path='/tbs/secret')  <- the target received it
+     *     client saw /tbs/secret: status=404     <- the TARGET's answer
+     *
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * Suite Community 2026.7.3, while `ProxyRequestReceivedAction.drop()`
+     * does -- zero hits, Burp's own 1529-byte page. The two are not
+     * interchangeable. docs/burp-proxy-measurements.md, Q4, has both side by
+     * side.
+     *
+     * THE MUST-BE-ZERO IS THE POINT OF THIS METHOD. `drop()` there is not
+     * merely useless: while it was in place the refusal branch wrote a
+     * `denial` row and took the `pending` entry for a request that reached the
+     * target, so hx recorded a refusal that did not happen and lost the
+     * exchange that did. That is fabricated evidence in the dangerous
+     * direction, and the natural instinct of the next reader who finds a
+     * pass-through where a scope check used to be is to put the drop back. A
+     * zero is what stops that, and it reads as a rule rather than as an
+     * omission.
+     *
+     * THE OTHER TWO ARE THE CONVERSE: the observation must still HAPPEN and
+     * must still be SAID. A must-be-zero on its own is satisfied by deleting
+     * the whole callback body, which would lose the one signal an operator
+     * gets at the moment the boundary is crossed. So the question is counted,
+     * and the log is POSITIONED between the question and the pass-through --
+     * a count of `logToError(` would not do, because the entry point logs
+     * elsewhere (the idle-extension refusal, the failed connect) and a needle
+     * that matched those would be green with this callback silent.
+     *
+     * WIRE-EXISTS needles, so they read {@link #code}.
+     */
+    static void theSecondCallbackObservesAndCannotRefuse() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int late = calls(entry, "ProxyRequestToBeSentAction.drop(",
+                                "ProxyRequestToBeSentAction::drop");
+        int early = calls(entry, "ProxyRequestReceivedAction.drop(",
+                                 "ProxyRequestReceivedAction::drop");
+        int asked = calls(entry, "policy.decideScopeOnly(", "policy::decideScopeOnly");
+        check("the pre-send callback NEVER drops -- that action does not "
+              + "prevent egress on this Burp (" + late + ")", late == 0);
+        check("while the request-received callback still does, which is the "
+              + "one that works (" + early + ")", early == 1);
+        check("and the pre-send scope question is still asked (" + asked + ")",
+              asked == 1);
+
+        // The log sits BETWEEN the question and the pass-through, so a
+        // callback that asks and says nothing is red. Positions rather than a
+        // count: this file logs elsewhere too.
+        int ask = entry.indexOf("policy.decideScopeOnly(");
+        int log = entry.indexOf("logToError", ask);
+        int through = entry.indexOf(
+                "return ProxyRequestToBeSentAction.continueWith(r);");
+        check("the answer is logged after it is asked (" + ask + " < " + log
+              + ")", ask >= 0 && log > ask);
+        check("and before the request goes through anyway (" + log + " < "
+              + through + ")", through > log);
+    }
+
+    /**
+     * THE REFUSAL IS DECIDED AND HELD BEFORE ANYTHING IS RECORDED, AND IS
+     * RETURNED WHATEVER THE RECORDING DID.
+     *
+     * "Capture never gates enforcement" was true at the two request callbacks
+     * only because {@link hx.proxy.Capture#offer} documents that it never
+     * throws. That is a contingent property of another class, not a structure,
+     * and it is one field made nullable away from being false: a `Captured`
+     * with a null `Source` NPEs at `dropped[o.source().ordinal()]`. A throw
+     * out of that line escaped the handler with `drop()` never executed, and
+     * what Burp does with a proxy handler that threw is measured nowhere in
+     * this repository.
+     *
+     * So the action is bound to a local BEFORE the offer and returned AFTER
+     * it, with the offer inside a `try`. The property is then the control
+     * flow's rather than the callee's -- {@link hx.proxy.Capture}'s promise is
+     * still worth keeping, and nothing depends on it any more.
+     *
+     * ONE refusing callback, not two. It was two until Task 9 measured that
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3: the second callback's refusal enforced nothing and wrote a
+     * `denial` row for a request that reached the target, so it is gone and
+     * that callback now observes and logs. The response handler is not counted
+     * here either -- it already wrapped its offer, and its action carries no
+     * enforcement, it forwards either way.
+     *
+     * A COUNT OF ONE IS WEAKER THAN A COUNT OF TWO AGAINST A DELETION, and the
+     * position checks below are what carry it: `bind` before `offer` before
+     * `ret` are three indexOf's that all go to -1 or invert if the binding is
+     * removed or the offer is moved ahead of it.
+     */
+    static void theRefusalIsHeldBeforeItIsRecorded() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int bound = count(entry, "Action refuse =");
+        int returned = count(entry, "return refuse;");
+        int bind = entry.indexOf("Action refuse =");
+        int offer = entry.indexOf("capture.offer(");
+        int ret = entry.indexOf("return refuse;");
+        check("the one refusing callback binds its action first (" + bound + ")",
+              bound == 1);
+        check("and returns that local rather than a fresh call (" + returned + ")",
+              returned == 1);
+        check("the action is decided before anything is recorded (" + bind
+              + " < " + offer + ")", bind >= 0 && offer >= 0 && bind < offer);
+        check("and returned after (" + ret + " > " + offer + ")",
+              ret > offer);
+    }
+
+    /**
+     * THE CLOCK AND THE ATTRIBUTION ARE WRITTEN DOWN, AND TAKEN BACK.
+     *
+     * `Pending` is well tested as a CLASS and was held by nothing as WIRING.
+     * MEASURED by a reviewer on the committed tree: guard `pending.put(...)`
+     * so it never runs -- one `if` -- and the suite reads 12 summary lines /
+     * 0 FAIL / rc=0 while hx captures ZERO proxy exchanges. Every response
+     * handler then takes a miss, counts `countLost(UNATTRIBUTED)` and records
+     * nothing, so the only symptom is `run.dropped_total` climbing, which S5
+     * presents as a coverage FLOOR -- i.e. the failure looks exactly like "the
+     * harness is fine, this run just saw little traffic". A total outage that
+     * reads as poor coverage is the worst shape a defect can have here.
+     *
+     * ONE take, and it used to be two. The second was in the second request
+     * callback's refusal branch, on the reasoning that "this request is not
+     * going to the target, so no response can arrive for it" -- a sentence
+     * Task 9 measured FALSE, because `ProxyRequestToBeSentAction.drop()` does
+     * not prevent egress on Burp 2026.7.3. Taking the entry there DISCARDED
+     * THE CLOCK AND THE SOURCE of a request that was about to be answered, so
+     * the response handler then missed, counted `countLost` and recorded
+     * nothing. The refusal is gone and so is the take: the response handler is
+     * the only place an entry is taken back, which is the only place one is
+     * ever answered.
+     *
+     * WIRE-EXISTS needles, so they read {@link #code}.
+     *
+     * WHAT THEY DO NOT SEE, and it is why the counts are not the whole check:
+     * a `put` that is never REACHED still counts 1, and the measured mutation
+     * is exactly that -- a guard, not a deletion. So the statement's own line
+     * is asserted to carry nothing in front of it and to be indented like the
+     * `continueWith` it precedes, which is what a same-line guard and an
+     * enclosing block respectively disturb.
+     *
+     * MEASURED, three shapes, each 12 summary lines and rc=1: the put DELETED
+     * (3 FAIL), the reviewer's same-line guard `if (source == null) ...`
+     * (2 FAIL, the line prefix and the indent), and an ENCLOSING `if { }`
+     * block (1 FAIL, the indent alone -- the block re-indents by four).
+     *
+     * WHAT REMAINS UNSEEN even so: a guard whose block happens to re-indent to
+     * exactly this column, and any condition that is false at RUNTIME rather
+     * than in the text. Closing that needs Burp driving real traffic, and it
+     * is Task 9's -- see HxExtension's assumption block.
+     */
+    static void theClockAndTheAttributionAreWrittenDownAndTakenBack()
+            throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int put = calls(entry, "pending.put(", "pending::put");
+        int take = calls(entry, "pending.take(", "pending::take");
+        check("the request handler writes the clock and the source down ("
+              + put + ")", put == 1);
+        check("and the response handler -- the only caller that has an answer "
+              + "to pair them with -- takes them back (" + take + ")",
+              take == 1);
+
+        // AND THE PUT IS UNCONDITIONAL. The measured mutation is not a
+        // deletion -- it is `if (source == null) pending.put(...)`, which
+        // leaves the count above at 1. So the statement's own line is checked:
+        // nothing but whitespace in front of it, and the same indentation as
+        // the `continueWith` that follows it in the same block.
+        int put1 = entry.indexOf("pending.put(");
+        int lineStart = entry.lastIndexOf('\n', put1) + 1;
+        String prefix = put1 >= 0 ? entry.substring(lineStart, put1) : "x";
+        check("the put is a statement of its own, with no guard in front of it "
+              + "[" + prefix + "]", put1 >= 0 && prefix.isBlank());
+        int cont = entry.indexOf("return ProxyRequestReceivedAction.continueWith(r);");
+        int contStart = entry.lastIndexOf('\n', cont) + 1;
+        check("and sits in the same block as the pass-through it precedes ("
+              + prefix.length() + " vs " + (cont - contStart) + ")",
+              cont > put1 && prefix.length() == cont - contStart);
+    }
+
+    /**
+     * THE RECORDING STRUCTURES HOLD THEIR MONITORS.
+     *
+     * `Pending` is reached from Burp's proxy threads, so every read and every
+     * write of its map and its counter is inside `synchronized (live)`. The
+     * concurrency test in `PendingTest` separates that for `put` and `take` --
+     * with all four monitors removed it goes red 3 runs of 3 -- but NOT for
+     * `evicted()` and `size()`, which no test reads from a second thread.
+     * MEASURED by a reviewer: de-synchronizing those two alone reads 12 / 0
+     * FAIL / rc=0, so the claim in `Pending`'s javadoc was true and held by
+     * nothing.
+     *
+     * A COUNT IS NOT A PLACEMENT CHECK and this one does not pretend to be:
+     * four `synchronized (live) {` in that file could in principle be four
+     * monitors around the wrong code. What it does catch is the shape that
+     * actually happens -- an accessor written or edited without one -- and the
+     * placement of the two that matter most is separated behaviourally next
+     * door. The four are `put`, `take`, `evicted` and `size`; the number is
+     * stated rather than derived because there is nothing in the file to
+     * derive it from that is not the same count read twice.
+     */
+    static void theRecordingStructuresHoldTheirMonitors() throws IOException {
+        String pending = code(Path.of("src", "hx", "proxy", "Pending.java"));
+        int monitors = count(pending, "synchronized (live) {");
+        check("Pending guards all four of its accessors -- put, take, evicted, "
+              + "size (" + monitors + ")", monitors == 4);
+    }
+
+    /**
+     * ENFORCEMENT NEVER WAITS ON RECORDING.
+     *
+     * The gate is asked before anything is offered to the capture queue. Put
+     * the other way round -- offer first, decide after -- and every refused
+     * request has already been queued as an exchange the harness will record,
+     * and a full or wedged queue is suddenly in the path of a DECISION rather
+     * than of a record. S4 is explicit that a wedged harness changes what hx
+     * KNOWS, never what it ALLOWS; this is that sentence made structural.
+     *
+     * A position check, and the honest reason is the same one
+     * {@link #theAdapterBuildsItsRequestInsideTheTry} gives: HxExtension needs
+     * Burp to run at all. Offsets are taken in {@link #code}, whose stripper
+     * preserves length, so an index into it is an index into the file and a
+     * commented decoy cannot move either end.
+     *
+     * THE ANTI-VACUITY CHECKS ARE LOAD-BEARING, not decoration. `indexOf`
+     * answers -1 for a needle that is not there, and -1 is less than every
+     * real offset -- so DELETING the gate call would satisfy "the gate comes
+     * first" perfectly. The presence checks are what make the mutation red.
+     *
+     * WHAT IT DOES NOT SEE: which handler each needle is in. These are
+     * FIRST-OCCURRENCE offsets over the whole file, not brace nesting, so a
+     * `gate.decide(` in one handler ahead of a `capture.offer(` in another
+     * satisfies it. There is exactly one of the former, so today it cannot
+     * drift; a second decision site would need this check rewritten around
+     * the handler's own body, the way the adapter check anchors at its
+     * declaration.
+     */
+    static void theGateDecidesBeforeAnythingIsQueued() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int decide = entry.indexOf("gate.decide(");
+        int offer = entry.indexOf("capture.offer(");
+        check("the gate is asked in " + ENTRY_POINT + " (" + decide + ")",
+              decide >= 0);
+        check("and something is queued there (" + offer + ")", offer >= 0);
+        check("and the decision comes first (" + decide + " < " + offer + ")",
+              decide >= 0 && offer >= 0 && decide < offer);
+    }
+
+    /**
+     * THE RECORD IS BUILT BY THE THING THAT REDACTS, AND NEVER HERE.
+     *
+     * THREE TURNS OF ONE SCREW, and this method is what is left of them. The
+     * redaction wiring lived in {@link #ENTRY_POINT} and the same defect was
+     * found three times, each smaller than the last and each GREEN against the
+     * check written for the one before it:
+     *
+     *   1. the request half redacted with `redactRequest` and an empty
+     *      `Injected` -- `return raw.clone()`, the operator's live cookie
+     *      into a content-addressed store. Closed by an ORDER check;
+     *   2. both redaction calls left in place and the RAW locals queued
+     *      instead of their results -- one identifier each. Closed by a
+     *      DATAFLOW check: each local bound once, read once, and the record
+     *      construction delimited and searched for the names it must not
+     *      contain;
+     *   3. the two redactors SWAPPED. Both functions still correct, both
+     *      pointed at the wrong message, BOTH HALVES leaking -- and every
+     *      assertion of (2) still satisfied, because each function is still
+     *      called and each result is still queued. MEASURED at 12 summary
+     *      lines / 1880 ok / 0 FAIL / rc=0.
+     *
+     * ORDERING IS NOT DATAFLOW; DATAFLOW IS NOT APPLICATION. Every one of
+     * those checks asks a question about the TEXT of a file that needs Burp to
+     * construct a single argument and so cannot be executed by this suite at
+     * all. The fourth hole would have been smaller again. So the redaction,
+     * the pairing of each redactor to its own message, and the construction of
+     * the {@link hx.proxy.Observed} were moved into {@link hx.proxy.Recorder},
+     * which has no `burp.*` type in it, and `RecorderTest` DRIVES them: it
+     * asserts over BYTES, so a swapped pair, a discarded argument and an
+     * identity function all turn it red.
+     *
+     * WHAT IS LEFT FOR TEXT TO SAY, and it is the whole of what this method
+     * now does:
+     *
+     *   - the record is built by the Recorder and NEVER inline. THE REAL BOUND
+     *     HERE IS THE COMPILER, NOT THIS COUNT. `new Observed(` missed
+     *     `new hx.proxy.Observed(`; the widened `Observed(` missed
+     *     `Observed::new` -- measured at 13 / 1900 ok / 0 FAIL / rc=0 with
+     *     both halves raw -- and a third widening would miss a fourth
+     *     spelling. So {@link hx.proxy.Observed} and {@link hx.proxy.Denied}
+     *     are PACKAGE-PRIVATE: nothing outside `hx.proxy` can name either type
+     *     by any spelling, and `javac` says so rather than a needle. That is
+     *     asserted where it can be asserted for real -- by REFLECTION, in
+     *     `RecorderTest.theCompilerBoundsConstruction`, which reads the
+     *     compiled modifiers and cannot be fooled by how a construction is
+     *     written. The counts below are what remains AFTER that bound: they
+     *     narrow construction WITHIN the package to one file, and they count
+     *     BOTH spellings a constructor has -- `Observed(` with `Observed::new`
+     *     and `Denied(` with `Denied::new` -- so the reference form that
+     *     defeated the earlier needle is covered here as well.
+     *     {@link #theTypeNeedlesCoverEveryConstructionForm} is what holds that
+     *     pairing in place;
+     *   - the proxy path's redaction is on the drivable side of the line.
+     *     `.redactObservedRequest(` appears exactly once in extension/src and
+     *     it is in Recorder.java, and the entry point CALLS neither redaction
+     *     method at all. Moving either call back into the entry point is red.
+     *     Counted WITH the leading dot, the way the deprecated-accessor check
+     *     is, so `Redactor`'s own declaration of the method is not a call;
+     *   - THE FIRST call site's two raw arrays go to the two slots the right
+     *     way round. Both are `byte[]`, so a swap compiles and puts the
+     *     response in the request's slot. Each binding is delimited to its own
+     *     `;` and checked for what it names, and their order inside the call
+     *     is asserted;
+     *   - and there is only one call site to check, because the Recorder is
+     *     CONSTRUCTED once and CALLED once. Both halves of that are needed and
+     *     only the first was obvious: every arm above is `indexOf`, the FIRST
+     *     match, so a second `Recorder` built in another handler with the
+     *     halves reversed was measured at 13 / 1900 ok / 0 FAIL / rc=0 with
+     *     both halves leaking -- G1 restored through a door nothing was
+     *     looking at. But ONE Recorder called TWICE is the same door, so the
+     *     call is counted too. Constructions are counted the way `Policy` is.
+     *
+     * THE ORDERING AND CALL-SITE ARMS ARE A TEXT SCAN with the same limit as
+     * every other in this file -- see the class javadoc: they see names, not
+     * values, they cannot see through a call, and they read the FIRST call
+     * site, which is only sufficient because the count above says there is one
+     * Recorder to call. The layer that closes what they cannot is
+     * `RecorderTest` for the transform and Task 9 for the wire.
+     */
+    static void theRecordIsBuiltByTheRecorderAndNeverInline(List<Path> sources)
+            throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+
+        // ---- the record is built where the redaction is ---------------------
+        List<String> observed = new ArrayList<>();
+        List<String> denied = new ArrayList<>();
+        List<String> jobFour = new ArrayList<>();
+        for (Path p : sources) {
+            String c = code(p);
+            // `Observed(` and not `new Observed(`, so a QUALIFIED
+            // construction -- `new hx.proxy.Observed(...)` -- cannot slip
+            // past. That shape was measured slipping past the `new ` spelling
+            // during this round's own sabotage, which is the F4 lesson
+            // arriving a third time: needle the name, not the phrase around
+            // it. The cost is that the record's own DECLARATION matches, so
+            // the expected answer is two files rather than one.
+            int n = calls(c, "Observed(", "Observed::new");
+            if (n > 0) observed.add(p + " x" + n);
+            int d = calls(c, "Denied(", "Denied::new");
+            if (d > 0) denied.add(p + " x" + d);
+            int j = calls(c, ".redactObservedRequest(", "::redactObservedRequest");
+            if (j > 0) jobFour.add(p + " x" + j);
+        }
+        check("Observed is DECLARED in one file and CONSTRUCTED in one, and "
+              + "the one that constructs it is " + RECORDER + " -- not " + observed,
+              observed.equals(List.of(OBSERVED + " x1", RECORDER + " x1")));
+        // The SAME for Denied, and this is what makes the within-package half
+        // of the compiler bound complete rather than half-done: `javac` stops
+        // another package from naming either record, and these two counts stop
+        // a second construction site inside `hx.proxy`, in both spellings a
+        // constructor has.
+        check("and Denied likewise, constructed only in " + RECORDER
+              + " -- not " + denied,
+              denied.equals(List.of(DENIED + " x1", RECORDER + " x1")));
+        check("and redacts an observed request in exactly one place, the same "
+              + "one -- not " + jobFour,
+              jobFour.equals(List.of(RECORDER + " x1")));
+        // The entry point names NEITHER redaction method. This is the
+        // must-be-zero that says the wiring stayed on the drivable side of the
+        // line: put either call back in here and it is red, whatever else the
+        // line does.
+        int entryRedacts =
+                calls(entry, ".redactObservedRequest(", "::redactObservedRequest")
+              + calls(entry, ".redactResponse(", "::redactResponse");
+        check("and the entry point redacts nothing itself (" + entryRedacts + ")",
+              entryRedacts == 0);
+
+        // ONE Recorder, counted the way one Policy is -- and for a sharper
+        // reason: every positional arm below reads the FIRST call site, so a
+        // SECOND Recorder is a second call site nothing looks at. Measured:
+        // one built in handleResponseToBeSent with the halves reversed read
+        // 13 / 1900 ok / 0 FAIL / rc=0 with both halves leaking. `Recorder(`
+        // and not `new Recorder(`, so a qualified construction cannot slip;
+        // the cost is that Recorder's own constructor declaration matches.
+        List<String> recorders = new ArrayList<>();
+        for (Path p : sources) {
+            int n = calls(code(p), "Recorder(", "Recorder::new");
+            if (n > 0) recorders.add(p + " x" + n);
+        }
+        check("Recorder is DECLARED in one file and CONSTRUCTED in one, and the "
+              + "one that constructs it is " + ENTRY_POINT + " -- not " + recorders,
+              recorders.equals(List.of(ENTRY_POINT + " x1", RECORDER + " x1")));
+        // ...AND CALLED ONCE. One Recorder is not one call site: the same
+        // object called twice is two sets of arguments and only the first is
+        // read by the arms below. Counting constructions alone would have left
+        // that, and the sentence "there is one call site" would have been a
+        // claim about a count that does not say it.
+        int recordCalls = calls(entry, "recorder.record(", "recorder::record");
+        check("and the entry point calls it exactly once, so the positional "
+              + "arms below see every call there is (" + recordCalls + ")",
+              recordCalls == 1);
+
+        // ---- and it is handed the two halves the right way round ------------
+        check("the entry point builds its record through the Recorder ("
+              + entry.indexOf("recorder.record(") + ")",
+              entry.indexOf("recorder.record(") >= 0);
+        // Delimited through the same helper as the bindings, which answers ""
+        // for a needle that is gone -- so a renamed call is a clean FAIL here
+        // rather than a StringIndexOutOfBounds out of this method. Measured:
+        // the unguarded version threw, TestSupport.t turned it into a named
+        // FAIL, and every assertion after it went unrun.
+        String args = statement(entry, "recorder.record(");
+        int rawReq = args.indexOf("rawRequest");
+        int rawResp = args.indexOf("rawResponse");
+        check("the call names both raw halves (" + rawReq + ", " + rawResp + ")",
+              rawReq >= 0 && rawResp >= 0);
+        check("and passes the request half first (" + rawReq + " < " + rawResp + ")",
+              rawReq >= 0 && rawResp >= 0 && rawReq < rawResp);
+        // ADJACENT AND BARE. The ordering check above is satisfied by
+        // `asSent(r, rawRequest), rawResponse` -- a call wrapping the value at
+        // its use site, which is the residual this class's javadoc names and
+        // the one shape a text scan cannot see through. It cannot see through
+        // it here either; what it CAN say is that the two slots are the two
+        // bare locals, side by side, with nothing between them. Measured red
+        // on the wrapping shape and on the swap.
+        check("and passes them bare and adjacent, with no call between the "
+              + "locals and the slots", args.contains("rawRequest, rawResponse,"));
+
+        // Each local bound once and passed once, so a third use is something
+        // else being done with a raw array.
+        check("the raw request local is bound once and passed once, not "
+              + count(entry, "rawRequest") + " times",
+              count(entry, "rawRequest") == 2);
+        check("and the raw response local likewise, not " + count(entry, "rawResponse"),
+              count(entry, "rawResponse") == 2);
+
+        // ...and each holds what its name says. Delimited to its own binding
+        // statement, because `toByteArray()` appears three times in this file
+        // and `initiatingRequest()` five: an undelimited search would be
+        // satisfied by the wrong site.
+        String reqBind = statement(entry, "byte[] rawRequest =");
+        String respBind = statement(entry, "byte[] rawResponse =");
+        check("the request half is read from the INITIATING request ("
+              + reqBind.trim() + ")", reqBind.contains("initiatingRequest("));
+        check("and the response half from the response itself ("
+              + respBind.trim() + ")",
+              respBind.contains("toByteArray(") && !respBind.contains("initiatingRequest("));
+    }
+
+    /** One Java statement, from the start of {@code needle} to the `;` that
+     *  ends it, or "" if the needle is absent. The empty string satisfies no
+     *  `contains` check and fails every one, which is the fail-safe direction
+     *  for a needle that has been renamed away. */
+    static String statement(String haystack, String needle) {
+        int at = haystack.indexOf(needle);
+        if (at < 0) return "";
+        int end = haystack.indexOf(";", at);
+        return end < 0 ? "" : haystack.substring(at, end);
+    }
+
+    /**
+     * EVERY NEEDLE THAT NAMES A TYPE COVERS EVERY WAY THAT TYPE CAN BE WRITTEN
+     * -- and for a CONSTRUCTION that is a closed set of four.
+     *
+     * SEVEN INSTANCES OF ONE DEFECT ON ONE TASK, every one a needle that
+     * matched the spelling someone happened to write rather than the construct
+     * it was about, and every one found by a reviewer rather than by this
+     * suite. Five were WORKING defects measured at a fully green run:
+     *
+     *     `new Socket(`     blind to `new java.net.Socket(`  -- a live TCP egress
+     *     `new Observed(`   blind to `new hx.proxy.Observed(` -- raw credentials queued
+     *     `Observed(`       blind to `Observed::new`          -- raw credentials queued
+     *     `new Policy(`     blind to `new hx.policy.Policy(`  -- a second per-run budget
+     *     `Policy(`         blind to `Policy::new`            -- a second per-run budget
+     *     `import burp.`    blind to a fully-qualified Montoya type
+     *     `openConnection(` blind to `URL.getContent()`       -- same family, API side
+     *
+     * WHY THIS ONE IS WORTH ENUMERATING WHEN `SocketHandler` WAS NOT, because
+     * the two look alike and are not:
+     *
+     *   - the set of TYPE NAMES that can open a socket is UNBOUNDED. No needle
+     *     list closes it, which is why {@link #noSecondEgressFamilyExists}
+     *     declares that exclusion instead of chasing it;
+     *   - the set of CONSTRUCTION SYNTAXES FOR A NAMED TYPE is CLOSED BY THE
+     *     JAVA GRAMMAR. A constructor has exactly two spellings, `new T(...)`
+     *     and `T::new`, and each may be qualified or not. FOUR FORMS, and the
+     *     language defines the list.
+     *
+     * So the constructed table below is a finite game finished, not an
+     * infinite one played: for each type all four forms are GENERATED, and at
+     * least one of that type's needles must match each. A needle reverted to
+     * `new T(` fails the qualified form; a needle left as `T(` fails the
+     * reference form.
+     *
+     * NEEDLE OR COMPILER, and which is which is deliberate. Where a
+     * compiler-enforced bound was available it was taken and is not
+     * re-litigated here: {@link hx.proxy.Observed} and {@link hx.proxy.Denied}
+     * are package-private, so `javac` refuses every construction from another
+     * package whatever its spelling -- verified by a probe class in package
+     * `hx`, which does not compile. Their rows below are what remains, the
+     * bound WITHIN `hx.proxy`, where a needle is all there is. `Policy` gets no
+     * such bound -- `hx.send` and `hx.proxy` both hold one and `hx` builds it,
+     * so it is public of necessity -- and there the needles are the whole of
+     * it.
+     *
+     * ANTI-VACUITY, both directions where they exist. The needles of
+     * {@link #noSecondEgressFamilyExists} live in one array literal, so that
+     * array is parsed out of this file and every entry must appear in a table
+     * here -- adding a needle without a row is red. And every needle in either
+     * table must appear as a literal OUTSIDE the tables, so a row whose needle
+     * was renamed away is red; the tables are cut out of the text first,
+     * because otherwise a row's own literal answers the search for its own
+     * use. For the needles scattered across other methods no rule can
+     * enumerate them, so that second direction is all there is for those, and
+     * it is the honest limit of this check.
+     *
+     * THE METHOD HALF OF THE SAME GRAMMAR POINT IS HERE TOO, and it is here
+     * because the sentence that used to stand in its place was FALSE. That
+     * sentence said the method form was "left open deliberately: the only
+     * needles it would defeat are the two deprecated-accessor ones, and no S4
+     * or S7 property rests on them." MEASURED, against the tree that carried
+     * it: a second Gate charge at the proxy's second callback, written
+     *
+     *     Function<HxRequest, Decision> g = policy::checkGate;
+     *     if (d.allowed()) d = g.apply(edited);
+     *
+     * read 13 summary lines / 2024 ok / 0 FAIL / rc=0. That is a crawler
+     * charged TWO rate tokens and TWO budget slots for one request -- S4's
+     * rate limit and its per-run budget, both, and the exact defect
+     * {@link #theGateIsSpentOnlyWhereTheHalvesArePaired}'s must-be-zero arm
+     * exists to prevent. `client::configEpoch` against the deprecated-accessor
+     * needle was green the same way. So it was a finding rather than a
+     * residual, and the `called` table below is the fix.
+     *
+     * EVERY METHOD NEEDLE THAT IS *COUNTED* IS LISTED, must-be-zero and
+     * exactly-N alike -- and the qualifier is load-bearing rather than
+     * hedging.
+     *
+     * THAT SENTENCE WAS FALSE WHEN IT WAS WRITTEN, and it named its own
+     * counter-example. It went on to exempt `withRedirectionMode(` as a needle
+     * "read POSITIONALLY (`indexOf`) and never counted". It was counted, three
+     * times, in an exactly-N arm inside {@link #redirectsAreNotFollowed} --
+     * with no `::withRedirectionMode` companion and no row here, so it was the
+     * one counted method needle on this branch whose four-form grammar set was
+     * unfinished. IT IS NOW COUNTED THROUGH {@link #calls} AND HAS A ROW. Note
+     * the shape of the escape, because it is the reason this paragraph is long:
+     * the pairing arm below is driven from PAIRS, which is filled FROM THESE
+     * TABLES, so a needle with no row is never examined at all. The sweep
+     * enforced "every listed needle is used" and "every egress needle has a
+     * row", and NOT the direction its own sentence claimed -- so a false
+     * sentence there was invisible. Control, to prove the pairing arm works
+     * and that table absence was the whole of the escape: rewriting
+     * `calls(entry, "setHaltSink(", "::setHaltSink")` as
+     * `count(entry, "setHaltSink(")` reddens at 2 FAIL.
+     *
+     * SO THE CLAIM IS NOW HALF-MECHANISED, and the half that is not says so.
+     * The arm at the end of this method requires every needle PAIR handed to
+     * {@link #calls} to have a row here, which is the direction that was
+     * enforced by nobody. Writing it found THREE more unlisted pairs beyond
+     * the one a reviewer read out --
+     * `ProxyRequestReceivedAction.drop(`, `ProxyRequestToBeSentAction.drop(`
+     * and the receiver-qualified `policy.decideScopeOnly(` -- which is the
+     * measure of how far prose gets on this.
+     *
+     * WHAT IS STILL PROSE: a needle counted through {@link #count} on ONE
+     * form, and a needle read only by `indexOf`. Neither is mechanised, and
+     * for the second there is nothing to mechanise -- an offset does not sum,
+     * so a positional needle has no second form to forget. FOUR method
+     * needles are read positionally with no row, and they are listed here
+     * because that list is the whole of the guarantee: `capture.offer(`
+     * ({@link #theGateDecidesBeforeAnythingIsQueued},
+     * {@link #theRefusalIsHeldBeforeItIsRecorded}), `logToError`
+     * ({@link #theSecondCallbackObservesAndCannotRefuse}), `sender.issue(`
+     * and `t.start()` ({@link #everyPathThatSpendsTheGateArmsItFirst} and
+     * {@link #everyKillPathIsWiredBeforeTheDial}). The other positionally-read
+     * method needles -- `http().sendRequest(`, `gate.decide(`, `limits.arm(`,
+     * `pending.put(`, `recorder.record(`, `policy.decideScopeOnly(`,
+     * `.authorisation()`, `HttpService.httpService(`,
+     * `HttpRequest.httpRequest(` -- all have rows, because they are counted
+     * somewhere too.
+     *
+     * What the positional exemption leaves open is narrower and is named where
+     * it lives -- an ORDER check cannot see a call it does not spell, so
+     * `capture::offer` used before the gate would satisfy
+     * {@link #theGateDecidesBeforeAnythingIsQueued}. That is a recording-order
+     * failure, not an enforcement one; it is IGNORANCE, not safety. Round 4
+     * listed only the must-be-zero ones, on the argument that substituting a
+     * reference for a call LOWERS an exactly-N count and fails closed. True,
+     * and about the wrong operation: ADDING a second call in the other form
+     * leaves the count where it was while the property is false. That is how
+     * the SHIPPED send path charged the Gate twice at 13 / 2067 ok / 0 FAIL /
+     * rc=0. {@link #calls} is where the sum is taken; this table is what makes
+     * a check that forgets one form go red, because every needle here must
+     * appear in this file OUTSIDE these tables.
+     */
+    static void theTypeNeedlesCoverEveryConstructionForm() throws IOException {
+        // {simple name, package, the needles this file uses for that type...}
+        String[][] constructed = {
+            {"Socket",            "java.net",      "Socket(", "Socket::new"},
+            {"URL",               "java.net",      "URL(", "URL::new"},
+            {"InetSocketAddress", "java.net",      "InetSocketAddress"},
+            {"DatagramSocket",    "java.net",      "DatagramSocket"},
+            {"InetAddress",       "java.net",      "InetAddress"},
+            {"HttpClient",        "java.net.http", "HttpClient"},
+            {"ProcessBuilder",    "java.lang",     "ProcessBuilder"},
+            {"Policy",            "hx.policy",     "Policy(", "Policy::new"},
+            {"Recorder",          "hx.proxy",      "Recorder(", "Recorder::new"},
+            {"Observed",          "hx.proxy",      "Observed(", "Observed::new"},
+            {"Denied",            "hx.proxy",      "Denied(", "Denied::new"},
+        };
+        // Needles naming something OTHER than a construction -- a member
+        // access, an instance call, a package. There is no `new` form for
+        // these; what has to hold is that qualifying the type cannot hide them.
+        String[][] referenced = {
+            {"openConnection(",   "new java.net.URL(\"http://h/\").openConnection()"},
+            {"openStream(",       "new java.net.URL(\"http://h/\").openStream()"},
+            {"collaborator()",    "api.collaborator().createClient()"},
+            {"Runtime.getRuntime", "java.lang.Runtime.getRuntime().exec(\"curl\")"},
+            {"RedirectionMode.",  "burp.api.montoya.http.RedirectionMode.NEVER"},
+            {"HttpService.httpService(",
+             "burp.api.montoya.http.HttpService.httpService(h, p, s)"},
+            {"HttpRequest.httpRequest(",
+             "burp.api.montoya.http.message.requests.HttpRequest.httpRequest(s, b)"},
+            {MONTOYA,             "burp.api.montoya.core.ByteArray b = null;"},
+            {"hx.proxy",          "hx.proxy.Observed o = null;"},
+        };
+
+        // {method name, receiver used in the qualified form, needles...}
+        // A method INVOCATION has two spellings too -- `recv.m(...)` and
+        // `recv::m` -- and the second is an invocation in every sense that
+        // matters: it reaches the same method with the same effects. Only the
+        // MUST-BE-ZERO needles are listed, and that is a decision rather than
+        // an omission: for a needle that must be exactly N, replacing a call
+        // with a reference LOWERS the count and the check fails CLOSED. For a
+        // needle that must be zero it raises nothing, and the check stays
+        // green while the thing it forbids happens.
+        // {method, receiver, the call's argument text, needles...}. The
+        // argument text is spelled rather than generated because ARITY is a
+        // fact about the method, and a needle for a no-argument method
+        // legitimately carries its closing paren -- `.configEpoch()`. The
+        // REFERENCE form is still derived, which is the half that has been
+        // wrong.
+        String[][] called = {
+            {"sendRequests",          "api.http()", "(a)", "sendRequests(", "::sendRequests"},
+            {"configEpoch",           "client",     "()",  ".configEpoch()", "::configEpoch"},
+            {"scopeConfig",           "client",     "()",  ".scopeConfig()", "::scopeConfig"},
+            {"checkGate",             "policy",     "(a)", ".checkGate(", "::checkGate"},
+            {"decide",                "policy",     "(a)", "policy.decide(", "policy::decide"},
+            {"redactObservedRequest", "redactor",   "(a)", ".redactObservedRequest(",
+                                                           "::redactObservedRequest"},
+            {"redactResponse",        "redactor",   "(a)", ".redactResponse(", "::redactResponse"},
+            {"openConnection",        "u",          "()",  "openConnection(", "::openConnection"},
+            {"openStream",            "u",          "()",  "openStream(", "::openStream"},
+            {"collaborator",          "api",        "()",  "collaborator()", "::collaborator"},
+            // ...and every EXACTLY-N method needle, which round 4 left on one
+            // form on a fail-closed argument that was about substitution and
+            // not about ADDITION. See {@link #calls}.
+            {"sendRequest",           "api.http()", "(a)", "http().sendRequest", "::sendRequest"},
+            {"http",                  "api",        "()",  ".http()", "::http"},
+            {"authorisation",         "c",          "()",  ".authorisation()", "::authorisation"},
+            {"decideBeforeGate",      "policy",     "(a)", ".decideBeforeGate(",
+                                                           "::decideBeforeGate"},
+            {"decideScopeOnly",       "policy",     "(a)", "decideScopeOnly(",
+                                                           "::decideScopeOnly"},
+            {"decide",                "gate",       "(a)", "gate.decide(", "gate::decide"},
+            {"registerRequestHandler", "api.proxy()", "(a)", "registerRequestHandler(",
+                                                           "::registerRequestHandler"},
+            {"registerResponseHandler", "api.proxy()", "(a)", "registerResponseHandler(",
+                                                           "::registerResponseHandler"},
+            {"put",                   "pending",    "(a)", "pending.put(", "pending::put"},
+            {"take",                  "pending",    "(a)", "pending.take(", "pending::take"},
+            {"record",                "recorder",   "(a)", "recorder.record(",
+                                                           "recorder::record"},
+            {"start",                 "haltSwitch", "()",  "haltSwitch.start()",
+                                                           "haltSwitch::start"},
+            {"setHaltSink",           "c",          "(a)", "setHaltSink(", "::setHaltSink"},
+            {"setHaltSource",         "c",          "(a)", "setHaltSource(", "::setHaltSource"},
+            {"setHaltNotifier",       "sender",     "(a)", "setHaltNotifier(",
+                                                           "::setHaltNotifier"},
+            {"setSendHandler",        "c",          "(a)", "setSendHandler(",
+                                                           "::setSendHandler"},
+            {"setConfigGuard",        "c",          "(a)", "setConfigGuard(",
+                                                           "::setConfigGuard"},
+            // The needle the sentence above wrongly exempted, plus the two
+            // this fix wave added: the drain that had no check at all, and the
+            // arming call site that had none either.
+            {"withRedirectionMode",   "options",    "(a)", "withRedirectionMode(",
+                                                           "::withRedirectionMode"},
+            {"start",                 "capture",    "()",  "capture.start()",
+                                                           "capture::start"},
+            {"arm",                   "limits",     "(a)", "limits.arm(",
+                                                           "limits::arm"},
+            // ...and the three the false sentence ALSO missed, found by
+            // mechanising the direction it claimed rather than by re-reading
+            // it. Each is a needle PAIR handed to calls() with no row here.
+            // `decideScopeOnly` gets a SECOND row because a needle is a
+            // spelling, not a method: the receiver-qualified pair
+            // theSecondCallbackObservesAndCannotRefuse counts is a different
+            // pair of literals from the bare one above, and the arm below
+            // matches literals.
+            {"decideScopeOnly",       "policy",     "(a)", "policy.decideScopeOnly(",
+                                                           "policy::decideScopeOnly"},
+            {"drop",         "ProxyRequestReceivedAction", "()",
+                                       "ProxyRequestReceivedAction.drop(",
+                                       "ProxyRequestReceivedAction::drop"},
+            {"drop",         "ProxyRequestToBeSentAction", "()",
+                                       "ProxyRequestToBeSentAction.drop(",
+                                       "ProxyRequestToBeSentAction::drop"},
+        };
+
+        PAIRS.clear();
+        for (String[] row : constructed)
+            if (row.length > 3) PAIRS.add(Arrays.copyOfRange(row, 2, row.length));
+        for (String[] row : called)
+            if (row.length > 4) PAIRS.add(Arrays.copyOfRange(row, 3, row.length));
+
+        List<String> every = new ArrayList<>();
+        for (String[] row : constructed) {
+            String simple = row[0], pkg = row[1];
+            String[] needles = Arrays.copyOfRange(row, 2, row.length);
+            for (String n : needles) every.add(n);
+            // THE FOUR FORMS, generated rather than typed out, so the list
+            // cannot be quietly shortened by hand.
+            String[] forms = {
+                "new " + simple + "(a, b)",
+                "new " + pkg + "." + simple + "(a, b)",
+                simple + "::new",
+                pkg + "." + simple + "::new",
+            };
+            for (String form : forms) {
+                boolean matched = false;
+                for (String n : needles) if (count(form, n) >= 1) matched = true;
+                check("`" + form + "` is matched by one of "
+                      + Arrays.toString(needles), matched);
+            }
+        }
+        for (String[] row : referenced) {
+            every.add(row[0]);
+            check("`" + row[0] + "` matches its qualified spelling `" + row[1] + "`",
+                  count(row[1], row[0]) >= 1);
+        }
+        for (String[] row : called) {
+            String method = row[0], recv = row[1], args = row[2];
+            String[] needles = Arrays.copyOfRange(row, 3, row.length);
+            for (String n : needles) every.add(n);
+            String[] forms = { recv + "." + method + args, recv + "::" + method };
+            for (String form : forms) {
+                boolean matched = false;
+                for (String n : needles) if (count(form, n) >= 1) matched = true;
+                check("`" + form + "` is matched by one of "
+                      + Arrays.toString(needles), matched);
+            }
+        }
+
+        String self = codeKeepingLiterals(Path.of("test", "hx", "ChokepointTest.java"));
+        check("this class can read its own source (" + self.length() + " chars)",
+              self.length() > 10_000);
+        int tablesAt = self.indexOf("String[][] constructed = {");
+        int tablesEnd = self.indexOf("        };",
+                                     self.indexOf("String[][] called = {"));
+        check("the row tables were located and excluded (" + tablesAt + ".."
+              + tablesEnd + ")", tablesAt >= 0 && tablesEnd > tablesAt);
+        String elsewhere = tablesEnd > tablesAt
+                ? self.substring(0, tablesAt) + self.substring(tablesEnd) : self;
+        for (String needle : every)
+            check("`" + needle + "` is a needle this file still uses",
+                  count(elsewhere, "\"" + needle + "\"") >= 1);
+
+        // EVERY COUNT OF A PAIRED NEEDLE GOES THROUGH calls(). This is the arm
+        // that makes the sweep pin ITS OWN property rather than merely listing
+        // forms: a check that counts `.checkGate(` and forgets `::checkGate`
+        // is exactly the round-5 finding, and without this the sweep stayed
+        // green on it -- measured, S at 13 / 2197 ok / 0 FAIL / rc=0.
+        //
+        // Balance of OCCURRENCES was tried first and is the wrong rule: a
+        // needle legitimately appears in prose-free places that are not
+        // counts -- `setHaltSink(` sits three times inside the STRIPPER's own
+        // fixture -- and ten of thirty-three pairs were "unbalanced" while
+        // every one was correct. What has to hold is narrower: where a paired
+        // needle is COUNTED against a real source file, both forms are summed.
+        //
+        // `count(stripped,` is the one exception and it is named rather than
+        // filtered by a pattern: theStripperIsNotVacuousAndDoesNotOverreach
+        // counts needles inside a FIXTURE STRING to prove the stripper works,
+        // which is not policing a wire and must not be summed.
+        List<String> single = new ArrayList<>();
+        for (String[] row : pairs()) {
+            if (row.length < 2) continue;
+            for (String needle : row) {
+                for (String line : elsewhere.split("\n")) {
+                    if (!line.contains("\"" + needle + "\"")) continue;
+                    if (!line.contains("count(")) continue;
+                    if (line.contains("count(stripped,")) continue;
+                    single.add(needle + " @ " + line.trim());
+                }
+            }
+        }
+        check("every count of a paired needle sums both grammar forms through "
+              + "calls(), not one of them " + single, single.isEmpty());
+
+        // ...AND THE OTHER DIRECTION, which is the one the javadoc above
+        // CLAIMED and which nothing enforced until this wave. Every needle
+        // PAIR handed to calls() must have a row here. Without it a paired
+        // needle can be counted with no row, and the arm above -- driven from
+        // PAIRS, which is filled FROM THESE TABLES -- never examines it: that
+        // is exactly how `withRedirectionMode(` sat in an exactly-N arm on one
+        // grammar form while a sentence twelve lines up named it as never
+        // counted. Three MORE unlisted pairs fell out of writing this, none of
+        // them found by reading.
+        //
+        // Matched on the LITERALS, because a needle is a spelling: the same
+        // method reached through a different receiver-qualified pair is a
+        // different pair of strings and needs its own row.
+        //
+        // The scan takes the FIRST TWO string literals between each `calls(`
+        // and the `;` that ends its statement. That reads a nested
+        // `calls(text(p), "a", "b")` correctly and would misread a first
+        // argument that itself contained a string literal; there is none, and
+        // a new one would show up here as an unlisted pair rather than as
+        // silence. `calls`'s own DECLARATION is skipped because no literal
+        // stands between it and the next `;`.
+        List<String> unlisted = new ArrayList<>();
+        int sites = 0, scan = 0;
+        while ((scan = elsewhere.indexOf("calls(", scan)) >= 0) {
+            int stop = elsewhere.indexOf(";", scan);
+            List<String> lits = stop < 0 ? List.<String>of()
+                    : literals(elsewhere.substring(scan + "calls(".length(), stop));
+            scan += "calls(".length();
+            if (lits.size() < 2) continue;
+            sites++;
+            boolean listed = false;
+            for (String[] row : pairs())
+                if (row.length >= 2 && row[0].equals(lits.get(0))
+                                    && row[1].equals(lits.get(1))) listed = true;
+            if (!listed) unlisted.add(lits.get(0) + " + " + lits.get(1));
+        }
+        // Anti-vacuity: a scan that matched nothing would report no unlisted
+        // pairs and say nothing at all.
+        check("the calls() sites were found (" + sites + ")", sites >= 25);
+        check("and every needle pair counted through calls() has a row here "
+              + unlisted, unlisted.isEmpty());
+
+        int from = self.indexOf("String[] needles = {");
+        int to = self.indexOf("};", from);
+        check("the egress needle array was found (" + from + ".." + to + ")",
+              from >= 0 && to > from);
+        List<String> missing = new ArrayList<>();
+        String array = to > from ? self.substring(from, to) : "";
+        int at = 0, found = 0;
+        while ((at = array.indexOf('"', at)) >= 0) {
+            int close = array.indexOf('"', at + 1);
+            if (close < 0) break;
+            String needle = array.substring(at + 1, close);
+            found++;
+            if (!every.contains(needle)) missing.add(needle);
+            at = close + 1;
+        }
+        check("every egress needle was read out of the array (" + found + ")",
+              found >= 12);
+        check("...and every one of them has a row " + missing, missing.isEmpty());
+    }
+
+    /**
+     * ONE METHOD INVOCATION, COUNTED IN EVERY GRAMMAR FORM IT HAS.
+     *
+     * Round 4 widened the MUST-BE-ZERO needles to `recv.m(` plus `recv::m` and
+     * argued the exactly-N ones were safe because a reference SUBSTITUTED for
+     * a call lowers the count and fails closed. That argument was about the
+     * wrong operation. MEASURED, in the SHIPPED send path:
+     *
+     *     Decision d = policy.checkGate(req);
+     *     Function<HxRequest, Decision> g2 = policy::checkGate;
+     *     if (d.allowed()) d = g2.apply(req);
+     *
+     *     13 summary lines / 2067 ok / 0 FAIL / rc=0
+     *
+     * ADDITION, not substitution: the original spelling stays, the count stays
+     * at one, and the Gate is charged TWICE for every request -- S4's rate
+     * limit and its per-run budget, on the path that issues. So an exactly-N
+     * count has to be a count of the SUM of the forms, and every such needle
+     * in this file goes through here.
+     */
+    /** The needle sets that have more than one grammar form, filled by the
+     *  sweep from its own tables so the two cannot drift. */
+    private static final List<String[]> PAIRS = new ArrayList<>();
+
+    static List<String[]> pairs() { return PAIRS; }
+
+    static int calls(String haystack, String dotted, String reference) {
+        return count(haystack, dotted) + count(haystack, reference);
+    }
+
+    /** The string literals in {@code s}, in order, at most two -- enough for
+     *  one {@link #calls} argument pair. Escapes are stepped over so a `\"`
+     *  inside a needle cannot end it early; no needle in this file has one,
+     *  and the loop is written to survive the first that does. */
+    static List<String> literals(String s) {
+        List<String> out = new ArrayList<>();
+        int i = 0;
+        while (out.size() < 2 && (i = s.indexOf('"', i)) >= 0) {
+            int close = i + 1;
+            while (close < s.length() && s.charAt(close) != '"') {
+                if (s.charAt(close) == '\\') close++;
+                close++;
+            }
+            if (close >= s.length()) break;
+            out.add(s.substring(i + 1, close));
+            i = close + 1;
+        }
+        return out;
+    }
+
     static int count(String haystack, String needle) {
         int n = 0, i = 0;
         while ((i = haystack.indexOf(needle, i)) >= 0) { n++; i += needle.length(); }
@@ -17301,6 +20666,27 @@ public class ChokepointTest {
      *  supply. */
     static String code(Path p) throws IOException {
         return stripCommentsAndLiterals(text(p));
+    }
+
+    /**
+     * The file with COMMENTS blanked and STRING LITERALS KEPT.
+     *
+     * A third reading, and it exists for one job: asking whether this class
+     * still USES a needle. That question is answered by searching for the
+     * needle as a quoted literal, so {@link #code} is useless -- it blanks
+     * literal bodies, which is the very text being looked for. And
+     * {@link #text} is fail-OPEN here, measured: deleting
+     * `count(t, "::configEpoch")` reddens the arm, but the same deletion with
+     * `// TODO(plan-9): restore count(t, "::configEpoch") here` left above it
+     * read 13 summary lines / 2067 ok / 0 FAIL / rc=0. That is the
+     * setHaltSource-TODO failure this class was built around, arriving in the
+     * check that polices the other needles.
+     *
+     * A needle proving A CHECK EXISTS is proving a wire exists, and prose
+     * cannot wire anything -- so comments go and literals stay.
+     */
+    static String codeKeepingLiterals(Path p) throws IOException {
+        return strip(text(p), false);
     }
 
     /**
@@ -17346,6 +20732,14 @@ public class ChokepointTest {
      * both directions.
      */
     static String stripCommentsAndLiterals(String src) {
+        return strip(src, true);
+    }
+
+    /** @param blankLiterals whether a literal's BODY is blanked too. Literals
+     *  are always PARSED, whichever way this is set, so a `//` inside a string
+     *  still starts no comment -- that is the over-run this class's stripper
+     *  test drives from both sides. */
+    static String strip(String src, boolean blankLiterals) {
         char[] out = src.toCharArray();
         int n = out.length, i = 0;
         while (i < n) {
@@ -17355,6 +20749,7 @@ public class ChokepointTest {
                 i += block ? 3 : 1;              // the opening delimiter is kept
                 while (i < n) {
                     if (out[i] == '\\') {
+                        if (!blankLiterals) { i += 2; continue; }
                         // The escape and the character it escapes are ONE
                         // unit. Blanking the backslash alone would leave a
                         // bare `"` behind it that reads as the close, and
@@ -17375,7 +20770,7 @@ public class ChokepointTest {
                         // the rest of the file. Stop at the line end.
                         if (out[i] == '\n') break;
                     }
-                    i = blank(out, i, n);
+                    i = blankLiterals ? blank(out, i, n) : i + 1;
                 }
                 continue;
             }
@@ -17574,12 +20969,28 @@ import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.RedirectionMode;
 import burp.api.montoya.http.RequestOptions;
+import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.proxy.http.InterceptedRequest;
+import burp.api.montoya.proxy.http.InterceptedResponse;
+import burp.api.montoya.proxy.http.ProxyRequestHandler;
+import burp.api.montoya.proxy.http.ProxyRequestReceivedAction;
+import burp.api.montoya.proxy.http.ProxyRequestToBeSentAction;
+import burp.api.montoya.proxy.http.ProxyResponseHandler;
+import burp.api.montoya.proxy.http.ProxyResponseReceivedAction;
+import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction;
 import hx.bridge.BridgeClient;
 import hx.policy.Clock;
+import hx.policy.Decision;
 import hx.policy.Distress;
+import hx.policy.HxRequest;
 import hx.policy.Policy;
+import hx.proxy.Capture;
+import hx.proxy.Pending;
+import hx.proxy.ProxyGate;
+import hx.proxy.Recorder;
+import hx.proxy.Source;
 import hx.send.HaltSwitch;
 import hx.send.Http;
 import hx.send.HttpReply;
@@ -17590,13 +21001,24 @@ import hx.send.Sender;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Burp entry point, and the only file in extension/src that names burp.* at
  * all. It reads its socket path, engagement id, instance id and halt sentinel
  * from system properties so the harness controls them at launch, builds the
- * send path, then dials in on a background thread and stays in DENY-ALL until
- * configured.
+ * send path AND the proxy path, then dials in on a background thread and stays
+ * in DENY-ALL until configured.
+ *
+ * BOTH of S4's enforcement points are joined here and nowhere else: the send
+ * path through {@link Sender}, and the proxy handlers through
+ * {@link ProxyGate}. Neither can be driven without Burp, so what holds them in
+ * place is ChokepointTest -- counts for the wires, positions for the two
+ * orderings that make the second point mean anything (the gate decides before
+ * anything is queued; the {@link Redactor} runs before anything is queued).
  */
 public class HxExtension implements BurpExtension {
 
@@ -17605,8 +21027,14 @@ public class HxExtension implements BurpExtension {
     // for. Read it ONCE into a local there too: `if (client != null)
     // client.close()` races itself, NPEs inside the handler, and skips the
     // close() that was the point of the handler.
+    //
+    // `capture` is SHADOWED by a local of the same name inside initialize, so
+    // the unloading handler names it `this.capture` -- the field, published by
+    // the volatile write, rather than the local the lambda would otherwise
+    // close over.
     private volatile BridgeClient client;
     private volatile HaltSwitch halt;
+    private volatile Capture capture;
 
     /** Single-digit req/s, per spec s4's production profile. Used only when a
      *  configure body omits limit.rate_rps. */
@@ -17670,7 +21098,20 @@ public class HxExtension implements BurpExtension {
                     public void error(String s) { api.logging().logToError(s); }
                 });
 
-        Sender sender = new Sender(new Policy(limits), redactor, haltSwitch,
+        // ONE Policy for the whole extension, given a name so the second
+        // enforcement point can be handed THIS one. Policy owns the Gate, and
+        // the Gate is where the rate limit and the per-run budget live: a
+        // proxy path that built its own `new Policy(new Limits(...))` would be
+        // a SECOND per-run budget for one run, and no behavioural test can see
+        // that -- each half of it is internally consistent, and the pair
+        // counter in ChokepointTest counts `.decideBeforeGate(` and
+        // `.checkGate(`, not constructions. Measured: adding that second
+        // Policy here was 10 x ALL PASS before ChokepointTest.oneRunHasOnePolicy
+        // existed, and is 1 FAIL naming this file now. Sharing this reference
+        // is the wiring Task 7 needs; the inline construction this replaces is
+        // the shape that makes a second one the natural thing to write.
+        Policy policy = new Policy(limits);
+        Sender sender = new Sender(policy, redactor, haltSwitch,
                                    distress, montoyaHttp(api, clock), clock);
         // Auto-halt is extension-initiated: there is no outstanding id to
         // answer, so this frame is the only way the harness hears about a stop
@@ -17707,8 +21148,404 @@ public class HxExtension implements BurpExtension {
         // silently ignored -- an operator who believes they slowed the run
         // down and did not is the failure this exists to prevent.
         c.setConfigGuard(limits::refuseIfLimitsMoved);
+
+        // ---- S4's SECOND enforcement point -------------------------------
+        //
+        // Wired here: after the send path, and BEFORE the dial -- the same
+        // rule the kill paths follow and for the same reason. A window in
+        // which the proxy is live and the gate is not is a window in which
+        // S4's promise ("every byte that leaves this machine crosses exactly
+        // one of two enforcement points") is false.
+        //
+        // Nothing in this block can be DRIVEN without Burp -- the handlers
+        // take Montoya types that only Burp constructs -- so ChokepointTest
+        // counts and positions it instead: the registrations, the gate call
+        // inside the handler, the pre-send scope OBSERVATION (which decides
+        // nothing -- see the second callback), and the two ORDERINGS this join
+        // exists to protect (enforcement before recording, redaction before
+        // queueing). The ONE piece of it that is
+        // ordinary code is `listenerPort` below, which takes a String; it is
+        // public and ProxyGateTest drives it.
+        //
+        // WHAT THIS WIRING RESTS ON AND CANNOT CHECK -- Task 9's list, written
+        // down here rather than left implicit. It is item 3 of the canonical
+        // open list in Recorder's javadoc, which is the one place this path's
+        // residuals are enumerated; this block is where the CONDITIONS live.
+        // Every item is a thing a real Burp settles in minutes and nothing in
+        // this repository can settle at all.
+        //
+        //  1. THAT A SEND-PATH REQUEST DOES NOT TRAVERSE THESE HANDLERS.
+        //     `api.http().sendRequest` in the adapter below issues from Burp's
+        //     own HTTP stack rather than through a proxy listener. If it did
+        //     traverse them, every send would be decided twice and, worse,
+        //     attributed by a listener port it does not have: UNATTRIBUTED,
+        //     refused, and the send path dead. Unmeasured.
+        //  2. SETTLED: THE FIRST CALLBACK'S VERDICT IS HONOURED. Still
+        //     invisible to this suite -- `if (!verdict.allow() && false)`
+        //     forwards every refused request and reads 13 ALL PASS / 2198 ok
+        //     / 0 FAIL / rc=0 -- so the check that holds it is
+        //     tests/integration/test_proxy_capture.py, and it is held the only
+        //     way it can be: the OUT-OF-SCOPE TARGET's own log, never the
+        //     client's response. Task 1 measured `drop()` returning 200 OK
+        //     with 1529 bytes of Burp's own HTML, so a drop and a delivery are
+        //     indistinguishable by status code at the client, and a test that
+        //     reads the client side passes on a gate that forwards
+        //     everything. Under that mutation the integration suite loses
+        //     three tests; it stays green in every Java suite.
+        //  3. SETTLED, AND THE ANSWER WAS NO. This item used to read "THAT
+        //     `drop()` FROM THE SECOND CALLBACK SENDS NOTHING ... Montoya
+        //     documents both actions identically; nobody has watched the
+        //     wire". Task 9 watched it:
+        //     `ProxyRequestToBeSentAction.drop()` DOES NOT PREVENT EGRESS on
+        //     2026.7.3 -- action() reads DROP, the target logs the request,
+        //     and the client gets the TARGET's answer -- while the drop from
+        //     `handleRequestReceived` sends zero bytes. So the second callback
+        //     no longer refuses anything; it observes and logs. Kept as an
+        //     item rather than deleted, because "we assumed X, measured X,
+        //     and X was false" is the only entry in this list that has ever
+        //     changed a design. docs/burp-proxy-measurements.md, Q4.
+        //  4. THAT `path()` CARRIES THE QUERY AND `httpService().host()` IS
+        //     THE CONNECTION HOST. Montoya's documented contract, unmeasured
+        //     here. If either is wrong the request is scope_denied by
+        //     Policy.checkScope's host/path agreement test -- fail-closed, but
+        //     it would refuse working traffic.
+        //  5. TWO PROXY BYTE-FLOWS THAT REACH NEITHER CALLBACK, so neither is
+        //     enforced or captured here:
+        //       - WEBSOCKET. After a scope-allowed 101 upgrade, frames
+        //         traverse Burp's separate proxy-WebSocket handlers, and this
+        //         extension registers none. The destination was scope-decided
+        //         at upgrade time, so the engagement boundary itself holds;
+        //         per-message enforcement and ALL capture do not.
+        //       - PER-HOST CERTIFICATE MINTING. Burp connects to the target to
+        //         copy its certificate when minting the CA-signed one for a
+        //         CONNECT, and that happens before any request reaches a
+        //         handler -- so a TLS ClientHello carrying the target's SNI
+        //         can leave for a host these handlers would then refuse.
+        //         Unverified, and exactly the kind of claim a real-Burp
+        //         measurement should settle.
+        //
+        // 0 is "no crawler configured", which Source.forListenerPort reads as
+        // "attribute every request whose own listener port parses to
+        // OPERATOR". A deployment that never sets -Dhx.crawler_port therefore
+        // applies the human's rules to humans rather than the agent's rules to
+        // a human by accident.
+        int crawlerPort = Integer.getInteger("hx.crawler_port", 0);
+        ProxyGate gate = new ProxyGate(policy);   // THE SAME Policy -- see above
+        Capture capture = new Capture(Capture.DEFAULT_CAPACITY, c.exchangeSink());
+        // The SAME Redactor the send path uses. It holds no per-request state
+        // -- Redactor.Injected exists so that the state which IS per-request
+        // travels with the bytes -- so one instance is right, and a second
+        // would be a second set of redaction rules with nothing comparing
+        // them.
+        Recorder recorder = new Recorder(redactor);
+        // ONE number for both bounds, so there is one figure to reason about
+        // rather than two. It is NOT a claim that the two overflow together:
+        // they count different things -- the queue holds records waiting for
+        // the drain, this map holds requests waiting for a response -- and an
+        // empty queue is perfectly compatible with 600 requests in flight and
+        // this map evicting. What the map's bound says is only this: it
+        // overflows once more than DEFAULT_CAPACITY requests are unanswered at
+        // one moment, and every eviction past that is a `take` that will miss
+        // and a record counted lost.
+        Pending pending = new Pending(Capture.DEFAULT_CAPACITY);
+
+        api.proxy().registerRequestHandler(new ProxyRequestHandler() {
+
+            /**
+             * The request arriving from the browser: attribute it, decide
+             * about it, and either drop it or start its clock.
+             */
+            @Override
+            public ProxyRequestReceivedAction handleRequestReceived(InterceptedRequest r) {
+                // UNATTRIBUTED until proved otherwise, so a throw out of any
+                // of the reads below leaves the source at the answer ProxyGate
+                // refuses rather than at the permissive one. `method` and
+                // `url` are read into locals inside the try for the same
+                // reason the adapter builds its request inside one: they are
+                // Montoya's code handed a hostile page's bytes, and a throw
+                // out of them while building the refusal record would escape
+                // handler entirely.
+                Source source = Source.UNATTRIBUTED;
+                String method = "";
+                String url = "";
+                ProxyGate.Verdict verdict;
+                try {
+                    source = Source.forListenerPort(
+                            listenerPort(r.listenerInterface()), crawlerPort);
+                    method = r.method();
+                    url = r.url();
+                    // ONE read, passed in. configEpoch() and scopeConfig() are
+                    // two reads of one record and can straddle a commit; a
+                    // decision made from two halves of two authorisations is a
+                    // decision about a request nobody authorised.
+                    BridgeClient.Authorisation auth = c.authorisation();
+                    // THE SAME ARMING THE SEND PATH DOES, FROM THE SAME
+                    // SNAPSHOT THIS REQUEST IS ABOUT TO BE DECIDED UNDER.
+                    // Without it the CRAWLER branch reaches Limits.check with
+                    // `limiter == null` and every crawler request that passes
+                    // scope, method and dangerous.path is refused
+                    // `not_configured` -- fail-closed, and a lie about why:
+                    // the run IS configured, and the denial lands under a kind
+                    // an operator reads as "nobody authorised this", with no
+                    // EXTENSION_FAULT prefix to separate the two. The three
+                    // answers are DRIVEN, against a real Limits and a fully
+                    // configured authorisation, in
+                    // ProxyGateTest -- "a crawler request that passes scope,
+                    // method and dangerous.path REACHES the gate, and an
+                    // unarmed one refuses it": unarmed CRAWLER denied, armed
+                    // CRAWLER allowed, OPERATOR allowed either way.
+                    //
+                    // ARMED ONCE IS UNCHANGED. Limits.arm returns early once a
+                    // limiter exists, so this cannot re-arm the run from a
+                    // later snapshot; a configure that MOVES an armed limit is
+                    // still refused by setConfigGuard above, which is the
+                    // mechanism s4 asks for. What this line changes is only
+                    // WHICH of the two enforcement points may be the first to
+                    // arm -- and either way it is the first authorisation with
+                    // an epoch that supplies the numbers.
+                    //
+                    // Inside the try, deliberately: arm() throws on a limit
+                    // key that is present and unusable, and a throw here is a
+                    // DENY through the catch below rather than a throw off a
+                    // Burp proxy thread.
+                    limits.arm(auth);
+                    verdict = gate.decide(proxyRequest(r), auth, source);
+                } catch (RuntimeException e) {
+                    // A gate that threw has decided NOTHING, and the only safe
+                    // reading of nothing is no. `not_configured` with the
+                    // EXTENSION_FAULT prefix, per S6's documented overload: a
+                    // broken jar and an unconfigured run land under one
+                    // denial.kind and the prefix is what separates them.
+                    verdict = new ProxyGate.Verdict(false, "not_configured",
+                            BridgeClient.EXTENSION_FAULT
+                            + "the proxy request handler threw: " + e);
+                }
+                if (!verdict.allow()) {
+                    // THE ACTION IS DECIDED AND HELD BEFORE ANYTHING IS
+                    // RECORDED, and it is returned whatever the recording did.
+                    // "Capture never gates enforcement" was true here only
+                    // because Capture.offer documents that it never throws --
+                    // a property worth keeping AND worth not depending on. A
+                    // throw out of this line (a Captured with a null Source
+                    // NPEs at `dropped[o.source().ordinal()]`) would escape the
+                    // handler with drop() never executed, and what Burp does
+                    // with a handler that threw is measured nowhere in this
+                    // repo. Now the refusal cannot be undone by the record.
+                    ProxyRequestReceivedAction refuse =
+                            ProxyRequestReceivedAction.drop();
+                    try {
+                        capture.offer(recorder.denial(method, url,
+                                verdict.errorClass(), verdict.detail(), source));
+                    } catch (Throwable ignored) {
+                        // Throwable, and swallowed, and that IS a silent loss
+                        // -- the one place in this design where a lost record
+                        // is not counted, because the thing that counts is the
+                        // thing that threw. The trade is stated rather than
+                        // hidden: a refusal hx failed to record is a gap in
+                        // the evidence; a refusal hx failed to ENFORCE is
+                        // bytes on the wire.
+                    }
+                    return refuse;
+                }
+                // nanoTime, not the wall clock: this is the origin of a
+                // DURATION, and Instant.now() would measure an NTP step as
+                // latency. Same distinction the send adapter makes below.
+                pending.put(r.messageId(), System.nanoTime(), source);
+                return ProxyRequestReceivedAction.continueWith(r);
+            }
+
+            /**
+             * The last point before the bytes leave, and the reason this
+             * handler has two halves.
+             *
+             * AN OBSERVATION POST, NOT AN ENFORCEMENT POINT. It cannot refuse
+             * anything, and this callback used to try. Task 9 measured why it
+             * must not: `ProxyRequestToBeSentAction.drop()` DOES NOT PREVENT
+             * EGRESS on Burp Suite Community 2026.7.3. The probe returned an
+             * action whose own `action()` reads `DROP`, and Burp forwarded the
+             * request anyway -- the target logged it, answered a real 404, and
+             * the client received the TARGET's answer rather than Burp's page.
+             * The drop from `handleRequestReceived` is unaffected: zero hits,
+             * Burp's own 1529-byte HTML. The two actions are not
+             * interchangeable, and Task 1 measured the one that works.
+             * docs/burp-proxy-measurements.md, Q4, has both side by side.
+             *
+             * WHAT THAT COST WHILE THIS CALLBACK STILL REFUSED, and it is
+             * worse than a plain fail-open: the refusal branch wrote a
+             * `denial` row and took the `pending` entry, on the reasoning --
+             * stated in its own comment -- that "this request is not going to
+             * the target, so no response can arrive for it". That sentence is
+             * measured FALSE. So hx recorded a refusal for a request that
+             * reached the client's system, and charged its response to
+             * `countLost`. A report reads that row as "hx blocked this". This
+             * project has twice refused to record a guess as a fact --
+             * `transport_error` has no row because Montoya cannot distinguish
+             * the three cases, and 599 needed its own outcome so an unreadable
+             * status could not read as a real one. Same rule.
+             *
+             * THE ESCAPE IS ALREADY RECORDED, AND THAT IS THE HONEST RECORD.
+             * A request edited out of scope in the Intercept tab goes out, is
+             * answered, and reaches `handleResponseReceived` like any other --
+             * so it lands as an `exchange` row whose `url` is outside the
+             * engagement's scope. Nothing new is needed to HAVE the evidence,
+             * and a query for exchanges outside `scope.include` finds it.
+             * Rewriting the request to something harmless was considered and
+             * refused: that fabricates traffic the operator never sent, which
+             * is worse than recording the escape.
+             *
+             * SO THE QUESTION IS STILL ASKED, AND ONLY LOGGED. Reaching this
+             * callback at all means the first one ALLOWED the request --
+             * measured: a request dropped at `handleRequestReceived` produces
+             * no second-callback entry in the probe's log at all. So a `deny`
+             * here IS a disagreement with the first callback, which is to say
+             * an edit, and the operator gets it at the moment it happens
+             * rather than only in a later query.
+             *
+             * `decideScopeOnly` and not `decide`, for every source, and the
+             * reason is no longer about double-charging: this asks about S4's
+             * BOUNDARY, which is the only rule an edit can breach that no
+             * later query could attribute. It spends no rate token and no
+             * budget slot, so an observation costs a crawler nothing.
+             *
+             * S4's COUNT OF ENFORCEMENT POINTS IS UNCHANGED AT TWO -- the send
+             * path and `handleRequestReceived`. This was never one of them;
+             * it was a second DECISION inside one of them, and it is now not
+             * even that.
+             */
+            @Override
+            public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest r) {
+                // BUILT AS A STRING FIRST, LOGGED AFTERWARDS, AND THE
+                // PASS-THROUGH DEPENDS ON NEITHER. Every read below is
+                // Montoya's code handed a hostile page's bytes, and a throw
+                // out of any of them once escaped this handler with the
+                // request's fate undecided -- what Burp does with a proxy
+                // handler that threw is measured nowhere in this repository.
+                // Now the worst any of it can do is cost the operator a log
+                // line: `continueWith` is the only exit, on every path.
+                //
+                // NO `Source` HERE ANY MORE, and its absence is the point.
+                // Attribution decides WHICH RULES a request gets, and this
+                // callback applies none -- so reading the listener again would
+                // be a second attribution nothing acts on, and a reader would
+                // reasonably assume something did.
+                String note = null;
+                try {
+                    // ONE read, and it feeds the one question. configEpoch()
+                    // and scopeConfig() are two reads of one record and can
+                    // straddle a commit; an answer assembled from two halves
+                    // of two authorisations is an answer about a request
+                    // nobody authorised -- as true of a log line as of a
+                    // verdict, because the log line is what an operator acts
+                    // on at 02:00.
+                    BridgeClient.Authorisation auth = c.authorisation();
+                    Decision d = policy.decideScopeOnly(proxyRequest(r), auth);
+                    if (!d.allowed())
+                        note = "hx: THE ENGAGEMENT BOUNDARY IS BEING CROSSED "
+                             + "AND THIS EXTENSION CANNOT STOP IT. "
+                             + r.method() + " " + r.url() + " was ALLOWED at "
+                             + "handleRequestReceived and is out of scope now, "
+                             + "so it was edited between the two callbacks -- "
+                             + "Burp's Intercept tab sits there. "
+                             + "ProxyRequestToBeSentAction.drop() does not "
+                             + "prevent egress on this Burp (measured; see "
+                             + "docs/burp-proxy-measurements.md, Q4), so the "
+                             + "request WILL reach the target. It will be "
+                             + "recorded as an exchange whose url is outside "
+                             + "scope.include -- that row is the evidence. "
+                             + "Reason: " + d.detail();
+                } catch (RuntimeException e) {
+                    // NOT a refusal any more, because there is no refusal to
+                    // be had here. An unreadable request is a thing the
+                    // operator should see, and it is all this callback can do
+                    // about it.
+                    note = BridgeClient.EXTENSION_FAULT
+                         + "hx: the pre-send scope observation threw, so "
+                         + "nothing here can say whether this request is still "
+                         + "in scope. The first callback allowed it and it is "
+                         + "going out: " + e;
+                }
+                if (note != null)
+                    try {
+                        api.logging().logToError(note);
+                    } catch (Throwable ignored) {
+                        // The pass-through must not depend on the logger
+                        // either. A lost log line is a lost log line; a throw
+                        // here would leave a request Burp has already been
+                        // told to send with no action returned for it.
+                    }
+                return ProxyRequestToBeSentAction.continueWith(r);
+            }
+        });
+
+        api.proxy().registerResponseHandler(new ProxyResponseHandler() {
+
+            @Override
+            public ProxyResponseReceivedAction handleResponseReceived(InterceptedResponse r) {
+                Pending.Entry e = pending.take(r.messageId());
+                if (e == null) {
+                    // NO START TIME AND NO SOURCE, so there is no exchange to
+                    // record: a row with a guessed duration on it is
+                    // fabricated evidence, and this project has refused that
+                    // twice already. Charged to UNATTRIBUTED because this is
+                    // the one place the source is genuinely unknown -- a drop
+                    // with no run attached beats a drop filed against a run
+                    // that was picked.
+                    capture.countLost(Source.UNATTRIBUTED);
+                    return ProxyResponseReceivedAction.continueWith(r);
+                }
+                try {
+                    // THE ONLY THING THIS BLOCK DOES IS READ BYTES OFF MONTOYA
+                    // AND HAND THEM OVER. Redaction, the pairing of each
+                    // redactor to its own message, and the construction of the
+                    // Observed all live in Recorder -- a class with no burp.*
+                    // type in it, which is what makes them drivable. This
+                    // wiring was in here and the same defect was found three
+                    // times: the wrong redactor for the request half, the raw
+                    // locals queued instead of the redacted ones, and the two
+                    // redactors swapped. Each was invisible to the structural
+                    // check written for the one before it, because every one
+                    // of those checks reads the TEXT of a file the suite
+                    // cannot execute. See Recorder's javadoc.
+                    byte[] rawRequest = r.initiatingRequest().toByteArray().getBytes();
+                    byte[] rawResponse = r.toByteArray().getBytes();
+                    long ms = (System.nanoTime() - e.startNanos()) / 1_000_000L;
+                    // WHICH ARRAY IS WHICH IS THE ONE THING LEFT THAT ONLY THE
+                    // TEXT CAN SAY: both are byte[], so a swap here compiles
+                    // and means the request slot carries the response. That is
+                    // the last survivor of a defect found three times, and it
+                    // is pinned in ChokepointTest -- the two bindings by what
+                    // each names, and their order in this call. Everything
+                    // past this line is RecorderTest's.
+                    capture.offer(recorder.record(r.initiatingRequest().method(),
+                                                  r.initiatingRequest().url(),
+                                                  r.statusCode(), ms,
+                                                  rawRequest, rawResponse,
+                                                  e.source()));
+                } catch (RuntimeException ex) {
+                    // Redaction that could not finish, or bytes Montoya would
+                    // not hand over. The record is lost either way and says so
+                    // -- offering it unredacted is the one answer that is
+                    // worse than losing it. Recorder deliberately does not
+                    // catch its own RangeError: it has no counter, and a
+                    // fallback there would be an unredacted record.
+                    capture.countLost(e.source());
+                }
+                return ProxyResponseReceivedAction.continueWith(r);
+            }
+
+            /** A bare pass-through. The response was already captured at
+             *  handleResponseReceived; capturing it again here would double
+             *  every row in the store. */
+            @Override
+            public ProxyResponseToBeSentAction handleResponseToBeSent(InterceptedResponse r) {
+                return ProxyResponseToBeSentAction.continueWith(r);
+            }
+        });
+
         haltSwitch.start();
+        capture.start();
         this.halt = haltSwitch;
+        this.capture = capture;
         this.client = c;
 
         Thread t = new Thread(() -> {
@@ -17726,8 +21563,121 @@ public class HxExtension implements BurpExtension {
             if (live != null) live.close();
             HaltSwitch h = halt;
             if (h != null) h.stop();
+            // ONE stop(), here, and there is no second. A record offered
+            // DURING stop() counts itself (Capture's path 5) and has nothing
+            // left to report through; a second call would race the first
+            // identically while the JVM is being torn down. `this.capture`
+            // and not `capture`: the local of that name inside initialize
+            // shadows the field, and it is the FIELD this handler -- on
+            // another thread -- must read.
+            Capture cap = this.capture;
+            if (cap != null) cap.stop();
         });
         api.logging().logToOutput("hx: bridge dialling " + sock);
+    }
+
+    /**
+     * The port off Burp's `listenerInterface()`, or {@link Source#NO_PORT}
+     * when there is not one to be had.
+     *
+     * MEASURED: `listenerInterface()` answers `"127.0.0.1:<port>"` and names a
+     * different port per listener, over plain HTTP and through a CONNECT
+     * tunnel -- docs/burp-proxy-measurements.md, Q1. There is no
+     * `listenerPort()` on an intercepted message (the HISTORY type has one and
+     * is not reachable from a handler), so the port is parsed after the LAST
+     * colon: an IPv6 interface is `[::1]:8080` and the first colon is inside
+     * the address.
+     *
+     * EVERY FAILURE OF THE PARSE ANSWERS NO_PORT, and none of them invents a
+     * number: a null interface, no colon at all, an empty tail, a tail that is
+     * not all digits, and a digit run too long for {@code Integer.parseInt} to
+     * take. `Source.forListenerPort` turns NO_PORT into UNATTRIBUTED and
+     * ProxyGate REFUSES it -- "we could not work out who is driving" is a code
+     * failure or a change in Burp, and the operator branch is the one that
+     * drops the method allowlist, the dangerous-path denylist, the rate limit
+     * and the budget. The refusal is not caught and retried as OPERATOR.
+     *
+     * WHAT THIS METHOD DOES NOT DO IS CHECK THE VALUE RANGE, and that is
+     * deliberate rather than an omission. `70000` parses fine and is handed
+     * over as itself; {@link Source#forListenerPort} answers UNATTRIBUTED for
+     * anything outside 1..65535, and duplicating that test here would add a
+     * branch no input could separate from its absence -- the same finding
+     * Source's own comment records about a `crawlerPort > 0` clause it
+     * removed.
+     *
+     * IT DOES BOUND THE DIGIT COUNT, and the earlier version of this paragraph
+     * gave the wrong reason for it. It said the bound "exists only because
+     * {@code Integer.parseInt} THROWS on a longer run of digits" -- true of A
+     * bound, false of THIS bound: nine digits always parse, so `> 5` also
+     * rejects every 6-to-9-digit tail that would have parsed fine. That IS a
+     * range check, on the digit count rather than on the value.
+     *
+     * MEASURED, because the obvious correction was wrong too: it is NOT "any
+     * bound below eleven". {@code Integer.parseInt} takes "999999999" and
+     * "2147483647" and THROWS on "2147483648" -- both ten digits. So the
+     * requirement is a bound of at most NINE, and a `> 10` written in the
+     * belief that ten digits always parse would let a 10-digit tail throw out
+     * of here onto a Burp proxy thread. Five is chosen because no TCP port has
+     * six digits, so nothing this bound rejects could have been a listener,
+     * and it is comfortably inside nine. What no input in this suite separates
+     * is `> 5` from `> 9`: both send a 30-digit tail to NO_PORT and both hand
+     * `70000` over, and the behaviour is identical either way because
+     * `forListenerPort`'s range test comes first.
+     * `ProxyGateTest.theListenerInterfaceIsParsedOrRefused` pins the two ends
+     * -- the 30-digit tail, which separates the bound from its absence, and
+     * `70000`, which separates this method from `Source`.
+     *
+     * NOT the same thing as an unrecognised port. A port that PARSES and is
+     * not the crawler's is the operator, deliberately -- see Source, which
+     * pins both sides of that line.
+     *
+     * PUBLIC and static so it can be DRIVEN. It is the one piece of the second
+     * enforcement point that needs no Burp to run, and it decides which of two
+     * rule sets a request gets -- leaving it untestable alongside everything
+     * else in this file would leave the attribution parse itself resting on
+     * nothing. `ProxyGateTest.theListenerInterfaceIsParsedOrRefused` is where
+     * it is pinned, next to the attribution rule it feeds.
+     */
+    public static int listenerPort(String listenerInterface) {
+        if (listenerInterface == null) return Source.NO_PORT;
+        int colon = listenerInterface.lastIndexOf(':');
+        if (colon < 0) return Source.NO_PORT;
+        String tail = listenerInterface.substring(colon + 1);
+        if (tail.isEmpty()) return Source.NO_PORT;
+        for (int i = 0; i < tail.length(); i++)
+            if (tail.charAt(i) < '0' || tail.charAt(i) > '9') return Source.NO_PORT;
+        // Bounded before parsing: `Integer.parseInt` on a 30-digit run of
+        // digits throws, and a throw here would be a decision this method
+        // cannot make reaching a caller that has no answer for it either.
+        if (tail.length() > 5) return Source.NO_PORT;
+        return Integer.parseInt(tail);
+    }
+
+    /**
+     * One intercepted request, as the rules ask about it.
+     *
+     * `path()` carries the query and Policy wants the two apart, so it is
+     * split at the FIRST `?` -- `pathWithoutQuery()` exists and would be a
+     * second accessor to trust where one already answers. Policy checks that
+     * the url's authority and path agree with `host` and `path` before it
+     * matches anything (Policy.checkScope), so a Burp that disagreed with
+     * itself is a scope_denied rather than a decision about the wrong
+     * destination.
+     *
+     * Every field is read from Montoya inside the CALLER'S try. A null out of
+     * any of them is an IllegalArgumentException from HxRequest's own
+     * constructor, which is a RuntimeException, which is a DENY.
+     */
+    private static HxRequest proxyRequest(InterceptedRequest r) {
+        String pathAndQuery = r.path();
+        int q = pathAndQuery.indexOf('?');
+        String path = q < 0 ? pathAndQuery : pathAndQuery.substring(0, q);
+        String query = q < 0 ? "" : pathAndQuery.substring(q + 1);
+        Map<String, List<String>> headers = new LinkedHashMap<>();
+        for (HttpHeader h : r.headers())
+            headers.computeIfAbsent(h.name(), k -> new ArrayList<>()).add(h.value());
+        return new HxRequest(r.method(), r.url(), r.httpService().host(),
+                             path, query, headers, r.body().getBytes());
     }
 
     /**
@@ -18495,6 +22445,97 @@ def test_the_protocol_doc_lists_exactly_the_classes_the_code_emits():
         f"only in the code: {sorted(set(ERROR_CLASSES) - listed)}")
 
 
+def _java_method_body(text: str, signature: str) -> str:
+    """The brace-matched body of one Java method, by its signature line.
+
+    Crude on purpose: it counts braces from the method's opening one. That is
+    wrong for a body containing a brace inside a string or character literal,
+    and none of the three below does -- asserted by the field sets coming out
+    non-empty and the right size, which a truncated body would not.
+    """
+    start = text.index(signature)
+    open_brace = text.index("{", start)
+    depth = 0
+    for i in range(open_brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace:i]
+    raise AssertionError(f"unbalanced braces after {signature!r}")
+
+
+def test_the_protocol_doc_lists_exactly_the_fields_the_capture_frames_carry():
+    """The three unsolicited frames S4's second enforcement point reports.
+
+    A HEADER FIELD IS A VOCABULARY IN TWO PLACES. The Java side puts the keys
+    on the wire; `docs/bridge-protocol.md` is what a second implementation --
+    and the next reader of `hx.capture` -- is written from. They drifted for a
+    whole plan already: the doc said `exchange {v,t,...} unsolicited; no id.
+    Defined in a later plan.` while Tasks 4 and 6 had built and consumed the
+    real thing, and it named neither `dropped` nor `denial` at all.
+
+    THE DIRECTION THAT MATTERS IS A KEY THE DOC DOES NOT NAME. An unknown
+    header key is IGNORED on the Python side, not refused -- so a field added
+    to the Java frame without a reader is a fact the operator never sees and a
+    reason to believe it was recorded. This is the check that makes such a key
+    say so.
+
+    The two sides have independent sources: the doc's own frame table, and the
+    `put("...")` calls in the methods that build each frame. `v` is stamped by
+    the sink rather than by the record's own arm, which is why the exchange
+    and denial sets are unioned with the sink's -- and it is IN the doc,
+    because a frame without it is one `BridgeServer._handle` drops before it
+    looks at `t`.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1]
+    doc = (root / "docs" / "bridge-protocol.md").read_text(encoding="utf-8")
+    documented = {
+        m.group(1): set(m.group(2).split(","))
+        for m in re.finditer(
+            r"^ +burp -> py +(exchange|denial|dropped) +\{([a-z_,]+)\}",
+            doc, re.M)
+    }
+    assert set(documented) == {"exchange", "denial", "dropped"}, (
+        f"the frame table no longer names all three: {sorted(documented)}")
+
+    capture = (root / "extension" / "src" / "hx" / "proxy"
+               / "Capture.java").read_text(encoding="utf-8")
+    bridge = (root / "extension" / "src" / "hx" / "bridge"
+              / "BridgeClient.java").read_text(encoding="utf-8")
+    key = re.compile(r'\.put\(\s*"([a-z_]+)"')
+
+    # `v` is put by the SINK, in the arm that writes each frame; the record's
+    # own arm puts everything else. Both halves are read, so a `v` dropped
+    # from either is a difference here rather than a frame the far side
+    # discards in silence.
+    sink_exchange = set(key.findall(_java_method_body(
+        bridge, "public boolean exchange(Map<String, Object> header, byte[] request,")))
+    sink_denial = set(key.findall(_java_method_body(
+        bridge, "public boolean denial(Map<String, Object> header)")))
+    sink_dropped = set(key.findall(_java_method_body(
+        bridge, "public boolean dropped(long n, String source)")))
+
+    emitted = {
+        "exchange": sink_exchange | set(key.findall(
+            _java_method_body(capture, "private void deliverExchange(Observed o)"))),
+        "denial": sink_denial | set(key.findall(
+            _java_method_body(capture, "private void deliverDenial(Denied d)"))),
+        "dropped": sink_dropped,
+    }
+    # Anti-vacuity: an empty or truncated parse would compare two empty sets
+    # for a frame and pass. Every frame carries `v` and `t` at minimum, and
+    # the doc is what says how many more.
+    for name, fields in emitted.items():
+        assert {"v", "t"} <= fields, f"{name} lost its envelope: {sorted(fields)}"
+    assert emitted == documented, {
+        name: {"only in the doc": sorted(documented[name] - emitted[name]),
+               "only in the code": sorted(emitted[name] - documented[name])}
+        for name in documented if documented[name] != emitted[name]
+    }
+
+
 def test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan():
     """A regex that stopped matching would shrink ERROR_CLASSES quietly, and
     every set-equality test here would then be comparing two small sets.
@@ -18649,12 +22690,17 @@ def test_the_module_docstrings_counts_are_the_counts():
     """The docstring said "twenty-one columns, six of which are nullable ids".
     Both numbers were wrong, and neither was checkable by reading.
 
-    MEASURED: the two INSERTs name 25 columns (9 + 16). Twenty-one is the
-    number of keyword parameters (8 + 13) -- a different thing, and the likely
+    MEASURED: the two INSERTs name 26 columns (10 + 16). Twenty-three is the
+    number of keyword parameters (9 + 14) -- a different thing, and the likely
     source of the error, so it is derived here too and named as itself. Five
     keyword parameters are nullable ids; `req_blob` and `resp_blob` are `str |
     None` as well and are deliberately excluded, because a blob digest is not
     a row id.
+
+    The numbers were 25 and 21 until Plan 4 gave both writers a `via` and
+    `denial` the column to put it in. That they MOVED is the demonstration:
+    the docstring they pin was updated because this went red, which is the
+    opposite of the comment that carried a stale number for two plans.
 
     Derived rather than transcribed. A comment carrying a number nothing
     computes is a comment that goes stale on the next column.
@@ -18679,8 +22725,8 @@ def test_the_module_docstrings_counts_are_the_counts():
             if annotation == "str | None" and param.name.endswith("_id"):
                 nullable_ids.append(f"{name}.{param.name}")
 
-    assert columns == 25, columns
-    assert keywords == 21, keywords
+    assert columns == 26, columns
+    assert keywords == 23, keywords
     assert nullable_ids == [
         "record_denial.run_id", "record_denial.scope_version_id",
         "record_exchange.run_id", "record_exchange.surface_id",
@@ -18689,8 +22735,8 @@ def test_the_module_docstrings_counts_are_the_counts():
 
     # ...and the docstring says the numbers this just computed.
     doc = records.__doc__
-    assert "**25** columns" in doc, doc
-    assert "9 on `denial`, 16 on `exchange`" in doc, doc
+    assert "**26** columns" in doc, doc
+    assert "10 on `denial`, 16 on `exchange`" in doc, doc
     assert "**five**" in doc, doc
 
 
@@ -18719,6 +22765,56 @@ def test_a_denial_with_no_run_is_allowed(conn):
                                    at_us=1)
     assert conn.execute("SELECT run_id FROM denial WHERE id=?",
                         (row_id,)).fetchone()["run_id"] is None
+
+
+def test_both_writers_still_default_to_the_send_path(conn):
+    """The default is what makes `via` a safe edit to a module with coherence
+    guards already in it: every call site written before Plan 4 keeps writing
+    the rows it always wrote. Both writers, because a default added to one of
+    them is a silent behaviour change in the other."""
+    d = records.record_denial(conn, run_id="r-1", kind="scope", method="GET",
+                              url="https://elsewhere.test/", detail="out of scope",
+                              at_us=1)
+    x = records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/", status=200,
+                                req_blob=None, resp_blob=None, ms=1, at_us=1)
+    assert conn.execute("SELECT via FROM denial WHERE id=?", (d,)).fetchone()[0] \
+        == "send"
+    assert conn.execute("SELECT via FROM exchange WHERE id=?", (x,)).fetchone()[0] \
+        == "send"
+
+
+def test_a_second_egress_point_is_recorded_as_itself(conn):
+    """The whole reason `via` is a parameter now. `SELECT kind, COUNT(*) FROM
+    denial` answered for two egress points at once while the column existed on
+    only one of the two tables, and "the crawler is being refused everywhere"
+    and "my browsing is being refused everywhere" are opposite instructions."""
+    d = records.record_denial(conn, run_id="r-1", kind="scope", method="GET",
+                              url="https://elsewhere.test/", detail="out of scope",
+                              at_us=1, via="proxy")
+    x = records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/", status=200,
+                                req_blob=None, resp_blob=None, ms=1, at_us=1,
+                                via="proxy")
+    assert conn.execute("SELECT via FROM denial WHERE id=?", (d,)).fetchone()[0] \
+        == "proxy"
+    assert conn.execute("SELECT via FROM exchange WHERE id=?", (x,)).fetchone()[0] \
+        == "proxy"
+
+
+@pytest.mark.parametrize("writer", ["record_denial", "record_exchange"])
+def test_a_via_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn, writer):
+    """Redundant with both CHECK constraints and worth its lines for the same
+    reason the `kind` check is: SQLite answers with "CHECK constraint failed:
+    denial", which names neither the value nor the three it would accept."""
+    common = dict(run_id="r-1", method="GET", url="https://app.example.test/",
+                  at_us=1, via="carrier-pigeon")
+    extra = ({"kind": "scope", "detail": "x"} if writer == "record_denial"
+             else {"status": 200, "req_blob": None, "resp_blob": None, "ms": 1})
+    with pytest.raises(ValueError, match="unknown via"):
+        getattr(records, writer)(conn, **common, **extra)
+    table = "denial" if writer == "record_denial" else "exchange"
+    assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
 def test_an_exchange_row_records_the_pair_and_derives_recv_us(conn):
@@ -18807,6 +22903,36 @@ def test_every_outcome_this_module_accepts_is_one_the_schema_accepts(conn):
                                 at_us=1, outcome=outcome)
     assert conn.execute("SELECT COUNT(DISTINCT outcome) FROM exchange"
                         ).fetchone()[0] == len(records.EXCHANGE_OUTCOMES)
+
+
+@pytest.mark.parametrize(
+    "outcome", sorted(o for o, s in LEGAL_STATUS.items() if s is not None))
+def test_an_outcome_that_means_a_response_came_back_is_refused_without_one(
+        conn, outcome):
+    """The other direction of the table above, and it was short by one.
+
+    `truncated` means the response ARRIVED and was cut short, so a truncated
+    row with a NULL status is the same "row that reads as evidence and is
+    not" that the `ok` guard has always refused. It was outside the guard
+    until 2026-08-25 and the gap was reachable from the wire: a `result`
+    frame with no `status` key at all, through `hx.capture`, MEASURED an
+    accepted exchange with `status NULL`, one surface and
+    `requests_issued=1`.
+
+    Driven off LEGAL_STATUS rather than a literal pair, so an outcome added
+    later that carries a status inherits the refusal instead of falling
+    through a decision nobody made. The table is asserted to cover
+    EXCHANGE_OUTCOMES exactly a few lines above, which is what makes this
+    parametrisation total rather than a sample.
+    """
+    expected = "599" if outcome == "status_unreadable" else "no status"
+    with pytest.raises(ValueError, match=expected):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=None, req_blob="a" * 64,
+                                resp_blob=None, ms=1, at_us=1,
+                                outcome=outcome)
+    assert conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
 
 
 def test_the_module_and_the_schema_agree_on_the_outcome_vocabulary():
@@ -18965,9 +23091,12 @@ argument would file evidence against the wrong run without any type error to
 show for it.
 
 COUNTED, because this paragraph had both numbers wrong. The two INSERTs name
-**25** columns -- 9 on `denial`, 16 on `exchange` -- not twenty-one; 21 is the
-number of KEYWORD PARAMETERS the two writers take between them (8 and 13),
-which is a different thing and the likely source of the error. And **five** of
+**26** columns -- 10 on `denial`, 16 on `exchange` -- not twenty-one; 23 is the
+number of KEYWORD PARAMETERS the two writers take between them (9 and 14),
+which is a different thing and the likely source of the error. (25/21/8/13
+until Plan 4 gave both writers a `via`, and `denial` the column to put it in.
+The numbers move; that they are DERIVED rather than transcribed is the point.)
+And **five** of
 those parameters are nullable ids of the same shape, not six:
 `record_denial.run_id`, `record_denial.scope_version_id`,
 `record_exchange.run_id`, `record_exchange.surface_id` and
@@ -18980,6 +23109,14 @@ Neither writer opens a transaction. Each is a single INSERT (or a single
 UPDATE), which is atomic on its own under `db.connect`'s autocommit
 connection; a caller writing an exchange row and its blobs together should
 wrap the pair in `db.transaction` itself.
+
+BOTH WRITERS REDACT THE URL THEY ARE GIVEN. §7 keeps credentials out of the
+store, and until 2026-08-26 its whole mechanism was header names and injected
+byte ranges inside the JVM -- so a credential in the request TARGET
+(`http://user:pass@host/`) reached `exchange.url` and `denial.url` untouched.
+`redact_url` is that boundary, and it is at the WRITER rather than at
+`hx.capture` so that it covers the callers this plan has not written yet. See
+its docstring for the rule, and for the half of the finding it does not close.
 """
 from __future__ import annotations
 
@@ -18997,6 +23134,12 @@ DENIAL_KIND: dict[str, str] = {
     "rate_limited": "rate",
     "budget_exhausted": "budget",
     "not_configured": "not_configured",
+    # Added 2026-08-25 with SCHEMA_VERSION 6, closing the gap the comment on
+    # UNRECORDABLE called "the gap to close first". S4 is unconditional and
+    # this class was the one denial the vocabulary could not express, so it
+    # reached `hx.capture` and vanished silently. S7's "never persisted" is
+    # about the request bytes; the refusal is a denial like any other.
+    "unmanaged_credential": "credential",
 }
 DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 
@@ -19016,6 +23159,194 @@ DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 # form a consumer can test for. `BridgeClient.EXTENSION_FAULT` is the same
 # string on the Java side, and a test pins the pair.
 EXTENSION_FAULT = "extension fault: "
+
+# What `redact_url` writes over a request target's userinfo.
+#
+# THE SAME STRING `Redactor.OBSERVED_USERINFO` writes into the BLOB, byte for
+# byte, and `tests/test_credentials_never_reach_the_store.py` reads it out of
+# the .java file and compares. §7's placeholders are a wire-visible vocabulary:
+# a `url` column saying one thing and the request blob beside it saying another
+# is two spellings of one fact, and a report that joins them shows two.
+#
+# A `str`, not a container, so the module-level vocabulary scan in
+# `tests/test_vocabularies_match_the_schema.py` does not see it -- and it has
+# no schema CHECK to be paired against either, because no column enumerates it.
+# It is pinned against the Java constant instead, which is the copy that can
+# actually drift.
+OBSERVED_USERINFO = "{{observed:userinfo}}"
+
+# What `redact_url` writes over a credential parameter's VALUE. The name and
+# the `=` are kept -- `surface.query_key_set` reads the KEY, and a redaction
+# that moved a key would change which surface a request belongs to.
+#
+# `Redactor.OBSERVED_PARAM` is the same string, pinned by the same test that
+# pins OBSERVED_USERINFO.
+OBSERVED_PARAM = "{{observed:param}}"
+
+# Query-parameter names whose VALUE is a credential, lower-cased.
+#
+# A FIXED LIST OF NAMES, MATCHED WHOLE AND CASE-INSENSITIVELY, and the whole
+# design is in `Redactor.CREDENTIAL_PARAMS` -- including which names are
+# deliberately ABSENT (`code`, `state`, `nonce`, `csrf`) and why, and what the
+# ambiguous entries cost. This is the second copy of that vocabulary and it is
+# COMPARED against the first rather than trusted: a test reads the array out of
+# Redactor.java and requires the two sets to be equal. A name added on one side
+# only is a leak on the other, and it is exactly the drift
+# `tests/test_vocabularies_match_the_schema.py` exists to refuse -- one
+# artifact further out, because these two places are two LANGUAGES.
+#
+# IT IS INCOMPLETE BY CONSTRUCTION. It catches well-known names and NOT a
+# client's own name for a token: `?acme_session=` reaches this column and the
+# blob store verbatim, and a test asserts that rather than a comment claiming
+# it. The route out is an operator-declared list in the engagement config,
+# which needs a config schema change AND a `configure` wire key -- an
+# unrecognised `configure` key is a hard `bad_config` today, so there is no
+# wire for it either.
+CREDENTIAL_PARAMS = frozenset({
+    "access_token", "refresh_token", "id_token", "auth_token", "token",
+    "jwt",
+    "api_key", "apikey", "api-key", "key",
+    "secret", "client_secret",
+    "password", "passwd", "pwd",
+    "auth", "authorization",
+    "sig", "signature",
+    "session", "sessionid", "sid",
+    "x-amz-signature", "x-amz-credential", "x-amz-security-token",
+})
+
+
+def redact_url(url: str) -> str:
+    """A url with the userinfo of its authority replaced. §7.
+
+    THE COLUMN HALF OF THE SAME FINDING THE EXTENSION'S JOB 5 CLOSES IN THE
+    BLOB. `http://user:pass@app.test/` reached `exchange.url` and `denial.url`
+    verbatim. A column is deletable where a content-addressed blob is not, so
+    this is the lesser half -- but two halves of one request redacted by two
+    different rules is how a report ends up quoting the credential out of the
+    column beside the blob that does not have it.
+
+    THE RULE IS RFC 3986 AND NOTHING ELSE. 3.2: the authority follows `//` and
+    ends at the next `/`, `?` or `#`, or at the end. 3.2.1:
+    `authority = [ userinfo "@" ] host [ ":" port ]`. 2.2: `@` is a gen-delim,
+    and neither a host nor a port may contain one. So an `@` inside an
+    authority IS the userinfo delimiter; nothing here guesses whether what
+    precedes it looks like a secret, because the RFC has already said that is
+    where one goes.
+
+    `urlsplit` is deliberately NOT used. It would parse and this would then
+    have to re-assemble, and `urlunsplit` normalises -- it drops an empty
+    query's `?`, and re-joins a fragment this store has no reason to move.
+    `exchange.url` is EVIDENCE: the only edit it may carry is the one this
+    function is for. So the rule is applied to the string in place, which also
+    makes it the same rule the Java side applies to a request line, character
+    for character. They are compared over one shared vector file.
+
+    THE LAST `@` IN THE AUTHORITY, matching `urlsplit`'s own `rpartition('@')`
+    and the WHATWG URL parser. A conforming userinfo pct-encodes its own `@`,
+    so the two rules differ only on a malformed authority carrying two -- and
+    taking the first would leave the bytes between them verbatim.
+
+    WHAT IT DOES NOT TOUCH, named here because §7's mechanisms are only worth
+    what their exclusions are:
+
+      - A CREDENTIAL IN A QUERY PARAMETER THIS LIST DOES NOT NAME. The
+        VALUES of `CREDENTIAL_PARAMS` are replaced -- `?access_token=` is
+        redacted -- and a client's own name for a token is NOT:
+        `?acme_session=` reaches this column verbatim. Names, never shapes: a
+        rule that redacted what looks opaque would rewrite `?id=1001` and
+        corrupt the exact evidence an access-control check reads. The limit
+        is pinned by a test using a made-up parameter name, so it is a
+        measured fact and not a caveat that can be quietly widened.
+      - A NON-CREDENTIAL PARAMETER'S VALUE, which is the point of the list
+        existing at all. `?id=1001` survives byte for byte.
+      - A PERCENT-ENCODED NAME (`%61ccess_token`), a pair separated by `;`
+        rather than `&`, and a credential nested inside another parameter's
+        value. See `Redactor.addCredentialParamCuts` for each.
+      - An `@` in the PATH, the QUERY or the FRAGMENT. RFC 3986 3.3 allows one
+        there and `/users/alice@example.test` is a real path segment.
+      - A url with no `://` at all. There is no authority to find.
+    """
+    cuts = _userinfo_cuts(url) + _credential_param_cuts(url)
+    if not cuts:
+        # The common url, returned by identity. Anything with nothing to
+        # redact must come back byte for byte.
+        return url
+    cuts.sort()
+    out = []
+    at = 0
+    for start, end, with_ in cuts:
+        # Overlap is DROPPED, not merged, exactly as the Java side does it and
+        # for the same input: `?access_token=http://u:p@h/` nests a userinfo
+        # cut inside a parameter-value cut, and sorted by start the outer one
+        # has already consumed it.
+        if start < at:
+            continue
+        out.append(url[at:start])
+        out.append(with_)
+        at = end
+    out.append(url[at:])
+    return "".join(out)
+
+
+def _userinfo_cuts(url: str) -> list[tuple[int, int, str]]:
+    """The userinfo of the first URI in `url`, as a (start, end, text) cut.
+
+    The cut ENDS at the `@` rather than past it, so the `@` survives and the
+    result still reads as an authority.
+    """
+    scheme = url.find("://")
+    if scheme < 0:
+        return []
+    start = scheme + 3
+    end = start
+    # The authority's own terminators, plus the whitespace that ends a request
+    # target inside a request line. The whitespace half is redundant for a url
+    # column and is here so that this rule and the extension's are ONE rule:
+    # a difference the shared vectors cannot reach is still a difference.
+    while end < len(url) and url[end] not in "/?# \t\r\n":
+        end += 1
+    at = url.rfind("@", start, end)
+    if at < 0:
+        return []
+    return [(start, at, OBSERVED_USERINFO)]
+
+
+def _credential_param_cuts(url: str) -> list[tuple[int, int, str]]:
+    """The VALUES of `CREDENTIAL_PARAMS` in the query, as cuts.
+
+    RFC 3986 3.4: the query begins at the FIRST `?` and runs to the next `#`
+    or the end. `?` is a gen-delim and not a `pchar`, so it cannot appear
+    unencoded in a path and the first one really is the delimiter. Inside a
+    request LINE the target also ends at the SP before the HTTP-version, so
+    whitespace ends the scan too -- the same terminator set the extension
+    uses, because these are one rule in two languages.
+
+    `parse_qsl` is deliberately NOT used, twice over: it DECODES, and this
+    function has to return the byte offsets of the raw text so the rest of the
+    url survives verbatim; and it drops what it cannot parse, which would
+    silently leave a malformed pair carrying a credential untouched.
+
+    A pair with no `=` has no value to redact. An EMPTY value is left alone
+    for the reason job 3 leaves a deletion cookie's empty value: an empty
+    value cannot be a credential, and a placeholder would read as an issuance.
+    """
+    q = url.find("?")
+    if q < 0:
+        return []
+    end = q + 1
+    while end < len(url) and url[end] not in "# \t\r\n":
+        end += 1
+    cuts: list[tuple[int, int, str]] = []
+    p = q + 1
+    while p < end:
+        amp = url.find("&", p, end)
+        if amp < 0:
+            amp = end
+        eq = url.find("=", p, amp)
+        if eq >= 0 and eq + 1 < amp and url[p:eq].lower() in CREDENTIAL_PARAMS:
+            cuts.append((eq + 1, amp, OBSERVED_PARAM))
+        p = amp + 1
+    return cuts
 
 # Error class (spec S6) -> the `outcome` the exchange table accepts WHEN THE
 # REQUEST WAS ISSUED. Two of the four entries are never issued; the other two
@@ -19146,16 +23477,35 @@ STATUS_UNREADABLE = 599
 NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
                                 "tls_error", "bridge_lost"})
 
+# S5's `via` vocabulary, and the schema's CHECK enforces the same three.
+# `send` was the only value either writer could produce until Plan 4:
+# record_exchange hardcoded the literal and `denial` had no column to put one
+# in. `proxy` and `crawl` are the two other egress points, and a fourth value
+# would mean a fourth path -- which S4 forbids outright.
+#
+# Both `exchange.via` and `denial.via` carry it, and a test compares this
+# constant against BOTH constraints rather than one: the column was added to
+# `denial` in Plan 4 and two CHECKs spelling the same vocabulary are two
+# places for it to drift.
+VIA_VALUES = frozenset({"proxy", "send", "crawl"})
+
 # Error classes with no row of their own, named rather than forgotten.
 # `denial.kind` and `exchange.outcome` are CHECK-constrained vocabularies
 # written before these classes existed, and widening either is a schema
 # migration -- a new SCHEMA_VERSION and a table rebuild. A class in here still
 # reaches the caller as BridgeError.error_class; what it does not get is a row.
 #
-#   unmanaged_credential -- a real denial (S7 refuses the request and never
-#       persists it) with no `kind` to record it under. This is the gap to
-#       close first: it is the only class here that S4 calls a denial about a
-#       request the extension agreed to look at.
+# WHAT IS LEFT HERE IS NOT A DENIAL, and that is the whole of why the set is
+# allowed to be non-empty. S4's sentence -- "Any denial produces a `denial` row
+# and a distinct error class. Denials are never silent" -- is about DENIALS,
+# and every remaining member is a transport failure, a run-wide stop, or a
+# refusal about a FRAME rather than about a request the extension agreed to
+# look at. `unmanaged_credential` was the one exception, which is exactly why
+# it was called "the gap to close first"; it left this set on 2026-08-25 for
+# DENIAL_KIND and a `credential` row. What is left is a category rather than a
+# backlog, and the rule that follows from it is the useful part: a new class
+# that IS a denial must be given a `kind` rather than added below.
+#
 #   transport_error -- the request DID leave the JVM, so it belongs in
 #       `exchange`, but see EXCHANGE_OUTCOME above.
 #   halted -- not a per-request denial at all. One distressed host aborts the
@@ -19187,7 +23537,7 @@ NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
 #       transcribed from S6 by hand and S6 did not list it either. Both ends
 #       of that are fixed: S6 lists it, and the set is now DERIVED from the
 #       emit sites.
-UNRECORDABLE = frozenset({"unmanaged_credential", "transport_error", "halted",
+UNRECORDABLE = frozenset({"transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
                           "protocol_mismatch", "bad_config", "unknown_frame"})
 
@@ -19214,8 +23564,12 @@ def row_for(error_class: str, *,
     An `issued=False` ambiguous class routes NOWHERE. `denial.kind`'s
     vocabulary is Plan 1's and has no value for "the caller's deadline had
     already passed", so the honest answer today is no row rather than a row
-    filed under a reason that is not the reason -- the same position
-    `unmanaged_credential` is in, and it belongs in the same schema migration.
+    filed under a reason that is not the reason. This was the same position
+    `unmanaged_credential` was in until SCHEMA_VERSION 6 gave it a kind; the
+    difference is that a never-issued `timeout` is not a DENIAL -- nobody
+    refused it, the caller gave up -- so S4's "denials are never silent" does
+    not reach it, and a kind of its own would be a new fact rather than a
+    vocabulary this store already had.
     """
     if error_class in DENIAL_KIND:
         # Precedence, and it is the whole reason this is a function: the two
@@ -19257,7 +23611,7 @@ def new_id(prefix: str) -> str:
 
 def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
                   method: str, url: str, detail: str, at_us: int,
-                  resolved_ip: str | None = None,
+                  via: str = "send", resolved_ip: str | None = None,
                   scope_version_id: str | None = None) -> str:
     """Record one refused request. Returns the row id.
 
@@ -19268,7 +23622,14 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
 
     `run_id` may be None. A `not_configured` denial at 02:00 happens before
     any run row exists, and that denial is exactly the one worth having.
+
+    `via` says WHICH EGRESS POINT refused. It defaults to 'send' because these
+    writers were built for the send path and every call site that predates
+    Plan 4 is one of its rows -- a default that is a fact about this module's
+    history, not a guess about the caller. `hx.capture` passes 'proxy'.
     """
+    if via not in VIA_VALUES:
+        raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
     if kind not in DENIAL_KINDS:
         raise ValueError(
             f"{kind!r} is not a denial kind; the schema accepts "
@@ -19276,11 +23637,16 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
             "records.DENIAL_KIND, and see records.UNRECORDABLE for the "
             "classes that have no row to go in yet."
         )
+    # AT THE WRITER, not at the caller, and for `count_drop`'s reason: this is
+    # where a url becomes a row, so it covers the callers that do not exist
+    # yet. `hx.capture` is the only one today and it hands the raw frame value
+    # straight through.
+    url = redact_url(url)
     row_id = new_id("d")
     conn.execute(
         "INSERT INTO denial(id, run_id, ts_us, kind, method, url, resolved_ip,"
-        " reason, scope_version_id) VALUES(?,?,?,?,?,?,?,?,?)",
-        (row_id, run_id, at_us, kind, method, url, resolved_ip, detail,
+        " reason, via, scope_version_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (row_id, run_id, at_us, kind, method, url, resolved_ip, detail, via,
          scope_version_id),
     )
     return row_id
@@ -19289,7 +23655,7 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
 def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
                     method: str, url: str, status: int | None,
                     req_blob: str | None, resp_blob: str | None, ms: int,
-                    at_us: int, outcome: str = "ok",
+                    at_us: int, outcome: str = "ok", via: str = "send",
                     resp_len: int | None = None,
                     surface_id: str | None = None,
                     scope_version_id: str | None = None,
@@ -19310,25 +23676,42 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     carries the outcome at all. That pairing reaches disk HERE and nowhere
     else, so this is the only place it can be enforced.
 
-    `via` is always 'send' here. The other two values in that vocabulary
-    belong to the proxy and the crawler, which are their own egress point and
-    their own plan.
+    `via` was always 'send' here until Plan 4, when `hx.capture` became the
+    proxy's egress point and passed 'proxy'. It still DEFAULTS to 'send', so
+    every send-path call site is unchanged; `crawl` has no caller yet.
 
     `identity`, `identity_generation` and `identity_state` stay NULL. Identity
     injection ships in Plan 5; writing 'assumed' now would be a claim about
     authentication that nothing in this plan can support.
     """
+    if via not in VIA_VALUES:
+        raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
     if outcome not in EXCHANGE_OUTCOMES:
         raise ValueError(
             f"{outcome!r} is not an exchange outcome; the schema accepts "
             f"{sorted(EXCHANGE_OUTCOMES)}. Map an error class through "
             "records.EXCHANGE_OUTCOME."
         )
-    if outcome == "ok" and status is None:
-        # 'ok' means a response came back. A row claiming one with no status
-        # is a row that reads as evidence and is not.
-        raise ValueError("an 'ok' exchange with no status is not an exchange "
-                         "that happened; give it the outcome it really had")
+    if status is None and outcome in ("ok", "truncated"):
+        # Both mean a response CAME BACK -- 'ok' whole, 'truncated' cut short
+        # -- so a row claiming one with no status is a row that reads as
+        # evidence and is not.
+        #
+        # 'truncated' was outside this guard until 2026-08-25, and the guard's
+        # absence was reachable: a `result` frame with no `status` key at all
+        # reached `hx.capture` and MEASURED an accepted exchange, one surface,
+        # `requests_issued=1` and `status NULL`. The third outcome that means
+        # a response came back, 'status_unreadable', is refused by the
+        # stricter guard below -- its only legal status is the 599 sentinel,
+        # so None fails there.
+        #
+        # What is left may be NULL and the NULL is the fact: NO_STATUS_OUTCOMES
+        # never had a status to carry, and scope_denied/rate_limited were
+        # decided before issuance. A test drives this off the same table that
+        # says which status each outcome may legally carry.
+        raise ValueError(
+            f"an exchange with outcome={outcome!r} and no status is not an "
+            "exchange that happened; give it the outcome it really had")
     if outcome == "status_unreadable" and status != STATUS_UNREADABLE:
         # The converse of the guard above, and the one this task was the
         # deliberate verification for. See STATUS_UNREADABLE.
@@ -19348,13 +23731,17 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
             "is not a fact about anything, and a check reads it later without "
             "the frame it came from."
         )
+    # §7, the same call `record_denial` makes and for the same reason: the two
+    # url columns are one exposure and a rule applied to one of them is a rule
+    # the other drifts away from.
+    url = redact_url(url)
     row_id = new_id("x")
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
         " recv_us, method, url, status, req_blob, resp_blob, resp_len,"
         " body_shed, scope_version_id, seq)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (row_id, run_id, surface_id, "send", outcome, at_us,
+        (row_id, run_id, surface_id, via, outcome, at_us,
          at_us + ms * 1000, method, url, status, req_blob, resp_blob,
          resp_len,
          # S6: solicited exchanges are NEVER shed -- they are about to become
@@ -20960,7 +25347,7 @@ so the block can be pasted whole.
                                      "engagement_id"})
 
     def __init__(self, socket_path: Path, engagement_id: str, operator_halt,
-                 on_hello=None, on_halted=None):
+                 on_hello=None, on_halted=None, on_exchange=None):
         """
         `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
         module keeps no dependency on the store, and tests can attach anything
@@ -20988,11 +25375,26 @@ so the block can be pasted whole.
         sentinel in a directory of its own, which is exactly the discipline
         the Java side imposes on itself.
 
-        `on_hello` and `on_halted` are both called ON THE READ THREAD, so
-        neither may touch a sqlite3 connection opened elsewhere: it belongs to
-        the thread that created it and raises ProgrammingError anywhere else
-        (tests/test_halt.py demonstrates it). Hand the work to the thread that
-        owns the store instead.
+        `on_hello`, `on_halted` and `on_exchange` are ALL called ON THE READ
+        THREAD, so none may touch a sqlite3 connection opened elsewhere: it
+        belongs to the thread that created it and raises ProgrammingError
+        anywhere else (tests/test_halt.py demonstrates it). Hand the work to
+        the thread that owns the store instead.
+
+        `on_exchange(header, request, response)` takes Plan 4's proxy traffic:
+        `exchange`, `denial` and `dropped` frames, which are UNSOLICITED --
+        nothing is waiting on an id, so without a sink installed they are read
+        and discarded. `hx.capture.Capture.on_exchange` has this shape.
+
+        IT IS THE ONE CALLBACK WHOSE THROW IS NOT FATAL. `on_halted` returning
+        an exception closes the connection, because a stop nothing wrote down
+        is a stop that did not happen. Capture is the opposite case and S4 says
+        so: a wedged harness or a lost record changes what hx KNOWS, never what
+        it ALLOWS, so a bookkeeping failure here must not become an outage on
+        the operator's browser. The exception is kept in
+        `exchange_callback_error`, the channel is kept with it, and the lost
+        record is handed back as a `dropped` frame so the run's coverage floor
+        moves -- see `_capture`, which explains why keeping it was not enough.
         """
         if operator_halt is None:
             # The signature already refuses an OMITTED argument. This refuses
@@ -21011,18 +25413,50 @@ so the block can be pasted whole.
         self.engagement_id = engagement_id
         self.on_hello = on_hello
         self.on_halted = on_halted
+        self.on_exchange = on_exchange
         self.operator_halt = operator_halt
         # The last unsolicited `halted` frame, kept so a harness with no
         # on_halted callback installed can still see why issuance stopped.
         self.last_halted: dict | None = None
         self.halted_callback_error: BaseException | None = None
+        # The last thing an `on_exchange` frame failed on -- a malformed
+        # two-body payload, or a throw out of the sink. Recorded rather than
+        # raised: see the note on the constructor's `on_exchange`. These two
+        # are DIAGNOSTICS, read by tests and by whoever is debugging the
+        # bridge; the coverage consequence of the same failure travels the
+        # `dropped` frame `_capture` hands back, because nothing outside
+        # tests/ reads either of these and a run cannot get its floor from a
+        # number no one looks at.
+        #
+        # `exchange_errors` COUNTS FAILED SINK CALLS, NOT RECORDS LOST, and the
+        # two stopped being the same number when `_count_as_dropped` arrived:
+        # ONE lost record whose `dropped` retry also raises counts TWO, the
+        # original call and the retry. That is the right number for a
+        # diagnostic -- it is how many times the sink misbehaved, which is what
+        # someone debugging the sink wants -- and the wrong one for coverage,
+        # which is exactly why coverage does not come from here.
+        # `run.dropped_total`, fed by the `dropped` frame, is the count of
+        # RECORDS.
+        self.exchange_callback_error: BaseException | None = None
+        self.exchange_errors = 0
 
         self.state = "waiting"
         self.config_epoch = 0
         self.peer_uid: int | None = None
         self.peer_pid: int | None = None
+        self.peer_exe: str | None = None
         self.hello: dict | None = None
         self.rejected_hellos = 0
+        # Peers refused by SO_PEERCRED, i.e. another UID on this machine
+        # reaching for this socket. It sits beside `rejected_hellos`
+        # deliberately: the two are the same kind of number and one of them
+        # existed while the other -- the one that is a security event rather
+        # than a misconfiguration -- did not.
+        self.rejected_peers = 0
+        # The last one, for whoever is looking. Kept rather than only logged,
+        # because `hx` installs no logging handler and a library that did
+        # would be deciding for its embedder where diagnostics go.
+        self.last_rejected_peer: dict | None = None
 
         self._srv: socket.socket | None = None
         self._conn: socket.socket | None = None
@@ -21038,6 +25472,19 @@ so the block can be pasted whole.
         # _deliver() that wakes the _request() waiting on the very frame being
         # written.
         self._send_lock = threading.Lock()
+
+    # ---- lifecycle ---------------------------------------------------
+
+    def start(self) -> None:
+        if self.socket_path.exists():
+            raise BridgeError(
+                f"socket path already exists: {self.socket_path}. Refusing to "
+                "start rather than adopt a path another process may own."
+            )
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.socket_path.parent, 0o700)
+
+        self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 ```
 
 In `_handle()`, the hello arm gains the re-assert immediately before the
@@ -21087,11 +25534,22 @@ arms with these three:
                     return False
             return True
 
+        if t in ("exchange", "denial", "dropped"):
+            # `exchange` USED TO BE IN THE `_deliver` TUPLE BELOW and is not any
+            # more, which is deliberate rather than an oversight. `_deliver`
+            # answers a WAITER by `id`; these three are UNSOLICITED -- nothing
+            # holds an id for them -- so `_deliver` had nothing to wake and the
+            # frame reached no one. Nothing regressed on the send path when it
+            # moved: no solicited `exchange` reply exists in either
+            # implementation, and no `_request` waits on one.
+            self._capture(t, header, body)
+            return True
+
         if t == "configured":
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error", "exchange"):
+        if t in ("result", "error"):
             self._deliver(header, body)
             return True
 ```
@@ -22405,14 +26863,34 @@ Replace `launch_burp` in `tests/integration/burp_fixture.py` with this:
 ```python
 # tests/integration/burp_fixture.py -- launch_burp gains the halt sentinel
 def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
-                sentinel: Path) -> subprocess.Popen:
+                sentinel: Path, crawler_port: int = 0) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
     buffer fills and the test hangs with no diagnostic. A file also means a
     failing test can quote what Burp actually said.
+
+    TWO PROXY LISTENERS, and the SECOND one is the crawler's. S4 tells the
+    operator and the crawler apart by WHICH LISTENER a request arrived on and
+    by nothing in the traffic itself, so a rig with one listener cannot
+    exercise the split at all -- `Source.forListenerPort` would answer OPERATOR
+    for every request and the two rule sets would never be told apart.
+
+    `-Dhx.crawler_port` IS THE OTHER HALF OF THAT AND IT IS NOT OPTIONAL.
+    `HxExtension` reads it with a default of 0, and `Source.forListenerPort`
+    reads 0 as "no crawler configured" -- so a launch that omits it attributes
+    EVERY request to the operator however many listeners are running, and a
+    test of the split passes while measuring nothing. This is the
+    `-Dhx.halt_sentinel` incident that this function's own comment below
+    records, one plan later; the property is passed from the config file Burp
+    was actually handed, never from the argument, so the number the extension
+    compares against and the number Burp bound cannot drift.
+
+    `crawler_port=0` means "any free port"; read the real ones back with
+    proxy_port() and second_proxy_port().
     """
     home = make_home(workdir)
+    ports = write_listener_config(workdir, crawler_port)
     log = (workdir / "burp.log").open("wb")
     cmd = [
         "java",
@@ -22427,17 +26905,8 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
         # was not updated -- the integration tests are deselected from the
         # default run, so nothing said so for a day.
         f"-Dhx.halt_sentinel={sentinel}",
-        *ADD_OPENS,
-        "-cp", f"{BURP_JAR}:{EXT_JAR}",
-        "burp.StartBurp",
-        "--developer-extension-class-name=hx.HxExtension",
-        "--disable-auto-update",
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
-                            stderr=subprocess.STDOUT, cwd=LAB)
-    proc.stdin.write(b"\n\n")     # bare newline selects Community Edition
-    proc.stdin.flush()
-    return proc
+        # Read back out of the config above rather than from `crawler_port`,
+        # which may be the 0 that means "choose one for me".
 ```
 
 **The block above is now stale in one respect, deliberately left rather than
@@ -22556,9 +27025,12 @@ from typing import Sequence
 
 import pytest
 
+from hx import capture as capture_mod
 from hx import config, engagement
 from hx.bridge import server
 from hx.halt import OperatorHalt
+from hx.store import blobs as blobs_mod
+from hx.store import db as db_mod
 from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer
 
@@ -22597,12 +27069,118 @@ def pytest_terminal_summary(terminalreporter) -> None:
         if getattr(item, "get_closest_marker", None)
         and item.get_closest_marker("integration") is not None
     ]
+    _announce_skipped(terminalreporter)
     if not deselected:
         return
     terminalreporter.write_line(
         f"NOT RUN: {len(deselected)} integration tests -- the only tests here "
         "that drive a real Burp. Run them with: pytest -m integration",
         yellow=True)
+
+
+def _announce_skipped(terminalreporter) -> None:
+    """Announce integration tests that RAN and SKIPPED, not only deselected ones.
+
+    The hook above exists because `9 deselected` reads as somebody having
+    scoped a run deliberately. `3 skipped` reads the same way and is worse: a
+    deselected test was never asked to run, while a skipped one was asked,
+    declined, and reported green.
+
+    Both halves of that have now bitten this project. The real-Burp tests were
+    dark for a day behind a deselect. Task 1's measurements were one renamed
+    directory away from being dark behind a skip, and the extension jar going
+    stale skipped all 17 integration tests while the commit that did it
+    recorded them as passing.
+    """
+    # `stats["skipped"]` holds TestReport, NOT Item -- and a TestReport has no
+    # get_closest_marker. The first version of this filter was copied from the
+    # deselected path above, where the objects ARE Items, and the
+    # `getattr(..., None)` guard turned the resulting AttributeError into
+    # permanent silence: 17 skipped integration tests printed not one line.
+    # Measured with HX_BURP_LAB=/nonexistent.
+    #
+    # That is worse than the hole it was written to close. A warning that is
+    # never present is not a warning, which is the same reasoning the
+    # deselected line's own docstring gives for not printing unconditionally.
+    # `keywords` is what a TestReport carries, and it holds the marker names.
+    skipped = [
+        report for report in terminalreporter.stats.get("skipped", [])
+        if "integration" in getattr(report, "keywords", ())
+    ]
+    if skipped:
+        terminalreporter.write_line(
+            f"SKIPPED: {len(skipped)} integration tests declined to run. A "
+            "skipped test reported green; read the reason above before "
+            "trusting this suite.", yellow=True)
+
+
+class ReadThreadCapture:
+    """`hx.capture.Capture`, on a connection belonging to the thread that uses it.
+
+    THE SINK IS CALLED ON THE BRIDGE'S READ THREAD. `BridgeServer.__init__`
+    says so in as many words and adds the consequence: a callback there "may
+    not touch a sqlite3 connection opened elsewhere: it belongs to the thread
+    that created it and raises ProgrammingError anywhere else". `eng.db` is
+    opened by the fixture, on the main thread, so a `Capture(eng.db, ...)`
+    installed here raises on EVERY frame.
+
+    MEASURED, because the failure is silent in the worst way. `_capture`
+    catches everything the sink throws -- deliberately; S4 says a lost record
+    changes what hx KNOWS, never what it ALLOWS -- keeps the exception in
+    `BridgeServer.exchange_callback_error`, and retries the loss as a `dropped`
+    frame, which raises identically. So the observable is a live Burp, a green
+    handshake, traffic flowing to the target, and ZERO rows: exactly the shape
+    whose natural diagnosis is "the extension never sent anything".
+
+        sqlite3.ProgrammingError: SQLite objects created in a thread can only
+        be used in that same thread.
+
+    So the connection is opened LAZILY, on the first call, which happens on the
+    read thread -- and every later call is on that same thread. The main thread
+    keeps reading through `eng.db`; two connections to one WAL database is the
+    ordinary arrangement and each sees the other's commits.
+
+    It is deliberately NOT closed at teardown. `Connection.close()` is thread-
+    affine as well (measured, same exception), so closing it from the fixture's
+    unwind would raise during teardown and replace whatever failed the test.
+    `srv.stop()` joins the read thread first, so nothing is still writing.
+    """
+
+    def __init__(self, root: Path, engagement_id: str, cfg: config.Config):
+        self._root = Path(root)
+        self._engagement_id = engagement_id
+        self._config = cfg
+        self._capture: capture_mod.Capture | None = None
+
+    def _lazy(self) -> capture_mod.Capture:
+        if self._capture is None:
+            self._capture = capture_mod.Capture(
+                db_mod.connect(self._root / "hx.db"),
+                blobs_mod.BlobStore(self._root / "blobs"),
+                self._engagement_id, self._config)
+        return self._capture
+
+    def __call__(self, header: dict, request: bytes, response: bytes):
+        return self._lazy().on_exchange(header, request, response)
+
+    def on_halted(self, header: dict):
+        """S4's auto-halt, on the same connection and the same thread.
+
+        This rig wired `on_hello` and `on_exchange` and NOT this one, which was
+        half of why `records.abort_run` had no caller outside tests: S4's "one
+        distressed host aborts the whole run" reached the wire, reached
+        `BridgeServer.last_halted`, and stopped there. A real Burp really does
+        emit this frame -- `test_five_hundreds_from_the_slow_route_abort_the_
+        whole_run` drives ten 500s and reads it off the socket -- so wiring it
+        here is what makes the ROW the thing a real auto-halt produces rather
+        than something a test wrote by hand beside it.
+
+        The connection is this class's own, opened lazily on the read thread,
+        for the reason the class docstring gives: `BridgeServer` catches the
+        `ProgrammingError` a foreign connection raises, so the observable of
+        getting this wrong is a green run and an empty table.
+        """
+        return self._lazy().on_halted(header)
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -22625,6 +27203,14 @@ class Rig:
     halt: OperatorHalt
     run_id: str
     workdir: Path
+    # The two proxy listeners this run's Burp bound, read back from the config
+    # file it was handed rather than kept as a second copy here. S4 tells the
+    # operator and the crawler apart by WHICH of these a request arrived on and
+    # by nothing in the traffic, so a test of that split needs both numbers.
+    # `crawler_port` is also what `-Dhx.crawler_port` carries into the JVM; see
+    # burp_fixture.launch_burp for why passing it is not optional.
+    proxy_port: int
+    crawler_port: int
     last_request: bytes = field(default=b"", init=False)
 
     @property
@@ -22751,6 +27337,10 @@ class Rig:
 
 @pytest.fixture
 def rig(tmp_path):
+    # Order matters: an unbuilt jar is a FAILURE and a missing Burp is a skip,
+    # and asking the skip question first turns the former into the latter.
+    if bf.unbuilt():
+        pytest.fail("unbuilt: " + ", ".join(bf.unbuilt()))
     if bf.missing():
         pytest.skip("missing: " + ", ".join(bf.missing()))
 
@@ -22797,22 +27387,63 @@ def rig(tmp_path):
         # writes. The price is that this side now refuses a send of its own
         # accord while that file exists, which is why the halt test sends
         # through Rig.send_unguarded.
+        #
+        # `on_exchange` is Plan 4's proxy traffic arriving UNSOLICITED, and
+        # without a sink installed BridgeServer reads those frames and DISCARDS
+        # them -- its own `_capture` says so. This rig had no sink at all until
+        # Task 9, which is right for the send-path tests (they assert on
+        # `result` frames) and fatal to any assertion about a row: every
+        # exchange, denial and dropped frame would be read off the socket,
+        # thrown away, and the database would answer empty while Burp
+        # cheerfully sent them.
+        # ONE sink object for both callbacks, so both run on ONE connection
+        # opened on the read thread. Two objects would open two, and the
+        # second would be as thread-affine as the first with nothing making
+        # that obvious.
+        sink = ReadThreadCapture(eng.root, eng.id, cfg)
         srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id=eng.id,
-                                  operator_halt=operator_halt)
+                                  operator_halt=operator_halt,
+                                  on_exchange=sink,
+                                  on_halted=sink.on_halted)
         stack.callback(srv.stop)
         srv.start()
 
-        proc = bf.launch_burp(srv.socket_path, eng.id, tmp_path / "burp",
+        burpdir = tmp_path / "burp"
+        proc = bf.launch_burp(srv.socket_path, eng.id, burpdir,
                               sentinel=operator_halt.sentinel_path)
         stack.callback(_reap, proc)
 
         if not bf.wait_for(lambda: srv.state == "connected"):
             raise AssertionError(
                 "Burp never completed the hello handshake; see "
-                f"{tmp_path / 'burp' / 'burp.log'}")
+                f"{burpdir / 'burp.log'}")
+
+        # BEFORE any test touches a listener. `listen_mode: loopback_only` goes
+        # into both listeners in `write_listener_config` and is not self-
+        # enforcing: changing that one string to `all_interfaces` left
+        # test_proxy_facts.py reporting `3 passed` with `ss` showing the
+        # listeners bound to `*` -- an open forward proxy on whatever network
+        # this laptop is attached to, for as long as the run lasts.
+        #
+        # Polled, not read once: the handshake says the extension loaded and
+        # says nothing about when Burp bound its listeners. The wait is bounded
+        # at 15 s and costs one `ss` call on the happy path -- waiting cannot
+        # turn a wildcard bind into a loopback one, so the seconds only ever
+        # get spent once the check has already found something.
+        ports = bf.listener_ports(burpdir)
+        violation: str | None = "the loopback check did not run"
+
+        def on_loopback_only() -> bool:
+            nonlocal violation
+            violation = bf.not_loopback_only(proc.pid, ports)
+            return violation is None
+
+        if not bf.wait_for(on_loopback_only, 15):
+            raise AssertionError(violation)
 
         yield Rig(eng=eng, srv=srv, proc=proc, target=target, offside=offside,
-                  halt=operator_halt, run_id=run_id, workdir=tmp_path)
+                  halt=operator_halt, run_id=run_id, workdir=tmp_path,
+                  proxy_port=ports[0], crawler_port=ports[1])
 ```
 
 - [ ] **Step 8: Write the end-to-end test**
@@ -22915,8 +27546,9 @@ CLOCK_SKEW_SLACK_US = 5_000
 # Error class -> `denial.kind` is records.DENIAL_KIND, imported rather than
 # restated. A second copy here would be the copy nothing tests, and the two
 # would agree right up until Plan 1's CHECK constraint grew a value.
-# unmanaged_credential is in neither: see records.UNRECORDABLE, and the
-# assertion that pins the gap in test_the_gate_refuses_four_ways.
+# unmanaged_credential was in neither until SCHEMA_VERSION 6 gave it the
+# `credential` kind; the assertions in test_the_gate_refuses_four_ways are
+# where that closure is demonstrated rather than asserted.
 
 
 def _blobs_containing(eng, needle: bytes) -> list[Path]:
@@ -23173,10 +27805,13 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
     # shape had never been driven: every case above sends its credential to
     # an in-scope path, so the two guards were never made to compete.
     #
-    # Until the whole-branch review it answered `unmanaged_credential`, and
-    # that class is in records.UNRECORDABLE -- so a scope violation carrying a
+    # Until the whole-branch review it answered `unmanaged_credential`, which
+    # was then in records.UNRECORDABLE -- so a scope violation carrying a
     # Cookie produced no row anywhere and named the credential rather than the
-    # boundary crossed. It is not an exotic input either: until Plan 5 ships
+    # boundary crossed. The class has a row of its own now, and the ordering
+    # still matters: the scope boundary is the fact worth recording, and a
+    # `credential` row would name the wrong reason for the refusal. It is not
+    # an exotic input either: until Plan 5 ships
     # identity injection, the natural agent action is replaying a request
     # lifted from Burp's history, and those carry a Cookie.
     attempt("scope_with_credential", "GET", "/api/orders", to=rig.offside,
@@ -23216,15 +27851,37 @@ def test_the_gate_refuses_four_ways_and_no_target_sees_any_of_them(rig):
         (rig.run_id,))]
     assert kinds == ["scope", "method", "dangerous", "scope"]
 
-    # A gap, pinned rather than papered over: Plan 1's denial.kind CHECK
-    # lists scope, method, dangerous, rate, budget and not_configured. There
-    # is no kind for unmanaged_credential -- nor for halted, transport_error,
-    # timeout or bridge_lost -- so S6's error classes are wider than the
-    # table that is supposed to record them. records.UNRECORDABLE is where
-    # that is written down; this is where it is demonstrated, and when the
-    # schema grows a kind these two assertions are what will say so.
-    assert "unmanaged_credential" in records.UNRECORDABLE
-    with pytest.raises((sqlite3.IntegrityError, ValueError)):
+    # The gap this block used to pin is CLOSED, and these assertions are what
+    # said so. Plan 1's denial.kind CHECK listed scope, method, dangerous,
+    # rate, budget and not_configured, and there was no kind for
+    # unmanaged_credential -- so S4's "denials are never silent" did not hold
+    # for the one class here that IS a denial about a request the extension
+    # agreed to look at. SCHEMA_VERSION 6 added 'credential'.
+    #
+    # Classes still wider than the tables remain, and none of them is a
+    # denial about a request the extension agreed to look at -- which is the
+    # sentence S4 makes. This is not the place they are enumerated: an
+    # earlier version of this comment named four as a closed list and was
+    # wrong twice over -- short by the five frame-level refusals
+    # records.UNRECORDABLE also holds (bad_frame, engagement_mismatch,
+    # protocol_mismatch, bad_config, unknown_frame), and attributing two of
+    # the four it did name, timeout and bridge_lost, to a set that does not
+    # contain them. records.UNRECORDABLE and records.AMBIGUOUS_ISSUANCE hold
+    # the membership, with a reason written against each name; read it there.
+    assert "unmanaged_credential" not in records.UNRECORDABLE
+    assert records.record_denial(
+        rig.eng.db, run_id=rig.run_id,
+        kind=records.DENIAL_KIND["unmanaged_credential"],
+        method="GET", url=f"{rig.target.origin}/api/orders",
+        detail="a Cookie header this extension did not inject",
+        at_us=engagement.now_us()).startswith("d-")
+    assert rig.eng.db.execute(
+        "SELECT kind FROM denial WHERE run_id=? ORDER BY ts_us DESC, rowid DESC",
+        (rig.run_id,)).fetchone()["kind"] == "credential"
+    # ...and the class is still not a KIND. Passing the wire name where a
+    # schema value belongs is the mistake this refusal exists for, and closing
+    # the gap did not make the two words interchangeable.
+    with pytest.raises(ValueError, match="not a denial kind"):
         records.record_denial(
             rig.eng.db, run_id=rig.run_id, kind="unmanaged_credential",
             method="GET", url=f"{rig.target.origin}/api/orders",
@@ -23380,8 +28037,7 @@ def test_the_rate_limit_trips_and_its_retry_hint_is_true(rig):
         "the gate refused, named a wait, and was still refusing after it")
     assert len(rig.target.hits_for("/health")) == hits_before + 1
 
-    # Denials are never silent (S4). rate_limited has a kind of its own,
-    # unlike unmanaged_credential.
+    # Denials are never silent (S4), and rate_limited has a kind of its own.
     assert records.record_denial(
         rig.eng.db, run_id=rig.run_id,
         kind=records.DENIAL_KIND["rate_limited"],
@@ -23656,37 +28312,61 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
     """
     rig.configure()
 
-    frames: list[dict] = []
-    # Appended, not acted on. This callback runs on the bridge's read-loop
-    # thread, and sqlite3 connections are single-thread by default, so the
-    # store write below belongs to the thread that owns the run.
-    rig.srv.on_halted = frames.append
-
+    # THE RIG'S OWN HANDLER IS LEFT IN PLACE, and that is the change this test
+    # exists to hold. It used to replace it with `frames.append` and then call
+    # `records.abort_run` itself, three lines below the assertion -- so the row
+    # this test proved was the row the TEST wrote, and `abort_run` had no
+    # caller anywhere but a test. S5's "an aborted run must never render as a
+    # clean one" was unenforced by construction, and this was the test that
+    # looked like it was enforcing it.
+    #
+    # `last_halted` is what a harness with no callback installed reads, so the
+    # frame is still observable without taking the callback away from the
+    # thing that acts on it.
     seen = _issue_until(rig, "/slow?ms=40&status=500", want="halted")
     assert seen.count(500) >= 10, \
         f"the 5xx rule needs ten answered samples before it may trip; got {seen}"
     assert seen[-1] == "halted"
 
-    assert bf.wait_for(lambda: bool(frames), timeout=10), (
+    assert bf.wait_for(lambda: rig.srv.last_halted is not None, timeout=10), (
         "auto-halt is extension-initiated, so there is no outstanding id to "
         "answer: without an unsolicited `halted` frame it is invisible until "
         "the next send fails and run.status has no stop_reason to record")
-    frame = frames[0]
+    frame = rig.srv.last_halted
     assert frame["t"] == "halted"
     assert "5xx rate" in frame["reason"], frame
     assert frame["host"] == rig.target.host, frame
     assert frame["window"], frame
 
-    assert records.abort_run(
-        rig.eng.db, run_id=rig.run_id,
-        stop_reason=f"{frame['reason']} on {frame['host']}",
-        at_us=engagement.now_us()) is True
+    # THE ROW THE HANDLER WROTE. The rig's `on_halted` runs on the bridge's
+    # read thread with a connection of its own, so this main-thread connection
+    # sees the commit rather than making it -- two connections to one WAL
+    # database, which is the ordinary arrangement here.
+    def aborted():
+        return rig.eng.db.execute(
+            "SELECT status FROM run WHERE id=?", (rig.run_id,)
+        ).fetchone()["status"] == "aborted"
+
+    assert bf.wait_for(aborted, timeout=10), (
+        "the `halted` frame arrived and no run was aborted. `hx.capture."
+        "Capture.on_halted` is the writer and the rig installs it; without "
+        "it the run closes `completed`/`idle` or `error` later and S5's "
+        f"reading is lost. srv.halted_callback_error={rig.srv.halted_callback_error!r}")
     row = rig.eng.db.execute(
         "SELECT status, stop_reason, ended_us FROM run WHERE id=?",
         (rig.run_id,)).fetchone()
-    assert row["status"] == "aborted"
     assert "5xx rate" in row["stop_reason"]
+    assert rig.target.host in row["stop_reason"]
     assert row["ended_us"] is not None
+    # And it really was the HANDLER, not this test: a second abort of a run
+    # already stopped answers False. `abort_run` is guarded on
+    # `status='running'` precisely so the first diagnosis survives.
+    assert records.abort_run(
+        rig.eng.db, run_id=rig.run_id, stop_reason="a symptom arriving second",
+        at_us=engagement.now_us()) is False
+    assert rig.eng.db.execute(
+        "SELECT stop_reason FROM run WHERE id=?",
+        (rig.run_id,)).fetchone()["stop_reason"] == row["stop_reason"]
 
     # One distressed host aborts the WHOLE run, and a human decides when it
     # restarts. `resume` lifts an operator halt; it does not undo distress.

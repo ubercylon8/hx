@@ -11,6 +11,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /** Hand-rolled runner: JUnit would be a dependency, and this jar has none. */
@@ -390,6 +391,40 @@ public class LimiterTest {
               3 == raceAgainst(new Limiter(new TickClock(T0), 10_000, 3)));
     }
 
+    /**
+     * How long 1600 non-blocking calls get before the race is called HUNG.
+     *
+     * `check` takes a monitor and does arithmetic; 1600 of them across eight
+     * threads is a fraction of the well-under-a-second this whole class takes
+     * to run. Ten seconds cannot fire on anything but a genuine park -- and a
+     * genuine park is the whole reason it exists.
+     *
+     * WHAT IT CATCHES, measured on this file one mutation at a time against a
+     * clean 11 summary lines / 0 FAIL / rc=0: a `check` that PARKS a caller it
+     * made wait for its own monitor -- a rate limiter that THROTTLES the
+     * caller rather than REFUSING it, the same §4 violation the capture layer
+     * above exists to forbid, one layer down -- parked all eight workers, and
+     * this bound turned that into a named FAIL against this class's own
+     * counter: "a concurrent caller of Limiter.check had not finished after
+     * 10000 ms, so it HUNG". Whether that mutation trips HERE or in
+     * checkIsExclusiveWithItselfDeterministically below depends on its own
+     * timing -- both were seen -- and the point is that both waits are bounded,
+     * not which one goes first. Deleting this method's own `go.countDown()` is
+     * caught too, by the matching bound on `go.await`: 11 summary lines,
+     * 2 FAIL, rc=1. Both were 10 lines / 0 FAIL / rc=1 before the bounds.
+     *
+     * WHAT IT DOES NOT CATCH, and this docstring asserted the opposite until
+     * it was measured: a `check` that SLEEPS instead of returning
+     * `rateLimited` never reaches this method at all. It parks in
+     * `theWindowIsExactAtItsBoundaries`, the FIRST of this class's fourteen
+     * methods and eleven before `raceAgainst`, in a direct call with no helper
+     * thread to join -- 10 summary lines, 10 ALL PASS, 0 FAIL, rc=1, and no
+     * worker is ever constructed. Unchanged by every bound in this file. The
+     * EXIT CODE is the only thing that sees it, with `TestSupport`'s shutdown
+     * hook to name the method. See {@link hx.TestSupport#t}.
+     */
+    static final long RACE_DEADLINE_MS = 10_000L;
+
     static int raceAgainst(Limiter l) throws Exception {
         int threads = 8, callsEach = 200;
         AtomicInteger allowed = new AtomicInteger();
@@ -397,21 +432,40 @@ public class LimiterTest {
         List<Thread> workers = new ArrayList<>();
         for (int t = 0; t < threads; t++) {
             Thread w = new Thread(() -> {
-                try { go.await(); } catch (InterruptedException e) { return; }
+                try {
+                    // Bounded, and the workers are DAEMONS. A non-daemon
+                    // worker that never releases holds the JVM up AFTER
+                    // main() has printed ALL PASS: eleven green summary lines
+                    // and a suite that still blocks to the backstop.
+                    if (!go.await(RACE_DEADLINE_MS, TimeUnit.MILLISECONDS)) return;
+                } catch (InterruptedException e) { return; }
                 for (int i = 0; i < callsEach; i++)
                     if (l.check(ACCOUNT).allowed()) allowed.incrementAndGet();
             });
+            w.setDaemon(true);
             workers.add(w);
             w.start();
         }
         go.countDown();
-        for (Thread w : workers) w.join();
+        for (Thread w : workers)
+            TestSupport.join(w, RACE_DEADLINE_MS,
+                             "a concurrent caller of Limiter.check");
         // issued() is the limiter's own count; allowed is the callers'. They
         // must agree, or one of the two is not counting what it claims to.
         if (l.issued() != allowed.get())
             check("issued() disagrees with the callers: " + l.issued() + " vs " + allowed.get(), false);
         return allowed.get();
     }
+
+    /** How long the helper below gets to finish one non-blocking `check` once
+     *  the monitor is free. Half of RACE_DEADLINE_MS against a thousandth of
+     *  the work, and a HANG bound rather than a timing assertion.
+     *
+     *  Declared ABOVE the next method's docstring rather than between it and
+     *  the method. Two javadoc comments in a row and javac attaches only the
+     *  second: the first documents nothing, which is how this file's sibling
+     *  in hx.TestSupport silently lost the paragraph explaining hangs. */
+    static final long HELPER_RELEASE_MS = 5_000L;
 
     /**
      * The mutual-exclusion guard on check(), deterministically -- the guard
@@ -434,6 +488,20 @@ public class LimiterTest {
      * checks: a thread parked on some unrelated lock -- a class-init monitor,
      * say -- is also BLOCKED, and accepting that would pass a Limiter with no
      * lock on check() at all, for the wrong reason.
+     *
+     * THE JOIN BELOW IS BOUNDED AND THROWS, and that is load-bearing rather
+     * than tidy. `limiter.issued()` after it is a `synchronized` accessor, so
+     * a helper still parked INSIDE check() is still holding the monitor that
+     * call needs -- and entering a monitor cannot be bounded, interrupted or
+     * timed out from here. Measured with the exact mutation this method exists
+     * to catch, a `check` that parks a caller it made wait for the monitor:
+     * on a plain `helper.join(5000)` this method printed its FAIL and then
+     * parked on `issued()` forever, taking LimiterTest from ELEVEN summary
+     * lines to TEN with rc=1 as the only signal -- the very truncation the
+     * bounds in this file were added to remove, wearing a second shape and
+     * missed by the sweep that added them. `TestSupport.join` throwing means
+     * `issued()` is never reached: the only bound available for a monitor is
+     * not making the call.
      */
     static void checkIsExclusiveWithItselfDeterministically() throws Exception {
         TickClock clock = new TickClock(T0);
@@ -447,7 +515,8 @@ public class LimiterTest {
             check("a concurrent check() is parked on Limiter's own monitor",
                   waitUntilBlockedOn(helper, limiter));
         }
-        helper.join(5000);
+        TestSupport.join(helper, HELPER_RELEASE_MS,
+                         "the concurrent check(), after limiter's monitor was released");
         check("...and proceeds once the monitor is released", !helper.isAlive());
         check("...and its issuance was actually counted", limiter.issued() == 1L);
     }

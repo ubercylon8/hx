@@ -187,18 +187,28 @@ def test_agent_can_set_other_statuses(tmp_path: Path):
 
 
 def test_dangling_first_seen_run_rejected(tmp_path: Path):
-    """A dangling first_seen_run reference is rejected by FK constraint."""
+    """A dangling first_seen_run reference is rejected by FK constraint.
+
+    MEASURED: this raised `NOT NULL constraint failed:
+    surface.normaliser_version` -- and later `surface.discovered_by` -- and
+    never reached the foreign key at all. Both columns are deliberately
+    DEFAULT-less, so an INSERT that names neither fails before SQLite looks at
+    the reference, and `pytest.raises(IntegrityError)` could not tell the two
+    apart. The row below is complete except for the one thing under test, and
+    the match is on the constraint's own name.
+    """
     conn = db.connect(tmp_path / "hx.db")
     db.init_schema(conn)
     conn.execute(
         "INSERT INTO engagement(id, name, client, created_us, status)"
         " VALUES('e1','acme','Acme',1,'active')"
     )
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
         conn.execute(
             "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
-            " path_template, first_seen_run)"
-            " VALUES('s1','e1','GET','https','app.acme.com',443,'/api/users','NO_SUCH_RUN')"
+            " path_template, discovered_by, normaliser_version, first_seen_run)"
+            " VALUES('s1','e1','GET','https','app.acme.com',443,'/api/users',"
+            "'proxy',1,'NO_SUCH_RUN')"
         )
 
 

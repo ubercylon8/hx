@@ -42,6 +42,8 @@ public class PolicyTest {
         t("theVerdictTypeCarriesItsClassAndItsHint", PolicyTest::theVerdictTypeCarriesItsClassAndItsHint);
         t("aRequestFieldThatIsNullIsARejectedFrameNotANullPointer", PolicyTest::aRequestFieldThatIsNullIsARejectedFrameNotANullPointer);
         t("epochZeroIsNotConfigured", PolicyTest::epochZeroIsNotConfigured);
+        t("scopeOnlyFailsClosedWithoutHelpFromItsCaller",
+          PolicyTest::scopeOnlyFailsClosedWithoutHelpFromItsCaller);
         t("anInScopeRequestIsAllowed", PolicyTest::anInScopeRequestIsAllowed);
         t("scopeMatchesSchemeHostPortAndPath", PolicyTest::scopeMatchesSchemeHostPortAndPath);
         t("anEmptyScopeIncludeIsAnsweredByItsOwnGuard", PolicyTest::anEmptyScopeIncludeIsAnsweredByItsOwnGuard);
@@ -107,6 +109,12 @@ public class PolicyTest {
 
     /** A request in the shape Sender.parse produces: the url built from the
      *  frame's target_host and the origin-form target, the parts split out. */
+    /** The long, cheap-to-read fixture: same byte volume as the costly one,
+     *  two readings instead of sixteen. Used as the reference for the cost
+     *  ratio AND as the benign case, deliberately the same literal so a change
+     *  to one cannot silently diverge from the other. */
+    static final String LONG_BENIGN = "/sso/saml/" + "QUJD".repeat(2000);
+
     static HxRequest req(String method, String url, String host, String path, String query) {
         Map<String, List<String>> headers = new LinkedHashMap<>();
         headers.put("Host", List.of(host));
@@ -243,6 +251,52 @@ public class PolicyTest {
                "not_configured");
         denies("a null Authorisation is not_configured, not a crash",
                p, orders(), null, "not_configured");
+    }
+
+    /**
+     * decideScopeOnly's `not_configured` preamble, with the inputs that
+     * separate it from its absence.
+     *
+     * It had none. Deleting `unusable(auth)` from decideScopeOnly -- leaving
+     * `return checkScope(req, auth.scope());` -- was 10 x ALL PASS / 1637 ok /
+     * 0 FAIL, measured: the only caller is ProxyGate, whose own epoch-0 guard
+     * answers before this method is reached, and nothing drove a
+     * malformed-but-non-zero-epoch authorisation down the operator path. A
+     * guard is only tested by the input that separates it from its absence,
+     * and that rule is not for other people's guards.
+     *
+     * So both calls below are DIRECT -- `p.decideScopeOnly(...)`, not through
+     * ProxyGate -- which is also the caller the javadoc's promise is about.
+     * The two inputs are the two arms of Policy.unusable: epoch 0, and a
+     * readable epoch with a scope that cannot be read. With the preamble gone
+     * the first answers `scope_denied` (the empty-include guard) and the
+     * second throws three frames down, which the per-method guard turns into a
+     * named FAIL.
+     *
+     * NOT claimed: that these two exhaust what decideScopeOnly refuses. They
+     * are the two arms of unusable() as it stands; a third arm added there
+     * needs its own check here, and this one will not notice.
+     */
+    static void scopeOnlyFailsClosedWithoutHelpFromItsCaller() {
+        CountingGate gate = new CountingGate();
+        Policy p = new Policy(gate);
+
+        Decision none = p.decideScopeOnly(orders(), denyAll());
+        check("epoch 0 asked scope-only is not_configured (got "
+              + (none.allowed() ? "ALLOWED" : none.errorClass()) + ")",
+              !none.allowed() && "not_configured".equals(none.errorClass()));
+
+        Decision unreadable =
+                p.decideScopeOnly(orders(), new BridgeClient.Authorisation(EPOCH, null));
+        check("and an authorisation carrying no scope is too (got "
+              + (unreadable.allowed() ? "ALLOWED" : unreadable.errorClass()) + ")",
+              !unreadable.allowed()
+              && "not_configured".equals(unreadable.errorClass()));
+
+        // The question stops before the Gate for the same reason decide() does
+        // not reach it on a refusal: a request refused for having no usable
+        // authorisation must not spend the run's budget.
+        check("neither refusal spent the gate (" + gate.calls + " call(s))", gate.calls == 0);
     }
 
     // ---- scope -----------------------------------------------------------
@@ -1941,9 +1995,17 @@ public class PolicyTest {
         long dotStart = System.nanoTime();
         Decision dotVerdict = p.decide(dottedReq, APP);
         long dotMs = (System.nanoTime() - dotStart) / 1_000_000;
-        check("a path of " + (Policy.MAX_TARGET_CHARS - 1) + " U+0130 characters is "
-              + "decided in " + dotMs + " ms (was 99 ms, and allowed)",
-              dotMs < 30 && dotVerdict != null);
+        // The bound is the READING COUNT, with the milliseconds printed but not
+        // asserted on -- amended 2026-08-24. The `dotMs < 30` this replaces
+        // measured 8 ms quiescent and FAILED at 32 and 35 ms under 24 and 48
+        // busy threads: 3.75x headroom on a machine whose absolute figures
+        // move 5x, which is a check that goes red for reasons unrelated to the
+        // code. What "was 99 ms" actually measured was a fold deriving one
+        // reading per code point; the count is that fact directly.
+        int dottedReadings = Policy.readings(dotted, Policy.readingBudget(dotted.length())).size();
+        check("a path of " + (Policy.MAX_TARGET_CHARS - 1) + " U+0130 characters reads "
+              + dottedReadings + " ways and is decided (" + dotMs + " ms, was 99 ms and allowed)",
+              dottedReadings <= 4 && dotVerdict != null);
 
         char[] alphabet = ("ab/./..;\\ %2e2f5c%c0%aeADMIN" + '\0'
                 + "\u00c0\u00ae\uff0f\uff0e\u0130\u2215\ufe52").toCharArray();
@@ -2710,6 +2772,22 @@ public class PolicyTest {
               + ") in " + ms + " ms",
               !big.allowed() && "scope_denied".equals(big.errorClass()) && ms < 60);
 
+        // AND THE COUNT, WHICH IS THE THING THAT ACTUALLY MOVES -- added
+        // 2026-08-24 after a reviewer reintroduced the defect these checks
+        // exist for (the reading bound moved from construction back to
+        // matching) and found the timing checks BOTH still green: this one at
+        // 44 ms against its 60 ms ceiling, and the ratio check below at an
+        // unchanged 54x. The set went 17 members -> 50. So the explosion was
+        // caught by nothing, while two checks written to catch it passed.
+        //
+        // Time was always a proxy for the count, and a bad one: it moves with
+        // the machine, and the previous ceiling on this file went red at load
+        // with no code change. The count moves only with the code.
+        int worstReadings = Policy.readings(worst, Policy.readingBudget(worst.length())).size();
+        check("and its reading set is bounded at " + worstReadings + " members, "
+              + "not the 50 an unbounded derivation builds",
+              worstReadings <= 24);
+
         // The costliest target a hill climb over the trigger alphabet could
         // build, tiled to the length bound. It is UNDER the reading bound and
         // so it is DECIDED rather than refused -- which is the point: nothing
@@ -2743,6 +2821,43 @@ public class PolicyTest {
         // round and the fold did not move it. The measurement below is a MEDIAN
         // of five rather than a single sample, so the check answers "is this
         // code slow" rather than "was the machine busy for one sample".
+        // MEASURED AGAINST THE MACHINE, NOT AGAINST A STOPWATCH -- amended
+        // 2026-08-24, and the reason is in the paragraph above rather than in
+        // this one. That paragraph already recorded that a saturated machine
+        // fails an absolute ceiling ("24 busy threads 89 ms -- over the
+        // ceiling"), and shipped the absolute ceiling anyway. It duly went red
+        // at 105 ms on a machine running a Windows VM at 158% CPU, with no
+        // code change, at the start of the next plan.
+        //
+        // A permanently-red check is worse than a missing one. Rule 1 of this
+        // project is to judge a run by its summary line, and a check that is
+        // red for reasons unrelated to the code trains every reader to look
+        // past exactly the line they must not look past.
+        //
+        // So the bound is now a RATIO against the same function on the same
+        // byte volume with a cheap reading count, measured microseconds apart
+        // in the same loop. Load hits both halves equally, so the ratio does
+        // not move with it: measured 54 on two consecutive runs at load 3-4.6,
+        // where the absolute figures were 108 ms and 109 ms against a
+        // quiescent 40 ms. The ceiling of 100 is roughly 2x the measured
+        // ratio. The first version of this comment also claimed the defect
+        // this check exists for "sits near 200-400 on the same scale". THAT
+        // NUMBER WAS NEVER MEASURED, in a comment whose whole argument is
+        // measure-do-not-assume, and a reviewer who did measure it found the
+        // opposite: with the reading bound removed the ratio reads an
+        // unchanged 54x. The ratio does not catch that defect. THE READING
+        // COUNT ABOVE DOES, and it is where that guarantee now lives.
+        //
+        // What this ratio catches is a change that makes the EXPENSIVE path
+        // disproportionately worse. What it cannot see is a UNIFORM slowdown:
+        // if every decide() got 5x slower both halves scale together, the
+        // ratio holds, and only the printed milliseconds would say so. The old
+        // absolute ceiling did catch that, and this trade is deliberate --
+        // a uniform slowdown is visible in the suite's wall time, while a
+        // load-dependent ceiling is red for reasons no reader can act on.
+        //
+        // The absolute figures are still PRINTED, because a reader chasing a
+        // slow suite wants the milliseconds even when the ratio is fine.
         String costly = "/\u2215\u2170\ufe52/D\uff0f2\u2216;%c2/.\u2170\u29f89\u0269/\uff05";
         StringBuilder costlyTiled = new StringBuilder();
         while (costlyTiled.length() + costly.length() <= Policy.MAX_TARGET_CHARS)
@@ -2750,26 +2865,43 @@ public class PolicyTest {
         String costlyPath = costlyTiled.toString();
         HxRequest costlyReq = req("GET", "https://app.example.test" + costlyPath,
                                   "app.example.test", costlyPath, "");
+        // Same byte volume, cheap to read. ONE literal, shared with the benign
+        // check below -- it is hoisted rather than repeated because the first
+        // version of this comment claimed the sharing while declaring a second
+        // identical literal forty lines down, which is a guarantee asserted
+        // and not provided.
+        String refPath = LONG_BENIGN;
+        HxRequest refReq = req("GET", "https://app.example.test" + refPath,
+                               "app.example.test", refPath, "");
         p.decide(costlyReq, APP);
-        long[] samples = new long[5];
+        p.decide(refReq, APP);
+        long[] samples = new long[9];
+        long[] refSamples = new long[9];
         Decision cVerdict = null;
         for (int i = 0; i < samples.length; i++) {
+            // Interleaved, so a load spike lands on both rather than on one.
             long cStart = System.nanoTime();
             cVerdict = p.decide(costlyReq, APP);
-            samples[i] = (System.nanoTime() - cStart) / 1_000_000;
+            samples[i] = System.nanoTime() - cStart;
+            long rStart = System.nanoTime();
+            p.decide(refReq, APP);
+            refSamples[i] = System.nanoTime() - rStart;
         }
         Arrays.sort(samples);
-        long cMs = samples[samples.length / 2];
+        Arrays.sort(refSamples);
+        long cNs = samples[samples.length / 2];
+        long rNs = Math.max(1L, refSamples[refSamples.length / 2]);
+        long ratio = cNs / rNs;
         check("the costliest target a hill climb could build (" + costlyPath.length()
               + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath.length())).size()
               + " readings) is answered " + (cVerdict.allowed() ? "allow" : cVerdict.errorClass())
-              + " in " + cMs + " ms (median of " + samples.length + ", "
-              + Arrays.toString(samples) + ")",
-              cMs < 80 && cVerdict != null);
+              + " at " + ratio + "x the cost of the same volume read cheaply ("
+              + (cNs / 1_000_000) + " ms vs " + (rNs / 1_000_000) + " ms)",
+              ratio < 100 && cVerdict != null);
 
         // ...while a long BENIGN target is decided rather than refused: the
         // size bound must not turn into a length bound of its own.
-        String longBenign = "/sso/saml/" + "QUJD".repeat(2000);
+        String longBenign = LONG_BENIGN;
         check("the long benign fixture is near the length bound and reads "
               + Policy.readings(longBenign).size() + " ways",
               longBenign.length() > 4096 && Policy.readings(longBenign).size() <= 2);

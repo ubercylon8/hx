@@ -1,4 +1,5 @@
 import json
+import re
 import socket
 from pathlib import Path
 
@@ -286,3 +287,158 @@ def test_encode_refuses_an_integer_outside_signed_64_bit_range():
     # The boundary values themselves must still be accepted.
     codec.encode({"v": 1, "t": "send", "deadline_us": 2 ** 63 - 1})
     codec.encode({"v": 1, "t": "send", "deadline_us": -(2 ** 63)})
+
+
+# ---- the two-body form -------------------------------------------------
+#
+# Plan 4's `exchange` frame carries a request AND a response, and they cannot
+# share one opaque body: the far side content-addresses each on its own. The
+# form declares itself in the header under `codec.BODIES_KEY` and packs the
+# body slot as [len(first)][first][len(second)][second], leaving the OUTER
+# frame -- length prefix, header, newline, body slot -- exactly as it was.
+
+
+# The SAME literal CodecTest.java records for the same inputs. Two codecs that
+# only round-trip against themselves can disagree forever, which is why the
+# golden vectors exist at all; this is that pin for the two-body form. It is a
+# literal here rather than a row in frames.json because every consumer of that
+# file calls the ONE-body encoder.
+TWO_BODY_HEX = (
+    "0000004f7b2276223a312c2274223a2265786368616e6765222c2275726c223a"
+    "22687474703a2f2f6170702e746573742f78222c22626f64696573223a327d0a"
+    "0000000352455100000008524553504f4e5345"
+)
+
+
+def _exchange_header():
+    return {"v": 1, "t": "exchange", "url": "http://app.test/x"}
+
+
+def test_the_two_body_wire_form_is_the_same_on_both_sides():
+    raw = codec.encode_two(_exchange_header(), b"REQ", b"RESPONSE")
+    assert raw.hex() == TWO_BODY_HEX
+    header, body, _ = codec.decode(bytes.fromhex(TWO_BODY_HEX))
+    assert codec.split_bodies(header, body) == (b"REQ", b"RESPONSE")
+
+
+def test_two_bodies_round_trip_and_stay_apart():
+    """A first half whose own bytes look like a length prefix, and an empty
+    second half: the pair that separates real length prefixes from a scan."""
+    first, second = b"\x00\x00\x00\x08x", b""
+    header, body, _ = codec.decode(codec.encode_two(_exchange_header(), first, second))
+    assert codec.split_bodies(header, body) == (first, second)
+
+    big = bytes(range(256)) * 300
+    header, body, _ = codec.decode(codec.encode_two(_exchange_header(), big, big))
+    assert codec.split_bodies(header, body) == (big, big)
+
+
+def test_the_one_body_form_is_untouched_by_the_two_body_form():
+    """Every existing frame goes through `encode`, and the golden vectors pin
+    their bytes. This says it from the other side: a one-body frame declares
+    no `bodies`, so nothing can read its payload as two halves."""
+    header, body, _ = codec.decode(codec.encode(_exchange_header(), b"BODY"))
+    assert codec.BODIES_KEY not in header
+    assert body == b"BODY"
+    with pytest.raises(codec.FrameError, match="one body, not two"):
+        codec.split_bodies(header, body)
+
+
+def test_encode_two_has_no_caller_outside_the_tests():
+    """The bound the split-point asymmetry rests on, made falsifiable.
+
+    `codec.decode` deliberately does NOT split the two bodies and Java's
+    `Frame.decode` does; the note at `split_bodies` says the asymmetry "is
+    bounded: two-body frames travel Burp -> Python only". Nothing enforced
+    that. Java pins its half -- `Frame.encode(` has exactly two call sites in
+    `extension/src`, both in BridgeClient, and the golden vectors redden if a
+    third appears -- and this is the matching pin: the only encoder of a
+    two-body frame on this side has no production caller, so this side emits
+    none.
+
+    A search over `src/`, not an import graph: a call reached through
+    `getattr` or a re-export would slip past the latter, and the string is
+    what a reviewer greps for anyway.
+    """
+    src = Path(__file__).resolve().parents[1] / "src"
+    callers = sorted(
+        f"{p.relative_to(src).as_posix()}:{n}"
+        for p in src.rglob("*.py")
+        for n, line in enumerate(p.read_text().splitlines(), 1)
+        if "encode_two(" in line and not line.lstrip().startswith("def ")
+    )
+    assert callers == [], (
+        "encode_two now has production callers "
+        f"({callers}); two-body frames travel Burp -> Python only, and the "
+        "note at codec.split_bodies rests on that. Python -> Burp two-body "
+        "traffic means Java's eager split CLOSES the connection where this "
+        "side counts and continues -- DENY-ALL, and the halt path with it."
+    )
+
+
+def test_two_bodies_over_max_frame_are_refused_before_they_are_joined():
+    """Mirrors `Frame.encode(header, a, b)`, which checks first for the same
+    reason: a bound on how much one frame may make the process allocate is
+    lost if it is enforced after the allocation."""
+    half = b"x" * (codec.MAX_FRAME // 2 + 16)
+    with pytest.raises(codec.FrameError, match="exceed MAX_FRAME"):
+        codec.encode_two(_exchange_header(), half, half)
+
+
+def test_encoding_two_bodies_does_not_stamp_the_callers_header():
+    """Or the next frame that header builds silently declares two bodies it
+    has not got."""
+    header = _exchange_header()
+    codec.encode_two(header, b"a", b"b")
+    assert codec.BODIES_KEY not in header
+
+
+@pytest.mark.parametrize("payload,why", [
+    (b"\x00\x00", "no length prefix for its first body"),
+    (b"\x00\x00\x00\x63a", "declares a first body of 99"),
+    (b"\x00\x00\x00\x01a\x00\x00\x00\x63", "declares bodies of 1 \\+ 99"),
+    (b"\x00\x00\x00\x01a\x00\x00\x00\x01bX", "do not fill"),
+])
+def test_a_malformed_two_body_payload_is_refused(payload, why):
+    """Each is a payload a lenient reader would accept by guessing, and each
+    guess is a different pair of halves than the writer meant. EXACT FIT is
+    required: the lengths are on the wire so neither side has to guess."""
+    raw = codec.encode({**_exchange_header(), codec.BODIES_KEY: 2}, payload)
+    header, body, _ = codec.decode(raw)
+    with pytest.raises(codec.FrameError, match=why):
+        codec.split_bodies(header, body)
+
+
+@pytest.mark.parametrize("declared", [1, 3, 0, True])
+def test_a_bodies_count_this_version_does_not_know_is_refused(declared):
+    """`bodies` is a declaration, not a hint. `True` is in this list because
+    `True == 1` in Python and a header may legitimately carry bools, so an
+    `== 2` test written the obvious way on a future version that accepted 1
+    would let it through."""
+    raw = codec.encode({**_exchange_header(), codec.BODIES_KEY: declared}, b"abc")
+    header, body, _ = codec.decode(raw)
+    with pytest.raises(codec.FrameError, match="reads 2 and no other value"):
+        codec.split_bodies(header, body)
+
+
+def test_the_java_side_rejects_the_same_malformed_two_body_payloads():
+    """The same payloads are refused on both sides, at different POINTS.
+
+    Java's `Frame.decode` splits eagerly and raises there. This side splits at
+    `split_bodies`, so a mis-packed capture frame is counted by BridgeServer
+    rather than closing the control channel -- see the note in `decode`. What
+    is shared is the four payloads, the unknown-count case, and the bytes
+    below; what differs is which call raises.
+
+    The Java half is CodecTest.malformedTwoBodyPayloadsAreRefused. Named here
+    so a change to one is a change someone can find in the other; there is no
+    JVM in this suite to run it from.
+    """
+    java = Path(__file__).parents[1] / "extension" / "test" / "hx" / "bridge" / "CodecTest.java"
+    text = java.read_text()
+    assert "malformedTwoBodyPayloadsAreRefused" in text
+    # The literal itself, reassembled from the Java string concatenation, so a
+    # drift in either file's expected bytes reddens here rather than waiting
+    # for someone to run the other suite.
+    declaration = text.split("TWO_BODY_HEX =", 1)[1].split(";", 1)[0]
+    assert "".join(re.findall(r'"([0-9a-f]*)"', declaration)) == TWO_BODY_HEX

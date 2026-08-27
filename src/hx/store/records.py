@@ -11,9 +11,12 @@ argument would file evidence against the wrong run without any type error to
 show for it.
 
 COUNTED, because this paragraph had both numbers wrong. The two INSERTs name
-**25** columns -- 9 on `denial`, 16 on `exchange` -- not twenty-one; 21 is the
-number of KEYWORD PARAMETERS the two writers take between them (8 and 13),
-which is a different thing and the likely source of the error. And **five** of
+**26** columns -- 10 on `denial`, 16 on `exchange` -- not twenty-one; 23 is the
+number of KEYWORD PARAMETERS the two writers take between them (9 and 14),
+which is a different thing and the likely source of the error. (25/21/8/13
+until Plan 4 gave both writers a `via`, and `denial` the column to put it in.
+The numbers move; that they are DERIVED rather than transcribed is the point.)
+And **five** of
 those parameters are nullable ids of the same shape, not six:
 `record_denial.run_id`, `record_denial.scope_version_id`,
 `record_exchange.run_id`, `record_exchange.surface_id` and
@@ -26,6 +29,14 @@ Neither writer opens a transaction. Each is a single INSERT (or a single
 UPDATE), which is atomic on its own under `db.connect`'s autocommit
 connection; a caller writing an exchange row and its blobs together should
 wrap the pair in `db.transaction` itself.
+
+BOTH WRITERS REDACT THE URL THEY ARE GIVEN. §7 keeps credentials out of the
+store, and until 2026-08-26 its whole mechanism was header names and injected
+byte ranges inside the JVM -- so a credential in the request TARGET
+(`http://user:pass@host/`) reached `exchange.url` and `denial.url` untouched.
+`redact_url` is that boundary, and it is at the WRITER rather than at
+`hx.capture` so that it covers the callers this plan has not written yet. See
+its docstring for the rule, and for the half of the finding it does not close.
 """
 from __future__ import annotations
 
@@ -43,6 +54,12 @@ DENIAL_KIND: dict[str, str] = {
     "rate_limited": "rate",
     "budget_exhausted": "budget",
     "not_configured": "not_configured",
+    # Added 2026-08-25 with SCHEMA_VERSION 6, closing the gap the comment on
+    # UNRECORDABLE called "the gap to close first". S4 is unconditional and
+    # this class was the one denial the vocabulary could not express, so it
+    # reached `hx.capture` and vanished silently. S7's "never persisted" is
+    # about the request bytes; the refusal is a denial like any other.
+    "unmanaged_credential": "credential",
 }
 DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 
@@ -62,6 +79,194 @@ DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 # form a consumer can test for. `BridgeClient.EXTENSION_FAULT` is the same
 # string on the Java side, and a test pins the pair.
 EXTENSION_FAULT = "extension fault: "
+
+# What `redact_url` writes over a request target's userinfo.
+#
+# THE SAME STRING `Redactor.OBSERVED_USERINFO` writes into the BLOB, byte for
+# byte, and `tests/test_credentials_never_reach_the_store.py` reads it out of
+# the .java file and compares. §7's placeholders are a wire-visible vocabulary:
+# a `url` column saying one thing and the request blob beside it saying another
+# is two spellings of one fact, and a report that joins them shows two.
+#
+# A `str`, not a container, so the module-level vocabulary scan in
+# `tests/test_vocabularies_match_the_schema.py` does not see it -- and it has
+# no schema CHECK to be paired against either, because no column enumerates it.
+# It is pinned against the Java constant instead, which is the copy that can
+# actually drift.
+OBSERVED_USERINFO = "{{observed:userinfo}}"
+
+# What `redact_url` writes over a credential parameter's VALUE. The name and
+# the `=` are kept -- `surface.query_key_set` reads the KEY, and a redaction
+# that moved a key would change which surface a request belongs to.
+#
+# `Redactor.OBSERVED_PARAM` is the same string, pinned by the same test that
+# pins OBSERVED_USERINFO.
+OBSERVED_PARAM = "{{observed:param}}"
+
+# Query-parameter names whose VALUE is a credential, lower-cased.
+#
+# A FIXED LIST OF NAMES, MATCHED WHOLE AND CASE-INSENSITIVELY, and the whole
+# design is in `Redactor.CREDENTIAL_PARAMS` -- including which names are
+# deliberately ABSENT (`code`, `state`, `nonce`, `csrf`) and why, and what the
+# ambiguous entries cost. This is the second copy of that vocabulary and it is
+# COMPARED against the first rather than trusted: a test reads the array out of
+# Redactor.java and requires the two sets to be equal. A name added on one side
+# only is a leak on the other, and it is exactly the drift
+# `tests/test_vocabularies_match_the_schema.py` exists to refuse -- one
+# artifact further out, because these two places are two LANGUAGES.
+#
+# IT IS INCOMPLETE BY CONSTRUCTION. It catches well-known names and NOT a
+# client's own name for a token: `?acme_session=` reaches this column and the
+# blob store verbatim, and a test asserts that rather than a comment claiming
+# it. The route out is an operator-declared list in the engagement config,
+# which needs a config schema change AND a `configure` wire key -- an
+# unrecognised `configure` key is a hard `bad_config` today, so there is no
+# wire for it either.
+CREDENTIAL_PARAMS = frozenset({
+    "access_token", "refresh_token", "id_token", "auth_token", "token",
+    "jwt",
+    "api_key", "apikey", "api-key", "key",
+    "secret", "client_secret",
+    "password", "passwd", "pwd",
+    "auth", "authorization",
+    "sig", "signature",
+    "session", "sessionid", "sid",
+    "x-amz-signature", "x-amz-credential", "x-amz-security-token",
+})
+
+
+def redact_url(url: str) -> str:
+    """A url with the userinfo of its authority replaced. §7.
+
+    THE COLUMN HALF OF THE SAME FINDING THE EXTENSION'S JOB 5 CLOSES IN THE
+    BLOB. `http://user:pass@app.test/` reached `exchange.url` and `denial.url`
+    verbatim. A column is deletable where a content-addressed blob is not, so
+    this is the lesser half -- but two halves of one request redacted by two
+    different rules is how a report ends up quoting the credential out of the
+    column beside the blob that does not have it.
+
+    THE RULE IS RFC 3986 AND NOTHING ELSE. 3.2: the authority follows `//` and
+    ends at the next `/`, `?` or `#`, or at the end. 3.2.1:
+    `authority = [ userinfo "@" ] host [ ":" port ]`. 2.2: `@` is a gen-delim,
+    and neither a host nor a port may contain one. So an `@` inside an
+    authority IS the userinfo delimiter; nothing here guesses whether what
+    precedes it looks like a secret, because the RFC has already said that is
+    where one goes.
+
+    `urlsplit` is deliberately NOT used. It would parse and this would then
+    have to re-assemble, and `urlunsplit` normalises -- it drops an empty
+    query's `?`, and re-joins a fragment this store has no reason to move.
+    `exchange.url` is EVIDENCE: the only edit it may carry is the one this
+    function is for. So the rule is applied to the string in place, which also
+    makes it the same rule the Java side applies to a request line, character
+    for character. They are compared over one shared vector file.
+
+    THE LAST `@` IN THE AUTHORITY, matching `urlsplit`'s own `rpartition('@')`
+    and the WHATWG URL parser. A conforming userinfo pct-encodes its own `@`,
+    so the two rules differ only on a malformed authority carrying two -- and
+    taking the first would leave the bytes between them verbatim.
+
+    WHAT IT DOES NOT TOUCH, named here because §7's mechanisms are only worth
+    what their exclusions are:
+
+      - A CREDENTIAL IN A QUERY PARAMETER THIS LIST DOES NOT NAME. The
+        VALUES of `CREDENTIAL_PARAMS` are replaced -- `?access_token=` is
+        redacted -- and a client's own name for a token is NOT:
+        `?acme_session=` reaches this column verbatim. Names, never shapes: a
+        rule that redacted what looks opaque would rewrite `?id=1001` and
+        corrupt the exact evidence an access-control check reads. The limit
+        is pinned by a test using a made-up parameter name, so it is a
+        measured fact and not a caveat that can be quietly widened.
+      - A NON-CREDENTIAL PARAMETER'S VALUE, which is the point of the list
+        existing at all. `?id=1001` survives byte for byte.
+      - A PERCENT-ENCODED NAME (`%61ccess_token`), a pair separated by `;`
+        rather than `&`, and a credential nested inside another parameter's
+        value. See `Redactor.addCredentialParamCuts` for each.
+      - An `@` in the PATH, the QUERY or the FRAGMENT. RFC 3986 3.3 allows one
+        there and `/users/alice@example.test` is a real path segment.
+      - A url with no `://` at all. There is no authority to find.
+    """
+    cuts = _userinfo_cuts(url) + _credential_param_cuts(url)
+    if not cuts:
+        # The common url, returned by identity. Anything with nothing to
+        # redact must come back byte for byte.
+        return url
+    cuts.sort()
+    out = []
+    at = 0
+    for start, end, with_ in cuts:
+        # Overlap is DROPPED, not merged, exactly as the Java side does it and
+        # for the same input: `?access_token=http://u:p@h/` nests a userinfo
+        # cut inside a parameter-value cut, and sorted by start the outer one
+        # has already consumed it.
+        if start < at:
+            continue
+        out.append(url[at:start])
+        out.append(with_)
+        at = end
+    out.append(url[at:])
+    return "".join(out)
+
+
+def _userinfo_cuts(url: str) -> list[tuple[int, int, str]]:
+    """The userinfo of the first URI in `url`, as a (start, end, text) cut.
+
+    The cut ENDS at the `@` rather than past it, so the `@` survives and the
+    result still reads as an authority.
+    """
+    scheme = url.find("://")
+    if scheme < 0:
+        return []
+    start = scheme + 3
+    end = start
+    # The authority's own terminators, plus the whitespace that ends a request
+    # target inside a request line. The whitespace half is redundant for a url
+    # column and is here so that this rule and the extension's are ONE rule:
+    # a difference the shared vectors cannot reach is still a difference.
+    while end < len(url) and url[end] not in "/?# \t\r\n":
+        end += 1
+    at = url.rfind("@", start, end)
+    if at < 0:
+        return []
+    return [(start, at, OBSERVED_USERINFO)]
+
+
+def _credential_param_cuts(url: str) -> list[tuple[int, int, str]]:
+    """The VALUES of `CREDENTIAL_PARAMS` in the query, as cuts.
+
+    RFC 3986 3.4: the query begins at the FIRST `?` and runs to the next `#`
+    or the end. `?` is a gen-delim and not a `pchar`, so it cannot appear
+    unencoded in a path and the first one really is the delimiter. Inside a
+    request LINE the target also ends at the SP before the HTTP-version, so
+    whitespace ends the scan too -- the same terminator set the extension
+    uses, because these are one rule in two languages.
+
+    `parse_qsl` is deliberately NOT used, twice over: it DECODES, and this
+    function has to return the byte offsets of the raw text so the rest of the
+    url survives verbatim; and it drops what it cannot parse, which would
+    silently leave a malformed pair carrying a credential untouched.
+
+    A pair with no `=` has no value to redact. An EMPTY value is left alone
+    for the reason job 3 leaves a deletion cookie's empty value: an empty
+    value cannot be a credential, and a placeholder would read as an issuance.
+    """
+    q = url.find("?")
+    if q < 0:
+        return []
+    end = q + 1
+    while end < len(url) and url[end] not in "# \t\r\n":
+        end += 1
+    cuts: list[tuple[int, int, str]] = []
+    p = q + 1
+    while p < end:
+        amp = url.find("&", p, end)
+        if amp < 0:
+            amp = end
+        eq = url.find("=", p, amp)
+        if eq >= 0 and eq + 1 < amp and url[p:eq].lower() in CREDENTIAL_PARAMS:
+            cuts.append((eq + 1, amp, OBSERVED_PARAM))
+        p = amp + 1
+    return cuts
 
 # Error class (spec S6) -> the `outcome` the exchange table accepts WHEN THE
 # REQUEST WAS ISSUED. Two of the four entries are never issued; the other two
@@ -192,16 +397,35 @@ STATUS_UNREADABLE = 599
 NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
                                 "tls_error", "bridge_lost"})
 
+# S5's `via` vocabulary, and the schema's CHECK enforces the same three.
+# `send` was the only value either writer could produce until Plan 4:
+# record_exchange hardcoded the literal and `denial` had no column to put one
+# in. `proxy` and `crawl` are the two other egress points, and a fourth value
+# would mean a fourth path -- which S4 forbids outright.
+#
+# Both `exchange.via` and `denial.via` carry it, and a test compares this
+# constant against BOTH constraints rather than one: the column was added to
+# `denial` in Plan 4 and two CHECKs spelling the same vocabulary are two
+# places for it to drift.
+VIA_VALUES = frozenset({"proxy", "send", "crawl"})
+
 # Error classes with no row of their own, named rather than forgotten.
 # `denial.kind` and `exchange.outcome` are CHECK-constrained vocabularies
 # written before these classes existed, and widening either is a schema
 # migration -- a new SCHEMA_VERSION and a table rebuild. A class in here still
 # reaches the caller as BridgeError.error_class; what it does not get is a row.
 #
-#   unmanaged_credential -- a real denial (S7 refuses the request and never
-#       persists it) with no `kind` to record it under. This is the gap to
-#       close first: it is the only class here that S4 calls a denial about a
-#       request the extension agreed to look at.
+# WHAT IS LEFT HERE IS NOT A DENIAL, and that is the whole of why the set is
+# allowed to be non-empty. S4's sentence -- "Any denial produces a `denial` row
+# and a distinct error class. Denials are never silent" -- is about DENIALS,
+# and every remaining member is a transport failure, a run-wide stop, or a
+# refusal about a FRAME rather than about a request the extension agreed to
+# look at. `unmanaged_credential` was the one exception, which is exactly why
+# it was called "the gap to close first"; it left this set on 2026-08-25 for
+# DENIAL_KIND and a `credential` row. What is left is a category rather than a
+# backlog, and the rule that follows from it is the useful part: a new class
+# that IS a denial must be given a `kind` rather than added below.
+#
 #   transport_error -- the request DID leave the JVM, so it belongs in
 #       `exchange`, but see EXCHANGE_OUTCOME above.
 #   halted -- not a per-request denial at all. One distressed host aborts the
@@ -233,7 +457,7 @@ NO_STATUS_OUTCOMES = frozenset({"timeout", "conn_refused", "dns_error",
 #       transcribed from S6 by hand and S6 did not list it either. Both ends
 #       of that are fixed: S6 lists it, and the set is now DERIVED from the
 #       emit sites.
-UNRECORDABLE = frozenset({"unmanaged_credential", "transport_error", "halted",
+UNRECORDABLE = frozenset({"transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
                           "protocol_mismatch", "bad_config", "unknown_frame"})
 
@@ -260,8 +484,12 @@ def row_for(error_class: str, *,
     An `issued=False` ambiguous class routes NOWHERE. `denial.kind`'s
     vocabulary is Plan 1's and has no value for "the caller's deadline had
     already passed", so the honest answer today is no row rather than a row
-    filed under a reason that is not the reason -- the same position
-    `unmanaged_credential` is in, and it belongs in the same schema migration.
+    filed under a reason that is not the reason. This was the same position
+    `unmanaged_credential` was in until SCHEMA_VERSION 6 gave it a kind; the
+    difference is that a never-issued `timeout` is not a DENIAL -- nobody
+    refused it, the caller gave up -- so S4's "denials are never silent" does
+    not reach it, and a kind of its own would be a new fact rather than a
+    vocabulary this store already had.
     """
     if error_class in DENIAL_KIND:
         # Precedence, and it is the whole reason this is a function: the two
@@ -303,7 +531,7 @@ def new_id(prefix: str) -> str:
 
 def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
                   method: str, url: str, detail: str, at_us: int,
-                  resolved_ip: str | None = None,
+                  via: str = "send", resolved_ip: str | None = None,
                   scope_version_id: str | None = None) -> str:
     """Record one refused request. Returns the row id.
 
@@ -314,7 +542,14 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
 
     `run_id` may be None. A `not_configured` denial at 02:00 happens before
     any run row exists, and that denial is exactly the one worth having.
+
+    `via` says WHICH EGRESS POINT refused. It defaults to 'send' because these
+    writers were built for the send path and every call site that predates
+    Plan 4 is one of its rows -- a default that is a fact about this module's
+    history, not a guess about the caller. `hx.capture` passes 'proxy'.
     """
+    if via not in VIA_VALUES:
+        raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
     if kind not in DENIAL_KINDS:
         raise ValueError(
             f"{kind!r} is not a denial kind; the schema accepts "
@@ -322,11 +557,16 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
             "records.DENIAL_KIND, and see records.UNRECORDABLE for the "
             "classes that have no row to go in yet."
         )
+    # AT THE WRITER, not at the caller, and for `count_drop`'s reason: this is
+    # where a url becomes a row, so it covers the callers that do not exist
+    # yet. `hx.capture` is the only one today and it hands the raw frame value
+    # straight through.
+    url = redact_url(url)
     row_id = new_id("d")
     conn.execute(
         "INSERT INTO denial(id, run_id, ts_us, kind, method, url, resolved_ip,"
-        " reason, scope_version_id) VALUES(?,?,?,?,?,?,?,?,?)",
-        (row_id, run_id, at_us, kind, method, url, resolved_ip, detail,
+        " reason, via, scope_version_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (row_id, run_id, at_us, kind, method, url, resolved_ip, detail, via,
          scope_version_id),
     )
     return row_id
@@ -335,7 +575,7 @@ def record_denial(conn: sqlite3.Connection, *, run_id: str | None, kind: str,
 def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
                     method: str, url: str, status: int | None,
                     req_blob: str | None, resp_blob: str | None, ms: int,
-                    at_us: int, outcome: str = "ok",
+                    at_us: int, outcome: str = "ok", via: str = "send",
                     resp_len: int | None = None,
                     surface_id: str | None = None,
                     scope_version_id: str | None = None,
@@ -356,25 +596,42 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     carries the outcome at all. That pairing reaches disk HERE and nowhere
     else, so this is the only place it can be enforced.
 
-    `via` is always 'send' here. The other two values in that vocabulary
-    belong to the proxy and the crawler, which are their own egress point and
-    their own plan.
+    `via` was always 'send' here until Plan 4, when `hx.capture` became the
+    proxy's egress point and passed 'proxy'. It still DEFAULTS to 'send', so
+    every send-path call site is unchanged; `crawl` has no caller yet.
 
     `identity`, `identity_generation` and `identity_state` stay NULL. Identity
     injection ships in Plan 5; writing 'assumed' now would be a claim about
     authentication that nothing in this plan can support.
     """
+    if via not in VIA_VALUES:
+        raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
     if outcome not in EXCHANGE_OUTCOMES:
         raise ValueError(
             f"{outcome!r} is not an exchange outcome; the schema accepts "
             f"{sorted(EXCHANGE_OUTCOMES)}. Map an error class through "
             "records.EXCHANGE_OUTCOME."
         )
-    if outcome == "ok" and status is None:
-        # 'ok' means a response came back. A row claiming one with no status
-        # is a row that reads as evidence and is not.
-        raise ValueError("an 'ok' exchange with no status is not an exchange "
-                         "that happened; give it the outcome it really had")
+    if status is None and outcome in ("ok", "truncated"):
+        # Both mean a response CAME BACK -- 'ok' whole, 'truncated' cut short
+        # -- so a row claiming one with no status is a row that reads as
+        # evidence and is not.
+        #
+        # 'truncated' was outside this guard until 2026-08-25, and the guard's
+        # absence was reachable: a `result` frame with no `status` key at all
+        # reached `hx.capture` and MEASURED an accepted exchange, one surface,
+        # `requests_issued=1` and `status NULL`. The third outcome that means
+        # a response came back, 'status_unreadable', is refused by the
+        # stricter guard below -- its only legal status is the 599 sentinel,
+        # so None fails there.
+        #
+        # What is left may be NULL and the NULL is the fact: NO_STATUS_OUTCOMES
+        # never had a status to carry, and scope_denied/rate_limited were
+        # decided before issuance. A test drives this off the same table that
+        # says which status each outcome may legally carry.
+        raise ValueError(
+            f"an exchange with outcome={outcome!r} and no status is not an "
+            "exchange that happened; give it the outcome it really had")
     if outcome == "status_unreadable" and status != STATUS_UNREADABLE:
         # The converse of the guard above, and the one this task was the
         # deliberate verification for. See STATUS_UNREADABLE.
@@ -394,13 +651,17 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
             "is not a fact about anything, and a check reads it later without "
             "the frame it came from."
         )
+    # §7, the same call `record_denial` makes and for the same reason: the two
+    # url columns are one exposure and a rule applied to one of them is a rule
+    # the other drifts away from.
+    url = redact_url(url)
     row_id = new_id("x")
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
         " recv_us, method, url, status, req_blob, resp_blob, resp_len,"
         " body_shed, scope_version_id, seq)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (row_id, run_id, surface_id, "send", outcome, at_us,
+        (row_id, run_id, surface_id, via, outcome, at_us,
          at_us + ms * 1000, method, url, status, req_blob, resp_blob,
          resp_len,
          # S6: solicited exchanges are NEVER shed -- they are about to become

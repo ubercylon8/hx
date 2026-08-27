@@ -1,3 +1,4 @@
+import logging
 import os
 import socket
 import stat
@@ -1842,3 +1843,349 @@ def test_send_refuses_a_reply_that_is_not_a_result_or_an_error(srv_with_halt):
         assert out["err"].error_class is None
     finally:
         c.close()
+
+
+# ---- Plan 4's unsolicited proxy traffic ---------------------------------
+#
+# `exchange`, `denial` and `dropped` frames answer no request: nothing is
+# waiting on an id, so `_deliver` would drop them on the floor. They go to
+# `on_exchange`, on the READ THREAD, with the same discipline `on_hello` and
+# `on_halted` carry -- and with one deliberate difference, which the first two
+# tests below are about.
+
+
+def _exchange_server(tmp_path, halt, sink):
+    s = server.BridgeServer(tmp_path / "x.sock", engagement_id="e-1",
+                            operator_halt=halt, on_exchange=sink)
+    s.start()
+    return s
+
+
+def _push(c, frame: bytes, srv, predicate, timeout=5.0):
+    """Write an unsolicited frame and wait for the read thread to act on it."""
+    c.sendall(frame)
+    deadline = time.time() + timeout
+    while time.time() < deadline and not predicate():
+        time.sleep(0.005)
+    return predicate()
+
+
+def test_an_exchange_frame_reaches_the_sink_with_both_halves(tmp_path, halt):
+    seen = []
+    s = _exchange_server(tmp_path, halt,
+                         lambda h, req, resp: seen.append((h, req, resp)))
+    try:
+        c = _connected(s)
+        frame = codec.encode_two(
+            {"v": 1, "t": "exchange", "via": "proxy", "source": "operator",
+             "method": "GET", "url": "http://app.test/x", "status": 200,
+             "ms": 12, "outcome": "ok"},
+            b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\nhi")
+        assert _push(c, frame, s, lambda: len(seen) == 1)
+        header, request, response = seen[0]
+        assert header["url"] == "http://app.test/x"
+        # The two halves arrive APART. Spliced, the far side would hash one
+        # blob for what S5 stores as two, and every request digest in the
+        # engagement would carry its response's bytes.
+        assert request == b"GET / HTTP/1.1\r\n\r\n"
+        assert response == b"HTTP/1.1 200 OK\r\n\r\nhi"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_dropped_frame_reaches_the_sink_and_does_not_close_the_channel(tmp_path, halt):
+    """Before this arm existed a `dropped` frame fell through `_handle` to
+    `return False`: the drop report -- the one thing that says a run's coverage
+    is a floor -- closed the connection that carried it, and DENY-ALL is where
+    a closed connection lands."""
+    seen = []
+    s = _exchange_server(tmp_path, halt,
+                         lambda h, req, resp: seen.append(h))
+    try:
+        c = _connected(s)
+        assert _push(c, codec.encode({"v": 1, "t": "dropped", "n": 7,
+                                      "source": "crawler"}),
+                     s, lambda: len(seen) == 1)
+        assert seen[0]["n"] == 7
+        assert seen[0]["source"] == "crawler"
+        # Still live: another frame gets through on the same connection.
+        assert _push(c, codec.encode({"v": 1, "t": "denial", "via": "proxy",
+                                      "url": "http://app.test/y",
+                                      "error_class": "scope_denied"}),
+                     s, lambda: len(seen) == 2)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_sink_that_throws_does_not_take_the_connection_down(tmp_path, halt):
+    """The one callback whose throw is NOT fatal, and S4 is why: a wedged
+    harness or a lost record changes what hx KNOWS, never what it ALLOWS. A
+    bookkeeping bug closing the channel would drop the extension to DENY-ALL
+    and stop the operator's browsing -- the failure turned into an outage.
+
+    `on_halted` is the opposite case and stays that way: a stop nothing wrote
+    down is a stop that did not happen.
+    """
+    calls = []
+
+    def sink(header, request, response):
+        calls.append(header)
+        raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        # TWO calls for one frame: the exchange, and the `dropped` frame that
+        # says the exchange was lost. The retry is attempted ONCE and only for
+        # a frame that was not itself a drop report, so a sink that raises on
+        # everything costs one extra call and not a recursion.
+        assert _push(c, frame, s, lambda: len(calls) == 2)
+        assert calls[0]["t"] == "exchange"
+        assert calls[1] == {"v": 1, "t": "dropped", "n": 1}
+        assert isinstance(s.exchange_callback_error, RuntimeError)
+        assert s.exchange_errors == 2      # the exchange, and the retry
+        # ...and the NEXT one still arrives, which is what "not fatal" means.
+        assert _push(c, frame, s, lambda: len(calls) == 4)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_lost_exchange_is_handed_back_as_a_drop(tmp_path, halt):
+    """The coverage floor, on this side of the bridge.
+
+    `exchange_callback_error` and `exchange_errors` are kept, and nothing
+    outside tests/ reads either -- so a run whose every exchange frame was
+    malformed reported COMPLETE coverage. That is the Java side's "a Burp log
+    line is not the coverage floor" wearing a different hat. `run.dropped_total`
+    is the number S5 makes the floor, and the only way a loss here reaches it
+    is a `dropped` frame.
+    """
+    seen = []
+
+    def sink(header, request, response):
+        seen.append(header)
+        if header.get("t") != "dropped":
+            raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange", "via": "proxy",
+                                  "source": "crawler",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        assert _push(c, frame, s, lambda: len(seen) == 2)
+        assert seen[1]["t"] == "dropped" and seen[1]["n"] == 1
+        # Against the CRAWLER's run, not the operator's. `hx.capture._run`
+        # turns this string into a run KIND, and filing the crawler's lost
+        # exchange against the operator inflates the wrong row's floor.
+        assert seen[1]["source"] == "crawler"
+        assert s.exchange_errors == 1      # the retry succeeded
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_lost_drop_report_is_not_re_reported_as_another_drop(tmp_path, halt):
+    """One extra call, never a recursion -- and never a count of its own.
+
+    A `dropped` frame the sink could not record is already the coverage floor
+    failing to land; answering it with a second `dropped` frame would be a
+    number this side invented, and a sink that refuses every drop report would
+    invent one per frame forever.
+    """
+    seen = []
+
+    def sink(header, request, response):
+        seen.append(header)
+        raise RuntimeError("the store is on fire")
+
+    s = _exchange_server(tmp_path, halt, sink)
+    try:
+        c = _connected(s)
+        assert _push(c, codec.encode({"v": 1, "t": "dropped", "n": 5}),
+                     s, lambda: s.exchange_errors == 1)
+        time.sleep(0.05)
+        assert len(seen) == 1 and seen[0]["n"] == 5
+        assert s.exchange_errors == 1
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_a_malformed_two_body_payload_is_counted_not_raised(tmp_path, halt):
+    """`_serve` closes the connection on a FrameError, so a split that raised
+    out of `_handle` would be the same outage by another route."""
+    seen = []
+    s = _exchange_server(tmp_path, halt, lambda h, q, r: seen.append(h))
+    try:
+        c = _connected(s)
+        # Declares two bodies; the payload holds one truncated length prefix.
+        bad = codec.encode({"v": 1, "t": "exchange", "url": "http://app.test/x",
+                            codec.BODIES_KEY: 2}, b"\x00\x00")
+        assert _push(c, bad, s, lambda: s.exchange_errors == 1)
+        assert isinstance(s.exchange_callback_error, codec.FrameError)
+        # The frame never became an exchange row -- and it did not vanish
+        # either. A payload that could not be split is a record hx does not
+        # have, so it reaches the sink as a drop instead.
+        assert seen == [{"v": 1, "t": "dropped", "n": 1}]
+        good = codec.encode_two({"v": 1, "t": "exchange",
+                                 "url": "http://app.test/y"}, b"a", b"b")
+        assert _push(c, good, s, lambda: len(seen) == 2)
+        assert s.state == "connected"
+        c.close()
+    finally:
+        s.stop()
+
+
+def test_an_exchange_frame_with_no_sink_installed_keeps_the_channel(tmp_path, halt):
+    """A harness that has not wired capture up yet is a harness that loses the
+    records, not one that loses the connection."""
+    s = server.BridgeServer(tmp_path / "n.sock", engagement_id="e-1",
+                            operator_halt=halt)
+    s.start()
+    try:
+        c = _connected(s)
+        frame = codec.encode_two({"v": 1, "t": "exchange",
+                                  "url": "http://app.test/x"}, b"a", b"b")
+        c.sendall(frame)
+        c.sendall(codec.encode({"v": 1, "t": "dropped", "n": 1}))
+        # Nothing to observe on the sink, so observe the channel instead: a
+        # hello over the same connection still lands.
+        assert _push(c, codec.encode({"v": 1, "t": "halted", "reason": "x",
+                                      "host": "h", "window": "w"}),
+                     s, lambda: s.last_halted is not None)
+        c.close()
+    finally:
+        s.stop()
+
+
+def _reject_next_peer(monkeypatch):
+    """Make SO_PEERCRED report a foreign uid, the way
+    `test_so_peercred_rejects_a_foreign_uid` does. A test cannot connect as
+    another account, and the branch worth covering is the one that only
+    another account can reach."""
+    real_getsockopt = socket.socket.getsockopt
+
+    def fake_getsockopt(self, level, optname, buflen=0):
+        if optname == socket.SO_PEERCRED:
+            return struct.pack("3i", 4242, os.getuid() + 1, os.getgid())
+        return real_getsockopt(self, level, optname, buflen)
+
+    monkeypatch.setattr(socket.socket, "getsockopt", fake_getsockopt)
+
+
+def test_a_refused_peer_is_counted_and_logged_rather_than_dropped_in_silence(
+        srv, monkeypatch, caplog):
+    """S6's uid check left NO TRACE, and it is the one connection event on
+    this socket that is a security event rather than a misconfiguration.
+
+    `rejected_hellos` sits four lines of code away and has been counted since
+    Plan 2 -- a wrong engagement_id, which is an operator pointing a harness
+    at the wrong store. Another UID on this machine reaching for a capability
+    that can send arbitrary HTTP into a client's production estate got a bare
+    `return`: no counter, no log line, no row. An attempt nobody can see is
+    indistinguishable from no attempt.
+
+    Both halves are asserted. The counter is what a caller can read; the log
+    line is what an operator sees at the time, and `hx` installs no handler,
+    so the LEVEL is load-bearing -- under Python's default configuration a
+    WARNING reaches lastResort on stderr and an INFO does not.
+    """
+    _reject_next_peer(monkeypatch)
+    before = srv.rejected_peers
+    with caplog.at_level(logging.WARNING, logger="hx.bridge.server"):
+        c = _client(srv.socket_path)
+        try:
+            hello = codec.encode({"v": 1, "t": "hello", "ext_version": "0.1",
+                                  "pid": os.getpid(), "burp_version": "x",
+                                  "instance_id": "i-1", "engagement_id": "e-1"})
+            assert _never_served(c, hello) == b""
+            _await(lambda: srv.rejected_peers > before,
+                   "a peer was refused by SO_PEERCRED and nothing counted it")
+        finally:
+            c.close()
+
+    assert srv.rejected_peers == before + 1
+    assert srv.last_rejected_peer["uid"] == os.getuid() + 1
+    assert srv.last_rejected_peer["pid"] == 4242
+    assert "exe" in srv.last_rejected_peer
+
+    warnings_ = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings_, (
+        "the refusal was counted and not logged. The counter is read by "
+        "whoever thinks to look; the log line is what reaches an operator who "
+        "does not know to")
+    text = warnings_[-1].getMessage()
+    assert str(os.getuid() + 1) in text and "4242" in text, text
+
+
+def test_a_refused_peer_is_still_refused_and_none_of_this_serves_it(
+        srv, monkeypatch):
+    """The counter must not be the only thing that changed. A diagnostic that
+    also opened the door would be worse than no diagnostic, and the two
+    fields the uid check `return`s in front of are what say the connection was
+    REFUSED rather than merely quiet."""
+    _reject_next_peer(monkeypatch)
+    c = _client(srv.socket_path)
+    try:
+        assert _never_served(c, codec.encode(
+            {"v": 1, "t": "hello", "ext_version": "0.1", "pid": os.getpid(),
+             "burp_version": "x", "instance_id": "i-1",
+             "engagement_id": "e-1"})) == b""
+        _await(lambda: srv.rejected_peers == 1, "the refusal was not counted")
+        assert (srv.peer_uid, srv.peer_pid, srv.peer_exe) == (None, None, None)
+        assert srv.state == "waiting"
+        assert srv.hello is None
+    finally:
+        c.close()
+
+
+def test_the_accepted_peers_executable_is_resolved_and_recorded(srv):
+    """S6: "peer credentials are checked and the connecting pid's executable
+    is logged." Nothing resolved it, on either path. This is a real pid -- the
+    test's own -- so the readlink succeeds and the value is the interpreter
+    running this suite, which is what makes the assertion a real one rather
+    than a check that some string was stored."""
+    c = _connected(srv)
+    try:
+        assert srv.peer_pid == os.getpid()
+        assert srv.peer_exe == os.readlink(f"/proc/{os.getpid()}/exe")
+    finally:
+        c.close()
+
+
+def test_an_unresolvable_executable_says_which_kind_of_unresolvable(monkeypatch):
+    """`peer_exe` NEVER RAISES and never answers "unknown".
+
+    It runs inside `_serve` on the accept-loop thread, where a throw takes the
+    connection down -- and a diagnostic that can refuse a peer is not a
+    diagnostic. The three answers are also deliberately different strings: for
+    a peer running as ANOTHER uid, which is exactly the peer this exists to
+    describe, `/proc/<pid>/exe` needs PTRACE_MODE_READ and the kernel refuses
+    it unless hx is root. "unknown" would read as "no executable" rather than
+    "not permitted to look", and the difference is the whole diagnostic.
+    """
+    def raiser(exc):
+        def go(_path):
+            raise exc
+        return go
+
+    monkeypatch.setattr(server.os, "readlink", raiser(PermissionError(13, "x")))
+    assert "permission denied" in server.peer_exe(1).lower()
+    monkeypatch.setattr(server.os, "readlink", raiser(FileNotFoundError(2, "x")))
+    assert "gone" in server.peer_exe(1)
+    monkeypatch.setattr(server.os, "readlink", raiser(OSError(5, "EIO")))
+    assert server.peer_exe(1).startswith("<unreadable:")
+    # A pid this process cannot possibly be resolving, through the REAL
+    # readlink: the answer is still a string and still not an exception.
+    monkeypatch.undo()
+    assert isinstance(server.peer_exe(0x7FFFFFFF), str)

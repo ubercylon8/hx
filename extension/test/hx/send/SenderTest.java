@@ -658,12 +658,14 @@ public class SenderTest {
      *   dangerous-path AND unmanaged Cookie  -> unmanaged_credential
      *   wrong method AND unmanaged Cookie    -> unmanaged_credential
      *
-     * `unmanaged_credential` is in `records.UNRECORDABLE`: there is no
-     * `denial` row for it and no `kind` to file one under. So a scope
+     * `unmanaged_credential` was in `records.UNRECORDABLE` when this moved:
+     * no `denial` row for it and no `kind` to file one under. So a scope
      * violation carrying a Cookie produced NO ROW ANYWHERE, and an error class
      * naming the credential rather than the boundary crossed. s4: "Any denial
      * produces a `denial` row and a distinct error class. Denials are never
-     * silent."
+     * silent." SCHEMA_VERSION 6 gave the class `kind='credential'`, which
+     * settles the row half; the WRONG-CLASS half is what this ordering fixes
+     * and it is unaffected.
      *
      * WHY THAT WAS NOT A THEORETICAL SHAPE. Until Plan 5 ships identity
      * injection, the natural agent action is replaying a request lifted from

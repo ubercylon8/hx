@@ -155,6 +155,10 @@ public class BridgeClientTest {
               BridgeClientTest::aThrowingSendArmBothDeniesAndStopsTheLoop);
             t("anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives",
               BridgeClientTest::anUnusableLimitIsRefusedAtConfigureTimeAndTheChannelSurvives);
+            t("theExchangeSinkFramesBothHalves",
+              BridgeClientTest::theExchangeSinkFramesBothHalves);
+            t("theExchangeSinkNeverRaisesIntoCapture",
+              BridgeClientTest::theExchangeSinkNeverRaisesIntoCapture);
         } finally {
             Files.deleteIfExists(sock);
             Files.deleteIfExists(dir);
@@ -1347,6 +1351,159 @@ public class BridgeClientTest {
                   "bad_config".equals(zero.header.get("class")));
         } finally {
             Files.deleteIfExists(dir.resolve("bl.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * The capture sink, on the wire: one frame, two bodies, version stamped.
+     *
+     * The two halves cannot share one opaque body -- the far side
+     * content-addresses each on its own -- and a `v` this side forgets is a
+     * frame BridgeServer._handle drops before it looks at `t` at all.
+     */
+    static void theExchangeSinkFramesBothHalves() throws Exception {
+        Path dir = Files.createTempDirectory("hxbridge-x");
+        try (Live l = live(dir, "xs.sock")) {
+            BridgeClient.ExchangeSink sink = l.client.exchangeSink();
+            Map<String, Object> h = new LinkedHashMap<>();
+            h.put("t", "exchange");
+            h.put("via", "proxy");
+            h.put("source", "operator");
+            h.put("url", "http://app.test/x");
+            check("a delivered exchange answers TRUE, which is what lets the "
+                  + "drain not count it as a drop",
+                  sink.exchange(h, "REQ".getBytes(StandardCharsets.UTF_8),
+                                "RESPONSE".getBytes(StandardCharsets.UTF_8)));
+            Frame.Decoded f = read(l.reader, l.peer, "the exchange frame");
+            check("the frame is an exchange (" + f.header.get("t") + ")",
+                  "exchange".equals(f.header.get("t")));
+            check("and carries the protocol version (" + f.header.get("v") + ")",
+                  Long.valueOf(BridgeClient.PROTOCOL_VERSION).equals(f.header.get("v")));
+            check("and declares two bodies (" + f.header.get(Frame.BODIES_KEY) + ")",
+                  Long.valueOf(2L).equals(f.header.get(Frame.BODIES_KEY)));
+            check("the request half arrived intact ("
+                  + new String(f.body, StandardCharsets.UTF_8) + ")",
+                  "REQ".equals(new String(f.body, StandardCharsets.UTF_8)));
+            check("and the response half separately, not spliced onto it ("
+                  + (f.second == null ? "null"
+                     : new String(f.second, StandardCharsets.UTF_8)) + ")",
+                  f.second != null
+                  && "RESPONSE".equals(new String(f.second, StandardCharsets.UTF_8)));
+
+            // A drop report the far side can add to run.dropped_total.
+            check("a delivered drop report answers TRUE, which is what lets "
+                  + "the drain advance its cumulative counter",
+                  sink.dropped(4L, "crawler"));
+            Frame.Decoded d = read(l.reader, l.peer, "the drop report");
+            check("the drop frame is the type hx.capture knows ("
+                  + d.header.get("t") + ")", "dropped".equals(d.header.get("t")));
+            check("and carries n as an integer (" + d.header.get("n") + ")",
+                  Long.valueOf(4L).equals(d.header.get("n")));
+            check("and names the source whose run it belongs to ("
+                  + d.header.get("source") + ")",
+                  "crawler".equals(d.header.get("source")));
+
+            // A source with no spelling gets no key, rather than the operator's.
+            // hx/capture.py documents what an ABSENT source means and answers
+            // the operator's run for it; a second place writing "operator" is a
+            // second place that decision can drift. NULL is how "no spelling"
+            // reaches here now: `Capture.sourceName` answers it for a Source
+            // this side has no string for, and this file no longer knows what
+            // an hx.proxy enum is at all.
+            sink.dropped(1L, null);
+            Frame.Decoded u = read(l.reader, l.peer, "the unattributed drop report");
+            check("an unspellable source is omitted, not defaulted ("
+                  + u.header.get("source") + ")",
+                  !u.header.containsKey("source"));
+
+            // A denial: S4's second enforcement point refusing a request.
+            // ONE body slot and it is empty -- the request never left, so
+            // there are no bytes to carry, and `server.py::_capture` splits
+            // two bodies out of an `exchange` frame ONLY. A denial framed
+            // with two would be read as a malformed exchange by the far side
+            // and counted as a drop rather than recorded as the refusal it is.
+            Map<String, Object> dn = new LinkedHashMap<>();
+            dn.put("t", "denial");
+            dn.put("via", "proxy");
+            dn.put("source", "operator");
+            dn.put("method", "POST");
+            dn.put("url", "http://app.test/account/delete");
+            dn.put("error_class", "dangerous_denied");
+            dn.put("detail", "matches dangerous.path /account/delete");
+            check("a delivered denial answers TRUE, which is what lets the "
+                  + "drain not count it as a drop", sink.denial(dn));
+            Frame.Decoded n = read(l.reader, l.peer, "the denial frame");
+            check("the denial frame is the type hx.capture knows ("
+                  + n.header.get("t") + ")", "denial".equals(n.header.get("t")));
+            check("and carries the protocol version (" + n.header.get("v") + ")",
+                  Long.valueOf(BridgeClient.PROTOCOL_VERSION).equals(n.header.get("v")));
+            check("and the class the far side routes on ("
+                  + n.header.get("error_class") + ")",
+                  "dangerous_denied".equals(n.header.get("error_class")));
+            check("and declares ONE body, not two (" + n.header.get(Frame.BODIES_KEY)
+                  + ")", !n.header.containsKey(Frame.BODIES_KEY));
+            check("which is empty (" + n.body.length + " bytes)",
+                  n.body.length == 0 && n.second == null);
+        } finally {
+            Files.deleteIfExists(dir.resolve("xs.sock")); Files.deleteIfExists(dir);
+        }
+    }
+
+    /**
+     * A dead socket loses the records. It must not ALSO stop the browser, and
+     * it must not read as success.
+     *
+     * Not raising is the same rule as "offering never blocks", one layer down:
+     * an exception out of here lands on Capture's drain thread, and the drain
+     * dying is how a lost record becomes a permanently silent capture. So
+     * every arm of the sink swallows.
+     *
+     * SWALLOWING IS NOT ENOUGH, and this method's last check used to say it
+     * was: "and so was the lost drop report, which is the coverage floor",
+     * about a line in Burp's log. It is not the coverage floor.
+     * `run.dropped_total` is, and nothing reads Burp's log into it. Because
+     * these methods returned normally after logging, the drain read a failed
+     * write as an acknowledged report and advanced its cumulative counter past
+     * it: 5,000 drops counted while the harness restarts, one log line, a
+     * reconnect, and `run.dropped_total = 0`. The boolean is what the far side
+     * can act on.
+     */
+    static void theExchangeSinkNeverRaisesIntoCapture() throws Exception {
+        Path dir = Files.createTempDirectory("hxbridge-xd");
+        try (Live l = live(dir, "xd.sock")) {
+            BridgeClient.ExchangeSink sink = l.client.exchangeSink();
+            l.peer.close();
+            l.client.close();          // the channel is gone; writes must fail
+            boolean threw = false;
+            boolean anyClaimedDelivery = false;
+            try {
+                for (int i = 0; i < 5; i++) {
+                    anyClaimedDelivery |=
+                        sink.exchange(Map.of("t", "exchange", "url", "http://a/" + i),
+                                      "r".getBytes(StandardCharsets.UTF_8),
+                                      "s".getBytes(StandardCharsets.UTF_8));
+                    anyClaimedDelivery |= sink.dropped(1L, "operator");
+                    anyClaimedDelivery |=
+                        sink.denial(Map.of("t", "denial", "url", "http://a/" + i,
+                                           "error_class", "scope_denied"));
+                }
+            } catch (Throwable t) { threw = true; }
+            check("no arm raised into the drain thread", !threw);
+            check("and none claimed to have delivered anything, which is "
+                  + "what keeps the coverage floor countable",
+                  !anyClaimedDelivery);
+            check("the lost exchange was logged, not swallowed silently",
+                  l.log.sawError("exchange frame undeliverable"));
+            check("and so was the lost drop report",
+                  l.log.sawError("drop report undeliverable"));
+            // The denial is the newest of the three and the easiest to leave
+            // out: a refusal hx recorded nowhere is the one loss that reads,
+            // from the operator's side, exactly like a request that was
+            // allowed.
+            check("and so was the lost denial",
+                  l.log.sawError("denial frame undeliverable"));
+        } finally {
+            Files.deleteIfExists(dir.resolve("xd.sock")); Files.deleteIfExists(dir);
         }
     }
 

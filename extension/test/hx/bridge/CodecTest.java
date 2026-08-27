@@ -54,6 +54,12 @@ public class CodecTest {
         t("malformedInputsAreRejected", CodecTest::malformedInputsAreRejected);
         t("invalidUtf8HeaderIsRejected", CodecTest::invalidUtf8HeaderIsRejected);
         t("pairedSurrogateEqualsRawSupplementaryCharacter", CodecTest::pairedSurrogateEqualsRawSupplementaryCharacter);
+        t("twoBodiesRoundTripAndStayApart", CodecTest::twoBodiesRoundTripAndStayApart);
+        t("theOneBodyFormIsUntouchedByTheTwoBodyForm",
+          CodecTest::theOneBodyFormIsUntouchedByTheTwoBodyForm);
+        t("malformedTwoBodyPayloadsAreRefused", CodecTest::malformedTwoBodyPayloadsAreRefused);
+        t("theTwoBodyWireFormIsTheSameOnBothSides",
+          CodecTest::theTwoBodyWireFormIsTheSameOnBothSides);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -332,6 +338,122 @@ public class CodecTest {
         raw[2] = (byte) (len >>> 8);  raw[3] = (byte) len;
         System.arraycopy(payload, 0, raw, 4, len);
         return raw;
+    }
+
+    // ---- the two-body form ---------------------------------------------
+
+    /**
+     * The SAME bytes tests/test_bridge_codec.py records for the same inputs.
+     *
+     * A frame both codecs merely round-trip against THEMSELVES is a frame two
+     * implementations can disagree about forever: the existing golden vectors
+     * exist for exactly that reason, and the two-body form needs its own,
+     * because none of them declares `bodies`. Written as a literal in both
+     * files rather than added to frames.json, whose every consumer calls the
+     * ONE-body encoder.
+     */
+    static final String TWO_BODY_HEX =
+        "0000004f7b2276223a312c2274223a2265786368616e6765222c2275726c223a"
+      + "22687474703a2f2f6170702e746573742f78222c22626f64696573223a327d0a"
+      + "0000000352455100000008524553504f4e5345";
+
+    static Map<String, Object> exchangeHeader() {
+        Map<String, Object> h = new LinkedHashMap<>();
+        h.put("v", 1L);
+        h.put("t", "exchange");
+        h.put("url", "http://app.test/x");
+        return h;
+    }
+
+    static void theTwoBodyWireFormIsTheSameOnBothSides() {
+        byte[] raw = Frame.encode(exchangeHeader(),
+                                  "REQ".getBytes(StandardCharsets.UTF_8),
+                                  "RESPONSE".getBytes(StandardCharsets.UTF_8));
+        check("the two-body frame is byte-for-byte what Python writes ("
+              + hex(raw) + ")", TWO_BODY_HEX.equals(hex(raw)));
+        Frame.Decoded d = Frame.decode(unhex(TWO_BODY_HEX));
+        check("and Python's bytes decode here to the same request half",
+              "REQ".equals(new String(d.body, StandardCharsets.UTF_8)));
+        check("and to the same response half",
+              d.second != null
+              && "RESPONSE".equals(new String(d.second, StandardCharsets.UTF_8)));
+    }
+
+    static void twoBodiesRoundTripAndStayApart() {
+        // Two EMPTY halves, and a first half whose bytes are a plausible
+        // length prefix of their own: the case that separates real length
+        // prefixes from a delimiter scan.
+        byte[] first = new byte[] {0, 0, 0, 8, 'x'};
+        byte[] second = new byte[0];
+        Frame.Decoded d = Frame.decode(Frame.encode(exchangeHeader(), first, second));
+        check("a first half that looks like a length prefix survives whole",
+              Arrays.equals(first, d.body));
+        check("an EMPTY second half is an empty array, not a null -- an "
+              + "exchange with no response is not a one-body frame",
+              d.second != null && d.second.length == 0);
+
+        byte[] big = new byte[70000];
+        for (int i = 0; i < big.length; i++) big[i] = (byte) i;
+        Frame.Decoded e = Frame.decode(Frame.encode(exchangeHeader(), big, big));
+        check("a body larger than one read chunk round-trips as the first half",
+              Arrays.equals(big, e.body));
+        check("and as the second", Arrays.equals(big, e.second));
+    }
+
+    static void theOneBodyFormIsUntouchedByTheTwoBodyForm() {
+        // Item 5 of this task: every existing frame goes through Frame, and
+        // the golden vectors pin their bytes. This says the same thing from
+        // the other side -- a one-body frame decodes with NO second body, so
+        // nothing that reads `second` can mistake a payload for two halves.
+        Map<String, Object> h = exchangeHeader();
+        byte[] raw = Frame.encode(h, "BODY".getBytes(StandardCharsets.UTF_8));
+        Frame.Decoded d = Frame.decode(raw);
+        check("a one-body frame has no second body", d.second == null);
+        check("and its body is the whole payload",
+              "BODY".equals(new String(d.body, StandardCharsets.UTF_8)));
+        check("and its header carries no " + Frame.BODIES_KEY + " key",
+              !d.header.containsKey(Frame.BODIES_KEY));
+        // The stamp goes on a COPY: a caller's map must not come back mutated,
+        // or the next frame it builds silently declares two bodies it has not
+        // got.
+        Frame.encode(h, "a".getBytes(StandardCharsets.UTF_8),
+                     "b".getBytes(StandardCharsets.UTF_8));
+        check("and encoding two bodies did not stamp the caller's header",
+              !h.containsKey(Frame.BODIES_KEY));
+    }
+
+    static void malformedTwoBodyPayloadsAreRefused() {
+        // Each case is a payload a lenient reader would accept by guessing,
+        // and each guess is a different pair of halves than the writer meant.
+        expectThrows("a payload too short to hold a first length prefix",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(new byte[] {0, 0})));
+        expectThrows("a first length that runs past the payload",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(new byte[] {0, 0, 0, 99, 'a'})));
+        expectThrows("a second length that runs past the payload",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(
+                         new byte[] {0, 0, 0, 1, 'a', 0, 0, 0, 99})));
+        expectThrows("bodies that leave trailing bytes behind them",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(twoBodyFrame(
+                         new byte[] {0, 0, 0, 1, 'a', 0, 0, 0, 1, 'b', 'X'})));
+        // `bodies` is a declaration, not a hint: a value this version does not
+        // know is a frame it cannot read, and reading it as one body would
+        // hand the far side a request with a response spliced onto it.
+        Map<String, Object> three = exchangeHeader();
+        three.put(Frame.BODIES_KEY, 3L);
+        expectThrows("a bodies count this version does not know",
+                     Frame.FrameError.class,
+                     () -> Frame.decode(Frame.encode(three, new byte[] {1, 2, 3})));
+    }
+
+    /** A frame declaring two bodies over a payload chosen by the caller. */
+    static byte[] twoBodyFrame(byte[] payload) {
+        Map<String, Object> h = exchangeHeader();
+        h.put(Frame.BODIES_KEY, 2L);
+        return Frame.encode(h, payload);
     }
 
     static String hex(byte[] b) {

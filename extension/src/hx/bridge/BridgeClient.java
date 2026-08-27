@@ -686,6 +686,134 @@ public final class BridgeClient {
         out.flush();
     }
 
+    /** The two-body write, on the SAME monitor as the one-body one. Frames are
+     *  built whole and written under one lock precisely so two threads cannot
+     *  splice their bytes together -- and this one is written by the capture
+     *  drain while the read loop may be answering a send. */
+    private synchronized void send(Map<String, Object> header, byte[] first,
+                                   byte[] second) throws IOException {
+        out.write(Frame.encode(header, first, second));
+        out.flush();
+    }
+
+    /**
+     * Where the capture drain pushes what it has recorded.
+     *
+     * DECLARED HERE, like {@link HaltSink} and {@link SendHandler}, and for
+     * the same reason: the package that CALLS the bridge depends on the
+     * bridge, never the other way round. Returning a proxy-package type from
+     * this class made the two packages import each other -- a cycle javac
+     * does not mind and a reader does.
+     *
+     * SOURCE-AGNOSTIC, which is the half that actually breaks it. A
+     * `dropped(long, Source)` still names the other package in its signature,
+     * and an implementation of it still has to know how that enum is spelled.
+     * So the caller does the spelling -- `Capture.sourceName`, where it
+     * already lived -- and hands over a STRING, with `null` meaning "this
+     * source has no spelling". The sink's whole job with a null is to omit
+     * the key.
+     *
+     * FALSIFIABLE rather than asserted: ChokepointTest's
+     * `theBridgeNamesNothingInTheProxyPackage` counts the needle in every
+     * SHIPPED file of this package and requires zero, comments included.
+     * WHAT IT DOES NOT COVER is this package's tests: `ChokepointTest.sources()`
+     * walks `extension/src` only, and `extension/test` names the other package
+     * freely -- BridgeClientTest does, at the point where it builds a record
+     * to hand this sink. That is the right boundary rather than an oversight:
+     * a test is not compiled into the jar, so it cannot reintroduce the cycle
+     * the guard exists to keep out of it.
+     *
+     * EVERY METHOD ANSWERS WHETHER THE RECORD REACHED THE WIRE, and none
+     * raises. Not raising is the same rule as "offering never blocks", one
+     * layer down: an exception thrown back into the drain thread kills it,
+     * and every record after it is lost silently. But "swallow and return"
+     * alone was a second silence -- the drain read a normal return as
+     * success and advanced its cumulative counter past drops that never left
+     * the process. Measured shape: the queue saturates while the Python
+     * harness restarts, 5,000 drops are counted, the write fails, one line
+     * lands in Burp's log, the bridge reconnects, and `run.dropped_total`
+     * reads 0. A BURP LOG LINE IS NOT THE COVERAGE FLOOR. False is.
+     *
+     * NOT A SEND, and not gated like one. `maySend()` answers "may this
+     * extension ISSUE a request", and an exchange frame issues nothing: it
+     * reports traffic that has ALREADY happened, through the proxy, under
+     * S4's other enforcement point. Refusing to report it while halted would
+     * mean an operator hitting stop also stopped the record of what had been
+     * seen up to that moment -- the halt erasing its own evidence.
+     */
+    public interface ExchangeSink {
+        /** True once the frame is on the wire. False means the record is
+         *  lost and the caller is the only thing that can count it. */
+        boolean exchange(Map<String, Object> header, byte[] request, byte[] response);
+
+        /** `source` is the far side's spelling, or null for a source that has
+         *  none. True once the report is on the wire; false leaves the whole
+         *  outstanding total with the caller, to go out again. */
+        boolean dropped(long n, String source);
+
+        /** A request S4's second enforcement point refused. One body slot,
+         *  empty: `server.py::_capture` hands `denial` and `dropped` to the
+         *  sink as two empty halves. True once the frame is on the wire;
+         *  false means the record is lost and the caller must count it. */
+        boolean denial(Map<String, Object> header);
+    }
+
+    public ExchangeSink exchangeSink() {
+        return new ExchangeSink() {
+            public boolean exchange(Map<String, Object> header, byte[] request,
+                                    byte[] response) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.putAll(header);
+                try {
+                    send(f, request, response);
+                    return true;
+                } catch (Throwable e) {
+                    log.error("hx: exchange frame undeliverable, record lost: " + e);
+                    return false;
+                }
+            }
+
+            public boolean dropped(long n, String source) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.put("t", "dropped");
+                f.put("n", n);
+                // OMITTED, not defaulted, when the source has no spelling.
+                // `hx.capture` documents what an absent `source` means and
+                // answers the operator's run for it; writing "operator" here
+                // would make this file a second, quieter place that decision
+                // is taken, and the two would drift.
+                if (source != null) f.put("source", source);
+                try {
+                    send(f, new byte[0]);
+                    return true;
+                } catch (Throwable e) {
+                    log.error("hx: drop report undeliverable, coverage floor "
+                              + "unrecorded: " + e);
+                    return false;
+                }
+            }
+
+            public boolean denial(Map<String, Object> header) {
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("v", PROTOCOL_VERSION);
+                f.putAll(header);
+                try {
+                    // ONE body, and empty. A denial describes a request that
+                    // produced no traffic: there are no bytes to carry, and
+                    // `server.py::_capture` splits two bodies out of an
+                    // `exchange` frame only.
+                    send(f, new byte[0]);
+                    return true;
+                } catch (Throwable e) {
+                    log.error("hx: denial frame undeliverable, record lost: " + e);
+                    return false;
+                }
+            }
+        };
+    }
+
     public void close() {
         synchronized (commitLock) {
             closed = true;           // sticky: checked by connect() and handle()

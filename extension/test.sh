@@ -5,6 +5,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MONTOYA="${MONTOYA_JAR:-../../burp-lab/probe/lib/montoya-api.jar}"
+# REFUSE TO START RATHER THAN COMPILE NOTHING. build.sh has had this line
+# since it was written; this file did not, and the gap is rule 1's own failure
+# mode built into the harness rule 1 exists to protect. Without the jar every
+# `import burp.api.montoya.*` is a javac error, ZERO summary lines print, and
+# `./test.sh | grep -c FAIL` -- the idiom this project's briefs prescribe --
+# reads 0. Measured on this tree with MONTOYA_JAR=/nonexistent: 0 summary
+# lines, 0 FAIL, rc=1, and a hundred lines of javac noise above it. The exit
+# code was the ONLY thing that saw it, and a reviewer piping to grep does not
+# see the exit code. The default path is relative to extension/ and does not
+# resolve from a git worktree, so this is one `git worktree add` away from any
+# reviewer -- both whole-branch reviewers of this tree had to set MONTOYA_JAR
+# by hand, and both wrote down that this file does not say so.
+[ -f "$MONTOYA" ] || { echo "montoya-api.jar not found at $MONTOYA (set MONTOYA_JAR)" >&2; exit 1; }
+
 rm -rf build/test-classes
 mkdir -p build/test-classes
 javac --release 21 -nowarn -Xlint:-options \
@@ -23,6 +37,10 @@ CLASSES=(
     hx.send.RedactorTest
     hx.send.HaltSwitchTest
     hx.send.SenderTest
+    hx.proxy.ProxyGateTest
+    hx.proxy.CaptureTest
+    hx.proxy.PendingTest
+    hx.proxy.RecorderTest
     hx.ChokepointTest
 )
 

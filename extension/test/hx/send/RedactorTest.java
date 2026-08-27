@@ -69,6 +69,57 @@ public class RedactorTest {
         t("aHeadWhoseFirstLineIsAFieldIsStillRedacted", RedactorTest::aHeadWhoseFirstLineIsAFieldIsStillRedacted);
         t("theResponseBodyIsNeverRewritten", RedactorTest::theResponseBodyIsNeverRewritten);
 
+        t("anObservedCookieIsReplacedAndItsNameKept",
+          RedactorTest::anObservedCookieIsReplacedAndItsNameKept);
+        t("anObservedAuthorizationIsReplaced",
+          RedactorTest::anObservedAuthorizationIsReplaced);
+        t("anObservedProxyAuthorizationIsReplaced",
+          RedactorTest::anObservedProxyAuthorizationIsReplaced);
+        t("twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob);
+        t("anObservedCredentialNameIsMatchedWhateverItsCase",
+          RedactorTest::anObservedCredentialNameIsMatchedWhateverItsCase);
+        t("aCookieInTheREQUESTBodyIsNeverRewritten",
+          RedactorTest::aCookieInTheRequestBodyIsNeverRewritten);
+        t("aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases",
+          RedactorTest::aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases);
+        t("aFoldedContinuationOfAnObservedCredentialIsRedacted",
+          RedactorTest::aFoldedContinuationOfAnObservedCredentialIsRedacted);
+        t("whitespaceBeforeTheColonDoesNotHideAnObservedCredential",
+          RedactorTest::whitespaceBeforeTheColonDoesNotHideAnObservedCredential);
+        t("aBlankLineBeforeTheRequestLineDoesNotEndTheHead",
+          RedactorTest::aBlankLineBeforeTheRequestLineDoesNotEndTheHead);
+        t("anAbsoluteFormRequestLineIsNotMatchedAsAField",
+          RedactorTest::anAbsoluteFormRequestLineIsNotMatchedAsAField);
+        t("redactObservedRequestRefusesNullBytes",
+          RedactorTest::redactObservedRequestRefusesNullBytes);
+        t("theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem",
+          RedactorTest::theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem);
+        t("aUserinfoCredentialNeverReachesTheBlobStore",
+          RedactorTest::aUserinfoCredentialNeverReachesTheBlobStore);
+        t("twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob);
+        t("onlyTheFirstHeadLineIsATarget",
+          RedactorTest::onlyTheFirstHeadLineIsATarget);
+        t("aCredentialFirstLineIsStillRedactedAsAField",
+          RedactorTest::aCredentialFirstLineIsStillRedactedAsAField);
+        t("theRequestBodyIsNeverRewrittenByJobFive",
+          RedactorTest::theRequestBodyIsNeverRewrittenByJobFive);
+        t("aCredentialParameterLosesItsValueAndKeepsItsKey",
+          RedactorTest::aCredentialParameterLosesItsValueAndKeepsItsKey);
+        t("anIdentifierParameterIsNeverTouched",
+          RedactorTest::anIdentifierParameterIsNeverTouched);
+        t("twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob",
+          RedactorTest::twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob);
+        t("aClientsOwnNameForATokenIsNotCaught",
+          RedactorTest::aClientsOwnNameForATokenIsNotCaught);
+        t("theParameterNamesAreMatchedWholeAndCaseInsensitively",
+          RedactorTest::theParameterNamesAreMatchedWholeAndCaseInsensitively);
+        t("aNestedCutIsWrittenOnceNotTwice",
+          RedactorTest::aNestedCutIsWrittenOnceNotTwice);
+        t("theEmptyInjectedPathIsWhyJobFourExists",
+          RedactorTest::theEmptyInjectedPathIsWhyJobFourExists);
+
         t("redactionHappensBeforeHashing", RedactorTest::redactionHappensBeforeHashing);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
@@ -347,8 +398,14 @@ public class RedactorTest {
         injected.register("ident-admin", tokenStart(raw), tokenEnd(raw));
         String[] fromWorker = new String[1];
         Thread worker = new Thread(() -> fromWorker[0] = text(r.redactRequest(raw, injected)));
+        // Daemon and bounded, for the reason on TestSupport.t: an unbounded
+        // `worker.join()` here turns any `redactRequest` that ever takes a
+        // lock into a class that prints NO summary line and no FAIL line, and
+        // a non-daemon worker holds the JVM open past ALL PASS. Ten seconds
+        // against a single in-memory byte-copy.
+        worker.setDaemon(true);
         worker.start();
-        worker.join();
+        TestSupport.join(worker, 10_000L, "the worker thread doing the redaction");
         check("a range registered on the read loop is applied by the worker that redacts",
               fromWorker[0].contains("Authorization: {{identity:ident-admin:authz}}\r\n")
               && !fromWorker[0].contains(TOKEN));
@@ -814,6 +871,510 @@ public class RedactorTest {
         hashedFirst.put(sha256(raw), raw);
         check("hashing first leaves the credential recoverable from the store",
               text(hashedFirst.get(sha256(raw))).contains(TOKEN));
+    }
+
+    // ---- job 4: a request hx OBSERVED, not one it composed -----------------
+    //
+    // Every method below drives redactObservedRequest, which is the ONLY
+    // mechanism between an operator's live session cookie and a
+    // content-addressed blob store. Deleting the header-name match from that
+    // method has to redden here or the finding it was written for is back.
+
+    static final String COOKIE_SECRET = "3f9a1c77e5b24d0e8a1b6c4d2f7e9013";
+    static final String BEARER_SECRET = "eyJhbGciOiJIUzI1NiJ9.b3BlcmF0b3I.7d1a";
+
+    /** What the operator's browser sends through the proxy: a credential this
+     *  extension did not compose, cannot refuse, and must not store. */
+    static byte[] browsedRequest(String cookieValue) {
+        return bytes("GET /account/settings HTTP/1.1\r\n"
+                   + "Host: app.example.test\r\n"
+                   + "User-Agent: Mozilla/5.0\r\n"
+                   + "Cookie: JSESSIONID=" + cookieValue + "; theme=dark\r\n"
+                   + "Accept: text/html\r\n"
+                   + "\r\n");
+    }
+
+    static void anObservedCookieIsReplacedAndItsNameKept() {
+        Redactor r = new Redactor();
+        byte[] raw = browsedRequest(COOKIE_SECRET);
+        byte[] wire = raw.clone();
+        String out = text(r.redactObservedRequest(raw));
+        // THE CHECK WHOSE ABSENCE WAS THE WHOLE FINDING. With redactRequest
+        // and an empty Injected -- the shipped state for one commit -- this
+        // line is the operator's live session cookie, verbatim, on its way
+        // into a content-addressed store.
+        check("the live session cookie is GONE (" + out.replace("\r\n", " | ") + ")",
+              !out.contains(COOKIE_SECRET));
+        check("the header name and colon survive, so the evidence still shows "
+              + "a credential was sent",
+              out.contains("Cookie: {{observed:cookie}}\r\n"));
+        // THE WHOLE VALUE, not a parsed part of it. `theme=dark` is inside the
+        // Cookie header and goes with it: a per-pair rule here would have to
+        // decide which cookie names are secrets, and the browser's own
+        // `JSESSIONID=` tells a check nothing the response's Set-Cookie did
+        // not already say.
+        check("and the whole value went, not just the pair that looked secret",
+              !out.contains("theme=dark"));
+        check("every other header is verbatim",
+              out.contains("GET /account/settings HTTP/1.1\r\n")
+              && out.contains("Host: app.example.test\r\n")
+              && out.contains("User-Agent: Mozilla/5.0\r\n")
+              && out.contains("Accept: text/html\r\n"));
+        check("and the argument is not modified", Arrays.equals(raw, wire));
+    }
+
+    static void anObservedAuthorizationIsReplaced() {
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /api/me HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Authorization: Bearer " + BEARER_SECRET + "\r\n"
+                         + "\r\n");
+        String out = text(r.redactObservedRequest(raw));
+        check("the bearer token is gone", !out.contains(BEARER_SECRET));
+        check("...and so is the scheme that carried it, because the whole "
+              + "value is the secret",
+              out.contains("Authorization: {{observed:authorization}}\r\n"));
+    }
+
+    static void anObservedProxyAuthorizationIsReplaced() {
+        // The third of §6's three names, and the one a reader is likeliest to
+        // assume is covered because the other two are.
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /x HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Proxy-Authorization: Basic b3A6cDRzc3cwcmQ=\r\n"
+                         + "\r\n");
+        String out = text(r.redactObservedRequest(raw));
+        check("the proxy credential is gone", !out.contains("b3A6cDRzc3cwcmQ="));
+        check("and its name is kept",
+              out.contains("Proxy-Authorization: {{observed:proxy-authorization}}\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheCredentialProduceOneBlob() throws Exception {
+        // THE DETERMINISM CONSTRAINT, and it is not a style point. The plan's
+        // Global Constraints require redaction to be deterministic -- "two
+        // requests differing only in credential bytes must produce the same
+        // blob" -- and the store is CONTENT-ADDRESSED, so a hash, a length or
+        // any other function of the secret would give one page browsed under
+        // two sessions two digests and two stored copies. Before job 4 existed
+        // the proxy path broke this as well as leaking, because the raw
+        // credential bytes WERE the difference between the two blobs.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(browsedRequest(COOKIE_SECRET));
+        byte[] b = r.redactObservedRequest(
+                browsedRequest("00000000000000000000000000000000"));
+        check("two sessions, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        // And the control: the raw bytes really did differ, so the equality
+        // above is the redaction's doing and not the fixture's.
+        check("the inputs genuinely differed",
+              !Arrays.equals(browsedRequest(COOKIE_SECRET),
+                             browsedRequest("00000000000000000000000000000000")));
+    }
+
+    static void anObservedCredentialNameIsMatchedWhateverItsCase() {
+        // A browser may send any case it likes; HTTP field names are
+        // case-insensitive. A match that folded only one way would store the
+        // credential of every client that spells it differently.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "COOKIE: sid=" + COOKIE_SECRET + "\r\n"
+                    + "authorization: Bearer " + BEARER_SECRET + "\r\n"
+                    + "\r\n")));
+        check("an upper-case Cookie is matched", !out.contains(COOKIE_SECRET));
+        check("a lower-case Authorization is matched", !out.contains(BEARER_SECRET));
+        check("and the names are echoed as the client wrote them",
+              out.contains("COOKIE: {{observed:cookie}}\r\n")
+              && out.contains("authorization: {{observed:authorization}}\r\n"));
+    }
+
+    static void aCookieInTheRequestBodyIsNeverRewritten() {
+        // Only the head is scanned, for job 3's reason exactly: a body may
+        // legitimately carry the text. A form that posts a captured request,
+        // a bug report, an API doc -- rewriting those corrupts the evidence a
+        // check reads, and the body is not where a live credential is sent.
+        Redactor r = new Redactor();
+        String body = "report=Cookie: JSESSIONID=abc123; and it did not work";
+        String out = text(r.redactObservedRequest(
+                bytes("POST /support HTTP/1.1\r\n"
+                    + "Host: app.example.test\r\n"
+                    + "Content-Type: application/x-www-form-urlencoded\r\n"
+                    + "\r\n"
+                    + body)));
+        check("the body is byte-identical (" + out.substring(out.indexOf("\r\n\r\n") + 4) + ")",
+              out.endsWith(body));
+        check("and no placeholder was written into it",
+              !out.substring(out.indexOf("\r\n\r\n")).contains("{{observed:"));
+    }
+
+    static void aRequestWithNoCredentialRoundTripsVerbatimAndNeverAliases() {
+        Redactor r = new Redactor();
+        byte[] raw = bytes("GET /public/index.html HTTP/1.1\r\n"
+                         + "Host: app.example.test\r\n"
+                         + "Accept: text/html\r\n"
+                         + "\r\n");
+        byte[] out = r.redactObservedRequest(raw);
+        check("a request with nothing to redact comes back byte-identical",
+              Arrays.equals(raw, out));
+        // The same rule redactRequest's `raw.clone()` comment insists on: the
+        // returned array must never alias the array that goes on the wire, or
+        // a later in-place fix-up to one silently edits the other.
+        check("...and is a DIFFERENT array, not the one that goes on the wire",
+              raw != out);
+    }
+
+    static void aFoldedContinuationOfAnObservedCredentialIsRedacted() {
+        // obs-fold. RFC 9110 says a recipient must reject it and no real
+        // client emits it -- but if one does, the folded remainder of a
+        // credential is credential bytes. Same trade as job 3's fold branch:
+        // lose the continuation rather than store it.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\tcontinued=" + BEARER_SECRET + "\r\n"
+                    + "Accept: text/html\r\n"
+                    + "\r\n")));
+        check("the first line's value is gone", !out.contains(COOKIE_SECRET));
+        check("and so is the folded continuation", !out.contains(BEARER_SECRET));
+        check("the fold's leading whitespace is kept, so the message still "
+              + "parses the way it arrived",
+              out.contains("\r\n\t{{observed:cookie}}\r\n"));
+        check("and the header after the fold is untouched",
+              out.contains("Accept: text/html\r\n"));
+    }
+
+    static void whitespaceBeforeTheColonDoesNotHideAnObservedCredential() {
+        // RFC 9110 requires a recipient to reject `Cookie : v`, but name
+        // matching is all job 4 has, and a name we fail to match passes a live
+        // credential through verbatim. The same trim job 3 does.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("GET /x HTTP/1.1\r\n"
+                    + "Cookie : JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\r\n")));
+        check("the credential is still gone (" + out.replace("\r\n", " | ") + ")",
+              !out.contains(COOKIE_SECRET));
+    }
+
+    static void aBlankLineBeforeTheRequestLineDoesNotEndTheHead() {
+        // RFC 9112 2.2: a recipient MAY ignore an empty line before the
+        // request line, so one can reach us. Stopping there would end the head
+        // before a single field was read and copy the WHOLE request through as
+        // "body" -- every credential raw. Same guard, same reason, as job 3's.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(
+                bytes("\r\n"
+                    + "GET /x HTTP/1.1\r\n"
+                    + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                    + "\r\n")));
+        check("the leading blank line did not end the head",
+              !out.contains(COOKIE_SECRET));
+        check("and it is still there, verbatim", out.startsWith("\r\nGET /x"));
+    }
+
+    static void anAbsoluteFormRequestLineIsNotMatchedAsAField() {
+        // No line is privileged here -- every head line is matched as a field
+        // -- so the one line that is NOT a field has to survive that match. An
+        // absolute-form target carries a colon, which is the only way a
+        // request line can look like `name: value` at all.
+        Redactor r = new Redactor();
+        String line = "GET http://app.example.test:8080/x HTTP/1.1\r\n";
+        String out = text(r.redactObservedRequest(
+                bytes(line + "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n\r\n")));
+        check("the request line is verbatim (" + out.replace("\r\n", " | ") + ")",
+              out.startsWith(line));
+        check("and the credential after it is still redacted",
+              !out.contains(COOKIE_SECRET));
+    }
+
+    static void redactObservedRequestRefusesNullBytes() {
+        Redactor r = new Redactor();
+        // A RangeError, not the NPE it would otherwise be, for the reason the
+        // other two entry points give: an NPE out of here reaches a Burp proxy
+        // thread and the send path's catch-all alike.
+        expectThrows("null bytes are a RangeError", Redactor.RangeError.class,
+                     () -> r.redactObservedRequest(null));
+    }
+
+    // ---- job 5: the request TARGET ---------------------------------------
+
+    static final String TARGET_VECTORS = "request-target.txt";
+
+    /** The shared vector file, as (input, expected) pairs. Same file the
+     *  Python side reads; see its header for the format and for why one file
+     *  rather than two lists. */
+    static List<String[]> targetVectors() throws Exception {
+        java.nio.file.Path p = java.nio.file.Path.of(
+                "..", "tests", "vectors", TARGET_VECTORS);
+        List<String[]> out = new ArrayList<>();
+        for (String line : java.nio.file.Files.readAllLines(
+                p, StandardCharsets.UTF_8)) {
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            int tab = line.indexOf('\t');
+            if (tab < 0)
+                throw new IllegalArgumentException(
+                        "vector line with no tab: " + line);
+            out.add(new String[] { line.substring(0, tab), line.substring(tab + 1) });
+        }
+        return out;
+    }
+
+    /**
+     * THE ONE PLACE THE TWO IMPLEMENTATIONS ARE COMPARED. `redactObservedRequest`
+     * here and `hx.store.records.redact_url` there are the same RFC 3986 rule
+     * written twice, in two languages, on two sides of a bridge -- which is
+     * exactly the shape `tests/test_vocabularies_match_the_schema.py` exists
+     * to refuse. Neither side restates the cases; both read this file.
+     */
+    static void theSharedTargetVectorsAreRedactedTheSameWayPythonRedactsThem()
+            throws Exception {
+        Redactor r = new Redactor();
+        List<String[]> vectors = targetVectors();
+        // Anti-vacuity. A reader that found no file, or a format change that
+        // made every line a comment, would leave the loop below asserting
+        // nothing at all and printing ALL PASS.
+        check("the shared vector file was read (" + vectors.size() + " cases)",
+              vectors.size() >= 20);
+        boolean sawARedaction = false;
+        for (String[] v : vectors) {
+            String line = "GET " + v[0] + " HTTP/1.1\r\n";
+            String want = "GET " + v[1] + " HTTP/1.1\r\n";
+            String got = text(r.redactObservedRequest(
+                    bytes(line + "Host: app.example.test\r\n\r\n")));
+            check("target " + v[0] + " -> " + v[1]
+                  + " (got " + got.split("\r\n")[0] + ")",
+                  got.startsWith(want));
+            if (!v[0].equals(v[1])) sawARedaction = true;
+        }
+        // The second half of the anti-vacuity check: a file whose every case
+        // is a no-op would pass the loop above with job 5 deleted.
+        check("...and at least one of them is a case job 5 actually changes",
+              sawARedaction);
+    }
+
+    static void aUserinfoCredentialNeverReachesTheBlobStore() {
+        // THE MEASURED FINDING. `http://user:pass@host/` survived verbatim
+        // into a content-addressed blob store, which S7 calls the one item
+        // that cannot be retrofitted -- once written it is in every backup.
+        Redactor r = new Redactor();
+        String secret = "s3cret-live-password";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET http://alice:" + secret + "@app.example.test/orders HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("the password is gone from the copy that crosses the bridge",
+              !out.contains(secret));
+        check("and so is the username, which can BE the token",
+              !out.contains("alice"));
+        check("the placeholder and the @ are what is left ("
+              + out.split("\r\n")[0] + ")",
+              out.startsWith("GET http://{{observed:userinfo}}@app.example.test"
+                             + "/orders HTTP/1.1\r\n"));
+        check("everything after the authority is verbatim",
+              out.contains("/orders HTTP/1.1\r\nHost: app.example.test\r\n\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheUserinfoProduceOneBlob() throws Exception {
+        // Job 4's determinism constraint, restated for job 5 because it is the
+        // constraint a fix here is most likely to break: anything that carried
+        // a function of the credential -- a length, a hash, the username --
+        // would give one page browsed under two logins two digests and two
+        // stored copies.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(bytes(
+                "GET http://alice:s3cret@app.example.test/ HTTP/1.1\r\n\r\n"));
+        byte[] b = r.redactObservedRequest(bytes(
+                "GET http://bob:hunter2@app.example.test/ HTTP/1.1\r\n\r\n"));
+        check("two logins, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        check("the inputs genuinely differed", !Arrays.equals(
+                bytes("GET http://alice:s3cret@app.example.test/ HTTP/1.1\r\n\r\n"),
+                bytes("GET http://bob:hunter2@app.example.test/ HTTP/1.1\r\n\r\n")));
+    }
+
+    static void onlyTheFirstHeadLineIsATarget() {
+        // NAMED AS NOT COVERED in redactObservedRequest's javadoc, and pinned
+        // here so the sentence is a measurement rather than a claim. A URI in
+        // a FIELD VALUE keeps its userinfo: job 5 runs on one line, and
+        // running it over arbitrary field text would be the shape rule this
+        // class refuses everywhere else.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /orders HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "Referer: http://user:pass@app.example.test/login\r\n\r\n")));
+        check("the request line has no userinfo to take",
+              out.startsWith("GET /orders HTTP/1.1\r\n"));
+        check("and a Referer's userinfo is left RAW -- the named exclusion",
+              out.contains("Referer: http://user:pass@app.example.test/login"));
+    }
+
+    static void aCredentialFirstLineIsStillRedactedAsAField() {
+        // The interaction between job 4 and job 5. A malformed message whose
+        // FIRST line is a credential field must still be redacted as a field:
+        // job 5 takes the first line, and taking it must not mean skipping the
+        // credential match. Deleting `isFirstLine`'s guard the other way --
+        // running job 5 INSTEAD of the field match -- is what this catches.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "Cookie: JSESSIONID=" + COOKIE_SECRET + "\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a credential on the first line is still redacted (" + out.split("\r\n")[0] + ")",
+              !out.contains(COOKIE_SECRET));
+        check("...as job 4's placeholder, not job 5's",
+              out.startsWith("Cookie: {{observed:cookie}}\r\n"));
+    }
+
+    static void theRequestBodyIsNeverRewrittenByJobFive() {
+        // Job 4's rule, which job 5 inherits by sitting inside the same head
+        // scan: a body may legitimately carry a URI with a userinfo in it -- a
+        // documentation page, an API error dump, a captured request pasted
+        // into a form -- and rewriting it corrupts the evidence a check reads.
+        Redactor r = new Redactor();
+        String body = "curl http://user:pass@internal.example.test/ failed";
+        String out = text(r.redactObservedRequest(bytes(
+                "POST /report HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n"
+                + "Content-Length: " + body.length() + "\r\n\r\n" + body)));
+        check("a URI in the body keeps its userinfo verbatim",
+              out.endsWith(body));
+    }
+
+    static void aCredentialParameterLosesItsValueAndKeepsItsKey() {
+        // PROPERTY 1. The key survives and only the value is replaced -- and
+        // the key is what `surface.query_key_set` reads, so a redaction that
+        // moved it would change which SURFACE a request belongs to.
+        Redactor r = new Redactor();
+        String token = "eyJhbGciOiJIUzI1NiJ9.live.9f2c";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /cb?access_token=" + token + "&id=1001 HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("the token is gone (" + out.split("\r\n")[0] + ")",
+              !out.contains(token));
+        check("the KEY survives, so the surface is unchanged",
+              out.contains("access_token={{observed:param}}"));
+        check("and everything around it is verbatim",
+              out.startsWith("GET /cb?access_token={{observed:param}}&id=1001 "
+                             + "HTTP/1.1\r\n"));
+    }
+
+    static void anIdentifierParameterIsNeverTouched() {
+        // PROPERTY 2, and the reason this is a list of NAMES rather than a
+        // shape rule or a blanket redaction. `?id=1001` is what an IDOR check
+        // reads; a redaction that ate it would make the finding it was
+        // protecting unprovable. A shape heuristic eats exactly this.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /order/1001?id=1001&state=xyzzy&code=US HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("an identifier survives byte for byte (" + out.split("\r\n")[0] + ")",
+              out.startsWith("GET /order/1001?id=1001&state=xyzzy&code=US "
+                             + "HTTP/1.1\r\n"));
+    }
+
+    static void twoBrowsesDifferingOnlyInTheParameterValueProduceOneBlob()
+            throws Exception {
+        // PROPERTY 3. The store is content-addressed: anything carrying a
+        // function of the secret -- a length, a hash, a truncation -- gives
+        // one page fetched under two tokens two digests and two stored copies.
+        Redactor r = new Redactor();
+        byte[] a = r.redactObservedRequest(bytes(
+                "GET /cb?access_token=aaaaaaaaaaaaaaaa&id=7 HTTP/1.1\r\n\r\n"));
+        byte[] b = r.redactObservedRequest(bytes(
+                "GET /cb?access_token=z&id=7 HTTP/1.1\r\n\r\n"));
+        check("two tokens, one blob (" + text(a).replace("\r\n", " | ") + ")",
+              Arrays.equals(a, b));
+        check("...and therefore one digest", sha256(a).equals(sha256(b)));
+        check("the inputs genuinely differed", !Arrays.equals(
+                bytes("GET /cb?access_token=aaaaaaaaaaaaaaaa&id=7 HTTP/1.1\r\n\r\n"),
+                bytes("GET /cb?access_token=z&id=7 HTTP/1.1\r\n\r\n")));
+    }
+
+    static void aClientsOwnNameForATokenIsNotCaught() {
+        // THE LIMIT, AS A MEASURED FACT. This catches a fixed list of
+        // well-known names and does NOT catch a client's own name for a token.
+        // The parameter below is made up on purpose: no list can contain the
+        // name an application has not chosen yet, and stating that in a
+        // javadoc is a caveat someone can quietly widen while stating it here
+        // is a check that goes red when they do.
+        //
+        // If this goes RED, the list grew. That is not forbidden -- it is a
+        // DECISION, and the honest version of it is the operator-declared
+        // list in the engagement config, which needs a config schema change
+        // AND a `configure` wire key (an unrecognised key is a hard
+        // `bad_config` today, so there is no wire for it either).
+        Redactor r = new Redactor();
+        String secret = "live-acme-session-value";
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /p?acme_session=" + secret + " HTTP/1.1\r\n"
+                + "Host: app.example.test\r\n\r\n")));
+        check("a client's own name for a token reaches the blob store "
+              + "VERBATIM -- the limit of a fixed list of names",
+              out.contains("acme_session=" + secret));
+        // The two smaller edges of the same mechanism, so neither is a claim.
+        String enc = text(r.redactObservedRequest(bytes(
+                "GET /p?%61ccess_token=live HTTP/1.1\r\n\r\n")));
+        check("a percent-encoded NAME is not matched -- the scan does not "
+              + "decode, because a name that decodes two ways has no answer",
+              enc.contains("%61ccess_token=live"));
+        String semi = text(r.redactObservedRequest(bytes(
+                "GET /p?id=1;token=live HTTP/1.1\r\n\r\n")));
+        check("`;` is not a pair separator, so that whole pair is one name",
+              semi.contains("id=1;token=live"));
+    }
+
+    static void theParameterNamesAreMatchedWholeAndCaseInsensitively() {
+        Redactor r = new Redactor();
+        String upper = text(r.redactObservedRequest(bytes(
+                "GET /p?Access_Token=live&APIKEY=live2 HTTP/1.1\r\n\r\n")));
+        check("case-insensitive, the same fold the header names use",
+              upper.startsWith("GET /p?Access_Token={{observed:param}}"
+                               + "&APIKEY={{observed:param}} HTTP/1.1"));
+        check("and the KEY keeps its own case", upper.contains("Access_Token="));
+        // WHOLE, not a substring, in both directions: a name that CONTAINS a
+        // listed one and a listed one that is a PREFIX of the name are the two
+        // ways a substring match leaks or over-redacts.
+        String near = text(r.redactObservedRequest(bytes(
+                "GET /p?tokenizer=fast&my_access_token=live HTTP/1.1\r\n\r\n")));
+        check("a name merely CONTAINING a listed one is not one ("
+              + near.split("\r\n")[0] + ")",
+              near.startsWith("GET /p?tokenizer=fast&my_access_token=live "));
+    }
+
+    static void aNestedCutIsWrittenOnceNotTwice() {
+        // The one input that makes job 5's two rules overlap: a credential
+        // parameter whose VALUE is a URI carrying its own userinfo. The value
+        // cut swallows the userinfo cut, and emitting both would write the
+        // same bytes twice -- or, before the cuts were collected and sorted,
+        // hand write() a negative length on a Burp proxy thread.
+        Redactor r = new Redactor();
+        String out = text(r.redactObservedRequest(bytes(
+                "GET /cb?access_token=http://u:p@h/ HTTP/1.1\r\n\r\n")));
+        check("one placeholder, not two (" + out.split("\r\n")[0] + ")",
+              out.startsWith("GET /cb?access_token={{observed:param}} HTTP/1.1"));
+        check("and neither half of the nested credential survives",
+              !out.contains("u:p") && !out.contains("http://"));
+    }
+
+    static void theEmptyInjectedPathIsWhyJobFourExists() {
+        // THE FINDING, kept as a test so it cannot come back quietly. This is
+        // not a complaint about redactRequest -- an empty Injected returning
+        // the bytes unchanged is CORRECT for the send path, where job 2
+        // refuses any credential job 1 did not inject. It is only wrong as the
+        // whole of a path's redaction, and this pins the difference so that
+        // routing the proxy path back through redactRequest is visibly a leak
+        // rather than a plausible simplification.
+        Redactor r = new Redactor();
+        byte[] raw = browsedRequest(COOKIE_SECRET);
+        String viaInjected = text(r.redactRequest(raw, new Redactor.Injected(raw)));
+        check("redactRequest with an empty Injected returns the credential "
+              + "VERBATIM -- it is not a redaction of observed traffic",
+              viaInjected.contains(COOKIE_SECRET));
+        check("...while job 4 removes it",
+              !text(r.redactObservedRequest(raw)).contains(COOKIE_SECRET));
     }
 
     // ---- helpers ---------------------------------------------------------

@@ -1,0 +1,458 @@
+// extension/test/hx/proxy/ProxyGateTest.java
+package hx.proxy;
+
+import hx.TestSupport;
+import hx.bridge.BridgeClient;
+import hx.policy.Decision;
+import hx.policy.Gate;
+import hx.policy.HxRequest;
+import hx.policy.Policy;
+import hx.policy.TickClock;
+import hx.send.Limits;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * The gate, against fakes.
+ *
+ * The two cases that matter most are the pair: the SAME request is allowed
+ * for the operator and refused for the crawler. A test that only exercises
+ * one source cannot tell a working split from a gate that ignores source
+ * entirely -- which is rule 3 on this project. Rows B and C of this task's
+ * sabotage table are that split turned off in each direction, and each
+ * reddens only its own source's checks: neither is caught by the other's.
+ *
+ * Hand-rolled runner, like the other eleven classes: JUnit would be a
+ * dependency, and this jar has none.
+ */
+public class ProxyGateTest {
+
+    static int failures = 0;
+
+    static void check(String what, boolean ok) {
+        System.out.println((ok ? "  ok   " : "  FAIL ") + what);
+        if (!ok) failures++;
+    }
+
+    /** Runs one test method under the shared per-method guard: a throw out of
+     *  it becomes a named FAIL against THIS class's counter instead of ending
+     *  main() with the methods after it unrun and no summary line printed.
+     *  Load-bearing here rather than decoration: the input that separates this
+     *  class's own DENY-ALL guard from its absence makes the method THROW, and
+     *  without this guard that reads as a truncated run rather than a failure.
+     *  See {@link hx.TestSupport#t}. */
+    static void t(String name, TestSupport.Body body) {
+        TestSupport.t(ProxyGateTest::check, name, body);
+    }
+
+    public static void main(String[] args) throws Exception {
+        t("scope is absolute for the operator",
+          ProxyGateTest::scopeIsAbsoluteForTheOperator);
+        t("and absolute for the crawler",
+          ProxyGateTest::scopeIsAbsoluteForTheCrawler);
+        t("the operator's own browsing is not method-checked",
+          ProxyGateTest::theOperatorIsNotMethodChecked);
+        t("but the crawler is",
+          ProxyGateTest::theCrawlerIsMethodChecked);
+        t("the operator is not dangerous-path checked",
+          ProxyGateTest::theOperatorIsNotDangerousPathChecked);
+        t("but the crawler is (dangerous path)",
+          ProxyGateTest::theCrawlerIsDangerousPathChecked);
+        t("the operator does not spend the gate",
+          ProxyGateTest::theOperatorDoesNotSpendTheGate);
+        t("but the crawler does (the gate)",
+          ProxyGateTest::theCrawlerSpendsTheGate);
+        t("an unconfigured extension refuses every source",
+          ProxyGateTest::unconfiguredRefusesBoth);
+        t("a source that could not be attributed is refused, not defaulted",
+          ProxyGateTest::anUnattributableSourceIsRefused);
+        t("a crawler request that passes scope, method and dangerous.path "
+          + "REACHES the gate, and an unarmed one refuses it",
+          ProxyGateTest::theCrawlerReachesTheGateAndAnUnarmedOneRefusesIt);
+        t("the listener port decides the source",
+          ProxyGateTest::theListenerPortDecides);
+        t("a listener interface is parsed or refused, never guessed at",
+          ProxyGateTest::theListenerInterfaceIsParsedOrRefused);
+
+        System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
+        if (failures > 0) System.exit(1);
+    }
+
+    // ---- fixtures -------------------------------------------------------
+
+    static BridgeClient.Authorisation authorised() {
+        return new BridgeClient.Authorisation(7, Map.of(
+            "scope.include", List.of("http://app.test/*"),
+            "method.allow", List.of("GET", "HEAD"),
+            "dangerous.path", List.of("*/logout*")));
+    }
+
+    /**
+     * The host is taken FROM the url rather than fixed at "app.test".
+     *
+     * Policy refuses any request whose url authority is not the connection
+     * host, with the same `scope_denied` class an unmatched include produces,
+     * and it refuses it FIRST (Policy.checkScope). A fixture that hard-coded
+     * the host to "app.test" would therefore have `http://evil.test/x`
+     * refused by the host comparison rather than by the include patterns, and
+     * the two scope checks below would say nothing about scope.
+     *
+     * Measured, row G of this task's sabotage table. Adding
+     * "http://evil.test/*" to `scope.include` -- authorising the very request
+     * those checks exist to see refused -- reddens three checks with the host
+     * taken from the url, and the suite is back to 10 x ALL PASS with the same
+     * widened include the moment the host is hard-coded again.
+     */
+    static HxRequest req(String method, String url) {
+        java.net.URI u = java.net.URI.create(url);
+        return new HxRequest(method, url, u.getHost(), u.getPath(), "",
+                             Map.of(), new byte[0]);
+    }
+
+    /** A Gate that counts, so "did this spend budget" is observable. */
+    static final class CountingGate implements Gate {
+        int calls;
+        public Decision check(HxRequest r) { calls++; return Decision.allow(); }
+    }
+
+    static ProxyGate gateOver(Gate gate) {
+        // The Gate goes into the Policy, which is where the rate limit and the
+        // budget live in production too: Policy owns its Gate and consults it
+        // last. A call counted here is a call a real run spends a rate token
+        // and a budget slot on.
+        return new ProxyGate(new Policy(gate));
+    }
+
+    // ---- scope, which is absolute for everyone ---------------------------
+
+    static void scopeIsAbsoluteForTheOperator() {
+        ProxyGate g = gateOver(new CountingGate());
+        var v = g.decide(req("GET", "http://evil.test/x"), authorised(), Source.OPERATOR);
+        check("out of scope is refused even for the operator", !v.allow());
+        check("and the class names the boundary crossed (" + v.errorClass() + ")",
+              "scope_denied".equals(v.errorClass()));
+    }
+
+    static void scopeIsAbsoluteForTheCrawler() {
+        ProxyGate g = gateOver(new CountingGate());
+        var v = g.decide(req("GET", "http://evil.test/x"), authorised(), Source.CRAWLER);
+        check("out of scope is refused for the crawler too", !v.allow());
+    }
+
+    // ---- the four rules that constrain an agent, in pairs ----------------
+
+    static void theOperatorIsNotMethodChecked() {
+        ProxyGate g = gateOver(new CountingGate());
+        var v = g.decide(req("POST", "http://app.test/login"), authorised(), Source.OPERATOR);
+        check("a POST the allowlist omits still goes out for a human ("
+              + v.errorClass() + ")", v.allow());
+    }
+
+    static void theCrawlerIsMethodChecked() {
+        ProxyGate g = gateOver(new CountingGate());
+        var v = g.decide(req("POST", "http://app.test/login"), authorised(), Source.CRAWLER);
+        check("the same POST is refused for the crawler", !v.allow());
+        check("with method_denied (" + v.errorClass() + ")",
+              "method_denied".equals(v.errorClass()));
+    }
+
+    static void theOperatorIsNotDangerousPathChecked() {
+        ProxyGate g = gateOver(new CountingGate());
+        var v = g.decide(req("GET", "http://app.test/logout"), authorised(), Source.OPERATOR);
+        check("a deliberate click on a dangerous path is the operator's to make",
+              v.allow());
+    }
+
+    static void theCrawlerIsDangerousPathChecked() {
+        ProxyGate g = gateOver(new CountingGate());
+        var v = g.decide(req("GET", "http://app.test/logout"), authorised(), Source.CRAWLER);
+        check("a crawler that finds logout must not click it", !v.allow());
+        check("with dangerous_denied (" + v.errorClass() + ")",
+              "dangerous_denied".equals(v.errorClass()));
+    }
+
+    static void theOperatorDoesNotSpendTheGate() {
+        CountingGate gate = new CountingGate();
+        var v = gateOver(gate)
+            .decide(req("GET", "http://app.test/x"), authorised(), Source.OPERATOR);
+        // The allow is asserted alongside the count: a request refused before
+        // the Gate would also leave `calls` at 0, so the count on its own does
+        // not separate "the operator skips the Gate" from "the operator was
+        // denied".
+        check("the in-scope request is allowed (" + v.errorClass() + ")", v.allow());
+        check("browsing does not spend the run's budget (" + gate.calls + ")",
+              gate.calls == 0);
+    }
+
+    static void theCrawlerSpendsTheGate() {
+        CountingGate gate = new CountingGate();
+        var v = gateOver(gate)
+            .decide(req("GET", "http://app.test/x"), authorised(), Source.CRAWLER);
+        check("the same request is allowed for the crawler (" + v.errorClass() + ")",
+              v.allow());
+        check("crawling does (" + gate.calls + ")", gate.calls == 1);
+    }
+
+    // ---- the gate the crawler actually reaches ---------------------------
+
+    /**
+     * THE TEST THAT DID NOT EXIST, AND ITS ABSENCE IS WHY A LIVE DEFECT SHIPPED.
+     *
+     * Every crawler case above stops SHORT of the Gate.
+     * {@link #theCrawlerIsMethodChecked} drives a POST that `method.allow`
+     * refuses; {@link #theCrawlerIsDangerousPathChecked} drives `/logout`;
+     * {@link #scopeIsAbsoluteForTheCrawler} drives an out-of-scope host.
+     * {@link #theCrawlerSpendsTheGate} does reach it -- against a
+     * {@link CountingGate} that allows everything. The single crawler-listener
+     * INTEGRATION test drives a POST too. So no test anywhere drove a crawler
+     * request through scope, method and dangerous.path into the REAL Gate.
+     *
+     * WHAT THAT HID. {@link hx.send.Limits} is the Gate a real run carries, and
+     * it answers `not_configured` -- "the rate and budget are not armed" --
+     * until {@code arm} has run. `arm` had ONE call site, in the send
+     * handler, so every crawler request that got this far was refused as
+     * unauthorised on a correctly authorised run, until some unrelated `send`
+     * happened to arm it. Fail-closed, and a denial that lies about why.
+     *
+     * SO THE FIXTURE IS THE REAL Limits AND NOT A CountingGate. A fake that
+     * allows everything cannot fail this way, and that is the whole finding:
+     * the gate that exists in production has a state the test double does not
+     * have.
+     *
+     * THE THIRD CASE IS THE CONTROL. The operator gets the same request
+     * through the SAME unarmed Limits and is allowed, because the operator
+     * branch stops before the Gate -- so what the first case pins is the
+     * Gate's state, not the request.
+     *
+     * WHAT THIS DOES NOT PIN: that HxExtension arms it. This class constructs
+     * both objects itself. The wiring is text in a file no test can execute,
+     * and it is counted by
+     * {@code ChokepointTest.everyPathThatSpendsTheGateArmsItFirst}.
+     */
+    static void theCrawlerReachesTheGateAndAnUnarmedOneRefusesIt() {
+        BridgeClient.Authorisation auth = authorised();
+        // GET, in scope, not on the dangerous list: the three checks ahead of
+        // the Gate all pass, so this request reaches it and nothing else does
+        // the refusing.
+        HxRequest allowed = req("GET", "http://app.test/x");
+
+        var unarmed = gateOver(new Limits(new TickClock(1_000_000L), 5, 100))
+                .decide(allowed, auth, Source.CRAWLER);
+        check("an UNARMED gate refuses the crawler (" + unarmed.errorClass() + ")",
+              !unarmed.allow() && "not_configured".equals(unarmed.errorClass()));
+        // The detail is asserted, not just the class: `not_configured` is
+        // shared with DENY-ALL and with an unattributable source, so the class
+        // alone does not say that this is the Gate answering.
+        check("and says the rate and budget are the thing that is missing ("
+              + unarmed.detail() + ")",
+              unarmed.detail() != null
+              && unarmed.detail().contains("not armed"));
+
+        Limits armed = new Limits(new TickClock(1_000_000L), 5, 100);
+        armed.arm(auth);
+        var ok = gateOver(armed).decide(allowed, auth, Source.CRAWLER);
+        check("the SAME request is allowed once the gate is armed ("
+              + ok.errorClass() + ")", ok.allow());
+
+        // The control, and it is what makes the first case about the Gate.
+        var operator = gateOver(new Limits(new TickClock(1_000_000L), 5, 100))
+                .decide(allowed, auth, Source.OPERATOR);
+        check("and the operator is allowed through the same unarmed gate, "
+              + "because that branch never reaches it (" + operator.errorClass()
+              + ")", operator.allow());
+    }
+
+    // ---- DENY-ALL --------------------------------------------------------
+
+    static void unconfiguredRefusesBoth() {
+        var none = new BridgeClient.Authorisation(0, Map.of());
+        ProxyGate g = gateOver(new CountingGate());
+        for (Source s : Source.values()) {
+            var v = g.decide(req("GET", "http://app.test/x"), none, s);
+            check("DENY-ALL holds for " + s + " (" + v.errorClass() + ")",
+                  !v.allow() && "not_configured".equals(v.errorClass()));
+        }
+
+        // The separating input for ProxyGate's OWN epoch guard, and it is not
+        // the checks above. Policy refuses an epoch-0 authorisation on both of
+        // the paths this class calls, so with that guard deleted the three
+        // above still print `ok` and the failure is the NPE thrown out of THIS
+        // method the moment the loop below reaches a ProxyGate with no Policy
+        // -- re-measured on this tree, 9 x ALL PASS + 1 FAILURE / 1652 ok, the
+        // one FAIL being this method's name and a NullPointerException. (Row D
+        // of the sabotage table measured it when Source had two constants; the
+        // third constant adds a green check, not a red one, because an
+        // unattributable source is refused either way.) The guard adds that
+        // the answer is given BEFORE the
+        // Policy is consulted, and a ProxyGate holding no Policy is the one
+        // caller that can tell the two apart: with the guard it is a verdict,
+        // without it an NPE. The per-method guard in TestSupport.t turns that
+        // NPE into a named FAIL rather than a truncated run.
+        for (Source s : Source.values()) {
+            var v = new ProxyGate(null).decide(req("GET", "http://app.test/x"), none, s);
+            check("and it is answered without consulting Policy for " + s
+                  + " (" + v.errorClass() + ")",
+                  !v.allow() && "not_configured".equals(v.errorClass()));
+        }
+    }
+
+    // ---- the third answer ------------------------------------------------
+
+    /**
+     * A source this gate cannot recognise is REFUSED, and both spellings of
+     * one are: `Source.UNATTRIBUTED` and a null.
+     *
+     * Both were ALLOWED before the guard that answers them existed --
+     * measured, and with the whole suite at 10 x ALL PASS, because
+     * `source == Source.CRAWLER` is false for each and the else branch is the
+     * lenient one. The two requests are chosen as the separating inputs: a
+     * POST the allowlist omits, and a GET on a dangerous path. The CONTROL is
+     * that both are still allowed for Source.OPERATOR two methods up, so what
+     * these pin is attribution and not the four rules.
+     *
+     * NOT claimed: that null and UNATTRIBUTED exhaust what this branch
+     * catches. It is written as "neither of the two I know", so a constant
+     * added to Source later lands here too -- and that constant needs its own
+     * check, because this method names two and cannot see a third.
+     */
+    static void anUnattributableSourceIsRefused() {
+        CountingGate gate = new CountingGate();
+        ProxyGate g = gateOver(gate);
+        Source[] unknown = { Source.UNATTRIBUTED, null };
+        for (Source s : unknown) {
+            var post = g.decide(req("POST", "http://app.test/login"), authorised(), s);
+            check("a POST the allowlist omits is refused for " + s + " ("
+                  + post.errorClass() + ")",
+                  !post.allow() && "not_configured".equals(post.errorClass()));
+
+            var logout = g.decide(req("GET", "http://app.test/logout"), authorised(), s);
+            check("and so is a dangerous path for " + s + " ("
+                  + logout.errorClass() + ")",
+                  !logout.allow() && "not_configured".equals(logout.errorClass()));
+
+            // The class is shared with DENY-ALL, so the class alone does not
+            // say which guard answered. The detail does, and the prefix it
+            // starts with is the one records.py declares for itself -- the
+            // marker that separates "this jar is broken" from "the operator
+            // never configured a run", pinned identical on both sides by
+            // test_the_extension_fault_marker_is_the_same_string_on_both_sides.
+            check("with the extension-fault marker on the detail for " + s
+                  + " (" + logout.detail() + ")",
+                  logout.detail() != null
+                  && logout.detail().startsWith(BridgeClient.EXTENSION_FAULT));
+        }
+        check("and refusing an unattributable request spends nothing ("
+              + gate.calls + ")", gate.calls == 0);
+    }
+
+    // ---- attribution -----------------------------------------------------
+
+    static void theListenerPortDecides() {
+        check("the crawler port attributes to CRAWLER",
+              Source.forListenerPort(8081, 8081) == Source.CRAWLER);
+        check("any other port attributes to OPERATOR",
+              Source.forListenerPort(8080, 8081) == Source.OPERATOR);
+        // A port that PARSED and belongs to no listener hx knows about is the
+        // operator's: they may configure extra listeners, and crawler
+        // attribution is the stricter branch, so getting it by default would
+        // silently apply the agent's rules to a human.
+        check("and an unrecognised but usable port is OPERATOR, not CRAWLER",
+              Source.forListenerPort(9999, 8081) == Source.OPERATOR);
+        // Behaviour, not a guard: an unconfigured crawler port must swallow
+        // nothing. This input separates no branch of forListenerPort as it now
+        // stands -- 8080 is in range and 8080 != 0 -- and is kept as a pin on
+        // the answer rather than dressed up as more than it is.
+        check("an unconfigured crawler port matches nothing",
+              Source.forListenerPort(8080, 0) == Source.OPERATOR);
+
+        // The four inputs that separate the range test, and with it the whole
+        // third answer. Each is a port the caller could not determine, and
+        // each answered OPERATOR -- the branch that drops four of the five
+        // rules -- before the range test existed; measured, all four, against
+        // the committed body. (0, 0) was the sharpest: it answered OPERATOR
+        // only because of a `crawlerPort > 0` clause that existed for that one
+        // pair, and a bare equality made it CRAWLER instead.
+        check("a port that could not be read is UNATTRIBUTED, with a crawler configured",
+              Source.forListenerPort(Source.NO_PORT, 8081) == Source.UNATTRIBUTED);
+        check("and without one",
+              Source.forListenerPort(Source.NO_PORT, 0) == Source.UNATTRIBUTED);
+        check("a negative sentinel is UNATTRIBUTED, not a listener",
+              Source.forListenerPort(-1, 8081) == Source.UNATTRIBUTED);
+        check("and so is a number no TCP port can be",
+              Source.forListenerPort(70000, 8081) == Source.UNATTRIBUTED);
+        // The constant is the spelling Task 7 hands over, and it must be the
+        // value the rule actually treats that way -- a NO_PORT of, say, 1
+        // would make the two lines above pass while every real parse failure
+        // answered OPERATOR.
+        check("and NO_PORT is one of those numbers (" + Source.NO_PORT + ")",
+              Source.NO_PORT < 1 || Source.NO_PORT > 65535);
+    }
+
+    /**
+     * The other half of the attribution, and the only half that touches a
+     * string a Burp handed over.
+     *
+     * {@link Source} takes two ints and does no parsing on purpose. Something
+     * has to turn `listenerInterface()` into one of those ints, and that
+     * something lives in HxExtension -- a file nothing can drive, except this
+     * one static method, which is why it is public. Every failure here has to
+     * answer {@link Source#NO_PORT}, because the alternative is a number that
+     * might land on the crawler's port or on the operator's branch by
+     * accident: a parse that GUESSES is attribution decided by a malformed
+     * string.
+     *
+     * MEASURED FORM, from docs/burp-proxy-measurements.md Q1:
+     * `"127.0.0.1:8080"`, a different port per listener, over plain HTTP and
+     * through a CONNECT tunnel.
+     */
+    static void theListenerInterfaceIsParsedOrRefused() {
+        check("the measured form parses (" + hx.HxExtension.listenerPort("127.0.0.1:8080") + ")",
+              hx.HxExtension.listenerPort("127.0.0.1:8080") == 8080);
+        check("and a different listener gives a different port",
+              hx.HxExtension.listenerPort("127.0.0.1:8081") == 8081);
+        // THE LAST colon, not the first. An IPv6 interface puts colons inside
+        // the address, and splitting on the first would read `:1]:8080` --
+        // non-numeric, so NO_PORT, so UNATTRIBUTED, so every request on an
+        // IPv6 listener REFUSED. Fail-closed, but it would refuse a working
+        // configuration and read as a broken jar.
+        check("the port is taken after the LAST colon, so an IPv6 interface works ("
+              + hx.HxExtension.listenerPort("[::1]:8080") + ")",
+              hx.HxExtension.listenerPort("[::1]:8080") == 8080);
+
+        // Everything else is NO_PORT. Each of these is a shape a caller in
+        // trouble actually produces, and each would otherwise have to be
+        // invented into a number.
+        check("a null interface is NO_PORT",
+              hx.HxExtension.listenerPort(null) == Source.NO_PORT);
+        check("an interface with no colon at all is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1") == Source.NO_PORT);
+        check("an empty tail after the colon is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1:") == Source.NO_PORT);
+        check("a non-numeric tail is NO_PORT",
+              hx.HxExtension.listenerPort("127.0.0.1:http") == Source.NO_PORT);
+        check("and so is a tail that is only PARTLY numeric",
+              hx.HxExtension.listenerPort("127.0.0.1:8080x") == Source.NO_PORT);
+        check("a negative tail is NO_PORT, not a negative port",
+              hx.HxExtension.listenerPort("127.0.0.1:-1") == Source.NO_PORT);
+        check("an empty string is NO_PORT",
+              hx.HxExtension.listenerPort("") == Source.NO_PORT);
+        // THE INPUT THAT SEPARATES THE LENGTH BOUND FROM ITS ABSENCE. Without
+        // it `Integer.parseInt` THROWS on a run of digits past 2^31 -- out of
+        // the handler, on a Burp proxy thread, for a request that would then
+        // be neither allowed nor refused nor recorded. Every other overlong
+        // number is answered by Source's own range test; this one never
+        // reaches it.
+        check("a 30-digit tail is NO_PORT rather than an exception",
+              hx.HxExtension.listenerPort("127.0.0.1:" + "9".repeat(30))
+              == Source.NO_PORT);
+        // And a number that parses but is not a port: handed over as itself,
+        // because Source's range test is the one place that rule lives. Named
+        // here so the boundary between the two files is visible from both
+        // sides -- this method does NOT range-check.
+        check("a 5-digit number out of TCP range is handed over as itself, for "
+              + "Source to refuse (" + hx.HxExtension.listenerPort("127.0.0.1:70000") + ")",
+              hx.HxExtension.listenerPort("127.0.0.1:70000") == 70000
+              && Source.forListenerPort(70000, 8081) == Source.UNATTRIBUTED);
+    }
+}

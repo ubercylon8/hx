@@ -15,8 +15,11 @@ Everything here was established empirically, most of it the hard way:
 """
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -67,6 +70,106 @@ def missing() -> list[str]:
         return _missing()
     except OSError as exc:
         return [f"prerequisites under {LAB} could not be checked: {exc}"]
+
+
+def _jar_problem() -> str | None:
+    """The ONE place the jar's state is judged: "missing", "stale", "future", None.
+
+    One function because the first version of this split had two, and they had
+    already diverged in the commit that created them: `_missing()` special-
+    cased a future-dated source and `unbuilt()` did not. That is not a
+    cosmetic drift. A future mtime cannot be cleared by rebuilding -- no jar
+    can be stamped later than a source dated years ahead -- and `_missing()`'s
+    own comment records it being reproduced ("two honest rebuilds, still
+    reported stale both times"). Routing it to a hard FAIL told the operator
+    to run a script that provably cannot help, permanently.
+
+    So the three outcomes are distinguished HERE, once, and routed by who can
+    fix them: "missing" and "stale" are build.sh's, "future" is the clock's.
+    """
+    if not EXT_JAR.exists():
+        return "missing"
+    newest = _newest_source_mtime()
+    if newest > time.time() + 60:
+        return "future"
+    if newest > _jar_mtime():
+        return "stale"
+    return None
+
+
+def unbuilt() -> list[str]:
+    """Build products of THIS repo that are absent or stale. These must FAIL.
+
+    `missing()` answers "can this machine run Burp at all" -- a question whose
+    honest answer on someone else's laptop is no, and a skip. This one answers
+    "did you run build.sh", whose answer is always yes-or-you-forgot, and a
+    skip there is the failure mode this project keeps finding: a missing
+    artefact turns into a silent green.
+
+    It is not hypothetical. Task 1's fix round inherited a tree whose jar was
+    stale, `-m integration` reported all 17 tests SKIPPED, and the baseline
+    recorded one commit earlier as "integration 17 passed" was not
+    reproducible as committed. The same shape had just been fixed one level
+    down for the probe source; it was still open here.
+
+    Kept separate from `missing()` rather than merged into it because the two
+    have opposite correct behaviours, and a single list forces one of them to
+    be wrong.
+
+    Returns EMPTY when the machine cannot build at all. `build.sh` needs the
+    montoya jar from the same lab `_environment_missing()` reports and exits 1
+    without it, so telling a contributor with no lab to "run extension/build.sh"
+    sends them to a script that cannot succeed. A build product is only
+    independent of the machine when the machine can build it.
+
+    Wrapped for the same reason `missing()` is: this runs at IMPORT TIME
+    through test_real_burp's skipif, and an exception here is not a skipped
+    test, it is `Interrupted: 1 error during collection` for the entire
+    repository -- 396 fast tests reporting nothing. That was measured against
+    a lab directory at mode 000, and `missing()`'s docstring already records
+    the same hazard biting twice before.
+    """
+    try:
+        if _environment_missing():
+            return []
+        problem = _jar_problem()
+        if problem == "missing":
+            return [f"extension jar is missing (run extension/build.sh): {EXT_JAR}"]
+        if problem == "stale":
+            return ["extension jar is older than its sources (run extension/build.sh)"]
+        return []
+    except OSError as exc:
+        return []
+
+
+def _environment_missing() -> list[str]:
+    """Prerequisites this MACHINE may legitimately not have. Never the jar.
+
+    Split out so a caller can take the subset it actually depends on.
+    `probe_missing()` is the reason: the probe compiles its own class and
+    launches with `--developer-extension-class-name=hx.proxy.Probe`, so it
+    never loads the extension jar -- yet it inherited the jar's rows through
+    missing() and a STALE JAR silenced all three of Task 1's measurements.
+    A prerequisite that is not one is still a skip, and a skip still reports
+    green.
+    """
+    try:
+        return _environment_missing_unguarded()
+    except OSError as exc:
+        return [f"prerequisites under {LAB} could not be checked: {exc}"]
+
+
+def _environment_missing_unguarded() -> list[str]:
+    absent = []
+    if not BURP_JAR.exists():
+        absent.append(f"burp jar: {BURP_JAR}")
+    if not (SEED_HOME / ".java").is_dir():
+        absent.append(f"seed burp home: {SEED_HOME / '.java'}")
+    elif not _eula_accepted():
+        absent.append(f"burp.eula not accepted in {SEED_HOME / '.java'}")
+    if not (SEED_HOME / ".BurpSuite").is_dir():
+        absent.append(f"seed burp home: {SEED_HOME / '.BurpSuite'}")
+    return absent
 
 
 def _missing() -> list[str]:
@@ -192,15 +295,103 @@ def make_home(workdir: Path) -> Path:
     return home
 
 
+# The project config both launchers hand Burp, and the ports inside it.
+#
+# These three live ABOVE launch_burp because BOTH launchers need them and a
+# second copy is a second set of listener settings free to drift from this one
+# -- `listen_mode: loopback_only` above all, which is written once here and
+# read back by not_loopback_only() for whichever Burp is running. The probe
+# section below is where the mechanism is EXPLAINED (see launch_probe): Burp
+# Community has no API for creating a listener, so a listener comes from a
+# project config file or it does not exist.
+
+PROXY_CONFIG = "proxy-listeners.json"
+
+
+def _free_port() -> int:
+    """A port nothing holds right now, for a listener Burp is about to bind.
+
+    Necessary rather than tidy, and measured the hard way. A first draft of
+    this fixture picked its ports by hand, and every one of them was already
+    taken on this machine: 8080 by a llama.cpp router, 18080 by a node service,
+    18081 by an agent. A taken port does not fail, it SUCCEEDS against the
+    wrong process -- that run got a clean `421` from one and a clean `200` from
+    another, with Burp never involved and the probe file holding nothing but
+    `PROBE READY`. (8080 answers a proxy-style absolute-URI GET with a
+    `404 {"error":...}` and a `Server: llama.cpp` header.)
+
+    The window between this close() and Burp's bind() is a real race and
+    nothing here can close it. The far end is what settles it: a test believes
+    the port is Burp's only once a request through it has reached the probe's
+    own handler -- or, for launch_burp, once an exchange the extension observed
+    on that port has arrived over the bridge -- which nothing but Burp's proxy
+    can arrange.
+    """
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def write_listener_config(workdir: Path, second_port: int = 0) -> list[int]:
+    """Two loopback-only proxy listeners, written where `--config-file` wants
+    them. Returns the ports, first then second.
+
+    BOTH listeners are written, including the first, and that is not
+    redundancy: a config naming only the second leaves the first wherever
+    Burp's defaults put it, which is the 8080 `_free_port()` exists to avoid.
+
+    `loopback_only` is not decoration and it is not self-enforcing. Nothing in
+    this project has ever sent a request off this machine, and a proxy listener
+    on 0.0.0.0 is an open forward relay on whatever network the laptop is
+    attached to. This string was the whole of the protection until
+    not_loopback_only() was written, and changing it to `all_interfaces` left
+    the suite green with the proxy bound to `*`. Every caller must run that
+    check once the listeners are up.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    ports = [_free_port(), second_port or _free_port()]
+    (workdir / PROXY_CONFIG).write_text(json.dumps({"proxy": {
+        "request_listeners": [
+            {"certificate_mode": "per_host", "listen_mode": "loopback_only",
+             "listener_port": port, "running": True}
+            for port in ports
+        ]}}))
+    return ports
+
+
 def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
-                sentinel: Path) -> subprocess.Popen:
+                sentinel: Path, crawler_port: int = 0) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
     buffer fills and the test hangs with no diagnostic. A file also means a
     failing test can quote what Burp actually said.
+
+    TWO PROXY LISTENERS, and the SECOND one is the crawler's. S4 tells the
+    operator and the crawler apart by WHICH LISTENER a request arrived on and
+    by nothing in the traffic itself, so a rig with one listener cannot
+    exercise the split at all -- `Source.forListenerPort` would answer OPERATOR
+    for every request and the two rule sets would never be told apart.
+
+    `-Dhx.crawler_port` IS THE OTHER HALF OF THAT AND IT IS NOT OPTIONAL.
+    `HxExtension` reads it with a default of 0, and `Source.forListenerPort`
+    reads 0 as "no crawler configured" -- so a launch that omits it attributes
+    EVERY request to the operator however many listeners are running, and a
+    test of the split passes while measuring nothing. This is the
+    `-Dhx.halt_sentinel` incident that this function's own comment below
+    records, one plan later; the property is passed from the config file Burp
+    was actually handed, never from the argument, so the number the extension
+    compares against and the number Burp bound cannot drift.
+
+    `crawler_port=0` means "any free port"; read the real ones back with
+    proxy_port() and second_proxy_port().
     """
     home = make_home(workdir)
+    ports = write_listener_config(workdir, crawler_port)
     log = (workdir / "burp.log").open("wb")
     cmd = [
         "java",
@@ -215,10 +406,14 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
         # was not updated -- the integration tests are deselected from the
         # default run, so nothing said so for a day.
         f"-Dhx.halt_sentinel={sentinel}",
+        # Read back out of the config above rather than from `crawler_port`,
+        # which may be the 0 that means "choose one for me".
+        f"-Dhx.crawler_port={ports[1]}",
         *ADD_OPENS,
         "-cp", f"{BURP_JAR}:{EXT_JAR}",
         "burp.StartBurp",
         "--developer-extension-class-name=hx.HxExtension",
+        f"--config-file={workdir / PROXY_CONFIG}",
         "--disable-auto-update",
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
@@ -235,3 +430,275 @@ def wait_for(predicate, timeout: float = 90.0, interval: float = 0.5) -> bool:
             return True
         time.sleep(interval)
     return False
+
+
+# ---------------------------------------------------------------------------
+# The probe launcher, for docs/burp-proxy-measurements.md and the tests that
+# keep it true. Everything below is about one question: which proxy listener
+# did this request arrive on?
+#
+# WHY THE PROBE'S SOURCE IS UNDER tests/ AND NOT UNDER extension/src.
+# It is a second BurpExtension, and it registers a second proxy request
+# handler. Two structural checks forbid that in the shipped tree, both
+# rightly: ChokepointTest asserts burp.* is imported by HxExtension.java and
+# nothing else, and Plan 4's Task 7 asserts there is exactly one
+# registerRequestHandler. It was written under extension/src to take the
+# measurements and deleted from there in the same task.
+#
+# Deleting it outright would have left test_proxy_facts.py skipping forever,
+# and a test that can only skip is not the "goes red when Burp changes" half
+# of that deliverable -- it is the silence this repository keeps removing. So
+# the source lives beside the test that needs it and is compiled into a
+# throwaway directory per run, against the Burp jar itself: Burp ships the
+# whole Montoya API inside burpsuite_desktop_v2026.7.3.jar (997 entries under
+# burp/api/montoya/), so this adds no prerequisite that -m integration did not
+# already have.
+# ---------------------------------------------------------------------------
+
+# PROXY_CONFIG, _free_port and write_listener_config used to live here. They
+# moved above launch_burp when it grew its own second listener, so that the two
+# launchers share ONE spelling of `listen_mode: loopback_only` rather than two
+# free to drift. The explanation of WHY a listener has to come from a config
+# file at all stays in launch_probe's docstring below, where it was measured.
+PROBE_SRC = Path(__file__).resolve().parent / "probe" / "hx" / "proxy" / "Probe.java"
+PROBE_CLASS = "hx.proxy.Probe"
+
+
+def probe_missing() -> list[str]:
+    """What the probe needs FROM THIS MACHINE beyond what missing() covers.
+
+    Environment facts only, and the split is not tidiness. PROBE_SRC used to
+    be in this list, which made an absent probe a SKIP: renaming
+    tests/integration/probe/ produced `3 skipped in 0.03s` -- no error, no
+    diagnostic -- and the default run's summary line announces DESELECTED
+    integration tests, not skipped ones. So the three facts eight tasks rest
+    on stopped being checked with nothing red anywhere.
+
+    A Burp jar and a JDK are things a machine may legitimately not have. A
+    file this repository ships is not one of those. See probe_source_missing().
+
+    Kept out of missing() deliberately. That function runs at import time for
+    the whole repository and its contract is that nothing escapes it; this one
+    is called by a single fixture and may be as ordinary as it likes.
+    """
+    absent = _environment_missing()
+    if shutil.which("javac") is None:
+        absent.append("javac (a JDK, not just a JRE) to compile the probe")
+    return absent
+
+
+def probe_source_missing() -> str | None:
+    """Why the probe cannot be compiled at all -- or None when its source is here.
+
+    Separate from probe_missing() so the caller can treat it differently, and
+    the caller must: this is a FAILURE, not a skip. The scenario is specific
+    enough to answer in the message -- somebody reads Task 1's brief, sees
+    "Step 8: Delete the probe", and deletes the wrong copy.
+    """
+    if PROBE_SRC.exists():
+        return None
+    return (
+        f"the probe's source is gone: {PROBE_SRC}. This is not a missing "
+        "environment prerequisite, it is a file this repository ships, and "
+        "without it the three measurements in test_proxy_facts.py -- the only "
+        "check that Burp's proxy still behaves the way Plan 4 was designed "
+        "around -- cannot run at all. If it was deleted because Task 1's brief "
+        "says Step 8 deletes the probe: that step removed it from "
+        "extension/src, where a second registerRequestHandler breaks "
+        "ChokepointTest and Task 7. It belongs here. Restore it with "
+        "`git checkout tests/integration/probe/`."
+    )
+
+
+# --- F1: loopback_only, checked ------------------------------------------
+
+def _listening_sockets(pid: int) -> list[str]:
+    """Every local `address:port` this pid holds a LISTENING socket on.
+
+    `ss -ltnpH`: -l listening, -t tcp, -n numeric (a resolved `localhost`
+    would defeat the address parsing below), -p with the owning process, -H
+    without the header row. The process column reads
+    `users:(("java",pid=123,fd=8))`, so the pid is matched with its trailing
+    comma -- a bare `pid=123` also matches pid 1234.
+    """
+    out = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True,
+                         check=True).stdout
+    return [line.split()[3] for line in out.splitlines()
+            if f"pid={pid}," in line]
+
+
+def _is_loopback(local: str) -> bool:
+    """Is this `ss` local-address field on 127.0.0.0/8 or ::1?
+
+    The forms that actually turn up here, all measured on this machine:
+    `127.0.0.1:8080`, `[::1]:631`, `[::ffff:127.0.0.1]:40421` (what Burp's own
+    listeners look like), `0.0.0.0:8443`, `*:8444` and `127.0.0.53%lo:53`.
+
+    Anything unparseable -- `*` above all -- is NOT loopback. That direction
+    matters: `*` is the wildcard bind this whole check exists to catch, and a
+    parser that fell through to True for what it did not understand would
+    report an open relay as safe.
+    """
+    host = local.rsplit(":", 1)[0].strip("[]").split("%")[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    # Both halves, and the second is not redundant belt-and-braces. Whether
+    # IPv6Address.is_loopback answers True for an IPv4-MAPPED address is a
+    # property of the interpreter: the 3.12.13 running this suite says True
+    # (measured), and CPython has not always. `::ffff:127.0.0.1` is the form
+    # EVERY Burp listener takes here, so an interpreter that answered False
+    # would fail every honest run. The explicit test costs nothing and does
+    # not depend on which CPython this is.
+    return bool(addr.is_loopback or (mapped is not None and mapped.is_loopback))
+
+
+def not_loopback_only(pid: int, ports: list[int]) -> str | None:
+    """Why this Burp is not listening on loopback alone -- or None when it is.
+
+    `listen_mode: loopback_only` is written into every listener launch_probe
+    configures, three places in this tree call it non-optional, and until this
+    function existed NOTHING checked it. Changing that one string to
+    `all_interfaces` left `test_proxy_facts.py` reporting `3 passed in 38.03s`
+    while `ss` showed the two configured listeners bound to `*:34777` and
+    `*:38399` -- a forward proxy open to whatever network this laptop is
+    attached to, for the 38 s those three tests take. Reproduced here.
+
+    Two claims, because either one alone passes while the other is false:
+
+      - every port the config named is LISTENING for this pid, so the check
+        cannot pass vacuously against a Burp that bound nothing at all;
+      - every socket this pid listens on is on a loopback address, INCLUDING
+        the ones the config did not ask for. Burp opens a third listener of
+        its own on an ephemeral loopback port every run -- measured: it
+        answers `HTTP/1.1 204 No Content` to an absolute-URI GET, `200
+        Connection established` to a CONNECT and `204` again inside the
+        tunnel, forwards nothing to the target, and never reaches the
+        extension's handler. Harmless, and it must not fail this check; but a
+        check written only against the configured ports would also miss a
+        future listener that is not harmless.
+    """
+    try:
+        sockets = _listening_sockets(pid)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # NOT a pass. A guard that evaporates when its tool is missing is the
+        # defect this function was written to fix, one level down.
+        return (f"the listening sockets of burp pid {pid} could not be read, so "
+                f"`listen_mode: loopback_only` is unverified: {exc}")
+    if not sockets:
+        return (f"`ss -ltnpH` attributes no listening socket to burp pid {pid}, "
+                "so nothing here can say whether its proxy is on loopback. Burp "
+                "is running and its extension has loaded -- `PROBE READY` is on "
+                "disk -- so read this as a broken check before reading it as a "
+                "Burp that bound nothing.")
+    unbound = [port for port in ports
+               if not any(sock.endswith(f":{port}") for sock in sockets)]
+    if unbound:
+        return (f"burp pid {pid} was configured to listen on {unbound} and is "
+                f"not: it holds {sockets}. A check for `loopback_only` against "
+                "a port nothing bound would pass without measuring anything.")
+    off = [sock for sock in sockets if not _is_loopback(sock)]
+    if off:
+        return (f"burp pid {pid} is listening on {off}, which is not loopback. "
+                "A proxy listener on a wildcard or routable address is an open "
+                "forward relay on whatever network this machine is attached to, "
+                "for as long as the run lasts. Check `listen_mode` in "
+                f"{PROXY_CONFIG}: it must be loopback_only.")
+    return None
+
+
+def _compile_probe(workdir: Path) -> Path:
+    """The probe's classes, built fresh per run into a directory nothing keeps.
+
+    Compiled against BURP_JAR rather than montoya-api.jar so that the only
+    prerequisite is the one the integration suite already has. --release 21
+    matches extension/build.sh: Burp loads this class into the same JVM.
+    """
+    classes = workdir / "probe-classes"
+    classes.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["javac", "--release", "21", "-nowarn", "-Xlint:-options",
+         "-cp", str(BURP_JAR), "-d", str(classes), str(PROBE_SRC)],
+        check=True, capture_output=True, text=True)
+    return classes
+
+
+def launch_probe(workdir: Path, out: Path,
+                 extra_listener_port: int = 0) -> subprocess.Popen:
+    """Burp running hx.proxy.Probe, with a SECOND proxy listener.
+
+    The second listener is the whole point of Q1: one Burp, two ports, and the
+    question is whether the extension can tell which one a request came in on.
+    `extra_listener_port=0` means the caller does not care which port it gets;
+    read the real ones back with proxy_port() and second_proxy_port().
+
+    Burp Community has no API for creating a listener -- `burp.api.montoya.
+    proxy.Proxy` offers registerRequestHandler, registerResponseHandler,
+    registerWebSocketCreationHandler, history and intercept, and nothing that
+    opens a port. So the second listener comes from a PROJECT CONFIG FILE via
+    `--config-file`, which Community does accept. Both listeners are written
+    explicitly, including the first: a config that named only the second would
+    leave the first wherever Burp's defaults put it, which is the 8080 that
+    _free_port() exists to avoid.
+
+    `loopback_only` is not decoration. Nothing in this project has ever sent a
+    request off this machine, and a proxy listener on 0.0.0.0 is an open relay
+    on whatever network the laptop is attached to. It is also not self-
+    enforcing: this string was the whole of the protection until
+    not_loopback_only() was written, and changing it to `all_interfaces` left
+    the suite green with the proxy bound to `*`. Callers must run that check
+    once the listeners are up -- test_proxy_facts.py's fixture does.
+    """
+    home = make_home(workdir)
+    classes = _compile_probe(workdir)
+    write_listener_config(workdir, extra_listener_port)
+    log = (workdir / "burp.log").open("wb")
+    cmd = [
+        "java", "-Djava.awt.headless=true", f"-Duser.home={home}",
+        f"-Dhx.probe.out={out}",
+        # The probe's classes in place of the shipped extension jar. Burp
+        # loads exactly the one class named below, so EXT_JAR on the classpath
+        # would not load HxExtension -- it is left off because the probe does
+        # not need it, and because a jar on the path of a measurement run is a
+        # thing a later reader has to rule out.
+        *ADD_OPENS, "-cp", f"{BURP_JAR}:{classes}",
+        "burp.StartBurp",
+        f"--developer-extension-class-name={PROBE_CLASS}",
+        f"--config-file={workdir / PROXY_CONFIG}",
+        "--disable-auto-update",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log,
+                            stderr=subprocess.STDOUT, cwd=LAB)
+    proc.stdin.write(b"\n\n")
+    proc.stdin.flush()
+    return proc
+
+
+def listener_ports(workdir: Path) -> list[int]:
+    """The ports this run's Burp was TOLD to listen on, read back from its config.
+
+    Discovered rather than hard-coded, and from the file Burp itself was handed
+    rather than from a variable this module kept -- so the number a test dials
+    is the number Burp was asked for, with nothing in between that could drift.
+    """
+    cfg = json.loads((workdir / PROXY_CONFIG).read_text())
+    return [listener["listener_port"]
+            for listener in cfg["proxy"]["request_listeners"]]
+
+
+def proxy_port(workdir: Path) -> int:
+    """Burp's first proxy listener for this run.
+
+    NOT 8080. Burp Community does default to 8080, but a default is where a
+    listener goes when nobody says otherwise, and this fixture says otherwise
+    precisely because 8080 on a developer's machine is whatever else claimed it
+    first -- here, the local LLM router. See _free_port().
+    """
+    return listener_ports(workdir)[0]
+
+
+def second_proxy_port(workdir: Path) -> int:
+    """Burp's second proxy listener -- the other side of Q1's question."""
+    return listener_ports(workdir)[1]

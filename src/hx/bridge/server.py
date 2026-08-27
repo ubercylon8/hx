@@ -10,6 +10,7 @@ unconfigured until a configure frame is acknowledged.
 """
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import socket
@@ -19,6 +20,46 @@ import time
 from pathlib import Path
 
 from hx.bridge import codec
+
+# The first logger in `src/`, and it is deliberately a plain module logger with
+# no handler and no configuration: a library that installs a handler decides
+# for its embedder where the operator's diagnostics go. `hx` has no logging
+# setup yet, so under Python's default these records reach lastResort at
+# WARNING -- which is the level the refusal below uses, and is why the refusal
+# is visible on a bare `python -c` while the accept is not.
+_log = logging.getLogger(__name__)
+
+
+def peer_exe(pid: int) -> str:
+    """What `/proc/<pid>/exe` points at, or why it could not be read. S6.
+
+    A DIAGNOSTIC, NEVER A CHECK, and the distinction is the whole reason this
+    is a separate function with a docstring rather than an inline readlink.
+    Between the `getsockopt` that produced this pid and this call, the peer
+    can have exited and the pid can have been reused -- so the answer names a
+    process that may not be the one that connected. S6 says the executable is
+    LOGGED and says the credentials are CHECKED, and those are two different
+    sentences about two different facts: the uid is what authorises, and this
+    is what a human reads afterwards.
+    """
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except PermissionError:
+        # THE COMMON CASE FOR THE PATH THAT MATTERS, and it is stated rather
+        # than pretended around. Reading this link needs PTRACE_MODE_READ, so
+        # for a peer running as ANOTHER uid -- exactly the peer this is most
+        # worth knowing about -- the kernel refuses it unless hx is root. The
+        # uid, the pid and the refusal itself are still recorded; the program
+        # name is the part that is not available, and saying "unknown" would
+        # read as "no executable" rather than "not permitted to look".
+        return "<unreadable: permission denied (needs PTRACE_MODE_READ)>"
+    except FileNotFoundError:
+        return "<gone: the process exited before it could be resolved>"
+    except OSError as exc:
+        # Never raises. This runs inside `_serve`, on the accept-loop thread,
+        # where a throw would take the connection down -- and a diagnostic
+        # that can refuse a peer is not a diagnostic.
+        return f"<unreadable: {exc}>"
 
 
 class BridgeError(Exception):
@@ -79,7 +120,7 @@ class BridgeServer:
                                      "engagement_id"})
 
     def __init__(self, socket_path: Path, engagement_id: str, operator_halt,
-                 on_hello=None, on_halted=None):
+                 on_hello=None, on_halted=None, on_exchange=None):
         """
         `operator_halt` is an `hx.halt.OperatorHalt` -- duck-typed, so this
         module keeps no dependency on the store, and tests can attach anything
@@ -107,11 +148,26 @@ class BridgeServer:
         sentinel in a directory of its own, which is exactly the discipline
         the Java side imposes on itself.
 
-        `on_hello` and `on_halted` are both called ON THE READ THREAD, so
-        neither may touch a sqlite3 connection opened elsewhere: it belongs to
-        the thread that created it and raises ProgrammingError anywhere else
-        (tests/test_halt.py demonstrates it). Hand the work to the thread that
-        owns the store instead.
+        `on_hello`, `on_halted` and `on_exchange` are ALL called ON THE READ
+        THREAD, so none may touch a sqlite3 connection opened elsewhere: it
+        belongs to the thread that created it and raises ProgrammingError
+        anywhere else (tests/test_halt.py demonstrates it). Hand the work to
+        the thread that owns the store instead.
+
+        `on_exchange(header, request, response)` takes Plan 4's proxy traffic:
+        `exchange`, `denial` and `dropped` frames, which are UNSOLICITED --
+        nothing is waiting on an id, so without a sink installed they are read
+        and discarded. `hx.capture.Capture.on_exchange` has this shape.
+
+        IT IS THE ONE CALLBACK WHOSE THROW IS NOT FATAL. `on_halted` returning
+        an exception closes the connection, because a stop nothing wrote down
+        is a stop that did not happen. Capture is the opposite case and S4 says
+        so: a wedged harness or a lost record changes what hx KNOWS, never what
+        it ALLOWS, so a bookkeeping failure here must not become an outage on
+        the operator's browser. The exception is kept in
+        `exchange_callback_error`, the channel is kept with it, and the lost
+        record is handed back as a `dropped` frame so the run's coverage floor
+        moves -- see `_capture`, which explains why keeping it was not enough.
         """
         if operator_halt is None:
             # The signature already refuses an OMITTED argument. This refuses
@@ -130,18 +186,50 @@ class BridgeServer:
         self.engagement_id = engagement_id
         self.on_hello = on_hello
         self.on_halted = on_halted
+        self.on_exchange = on_exchange
         self.operator_halt = operator_halt
         # The last unsolicited `halted` frame, kept so a harness with no
         # on_halted callback installed can still see why issuance stopped.
         self.last_halted: dict | None = None
         self.halted_callback_error: BaseException | None = None
+        # The last thing an `on_exchange` frame failed on -- a malformed
+        # two-body payload, or a throw out of the sink. Recorded rather than
+        # raised: see the note on the constructor's `on_exchange`. These two
+        # are DIAGNOSTICS, read by tests and by whoever is debugging the
+        # bridge; the coverage consequence of the same failure travels the
+        # `dropped` frame `_capture` hands back, because nothing outside
+        # tests/ reads either of these and a run cannot get its floor from a
+        # number no one looks at.
+        #
+        # `exchange_errors` COUNTS FAILED SINK CALLS, NOT RECORDS LOST, and the
+        # two stopped being the same number when `_count_as_dropped` arrived:
+        # ONE lost record whose `dropped` retry also raises counts TWO, the
+        # original call and the retry. That is the right number for a
+        # diagnostic -- it is how many times the sink misbehaved, which is what
+        # someone debugging the sink wants -- and the wrong one for coverage,
+        # which is exactly why coverage does not come from here.
+        # `run.dropped_total`, fed by the `dropped` frame, is the count of
+        # RECORDS.
+        self.exchange_callback_error: BaseException | None = None
+        self.exchange_errors = 0
 
         self.state = "waiting"
         self.config_epoch = 0
         self.peer_uid: int | None = None
         self.peer_pid: int | None = None
+        self.peer_exe: str | None = None
         self.hello: dict | None = None
         self.rejected_hellos = 0
+        # Peers refused by SO_PEERCRED, i.e. another UID on this machine
+        # reaching for this socket. It sits beside `rejected_hellos`
+        # deliberately: the two are the same kind of number and one of them
+        # existed while the other -- the one that is a security event rather
+        # than a misconfiguration -- did not.
+        self.rejected_peers = 0
+        # The last one, for whoever is looking. Kept rather than only logged,
+        # because `hx` installs no logging handler and a library that did
+        # would be deciding for its embedder where diagnostics go.
+        self.last_rejected_peer: dict | None = None
 
         self._srv: socket.socket | None = None
         self._conn: socket.socket | None = None
@@ -238,8 +326,33 @@ class BridgeServer:
             if uid != os.getuid():
                 # The socket authenticates a uid, not a program; a different
                 # uid has no business here at all.
+                #
+                # COUNTED AND LOGGED, and it used to be a bare `return`. This
+                # is the one security-relevant connection event on this socket
+                # -- another account on this machine reaching for a capability
+                # that can send arbitrary HTTP into a client's production
+                # estate -- and it left no counter, no log line and no row, in
+                # contrast with `rejected_hellos` four lines of code away. An
+                # attempt nobody can see is indistinguishable from no attempt,
+                # and the refusal is exactly the thing worth knowing happened.
+                self.rejected_peers += 1
+                self.last_rejected_peer = {"pid": pid, "uid": uid,
+                                           "exe": peer_exe(pid)}
+                _log.warning(
+                    "hx bridge: refused a peer on %s -- uid %d is not %d "
+                    "(pid %d, exe %s). The socket authenticates a UID; a "
+                    "different one has no business here at all.",
+                    self.socket_path, uid, os.getuid(), pid, peer_exe(pid))
                 return
             self.peer_pid, self.peer_uid = pid, uid
+            # S6: "peer credentials are checked and the connecting pid's
+            # executable is LOGGED". Nothing resolved it, so the second half
+            # of that sentence was unmet on the path that succeeds as well as
+            # on the one that refuses. It is a diagnostic and never a check --
+            # see `peer_exe` for why it cannot be one.
+            self.peer_exe = peer_exe(pid)
+            _log.info("hx bridge: peer accepted on %s -- uid %d, pid %d, "
+                      "exe %s", self.socket_path, uid, pid, self.peer_exe)
 
             reader = codec.FrameReader(conn)
             while not self._stopping.is_set():
@@ -327,15 +440,109 @@ class BridgeServer:
                     return False
             return True
 
+        if t in ("exchange", "denial", "dropped"):
+            # `exchange` USED TO BE IN THE `_deliver` TUPLE BELOW and is not any
+            # more, which is deliberate rather than an oversight. `_deliver`
+            # answers a WAITER by `id`; these three are UNSOLICITED -- nothing
+            # holds an id for them -- so `_deliver` had nothing to wake and the
+            # frame reached no one. Nothing regressed on the send path when it
+            # moved: no solicited `exchange` reply exists in either
+            # implementation, and no `_request` waits on one.
+            self._capture(t, header, body)
+            return True
+
         if t == "configured":
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error", "exchange"):
+        if t in ("result", "error"):
             self._deliver(header, body)
             return True
 
         return False
+
+    def _capture(self, t: str, header: dict, body: bytes) -> None:
+        """Plan 4's unsolicited proxy traffic, handed to the sink.
+
+        NOTHING RAISES OUT OF HERE. `_serve` closes the connection on a
+        FrameError, and DENY-ALL is where a closed connection lands -- so a
+        malformed body or a sink that threw would take the operator's browsing
+        down with it, and the `halt` path with it. S4: a lost record changes
+        what hx knows, never what it allows. `codec.decode` leaves the two-body
+        split to `split_bodies` for exactly this reason; see the note there.
+
+        THE FAILURE IS KEPT *AND* COUNTED WHERE COVERAGE IS READ. Keeping it in
+        `exchange_callback_error` / `exchange_errors` was the whole of it, and
+        nothing outside `tests/` ever read either -- so a run whose every
+        exchange frame was malformed reported COMPLETE coverage, which is the
+        Java side's "a Burp log line is not the coverage floor" wearing a
+        different hat. A frame that could not be recorded is a record hx does
+        not have, so it goes back to the sink as a one-record `dropped` frame:
+        `run.dropped_total` is the number S5 makes the floor, and this is how a
+        loss on THIS side reaches it.
+
+        The retry is attempted ONCE and only for a frame that was not itself a
+        drop report, so a sink that raises on everything costs one extra call
+        and not a recursion; if that call fails too, the count stands and the
+        channel is still kept.
+
+        AND THAT LAST CASE LOSES THE COVERAGE FLOOR TOO -- named here because
+        it is the same lesson one layer up, and MEASURED in Task 9 against a
+        real Burp: with a sink that raises on every frame, three browsed
+        requests produced `exchange_errors = 6` (three exchanges and their
+        three `dropped` retries), no exchange rows, and `run.dropped_total`
+        STILL 0. The three requests reached the target and were served, which
+        is right -- S4 is unconditional -- but a reader of that run sees
+        complete coverage over an hour in which nothing was recorded at all.
+        `exchange_errors` is the only thing on this side that says otherwise
+        and NOTHING OUTSIDE tests/ READS IT, which is precisely the criticism
+        this method's own paragraph above makes of the version before it.
+        The floor moves only for a sink that fails on exchanges and SUCCEEDS on
+        `dropped` frames -- the saturated-queue case it was built for, where
+        the far side is slow rather than broken.
+
+        Not fixed here, and the reason is that there is nowhere honest to put
+        it: `run.dropped_total` is a column in the store, the store is what the
+        sink writes to, and a sink that cannot be written to cannot record that
+        it could not be written to. It needs a channel that is not the sink --
+        an operator-facing warning at `hx info`, or a harness-side log -- and
+        that is a decision about the CLI, not about this method.
+
+        Only `exchange` carries two bodies. `denial` and `dropped` describe
+        something that produced no traffic, so they arrive with an empty body
+        and are passed on as two empty halves -- which is what the far side's
+        `Capture.on_exchange` reads for them anyway.
+        """
+        if self.on_exchange is None:
+            return
+        try:
+            if t == "exchange":
+                request, response = codec.split_bodies(header, body)
+            else:
+                request, response = b"", b""
+            self.on_exchange(header, request, response)
+        except Exception as exc:
+            self.exchange_callback_error = exc
+            self.exchange_errors += 1
+            self._count_as_dropped(t, header)
+
+    def _count_as_dropped(self, t: str, header: dict) -> None:
+        """Tell the sink one record was lost. See `_capture`.
+
+        The `source` is carried across so the loss lands on the run the frame
+        belonged to; `hx.capture` reads an absent one as the operator's, which
+        is the same answer it gives an omitted key on the wire.
+        """
+        if t == "dropped":
+            return
+        drop = {"v": codec.PROTOCOL_VERSION, "t": "dropped", "n": 1}
+        if isinstance(header.get("source"), str):
+            drop["source"] = header["source"]
+        try:
+            self.on_exchange(drop, b"", b"")
+        except Exception as exc:
+            self.exchange_callback_error = exc
+            self.exchange_errors += 1
 
     def _reassert_halt(self) -> bool:
         """Tell a freshly connected peer it is still halted. False to close.

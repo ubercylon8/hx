@@ -138,6 +138,97 @@ def test_the_protocol_doc_lists_exactly_the_classes_the_code_emits():
         f"only in the code: {sorted(set(ERROR_CLASSES) - listed)}")
 
 
+def _java_method_body(text: str, signature: str) -> str:
+    """The brace-matched body of one Java method, by its signature line.
+
+    Crude on purpose: it counts braces from the method's opening one. That is
+    wrong for a body containing a brace inside a string or character literal,
+    and none of the three below does -- asserted by the field sets coming out
+    non-empty and the right size, which a truncated body would not.
+    """
+    start = text.index(signature)
+    open_brace = text.index("{", start)
+    depth = 0
+    for i in range(open_brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace:i]
+    raise AssertionError(f"unbalanced braces after {signature!r}")
+
+
+def test_the_protocol_doc_lists_exactly_the_fields_the_capture_frames_carry():
+    """The three unsolicited frames S4's second enforcement point reports.
+
+    A HEADER FIELD IS A VOCABULARY IN TWO PLACES. The Java side puts the keys
+    on the wire; `docs/bridge-protocol.md` is what a second implementation --
+    and the next reader of `hx.capture` -- is written from. They drifted for a
+    whole plan already: the doc said `exchange {v,t,...} unsolicited; no id.
+    Defined in a later plan.` while Tasks 4 and 6 had built and consumed the
+    real thing, and it named neither `dropped` nor `denial` at all.
+
+    THE DIRECTION THAT MATTERS IS A KEY THE DOC DOES NOT NAME. An unknown
+    header key is IGNORED on the Python side, not refused -- so a field added
+    to the Java frame without a reader is a fact the operator never sees and a
+    reason to believe it was recorded. This is the check that makes such a key
+    say so.
+
+    The two sides have independent sources: the doc's own frame table, and the
+    `put("...")` calls in the methods that build each frame. `v` is stamped by
+    the sink rather than by the record's own arm, which is why the exchange
+    and denial sets are unioned with the sink's -- and it is IN the doc,
+    because a frame without it is one `BridgeServer._handle` drops before it
+    looks at `t`.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1]
+    doc = (root / "docs" / "bridge-protocol.md").read_text(encoding="utf-8")
+    documented = {
+        m.group(1): set(m.group(2).split(","))
+        for m in re.finditer(
+            r"^ +burp -> py +(exchange|denial|dropped) +\{([a-z_,]+)\}",
+            doc, re.M)
+    }
+    assert set(documented) == {"exchange", "denial", "dropped"}, (
+        f"the frame table no longer names all three: {sorted(documented)}")
+
+    capture = (root / "extension" / "src" / "hx" / "proxy"
+               / "Capture.java").read_text(encoding="utf-8")
+    bridge = (root / "extension" / "src" / "hx" / "bridge"
+              / "BridgeClient.java").read_text(encoding="utf-8")
+    key = re.compile(r'\.put\(\s*"([a-z_]+)"')
+
+    # `v` is put by the SINK, in the arm that writes each frame; the record's
+    # own arm puts everything else. Both halves are read, so a `v` dropped
+    # from either is a difference here rather than a frame the far side
+    # discards in silence.
+    sink_exchange = set(key.findall(_java_method_body(
+        bridge, "public boolean exchange(Map<String, Object> header, byte[] request,")))
+    sink_denial = set(key.findall(_java_method_body(
+        bridge, "public boolean denial(Map<String, Object> header)")))
+    sink_dropped = set(key.findall(_java_method_body(
+        bridge, "public boolean dropped(long n, String source)")))
+
+    emitted = {
+        "exchange": sink_exchange | set(key.findall(
+            _java_method_body(capture, "private void deliverExchange(Observed o)"))),
+        "denial": sink_denial | set(key.findall(
+            _java_method_body(capture, "private void deliverDenial(Denied d)"))),
+        "dropped": sink_dropped,
+    }
+    # Anti-vacuity: an empty or truncated parse would compare two empty sets
+    # for a frame and pass. Every frame carries `v` and `t` at minimum, and
+    # the doc is what says how many more.
+    for name, fields in emitted.items():
+        assert {"v", "t"} <= fields, f"{name} lost its envelope: {sorted(fields)}"
+    assert emitted == documented, {
+        name: {"only in the doc": sorted(documented[name] - emitted[name]),
+               "only in the code": sorted(emitted[name] - documented[name])}
+        for name in documented if documented[name] != emitted[name]
+    }
+
+
 def test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan():
     """A regex that stopped matching would shrink ERROR_CLASSES quietly, and
     every set-equality test here would then be comparing two small sets.
@@ -292,12 +383,17 @@ def test_the_module_docstrings_counts_are_the_counts():
     """The docstring said "twenty-one columns, six of which are nullable ids".
     Both numbers were wrong, and neither was checkable by reading.
 
-    MEASURED: the two INSERTs name 25 columns (9 + 16). Twenty-one is the
-    number of keyword parameters (8 + 13) -- a different thing, and the likely
+    MEASURED: the two INSERTs name 26 columns (10 + 16). Twenty-three is the
+    number of keyword parameters (9 + 14) -- a different thing, and the likely
     source of the error, so it is derived here too and named as itself. Five
     keyword parameters are nullable ids; `req_blob` and `resp_blob` are `str |
     None` as well and are deliberately excluded, because a blob digest is not
     a row id.
+
+    The numbers were 25 and 21 until Plan 4 gave both writers a `via` and
+    `denial` the column to put it in. That they MOVED is the demonstration:
+    the docstring they pin was updated because this went red, which is the
+    opposite of the comment that carried a stale number for two plans.
 
     Derived rather than transcribed. A comment carrying a number nothing
     computes is a comment that goes stale on the next column.
@@ -322,8 +418,8 @@ def test_the_module_docstrings_counts_are_the_counts():
             if annotation == "str | None" and param.name.endswith("_id"):
                 nullable_ids.append(f"{name}.{param.name}")
 
-    assert columns == 25, columns
-    assert keywords == 21, keywords
+    assert columns == 26, columns
+    assert keywords == 23, keywords
     assert nullable_ids == [
         "record_denial.run_id", "record_denial.scope_version_id",
         "record_exchange.run_id", "record_exchange.surface_id",
@@ -332,8 +428,8 @@ def test_the_module_docstrings_counts_are_the_counts():
 
     # ...and the docstring says the numbers this just computed.
     doc = records.__doc__
-    assert "**25** columns" in doc, doc
-    assert "9 on `denial`, 16 on `exchange`" in doc, doc
+    assert "**26** columns" in doc, doc
+    assert "10 on `denial`, 16 on `exchange`" in doc, doc
     assert "**five**" in doc, doc
 
 
@@ -362,6 +458,56 @@ def test_a_denial_with_no_run_is_allowed(conn):
                                    at_us=1)
     assert conn.execute("SELECT run_id FROM denial WHERE id=?",
                         (row_id,)).fetchone()["run_id"] is None
+
+
+def test_both_writers_still_default_to_the_send_path(conn):
+    """The default is what makes `via` a safe edit to a module with coherence
+    guards already in it: every call site written before Plan 4 keeps writing
+    the rows it always wrote. Both writers, because a default added to one of
+    them is a silent behaviour change in the other."""
+    d = records.record_denial(conn, run_id="r-1", kind="scope", method="GET",
+                              url="https://elsewhere.test/", detail="out of scope",
+                              at_us=1)
+    x = records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/", status=200,
+                                req_blob=None, resp_blob=None, ms=1, at_us=1)
+    assert conn.execute("SELECT via FROM denial WHERE id=?", (d,)).fetchone()[0] \
+        == "send"
+    assert conn.execute("SELECT via FROM exchange WHERE id=?", (x,)).fetchone()[0] \
+        == "send"
+
+
+def test_a_second_egress_point_is_recorded_as_itself(conn):
+    """The whole reason `via` is a parameter now. `SELECT kind, COUNT(*) FROM
+    denial` answered for two egress points at once while the column existed on
+    only one of the two tables, and "the crawler is being refused everywhere"
+    and "my browsing is being refused everywhere" are opposite instructions."""
+    d = records.record_denial(conn, run_id="r-1", kind="scope", method="GET",
+                              url="https://elsewhere.test/", detail="out of scope",
+                              at_us=1, via="proxy")
+    x = records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/", status=200,
+                                req_blob=None, resp_blob=None, ms=1, at_us=1,
+                                via="proxy")
+    assert conn.execute("SELECT via FROM denial WHERE id=?", (d,)).fetchone()[0] \
+        == "proxy"
+    assert conn.execute("SELECT via FROM exchange WHERE id=?", (x,)).fetchone()[0] \
+        == "proxy"
+
+
+@pytest.mark.parametrize("writer", ["record_denial", "record_exchange"])
+def test_a_via_outside_the_vocabulary_is_refused_before_sqlite_sees_it(conn, writer):
+    """Redundant with both CHECK constraints and worth its lines for the same
+    reason the `kind` check is: SQLite answers with "CHECK constraint failed:
+    denial", which names neither the value nor the three it would accept."""
+    common = dict(run_id="r-1", method="GET", url="https://app.example.test/",
+                  at_us=1, via="carrier-pigeon")
+    extra = ({"kind": "scope", "detail": "x"} if writer == "record_denial"
+             else {"status": 200, "req_blob": None, "resp_blob": None, "ms": 1})
+    with pytest.raises(ValueError, match="unknown via"):
+        getattr(records, writer)(conn, **common, **extra)
+    table = "denial" if writer == "record_denial" else "exchange"
+    assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
 def test_an_exchange_row_records_the_pair_and_derives_recv_us(conn):
@@ -450,6 +596,36 @@ def test_every_outcome_this_module_accepts_is_one_the_schema_accepts(conn):
                                 at_us=1, outcome=outcome)
     assert conn.execute("SELECT COUNT(DISTINCT outcome) FROM exchange"
                         ).fetchone()[0] == len(records.EXCHANGE_OUTCOMES)
+
+
+@pytest.mark.parametrize(
+    "outcome", sorted(o for o, s in LEGAL_STATUS.items() if s is not None))
+def test_an_outcome_that_means_a_response_came_back_is_refused_without_one(
+        conn, outcome):
+    """The other direction of the table above, and it was short by one.
+
+    `truncated` means the response ARRIVED and was cut short, so a truncated
+    row with a NULL status is the same "row that reads as evidence and is
+    not" that the `ok` guard has always refused. It was outside the guard
+    until 2026-08-25 and the gap was reachable from the wire: a `result`
+    frame with no `status` key at all, through `hx.capture`, MEASURED an
+    accepted exchange with `status NULL`, one surface and
+    `requests_issued=1`.
+
+    Driven off LEGAL_STATUS rather than a literal pair, so an outcome added
+    later that carries a status inherits the refusal instead of falling
+    through a decision nobody made. The table is asserted to cover
+    EXCHANGE_OUTCOMES exactly a few lines above, which is what makes this
+    parametrisation total rather than a sample.
+    """
+    expected = "599" if outcome == "status_unreadable" else "no status"
+    with pytest.raises(ValueError, match=expected):
+        records.record_exchange(conn, run_id="r-1", method="GET",
+                                url="https://app.example.test/api/orders",
+                                status=None, req_blob="a" * 64,
+                                resp_blob=None, ms=1, at_us=1,
+                                outcome=outcome)
+    assert conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
 
 
 def test_the_module_and_the_schema_agree_on_the_outcome_vocabulary():

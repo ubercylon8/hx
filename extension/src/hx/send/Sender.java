@@ -45,11 +45,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   4. Policy, first half    scope -> method -> dangerous. None of them spends
  *                            anything, so they cost nothing to run early.
  *   5. unmanaged_credential  BETWEEN the two halves. Before the Gate for the
- *                            same reason as 1; after 4 because this class has
- *                            no `denial` row (records.UNRECORDABLE), so
- *                            running it first made an out-of-scope request
- *                            carrying a Cookie into a credential error with
- *                            the scope violation recorded nowhere.
+ *                            same reason as 1; after 4 because running it
+ *                            first made an out-of-scope request carrying a
+ *                            Cookie into a credential error, naming the
+ *                            credential rather than the boundary crossed.
+ *                            (The class had no `denial` row at all until
+ *                            SCHEMA_VERSION 6 gave it `kind='credential'`, so
+ *                            the scope violation was then recorded nowhere;
+ *                            the ordering stands on the first reason alone.)
  *   6. Policy, second half   the Gate: rate -> budget.
  *
  * Steps 2-6 hold the pinned order -- not_configured, halted, scope_denied,
@@ -248,10 +251,11 @@ public final class Sender {
         // that placement have different reasons. Before the Gate, for the same
         // reason as guard 1: Limits.check() spends a rate token and a budget
         // slot on a request that is about to be refused. After scope, method
-        // and dangerous, because this class is in records.UNRECORDABLE -- there
-        // is no `denial` row for it -- so running it first turned every
-        // out-of-scope request CARRYING A COOKIE into a credential error with
-        // no row anywhere. MEASURED before this moved:
+        // and dangerous, because running it first turned every out-of-scope
+        // request CARRYING A COOKIE into a credential error naming the
+        // credential rather than the boundary crossed -- and while the class
+        // was in records.UNRECORDABLE, which it was until SCHEMA_VERSION 6,
+        // with no row anywhere either. MEASURED before this moved:
         //
         //   out-of-scope AND unmanaged Cookie    -> unmanaged_credential
         //   out-of-scope, no cookie              -> scope_denied
@@ -654,7 +658,7 @@ public final class Sender {
      * out" is not a licence to report the interim head, and for why 101 is the
      * one 1xx where there was never a later head to run out of.
      */
-    static StatusScan scanStatus(byte[] raw, int reported) {
+    public static StatusScan scanStatus(byte[] raw, int reported) {
         // Not an interim status: the transport's answer IS the final one, and
         // re-reading the bytes behind it would let a peer's leading head
         // overrule a status the exchange really produced.
@@ -738,13 +742,27 @@ public final class Sender {
      * theDeprecatedAccessorsAreUnusedEverywhere, which makes the rule
      * explicit -- fix the javadoc, do not widen the needle.
      *
+     * PUBLIC, ALONG WITH {@link #scanStatus}, BECAUSE THERE IS ONE SCAN AND NOT
+     * TWO. The PROXY path emits the same two wire values -- `status` and
+     * `outcome` -- and shipped them as `r.statusCode()` raw and the literal
+     * `"ok"`, with no scan behind either: a `103 Early Hints` in front of a
+     * dead origin filed `status=103, outcome=ok`, which is the exact pair S5
+     * measured thirty of and the pair that leaves S4's auto-halt a healthy
+     * sample for every failing request. {@link #finalStatus} was already
+     * public and is NOT enough for that caller: it throws the provenance away,
+     * and deriving "was that unreadable" from the code alone gets a genuine
+     * 599 read out of the bytes behind a 103 exactly backwards. So the caller
+     * gets the whole answer rather than half of it and a second copy of this
+     * loop. `hx.proxy` -> `hx.send` is the edge {@link Redactor} already
+     * crosses in that direction; the reverse is the one to refuse.
+     *
      * @param code       what goes on the evidence line and into Distress
      * @param unreadable true when {@code code} is {@link #STATUS_UNREADABLE}
      *                   BECAUSE no final status line could be read behind a
      *                   reported 1xx, rather than because anything in the
      *                   exchange said 599
      */
-    record StatusScan(int code, boolean unreadable) { }
+    public record StatusScan(int code, boolean unreadable) { }
 
     /**
      * The three-digit code of a status line, or -1 for a line that is not
