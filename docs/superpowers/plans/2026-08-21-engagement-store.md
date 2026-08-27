@@ -2972,6 +2972,7 @@ from hx import cli
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
 from hx import run as run_mod
+from hx import scan as scan_mod
 from hx.store import records as records_mod
 
 
@@ -3736,6 +3737,87 @@ def test_deleting_the_sentinel_by_hand_leaves_the_two_sides_disagreeing(engageme
     result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
     assert result.exit_code == 0, result.output
     assert _halt_state(engagement)[0] is False
+
+
+# --- Task 7: `hx scan` ---
+
+
+@pytest.fixture
+def engagement_with_surface(engagement: Path) -> Path:
+    """One `surface` row and one `exchange` against it, so a passive check --
+    `active_safe`, `active_mutate` and `active_dos` all default to `probes`,
+    not `on_surface`, and this plan ships none of those -- has something to
+    read. Built on `engagement` the way `engagement_with_drops` and
+    `engagement_with_stale_run` are, per P2: this fixture did not exist
+    before this task."""
+    eng = eng_mod.open_(engagement)
+    try:
+        eng.db.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+            " port, path_template, discovered_by, normaliser_version)"
+            " VALUES('s1', ?, 'GET', 'https', 'app.acme.com', 443,"
+            " '/api/widgets', 'proxy', 1)",
+            (eng.id,))
+        records_mod.record_exchange(
+            eng.db, run_id=None, method="GET",
+            url="https://app.acme.com/api/widgets", status=200,
+            req_blob=None, resp_blob=None, ms=0, at_us=eng_mod.now_us(),
+            outcome="ok", surface_id="s1")
+    finally:
+        eng.db.close()
+    return engagement
+
+
+def test_scan_reports_what_it_ran(engagement_with_surface):
+    result = CliRunner().invoke(cli.main,
+                                ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    assert "surfaces" in result.output.lower()
+
+
+def test_scan_names_a_class_that_is_enabled_but_ships_no_checks(engagement_with_surface):
+    """config.DEFAULT_CHECKS turns `active_timing` ON by default and this
+    plan ships no checks in it. An operator reading `active_timing: enabled`
+    and seeing no rows would reasonably conclude it ran and found nothing.
+    The scan says so out loud instead."""
+    result = CliRunner().invoke(cli.main,
+                                ["scan", "--root", str(engagement_with_surface)])
+    assert "active_timing" in result.output
+    assert "no checks" in result.output.lower()
+
+
+def test_scan_with_no_surfaces_says_so_rather_than_reporting_success(engagement):
+    """Nothing captured yet is not the same as nothing found. An operator who
+    forgot to browse must not read `0 findings` as a clean bill."""
+    result = CliRunner().invoke(cli.main, ["scan", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "no surfaces" in result.output.lower()
+
+
+def test_scan_refuses_a_root_that_is_not_an_engagement(tmp_path):
+    result = CliRunner().invoke(cli.main, ["scan", "--root", str(tmp_path)])
+    assert result.exit_code != 0
+    assert result.output.strip()
+
+
+def test_scan_max_seconds_reaches_the_runner(engagement_with_surface, monkeypatch):
+    """Row C of the sweep: none of the tests above ever pass `--max-seconds`,
+    so a CLI that silently dropped it in favour of `max_seconds=None` on the
+    call to `scan.run` would leave every test above green. A deadline already
+    in the past is the input that separates 'wired through' from 'ignored' --
+    it only truncates the scan if the CLI's own option actually reaches
+    `scan.run`. `time.monotonic` is patched the same way
+    `test_budget_exhaustion_writes_skipped_rows_for_the_remaining_surfaces`
+    in `tests/test_scan.py` does it: one call to compute the deadline, one
+    call for the single surface `engagement_with_surface` seeds."""
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(scan_mod.time, "monotonic", lambda: next(ticks))
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface), "--max-seconds", "0",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "surfaces  0" in result.output
+    assert "skipped" in result.output.lower()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3765,6 +3847,8 @@ from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
 from hx import run as run_mod
+from hx import scan as scan_mod
+from hx.checks import registry
 from hx.store import db as db_mod
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -4137,6 +4221,48 @@ def resume(root) -> None:
             f"resume failed and the halt still stands ({oh.sentinel_path}): {exc}"
         ) from exc
     click.echo(f"issuance resumed; the halt was: {was}")
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--max-seconds", type=int, default=None,
+              help="Stop after this long. Remaining checks are recorded as "
+                   "skipped, never left absent.")
+def scan(root, max_seconds) -> None:
+    """Run the enabled check corpus over everything captured so far."""
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        surfaces = eng.db.execute(
+            "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
+            (eng.id,)).fetchone()[0]
+        if surfaces == 0:
+            # NOT an error, and not silence either. Nothing captured is a
+            # different fact from nothing found, and an operator who forgot
+            # to browse must not read `0 findings` as a clean bill.
+            click.echo("no surfaces captured yet -- browse the target "
+                       "through the proxy first, then scan")
+            return
+
+        summary = scan_mod.run(
+            eng.db, engagement_id=eng.id, blobs=eng.blobs,
+            config=eng.config, max_seconds=max_seconds)
+        click.echo(f"surfaces  {summary.surfaces}")
+        click.echo(f"checks    {summary.checks_run}")
+        click.echo(f"findings  {summary.findings}")
+        if summary.skipped:
+            for reason, n in sorted(summary.by_reason.items()):
+                click.echo(f"skipped   {n} ({reason})")
+
+        # A class the operator enabled that this build ships nothing for.
+        # Without this line, `active_timing: true` plus no rows reads as
+        # "ran, found nothing".
+        for klass, on in sorted(eng.config.checks.items()):
+            if on and not any(c.klass == klass for c in registry.CHECKS):
+                click.echo(f"note      {klass} is enabled but this build "
+                           f"ships no checks in it")
+    finally:
+        eng.db.close()
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
