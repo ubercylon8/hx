@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
@@ -103,15 +104,67 @@ def transaction(conn: sqlite3.Connection):
     forgetting. `hx.capture.on_exchange` is the first of those and did forget
     -- it wrote four statements unwrapped, and `upsert_surface` failing left a
     committed exchange row with a NULL `surface_id` behind it.
+
+    REENTRANT, since Task 6. `conn.execute("BEGIN")` against a connection
+    already inside a transaction raises
+    `OperationalError: cannot start a transaction within a transaction` --
+    MEASURED, the first time `hx.scan.run` called `records.record_evidence`
+    (which wraps itself in `transaction(conn)`) from inside its own
+    `_write_finding`, itself wrapped in `transaction(conn)`. A caller
+    composing two already-atomic helpers into one atomic unit is exactly the
+    "more call sites... in later plans" this docstring already predicted, so
+    the helper -- not either call site -- is what learns to nest.
+
+    `conn.in_transaction` decides which path runs. Outermost: a plain
+    `BEGIN`/`COMMIT`/`ROLLBACK`, unchanged from before -- MEASURED against
+    `hx.capture.on_exchange`, the merged, reviewed, non-nested caller, whose
+    own tests (`tests/test_capture.py`) still pass unmodified. Nested: a named
+    `SAVEPOINT`, released on success or rolled back to (then released) on
+    failure, before re-raising -- so an inner failure undoes only the inner
+    block's writes and the exception still propagates, while the OUTER
+    transaction is left exactly as if the inner block had never run, free to
+    retry or to fail on its own account.
+
+    RELEASING A SAVEPOINT IS NOT COMMITTING. SQLite only durably commits at
+    the outermost `COMMIT` -- a `RELEASE` just folds the inner block's writes
+    into the still-open outer transaction, so if the OUTER block later fails,
+    its `ROLLBACK` undoes the released inner work too, not just what the
+    outer block wrote itself. MEASURED both directions below (both are pinned
+    in `tests/test_db.py`):
+
+      * inner raises: the inner INSERT is gone, the exception propagates, and
+        a SEPARATE inner transaction run afterwards on the same connection
+        commits normally -- the savepoint stack was left clean, not wedged.
+      * outer raises, after a nested transaction already ran and released
+        cleanly inside it: the inner block's INSERT is ALSO gone. A savepoint
+        path that let it survive would make a partial write look atomic,
+        which is worse than the bug this replaces.
     """
-    conn.execute("BEGIN")
+    nested = conn.in_transaction
+    if not nested:
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # transaction already gone; do not mask the original error
+            raise
+        else:
+            conn.execute("COMMIT")
+        return
+
+    name = f"sp_{uuid.uuid4().hex}"
+    conn.execute(f"SAVEPOINT {name}")
     try:
         yield conn
     except BaseException:
         try:
-            conn.execute("ROLLBACK")
+            conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            conn.execute(f"RELEASE SAVEPOINT {name}")
         except sqlite3.Error:
-            pass  # transaction already gone; do not mask the original error
+            pass  # savepoint already gone; do not mask the original error
         raise
     else:
-        conn.execute("COMMIT")
+        conn.execute(f"RELEASE SAVEPOINT {name}")

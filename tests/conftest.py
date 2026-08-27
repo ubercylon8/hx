@@ -12,6 +12,7 @@ import sqlite3
 
 import pytest
 
+from hx import config as config_mod
 from hx.store import db as db_mod
 
 
@@ -60,3 +61,50 @@ def engagement_conn():
             (exchange_id,))
     yield conn
     conn.close()
+
+
+def _scan_env(*, passive: bool):
+    """An in-memory engagement with one surface and one exchange against it,
+    and a `Config` whose `checks.passive` is on or off.
+
+    Separate from `engagement_conn`: that fixture seeds `run` and `exchange`
+    rows for the finding/evidence unit tests and has no `surface` row at all
+    -- `hx.scan.run` queries `surface` first and would iterate zero of them
+    against it. `foreign_keys=ON` for the same reason `engagement_conn`
+    turned it on: it is what `db_mod.connect` actually does, and a scan_env
+    that let a dangling reference through would test a laxer database than
+    hx ever opens for real.
+    """
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.execute("PRAGMA foreign_keys=ON")
+    db_mod.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e-1','T','T',1,'active')")
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, discovered_by, normaliser_version)"
+        " VALUES('s-1','e-1','GET','https','app.test',443,'/','proxy',1)")
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url) VALUES('x-1', NULL, 's-1', 'proxy', 'ok', 1, 'GET',"
+        " 'https://app.test/')")
+    checks = dict(config_mod.DEFAULT_CHECKS)
+    checks["passive"] = passive
+    cfg = config_mod.Config(
+        name="T", client="T", scope_include=["*.test"], checks=checks)
+    return {"conn": conn, "engagement_id": "e-1", "blobs": None, "config": cfg}
+
+
+@pytest.fixture
+def scan_env():
+    env = _scan_env(passive=True)
+    yield env
+    env["conn"].close()
+
+
+@pytest.fixture
+def scan_env_disabled():
+    env = _scan_env(passive=False)
+    yield env
+    env["conn"].close()
