@@ -34,6 +34,7 @@ import pytest
 from hx import capture as capture_mod
 from hx import config as config_mod
 from hx import run as run_mod
+from hx.checks import base as base_mod
 from hx.store import db as db_mod
 from hx.store import records as records_mod
 
@@ -174,6 +175,18 @@ def test_discovered_by_is_total_over_via_and_says_only_what_the_schema_takes():
     assert set(capture_mod.DISCOVERED_BY.values()) <= checks["surface.discovered_by"]
 
 
+def test_check_severities_match_the_schema():
+    assert set(base_mod.SEVERITIES) == _checks()["finding.severity"]
+
+
+def test_check_confidences_match_the_schema():
+    assert set(base_mod.CONFIDENCES) == _checks()["finding.confidence"]
+
+
+def test_check_scope_levels_match_the_schema():
+    assert set(base_mod.SCOPE_LEVELS) == _checks()["finding.scope_level"]
+
+
 def test_every_python_vocabulary_in_this_repo_is_covered_here():
     """The list of pairings is itself a thing that drifts.
 
@@ -204,6 +217,9 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
         "hx.store.records.EXCHANGE_OUTCOMES",
         "hx.store.records.DENIAL_KINDS",
         "hx.store.records.VIA_VALUES",
+        "hx.checks.base.SEVERITIES",
+        "hx.checks.base.CONFIDENCES",
+        "hx.checks.base.SCOPE_LEVELS",
     }
     unpaired_with_reason = {
         # Error CLASSES are a wire vocabulary from §6, not a column. The
@@ -238,11 +254,18 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
         # LANGUAGE, which is why this file's schema-derived scan cannot be the
         # thing that holds it.
         "hx.store.records.CREDENTIAL_PARAMS",
+        # A check's insertion points, from S4. `check_run.insertion_name` and
+        # `finding.insertion_kind` are free TEXT -- no CHECK constrains
+        # either, so there is no schema vocabulary to pair this against.
+        # Open question 1 in the spec: constrain it with a CHECK once a
+        # second consumer of the vocabulary appears.
+        "hx.checks.base.INSERTION_KINDS",
     }
     found = set()
     for mod, name in ((run_mod, "hx.run"), (config_mod, "hx.config"),
                       (capture_mod, "hx.capture"),
-                      (records_mod, "hx.store.records")):
+                      (records_mod, "hx.store.records"),
+                      (base_mod, "hx.checks.base")):
         for attr in dir(mod):
             if attr.startswith("_") or not attr.isupper():
                 continue
@@ -260,6 +283,13 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
     assert "hx.capture.DISCOVERED_BY" in found, (
         "the scan no longer reaches hx.capture, or no longer looks at dicts; "
         "either way the map it was widened to catch is invisible to it again"
+    )
+    # Same guard, for `hx.checks.base`: a scan whose reach is not asserted is
+    # a scan that can be narrowed by accident, and this module is the one
+    # this task added.
+    assert "hx.checks.base.SEVERITIES" in found, (
+        "the scan no longer reaches hx.checks.base; the vocabulary this task "
+        "added is invisible to it again"
     )
     unaccounted = found - paired - unpaired_with_reason
     assert not unaccounted, (
