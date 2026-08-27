@@ -704,3 +704,134 @@ def abort_run(conn: sqlite3.Connection, *, run_id: str,
         # nothing would leave a live run marked as running forever.
         raise ValueError(f"no run {run_id!r} in this store")
     return False
+
+
+# S5's canonical dedupe key, in its field order. ONE builder, because two
+# spellings of one finding are two rows behind a UNIQUE constraint that was
+# supposed to prevent exactly that.
+_DEDUPE_FIELDS = ("type", "scheme", "host", "port", "method", "path_template",
+                  "insertion_kind", "insertion_name")
+
+
+def dedupe_key(*, type_: str, scheme: str, host: str, port: int | None,
+               method: str, path_template: str,
+               insertion_kind: str | None, insertion_name: str | None) -> str:
+    """`type|scheme|host|port|method|path_template|insertion_kind|insertion_name`.
+
+    LITERAL `-` FOR ABSENT PARTS, NEVER `None`. `finding.dedupe_key` is
+    `TEXT NOT NULL`, so this function must never itself hand back a bare
+    `None` -- verified: `INSERT INTO finding(...) VALUES(..., NULL, ...)`
+    raises `IntegrityError: NOT NULL constraint failed: finding.dedupe_key`
+    rather than inserting. That is the good case. The bad case this rule
+    actually guards against is the one where a part is missing and the
+    string built from it is well-formed anyway: SQLite's rule for a UNIQUE
+    index is that two NULLs are never equal, not even to each other, so any
+    design that let an absent part reach SQL as a real NULL -- a raw column
+    in a composite UNIQUE, or a key built by SQL `||` concatenation, where
+    `NULL || anything` is itself `NULL` -- would let the same finding insert
+    again on every scan, silently, with the constraint sitting there looking
+    like it worked. Collapsing every part into ONE Python string with a
+    literal placeholder for an absent part is what keeps that failure mode
+    out of reach in the first place, by never handing SQL a NULL to be
+    careless with.
+
+    Method and insertion kind are part of identity because S5 says they are:
+    `GET /api/order/{n}` leaking another tenant's data and `POST` on the same
+    template accepting mass-assignment are different findings with different
+    remediations.
+    """
+    parts = (type_, scheme, host, port, method, path_template,
+             insertion_kind, insertion_name)
+    return "|".join("-" if p is None or p == "" else str(p) for p in parts)
+
+
+def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
+                   dedupe_key: str, run_id: str) -> str:
+    """Insert the finding, or move `last_seen_run` if it is already known.
+
+    WHAT AN UPSERT MUST NOT TOUCH: `status`, and `first_seen_run`. An operator
+    who marked something `false_positive` has made a judgement the next scan
+    has no standing to reverse, and the run something was FIRST seen in is a
+    historical fact. The DO UPDATE clause names exactly what moves.
+    """
+    fid = new_id("f")
+    conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, description,"
+        " impact, remediation, cwe, severity, confidence, created_by, status,"
+        " insertion_name, insertion_kind, scope_level, payload,"
+        " first_seen_run, last_seen_run)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?, 'check', 'new', ?,?,?,?,?,?)"
+        " ON CONFLICT(engagement_id, dedupe_key) DO UPDATE SET"
+        "   last_seen_run=excluded.last_seen_run,"
+        "   severity=excluded.severity,"
+        "   confidence=excluded.confidence",
+        (fid, engagement_id, dedupe_key, candidate.title, candidate.description,
+         candidate.impact, candidate.remediation, candidate.cwe,
+         candidate.severity, candidate.confidence,
+         candidate.insertion.name if candidate.insertion else None,
+         candidate.insertion.kind if candidate.insertion else None,
+         candidate.scope_level, candidate.payload, run_id, run_id))
+    row = conn.execute(
+        "SELECT id FROM finding WHERE engagement_id=? AND dedupe_key=?",
+        (engagement_id, dedupe_key)).fetchone()
+    return row[0]
+
+
+def record_observation(conn: sqlite3.Connection, *, finding_id: str,
+                       run_id: str, observed: bool,
+                       exchange_id: str | None, severity_at: str | None,
+                       confidence_at: str | None, at_us: int) -> None:
+    """This run's answer about this finding.
+
+    `observed=0` is how a retest says FIXED -- but only where the surface was
+    actually tested. The caller owns that distinction; see `hx.scan`.
+    """
+    conn.execute(
+        "INSERT INTO finding_observation(finding_id, run_id, observed,"
+        " exchange_id, severity_at, confidence_at, ts_us)"
+        " VALUES(?,?,?,?,?,?,?)"
+        " ON CONFLICT(finding_id, run_id) DO UPDATE SET"
+        "   observed=excluded.observed, exchange_id=excluded.exchange_id,"
+        "   ts_us=excluded.ts_us",
+        (finding_id, run_id, 1 if observed else 0, exchange_id,
+         severity_at, confidence_at, at_us))
+
+
+def record_evidence(conn: sqlite3.Connection, *, finding_id: str,
+                    exchange_ids, at_us: int) -> None:
+    """The exchanges behind a finding, appended in order, without duplicates.
+
+    `seq` is the order S12 renders the chain in.
+
+    THE PLAN SAID THIS FUNCTION REPLACES. IT CANNOT, AND THE SCHEMA IS RIGHT.
+    `evidence` carries `trg_evidence_no_update` and `trg_evidence_no_delete`,
+    both of which `RAISE(ABORT, 'evidence is immutable')`, for the reason
+    written beside them: evidence is what a disputed finding is proven with
+    and must not be alterable after capture. A `DELETE FROM evidence` here
+    raised `IntegrityError` on the second recording of any finding --
+    measured, which is how this was found -- so re-recording could never have
+    replaced anything. It appends.
+
+    APPENDING ALONE IS NOT ENOUGH EITHER. A finding seen in three runs would
+    otherwise carry its exchange three times, and S12 renders that chain into
+    the report, where one problem observed once would read as three. So each
+    exchange is recorded ONCE per finding: already-recorded ids are skipped,
+    and `seq` continues from what is there rather than restarting.
+
+    The result is the property the plan wanted -- a chain that does not grow
+    on re-observation -- reached by the only route the schema permits.
+    """
+    known = {row[0] for row in conn.execute(
+        "SELECT exchange_id FROM evidence WHERE finding_id=?", (finding_id,))}
+    seq = conn.execute(
+        "SELECT COALESCE(MAX(seq) + 1, 0) FROM evidence WHERE finding_id=?",
+        (finding_id,)).fetchone()[0]
+    for exchange_id in exchange_ids:
+        if exchange_id in known:
+            continue
+        conn.execute(
+            "INSERT INTO evidence(id, finding_id, seq, role, kind,"
+            " exchange_id, captured_us) VALUES(?,?,?,'proof','exchange',?,?)",
+            (new_id("ev"), finding_id, seq, exchange_id, at_us))
+        known.add(exchange_id)
+        seq += 1
