@@ -81,7 +81,24 @@ def current_run(conn: sqlite3.Connection, *, engagement_id: str, kind: str,
     """
     at = _now_us() if now_us is None else now_us
     row = conn.execute(
-        "SELECT id, heartbeat_us FROM run"
+        # COALESCE, exactly as `reap_stale` does below and for the same
+        # reason: `heartbeat_us` is NULLABLE (schema.sql declares it plain
+        # `INTEGER`, no DEFAULT), and `at - NULL` is not a comparison in
+        # Python -- it is `TypeError: unsupported operand type(s) for -: 'int'
+        # and 'NoneType'`, raised on whichever thread happened to call this.
+        #
+        # FOUND BY MEASUREMENT, in Task 9's fix round, from a rig that inserts
+        # a `run` row by hand without the column. That raised out of
+        # `hx.capture.on_exchange`, which runs on the bridge's READ THREAD,
+        # where `BridgeServer._capture` catches it, files the record as a drop
+        # and keeps the channel -- so the whole of the symptom was an empty
+        # table. `reap_stale` had this COALESCE and a comment explaining it;
+        # this function, four lines up in the same module, did not.
+        #
+        # `started_us` is the fallback and it is NOT NULL, so a run that never
+        # heartbeated is judged on when it started -- which is the honest
+        # reading: nothing has reported on it since it opened.
+        "SELECT id, COALESCE(heartbeat_us, started_us) FROM run"
         " WHERE engagement_id=? AND kind=? AND status='running'"
         " ORDER BY started_us DESC LIMIT 1",
         (engagement_id, kind)).fetchone()

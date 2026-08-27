@@ -162,6 +162,8 @@ public class ChokepointTest {
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
         t("theSecondEnforcementPointIsRegisteredAndAsksTheGate",
           ChokepointTest::theSecondEnforcementPointIsRegisteredAndAsksTheGate);
+        t("theSecondCallbackObservesAndCannotRefuse",
+          ChokepointTest::theSecondCallbackObservesAndCannotRefuse);
         t("theRefusalIsHeldBeforeItIsRecorded",
           ChokepointTest::theRefusalIsHeldBeforeItIsRecorded);
         t("theClockAndTheAttributionAreWrittenDownAndTakenBack",
@@ -468,7 +470,8 @@ public class ChokepointTest {
      * This check counted ONE read in the whole of extension/src until Task 7,
      * and one was right while the send arm was the only thing deciding.
      * Wiring the second enforcement point makes it THREE: the send arm, the
-     * proxy request handler, and the re-decision before the bytes leave.
+     * proxy request handler, and the scope observation before the bytes
+     * leave.
      *
      * THE NUMBER IS NOT WHAT MATTERS AND WIDENING IT TO 3 WOULD PIN NOTHING.
      * `configEpoch()` and `scopeConfig()` are two reads of one record and can
@@ -488,21 +491,32 @@ public class ChokepointTest {
      *     in the other;
      *   - and nothing else in extension/src reads it at all.
      *
-     * DERIVED FROM THE CALLBACK DECLARATIONS, not from the questions, and that
-     * changed in fix round 1. It used to count `gate.decide(` +
-     * `decideScopeOnly(` -- one question per callback, which was true until
-     * the second callback gained a SECOND question (`decideBeforeGate` for the
-     * crawler, `decideScopeOnly` for the operator -- two branches of one
-     * decision, taken under one snapshot). Counting questions would then read
-     * three decisions against two reads and go red on correct code. The
-     * callbacks are the right unit: a callback decides once, whatever it asks.
+     * DERIVED FROM THE QUESTIONS -- `gate.decide(` + `decideScopeOnly(` -- and
+     * that is a restoration. Fix round 1 moved it to counting CALLBACK
+     * DECLARATIONS, because the second callback had gained a SECOND question
+     * (`decideBeforeGate` for the crawler, `decideScopeOnly` for the operator)
+     * and counting questions would have read three against two reads and gone
+     * red on correct code. Task 9 measured that the second callback cannot
+     * refuse anything -- `ProxyRequestToBeSentAction.drop()` does not prevent
+     * egress on Burp 2026.7.3 -- so it no longer branches by source and no
+     * longer decides: it asks ONE question, `decideScopeOnly`, and logs.
      *
-     * THE WITNESS FOR THE WIDENING, in the shape
-     * `test_vocabularies_match_the_schema.py` uses for its own: the equality
-     * is vacuous if both sides are zero -- a file with no reads and no
-     * callbacks satisfies it -- so the callback count is asserted to be 2
-     * outright. Deleting either callback is then red here as well as in the
-     * registration counts.
+     * Questions are the stronger unit whenever it is available, and this is
+     * why it is taken back: a callback that grows a SECOND question without a
+     * second snapshot read is exactly the two-halves-of-two-authorisations bug
+     * this method exists for, and a count of DECLARATIONS cannot see it.
+     *
+     * The two questions are not the same kind of thing and the equality does
+     * not claim they are: `gate.decide(` DECIDES and `decideScopeOnly(`
+     * OBSERVES. What both need, and what is counted, is that each was answered
+     * under an authorisation fetched for THIS request -- an observation
+     * assembled from two halves of two authorisations is a log line an
+     * operator acts on at 02:00 and it must not be a guess either.
+     *
+     * THE WITNESS FOR THE EQUALITY, in the shape
+     * `test_vocabularies_match_the_schema.py` uses for its own: it is vacuous
+     * if both sides are zero -- a file with no reads and no questions
+     * satisfies it -- so the question count is asserted to be 2 outright.
      *
      * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
      * `this.authorisation()` cannot supply one. BridgeClient's send arm writes
@@ -526,42 +540,40 @@ public class ChokepointTest {
         String entry = code(Path.of(ENTRY_POINT));
         int inBridge = calls(bridge, ".authorisation()", "::authorisation");
         int inEntry = calls(entry, ".authorisation()", "::authorisation");
-        // The two callbacks a request is decided about in, by their
-        // declarations. A response handler decides nothing and must read
-        // nothing, which is what the totals below enforce.
-        int callbacks = count(entry, "handleRequestReceived(InterceptedRequest r)")
-                      + count(entry, "handleRequestToBeSent(InterceptedRequest r)");
+        // The two questions the entry point asks of a request: the gate call
+        // that DECIDES, and the pre-send scope call that only OBSERVES. A
+        // response handler asks neither and must read nothing, which is what
+        // the totals below enforce.
+        int questions = calls(entry, "gate.decide(", "gate::decide")
+                      + calls(entry, "decideScopeOnly(", "::decideScopeOnly");
 
         check("the send arm reads the Authorisation snapshot once (" + inBridge + ")",
               inBridge == 1);
-        check("the entry point has two deciding callbacks -- the proxy request "
-              + "handler and the pre-send re-decision (" + callbacks + ")",
-              callbacks == 2);
-        check("and reads the snapshot exactly once per deciding callback ("
-              + inEntry + " reads, " + callbacks + " callbacks)",
-              inEntry == callbacks);
+        check("the entry point asks two questions -- the proxy gate and the "
+              + "pre-send scope observation (" + questions + ")",
+              questions == 2);
+        check("and reads the snapshot exactly once per question ("
+              + inEntry + " reads, " + questions + " questions)",
+              inEntry == questions);
         check("nothing else in extension/src reads it at all " + elsewhere,
               elsewhere.isEmpty());
-        check("so the whole extension reads it " + (1 + callbacks) + " times, "
-              + "once per decision (" + total + ")", total == 1 + callbacks);
+        check("so the whole extension reads it " + (1 + questions) + " times, "
+              + "once per question (" + total + ")", total == 1 + questions);
 
         // Each read AHEAD of the question it feeds. Without this, two reads in
         // one callback and none in the other satisfies the equality above --
-        // and "none in the other" is a decision taken under an authorisation
-        // fetched for a different request. The second callback asks one of two
-        // questions and both are spelled `policy.decide...`, so the common
-        // prefix is what is looked for; nothing before it in this file spells
-        // that (the first callback asks `gate.decide(`).
+        // and "none in the other" is an answer taken under an authorisation
+        // fetched for a different request.
         int read1 = entry.indexOf(".authorisation()");
         int gate = entry.indexOf("gate.decide(");
         int read2 = entry.indexOf(".authorisation()", read1 + 1);
-        int reDecision = entry.indexOf("policy.decide", read2);
+        int observation = entry.indexOf("policy.decideScopeOnly(", read2);
         check("the request handler reads before it asks the gate (" + read1
               + " < " + gate + ")", read1 >= 0 && read1 < gate);
-        check("and the re-decision reads its own, after that gate call and "
-              + "before its own question (" + gate + " < " + read2 + " < "
-              + reDecision + ")",
-              read2 > gate && reDecision > read2);
+        check("and the pre-send observation reads its own, after that gate "
+              + "call and before its own question (" + gate + " < " + read2
+              + " < " + observation + ")",
+              read2 > gate && observation > read2);
     }
 
     /**
@@ -719,30 +731,33 @@ public class ChokepointTest {
      * behavioural test green, because every one of them drives the path that
      * does call both.
      *
-     * THIS USED TO BE `before == 1 && gate == 1 && before == gate`, WHOLE-TREE,
-     * and fix round 1 made that false rather than wrong. The proxy path's
-     * second callback re-decides an INTERCEPT-EDITED request: S4 says the
-     * method allowlist and the dangerous-path denylist apply to crawler
-     * traffic in full, and an edit after the first callback's decision is a
-     * request nobody checked. So it asks `decideBeforeGate` -- and it must NOT
-     * ask the Gate, because the Gate was already spent for this request at the
-     * first callback, and asking again charges a crawler twice for one
-     * request.
+     * THE WHOLE-TREE PAIR `before == 1 && gate == 1 && before == gate` IS
+     * BACK, and its round trip is worth recording. Task 7's fix round 1 gave
+     * the proxy path's second callback a re-DECISION that asked
+     * `decideBeforeGate`, which made the whole-tree count 2 and forced this
+     * check into a per-file form. Task 9 measured that
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3, so that callback cannot refuse anything and no longer tries:
+     * it asks `decideScopeOnly` and LOGS. `decideBeforeGate` therefore has one
+     * caller again -- the issuing path -- and the original assertion is the
+     * true one.
      *
-     * Bumping the constant to 2 would have said nothing about that. What the
-     * check says instead, DERIVED per file rather than restated as a total:
+     * What the check says, DERIVED per file rather than restated as a total:
      *
      *   - the ISSUING path (Sender) asks both halves, the same number of
      *     times, and that number is one. This is the original pair assertion,
      *     narrowed to the file where the interleaving actually lives -- so a
      *     deleted `.checkGate(` there is still red;
-     *   - the entry point asks the free half and NEVER the paid one. A
-     *     must-be-zero, which is the strongest shape this class has, and it is
-     *     the thing that would go wrong: `policy.decide(` or `.checkGate(` at
-     *     the second callback is a double charge no behavioural test can see;
-     *   - NO OTHER FILE asks either half. A third caller of `decideBeforeGate`
-     *     is a path that might issue on a half-decision, and it has to be
-     *     looked at by a human rather than absorbed into a total.
+     *   - NO OTHER FILE IN THE TREE ASKS EITHER HALF, the entry point
+     *     included. A must-be-zero, which is the strongest shape this class
+     *     has. A third caller of `decideBeforeGate` is a path that might issue
+     *     on a half-decision, and it has to be looked at by a human rather
+     *     than absorbed into a total;
+     *   - and the entry point does not reach the Gate through the FRONT DOOR
+     *     either. Kept from fix round 1 and it is not about the deleted
+     *     decision: `policy.decide(` runs both halves inside Policy without
+     *     ever spelling `.checkGate(` here, which is the shape a double charge
+     *     would actually be written in, and the sweep above cannot see it.
      *
      * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
      * `.checkGate(` beside a live `.decideBeforeGate(` would otherwise keep
@@ -758,8 +773,6 @@ public class ChokepointTest {
         String entry = code(Path.of(ENTRY_POINT));
         int senderBefore = calls(sender, ".decideBeforeGate(", "::decideBeforeGate");
         int senderGate = calls(sender, ".checkGate(", "::checkGate");
-        int entryBefore = calls(entry, ".decideBeforeGate(", "::decideBeforeGate");
-        int entryGate = calls(entry, ".checkGate(", "::checkGate");
 
         check("the issuing path asks the boundary half exactly once ("
               + senderBefore + ")", senderBefore == 1);
@@ -770,15 +783,6 @@ public class ChokepointTest {
         check("so the issuing path never takes one without the other",
               senderBefore == senderGate);
 
-        check("the proxy path re-decides with the free half (" + entryBefore + ")",
-              entryBefore == 1);
-        // THE ONE THAT WOULD GO WRONG. The Gate was spent for this request at
-        // the first callback; spending it again charges a crawler twice for
-        // one request, shortening the run for no evidence, and every
-        // behavioural test stays green because each half of it is internally
-        // consistent.
-        check("and NEVER the paid one -- the Gate is not spent twice for one "
-              + "request (" + entryGate + ")", entryGate == 0);
         // ...and not through the front door either. `policy.decide(` runs both
         // halves INSIDE Policy, so it reaches the Gate without ever spelling
         // `.checkGate(` here -- which is the shape a double charge would
@@ -791,9 +795,13 @@ public class ChokepointTest {
         check("and not through policy.decide(), which reaches the Gate without "
               + "naming it (" + entryFull + ")", entryFull == 0);
 
+        // THE ENTRY POINT IS NO LONGER EXCLUDED. It was, while its second
+        // callback asked `decideBeforeGate`; that call is gone, so the entry
+        // point is swept like every other file and a re-added one is red here
+        // rather than needing a count of its own.
         List<String> elsewhere = new ArrayList<>();
         for (Path p : sources) {
-            if (p.toString().equals(SENDER) || p.toString().equals(ENTRY_POINT)) continue;
+            if (p.toString().equals(SENDER)) continue;
             String c = code(p);
             // BOTH FORMS on BOTH halves. The round-4 report claimed every
             // must-be-zero method needle counted both; this arm did not, so a
@@ -804,8 +812,8 @@ public class ChokepointTest {
                   + calls(c, ".checkGate(", "::checkGate");
             if (n > 0) elsewhere.add(p + " x" + n);
         }
-        check("and no other file in extension/src asks either half " + elsewhere,
-              elsewhere.isEmpty());
+        check("and no other file in extension/src asks either half -- the "
+              + "entry point included " + elsewhere, elsewhere.isEmpty());
     }
 
     /**
@@ -1121,35 +1129,35 @@ public class ChokepointTest {
      * behind it: the proxy is Burp's own socket, so a request the handler
      * passes through has crossed no rule of ours at all.
      *
-     * The FOURTH count is the one that is easiest to argue away. Montoya's
-     * ProxyRequestHandler has two callbacks, and Burp's INTERCEPT TAB sits
-     * between them: an operator can rewrite the request there, host included.
-     * A gate at the first callback only therefore lets an EDITED request leave
-     * with no decision about it, which is the one hole in this system where
-     * bytes could cross the engagement boundary. `decideScopeOnly(` and not
-     * `decide(` is deliberate and is counted as itself: the full question
-     * spends a rate token and a budget slot, so asking it twice would charge a
-     * crawler twice for one request -- and
-     * {@link #bothHalvesOfTheDecisionAreAskedAndOnlyOnce} could not see that,
-     * because it counts Policy's internal halves on the send path.
+     * THERE WAS A FOURTH COUNT AND IT IS GONE. It read "scope is re-decided
+     * before the request is sent (`decideScopeOnly(` == 1)", and it pinned a
+     * DECISION that Task 9 measured cannot exist: a refusal at the second
+     * callback does not stop the request, because
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3. A check that pins a decision nothing can act on is a check
+     * that certifies a hole as closed. The question is still asked and is now
+     * an OBSERVATION -- see
+     * {@link #theSecondCallbackObservesAndCannotRefuse}, which pins what is
+     * actually true of it, including the must-be-zero that stops the refusal
+     * being re-added.
      *
-     * WIRE-EXISTS needles, all four, so they read {@link #code}: prose cannot
+     * WIRE-EXISTS needles, all three, so they read {@link #code}: prose cannot
      * register a handler or ask a question. Taken in {@link #ENTRY_POINT},
      * which is the only file allowed to name burp.* at all -- see
      * {@link #montoyaIsConfinedToTheEntryPoint}, which is what makes that
      * narrowing safe rather than convenient.
      *
-     * WHAT THESE DO NOT SEE: whether the handler HONOURS the verdict. MEASURED
-     * by a reviewer, on the committed tree: `if (!verdict.allow() && false)`
-     * forwards every refused request to the target and reads 12 summary lines
-     * / 0 FAIL / rc=0. `gate.decide(` is still called once, the offer is still
-     * textually after it, and every count here is satisfied. Only Task 9
-     * driving real Burp can catch it, and the CONDITION IT MUST MEET is
-     * written where its implementer will read it -- in HxExtension's
-     * assumption block, item 2: assert a refused request reaches the target
-     * ZERO times, measured AT THE TARGET, never by reading the client's
-     * response, because `drop()` answers the client 200 OK with ~1529 bytes of
-     * Burp's own HTML and is indistinguishable from a delivery by status code.
+     * WHAT THESE DO NOT SEE: whether the handler HONOURS the verdict.
+     * `if (!verdict.allow() && false)` forwards every refused request to the
+     * target and reads 13 ALL PASS / 2198 ok / 0 FAIL / rc=0 -- re-measured on
+     * this tree. `gate.decide(` is still called once, the offer is still
+     * textually after it, and every count here is satisfied. Task 9 closed it
+     * from outside: `tests/integration/test_proxy_capture.py` asserts a
+     * refused request reaches the OUT-OF-SCOPE TARGET zero times, measured at
+     * the target's own log and never by reading the client's response --
+     * `drop()` answers the client 200 OK with 1529 bytes of Burp's own HTML
+     * and is indistinguishable from a delivery by status code. That mutation
+     * turns three integration tests red and no check here.
      *
      * The two position checks below cover the orderings; this one covers
      * existence.
@@ -1160,12 +1168,72 @@ public class ChokepointTest {
         int n1 = calls(entry, "registerRequestHandler(", "::registerRequestHandler");
         int n2 = calls(entry, "registerResponseHandler(", "::registerResponseHandler");
         int n3 = calls(entry, "gate.decide(", "gate::decide");
-        int n4 = calls(entry, "decideScopeOnly(", "::decideScopeOnly");
         check("registerRequestHandler appears exactly once (" + n1 + ")", n1 == 1);
         check("registerResponseHandler appears exactly once (" + n2 + ")", n2 == 1);
         check("the proxy handler asks the gate (" + n3 + ")", n3 == 1);
-        check("scope is re-decided before the request is sent (" + n4 + ")",
-              n4 == 1);
+    }
+
+    /**
+     * THE SECOND CALLBACK OBSERVES, LOGS, AND CANNOT REFUSE.
+     *
+     * MEASURED, Task 9, with the probe dropping at the second callback:
+     *
+     *     TBSDROP id=0 path=/tbs/secret          <- drop() WAS returned
+     *     Hit(method='GET', path='/tbs/secret')  <- the target received it
+     *     client saw /tbs/secret: status=404     <- the TARGET's answer
+     *
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * Suite Community 2026.7.3, while `ProxyRequestReceivedAction.drop()`
+     * does -- zero hits, Burp's own 1529-byte page. The two are not
+     * interchangeable. docs/burp-proxy-measurements.md, Q4, has both side by
+     * side.
+     *
+     * THE MUST-BE-ZERO IS THE POINT OF THIS METHOD. `drop()` there is not
+     * merely useless: while it was in place the refusal branch wrote a
+     * `denial` row and took the `pending` entry for a request that reached the
+     * target, so hx recorded a refusal that did not happen and lost the
+     * exchange that did. That is fabricated evidence in the dangerous
+     * direction, and the natural instinct of the next reader who finds a
+     * pass-through where a scope check used to be is to put the drop back. A
+     * zero is what stops that, and it reads as a rule rather than as an
+     * omission.
+     *
+     * THE OTHER TWO ARE THE CONVERSE: the observation must still HAPPEN and
+     * must still be SAID. A must-be-zero on its own is satisfied by deleting
+     * the whole callback body, which would lose the one signal an operator
+     * gets at the moment the boundary is crossed. So the question is counted,
+     * and the log is POSITIONED between the question and the pass-through --
+     * a count of `logToError(` would not do, because the entry point logs
+     * elsewhere (the idle-extension refusal, the failed connect) and a needle
+     * that matched those would be green with this callback silent.
+     *
+     * WIRE-EXISTS needles, so they read {@link #code}.
+     */
+    static void theSecondCallbackObservesAndCannotRefuse() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int late = calls(entry, "ProxyRequestToBeSentAction.drop(",
+                                "ProxyRequestToBeSentAction::drop");
+        int early = calls(entry, "ProxyRequestReceivedAction.drop(",
+                                 "ProxyRequestReceivedAction::drop");
+        int asked = calls(entry, "policy.decideScopeOnly(", "policy::decideScopeOnly");
+        check("the pre-send callback NEVER drops -- that action does not "
+              + "prevent egress on this Burp (" + late + ")", late == 0);
+        check("while the request-received callback still does, which is the "
+              + "one that works (" + early + ")", early == 1);
+        check("and the pre-send scope question is still asked (" + asked + ")",
+              asked == 1);
+
+        // The log sits BETWEEN the question and the pass-through, so a
+        // callback that asks and says nothing is red. Positions rather than a
+        // count: this file logs elsewhere too.
+        int ask = entry.indexOf("policy.decideScopeOnly(");
+        int log = entry.indexOf("logToError", ask);
+        int through = entry.indexOf(
+                "return ProxyRequestToBeSentAction.continueWith(r);");
+        check("the answer is logged after it is asked (" + ask + " < " + log
+              + ")", ask >= 0 && log > ask);
+        check("and before the request goes through anyway (" + log + " < "
+              + through + ")", through > log);
     }
 
     /**
@@ -1186,10 +1254,18 @@ public class ChokepointTest {
      * flow's rather than the callee's -- {@link hx.proxy.Capture}'s promise is
      * still worth keeping, and nothing depends on it any more.
      *
-     * Counted, not positioned per callback, because there are exactly two of
-     * these and a count of two is what a deleted one turns into. The response
-     * handler is not counted here: it already wrapped its offer, and its
-     * action carries no enforcement -- it forwards either way.
+     * ONE refusing callback, not two. It was two until Task 9 measured that
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3: the second callback's refusal enforced nothing and wrote a
+     * `denial` row for a request that reached the target, so it is gone and
+     * that callback now observes and logs. The response handler is not counted
+     * here either -- it already wrapped its offer, and its action carries no
+     * enforcement, it forwards either way.
+     *
+     * A COUNT OF ONE IS WEAKER THAN A COUNT OF TWO AGAINST A DELETION, and the
+     * position checks below are what carry it: `bind` before `offer` before
+     * `ret` are three indexOf's that all go to -1 or invert if the binding is
+     * removed or the offer is moved ahead of it.
      */
     static void theRefusalIsHeldBeforeItIsRecorded() throws IOException {
         String entry = code(Path.of(ENTRY_POINT));
@@ -1198,10 +1274,10 @@ public class ChokepointTest {
         int bind = entry.indexOf("Action refuse =");
         int offer = entry.indexOf("capture.offer(");
         int ret = entry.indexOf("return refuse;");
-        check("both refusing callbacks bind their action first (" + bound + ")",
-              bound == 2);
-        check("and return that local rather than a fresh call (" + returned + ")",
-              returned == 2);
+        check("the one refusing callback binds its action first (" + bound + ")",
+              bound == 1);
+        check("and returns that local rather than a fresh call (" + returned + ")",
+              returned == 1);
         check("the action is decided before anything is recorded (" + bind
               + " < " + offer + ")", bind >= 0 && offer >= 0 && bind < offer);
         check("and returned after (" + ret + " > " + offer + ")",
@@ -1221,10 +1297,16 @@ public class ChokepointTest {
      * harness is fine, this run just saw little traffic". A total outage that
      * reads as poor coverage is the worst shape a defect can have here.
      *
-     * TWO takes, not one, and both are needed: the response handler takes the
-     * entry to build the record, and the second request callback takes it when
-     * it refuses, because that request will never be answered and the map's
-     * bound should be spent on requests actually in flight.
+     * ONE take, and it used to be two. The second was in the second request
+     * callback's refusal branch, on the reasoning that "this request is not
+     * going to the target, so no response can arrive for it" -- a sentence
+     * Task 9 measured FALSE, because `ProxyRequestToBeSentAction.drop()` does
+     * not prevent egress on Burp 2026.7.3. Taking the entry there DISCARDED
+     * THE CLOCK AND THE SOURCE of a request that was about to be answered, so
+     * the response handler then missed, counted `countLost` and recorded
+     * nothing. The refusal is gone and so is the take: the response handler is
+     * the only place an entry is taken back, which is the only place one is
+     * ever answered.
      *
      * WIRE-EXISTS needles, so they read {@link #code}.
      *
@@ -1252,8 +1334,9 @@ public class ChokepointTest {
         int take = calls(entry, "pending.take(", "pending::take");
         check("the request handler writes the clock and the source down ("
               + put + ")", put == 1);
-        check("and both the response handler and the refusing re-decision take "
-              + "them back (" + take + ")", take == 2);
+        check("and the response handler -- the only caller that has an answer "
+              + "to pair them with -- takes them back (" + take + ")",
+              take == 1);
 
         // AND THE PUT IS UNCONDITIONAL. The measured mutation is not a
         // deletion -- it is `if (source == null) pending.put(...)`, which

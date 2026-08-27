@@ -409,6 +409,28 @@ class BridgeServer:
         and not a recursion; if that call fails too, the count stands and the
         channel is still kept.
 
+        AND THAT LAST CASE LOSES THE COVERAGE FLOOR TOO -- named here because
+        it is the same lesson one layer up, and MEASURED in Task 9 against a
+        real Burp: with a sink that raises on every frame, three browsed
+        requests produced `exchange_errors = 6` (three exchanges and their
+        three `dropped` retries), no exchange rows, and `run.dropped_total`
+        STILL 0. The three requests reached the target and were served, which
+        is right -- S4 is unconditional -- but a reader of that run sees
+        complete coverage over an hour in which nothing was recorded at all.
+        `exchange_errors` is the only thing on this side that says otherwise
+        and NOTHING OUTSIDE tests/ READS IT, which is precisely the criticism
+        this method's own paragraph above makes of the version before it.
+        The floor moves only for a sink that fails on exchanges and SUCCEEDS on
+        `dropped` frames -- the saturated-queue case it was built for, where
+        the far side is slow rather than broken.
+
+        Not fixed here, and the reason is that there is nowhere honest to put
+        it: `run.dropped_total` is a column in the store, the store is what the
+        sink writes to, and a sink that cannot be written to cannot record that
+        it could not be written to. It needs a channel that is not the sink --
+        an operator-facing warning at `hx info`, or a harness-side log -- and
+        that is a decision about the CLI, not about this method.
+
         Only `exchange` carries two bodies. `denial` and `dropped` describe
         something that produced no traffic, so they arrive with an empty body
         and are passed on as two empty halves -- which is what the far side's

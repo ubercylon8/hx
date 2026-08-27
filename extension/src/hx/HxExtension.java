@@ -197,9 +197,10 @@ public class HxExtension implements BurpExtension {
         // Nothing in this block can be DRIVEN without Burp -- the handlers
         // take Montoya types that only Burp constructs -- so ChokepointTest
         // counts and positions it instead: the registrations, the gate call
-        // inside the handler, the scope re-check before the bytes leave, and
-        // the two ORDERINGS this join exists to protect (enforcement before
-        // recording, redaction before queueing). The ONE piece of it that is
+        // inside the handler, the pre-send scope OBSERVATION (which decides
+        // nothing -- see the second callback), and the two ORDERINGS this join
+        // exists to protect (enforcement before recording, redaction before
+        // queueing). The ONE piece of it that is
         // ordinary code is `listenerPort` below, which takes a String; it is
         // public and ProxyGateTest drives it.
         //
@@ -216,20 +217,30 @@ public class HxExtension implements BurpExtension {
         //     traverse them, every send would be decided twice and, worse,
         //     attributed by a listener port it does not have: UNATTRIBUTED,
         //     refused, and the send path dead. Unmeasured.
-        //  2. THAT THE HANDLER'S VERDICT IS HONOURED. Nothing in the suite
-        //     sees this: `if (!verdict.allow() && false)` forwards every
-        //     refused request and reads 12 summary lines / 0 FAIL / rc=0 --
-        //     measured. THE CONDITION TASK 9 MUST MEET, and it is not
-        //     negotiable: assert a refused request reaches the target ZERO
-        //     times, MEASURED AT THE TARGET -- a request log, a connection
-        //     count -- and NEVER by reading the client's response. Task 1
-        //     measured `drop()` returning 200 OK with ~1529 bytes of Burp's
-        //     own HTML, so a drop and a delivery are indistinguishable by
-        //     status code at the client. A test that reads the client side
-        //     passes on a gate that forwards everything.
-        //  3. THAT `drop()` FROM THE SECOND CALLBACK SENDS NOTHING. Task 1
-        //     measured the drop from `handleRequestReceived` only. Montoya
-        //     documents both actions identically; nobody has watched the wire.
+        //  2. SETTLED: THE FIRST CALLBACK'S VERDICT IS HONOURED. Still
+        //     invisible to this suite -- `if (!verdict.allow() && false)`
+        //     forwards every refused request and reads 13 ALL PASS / 2198 ok
+        //     / 0 FAIL / rc=0 -- so the check that holds it is
+        //     tests/integration/test_proxy_capture.py, and it is held the only
+        //     way it can be: the OUT-OF-SCOPE TARGET's own log, never the
+        //     client's response. Task 1 measured `drop()` returning 200 OK
+        //     with 1529 bytes of Burp's own HTML, so a drop and a delivery are
+        //     indistinguishable by status code at the client, and a test that
+        //     reads the client side passes on a gate that forwards
+        //     everything. Under that mutation the integration suite loses
+        //     three tests; it stays green in every Java suite.
+        //  3. SETTLED, AND THE ANSWER WAS NO. This item used to read "THAT
+        //     `drop()` FROM THE SECOND CALLBACK SENDS NOTHING ... Montoya
+        //     documents both actions identically; nobody has watched the
+        //     wire". Task 9 watched it:
+        //     `ProxyRequestToBeSentAction.drop()` DOES NOT PREVENT EGRESS on
+        //     2026.7.3 -- action() reads DROP, the target logs the request,
+        //     and the client gets the TARGET's answer -- while the drop from
+        //     `handleRequestReceived` sends zero bytes. So the second callback
+        //     no longer refuses anything; it observes and logs. Kept as an
+        //     item rather than deleted, because "we assumed X, measured X,
+        //     and X was false" is the only entry in this list that has ever
+        //     changed a design. docs/burp-proxy-measurements.md, Q4.
         //  4. THAT `path()` CARRIES THE QUERY AND `httpService().host()` IS
         //     THE CONNECTION HOST. Montoya's documented contract, unmeasured
         //     here. If either is wrong the request is scope_denied by
@@ -354,115 +365,121 @@ public class HxExtension implements BurpExtension {
              * The last point before the bytes leave, and the reason this
              * handler has two halves.
              *
-             * Burp's Intercept tab sits BETWEEN the two callbacks, and an
-             * operator there can rewrite the request -- including its host. A
-             * gate that ran only at the first point would let an EDITED
-             * request leave with no decision about it at all, and S4 is
-             * unambiguous about what that costs: scope is the client's
-             * boundary and the one thing no caller may spend.
+             * AN OBSERVATION POST, NOT AN ENFORCEMENT POINT. It cannot refuse
+             * anything, and this callback used to try. Task 9 measured why it
+             * must not: `ProxyRequestToBeSentAction.drop()` DOES NOT PREVENT
+             * EGRESS on Burp Suite Community 2026.7.3. The probe returned an
+             * action whose own `action()` reads `DROP`, and Burp forwarded the
+             * request anyway -- the target logged it, answered a real 404, and
+             * the client received the TARGET's answer rather than Burp's page.
+             * The drop from `handleRequestReceived` is unaffected: zero hits,
+             * Burp's own 1529-byte HTML. The two actions are not
+             * interchangeable, and Task 1 measured the one that works.
+             * docs/burp-proxy-measurements.md, Q4, has both side by side.
              *
-             * SCOPE AND NOTHING ELSE, for every source. `decideScopeOnly`
-             * spends no rate token and no budget slot, so this re-check is
-             * free; `decide` would charge a crawler twice for one request, and
-             * ChokepointTest's pair counter could not see it because that one
-             * counts Policy's internal halves on the send path.
+             * WHAT THAT COST WHILE THIS CALLBACK STILL REFUSED, and it is
+             * worse than a plain fail-open: the refusal branch wrote a
+             * `denial` row and took the `pending` entry, on the reasoning --
+             * stated in its own comment -- that "this request is not going to
+             * the target, so no response can arrive for it". That sentence is
+             * measured FALSE. So hx recorded a refusal for a request that
+             * reached the client's system, and charged its response to
+             * `countLost`. A report reads that row as "hx blocked this". This
+             * project has twice refused to record a guess as a fact --
+             * `transport_error` has no row because Montoya cannot distinguish
+             * the three cases, and 599 needed its own outcome so an unreadable
+             * status could not read as a real one. Same rule.
              *
-             * TWO HONEST LIMITS. `drop()` from THIS callback is unmeasured --
-             * Task 1 measured the drop from handleRequestReceived only, where
-             * it sends zero bytes to the target and answers the client 200 OK
-             * with Burp's own HTML. The claim here is "Montoya documents both
-             * actions identically", not "we saw zero bytes"; Task 9 measures
-             * it. And this is a second scope DECISION, not a second
-             * enforcement point: S4 counts egress paths, not callbacks, and
-             * both callbacks belong to this one handler.
+             * THE ESCAPE IS ALREADY RECORDED, AND THAT IS THE HONEST RECORD.
+             * A request edited out of scope in the Intercept tab goes out, is
+             * answered, and reaches `handleResponseReceived` like any other --
+             * so it lands as an `exchange` row whose `url` is outside the
+             * engagement's scope. Nothing new is needed to HAVE the evidence,
+             * and a query for exchanges outside `scope.include` finds it.
+             * Rewriting the request to something harmless was considered and
+             * refused: that fabricates traffic the operator never sent, which
+             * is worse than recording the escape.
+             *
+             * SO THE QUESTION IS STILL ASKED, AND ONLY LOGGED. Reaching this
+             * callback at all means the first one ALLOWED the request --
+             * measured: a request dropped at `handleRequestReceived` produces
+             * no second-callback entry in the probe's log at all. So a `deny`
+             * here IS a disagreement with the first callback, which is to say
+             * an edit, and the operator gets it at the moment it happens
+             * rather than only in a later query.
+             *
+             * `decideScopeOnly` and not `decide`, for every source, and the
+             * reason is no longer about double-charging: this asks about S4's
+             * BOUNDARY, which is the only rule an edit can breach that no
+             * later query could attribute. It spends no rate token and no
+             * budget slot, so an observation costs a crawler nothing.
+             *
+             * S4's COUNT OF ENFORCEMENT POINTS IS UNCHANGED AT TWO -- the send
+             * path and `handleRequestReceived`. This was never one of them;
+             * it was a second DECISION inside one of them, and it is now not
+             * even that.
              */
             @Override
             public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest r) {
-                // ATTRIBUTED AGAIN, FROM THE LISTENER, and NOT read back out
-                // of `pending`. The entry is there and carries the first
-                // callback's answer, and using it would make ENFORCEMENT
-                // depend on a bounded RECORDING structure: past
-                // DEFAULT_CAPACITY requests in flight the map evicts, the
-                // source reads UNATTRIBUTED, and a request the first callback
-                // allowed is refused here because the capture map overflowed.
-                // S4 is explicit that a full queue changes what hx KNOWS and
-                // never what it ALLOWS, and that has to hold in both
-                // directions. The listener is the same connection either way,
-                // and `listenerInterface()` is measured on requests -- this is
-                // one (docs/burp-proxy-measurements.md, Q1).
-                Source source = Source.UNATTRIBUTED;
-                String method = "";
-                String url = "";
-                boolean allow;
-                String errorClass = null;
-                String detail = null;
+                // BUILT AS A STRING FIRST, LOGGED AFTERWARDS, AND THE
+                // PASS-THROUGH DEPENDS ON NEITHER. Every read below is
+                // Montoya's code handed a hostile page's bytes, and a throw
+                // out of any of them once escaped this handler with the
+                // request's fate undecided -- what Burp does with a proxy
+                // handler that threw is measured nowhere in this repository.
+                // Now the worst any of it can do is cost the operator a log
+                // line: `continueWith` is the only exit, on every path.
+                //
+                // NO `Source` HERE ANY MORE, and its absence is the point.
+                // Attribution decides WHICH RULES a request gets, and this
+                // callback applies none -- so reading the listener again would
+                // be a second attribution nothing acts on, and a reader would
+                // reasonably assume something did.
+                String note = null;
                 try {
-                    source = Source.forListenerPort(
-                            listenerPort(r.listenerInterface()), crawlerPort);
-                    method = r.method();
-                    url = r.url();
+                    // ONE read, and it feeds the one question. configEpoch()
+                    // and scopeConfig() are two reads of one record and can
+                    // straddle a commit; an answer assembled from two halves
+                    // of two authorisations is an answer about a request
+                    // nobody authorised -- as true of a log line as of a
+                    // verdict, because the log line is what an operator acts
+                    // on at 02:00.
                     BridgeClient.Authorisation auth = c.authorisation();
-                    HxRequest edited = proxyRequest(r);
-                    Decision d;
-                    if (source == Source.CRAWLER)
-                        // THE AGENT'S FREE RULES, in S4's order, Gate excluded.
-                        // S4 says the method allowlist and the dangerous-path
-                        // denylist apply to crawler traffic IN FULL, and an
-                        // edit in the Intercept tab can turn `GET /x` into
-                        // `POST /account/delete` after the first callback
-                        // checked the original. decideBeforeGate is scope +
-                        // method + dangerous and spends NOTHING -- its own
-                        // javadoc says so -- so keeping those two across an
-                        // edit is free.
-                        d = policy.decideBeforeGate(edited, auth);
-                    else if (source == Source.OPERATOR)
-                        // Scope, and nothing after it. The operator branch
-                        // drops the other four rules here for the same reason
-                        // ProxyGate drops them at the first callback: applying
-                        // an agent's rules to a human drives them off the
-                        // proxy, and then hx records nothing at all.
-                        d = policy.decideScopeOnly(edited, auth);
-                    else
-                        // "Not one of the two I know", written the way
-                        // ProxyGate writes it, so a constant added to Source
-                        // later is a refusal rather than falling into whichever
-                        // branch it was not named in.
-                        d = Decision.deny("not_configured",
-                                BridgeClient.EXTENSION_FAULT
-                                + "the proxy listener could not be attributed "
-                                + "to the operator or the crawler");
-                    allow = d.allowed();
-                    errorClass = d.errorClass();
-                    detail = d.detail();
+                    Decision d = policy.decideScopeOnly(proxyRequest(r), auth);
+                    if (!d.allowed())
+                        note = "hx: THE ENGAGEMENT BOUNDARY IS BEING CROSSED "
+                             + "AND THIS EXTENSION CANNOT STOP IT. "
+                             + r.method() + " " + r.url() + " was ALLOWED at "
+                             + "handleRequestReceived and is out of scope now, "
+                             + "so it was edited between the two callbacks -- "
+                             + "Burp's Intercept tab sits there. "
+                             + "ProxyRequestToBeSentAction.drop() does not "
+                             + "prevent egress on this Burp (measured; see "
+                             + "docs/burp-proxy-measurements.md, Q4), so the "
+                             + "request WILL reach the target. It will be "
+                             + "recorded as an exchange whose url is outside "
+                             + "scope.include -- that row is the evidence. "
+                             + "Reason: " + d.detail();
                 } catch (RuntimeException e) {
-                    Decision d = Decision.deny("not_configured",
-                            BridgeClient.EXTENSION_FAULT
-                            + "the pre-send scope re-check threw: " + e);
-                    allow = false;
-                    errorClass = d.errorClass();
-                    detail = d.detail();
+                    // NOT a refusal any more, because there is no refusal to
+                    // be had here. An unreadable request is a thing the
+                    // operator should see, and it is all this callback can do
+                    // about it.
+                    note = BridgeClient.EXTENSION_FAULT
+                         + "hx: the pre-send scope observation threw, so "
+                         + "nothing here can say whether this request is still "
+                         + "in scope. The first callback allowed it and it is "
+                         + "going out: " + e;
                 }
-                if (!allow) {
-                    // THE ACTION IS DECIDED AND HELD BEFORE ANYTHING IS
-                    // RECORDED. See the first callback for why this is
-                    // structure rather than tidiness.
-                    ProxyRequestToBeSentAction refuse =
-                            ProxyRequestToBeSentAction.drop();
-                    // The entry will never be answered: this request is not
-                    // going to the target, so no response can arrive for it.
-                    // Taken rather than left to age out, so the map's bound is
-                    // spent on requests that are actually in flight.
+                if (note != null)
                     try {
-                        pending.take(r.messageId());
-                        capture.offer(recorder.denial(method, url, errorClass,
-                                                      detail, source));
+                        api.logging().logToError(note);
                     } catch (Throwable ignored) {
-                        // See the first callback: the counter is the thing
-                        // that threw, so there is nothing left to count with,
-                        // and the refusal below stands regardless.
+                        // The pass-through must not depend on the logger
+                        // either. A lost log line is a lost log line; a throw
+                        // here would leave a request Burp has already been
+                        // told to send with no action returned for it.
                     }
-                    return refuse;
-                }
                 return ProxyRequestToBeSentAction.continueWith(r);
             }
         });

@@ -124,6 +124,54 @@ class TestAutoOpen:
                                 now_us=1000 + run_mod.IDLE_CLOSE_US - 1)
         assert b == a
 
+    def test_a_run_with_no_heartbeat_at_all_is_judged_on_when_it_started(self, conn):
+        """`heartbeat_us` is NULLABLE, and without a COALESCE this RAISES.
+
+        Found in Task 9's fix round, by measurement rather than by reading:
+        a rig that inserts a `run` row by hand -- `INSERT INTO run(id,
+        engagement_id, kind, safety_profile, started_us, status)`, which is a
+        perfectly legal insert against schema.sql's plain `INTEGER` column --
+        made this function raise
+
+            TypeError: unsupported operand type(s) for -: 'int' and 'NoneType'
+
+        `reap_stale` already had the COALESCE and a comment explaining exactly
+        this, four lines further down the same module. `current_run` did not.
+
+        WHY IT MATTERED MORE THAN A TypeError USUALLY DOES: the raise came out
+        of `hx.capture.on_exchange`, which runs on the bridge's READ THREAD,
+        where `BridgeServer._capture` catches everything, files the record as a
+        drop and keeps the channel -- by design, because S4 says a lost record
+        changes what hx KNOWS and never what it ALLOWS. So the whole of the
+        observable was an empty table while Burp went on sending.
+
+        BOTH SIDES OF THE WINDOW, because a COALESCE that fell back to `at`
+        (or to 0) would satisfy one of them and not the other: inside, the run
+        is handed back; outside, it is closed `idle` and a new one opens. That
+        is the same behaviour a row WITH a heartbeat gets, which is the claim.
+        """
+        conn.execute(
+            "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+            " started_us, status) VALUES('r-nohb',?,'browse','production',"
+            "1000,'running')", (ENG,))
+        assert conn.execute("SELECT heartbeat_us FROM run WHERE id='r-nohb'"
+                            ).fetchone()[0] is None, \
+            "this test is about a NULL heartbeat; the column now has a default"
+
+        inside = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                     safety_profile="production",
+                                     now_us=1000 + run_mod.IDLE_CLOSE_US)
+        assert inside == "r-nohb"
+        assert _status(conn, "r-nohb") == "running"
+
+        outside = run_mod.current_run(conn, engagement_id=ENG, kind="browse",
+                                      safety_profile="production",
+                                      now_us=1000 + run_mod.IDLE_CLOSE_US + 1)
+        assert outside != "r-nohb"
+        assert _status(conn, "r-nohb") == "completed"
+        assert conn.execute("SELECT stop_reason FROM run WHERE id='r-nohb'"
+                            ).fetchone()[0] == "idle"
+
 
 class TestStale:
     def test_a_run_left_running_past_the_window_resolves_to_error(self, conn):

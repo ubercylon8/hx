@@ -16,9 +16,10 @@ between the two jars (`sha256` match on both). An earlier version of this line
 credited the measurements to the standalone jar and contradicted the fixture.
 
 This document is one half of a deliverable. The other half is
-`tests/integration/test_proxy_facts.py`, which re-measures all three answers
-against a real Burp and fails if any of them changes. Two of those tests read
-this file back — Q1's checks the accessor table, Q3's checks the status and byte
+`tests/integration/test_proxy_facts.py`, which re-measures Q1, Q2 and Q3
+against a real Burp and fails if any of them changes. (Q4 is the exception and
+says so in its own section: re-taking it needs a probe patch that must not
+ship.) Two of those tests read this file back — Q1's checks the accessor table, Q3's checks the status and byte
 count Burp answers a dropped client with — so the prose and the measurement
 cannot drift apart in silence. Everything outside those two readbacks is prose
 that nothing enforces, and is marked as such where it matters.
@@ -320,6 +321,125 @@ Consequences for Plan 4, since this is the second enforcement point:
 
 ---
 
+## Q4. Does `drop()` from `handleRequestToBeSent` also prevent egress?
+
+### Answer: NO. It prevents nothing. The two callbacks' `drop()` are not interchangeable.
+
+`ProxyRequestHandler` has two callbacks and Montoya documents their two `drop()`
+actions identically. Q3 measured the first. This measures the second, and the
+answer is the opposite one.
+
+The probe was patched to drop at `handleRequestToBeSent` on a `/latedrop` path,
+leaving its existing `/drop` behaviour at `handleRequestReceived` untouched, so
+both actions could be taken in one Burp against one target. The patch was
+reverted afterwards; it is not in the shipped probe. Reproducing it is four
+lines — see "How to re-take this one" below.
+
+```
+control:            HTTP/1.0 200 OK          157 bytes   target hits: [('GET','/health')]
+latedrop response:  HTTP/1.0 404 Not Found   178 bytes   target hits delta: 1
+earlydrop response: HTTP/1.1 200 OK         1529 bytes   target hits delta: 0
+```
+
+Read that middle line carefully. `HTTP/1.0` and a **404** is the *target
+server's own answer* — this target speaks HTTP/1.0 and answers 404 for an
+unrouted path. Burp's drop page is `HTTP/1.1 200` in 1529 bytes and is on the
+third line. So the late-dropped request was **delivered, answered, and the
+answer was handed back to the client**.
+
+The probe's own log shows the same thing from inside the JVM:
+
+```
+TBS id=1 path=/latedrop/secret
+LATEDROPPED id=1 action=DROP class=jdk.proxy2.$Proxy124
+RESP id=1 status=404 reqpath=/latedrop/secret
+DROPPED id=2
+```
+
+`action=DROP` is printed off the returned object's own `action()` accessor, so
+this is not a case of building the wrong action: the extension asked for a drop,
+Burp acknowledged a drop, and forwarded the request. A response handler then ran
+on the target's real 404, which is the second half of the same finding — the
+exchange completes normally in every respect.
+
+The last line is `/drop/secret` through `handleRequestReceived` in the same run:
+zero hits, `DROPPED` logged, and no `TBS` line for that message id at all.
+
+### A request dropped at the first callback never reaches the second
+
+Visible in the log above and worth stating separately, because a design can rest
+on it: message id 2 was dropped at `handleRequestReceived` and produced no `TBS`
+line. So reaching `handleRequestToBeSent` means the first callback **allowed**
+the request, and a `deny` answer at the second callback is by construction a
+*disagreement* with the first — which is to say an edit in the Intercept tab
+that sits between them.
+
+### Consequences, and what the extension does now
+
+- **The proxy has ONE enforcement point, not two callbacks' worth.**
+  `handleRequestReceived` enforces. `handleRequestToBeSent` cannot. §4's count
+  of two enforcement points — the send path and the proxy request handler — is
+  unaffected; what is affected is a stronger claim that was never §4's: that a
+  request edited *after* the first decision is re-checked. It is not, and on
+  this Burp it cannot be.
+- **The hole is real and it is the Intercept tab.** An operator can rewrite a
+  request there, host included, after `handleRequestReceived` has approved the
+  original. Nothing in the JVM can stop the edited request leaving.
+- **`HxExtension.handleRequestToBeSent` no longer tries.** It used to return
+  `drop()` and write a `denial` row. That row was *fabricated evidence in the
+  dangerous direction*: hx recorded a refusal for a request that reached the
+  client's system, and — because the refusal branch also took the `pending`
+  entry — discarded the clock and source of the exchange that actually happened,
+  so the response was charged to `countLost`. The callback now asks
+  `decideScopeOnly`, logs loudly through `api.logging().logToError` when the
+  answer disagrees with the first callback's, and returns `continueWith`.
+- **The escape is still recorded, and that is the honest record.** An edited
+  out-of-scope request goes out, is answered, and reaches
+  `handleResponseReceived` like any other — so it lands as an `exchange` row
+  whose `url` is outside `scope.include`. Nothing had to be added to *have* that
+  evidence; a query for exchanges outside the scope patterns finds it.
+- **Rewriting the request to something harmless was considered and refused.** It
+  would fabricate traffic the operator never sent, which is worse than recording
+  the escape.
+
+### How to re-take this one
+
+Unlike Q1–Q3 there is no test that re-measures this, and the reason is a
+trade rather than an oversight: measuring it needs a probe that drops at the
+second callback, and the shipped probe deliberately does not — `test_proxy_facts`
+would then be measuring an action no shipped code takes. What *is* pinned, in
+`ChokepointTest.theSecondCallbackObservesAndCannotRefuse`, is the consequence:
+`ProxyRequestToBeSentAction.drop(` must appear **zero** times in
+`HxExtension.java`, the scope question must still be asked, and its answer must
+be logged between the asking and the pass-through. That is the check that stops
+the refusal being put back by a reader who finds a pass-through where a scope
+check used to be.
+
+To re-measure against a future Burp, patch
+`tests/integration/probe/hx/proxy/Probe.java`'s `handleRequestToBeSent`:
+
+```java
+public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest r) {
+    write("TBS id=" + r.messageId() + " path=" + r.path());
+    if (r.path().startsWith("/latedrop")) {
+        ProxyRequestToBeSentAction a = ProxyRequestToBeSentAction.drop();
+        write("LATEDROPPED id=" + r.messageId() + " action=" + a.action());
+        return a;
+    }
+    return ProxyRequestToBeSentAction.continueWith(r);
+}
+```
+
+then drive `/latedrop/secret` and `/drop/secret` through one probe and read the
+target's log. **Revert the patch afterwards** — a probe that drops at the second
+callback would make `test_proxy_facts.py`'s Q3 measure two different actions.
+
+If a future Burp answers YES here, that is a better world and it is a new
+measurement, not a bug fix: the refusal could go back, and this section and
+`HxExtension.handleRequestToBeSent` would have to change together.
+
+---
+
 ## Q1 and Q3 over HTTPS, through a `CONNECT` tunnel
 
 An earlier version of this document listed HTTPS as unmeasured and told Task 5
@@ -388,8 +508,12 @@ the answers above could fail to hold and nothing here would notice.
   this project has ever sent a request off this machine — and that is now
   enforced rather than intended; see "`loopback_only` is checked, not assumed".
 - **Burp Professional.** Community only.
-- **`drop()` from `handleRequestToBeSent`.** The drop measured here is from
-  `handleRequestReceived`, which is the earlier of the two and the one Plan 4's
-  gate uses.
+- ~~**`drop()` from `handleRequestToBeSent`.**~~ **Measured — see Q4.** It was
+  listed here on the reasoning that the drop measured in Q3 is from
+  `handleRequestReceived`, "which is the earlier of the two and the one Plan 4's
+  gate uses". By the time it was measured, Plan 4's gate was using both, and the
+  later one does not work. Left in place struck through rather than deleted: the
+  entry that was hardest to justify keeping on this list is the one that turned
+  out to matter, and a reader deciding what to measure next should see that.
 - **What Burp's third listener is for.** Its behaviour is measured above; why it
   exists is not. Nothing in Plan 4 sends anything to it.
