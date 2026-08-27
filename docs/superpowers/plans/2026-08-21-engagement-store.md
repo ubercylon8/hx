@@ -638,6 +638,62 @@ def test_nested_transaction_outer_failure_rolls_back_everything(tmp_path: Path):
             raise RuntimeError("outer failure")
     assert conn.execute("SELECT COUNT(*) FROM engagement").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+
+
+# --- Fix round 1, F5: nesting must be tracked explicitly, not inferred from
+# `conn.in_transaction` -- that flag cannot distinguish an outer
+# `transaction()` call from sqlite3's own driver-implicit BEGIN. ---
+
+
+def test_transaction_fails_loudly_rather_than_losing_data_on_a_driver_implicit_transaction(
+    tmp_path: Path,
+):
+    """F5 of the task-6 review. Deliberately NOT `db.connect()`, which always
+    passes `isolation_level=None` -- this is sqlite3's own DEFAULT isolation
+    mode, which auto-opens a transaction before the first DML statement.
+
+    Under the OLD (`conn.in_transaction`-based) implementation this is
+    exactly the failure: `conn.in_transaction` is already `True` from the
+    driver's own implicit BEGIN, so `transaction()` mistook it for nesting,
+    took the SAVEPOINT path, and RELEASEd without ever COMMITting -- the
+    INSERT below would survive the `with` block in memory but vanish on
+    close, silently. MEASURED before this fix: the row was gone from a fresh
+    connection to the same file, no exception anywhere.
+
+    Tracking nesting with `db._OPEN_TRANSACTIONS` (keyed by `id(conn)`,
+    populated only by `transaction()` itself) instead means this connection's
+    id was never added by us, so `transaction()` takes the OUTERMOST path --
+    and a `BEGIN` against a connection sqlite3 already opened one on fails
+    LOUDLY, exactly as it did before Task 6 existed.
+    """
+    path = tmp_path / "hx.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    assert conn.in_transaction, "the driver's own implicit BEGIN, not ours"
+
+    with pytest.raises(sqlite3.OperationalError, match="transaction"):
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                " started_us, status)"
+                " VALUES('r1','e1','manual','production',1,'running')"
+            )
+    conn.rollback()
+    conn.close()
+
+    # Nothing was silently lost OR silently kept: the whole implicit
+    # transaction -- including the engagement row that predated the failed
+    # `transaction()` call -- rolled back, because sqlite3 refused to let it
+    # proceed at all. A fresh connection to the same file sees neither row.
+    reread = sqlite3.connect(str(path))
+    assert reread.execute("SELECT COUNT(*) FROM engagement").fetchone()[0] == 0
+    assert reread.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+    reread.close()
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -1112,6 +1168,27 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
+# Connections `transaction()` currently owns the OUTER `BEGIN` for, tracked
+# by `id(conn)` rather than as an attribute ON the connection -- MEASURED:
+# `sqlite3.Connection` (and a bare subclass of it) refuses arbitrary
+# attribute assignment (`AttributeError: 'sqlite3.Connection' object has no
+# attribute ...`) and is not weak-referenceable either, so there is no
+# per-object place on the connection itself to record this. `id()`-keying is
+# safe against id-reuse specifically because the only code that ever inserts
+# a key also removes it, in a `finally`, before returning -- and for the
+# whole of that window the caller holds a live reference to `conn` on the
+# stack (it is the function's own argument), so the object cannot be
+# garbage-collected and its id() handed to something else while the key is
+# live. See F5 of the task-6 review for why this exists at all: `db.py`'s
+# previous version asked `conn.in_transaction`, which cannot distinguish an
+# OUTER `transaction()` call from sqlite3's own driver-implicit `BEGIN` (any
+# connection not opened with `isolation_level=None` opens one before its
+# first DML statement) -- and on such a connection, MEASURED, the old code
+# took the SAVEPOINT path, `RELEASE`d, and never `COMMIT`ted: a loud
+# `OperationalError` became silent data loss.
+_OPEN_TRANSACTIONS: set[int] = set()
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection):
     """Group statements into one all-or-nothing unit.
@@ -1136,15 +1213,30 @@ def transaction(conn: sqlite3.Connection):
     "more call sites... in later plans" this docstring already predicted, so
     the helper -- not either call site -- is what learns to nest.
 
-    `conn.in_transaction` decides which path runs. Outermost: a plain
-    `BEGIN`/`COMMIT`/`ROLLBACK`, unchanged from before -- MEASURED against
-    `hx.capture.on_exchange`, the merged, reviewed, non-nested caller, whose
-    own tests (`tests/test_capture.py`) still pass unmodified. Nested: a named
-    `SAVEPOINT`, released on success or rolled back to (then released) on
-    failure, before re-raising -- so an inner failure undoes only the inner
-    block's writes and the exception still propagates, while the OUTER
-    transaction is left exactly as if the inner block had never run, free to
-    retry or to fail on its own account.
+    WHICH PATH RUNS IS DECIDED BY OUR OWN `_OPEN_TRANSACTIONS` MARKER, NEVER
+    BY `conn.in_transaction`. That flag reflects the DRIVER's state, not
+    OURS, and the two are different questions: it is true both when this
+    function opened the transaction and when sqlite3's own default isolation
+    mode auto-began one behind our back, and `transaction()` needs to answer
+    only the first. Outermost (this connection's id not in the marker set):
+    a plain `BEGIN`/`COMMIT`/`ROLLBACK`, unchanged from before -- MEASURED
+    against `hx.capture.on_exchange`, the merged, reviewed, non-nested
+    caller, whose own tests (`tests/test_capture.py`) still pass unmodified.
+    Nested (this connection's id already in the marker set, because an outer
+    `transaction()` call is still on the stack): a named `SAVEPOINT`,
+    released on success or rolled back to (then released) on failure, before
+    re-raising -- so an inner failure undoes only the inner block's writes
+    and the exception still propagates, while the OUTER transaction is left
+    exactly as if the inner block had never run, free to retry or to fail on
+    its own account.
+
+    A connection that never goes through an outer `transaction()` call at
+    all -- one where sqlite3's own driver opened an implicit transaction on
+    its own -- is never in the marker set, so it always takes the OUTERMOST
+    path here and gets the loud `OperationalError` a doubled `BEGIN`
+    produces, exactly as before this function existed. That is deliberate:
+    see F5 above for what happened when nesting was instead inferred from
+    `conn.in_transaction`.
 
     RELEASING A SAVEPOINT IS NOT COMMITTING. SQLite only durably commits at
     the outermost `COMMIT` -- a `RELEASE` just folds the inner block's writes
@@ -1161,19 +1253,23 @@ def transaction(conn: sqlite3.Connection):
         path that let it survive would make a partial write look atomic,
         which is worse than the bug this replaces.
     """
-    nested = conn.in_transaction
-    if not nested:
-        conn.execute("BEGIN")
+    key = id(conn)
+    if key not in _OPEN_TRANSACTIONS:
+        _OPEN_TRANSACTIONS.add(key)
         try:
-            yield conn
-        except BaseException:
+            conn.execute("BEGIN")
             try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass  # transaction already gone; do not mask the original error
-            raise
-        else:
-            conn.execute("COMMIT")
+                yield conn
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass  # transaction already gone; do not mask the original error
+                raise
+            else:
+                conn.execute("COMMIT")
+        finally:
+            _OPEN_TRANSACTIONS.discard(key)
         return
 
     name = f"sp_{uuid.uuid4().hex}"
