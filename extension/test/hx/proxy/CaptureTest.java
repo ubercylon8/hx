@@ -47,6 +47,8 @@ public class CaptureTest {
           CaptureTest::anUnattributedRecordIsRefusedAndCounted);
         t("the header says what the harness reads",
           CaptureTest::theHeaderCarriesWhatTheConsumerReads);
+        t("the outcome comes from the record, not from a literal",
+          CaptureTest::theOutcomeComesFromTheRecord);
         t("a sink that throws does not kill the drain thread",
           CaptureTest::aThrowingSinkDoesNotKillTheDrain);
         t("a drop report that throws does not kill it either",
@@ -88,7 +90,7 @@ public class CaptureTest {
     }
 
     static Observed obs(int n, Source s) {
-        return new Observed("GET", "http://app.test/" + n, 200, 5L,
+        return new Observed("GET", "http://app.test/" + n, 200, "ok", 5L,
                             ("req" + n).getBytes(), ("resp" + n).getBytes(), s);
     }
 
@@ -466,8 +468,8 @@ public class CaptureTest {
         Capture c = new Capture(8, sink);
         c.start();
         try {
-            offerAll(c, new Observed("POST", "http://app.test/login", 302, 41L,
-                                     "req".getBytes(), "resp".getBytes(),
+            offerAll(c, new Observed("POST", "http://app.test/login", 302, "ok",
+                                     41L, "req".getBytes(), "resp".getBytes(),
                                      Source.CRAWLER));
             waitUntil(() -> sink.headers.size() == 1);
             Map<String, Object> h = sink.headers.get(0);
@@ -488,6 +490,52 @@ public class CaptureTest {
                   Long.valueOf(41L).equals(h.get("ms")));
             check("outcome is in records.EXCHANGE_OUTCOMES (" + h.get("outcome") + ")",
                   "ok".equals(h.get("outcome")));
+        } finally { c.stop(); }
+    }
+
+    /**
+     * THE OUTCOME IS THE RECORD'S, NOT A LITERAL THIS CLASS WRITES.
+     *
+     * `deliverExchange` hardcoded `h.put("outcome", "ok")` -- the ONLY
+     * `outcome` write on the whole proxy path -- so every proxy exchange was
+     * filed healthy whatever its bytes said. The method above cannot see that:
+     * its fixture is a healthy 302, so `"ok"` is the right answer for the
+     * wrong reason and a hardcoded literal passes it.
+     *
+     * THE SEPARATING INPUT IS AN UNHEALTHY RECORD, and it is S5's shape:
+     * `status=599` with `outcome='status_unreadable'`, which is what
+     * {@link Recorder} produces for a `103 Early Hints` in front of a dead
+     * origin. With the literal back, this method reads `ok` on a 599 -- the
+     * pair `record_exchange`'s coherence guard exists to refuse, and the pair
+     * that hands S4's auto-halt a healthy sample for a failing request.
+     *
+     * The 599 goes on `status` too, so the two travel as one answer: S5 makes
+     * `status_unreadable` legal only beside 599, and a row carrying one
+     * without the other is refused on the far side rather than written wrong.
+     *
+     * WHAT THIS DOES NOT PIN: that the SCAN is right, or that it runs. This
+     * class builds the record by hand.
+     * `RecorderTest.theStatusIsScannedOutOfTheBytesWithItsOutcome` drives the
+     * scan over real bytes; between them the answer is computed from the bytes
+     * and carried to the wire unchanged.
+     */
+    static void theOutcomeComesFromTheRecord() throws Exception {
+        Recording sink = new Recording();
+        Capture c = new Capture(8, sink);
+        c.start();
+        try {
+            offerAll(c, new Observed("GET", "http://app.test/slow", 599,
+                                     "status_unreadable", 12L,
+                                     "req".getBytes(), "resp".getBytes(),
+                                     Source.OPERATOR));
+            waitUntil(() -> sink.headers.size() == 1);
+            Map<String, Object> h = sink.headers.get(0);
+            check("an unreadable exchange is NOT filed as healthy ("
+                  + h.get("outcome") + ")",
+                  "status_unreadable".equals(h.get("outcome")));
+            check("and it carries the sentinel S5 pairs that outcome with ("
+                  + h.get("status") + ")",
+                  Long.valueOf(599L).equals(h.get("status")));
         } finally { c.stop(); }
     }
 

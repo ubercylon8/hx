@@ -456,7 +456,15 @@ public final class Capture {
             h.put("url", o.url());
             h.put("status", (long) o.status());
             h.put("ms", o.ms());
-            h.put("outcome", "ok");
+            // THE RECORD'S, NOT A LITERAL. This line read `"ok"` and was the
+            // only `outcome` write on the proxy path, so every proxy exchange
+            // was filed healthy whatever its bytes said -- including the
+            // `103 Early Hints` shape S5 measured thirty of. The answer is
+            // computed in Recorder by the SAME scan the send path uses, and
+            // arrives here already paired with the `status` above: S5 accepts
+            // `status_unreadable` only alongside 599, and Recorder is the one
+            // place that pairing is made.
+            h.put("outcome", o.outcome());
             delivered = sink.exchange(h, o.request(), o.response());
         } catch (Throwable t) {
             // A sink that throws is someone else's code failing. Losing

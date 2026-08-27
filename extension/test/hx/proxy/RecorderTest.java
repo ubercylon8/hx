@@ -82,6 +82,8 @@ public class RecorderTest {
           RecorderTest::aRangeErrorIsNotSwallowed);
         t("every shape of message is redacted, not just the small one",
           RecorderTest::everyShapeOfMessageIsRedacted);
+        t("the status and the outcome are SCANNED out of the bytes, not passed "
+          + "through", RecorderTest::theStatusIsScannedOutOfTheBytesWithItsOutcome);
         t("the COMPILER is what bounds construction, not a needle",
           RecorderTest::theCompilerBoundsConstruction);
 
@@ -388,6 +390,130 @@ public class RecorderTest {
      * package-private records is legal, and this asserts the arrangement
      * rather than assuming it.
      */
+    /**
+     * THE PROXY PATH ANSWERS THE SAME QUESTION THE SEND PATH DOES, over the
+     * bytes rather than over the text of a file.
+     *
+     * `Capture.deliverExchange` wrote `outcome: "ok"` unconditionally and the
+     * entry point handed Montoya's `statusCode()` through raw, so the proxy
+     * path emitted S5's wire vocabulary with NO SCAN BEHIND IT. Measured on
+     * Burp 2026.7.3 and recorded in S5: `statusCode()` answers the INTERIM
+     * head on a 103-then-200 exchange while `toByteArray()` carries both. So a
+     * CDN answering `103 Early Hints` in front of a dead origin was filed
+     * `status=103, outcome=ok` -- thirty such exchanges, a 0% 5xx rate, and
+     * S4's auto-halt never firing. `record_exchange`'s coherence guard accepts
+     * that pair because it is a LEGAL one; nothing downstream could catch it.
+     *
+     * Five fix rounds hardened this on the send path. A second implementation
+     * of one contract is how a hardened contract gets re-implemented
+     * unhardened, so `Recorder` calls {@code Sender.scanStatus} -- the same
+     * function, not a copy -- and this method drives the four endings that
+     * separate its arms:
+     *
+     *   - a plain 200: reported final, nothing to overrule. `ok`;
+     *   - 103 with a real 200 behind it: the interim head is REPLACED by the
+     *     status the exchange actually stated. 200 / `ok`, and this is the arm
+     *     that separates "scan the bytes" from "trust the report";
+     *   - 103 with NOTHING behind it -- the dead-origin shape: 599 /
+     *     `status_unreadable`. This is the arm the pass-through failed;
+     *   - a 101 upgrade with nothing behind it: 101 / `ok`, because RFC 9110
+     *     s15.2.2 makes a 101 head the last status its exchange will ever
+     *     state. Getting this one wrong is the MIRROR failure, and S5 records
+     *     it costing ten false 599s and an auto-halt against a healthy host.
+     *
+     * WHY 101 IS DRIVEN HERE and not left to SenderTest: this is a second
+     * CALLER of one scan, and a caller that reached it with the arguments
+     * swapped, or that passed the redacted bytes, or that computed `outcome`
+     * from the code alone would pass the first and third cases and fail this
+     * one. The point is not to re-test `scanStatus`; it is to pin that THIS
+     * path gets its whole answer from it.
+     *
+     * THE PAIRING IS CHECKED, not just the two fields: S5 makes
+     * `status_unreadable` legal only beside 599, and `record_exchange` raises
+     * on any other combination -- so a row that carried one without the other
+     * would be refused on the far side rather than written wrong.
+     */
+    static void theStatusIsScannedOutOfTheBytesWithItsOutcome() {
+        // The reported status is what Montoya would hand over, and it is the
+        // FIRST head every time -- that is the measured behaviour this exists
+        // to survive.
+        Observed plain = scanned(200, "HTTP/1.1 200 OK\r\n"
+                                    + "Content-Length: 0\r\n\r\n");
+        check("a plain final status is passed through (" + plain.status() + " / "
+              + plain.outcome() + ")",
+              plain.status() == 200 && "ok".equals(plain.outcome()));
+
+        Observed behind = scanned(103, "HTTP/1.1 103 Early Hints\r\n"
+                                     + "Link: </s.css>; rel=preload\r\n\r\n"
+                                     + "HTTP/1.1 200 OK\r\n"
+                                     + "Content-Length: 0\r\n\r\n");
+        check("an interim head is overruled by the status behind it ("
+              + behind.status() + " / " + behind.outcome() + ")",
+              behind.status() == 200 && "ok".equals(behind.outcome()));
+
+        // THE DEAD-ORIGIN SHAPE, and the one the shipped path filed as
+        // healthy.
+        Observed dead = scanned(103, "HTTP/1.1 103 Early Hints\r\n"
+                                   + "Link: </s.css>; rel=preload\r\n\r\n");
+        check("an interim head with nothing behind it is UNREADABLE, not ok ("
+              + dead.status() + " / " + dead.outcome() + ")",
+              dead.status() == 599
+              && "status_unreadable".equals(dead.outcome()));
+        check("and the two travel as the pair S5 accepts (" + dead.status()
+              + " with " + dead.outcome() + ")",
+              (dead.status() == 599) == "status_unreadable".equals(dead.outcome()));
+
+        // THE MIRROR, which S5 measured costing an auto-halt against a
+        // healthy host.
+        Observed upgrade = scanned(101, "HTTP/1.1 101 Switching Protocols\r\n"
+                                      + "Upgrade: websocket\r\n\r\n");
+        check("a completed 101 upgrade is its own final status, not distress ("
+              + upgrade.status() + " / " + upgrade.outcome() + ")",
+              upgrade.status() == 101 && "ok".equals(upgrade.outcome()));
+
+        // ---- A PEER'S OWN 599, both ways it can arrive ------------------
+        //
+        // THE TWO CASES BELOW ARE WHAT SEPARATE THE SCAN'S ANSWER FROM ITS
+        // NUMBER, and they are here because their absence was MEASURED green:
+        // with the four cases above alone, rewriting Recorder's outcome as
+        // `scan.code() == 599 ? "status_unreadable" : "ok"` -- deriving the
+        // provenance from the code instead of taking it from the scan, which
+        // is the "second implementation of one contract" shape this whole
+        // finding is about -- read 13 / 2256 ok / 0 FAIL / rc=0.
+        //
+        // S5 is explicit that 599 is NOT a reserved code: it is in unofficial
+        // use for connect timeouts, which is exactly the class of peer that
+        // fronts an origin with early hints. So `outcome` is the ONLY thing
+        // separating the sentinel from a peer that answered 599 itself, and a
+        // derivation from the number gets both of these exactly backwards --
+        // filing a real 599 as unreadable, which reads as "hx could not read
+        // this" about an exchange the peer answered.
+        Observed peer599 = scanned(599, "HTTP/1.1 599 Network Connect Timeout\r\n"
+                                      + "Content-Length: 0\r\n\r\n");
+        check("a peer's OWN 599 is ok, not the sentinel (" + peer599.status()
+              + " / " + peer599.outcome() + ")",
+              peer599.status() == 599 && "ok".equals(peer599.outcome()));
+
+        // ...and the same number read out of the BYTES behind an interim
+        // head, which is the arm no derivation from the code can get right.
+        Observed behind599 = scanned(103, "HTTP/1.1 103 Early Hints\r\n"
+                                        + "Link: </s.css>; rel=preload\r\n\r\n"
+                                        + "HTTP/1.1 599 Network Connect Timeout\r\n"
+                                        + "Content-Length: 0\r\n\r\n");
+        check("and so is a 599 the exchange STATED behind an interim head ("
+              + behind599.status() + " / " + behind599.outcome() + ")",
+              behind599.status() == 599 && "ok".equals(behind599.outcome()));
+    }
+
+    /** One record built from a response whose bytes are the point. The
+     *  request half is the ordinary fixture, so a RangeError out of it cannot
+     *  be mistaken for a scan result. */
+    static Observed scanned(int reported, String response) {
+        return (Observed) new Recorder(new Redactor())
+                .record("GET", "http://app.example.test/x", reported, 9L,
+                        rawRequest(), bytes(response), Source.CRAWLER);
+    }
+
     static void theCompilerBoundsConstruction() {
         check("Observed is not public (" + Modifier.toString(
                       Observed.class.getModifiers()) + ")",

@@ -316,6 +316,36 @@ public class HxExtension implements BurpExtension {
                     // decision made from two halves of two authorisations is a
                     // decision about a request nobody authorised.
                     BridgeClient.Authorisation auth = c.authorisation();
+                    // THE SAME ARMING THE SEND PATH DOES, FROM THE SAME
+                    // SNAPSHOT THIS REQUEST IS ABOUT TO BE DECIDED UNDER.
+                    // Without it the CRAWLER branch reaches Limits.check with
+                    // `limiter == null` and every crawler request that passes
+                    // scope, method and dangerous.path is refused
+                    // `not_configured` -- fail-closed, and a lie about why:
+                    // the run IS configured, and the denial lands under a kind
+                    // an operator reads as "nobody authorised this", with no
+                    // EXTENSION_FAULT prefix to separate the two. The three
+                    // answers are DRIVEN, against a real Limits and a fully
+                    // configured authorisation, in
+                    // ProxyGateTest -- "a crawler request that passes scope,
+                    // method and dangerous.path REACHES the gate, and an
+                    // unarmed one refuses it": unarmed CRAWLER denied, armed
+                    // CRAWLER allowed, OPERATOR allowed either way.
+                    //
+                    // ARMED ONCE IS UNCHANGED. Limits.arm returns early once a
+                    // limiter exists, so this cannot re-arm the run from a
+                    // later snapshot; a configure that MOVES an armed limit is
+                    // still refused by setConfigGuard above, which is the
+                    // mechanism s4 asks for. What this line changes is only
+                    // WHICH of the two enforcement points may be the first to
+                    // arm -- and either way it is the first authorisation with
+                    // an epoch that supplies the numbers.
+                    //
+                    // Inside the try, deliberately: arm() throws on a limit
+                    // key that is present and unusable, and a throw here is a
+                    // DENY through the catch below rather than a throw off a
+                    // Burp proxy thread.
+                    limits.arm(auth);
                     verdict = gate.decide(proxyRequest(r), auth, source);
                 } catch (RuntimeException e) {
                     // A gate that threw has decided NOTHING, and the only safe

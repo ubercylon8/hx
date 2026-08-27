@@ -7,6 +7,8 @@ import hx.policy.Decision;
 import hx.policy.Gate;
 import hx.policy.HxRequest;
 import hx.policy.Policy;
+import hx.policy.TickClock;
+import hx.send.Limits;
 
 import java.util.List;
 import java.util.Map;
@@ -65,6 +67,9 @@ public class ProxyGateTest {
           ProxyGateTest::unconfiguredRefusesBoth);
         t("a source that could not be attributed is refused, not defaulted",
           ProxyGateTest::anUnattributableSourceIsRefused);
+        t("a crawler request that passes scope, method and dangerous.path "
+          + "REACHES the gate, and an unarmed one refuses it",
+          ProxyGateTest::theCrawlerReachesTheGateAndAnUnarmedOneRefusesIt);
         t("the listener port decides the source",
           ProxyGateTest::theListenerPortDecides);
         t("a listener interface is parsed or refused, never guessed at",
@@ -187,6 +192,75 @@ public class ProxyGateTest {
         check("the same request is allowed for the crawler (" + v.errorClass() + ")",
               v.allow());
         check("crawling does (" + gate.calls + ")", gate.calls == 1);
+    }
+
+    // ---- the gate the crawler actually reaches ---------------------------
+
+    /**
+     * THE TEST THAT DID NOT EXIST, AND ITS ABSENCE IS WHY A LIVE DEFECT SHIPPED.
+     *
+     * Every crawler case above stops SHORT of the Gate.
+     * {@link #theCrawlerIsMethodChecked} drives a POST that `method.allow`
+     * refuses; {@link #theCrawlerIsDangerousPathChecked} drives `/logout`;
+     * {@link #scopeIsAbsoluteForTheCrawler} drives an out-of-scope host.
+     * {@link #theCrawlerSpendsTheGate} does reach it -- against a
+     * {@link CountingGate} that allows everything. The single crawler-listener
+     * INTEGRATION test drives a POST too. So no test anywhere drove a crawler
+     * request through scope, method and dangerous.path into the REAL Gate.
+     *
+     * WHAT THAT HID. {@link hx.send.Limits} is the Gate a real run carries, and
+     * it answers `not_configured` -- "the rate and budget are not armed" --
+     * until {@code arm} has run. `arm` had ONE call site, in the send
+     * handler, so every crawler request that got this far was refused as
+     * unauthorised on a correctly authorised run, until some unrelated `send`
+     * happened to arm it. Fail-closed, and a denial that lies about why.
+     *
+     * SO THE FIXTURE IS THE REAL Limits AND NOT A CountingGate. A fake that
+     * allows everything cannot fail this way, and that is the whole finding:
+     * the gate that exists in production has a state the test double does not
+     * have.
+     *
+     * THE THIRD CASE IS THE CONTROL. The operator gets the same request
+     * through the SAME unarmed Limits and is allowed, because the operator
+     * branch stops before the Gate -- so what the first case pins is the
+     * Gate's state, not the request.
+     *
+     * WHAT THIS DOES NOT PIN: that HxExtension arms it. This class constructs
+     * both objects itself. The wiring is text in a file no test can execute,
+     * and it is counted by
+     * {@code ChokepointTest.everyPathThatSpendsTheGateArmsItFirst}.
+     */
+    static void theCrawlerReachesTheGateAndAnUnarmedOneRefusesIt() {
+        BridgeClient.Authorisation auth = authorised();
+        // GET, in scope, not on the dangerous list: the three checks ahead of
+        // the Gate all pass, so this request reaches it and nothing else does
+        // the refusing.
+        HxRequest allowed = req("GET", "http://app.test/x");
+
+        var unarmed = gateOver(new Limits(new TickClock(1_000_000L), 5, 100))
+                .decide(allowed, auth, Source.CRAWLER);
+        check("an UNARMED gate refuses the crawler (" + unarmed.errorClass() + ")",
+              !unarmed.allow() && "not_configured".equals(unarmed.errorClass()));
+        // The detail is asserted, not just the class: `not_configured` is
+        // shared with DENY-ALL and with an unattributable source, so the class
+        // alone does not say that this is the Gate answering.
+        check("and says the rate and budget are the thing that is missing ("
+              + unarmed.detail() + ")",
+              unarmed.detail() != null
+              && unarmed.detail().contains("not armed"));
+
+        Limits armed = new Limits(new TickClock(1_000_000L), 5, 100);
+        armed.arm(auth);
+        var ok = gateOver(armed).decide(allowed, auth, Source.CRAWLER);
+        check("the SAME request is allowed once the gate is armed ("
+              + ok.errorClass() + ")", ok.allow());
+
+        // The control, and it is what makes the first case about the Gate.
+        var operator = gateOver(new Limits(new TickClock(1_000_000L), 5, 100))
+                .decide(allowed, auth, Source.OPERATOR);
+        check("and the operator is allowed through the same unarmed gate, "
+              + "because that branch never reaches it (" + operator.errorClass()
+              + ")", operator.allow());
     }
 
     // ---- DENY-ALL --------------------------------------------------------

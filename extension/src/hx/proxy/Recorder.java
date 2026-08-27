@@ -2,6 +2,7 @@
 package hx.proxy;
 
 import hx.send.Redactor;
+import hx.send.Sender;
 
 /**
  * One observed exchange turned into a redacted {@link Observed}, in a class a
@@ -139,9 +140,37 @@ public final class Recorder {
      */
     public Captured record(String method, String url, int status, long ms,
                            byte[] rawRequest, byte[] rawResponse, Source source) {
+        // THE SAME QUESTION THE SEND PATH ASKS, THROUGH THE SAME SCAN.
+        // Montoya parses an interim head as THE response: measured on
+        // 2026.7.3, `statusCode()` answered 103 on a 103-then-200 exchange
+        // while `toByteArray()` carried both heads. The entry point hands over
+        // exactly those two values, so a proxy path that passed `status`
+        // through and wrote `outcome: "ok"` beside it filed a `103 Early
+        // Hints` in front of a dead origin as `status=103, outcome=ok` -- S5's
+        // measured pair, thirty of them, with S4's auto-halt handed a healthy
+        // sample for every failing request. `record_exchange`'s coherence
+        // guard accepts it, because it is a legal pair.
+        //
+        // The scan is REUSED and not reimplemented. A second copy of that loop
+        // is the defect this class exists to prevent, one level up: two
+        // implementations of one contract, each internally consistent, free to
+        // drift, with nothing comparing them. See Sender.StatusScan for why
+        // the public `finalStatus` is not enough -- it discards the
+        // provenance, and a genuine 599 read out of the bytes behind a 103
+        // cannot be told from the sentinel without it.
+        //
+        // RUN ON THE RAW BYTES, before redaction, for the same reason the send
+        // path scans `reply.raw()`: the scan reads status LINES, redaction
+        // rewrites header VALUES, and asking the question of the bytes that
+        // arrived keeps the two independent. A null response half answers
+        // `unreadable` here without throwing and then throws out of
+        // `redactResponse` below, which is the answer that half already had.
+        Sender.StatusScan scan = Sender.scanStatus(rawResponse, status);
         byte[] request = redactor.redactObservedRequest(rawRequest);
         byte[] response = redactor.redactResponse(rawResponse);
-        return new Observed(method, url, status, ms, request, response, source);
+        return new Observed(method, url, scan.code(),
+                            scan.unreadable() ? "status_unreadable" : "ok",
+                            ms, request, response, source);
     }
 
     /**

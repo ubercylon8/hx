@@ -658,7 +658,7 @@ public final class Sender {
      * out" is not a licence to report the interim head, and for why 101 is the
      * one 1xx where there was never a later head to run out of.
      */
-    static StatusScan scanStatus(byte[] raw, int reported) {
+    public static StatusScan scanStatus(byte[] raw, int reported) {
         // Not an interim status: the transport's answer IS the final one, and
         // re-reading the bytes behind it would let a peer's leading head
         // overrule a status the exchange really produced.
@@ -742,13 +742,27 @@ public final class Sender {
      * theDeprecatedAccessorsAreUnusedEverywhere, which makes the rule
      * explicit -- fix the javadoc, do not widen the needle.
      *
+     * PUBLIC, ALONG WITH {@link #scanStatus}, BECAUSE THERE IS ONE SCAN AND NOT
+     * TWO. The PROXY path emits the same two wire values -- `status` and
+     * `outcome` -- and shipped them as `r.statusCode()` raw and the literal
+     * `"ok"`, with no scan behind either: a `103 Early Hints` in front of a
+     * dead origin filed `status=103, outcome=ok`, which is the exact pair S5
+     * measured thirty of and the pair that leaves S4's auto-halt a healthy
+     * sample for every failing request. {@link #finalStatus} was already
+     * public and is NOT enough for that caller: it throws the provenance away,
+     * and deriving "was that unreadable" from the code alone gets a genuine
+     * 599 read out of the bytes behind a 103 exactly backwards. So the caller
+     * gets the whole answer rather than half of it and a second copy of this
+     * loop. `hx.proxy` -> `hx.send` is the edge {@link Redactor} already
+     * crosses in that direction; the reverse is the one to refuse.
+     *
      * @param code       what goes on the evidence line and into Distress
      * @param unreadable true when {@code code} is {@link #STATUS_UNREADABLE}
      *                   BECAUSE no final status line could be read behind a
      *                   reported 1xx, rather than because anything in the
      *                   exchange said 599
      */
-    record StatusScan(int code, boolean unreadable) { }
+    public record StatusScan(int code, boolean unreadable) { }
 
     /**
      * The three-digit code of a status line, or -1 for a line that is not
