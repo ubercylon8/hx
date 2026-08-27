@@ -704,3 +704,112 @@ def test_a_broken_recorder_does_not_gate_the_browser_but_a_dead_bridge_does(rig)
         "the refusal did not hold: the target took "
         f"{len(rig.target.hits) - frozen} more request(s) after the bridge "
         "died.")
+
+
+# ---------------------------------------------------------------------------
+# 7. B3: an allowed request that fails at the transport. MEASURED, NOT FIXED.
+# ---------------------------------------------------------------------------
+
+
+def test_an_allowed_request_that_cannot_connect_leaves_no_trace_at_all(rig):
+    """THE MEASUREMENT B3 IS PARKED ON. This test PINS A GAP, not a fix.
+
+    An in-scope request that passes the gate and then fails to connect --
+    connection refused, DNS failure, TLS failure -- produces **no exchange
+    row, no denial row and no drop**. S5's `conn_refused | dns_error |
+    tls_error` outcomes are unreachable from the proxy path, and S5's own
+    stated reason for having `outcome` at all -- "a check reads silence as
+    not vulnerable" -- applies one layer earlier than it was written for.
+
+    WHAT WAS MEASURED HERE, against Burp Suite Community 2026.7.3:
+
+      - Burp answers the CLIENT with its own error page, `HTTP/1.1 200 OK`,
+        ~1535 bytes, `<title>Burp Suite</title>`. That is the same SHAPE a
+        dropped request produces (`DROP_LOOKS_LIKE`, ~1529 bytes), so a client
+        cannot tell "hx refused this" from "nothing answered" either.
+      - `exchange`: no row. `denial`: no row. `run.dropped_total`: unmoved.
+        `BridgeServer.exchange_errors`: 0 -- so this is not a sink that failed,
+        it is a record that was never made.
+
+    AND WHAT THAT IMPLIES ABOUT THE CALLBACK, stated as the inference it is
+    rather than as an observation: `handleResponseReceived` did not run for
+    that message. Had it run and found the `Pending` entry there would be an
+    exchange row; had it run and MISSED, `Capture.countLost` would have moved
+    `dropped_total`. Neither happened, so the entry is still sitting in
+    `Pending` waiting to be evicted by capacity pressure -- and
+    `Pending.evicted()` has no reader outside its own test.
+
+    WHY IT IS NOT FIXED HERE, rather than left to look like an oversight:
+
+      - THERE IS NO FAILURE CALLBACK TO USE. Measured off the jar this
+        extension compiles against (montoya-api.jar, 2025-09-23):
+        `ProxyRequestHandler` and `ProxyResponseHandler` declare exactly two
+        methods each and `HttpHandler` exactly two, and none of the six is a
+        failure or timeout notification. There is nothing to register.
+      - A TIME-BASED SWEEP OF `Pending` WOULD FABRICATE EVIDENCE. It has to
+        pick one of S5's four outcomes, and Montoya reports nothing that
+        distinguishes conn_refused from dns_error from tls_error -- which is
+        exactly why `records.EXCHANGE_OUTCOME` has no `transport_error` entry
+        and why the 599 sentinel needed an outcome of its own. It also has to
+        pick a duration, and a long-poll, an SSE stream and a WebSocket
+        upgrade all legitimately have no response for minutes: filing those as
+        transport failures is a fabricated fact in the evidence store.
+      - COUNTING IT AS A DROP instead needs the same duration, and gets the
+        error in the direction `Capture` already warns about -- a response
+        that arrives after the sweep is one loss reported and one exchange
+        recorded, and `run.dropped_total` becomes "wrong in the direction of
+        alarm".
+
+    THE ONE FACILITY THAT MIGHT CLOSE IT, named so the next attempt starts
+    from a measurement rather than a guess: `Proxy.history()` returns
+    `ProxyHttpRequestResponse`, which has `hasResponse()`, `id()` and
+    `listenerPort()`. It is a POLL and not a callback, and TWO THINGS ABOUT IT
+    ARE UNMEASURED -- whether Burp enters a request that never connected into
+    proxy history at all, and whether anything there separates "no response
+    yet" from "no response ever". Both are `test_proxy_facts.py`-shaped
+    questions; neither has been asked. See docs/burp-proxy-measurements.md Q5.
+
+    IF THIS TEST GOES RED, the gap has closed by itself -- a Burp upgrade, or
+    someone wiring a sweep -- and that is worth finding out about deliberately
+    rather than discovering in a report.
+    """
+    assert rig.configure() == 1
+
+    # A live request first, so the failure below is a fact about the DEAD
+    # target rather than about a path that never worked in this fixture.
+    assert status_of(browse(rig, "/api/orders")) == 200
+    settle(rig, lambda: rows(rig, "SELECT id FROM exchange"), "the live row")
+    live_rows = len(rows(rig, "SELECT id FROM exchange"))
+
+    # The destination stays IN SCOPE -- the gate allows it, and the connection
+    # is the thing that fails. Out of scope would be a `denial` row, which is
+    # the case that already works.
+    rig.target.stop()
+    time.sleep(0.5)
+
+    raw = browse(rig, "/api/orders?the-target-is-gone=1", timeout=20)
+    assert status_of(raw) == DROP_LOOKS_LIKE, (
+        "Burp answered a failed connection with something other than its own "
+        f"200 error page: {raw[:120]!r}")
+    assert b"Burp Suite" in raw
+
+    # Long enough for a frame to have crossed the bridge and a row to have
+    # been written. The live request above took well under this.
+    time.sleep(SETTLE_S)
+
+    assert len(rows(rig, "SELECT id FROM exchange")) == live_rows, (
+        "an exchange row appeared for a request that never connected. If the "
+        "outcome is one of S5's transport values this gap has been closed and "
+        "this test should be rewritten as the check for the fix; if it is "
+        "`ok` with Burp's own error page in the response blob, that is worse "
+        "than the gap -- a report would read Burp's page as the target's")
+    assert rows(rig, "SELECT kind, url FROM denial") == [], \
+        "the request was ALLOWED; a denial row here would record a refusal " \
+        "that did not happen"
+    assert rows(rig, "SELECT COALESCE(SUM(dropped_total), 0) AS n FROM run"
+                )[0]["n"] == 0, (
+        "the loss is now counted as a drop. That is a real improvement over "
+        "silence and it is NOT what this test pins -- rewrite it")
+    assert rig.srv.exchange_errors == 0, (
+        "this side's sink failed, so the empty table above measures a broken "
+        "harness rather than the gap this test is about")

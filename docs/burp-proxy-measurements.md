@@ -19,7 +19,10 @@ This document is one half of a deliverable. The other half is
 `tests/integration/test_proxy_facts.py`, which re-measures Q1, Q2 and Q3
 against a real Burp and fails if any of them changes. (Q4 is the exception and
 says so in its own section: re-taking it needs a probe patch that must not
-ship.) Two of those tests read this file back — Q1's checks the accessor table, Q3's checks the status and byte
+ship. Q5 is re-measured too, but from
+`tests/integration/test_proxy_capture.py` rather than from here — it needs a
+target that stops answering mid-test, which is the standing rig's target and
+not the probe's.) Two of those tests read this file back — Q1's checks the accessor table, Q3's checks the status and byte
 count Burp answers a dropped client with — so the prose and the measurement
 cannot drift apart in silence. Everything outside those two readbacks is prose
 that nothing enforces, and is marked as such where it matters.
@@ -440,6 +443,82 @@ measurement, not a bug fix: the refusal could go back, and this section and
 
 ---
 
+## Q5. What happens when an allowed request cannot connect?
+
+### Answer: NOTHING REACHES `hx`. No callback, no row, no drop.
+
+**Measured 2026-08-26**, same Burp, through the standing rig rather than the
+probe: an in-scope destination that the gate ALLOWS and that then refuses the
+connection (the target server stopped mid-test, so the port is closed while the
+scope rule still matches).
+
+| What | Result |
+|---|---|
+| The client is answered | `HTTP/1.1 200 OK`, ~1535 bytes, `<title>Burp Suite</title>` |
+| `exchange` rows | **none** |
+| `denial` rows | **none** |
+| `run.dropped_total` | **unmoved** |
+| `BridgeServer.exchange_errors` | 0 — nothing failed; nothing was attempted |
+
+The client-side answer is the same SHAPE as a dropped request (Q3, ~1529 bytes,
+identical head). **A client cannot tell "hx refused this" from "nothing
+answered"**, which is one more reason Q3's byte count is the only thing
+separating them and why nothing in this project reads the client's response to
+decide what happened.
+
+### `handleResponseReceived` did not run — inferred, and here is the inference
+
+Not observed directly; argued from the rows, because both halves are checkable.
+Had the callback run and FOUND its `Pending` entry there would be an exchange
+row. Had it run and MISSED, `Capture.countLost` would have moved
+`dropped_total`. Neither moved, so the callback did not run for that message —
+and the `Pending` entry is still in the map, waiting to be evicted by capacity
+pressure. `Pending.evicted()` has no reader outside its own test.
+
+### There is no failure callback to register
+
+Measured off `montoya-api.jar` (2025-09-23), the jar `extension/build.sh`
+compiles against, with `javap`:
+
+```
+ProxyRequestHandler   handleRequestReceived, handleRequestToBeSent          (2)
+ProxyResponseHandler  handleResponseReceived, handleResponseToBeSent        (2)
+HttpHandler           handleHttpRequestToBeSent, handleHttpResponseReceived (2)
+```
+
+Six methods, all response-shaped. None is a failure or timeout notification.
+**There is nothing to register**, so this gap cannot be closed by finding the
+right callback.
+
+### The one facility that might close it, and what is still unmeasured
+
+`Proxy.history()` returns `List<ProxyHttpRequestResponse>`, and that type has
+`hasResponse()`, `id()`, `listenerPort()` and `timingData()`. It is a POLL, not
+a callback. **Two things about it are unmeasured and both must be answered
+before anything is built on it:**
+
+1. does Burp enter a request that never connected into proxy history **at
+   all**, or only requests that got a response?
+2. does anything there separate "no response **yet**" from "no response
+   **ever**"? A long-poll, an SSE stream and a WebSocket upgrade are all
+   legitimately answerless for minutes.
+
+Both are `test_proxy_facts.py`-shaped questions and neither has been asked.
+Until they are, the alternatives are a time-based sweep of `Pending` — which
+must pick one of §5's four transport outcomes with nothing to distinguish them,
+and must pick a duration that a long-poll would fail — or nothing. This project
+has twice refused to record a guess as a fact (`transport_error` has no row;
+the 599 sentinel needed its own outcome), so it is nothing, for now.
+
+### Where this is pinned
+
+`tests/integration/test_proxy_capture.py::test_an_allowed_request_that_cannot_
+connect_leaves_no_trace_at_all`. It asserts the GAP: if it goes red, either a
+Burp upgrade changed the behaviour or someone closed it, and both are worth
+finding out about deliberately rather than in a report.
+
+---
+
 ## Q1 and Q3 over HTTPS, through a `CONNECT` tunnel
 
 An earlier version of this document listed HTTPS as unmeasured and told Task 5
@@ -517,3 +596,12 @@ the answers above could fail to hold and nothing here would notice.
   out to matter, and a reader deciding what to measure next should see that.
 - **What Burp's third listener is for.** Its behaviour is measured above; why it
   exists is not. Nothing in Plan 4 sends anything to it.
+- **`Proxy.history()` on a request that never connected.** Named in Q5 as the
+  one facility that might close the gap Q5 measures, and named here because it
+  is the measurement somebody will need before building on it: whether a failed
+  request appears in proxy history at all, and whether anything there separates
+  "no response yet" from "no response ever". Neither has been asked.
+- **A DNS failure and a TLS failure specifically.** Q5 measured a REFUSED
+  CONNECTION. §5's vocabulary has three transport outcomes and this
+  measurement produced evidence for none of them, so "all three behave alike"
+  is an assumption and is written here rather than in Q5's answer.
