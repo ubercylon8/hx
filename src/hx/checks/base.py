@@ -185,3 +185,20 @@ class Check(Protocol):
     version: str
     klass: str
     insertion_kinds: frozenset[str]
+
+
+@dataclass(frozen=True)
+class ExchangeRow:
+    """One captured exchange, as a check sees it.
+
+    Blob DIGESTS, not bytes. A surface with two hundred exchanges would
+    otherwise pull two hundred response bodies into memory before any check
+    decided it wanted one, and most checks want a handful. `ctx.blobs.get`
+    is the fetch, and it is the check's decision when to call it.
+    """
+    id: str
+    method: str
+    url: str
+    status: int | None
+    req_blob: str | None
+    resp_blob: str | None
