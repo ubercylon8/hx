@@ -386,8 +386,13 @@ git commit -m "feat(checks): the vocabulary a check speaks in, and the three wor
 §10 wants checks cheap to add. One line in a list is cheap. Discovery is cheaper still and is refused: `extension/test.sh` already records why — *"a class nobody lists is a file that compiles, never runs, and reads in review exactly like a test that passes."* For a security tool that failure renders as **tested, clean**.
 
 **Files:**
-- Create: `src/hx/checks/registry.py`
+- Create: `src/hx/checks/registry.py`, `src/hx/checks/passive/__init__.py` (a bare docstring; Task 4 replaces its contents)
 - Test: `tests/test_checks_registry.py`
+
+**Pre-flight ruling F2.** The registry imports `hx.checks.passive.*`, so the
+package must exist before this task's own tests can even import. Task 4 was
+where `__init__.py` appeared; it is created here instead, empty but for a
+docstring, and Task 4 overwrites it.
 
 **Interfaces:**
 - Consumes: `hx.checks.base.Check`.
@@ -905,7 +910,7 @@ no payload and no permission.
 
 **Files:**
 - Modify: `src/hx/checks/base.py` (add `ExchangeRow`), `src/hx/checks/passive/cookie_flags.py`, `.../security_headers.py`, `.../secret_in_response.py`, `.../stack_trace.py` (replace Task 2's stubs)
-- Create: `src/hx/checks/passive/__init__.py`, `tests/test_checks_passive.py`
+- Create: `src/hx/checks/passive/_http.py`, `tests/test_checks_passive.py` (`passive/__init__.py` already exists from Task 2; replace its contents)
 
 **Interfaces:**
 - Consumes: `Verdict`, `Candidate`, `CheckContext`; `ctx.blobs.get(digest)`.
@@ -1921,7 +1926,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from hx import insertion as insertion_mod
 from hx import run as run_mod
 from hx.checks import base, registry
 from hx.engagement import now_us
@@ -2258,7 +2262,7 @@ and is the reason this plan exists.
 
 **Interfaces:**
 - Consumes: `check_run`, `finding`, `finding_observation`, `evidence`, `run`, `engagement`; `records.redact_url`.
-- Produces: `report.render(conn, *, engagement_id, config) -> str`; `hx report [--root PATH] [--out PATH]`.
+- Produces: `report.render(conn, *, engagement_id, config, blobs=None) -> str`; `hx report [--root PATH] [--out PATH]`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2331,6 +2335,22 @@ def test_a_finding_carries_its_evidence_chain(report_env_with_findings):
     assert "Evidence" in out
 
 
+def test_derived_insertion_points_are_reported_as_not_probed(report_env_with_blobs):
+    """Pre-flight ruling F1. S4 says body and parameter insertion points are
+    derived and recorded so the coverage section can say `exists, not probed`.
+    Without this the derivation has no consumer in this plan at all."""
+    out = report.render(**report_env_with_blobs)
+    assert "Insertion points" in out
+    assert "None were probed" in out
+
+
+def test_insertion_points_are_omitted_when_no_blob_store_is_given(report_env):
+    """The separating case: `blobs=None` is how a caller says it cannot read
+    request bodies, and a section built from nothing would claim zero
+    insertion points rather than admitting it did not look."""
+    assert "Insertion points" not in report.render(**report_env)
+
+
 def test_an_engagement_with_no_check_runs_says_it_was_never_scanned(report_env):
     """A report with an empty coverage section is exactly the report S12 calls
     worse than none. It renders, and it says why it is empty."""
@@ -2366,12 +2386,13 @@ so `records.redact_url` runs over everything rendered.
 """
 from __future__ import annotations
 
+from hx import insertion as insertion_mod
 from hx.store import records
 
 _ORDER = ("Critical", "High", "Medium", "Low", "Info")
 
 
-def render(conn, *, engagement_id, config) -> str:
+def render(conn, *, engagement_id, config, blobs=None) -> str:
     out: list[str] = []
     eng = conn.execute(
         "SELECT id, name, client, created_us FROM engagement WHERE id=?",
@@ -2389,6 +2410,8 @@ def render(conn, *, engagement_id, config) -> str:
 
     out.extend(_findings(conn, engagement_id))
     out.extend(_coverage(conn, engagement_id))
+    if blobs is not None:
+        out.extend(_insertion_coverage(conn, engagement_id, blobs))
     out.extend(_limits(conn, engagement_id, config))
     return "\n".join(out) + "\n"
 
@@ -2462,6 +2485,44 @@ def _coverage(conn, engagement_id) -> list[str]:
     return out
 
 
+def _insertion_coverage(conn, engagement_id, blobs) -> list[str]:
+    """Insertion points derived from what was captured, and not probed.
+
+    S4 of the design doc says why this exists: body and parameter insertion
+    points are DERIVED AND RECORDED even though this build probes none of
+    them, so the coverage section can say `this parameter exists and was not
+    probed` rather than leaving the reader to assume it was covered.
+
+    DERIVED AT RENDER TIME, not stored -- S5 is explicit that there is no
+    insertion table in v1, and a derivation is a derivation whenever it runs.
+    """
+    rows = conn.execute(
+        "SELECT s.path_template, s.method, x.req_blob FROM surface s"
+        " LEFT JOIN exchange x ON x.id = s.exemplar_exchange_id"
+        " WHERE s.engagement_id=? ORDER BY s.path_template",
+        (engagement_id,)).fetchall()
+    counted: dict[str, int] = {}
+    for _template, _method, req_blob in rows:
+        if not req_blob:
+            continue
+        try:
+            raw = blobs.get(req_blob)
+        except Exception:
+            continue
+        for point in insertion_mod.derive(raw, _template):
+            counted[point.kind] = counted.get(point.kind, 0) + 1
+    if not counted:
+        return []
+    out = ["### Insertion points\n",
+           "Places a payload could go, derived from the traffic captured. "
+           "**None were probed** — this build ships no active checks.\n",
+           "| Kind | Found |", "|---|---|"]
+    for kind, n in sorted(counted.items()):
+        out.append(f"| `{kind}` | {n} |")
+    out.append("")
+    return out
+
+
 def _limits(conn, engagement_id, config) -> list[str]:
     out = ["## Limits\n",
            "What this assessment did not cover, stated rather than implied.\n"]
@@ -2502,7 +2563,7 @@ def report(root, out) -> None:
     eng = engagement.open_(path)
     try:
         text = report_mod.render(eng.db, engagement_id=eng.id,
-                                 config=eng.config)
+                                 config=eng.config, blobs=eng.blobs)
         target = out or (eng.root / "exports" / f"{eng.config.name}.md")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
