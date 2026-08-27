@@ -1,3 +1,4 @@
+import os
 import shutil
 from pathlib import Path
 
@@ -888,11 +889,25 @@ def test_report_out_creates_new_directories_at_0o700_not_the_umask(engagement_wi
     ambient umask (`755` under `022`, measured in the review) -- including
     when the path was inside the engagement root, which §3 governs
     unconditionally. `secure_mkdir` must leave every directory it creates at
-    `0o700`, never looser, with no window."""
-    target = tmp_path / "handoff" / "client" / "acme.md"
-    result = CliRunner().invoke(cli.main, [
-        "report", "--root", str(engagement_with_surface), "--out", str(target),
-    ])
+    `0o700`, never looser, with no window.
+
+    R3 (fix round 2): the umask is set explicitly here, LOOSE (`022`), and
+    restored after. Without this the test's separating power depended on
+    whatever umask the developer's or CI's shell happened to have: under a
+    restrictive ambient umask (`077`), the OLD buggy `mkdir(parents=True)`
+    creates directories at `0o777 & ~0o077 == 0o700` too -- the same result
+    the fix produces -- so the mutation this test exists to catch would pass
+    vacuously there. A guard whose discriminating power depends on the
+    environment it happens to run in is one that will quietly stop testing.
+    """
+    old_umask = os.umask(0o022)
+    try:
+        target = tmp_path / "handoff" / "client" / "acme.md"
+        result = CliRunner().invoke(cli.main, [
+            "report", "--root", str(engagement_with_surface), "--out", str(target),
+        ])
+    finally:
+        os.umask(old_umask)
     assert result.exit_code == 0, result.output
     assert target.exists()
     assert oct(target.stat().st_mode & 0o777) == "0o600"

@@ -359,12 +359,61 @@ def report_env_with_reconfirmed_finding():
     conn.close()
 
 
+@pytest.fixture
+def report_env_fixed_then_a_skipped_run():
+    """R2 (fix round 2): run 1 finds it, run 2 retests clean (fixed), run 3
+    is LATER (`started_us=3`) but its check was skipped for this surface --
+    no `finding_observation` row for run 3 at all, the same shape a real
+    `skipped`/`error`/never-in-this-run's-checks run leaves. `_latest_observed`
+    must still answer off run 2 (correctly: `False`), but the marker text
+    must not claim "the most recent run" -- run 3 IS the most recent run of
+    the engagement, and it never tested this finding. The old wording was
+    literally false of this exact scenario."""
+    conn = _conn()
+    _run(conn, "r-1", started_us=1)
+    _run(conn, "r-2", started_us=2)
+    _run(conn, "r-3", started_us=3)
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/old-endpoint")
+    fid = _finding(conn, run_id="r-1", title="XSS since patched, then skipped",
+                  severity="High", exchange_ids=["x-1"])
+    records.record_observation(conn, finding_id=fid, run_id="r-1",
+                               observed=True, exchange_id="x-1",
+                               severity_at="High", confidence_at="Firm",
+                               at_us=1)
+    records.record_observation(conn, finding_id=fid, run_id="r-2",
+                               observed=False, exchange_id=None,
+                               severity_at="High", confidence_at="Firm",
+                               at_us=2)
+    # No finding_observation row for r-3 -- the check never tested this
+    # surface that run, even though r-3 is chronologically the latest run.
+    yield {"conn": conn, "engagement_id": "e-1", "config": _config(),
+          "blobs": None}
+    conn.close()
+
+
 # --- Step 1's tests, verbatim (bar F3's tautology and F4's qualifier) -------
 
 def test_the_report_names_the_scope_and_its_hash(report_env):
     out = report.render(**report_env)
     assert "Scope" in out
     assert report_env["config"].scope_include[0] in out
+
+
+def test_a_credential_pasted_into_a_scope_pattern_is_redacted(report_env):
+    """R1 (fix round 2): F1's own fix missed the Scope section -- an
+    operator-authored `scope.include`/`scope.exclude` pattern reached the
+    export raw, the one place left where a credential survived. `_redact`
+    now wraps every pattern; `test_the_report_names_the_scope_and_its_hash`
+    above is the separating case for the ordinary pattern (no credential in
+    it, `_redact` is identity)."""
+    env = dict(report_env)
+    env["config"] = _config(
+        scope_include=["https://admin:hunter2@app.acme.test/*"],
+        scope_exclude=["https://svc:s3cr3t@internal.acme.test/*"])
+    out = report.render(**env)
+    assert "hunter2" not in out
+    assert "s3cr3t" not in out
+    assert "app.acme.test" in out
 
 
 def test_findings_are_grouped_by_severity_highest_first(report_env_with_findings):
@@ -613,6 +662,20 @@ def test_a_finding_never_retested_carries_no_fixed_marker(report_env_with_findin
     fixed either."""
     out = report.render(**report_env_with_findings)
     assert "appears fixed" not in out.lower()
+
+
+def test_the_fixed_marker_names_the_mechanism_not_the_latest_run(report_env_fixed_then_a_skipped_run):
+    """R2 (fix round 2): run 3 is chronologically the most recent run of the
+    engagement, and it never tested this finding's surface (no
+    `finding_observation` row for it) -- the datum the marker is built from
+    still correctly comes from run 2 (fixed), but the OLD wording ("not
+    observed in the most recent run") was false of this exact case: run 3
+    IS the most recent run, and it never observed anything about this
+    finding at all. The marker must still fire (the finding really is fixed
+    as of the last run that tested it) but must not use the false phrase."""
+    out = report.render(**report_env_fixed_then_a_skipped_run)
+    assert "appears fixed" in out.lower()
+    assert "not observed in the most recent run" not in out.lower()
 
 
 # --- F11: an enabled-but-unshipped check class is named in Coverage --------

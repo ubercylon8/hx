@@ -20,11 +20,17 @@ table's `reason` cell all reached the export raw. `reason` is not a marginal
 vector: `hx.scan` builds it as `f"{type(exc).__name__}: {exc}"`
 (`scan.py:163`), an exception message that can quote a response body or a
 request target, so it is attacker-influenced by construction. Every field
-below that is free text -- title, description, impact, remediation, an
-evidence URL, a coverage reason -- is routed through `_redact` before it
-reaches `out`. `check_id`, severity, confidence, verdict, status and cwe are
-controlled vocabularies fixed by the schema's own CHECK constraints; they
-never carry a URL and are not passed through it.
+below that can carry a URL -- title, description, impact, remediation, an
+evidence URL, a coverage reason, AND (fix round 2, R1) every `scope.include`/
+`scope.exclude` PATTERN in the Scope section -- is routed through `_redact`
+before it reaches `out`. The Scope section was the one place F1's own fix
+missed: an operator can paste a credential straight into a scope pattern
+(`https://user:pass@app.test/*`), and until R1 that string reached the
+export verbatim, unredacted, because it is operator-authored rather than
+something a check or the scan wrote -- but S12 draws no such exception, and
+neither does `_redact`. `check_id`, severity, confidence, verdict, status
+and cwe are controlled vocabularies fixed by the schema's own CHECK
+constraints; they never carry a URL and are not passed through it.
 
 `_redact` (and the `records.redact_url` it wraps) only removes the userinfo
 and credential-parameter VALUES of the FIRST authority/query it finds in a
@@ -99,9 +105,9 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
 
     out.append("## Scope\n")
     for pattern in config.scope_include:
-        out.append(f"- `{pattern}`")
+        out.append(f"- `{_redact(pattern)}`")
     for pattern in config.scope_exclude:
-        out.append(f"- excluded: `{pattern}`")
+        out.append(f"- excluded: `{_redact(pattern)}`")
     out.append("")
 
     # ONE SOURCE OF TRUTH FOR "HAS THIS ENGAGEMENT EVER BEEN SCANNED",
@@ -149,6 +155,17 @@ def _latest_observed(conn, finding_id) -> bool | None:
     `finding.last_seen_run` tracks a run id and not a raw timestamp), and it
     is stable under a write retried inside one run in a way a write-time
     timestamp is not.
+
+    R2 (fix round 2): this is the most recent run WHOSE OWNING CHECK ACTUALLY
+    TESTED the finding's surface -- a run that skipped the check, errored on
+    it, or never scanned this surface at all writes no `finding_observation`
+    row and is invisible to this query, correctly. The caller-facing marker
+    used to say "the most recent run", which is a different and sometimes
+    FALSE claim: a finding fixed in run 2, with run 3 skipping its check
+    entirely, is still reported here off run 2 -- correct -- but "the most
+    recent run" read as if it meant run 3, which never tested it. The
+    wording at the call site was corrected to say what this function
+    actually computes.
     """
     row = conn.execute(
         "SELECT fo.observed FROM finding_observation fo"
@@ -200,8 +217,9 @@ def _findings(conn, engagement_id, *, scanned) -> list[str]:
             marker = ""
             observed = _latest_observed(conn, fid)
             if observed is False:
-                marker = (" · **not observed in the most recent run — "
-                          "appears fixed; verify before closing**")
+                marker = (" · **not observed the last time its check "
+                          "tested this surface — appears fixed; verify "
+                          "before closing**")
             out.append(f"*Confidence: {confidence}*"
                        + (f" · *{cwe}*" if cwe else "")
                        + (f" · *status: {status}*" if status != "new" else "")
