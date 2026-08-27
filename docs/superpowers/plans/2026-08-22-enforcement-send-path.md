@@ -17706,6 +17706,8 @@ public class ChokepointTest {
           ChokepointTest::theAdapterBuildsItsRequestInsideTheTry);
         t("theSecondEnforcementPointIsRegisteredAndAsksTheGate",
           ChokepointTest::theSecondEnforcementPointIsRegisteredAndAsksTheGate);
+        t("theSecondCallbackObservesAndCannotRefuse",
+          ChokepointTest::theSecondCallbackObservesAndCannotRefuse);
         t("theRefusalIsHeldBeforeItIsRecorded",
           ChokepointTest::theRefusalIsHeldBeforeItIsRecorded);
         t("theClockAndTheAttributionAreWrittenDownAndTakenBack",
@@ -18012,7 +18014,8 @@ public class ChokepointTest {
      * This check counted ONE read in the whole of extension/src until Task 7,
      * and one was right while the send arm was the only thing deciding.
      * Wiring the second enforcement point makes it THREE: the send arm, the
-     * proxy request handler, and the re-decision before the bytes leave.
+     * proxy request handler, and the scope observation before the bytes
+     * leave.
      *
      * THE NUMBER IS NOT WHAT MATTERS AND WIDENING IT TO 3 WOULD PIN NOTHING.
      * `configEpoch()` and `scopeConfig()` are two reads of one record and can
@@ -18032,21 +18035,32 @@ public class ChokepointTest {
      *     in the other;
      *   - and nothing else in extension/src reads it at all.
      *
-     * DERIVED FROM THE CALLBACK DECLARATIONS, not from the questions, and that
-     * changed in fix round 1. It used to count `gate.decide(` +
-     * `decideScopeOnly(` -- one question per callback, which was true until
-     * the second callback gained a SECOND question (`decideBeforeGate` for the
-     * crawler, `decideScopeOnly` for the operator -- two branches of one
-     * decision, taken under one snapshot). Counting questions would then read
-     * three decisions against two reads and go red on correct code. The
-     * callbacks are the right unit: a callback decides once, whatever it asks.
+     * DERIVED FROM THE QUESTIONS -- `gate.decide(` + `decideScopeOnly(` -- and
+     * that is a restoration. Fix round 1 moved it to counting CALLBACK
+     * DECLARATIONS, because the second callback had gained a SECOND question
+     * (`decideBeforeGate` for the crawler, `decideScopeOnly` for the operator)
+     * and counting questions would have read three against two reads and gone
+     * red on correct code. Task 9 measured that the second callback cannot
+     * refuse anything -- `ProxyRequestToBeSentAction.drop()` does not prevent
+     * egress on Burp 2026.7.3 -- so it no longer branches by source and no
+     * longer decides: it asks ONE question, `decideScopeOnly`, and logs.
      *
-     * THE WITNESS FOR THE WIDENING, in the shape
-     * `test_vocabularies_match_the_schema.py` uses for its own: the equality
-     * is vacuous if both sides are zero -- a file with no reads and no
-     * callbacks satisfies it -- so the callback count is asserted to be 2
-     * outright. Deleting either callback is then red here as well as in the
-     * registration counts.
+     * Questions are the stronger unit whenever it is available, and this is
+     * why it is taken back: a callback that grows a SECOND question without a
+     * second snapshot read is exactly the two-halves-of-two-authorisations bug
+     * this method exists for, and a count of DECLARATIONS cannot see it.
+     *
+     * The two questions are not the same kind of thing and the equality does
+     * not claim they are: `gate.decide(` DECIDES and `decideScopeOnly(`
+     * OBSERVES. What both need, and what is counted, is that each was answered
+     * under an authorisation fetched for THIS request -- an observation
+     * assembled from two halves of two authorisations is a log line an
+     * operator acts on at 02:00 and it must not be a guess either.
+     *
+     * THE WITNESS FOR THE EQUALITY, in the shape
+     * `test_vocabularies_match_the_schema.py` uses for its own: it is vacuous
+     * if both sides are zero -- a file with no reads and no questions
+     * satisfies it -- so the question count is asserted to be 2 outright.
      *
      * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
      * `this.authorisation()` cannot supply one. BridgeClient's send arm writes
@@ -18070,42 +18084,40 @@ public class ChokepointTest {
         String entry = code(Path.of(ENTRY_POINT));
         int inBridge = calls(bridge, ".authorisation()", "::authorisation");
         int inEntry = calls(entry, ".authorisation()", "::authorisation");
-        // The two callbacks a request is decided about in, by their
-        // declarations. A response handler decides nothing and must read
-        // nothing, which is what the totals below enforce.
-        int callbacks = count(entry, "handleRequestReceived(InterceptedRequest r)")
-                      + count(entry, "handleRequestToBeSent(InterceptedRequest r)");
+        // The two questions the entry point asks of a request: the gate call
+        // that DECIDES, and the pre-send scope call that only OBSERVES. A
+        // response handler asks neither and must read nothing, which is what
+        // the totals below enforce.
+        int questions = calls(entry, "gate.decide(", "gate::decide")
+                      + calls(entry, "decideScopeOnly(", "::decideScopeOnly");
 
         check("the send arm reads the Authorisation snapshot once (" + inBridge + ")",
               inBridge == 1);
-        check("the entry point has two deciding callbacks -- the proxy request "
-              + "handler and the pre-send re-decision (" + callbacks + ")",
-              callbacks == 2);
-        check("and reads the snapshot exactly once per deciding callback ("
-              + inEntry + " reads, " + callbacks + " callbacks)",
-              inEntry == callbacks);
+        check("the entry point asks two questions -- the proxy gate and the "
+              + "pre-send scope observation (" + questions + ")",
+              questions == 2);
+        check("and reads the snapshot exactly once per question ("
+              + inEntry + " reads, " + questions + " questions)",
+              inEntry == questions);
         check("nothing else in extension/src reads it at all " + elsewhere,
               elsewhere.isEmpty());
-        check("so the whole extension reads it " + (1 + callbacks) + " times, "
-              + "once per decision (" + total + ")", total == 1 + callbacks);
+        check("so the whole extension reads it " + (1 + questions) + " times, "
+              + "once per question (" + total + ")", total == 1 + questions);
 
         // Each read AHEAD of the question it feeds. Without this, two reads in
         // one callback and none in the other satisfies the equality above --
-        // and "none in the other" is a decision taken under an authorisation
-        // fetched for a different request. The second callback asks one of two
-        // questions and both are spelled `policy.decide...`, so the common
-        // prefix is what is looked for; nothing before it in this file spells
-        // that (the first callback asks `gate.decide(`).
+        // and "none in the other" is an answer taken under an authorisation
+        // fetched for a different request.
         int read1 = entry.indexOf(".authorisation()");
         int gate = entry.indexOf("gate.decide(");
         int read2 = entry.indexOf(".authorisation()", read1 + 1);
-        int reDecision = entry.indexOf("policy.decide", read2);
+        int observation = entry.indexOf("policy.decideScopeOnly(", read2);
         check("the request handler reads before it asks the gate (" + read1
               + " < " + gate + ")", read1 >= 0 && read1 < gate);
-        check("and the re-decision reads its own, after that gate call and "
-              + "before its own question (" + gate + " < " + read2 + " < "
-              + reDecision + ")",
-              read2 > gate && reDecision > read2);
+        check("and the pre-send observation reads its own, after that gate "
+              + "call and before its own question (" + gate + " < " + read2
+              + " < " + observation + ")",
+              read2 > gate && observation > read2);
     }
 
     /**
@@ -18263,30 +18275,33 @@ public class ChokepointTest {
      * behavioural test green, because every one of them drives the path that
      * does call both.
      *
-     * THIS USED TO BE `before == 1 && gate == 1 && before == gate`, WHOLE-TREE,
-     * and fix round 1 made that false rather than wrong. The proxy path's
-     * second callback re-decides an INTERCEPT-EDITED request: S4 says the
-     * method allowlist and the dangerous-path denylist apply to crawler
-     * traffic in full, and an edit after the first callback's decision is a
-     * request nobody checked. So it asks `decideBeforeGate` -- and it must NOT
-     * ask the Gate, because the Gate was already spent for this request at the
-     * first callback, and asking again charges a crawler twice for one
-     * request.
+     * THE WHOLE-TREE PAIR `before == 1 && gate == 1 && before == gate` IS
+     * BACK, and its round trip is worth recording. Task 7's fix round 1 gave
+     * the proxy path's second callback a re-DECISION that asked
+     * `decideBeforeGate`, which made the whole-tree count 2 and forced this
+     * check into a per-file form. Task 9 measured that
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3, so that callback cannot refuse anything and no longer tries:
+     * it asks `decideScopeOnly` and LOGS. `decideBeforeGate` therefore has one
+     * caller again -- the issuing path -- and the original assertion is the
+     * true one.
      *
-     * Bumping the constant to 2 would have said nothing about that. What the
-     * check says instead, DERIVED per file rather than restated as a total:
+     * What the check says, DERIVED per file rather than restated as a total:
      *
      *   - the ISSUING path (Sender) asks both halves, the same number of
      *     times, and that number is one. This is the original pair assertion,
      *     narrowed to the file where the interleaving actually lives -- so a
      *     deleted `.checkGate(` there is still red;
-     *   - the entry point asks the free half and NEVER the paid one. A
-     *     must-be-zero, which is the strongest shape this class has, and it is
-     *     the thing that would go wrong: `policy.decide(` or `.checkGate(` at
-     *     the second callback is a double charge no behavioural test can see;
-     *   - NO OTHER FILE asks either half. A third caller of `decideBeforeGate`
-     *     is a path that might issue on a half-decision, and it has to be
-     *     looked at by a human rather than absorbed into a total.
+     *   - NO OTHER FILE IN THE TREE ASKS EITHER HALF, the entry point
+     *     included. A must-be-zero, which is the strongest shape this class
+     *     has. A third caller of `decideBeforeGate` is a path that might issue
+     *     on a half-decision, and it has to be looked at by a human rather
+     *     than absorbed into a total;
+     *   - and the entry point does not reach the Gate through the FRONT DOOR
+     *     either. Kept from fix round 1 and it is not about the deleted
+     *     decision: `policy.decide(` runs both halves inside Policy without
+     *     ever spelling `.checkGate(` here, which is the shape a double charge
+     *     would actually be written in, and the sweep above cannot see it.
      *
      * WIRE-EXISTS needles, so they read {@link #code}: a commented-out
      * `.checkGate(` beside a live `.decideBeforeGate(` would otherwise keep
@@ -18302,8 +18317,6 @@ public class ChokepointTest {
         String entry = code(Path.of(ENTRY_POINT));
         int senderBefore = calls(sender, ".decideBeforeGate(", "::decideBeforeGate");
         int senderGate = calls(sender, ".checkGate(", "::checkGate");
-        int entryBefore = calls(entry, ".decideBeforeGate(", "::decideBeforeGate");
-        int entryGate = calls(entry, ".checkGate(", "::checkGate");
 
         check("the issuing path asks the boundary half exactly once ("
               + senderBefore + ")", senderBefore == 1);
@@ -18314,15 +18327,6 @@ public class ChokepointTest {
         check("so the issuing path never takes one without the other",
               senderBefore == senderGate);
 
-        check("the proxy path re-decides with the free half (" + entryBefore + ")",
-              entryBefore == 1);
-        // THE ONE THAT WOULD GO WRONG. The Gate was spent for this request at
-        // the first callback; spending it again charges a crawler twice for
-        // one request, shortening the run for no evidence, and every
-        // behavioural test stays green because each half of it is internally
-        // consistent.
-        check("and NEVER the paid one -- the Gate is not spent twice for one "
-              + "request (" + entryGate + ")", entryGate == 0);
         // ...and not through the front door either. `policy.decide(` runs both
         // halves INSIDE Policy, so it reaches the Gate without ever spelling
         // `.checkGate(` here -- which is the shape a double charge would
@@ -18335,9 +18339,13 @@ public class ChokepointTest {
         check("and not through policy.decide(), which reaches the Gate without "
               + "naming it (" + entryFull + ")", entryFull == 0);
 
+        // THE ENTRY POINT IS NO LONGER EXCLUDED. It was, while its second
+        // callback asked `decideBeforeGate`; that call is gone, so the entry
+        // point is swept like every other file and a re-added one is red here
+        // rather than needing a count of its own.
         List<String> elsewhere = new ArrayList<>();
         for (Path p : sources) {
-            if (p.toString().equals(SENDER) || p.toString().equals(ENTRY_POINT)) continue;
+            if (p.toString().equals(SENDER)) continue;
             String c = code(p);
             // BOTH FORMS on BOTH halves. The round-4 report claimed every
             // must-be-zero method needle counted both; this arm did not, so a
@@ -18348,8 +18356,8 @@ public class ChokepointTest {
                   + calls(c, ".checkGate(", "::checkGate");
             if (n > 0) elsewhere.add(p + " x" + n);
         }
-        check("and no other file in extension/src asks either half " + elsewhere,
-              elsewhere.isEmpty());
+        check("and no other file in extension/src asks either half -- the "
+              + "entry point included " + elsewhere, elsewhere.isEmpty());
     }
 
     /**
@@ -18665,35 +18673,35 @@ public class ChokepointTest {
      * behind it: the proxy is Burp's own socket, so a request the handler
      * passes through has crossed no rule of ours at all.
      *
-     * The FOURTH count is the one that is easiest to argue away. Montoya's
-     * ProxyRequestHandler has two callbacks, and Burp's INTERCEPT TAB sits
-     * between them: an operator can rewrite the request there, host included.
-     * A gate at the first callback only therefore lets an EDITED request leave
-     * with no decision about it, which is the one hole in this system where
-     * bytes could cross the engagement boundary. `decideScopeOnly(` and not
-     * `decide(` is deliberate and is counted as itself: the full question
-     * spends a rate token and a budget slot, so asking it twice would charge a
-     * crawler twice for one request -- and
-     * {@link #bothHalvesOfTheDecisionAreAskedAndOnlyOnce} could not see that,
-     * because it counts Policy's internal halves on the send path.
+     * THERE WAS A FOURTH COUNT AND IT IS GONE. It read "scope is re-decided
+     * before the request is sent (`decideScopeOnly(` == 1)", and it pinned a
+     * DECISION that Task 9 measured cannot exist: a refusal at the second
+     * callback does not stop the request, because
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3. A check that pins a decision nothing can act on is a check
+     * that certifies a hole as closed. The question is still asked and is now
+     * an OBSERVATION -- see
+     * {@link #theSecondCallbackObservesAndCannotRefuse}, which pins what is
+     * actually true of it, including the must-be-zero that stops the refusal
+     * being re-added.
      *
-     * WIRE-EXISTS needles, all four, so they read {@link #code}: prose cannot
+     * WIRE-EXISTS needles, all three, so they read {@link #code}: prose cannot
      * register a handler or ask a question. Taken in {@link #ENTRY_POINT},
      * which is the only file allowed to name burp.* at all -- see
      * {@link #montoyaIsConfinedToTheEntryPoint}, which is what makes that
      * narrowing safe rather than convenient.
      *
-     * WHAT THESE DO NOT SEE: whether the handler HONOURS the verdict. MEASURED
-     * by a reviewer, on the committed tree: `if (!verdict.allow() && false)`
-     * forwards every refused request to the target and reads 12 summary lines
-     * / 0 FAIL / rc=0. `gate.decide(` is still called once, the offer is still
-     * textually after it, and every count here is satisfied. Only Task 9
-     * driving real Burp can catch it, and the CONDITION IT MUST MEET is
-     * written where its implementer will read it -- in HxExtension's
-     * assumption block, item 2: assert a refused request reaches the target
-     * ZERO times, measured AT THE TARGET, never by reading the client's
-     * response, because `drop()` answers the client 200 OK with ~1529 bytes of
-     * Burp's own HTML and is indistinguishable from a delivery by status code.
+     * WHAT THESE DO NOT SEE: whether the handler HONOURS the verdict.
+     * `if (!verdict.allow() && false)` forwards every refused request to the
+     * target and reads 13 ALL PASS / 2198 ok / 0 FAIL / rc=0 -- re-measured on
+     * this tree. `gate.decide(` is still called once, the offer is still
+     * textually after it, and every count here is satisfied. Task 9 closed it
+     * from outside: `tests/integration/test_proxy_capture.py` asserts a
+     * refused request reaches the OUT-OF-SCOPE TARGET zero times, measured at
+     * the target's own log and never by reading the client's response --
+     * `drop()` answers the client 200 OK with 1529 bytes of Burp's own HTML
+     * and is indistinguishable from a delivery by status code. That mutation
+     * turns three integration tests red and no check here.
      *
      * The two position checks below cover the orderings; this one covers
      * existence.
@@ -18704,12 +18712,72 @@ public class ChokepointTest {
         int n1 = calls(entry, "registerRequestHandler(", "::registerRequestHandler");
         int n2 = calls(entry, "registerResponseHandler(", "::registerResponseHandler");
         int n3 = calls(entry, "gate.decide(", "gate::decide");
-        int n4 = calls(entry, "decideScopeOnly(", "::decideScopeOnly");
         check("registerRequestHandler appears exactly once (" + n1 + ")", n1 == 1);
         check("registerResponseHandler appears exactly once (" + n2 + ")", n2 == 1);
         check("the proxy handler asks the gate (" + n3 + ")", n3 == 1);
-        check("scope is re-decided before the request is sent (" + n4 + ")",
-              n4 == 1);
+    }
+
+    /**
+     * THE SECOND CALLBACK OBSERVES, LOGS, AND CANNOT REFUSE.
+     *
+     * MEASURED, Task 9, with the probe dropping at the second callback:
+     *
+     *     TBSDROP id=0 path=/tbs/secret          <- drop() WAS returned
+     *     Hit(method='GET', path='/tbs/secret')  <- the target received it
+     *     client saw /tbs/secret: status=404     <- the TARGET's answer
+     *
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * Suite Community 2026.7.3, while `ProxyRequestReceivedAction.drop()`
+     * does -- zero hits, Burp's own 1529-byte page. The two are not
+     * interchangeable. docs/burp-proxy-measurements.md, Q4, has both side by
+     * side.
+     *
+     * THE MUST-BE-ZERO IS THE POINT OF THIS METHOD. `drop()` there is not
+     * merely useless: while it was in place the refusal branch wrote a
+     * `denial` row and took the `pending` entry for a request that reached the
+     * target, so hx recorded a refusal that did not happen and lost the
+     * exchange that did. That is fabricated evidence in the dangerous
+     * direction, and the natural instinct of the next reader who finds a
+     * pass-through where a scope check used to be is to put the drop back. A
+     * zero is what stops that, and it reads as a rule rather than as an
+     * omission.
+     *
+     * THE OTHER TWO ARE THE CONVERSE: the observation must still HAPPEN and
+     * must still be SAID. A must-be-zero on its own is satisfied by deleting
+     * the whole callback body, which would lose the one signal an operator
+     * gets at the moment the boundary is crossed. So the question is counted,
+     * and the log is POSITIONED between the question and the pass-through --
+     * a count of `logToError(` would not do, because the entry point logs
+     * elsewhere (the idle-extension refusal, the failed connect) and a needle
+     * that matched those would be green with this callback silent.
+     *
+     * WIRE-EXISTS needles, so they read {@link #code}.
+     */
+    static void theSecondCallbackObservesAndCannotRefuse() throws IOException {
+        String entry = code(Path.of(ENTRY_POINT));
+        int late = calls(entry, "ProxyRequestToBeSentAction.drop(",
+                                "ProxyRequestToBeSentAction::drop");
+        int early = calls(entry, "ProxyRequestReceivedAction.drop(",
+                                 "ProxyRequestReceivedAction::drop");
+        int asked = calls(entry, "policy.decideScopeOnly(", "policy::decideScopeOnly");
+        check("the pre-send callback NEVER drops -- that action does not "
+              + "prevent egress on this Burp (" + late + ")", late == 0);
+        check("while the request-received callback still does, which is the "
+              + "one that works (" + early + ")", early == 1);
+        check("and the pre-send scope question is still asked (" + asked + ")",
+              asked == 1);
+
+        // The log sits BETWEEN the question and the pass-through, so a
+        // callback that asks and says nothing is red. Positions rather than a
+        // count: this file logs elsewhere too.
+        int ask = entry.indexOf("policy.decideScopeOnly(");
+        int log = entry.indexOf("logToError", ask);
+        int through = entry.indexOf(
+                "return ProxyRequestToBeSentAction.continueWith(r);");
+        check("the answer is logged after it is asked (" + ask + " < " + log
+              + ")", ask >= 0 && log > ask);
+        check("and before the request goes through anyway (" + log + " < "
+              + through + ")", through > log);
     }
 
     /**
@@ -18730,10 +18798,18 @@ public class ChokepointTest {
      * flow's rather than the callee's -- {@link hx.proxy.Capture}'s promise is
      * still worth keeping, and nothing depends on it any more.
      *
-     * Counted, not positioned per callback, because there are exactly two of
-     * these and a count of two is what a deleted one turns into. The response
-     * handler is not counted here: it already wrapped its offer, and its
-     * action carries no enforcement -- it forwards either way.
+     * ONE refusing callback, not two. It was two until Task 9 measured that
+     * `ProxyRequestToBeSentAction.drop()` does not prevent egress on Burp
+     * 2026.7.3: the second callback's refusal enforced nothing and wrote a
+     * `denial` row for a request that reached the target, so it is gone and
+     * that callback now observes and logs. The response handler is not counted
+     * here either -- it already wrapped its offer, and its action carries no
+     * enforcement, it forwards either way.
+     *
+     * A COUNT OF ONE IS WEAKER THAN A COUNT OF TWO AGAINST A DELETION, and the
+     * position checks below are what carry it: `bind` before `offer` before
+     * `ret` are three indexOf's that all go to -1 or invert if the binding is
+     * removed or the offer is moved ahead of it.
      */
     static void theRefusalIsHeldBeforeItIsRecorded() throws IOException {
         String entry = code(Path.of(ENTRY_POINT));
@@ -18742,10 +18818,10 @@ public class ChokepointTest {
         int bind = entry.indexOf("Action refuse =");
         int offer = entry.indexOf("capture.offer(");
         int ret = entry.indexOf("return refuse;");
-        check("both refusing callbacks bind their action first (" + bound + ")",
-              bound == 2);
-        check("and return that local rather than a fresh call (" + returned + ")",
-              returned == 2);
+        check("the one refusing callback binds its action first (" + bound + ")",
+              bound == 1);
+        check("and returns that local rather than a fresh call (" + returned + ")",
+              returned == 1);
         check("the action is decided before anything is recorded (" + bind
               + " < " + offer + ")", bind >= 0 && offer >= 0 && bind < offer);
         check("and returned after (" + ret + " > " + offer + ")",
@@ -18765,10 +18841,16 @@ public class ChokepointTest {
      * harness is fine, this run just saw little traffic". A total outage that
      * reads as poor coverage is the worst shape a defect can have here.
      *
-     * TWO takes, not one, and both are needed: the response handler takes the
-     * entry to build the record, and the second request callback takes it when
-     * it refuses, because that request will never be answered and the map's
-     * bound should be spent on requests actually in flight.
+     * ONE take, and it used to be two. The second was in the second request
+     * callback's refusal branch, on the reasoning that "this request is not
+     * going to the target, so no response can arrive for it" -- a sentence
+     * Task 9 measured FALSE, because `ProxyRequestToBeSentAction.drop()` does
+     * not prevent egress on Burp 2026.7.3. Taking the entry there DISCARDED
+     * THE CLOCK AND THE SOURCE of a request that was about to be answered, so
+     * the response handler then missed, counted `countLost` and recorded
+     * nothing. The refusal is gone and so is the take: the response handler is
+     * the only place an entry is taken back, which is the only place one is
+     * ever answered.
      *
      * WIRE-EXISTS needles, so they read {@link #code}.
      *
@@ -18796,8 +18878,9 @@ public class ChokepointTest {
         int take = calls(entry, "pending.take(", "pending::take");
         check("the request handler writes the clock and the source down ("
               + put + ")", put == 1);
-        check("and both the response handler and the refusing re-decision take "
-              + "them back (" + take + ")", take == 2);
+        check("and the response handler -- the only caller that has an answer "
+              + "to pair them with -- takes them back (" + take + ")",
+              take == 1);
 
         // AND THE PUT IS UNCONDITIONAL. The measured mutation is not a
         // deletion -- it is `if (source == null) pending.put(...)`, which
@@ -19931,9 +20014,10 @@ public class HxExtension implements BurpExtension {
         // Nothing in this block can be DRIVEN without Burp -- the handlers
         // take Montoya types that only Burp constructs -- so ChokepointTest
         // counts and positions it instead: the registrations, the gate call
-        // inside the handler, the scope re-check before the bytes leave, and
-        // the two ORDERINGS this join exists to protect (enforcement before
-        // recording, redaction before queueing). The ONE piece of it that is
+        // inside the handler, the pre-send scope OBSERVATION (which decides
+        // nothing -- see the second callback), and the two ORDERINGS this join
+        // exists to protect (enforcement before recording, redaction before
+        // queueing). The ONE piece of it that is
         // ordinary code is `listenerPort` below, which takes a String; it is
         // public and ProxyGateTest drives it.
         //
@@ -19950,20 +20034,30 @@ public class HxExtension implements BurpExtension {
         //     traverse them, every send would be decided twice and, worse,
         //     attributed by a listener port it does not have: UNATTRIBUTED,
         //     refused, and the send path dead. Unmeasured.
-        //  2. THAT THE HANDLER'S VERDICT IS HONOURED. Nothing in the suite
-        //     sees this: `if (!verdict.allow() && false)` forwards every
-        //     refused request and reads 12 summary lines / 0 FAIL / rc=0 --
-        //     measured. THE CONDITION TASK 9 MUST MEET, and it is not
-        //     negotiable: assert a refused request reaches the target ZERO
-        //     times, MEASURED AT THE TARGET -- a request log, a connection
-        //     count -- and NEVER by reading the client's response. Task 1
-        //     measured `drop()` returning 200 OK with ~1529 bytes of Burp's
-        //     own HTML, so a drop and a delivery are indistinguishable by
-        //     status code at the client. A test that reads the client side
-        //     passes on a gate that forwards everything.
-        //  3. THAT `drop()` FROM THE SECOND CALLBACK SENDS NOTHING. Task 1
-        //     measured the drop from `handleRequestReceived` only. Montoya
-        //     documents both actions identically; nobody has watched the wire.
+        //  2. SETTLED: THE FIRST CALLBACK'S VERDICT IS HONOURED. Still
+        //     invisible to this suite -- `if (!verdict.allow() && false)`
+        //     forwards every refused request and reads 13 ALL PASS / 2198 ok
+        //     / 0 FAIL / rc=0 -- so the check that holds it is
+        //     tests/integration/test_proxy_capture.py, and it is held the only
+        //     way it can be: the OUT-OF-SCOPE TARGET's own log, never the
+        //     client's response. Task 1 measured `drop()` returning 200 OK
+        //     with 1529 bytes of Burp's own HTML, so a drop and a delivery are
+        //     indistinguishable by status code at the client, and a test that
+        //     reads the client side passes on a gate that forwards
+        //     everything. Under that mutation the integration suite loses
+        //     three tests; it stays green in every Java suite.
+        //  3. SETTLED, AND THE ANSWER WAS NO. This item used to read "THAT
+        //     `drop()` FROM THE SECOND CALLBACK SENDS NOTHING ... Montoya
+        //     documents both actions identically; nobody has watched the
+        //     wire". Task 9 watched it:
+        //     `ProxyRequestToBeSentAction.drop()` DOES NOT PREVENT EGRESS on
+        //     2026.7.3 -- action() reads DROP, the target logs the request,
+        //     and the client gets the TARGET's answer -- while the drop from
+        //     `handleRequestReceived` sends zero bytes. So the second callback
+        //     no longer refuses anything; it observes and logs. Kept as an
+        //     item rather than deleted, because "we assumed X, measured X,
+        //     and X was false" is the only entry in this list that has ever
+        //     changed a design. docs/burp-proxy-measurements.md, Q4.
         //  4. THAT `path()` CARRIES THE QUERY AND `httpService().host()` IS
         //     THE CONNECTION HOST. Montoya's documented contract, unmeasured
         //     here. If either is wrong the request is scope_denied by
@@ -20088,115 +20182,121 @@ public class HxExtension implements BurpExtension {
              * The last point before the bytes leave, and the reason this
              * handler has two halves.
              *
-             * Burp's Intercept tab sits BETWEEN the two callbacks, and an
-             * operator there can rewrite the request -- including its host. A
-             * gate that ran only at the first point would let an EDITED
-             * request leave with no decision about it at all, and S4 is
-             * unambiguous about what that costs: scope is the client's
-             * boundary and the one thing no caller may spend.
+             * AN OBSERVATION POST, NOT AN ENFORCEMENT POINT. It cannot refuse
+             * anything, and this callback used to try. Task 9 measured why it
+             * must not: `ProxyRequestToBeSentAction.drop()` DOES NOT PREVENT
+             * EGRESS on Burp Suite Community 2026.7.3. The probe returned an
+             * action whose own `action()` reads `DROP`, and Burp forwarded the
+             * request anyway -- the target logged it, answered a real 404, and
+             * the client received the TARGET's answer rather than Burp's page.
+             * The drop from `handleRequestReceived` is unaffected: zero hits,
+             * Burp's own 1529-byte HTML. The two actions are not
+             * interchangeable, and Task 1 measured the one that works.
+             * docs/burp-proxy-measurements.md, Q4, has both side by side.
              *
-             * SCOPE AND NOTHING ELSE, for every source. `decideScopeOnly`
-             * spends no rate token and no budget slot, so this re-check is
-             * free; `decide` would charge a crawler twice for one request, and
-             * ChokepointTest's pair counter could not see it because that one
-             * counts Policy's internal halves on the send path.
+             * WHAT THAT COST WHILE THIS CALLBACK STILL REFUSED, and it is
+             * worse than a plain fail-open: the refusal branch wrote a
+             * `denial` row and took the `pending` entry, on the reasoning --
+             * stated in its own comment -- that "this request is not going to
+             * the target, so no response can arrive for it". That sentence is
+             * measured FALSE. So hx recorded a refusal for a request that
+             * reached the client's system, and charged its response to
+             * `countLost`. A report reads that row as "hx blocked this". This
+             * project has twice refused to record a guess as a fact --
+             * `transport_error` has no row because Montoya cannot distinguish
+             * the three cases, and 599 needed its own outcome so an unreadable
+             * status could not read as a real one. Same rule.
              *
-             * TWO HONEST LIMITS. `drop()` from THIS callback is unmeasured --
-             * Task 1 measured the drop from handleRequestReceived only, where
-             * it sends zero bytes to the target and answers the client 200 OK
-             * with Burp's own HTML. The claim here is "Montoya documents both
-             * actions identically", not "we saw zero bytes"; Task 9 measures
-             * it. And this is a second scope DECISION, not a second
-             * enforcement point: S4 counts egress paths, not callbacks, and
-             * both callbacks belong to this one handler.
+             * THE ESCAPE IS ALREADY RECORDED, AND THAT IS THE HONEST RECORD.
+             * A request edited out of scope in the Intercept tab goes out, is
+             * answered, and reaches `handleResponseReceived` like any other --
+             * so it lands as an `exchange` row whose `url` is outside the
+             * engagement's scope. Nothing new is needed to HAVE the evidence,
+             * and a query for exchanges outside `scope.include` finds it.
+             * Rewriting the request to something harmless was considered and
+             * refused: that fabricates traffic the operator never sent, which
+             * is worse than recording the escape.
+             *
+             * SO THE QUESTION IS STILL ASKED, AND ONLY LOGGED. Reaching this
+             * callback at all means the first one ALLOWED the request --
+             * measured: a request dropped at `handleRequestReceived` produces
+             * no second-callback entry in the probe's log at all. So a `deny`
+             * here IS a disagreement with the first callback, which is to say
+             * an edit, and the operator gets it at the moment it happens
+             * rather than only in a later query.
+             *
+             * `decideScopeOnly` and not `decide`, for every source, and the
+             * reason is no longer about double-charging: this asks about S4's
+             * BOUNDARY, which is the only rule an edit can breach that no
+             * later query could attribute. It spends no rate token and no
+             * budget slot, so an observation costs a crawler nothing.
+             *
+             * S4's COUNT OF ENFORCEMENT POINTS IS UNCHANGED AT TWO -- the send
+             * path and `handleRequestReceived`. This was never one of them;
+             * it was a second DECISION inside one of them, and it is now not
+             * even that.
              */
             @Override
             public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest r) {
-                // ATTRIBUTED AGAIN, FROM THE LISTENER, and NOT read back out
-                // of `pending`. The entry is there and carries the first
-                // callback's answer, and using it would make ENFORCEMENT
-                // depend on a bounded RECORDING structure: past
-                // DEFAULT_CAPACITY requests in flight the map evicts, the
-                // source reads UNATTRIBUTED, and a request the first callback
-                // allowed is refused here because the capture map overflowed.
-                // S4 is explicit that a full queue changes what hx KNOWS and
-                // never what it ALLOWS, and that has to hold in both
-                // directions. The listener is the same connection either way,
-                // and `listenerInterface()` is measured on requests -- this is
-                // one (docs/burp-proxy-measurements.md, Q1).
-                Source source = Source.UNATTRIBUTED;
-                String method = "";
-                String url = "";
-                boolean allow;
-                String errorClass = null;
-                String detail = null;
+                // BUILT AS A STRING FIRST, LOGGED AFTERWARDS, AND THE
+                // PASS-THROUGH DEPENDS ON NEITHER. Every read below is
+                // Montoya's code handed a hostile page's bytes, and a throw
+                // out of any of them once escaped this handler with the
+                // request's fate undecided -- what Burp does with a proxy
+                // handler that threw is measured nowhere in this repository.
+                // Now the worst any of it can do is cost the operator a log
+                // line: `continueWith` is the only exit, on every path.
+                //
+                // NO `Source` HERE ANY MORE, and its absence is the point.
+                // Attribution decides WHICH RULES a request gets, and this
+                // callback applies none -- so reading the listener again would
+                // be a second attribution nothing acts on, and a reader would
+                // reasonably assume something did.
+                String note = null;
                 try {
-                    source = Source.forListenerPort(
-                            listenerPort(r.listenerInterface()), crawlerPort);
-                    method = r.method();
-                    url = r.url();
+                    // ONE read, and it feeds the one question. configEpoch()
+                    // and scopeConfig() are two reads of one record and can
+                    // straddle a commit; an answer assembled from two halves
+                    // of two authorisations is an answer about a request
+                    // nobody authorised -- as true of a log line as of a
+                    // verdict, because the log line is what an operator acts
+                    // on at 02:00.
                     BridgeClient.Authorisation auth = c.authorisation();
-                    HxRequest edited = proxyRequest(r);
-                    Decision d;
-                    if (source == Source.CRAWLER)
-                        // THE AGENT'S FREE RULES, in S4's order, Gate excluded.
-                        // S4 says the method allowlist and the dangerous-path
-                        // denylist apply to crawler traffic IN FULL, and an
-                        // edit in the Intercept tab can turn `GET /x` into
-                        // `POST /account/delete` after the first callback
-                        // checked the original. decideBeforeGate is scope +
-                        // method + dangerous and spends NOTHING -- its own
-                        // javadoc says so -- so keeping those two across an
-                        // edit is free.
-                        d = policy.decideBeforeGate(edited, auth);
-                    else if (source == Source.OPERATOR)
-                        // Scope, and nothing after it. The operator branch
-                        // drops the other four rules here for the same reason
-                        // ProxyGate drops them at the first callback: applying
-                        // an agent's rules to a human drives them off the
-                        // proxy, and then hx records nothing at all.
-                        d = policy.decideScopeOnly(edited, auth);
-                    else
-                        // "Not one of the two I know", written the way
-                        // ProxyGate writes it, so a constant added to Source
-                        // later is a refusal rather than falling into whichever
-                        // branch it was not named in.
-                        d = Decision.deny("not_configured",
-                                BridgeClient.EXTENSION_FAULT
-                                + "the proxy listener could not be attributed "
-                                + "to the operator or the crawler");
-                    allow = d.allowed();
-                    errorClass = d.errorClass();
-                    detail = d.detail();
+                    Decision d = policy.decideScopeOnly(proxyRequest(r), auth);
+                    if (!d.allowed())
+                        note = "hx: THE ENGAGEMENT BOUNDARY IS BEING CROSSED "
+                             + "AND THIS EXTENSION CANNOT STOP IT. "
+                             + r.method() + " " + r.url() + " was ALLOWED at "
+                             + "handleRequestReceived and is out of scope now, "
+                             + "so it was edited between the two callbacks -- "
+                             + "Burp's Intercept tab sits there. "
+                             + "ProxyRequestToBeSentAction.drop() does not "
+                             + "prevent egress on this Burp (measured; see "
+                             + "docs/burp-proxy-measurements.md, Q4), so the "
+                             + "request WILL reach the target. It will be "
+                             + "recorded as an exchange whose url is outside "
+                             + "scope.include -- that row is the evidence. "
+                             + "Reason: " + d.detail();
                 } catch (RuntimeException e) {
-                    Decision d = Decision.deny("not_configured",
-                            BridgeClient.EXTENSION_FAULT
-                            + "the pre-send scope re-check threw: " + e);
-                    allow = false;
-                    errorClass = d.errorClass();
-                    detail = d.detail();
+                    // NOT a refusal any more, because there is no refusal to
+                    // be had here. An unreadable request is a thing the
+                    // operator should see, and it is all this callback can do
+                    // about it.
+                    note = BridgeClient.EXTENSION_FAULT
+                         + "hx: the pre-send scope observation threw, so "
+                         + "nothing here can say whether this request is still "
+                         + "in scope. The first callback allowed it and it is "
+                         + "going out: " + e;
                 }
-                if (!allow) {
-                    // THE ACTION IS DECIDED AND HELD BEFORE ANYTHING IS
-                    // RECORDED. See the first callback for why this is
-                    // structure rather than tidiness.
-                    ProxyRequestToBeSentAction refuse =
-                            ProxyRequestToBeSentAction.drop();
-                    // The entry will never be answered: this request is not
-                    // going to the target, so no response can arrive for it.
-                    // Taken rather than left to age out, so the map's bound is
-                    // spent on requests that are actually in flight.
+                if (note != null)
                     try {
-                        pending.take(r.messageId());
-                        capture.offer(recorder.denial(method, url, errorClass,
-                                                      detail, source));
+                        api.logging().logToError(note);
                     } catch (Throwable ignored) {
-                        // See the first callback: the counter is the thing
-                        // that threw, so there is nothing left to count with,
-                        // and the refusal below stands regardless.
+                        // The pass-through must not depend on the logger
+                        // either. A lost log line is a lost log line; a throw
+                        // here would leave a request Burp has already been
+                        // told to send with no action returned for it.
                     }
-                    return refuse;
-                }
                 return ProxyRequestToBeSentAction.continueWith(r);
             }
         });
