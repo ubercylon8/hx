@@ -269,15 +269,19 @@ def make_home(workdir: Path, *, seed: Path | None = None) -> Path:
     return home
 
 
-# The project config both launchers hand Burp, and the ports inside it.
+# The project config every launcher hands Burp, and the ports inside it.
 #
-# These three live ABOVE launch_burp because BOTH launchers need them and a
+# These live ABOVE launch_burp because more than one launcher needs them and a
 # second copy is a second set of listener settings free to drift from this one
 # -- `listen_mode: loopback_only` above all, which is written once here and
-# read back by not_loopback_only() for whichever Burp is running. The probe
-# section below is where the mechanism is EXPLAINED (see launch_probe): Burp
-# Community has no API for creating a listener, so a listener comes from a
-# project config file or it does not exist.
+# read back by not_loopback_only() for whichever Burp is running.
+# `tests/integration/burp_fixture.py` re-exports both and its measurement
+# probe calls them, which is why they are module-level rather than folded into
+# launch_burp below.
+#
+# WHY A CONFIG FILE AT ALL: Burp Community has no API for creating a proxy
+# listener, so a listener comes from a project config file or it does not
+# exist.
 
 PROXY_CONFIG = "proxy-listeners.json"
 
@@ -291,21 +295,19 @@ _PORT_DRAWS = 8
 def _free_port() -> int:
     """A port nothing holds right now, for a listener Burp is about to bind.
 
-    Necessary rather than tidy, and measured the hard way. A first draft of
-    this fixture picked its ports by hand, and every one of them was already
-    taken on this machine: 8080 by a llama.cpp router, 18080 by a node service,
-    18081 by an agent. A taken port does not fail, it SUCCEEDS against the
-    wrong process -- that run got a clean `421` from one and a clean `200` from
-    another, with Burp never involved and the probe file holding nothing but
-    `PROBE READY`. (8080 answers a proxy-style absolute-URI GET with a
+    Necessary rather than tidy, and measured the hard way. This code was
+    written in `tests/integration/burp_fixture.py`, whose first draft picked
+    its ports by hand, and every one of them was already taken on this machine:
+    8080 by a llama.cpp router, 18080 by a node service, 18081 by an agent. A
+    taken port does not fail, it SUCCEEDS against the wrong process -- that run
+    got a clean `421` from one and a clean `200` from another, with Burp never
+    involved. (8080 answers a proxy-style absolute-URI GET with a
     `404 {"error":...}` and a `Server: llama.cpp` header.)
 
     The window between this close() and Burp's bind() is a real race and
-    nothing here can close it. The far end is what settles it: a test believes
-    the port is Burp's only once a request through it has reached the probe's
-    own handler -- or, for launch_burp, once an exchange the extension observed
-    on that port has arrived over the bridge -- which nothing but Burp's proxy
-    can arrange.
+    nothing here can close it. The far end is what settles it: the port is
+    Burp's only once an exchange the extension observed on that port has
+    arrived over the bridge, which nothing but Burp's proxy can arrange.
     """
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -422,9 +424,9 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path, *,
         f"-Dhx.instance={instance}",
         # Required, not optional: HxExtension.initialize() returns early
         # ("extension idle") without it, so the extension never dials and the
-        # handshake never happens. Task 6 made it mandatory and this fixture
-        # was not updated -- the integration tests are deselected from the
-        # default run, so nothing said so for a day.
+        # handshake never happens. Task 6 made it mandatory and the launcher
+        # this code grew up in was not updated -- the integration tests are
+        # deselected from the default run, so nothing said so for a day.
         f"-Dhx.halt_sentinel={sentinel}",
         # Read back out of the config above rather than from `crawler_port`,
         # which may be the 0 that means "choose one for me".
@@ -500,9 +502,10 @@ def _is_loopback(local: str) -> bool:
 def not_loopback_only(pid: int, ports: list[int]) -> str | None:
     """Why this Burp is not listening on loopback alone -- or None when it is.
 
-    `listen_mode: loopback_only` is written into every listener launch_probe
-    configures, three places in this tree call it non-optional, and until this
-    function existed NOTHING checked it. Changing that one string to
+    `listen_mode: loopback_only` is written into every listener
+    write_listener_config asks for, three places in this tree call it
+    non-optional, and until this function existed NOTHING checked it.
+    Changing that one string to
     `all_interfaces` left `test_proxy_facts.py` reporting `3 passed in 38.03s`
     while `ss` showed the two configured listeners bound to `*:34777` and
     `*:38399` -- a forward proxy open to whatever network this laptop is
@@ -531,10 +534,10 @@ def not_loopback_only(pid: int, ports: list[int]) -> str | None:
                 f"`listen_mode: loopback_only` is unverified: {exc}")
     if not sockets:
         return (f"`ss -ltnpH` attributes no listening socket to burp pid {pid}, "
-                "so nothing here can say whether its proxy is on loopback. Burp "
-                "is running and its extension has loaded -- `PROBE READY` is on "
-                "disk -- so read this as a broken check before reading it as a "
-                "Burp that bound nothing.")
+                "so nothing here can say whether its proxy is on loopback. That "
+                "pid answered the bridge handshake a moment ago, so read this "
+                "as a broken check -- an `ss` that cannot see this process's "
+                "sockets -- before reading it as a Burp that bound nothing.")
     unbound = [port for port in ports
                if not any(sock.endswith(f":{port}") for sock in sockets)]
     if unbound:
@@ -603,15 +606,21 @@ def proxy_port(workdir: Path) -> int:
     """Burp's first proxy listener for this run.
 
     NOT 8080. Burp Community does default to 8080, but a default is where a
-    listener goes when nobody says otherwise, and this fixture says otherwise
-    precisely because 8080 on a developer's machine is whatever else claimed it
-    first -- here, the local LLM router. See _free_port().
+    listener goes when nobody says otherwise, and write_listener_config says
+    otherwise precisely because 8080 on a developer's machine is whatever else
+    claimed it first -- here, the local LLM router. See _free_port().
     """
     return listener_ports(workdir)[0]
 
 
 def second_proxy_port(workdir: Path) -> int:
-    """Burp's second proxy listener -- the other side of Q1's question."""
+    """Burp's second proxy listener: the crawler's.
+
+    S4 tells the operator and the crawler apart by WHICH listener a request
+    arrived on and by nothing in the traffic, so this number and
+    `proxy_port()`'s are not interchangeable -- and never equal; see
+    write_listener_config.
+    """
     return listener_ports(workdir)[1]
 
 
