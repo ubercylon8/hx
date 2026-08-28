@@ -23123,6 +23123,8 @@ from __future__ import annotations
 import sqlite3
 import uuid
 
+from hx.store.db import transaction
+
 # Error class (spec S6) -> the `kind` value the denial table's CHECK
 # constraint accepts. The vocabulary is Plan 1's and cannot be widened from
 # here: an unrecognised kind is refused by SQLite itself, so this map is the
@@ -23784,6 +23786,338 @@ def abort_run(conn: sqlite3.Connection, *, run_id: str,
         # nothing would leave a live run marked as running forever.
         raise ValueError(f"no run {run_id!r} in this store")
     return False
+
+
+# Which parts of the key a `scope_level` must NOT let distinguish two
+# findings, keyed by S5's own `finding.scope_level` vocabulary. Identity has
+# to be exactly as wide as the thing being reported: a cookie set for a host
+# is ONE remediation whatever page happened to draw it, and a key that still
+# carried the page filed it once per page.
+#
+# `-`, the same literal this function already uses for an absent part, and
+# deliberately not a second placeholder: "this part does not apply here" and
+# "this part is not present" are the same fact about the key, and two
+# spellings of it would be two identities for one finding.
+#
+# EVERY VALUE IN `base.SCOPE_LEVELS` HAS AN ENTRY, and
+# `test_every_scope_level_has_a_key_rule` pins that it stays true -- a new
+# scope level added to the vocabulary without a decision here would silently
+# take `surface`'s behaviour by way of a `.get(..., frozenset())`.
+_SCOPE_BLANKS: dict[str, frozenset[str]] = {
+    # The whole engagement: nothing about WHERE it was seen is identity.
+    "engagement": frozenset({"scheme", "host", "port", "method",
+                             "path_template"}),
+    # One host, every surface under it. Scheme, host and port stay: two
+    # hosts' cookies are two clients' problems and two tickets.
+    "host": frozenset({"method", "path_template"}),
+    # One surface: S5's key as written, nothing dropped.
+    "surface": frozenset(),
+    # Narrower than a surface, not wider. Every part of a surface's identity
+    # is still true of the insertion point inside it, and the two insertion
+    # parts are what make it narrower.
+    "insertion": frozenset(),
+}
+
+
+def dedupe_key(*, type_: str, issue_type_id: str, scheme: str, host: str,
+               port: int | None, method: str, path_template: str,
+               insertion_kind: str | None, insertion_name: str | None,
+               scope_level: str) -> str:
+    """`type|issue_type|scheme|host|port|method|path_template|insertion_kind|insertion_name`.
+
+    NINE PARTS, NOT S5'S EIGHT. `issue_type_id` was added by F1 of the
+    whole-branch review (HIGH) and is the only part that distinguishes two
+    candidates from ONE check against ONE surface: `type_` is the check,
+    everything after it is the surface, and a passive check routinely yields
+    several. MEASURED on the eight-part key, with one document response
+    missing three security headers: three candidates produced three
+    byte-identical keys, `upsert_finding` collapsed them onto one row, and
+    that row paired the FIRST candidate's title and CWE (`DO UPDATE SET`
+    does not move those) with the LAST candidate's severity (it moves that)
+    -- a Medium frame-protection issue stored and rendered as `Missing
+    X-Content-Type-Options`, Low. It sits immediately after `type_` because
+    the two answer the same question at two grains -- which check, and what
+    it found -- and everything after them is location.
+
+    LITERAL `-` FOR ABSENT PARTS, NEVER `None`. `finding.dedupe_key` is
+    `TEXT NOT NULL`, so this function must never itself hand back a bare
+    `None` -- verified: `INSERT INTO finding(...) VALUES(..., NULL, ...)`
+    raises `IntegrityError: NOT NULL constraint failed: finding.dedupe_key`
+    rather than inserting. That is the good case. The bad case this rule
+    actually guards against is the one where a part is missing and the
+    string built from it is well-formed anyway: SQLite's rule for a UNIQUE
+    index is that two NULLs are never equal, not even to each other, so any
+    design that let an absent part reach SQL as a real NULL -- a raw column
+    in a composite UNIQUE, or a key built by SQL `||` concatenation, where
+    `NULL || anything` is itself `NULL` -- would let the same finding insert
+    again on every scan, silently, with the constraint sitting there looking
+    like it worked. Collapsing every part into ONE Python string with a
+    literal placeholder for an absent part is what keeps that failure mode
+    out of reach in the first place, by never handing SQL a NULL to be
+    careless with.
+
+    Method and insertion kind are part of identity because S5 says they are:
+    `GET /api/order/{n}` leaking another tenant's data and `POST` on the same
+    template accepting mass-assignment are different findings with different
+    remediations.
+
+    ...EXCEPT WHERE `scope_level` SAYS THE FINDING IS WIDER THAN ONE SURFACE.
+    F3 of the whole-branch review (MEDIUM): `Candidate.scope_level` was
+    stored on the row and never consulted here, so `path_template` was in
+    the key unconditionally and a host-scoped finding filed once per surface.
+    MEASURED, one flagless cookie across three surfaces of one host: THREE
+    rows, keys differing only in `/`, `/orders`, `/profile`, with identical
+    titles, severities and remediation -- the "same remediation forty times"
+    that `hx.checks.passive.cookie_flags`' own docstring says host scope
+    exists to prevent. `_SCOPE_BLANKS` above is the rule, one entry per
+    value of the vocabulary rather than an `if host` and an implicit else.
+    """
+    try:
+        blanks = _SCOPE_BLANKS[scope_level]
+    except KeyError:
+        raise ValueError(
+            f"unknown scope_level {scope_level!r}; the schema takes "
+            f"{sorted(_SCOPE_BLANKS)}") from None
+    parts = (("type_", type_), ("issue_type_id", issue_type_id),
+             ("scheme", scheme), ("host", host), ("port", port),
+             ("method", method), ("path_template", path_template),
+             ("insertion_kind", insertion_kind),
+             ("insertion_name", insertion_name))
+    return "|".join(
+        "-" if name in blanks or value is None or value == "" else str(value)
+        for name, value in parts)
+
+
+def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
+                   dedupe_key: str, run_id: str, surface_id: str | None = None,
+                   host: str | None = None,
+                   check_id: str | None = None) -> str:
+    """Insert the finding, or refresh it if it is already known.
+
+    WHAT AN UPSERT MUST NOT TOUCH: `status`, and `first_seen_run`. An operator
+    who marked something `false_positive` has made a judgement the next scan
+    has no standing to reverse, and the run something was FIRST seen in is a
+    historical fact. The DO UPDATE clause names exactly what moves.
+
+    WHAT IT MUST TOUCH IS EVERYTHING THAT IS CURRENT STATE, and until F12 of
+    fix round B that was half true: `severity` and `confidence` moved and
+    `title`, `description`, `impact`, `remediation` and `cwe` did not, so a
+    re-scan updated how bad a finding was and never what it SAID.
+
+    The rule that settles which is which: the finding's IDENTITY is whatever
+    `dedupe_key` spells, and everything else on the row is the latest
+    answer about it. For `hx.checks.passive.cookie_flags` after D1 of the
+    fix-round-A re-review, identity is THE COOKIE and the set of missing
+    flags is deliberately not in it. MEASURED after fix round A2, one cookie
+    over two runs (run 1 missing HttpOnly, SameSite and Secure; run 2 with
+    SameSite and Secure set): correctly ONE finding with two observations --
+    still wearing run 1's title, `Cookie session set without HttpOnly,
+    SameSite, Secure`, after the client had fixed two of the three. The
+    client is told they still have a problem they have fixed, on a finding
+    the retest machinery is otherwise handling correctly.
+
+    `cwe` MOVES WITH THE REST, and it is the one worth arguing. It looks
+    like a property of the issue type -- which IS identity, since
+    `issue_type_id` is the 2nd part of the key -- but it is not written from
+    the issue type: `cookie_flags` computes it as `"CWE-1004" if "HttpOnly"
+    in missing else "CWE-614"`, off the same current state that decides
+    `severity`. Leaving it behind pairs a refreshed severity with a stale
+    classification on one row, which is the chimera F1 of the whole-branch
+    review was about, one column over. The columns that stay put are the
+    ones the key is built FROM (`issue_type_id`, `insertion_name`,
+    `insertion_kind`, `scope_level`), the ones a human owns (`status`), and
+    the ones that are history (`first_seen_run`).
+
+    `surface_id`, `host` AND `check_id` ARE KEYWORD-ONLY AND DEFAULT TO
+    `None` -- BACKWARD COMPATIBLE with every call site that predates Task 6,
+    which is every test in `tests/test_records_findings.py`.
+
+    `issue_type_id` IS NOT A PARAMETER, AND IS NOW WRITTEN: it comes off the
+    candidate, like every other column here except the four above. It was
+    unwritten until F1 of the whole-branch review (HIGH), and a declared,
+    unwritten column is what made an earlier fix reach for it as a scratch
+    slot for `check.id` -- see schema.sql's comment on the pair. The two
+    remain different axes and must never share a value: `check_id` is WHICH
+    CHECK found this, `issue_type_id` is WHAT KIND OF ISSUE it is. Mapping
+    those values onto Burp's 183 vendored issue definitions is still a later
+    plan's job, and is a refinement of THIS axis -- a change of vocabulary
+    on one column, not a change of what the column means.
+
+    IT IS WRITTEN ON INSERT AND NOT MOVED ON CONFLICT, which is D5 of the
+    fix-round-A re-review. On the insert path it is the value the row is
+    identified BY; on the conflict path it is dead, because the conflict
+    target is `(engagement_id, dedupe_key)` and `dedupe_key` now contains
+    `issue_type_id` verbatim as its 2nd part -- `Candidate.__post_init__`
+    forbids an empty one, so `dedupe_key`'s `-`-for-absent branch cannot
+    fire for it -- so any row that conflicts already holds the identical
+    value, and `SCHEMA_VERSION` refuses to open a store written before the
+    column was populated. Dead is not why it is gone. It is gone because its
+    ONE reachable effect is harmful: `dedupe_key` arrives here as a free
+    parameter, independent of `candidate`, so a caller that built the key
+    from a DIFFERENT issue type would have had the disagreement silently
+    overwritten. Leaving it alone keeps the invariant a reader can check --
+    a row's `issue_type_id` is the 2nd part of its own `dedupe_key` -- and
+    turns that caller's bug into something visible instead of a quiet
+    overwrite.
+
+    `surface_id`/`host` exist because a retest needs to know WHICH surface a
+    finding lives on. Before this parameter existed, `upsert_finding` never
+    wrote `surface_id` at all -- the column stayed NULL forever, no writer
+    set it. MEASURED: driving `hx.scan.run` twice over one surface, once
+    finding and once clean, through the literal task-6-brief `upsert_finding`
+    call with no `surface_id` argument produced `finding_observation.observed
+    == [1]`, one row, never `[1, 0]` -- the retest half of S12 silently did
+    nothing, on every finding, forever.
+
+    `check_id` exists for a NARROWER question a retest also needs answered:
+    not just which surface, but which CHECK found it. F1 of the task-6
+    review, HIGH: keying a retest on surface alone means a finding reads as
+    `observed=0` (which a report renders as "fixed") when the surface was
+    visited but the check that owns the finding raised, went inconclusive,
+    was skipped by the budget, or was not even in this run's `checks` --
+    none of which is "looked and it's gone". `hx.scan._write_finding`
+    already has `check.id` in hand (it is the first field of `dedupe_key`,
+    S5's canonical string). `finding.check_id` (SCHEMA_VERSION 7, fix round
+    2 of Task 6) is where that identity belongs, DISTINCT from
+    `issue_type_id` -- an earlier version of this fix wrote `check.id` into
+    `issue_type_id` because that column was declared and unused, which
+    conflates "which check found this" with "what kind of Burp-vocabulary
+    issue this is" on one column with nothing at the schema level to catch
+    the collision the day a later plan starts writing real issue-type ids.
+    `hx.scan._mark_unobserved` reads `check_id` back to require an exact
+    `(surface_id, check.id)` match against THIS run's own `check_run` rows
+    with `verdict='clean'`, not surface membership alone.
+
+    The fix is here rather than in the runner because `dedupe_key` is already
+    built from surface AND check identity in exactly one place (this module's
+    `dedupe_key`) and a second place deciding either would be the same class
+    of drift that function's docstring warns about.
+    """
+    fid = new_id("f")
+    conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, issue_type_id,"
+        " title, description,"
+        " impact, remediation, cwe, severity, confidence, created_by, status,"
+        " insertion_name, insertion_kind, scope_level, payload, surface_id,"
+        " host, check_id, first_seen_run, last_seen_run)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?, 'check', 'new', ?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(engagement_id, dedupe_key) DO UPDATE SET"
+        "   last_seen_run=excluded.last_seen_run,"
+        "   title=excluded.title,"
+        "   description=excluded.description,"
+        "   impact=excluded.impact,"
+        "   remediation=excluded.remediation,"
+        "   cwe=excluded.cwe,"
+        "   severity=excluded.severity,"
+        "   confidence=excluded.confidence,"
+        "   surface_id=excluded.surface_id,"
+        "   host=excluded.host,"
+        "   check_id=excluded.check_id",
+        (fid, engagement_id, dedupe_key, candidate.issue_type_id,
+         candidate.title, candidate.description,
+         candidate.impact, candidate.remediation, candidate.cwe,
+         candidate.severity, candidate.confidence,
+         candidate.insertion.name if candidate.insertion else None,
+         candidate.insertion.kind if candidate.insertion else None,
+         candidate.scope_level, candidate.payload, surface_id, host,
+         check_id, run_id, run_id))
+    row = conn.execute(
+        "SELECT id FROM finding WHERE engagement_id=? AND dedupe_key=?",
+        (engagement_id, dedupe_key)).fetchone()
+    return row[0]
+
+
+def record_observation(conn: sqlite3.Connection, *, finding_id: str,
+                       run_id: str, observed: bool,
+                       exchange_id: str | None, severity_at: str | None,
+                       confidence_at: str | None, at_us: int) -> None:
+    """This run's answer about this finding.
+
+    `observed=0` is how a retest says FIXED -- but only where the surface was
+    actually tested. The caller owns that distinction; see `hx.scan`.
+
+    A SECOND CALL FOR THE SAME `(finding_id, run_id)` REPLACES THE WHOLE ROW,
+    not a subset of its columns. F7 of the task-5 review: the DO UPDATE used
+    to refresh `observed`, `exchange_id` and `ts_us` but leave `severity_at`
+    and `confidence_at` at whatever the FIRST call in this run wrote, so two
+    calls in one run could leave a row pairing a stale severity with a fresh
+    `observed` -- one row claiming to be "this run's answer" while two of its
+    five fields answered for different moments. This row is not a
+    point-in-time record with its own history; that history is `run_id`
+    itself, one row per run. Within one run there is exactly one current
+    answer, and the last call to name it wins on every column.
+    """
+    conn.execute(
+        "INSERT INTO finding_observation(finding_id, run_id, observed,"
+        " exchange_id, severity_at, confidence_at, ts_us)"
+        " VALUES(?,?,?,?,?,?,?)"
+        " ON CONFLICT(finding_id, run_id) DO UPDATE SET"
+        "   observed=excluded.observed, exchange_id=excluded.exchange_id,"
+        "   severity_at=excluded.severity_at,"
+        "   confidence_at=excluded.confidence_at,"
+        "   ts_us=excluded.ts_us",
+        (finding_id, run_id, 1 if observed else 0, exchange_id,
+         severity_at, confidence_at, at_us))
+
+
+def record_evidence(conn: sqlite3.Connection, *, finding_id: str,
+                    exchange_ids, at_us: int) -> None:
+    """Append the given exchanges to this finding's evidence chain, `seq`
+    continuing from what is already there. `seq` is the order S12 renders
+    the chain in.
+
+    `evidence` is append-only BY SCHEMA: `trg_evidence_no_update` and
+    `trg_evidence_no_delete` both `RAISE(ABORT, 'evidence is immutable')`,
+    because evidence is what a disputed finding is proven with and must not
+    be alterable after capture. The plan originally specified this function
+    as REPLACE -- `DELETE FROM evidence` then re-insert -- and that raised
+    `IntegrityError` on the second recording of any finding, measured, which
+    is how the trigger was found. This function only ever appends.
+
+    THE SKIP BELOW DOES ONE THING: it records each EXCHANGE ID once per
+    finding, so calling this twice with the same ids -- a retry, a duplicate
+    dispatch inside one run -- does not double the chain. F1 of the task-5
+    review: an earlier version of this docstring claimed that property as "a
+    chain that does not grow on re-observation" and "a finding seen in three
+    runs would not carry its exchange three times". That is FALSE of the real
+    path. `record_exchange` mints a fresh `x-<random>` id per row
+    (`new_id("x")`), so a later run observing the same finding produces a
+    NEW exchange with a new id every time -- the skip never fires across
+    runs, and a finding seen in N runs genuinely accumulates N evidence rows,
+    one per observation. This function does not and cannot dedupe across
+    runs; it has no stable key to dedupe on that would not also be a claim
+    about identity this module does not own. Per-run persistence -- "how many
+    runs has this been seen in" -- is `finding_observation`'s job, whose
+    primary key is `(finding_id, run_id)`; that is the table that answers it,
+    not this one.
+
+    UNBOUNDED GROWTH IS THE REAL CONSEQUENCE AND IS NOT FIXED HERE: a finding
+    seen in fifty runs holds fifty evidence rows, and a report must not print
+    fifty rows for one problem. §12 renders this chain; bounding what it
+    shows is the renderer's job, not this writer's -- the reader's next
+    question, named rather than solved.
+
+    Wrapped in `db.transaction` (F5 of the task-5 review): on the autocommit
+    connection `db.connect()` returns, an unwrapped multi-row loop failing
+    partway through leaves the rows already inserted committed -- a partial
+    chain that looks like the whole one until someone counts it.
+    """
+    with transaction(conn):
+        known = {row[0] for row in conn.execute(
+            "SELECT exchange_id FROM evidence WHERE finding_id=?",
+            (finding_id,))}
+        seq = conn.execute(
+            "SELECT COALESCE(MAX(seq) + 1, 0) FROM evidence WHERE finding_id=?",
+            (finding_id,)).fetchone()[0]
+        for exchange_id in exchange_ids:
+            if exchange_id in known:
+                continue
+            conn.execute(
+                "INSERT INTO evidence(id, finding_id, seq, role, kind,"
+                " exchange_id, captured_us) VALUES(?,?,?,'proof','exchange',?,?)",
+                (new_id("ev"), finding_id, seq, exchange_id, at_us))
+            known.add(exchange_id)
+            seq += 1
 ```
 
 
@@ -26495,6 +26829,20 @@ from urllib.parse import parse_qs, urlsplit
 # it, so a change here cannot leave one of them checking a stale literal.
 SESSION_COOKIE_VALUE = "s3cr3t-live-session-2f9a41c0"
 
+# `/login`'s own cookie, byte for byte: `session={SESSION_COOKIE_VALUE};
+# Path=/; HttpOnly; SameSite=Lax`. Task 9 measured `hx.passive.cookie-flags`
+# against it, expecting a finding the way the plan's own brief described the
+# route ("no Secure, HttpOnly or SameSite"), and got `clean`: HttpOnly and
+# SameSite ARE set, and the check does not demand Secure of an http:// origin
+# (`cookie_flags.py`'s own comment says so -- "a Secure cookie on an http://
+# origin is never sent at all"). `/login`'s exact Set-Cookie string is pinned
+# elsewhere -- `tests/test_target_server.py::test_the_login_route_sets_a_
+# cookie_worth_redacting` and `tests/integration/test_send_path.py`'s
+# redaction assertions both match it byte for byte -- so it is not this
+# route's to change. `/insecure-cookie` exists so a check with a real,
+# unambiguous absence to find has one, without touching the frozen string.
+FLAGLESS_COOKIE_VALUE = "s3cr3t-legacy-session-9b21fe70"
+
 # The most /slow will ever sleep, whatever the query string says. A typo in a
 # test ("ms=3600000") would otherwise wedge the suite for an hour with no
 # diagnostic; five seconds is longer than any deadline this suite sets and
@@ -26678,6 +27026,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(200, {"welcome": True}, extra=[
                 ("Set-Cookie",
                  f"session={SESSION_COOKIE_VALUE}; Path=/; HttpOnly; SameSite=Lax"),
+            ])
+        elif parts.path == "/insecure-cookie":
+            # A `session` cookie with NONE of the three flags
+            # `hx.passive.cookie-flags` looks for -- see FLAGLESS_COOKIE_VALUE's
+            # comment for why /login's own cookie cannot stand in for this.
+            self._reply(200, {"welcome": True}, extra=[
+                ("Set-Cookie", f"session={FLAGLESS_COOKIE_VALUE}"),
             ])
         elif parts.path == "/flaky":
             self._reply(_int_param(params, "status", 500), {"error": "upstream"})
@@ -27016,7 +27371,9 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import socket
 import subprocess
+import time
 import uuid
 import warnings
 from dataclasses import dataclass, field
@@ -27333,6 +27690,98 @@ class Rig:
         the old shape after any change to either.
         """
         return self.send(method, target_path, guarded=False, **kwargs)
+
+    # Long enough for a frame that crosses a Unix socket in under a
+    # millisecond once the response is complete (measured in
+    # tests/integration/test_proxy_capture.py, where this constant and the
+    # two methods below it lived until Task 9: the row was on disk 50 ms
+    # after the client's response on every run taken there), short enough
+    # that a wedged extension is a failure in seconds rather than a stalled
+    # suite.
+    SETTLE_S = 10.0
+
+    def browse(self, method: str, path: str, *, port: int | None = None,
+               to: "TargetServer | None" = None,
+               headers: Sequence[tuple[str, str]] = (), body: bytes = b"",
+               timeout: float = 30.0) -> bytes:
+        """One request through Burp's PROXY LISTENER, and the whole response
+        off the wire.
+
+        THE OTHER ROUTE. `send` goes through the bridge -- Burp's send call,
+        driven by an operator tool. This goes through the listener a real
+        browser would be pointed at, which is the one path `ProxyGate`
+        guards and the one a browsing session actually produces traffic on.
+        Nothing that only calls `send` has ever driven this side of the
+        extension.
+
+        THE FORWARD-PROXY form: the request line carries the absolute URI,
+        which is how a browser configured to use a proxy addresses one and
+        how the destination reaches Burp at all. The `Host` line is set to
+        match only so the target server sees a well-formed request.
+
+        Raw sockets rather than `http.client` for the same reason
+        `test_proxy_facts._Probe.raw_through_proxy` uses them: the byte
+        count of the FULL response is half of what a drop is recognised by,
+        and no http.client API exposes it. Reading to EOF is bounded twice
+        over -- the socket timeout above, and Burp closing the connection
+        itself.
+
+        `port` defaults to the OPERATOR listener. The crawler's is
+        `self.crawler_port` and the difference between them is the whole of
+        S4's source attribution.
+        """
+        dest = to or self.target
+        lines = [f"{method} {dest.origin}{path} HTTP/1.1",
+                 f"Host: {dest.host}:{dest.port}",
+                 "Connection: close"]
+        lines += [f"{name}: {value}" for name, value in headers]
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        # ISO-8859-1 for the same reason Sender.parse reads it that way: HTTP
+        # field values are octets, and one octet is one char here.
+        raw = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
+        sock = socket.create_connection(("127.0.0.1", port or self.proxy_port),
+                                        timeout=timeout)
+        try:
+            sock.sendall(raw)
+            chunks = []
+            while chunk := sock.recv(65536):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            sock.close()
+
+    def settle(self, predicate, what: str, timeout: float = SETTLE_S) -> None:
+        """Wait for a row to arrive, and say WHY it did not if it never does.
+
+        THE RECORD ARRIVES AFTER THE RESPONSE, so every row this waits for is
+        POLLED rather than read once. Measured (test_proxy_capture.py):
+        browsing five times and reading the table the instant each client
+        response completed gave 1, 1, 2, 3, 4 rows -- the capture frame
+        crosses the bridge on its own thread, behind the browser.
+
+        THE MESSAGE IS THE POINT, carried over unchanged from where this
+        lived before Task 9 moved it here. A sink that raises produces
+        exactly the same observable as an extension that sent nothing -- an
+        empty table -- and the two have opposite fixes. `exchange_errors`
+        and `exchange_callback_error` are the only things on this side that
+        can tell them apart, so they are in every timeout message rather
+        than left for whoever is debugging to find.
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            if predicate():
+                return
+            time.sleep(0.1)
+        pytest.fail(
+            f"{what} never arrived within {timeout}s. This side's sink failed "
+            f"{self.srv.exchange_errors} time(s), last: "
+            f"{self.srv.exchange_callback_error!r}. A sink that throws is caught, "
+            "counted and swallowed by BridgeServer._capture -- deliberately -- so "
+            "an empty table is what a BROKEN HARNESS looks like as well as a "
+            "silent extension. Read that number before reading Burp's log at "
+            f"{self.workdir / 'burp' / 'burp.log'}. Target log: "
+            f"{[(h.method, h.path) for h in self.target.hits]}")
 
 
 @pytest.fixture

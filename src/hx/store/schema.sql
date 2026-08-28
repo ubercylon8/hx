@@ -163,7 +163,42 @@ CREATE TABLE IF NOT EXISTS finding (
   id                 TEXT PRIMARY KEY,
   engagement_id      TEXT NOT NULL REFERENCES engagement(id),
   dedupe_key         TEXT NOT NULL,
+  -- TWO DIFFERENT AXES, added at two different times, and the collision
+  -- between them is exactly the thing this comment exists to foreclose.
+  --
+  -- issue_type_id: WHAT KIND OF ISSUE THIS IS. Spec S10/S12: report text,
+  -- severity and CWE mappings come from Burp's 183 vendored issue
+  -- definitions, so a report reads in the same vocabulary a Pro user's
+  -- would. Adopting those ids is still a later plan's job; until then each
+  -- check names its own stable value -- lowercase kebab (`missing-hsts`)
+  -- unless the id has to carry a name the protocol treats as case-sensitive,
+  -- as `cookie_flags` does for the cookie -- and swapping in Burp's
+  -- vocabulary later is a change of SPELLING on this axis, not a change of
+  -- what the axis means. NOT to be used for anything
+  -- else, including the column immediately below.
+  --
+  -- WRITTEN, and part of identity, since F1 of the whole-branch review
+  -- (HIGH). It is the 2nd part of `finding.dedupe_key` (see
+  -- `records.dedupe_key`), because every other part of that key is fixed by
+  -- the check and the surface: without it, three security headers missing
+  -- from one response filed ONE finding wearing the first candidate's title
+  -- and the last candidate's severity. This column being DECLARED AND
+  -- UNWRITTEN is also what made it look like a free slot to the earlier fix
+  -- described below; it is neither free nor unwritten now.
+  --
+  -- check_id: WHICH hx CHECK FOUND THIS, added at SCHEMA_VERSION 7 (fix
+  -- round 2 of Task 6). `hx.scan._mark_unobserved` needs to know, for a
+  -- retest, whether the SAME check that produced a finding ran clean on the
+  -- SAME surface again this run -- surface alone was measured to mark a
+  -- finding "observed=0" (which a report renders as FIXED) even when the
+  -- check that owns it crashed, went inconclusive, or never ran this run at
+  -- all (F1 of the task-6 review, HIGH). `issue_type_id` briefly carried
+  -- `check.id` for this purpose between fix rounds 1 and 2 -- WRONG, because
+  -- it collides with the axis above the day a later plan starts writing
+  -- real Burp issue-type ids here, with nothing at the schema level to catch
+  -- the two fighting over one column. This column is that catch.
   issue_type_id      TEXT,
+  check_id           TEXT,
   title              TEXT NOT NULL,
   description        TEXT,
   impact             TEXT,

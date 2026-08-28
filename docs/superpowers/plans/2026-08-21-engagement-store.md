@@ -552,6 +552,148 @@ def test_transaction_rolls_back_on_exception(tmp_path: Path):
             raise RuntimeError("simulated failure mid-transaction")
     count = conn.execute("SELECT COUNT(*) AS n FROM engagement").fetchone()["n"]
     assert count == 0
+
+
+# --- Task 6: transaction() is reentrant. hx.scan composes two already-atomic
+# helpers (`_write_finding`'s own transaction and `records.record_evidence`'s)
+# into one, and a bare `BEGIN` inside an open transaction raises
+# `OperationalError: cannot start a transaction within a transaction` --
+# MEASURED against records.record_evidence before this fix. Both directions
+# of the fix are pinned below rather than only the happy path, per the
+# ruling that a savepoint path swallowing a rollback would be worse than the
+# bug it replaces. ---
+
+
+def test_nested_transaction_inner_failure_rolls_back_only_inner_and_propagates(
+    tmp_path: Path,
+):
+    """A nested `transaction()` call that raises undoes ONLY its own writes
+    -- via SAVEPOINT / ROLLBACK TO SAVEPOINT, not the outer BEGIN -- and the
+    exception still propagates out of the inner `with` block rather than
+    being swallowed. The outer transaction is left alive and can go on to
+    commit its own writes, proving the inner failure did not also doom it."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO engagement(id, name, client, created_us, status)"
+            " VALUES('e1','acme','Acme',1,'active')"
+        )
+        with pytest.raises(RuntimeError, match="inner failure"):
+            with db.transaction(conn):
+                conn.execute(
+                    "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                    " started_us, status)"
+                    " VALUES('r1','e1','manual','production',1,'running')"
+                )
+                raise RuntimeError("inner failure")
+        # The outer transaction is still open: MEASURED by writing again and
+        # letting it commit, rather than assumed.
+        conn.execute(
+            "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+            " started_us, status)"
+            " VALUES('r2','e1','manual','production',2,'running')"
+        )
+    assert conn.execute("SELECT COUNT(*) FROM engagement").fetchone()[0] == 1
+    # r1 (the failed nested INSERT) is gone; r2 (written after, inside the
+    # still-live outer transaction) survived.
+    assert [r[0] for r in conn.execute("SELECT id FROM run ORDER BY id")] == ["r2"]
+
+    # The savepoint stack was left clean, not wedged: an unrelated LATER
+    # transaction on the same connection still commits normally rather than
+    # erroring on a dangling SAVEPOINT name or an unbalanced RELEASE.
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+            " started_us, status)"
+            " VALUES('r3','e1','manual','production',3,'running')"
+        )
+    assert conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 2
+
+
+def test_nested_transaction_outer_failure_rolls_back_everything(tmp_path: Path):
+    """RELEASING a savepoint is not committing: SQLite only durably commits
+    at the outermost COMMIT, so a nested `transaction()` that succeeds and
+    releases cleanly is only provisionally applied. If the OUTER block later
+    fails, its ROLLBACK must undo the released inner work too -- a savepoint
+    path that let committed-looking inner work survive an outer rollback
+    would make a partial write look atomic, which is worse than the bug this
+    replaces."""
+    conn = db.connect(tmp_path / "hx.db")
+    db.init_schema(conn)
+    with pytest.raises(RuntimeError, match="outer failure"):
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO engagement(id, name, client, created_us, status)"
+                " VALUES('e1','acme','Acme',1,'active')"
+            )
+            with db.transaction(conn):
+                conn.execute(
+                    "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                    " started_us, status)"
+                    " VALUES('r1','e1','manual','production',1,'running')"
+                )
+            # The nested transaction above released cleanly. It must not
+            # have escaped the outer transaction's authority regardless.
+            raise RuntimeError("outer failure")
+    assert conn.execute("SELECT COUNT(*) FROM engagement").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+
+
+# --- Fix round 1, F5: nesting must be tracked explicitly, not inferred from
+# `conn.in_transaction` -- that flag cannot distinguish an outer
+# `transaction()` call from sqlite3's own driver-implicit BEGIN. ---
+
+
+def test_transaction_fails_loudly_rather_than_losing_data_on_a_driver_implicit_transaction(
+    tmp_path: Path,
+):
+    """F5 of the task-6 review. Deliberately NOT `db.connect()`, which always
+    passes `isolation_level=None` -- this is sqlite3's own DEFAULT isolation
+    mode, which auto-opens a transaction before the first DML statement.
+
+    Under the OLD (`conn.in_transaction`-based) implementation this is
+    exactly the failure: `conn.in_transaction` is already `True` from the
+    driver's own implicit BEGIN, so `transaction()` mistook it for nesting,
+    took the SAVEPOINT path, and RELEASEd without ever COMMITting -- the
+    INSERT below would survive the `with` block in memory but vanish on
+    close, silently. MEASURED before this fix: the row was gone from a fresh
+    connection to the same file, no exception anywhere.
+
+    Tracking nesting with `db._OPEN_TRANSACTIONS` (keyed by `id(conn)`,
+    populated only by `transaction()` itself) instead means this connection's
+    id was never added by us, so `transaction()` takes the OUTERMOST path --
+    and a `BEGIN` against a connection sqlite3 already opened one on fails
+    LOUDLY, exactly as it did before Task 6 existed.
+    """
+    path = tmp_path / "hx.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    db.init_schema(conn)
+    conn.execute(
+        "INSERT INTO engagement(id, name, client, created_us, status)"
+        " VALUES('e1','acme','Acme',1,'active')"
+    )
+    assert conn.in_transaction, "the driver's own implicit BEGIN, not ours"
+
+    with pytest.raises(sqlite3.OperationalError, match="transaction"):
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO run(id, engagement_id, kind, safety_profile,"
+                " started_us, status)"
+                " VALUES('r1','e1','manual','production',1,'running')"
+            )
+    conn.rollback()
+    conn.close()
+
+    # Nothing was silently lost OR silently kept: the whole implicit
+    # transaction -- including the engagement row that predated the failed
+    # `transaction()` call -- rolled back, because sqlite3 refused to let it
+    # proceed at all. A fresh connection to the same file sees neither row.
+    reread = sqlite3.connect(str(path))
+    assert reread.execute("SELECT COUNT(*) FROM engagement").fetchone()[0] == 0
+    assert reread.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0
+    reread.close()
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -727,7 +869,42 @@ CREATE TABLE IF NOT EXISTS finding (
   id                 TEXT PRIMARY KEY,
   engagement_id      TEXT NOT NULL REFERENCES engagement(id),
   dedupe_key         TEXT NOT NULL,
+  -- TWO DIFFERENT AXES, added at two different times, and the collision
+  -- between them is exactly the thing this comment exists to foreclose.
+  --
+  -- issue_type_id: WHAT KIND OF ISSUE THIS IS. Spec S10/S12: report text,
+  -- severity and CWE mappings come from Burp's 183 vendored issue
+  -- definitions, so a report reads in the same vocabulary a Pro user's
+  -- would. Adopting those ids is still a later plan's job; until then each
+  -- check names its own stable value -- lowercase kebab (`missing-hsts`)
+  -- unless the id has to carry a name the protocol treats as case-sensitive,
+  -- as `cookie_flags` does for the cookie -- and swapping in Burp's
+  -- vocabulary later is a change of SPELLING on this axis, not a change of
+  -- what the axis means. NOT to be used for anything
+  -- else, including the column immediately below.
+  --
+  -- WRITTEN, and part of identity, since F1 of the whole-branch review
+  -- (HIGH). It is the 2nd part of `finding.dedupe_key` (see
+  -- `records.dedupe_key`), because every other part of that key is fixed by
+  -- the check and the surface: without it, three security headers missing
+  -- from one response filed ONE finding wearing the first candidate's title
+  -- and the last candidate's severity. This column being DECLARED AND
+  -- UNWRITTEN is also what made it look like a free slot to the earlier fix
+  -- described below; it is neither free nor unwritten now.
+  --
+  -- check_id: WHICH hx CHECK FOUND THIS, added at SCHEMA_VERSION 7 (fix
+  -- round 2 of Task 6). `hx.scan._mark_unobserved` needs to know, for a
+  -- retest, whether the SAME check that produced a finding ran clean on the
+  -- SAME surface again this run -- surface alone was measured to mark a
+  -- finding "observed=0" (which a report renders as FIXED) even when the
+  -- check that owns it crashed, went inconclusive, or never ran this run at
+  -- all (F1 of the task-6 review, HIGH). `issue_type_id` briefly carried
+  -- `check.id` for this purpose between fix rounds 1 and 2 -- WRONG, because
+  -- it collides with the axis above the day a later plan starts writing
+  -- real Burp issue-type ids here, with nothing at the schema level to catch
+  -- the two fighting over one column. This column is that catch.
   issue_type_id      TEXT,
+  check_id           TEXT,
   title              TEXT NOT NULL,
   description        TEXT,
   impact             TEXT,
@@ -943,6 +1120,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
@@ -960,7 +1138,31 @@ from hx.store.paths import secure_mkdir
 # rather than failing, which is the guess the DEFAULT was removed to stop.
 # `engagement.open_`'s comparison against this constant is the only thing in
 # the tree that can notice either.
-SCHEMA_VERSION = 6
+#
+# 6 -> 7 (2026-08-27, Task 6 fix round 2): `finding` gained `check_id`,
+# additive and nullable -- no existing row's meaning changes, so this bump
+# exists only to make an old store's absence of the column loud
+# (`engagement.open_`'s version check) rather than something a later reader
+# discovers by getting a `sqlite3.OperationalError: no such column` from a
+# query it had every right to assume would work. See schema.sql's own
+# comment on `finding.check_id` for why the column exists: it is NOT the
+# same axis as `finding.issue_type_id`, and conflating the two was reachable
+# without one.
+# 7 -> 8 (2026-08-27, whole-branch review fix round A): NO DDL CHANGE, and
+# the bump is deliberate anyway. `finding.dedupe_key`'s FORMAT changed --
+# `records.dedupe_key` gained `issue_type_id` as its 2nd part (F1, HIGH),
+# and blanks `method`/`path_template` for a host-scoped finding and the
+# whole location for an engagement-scoped one (F3, MEDIUM) --
+# so every key an older store holds is spelled in a format this code will
+# never produce again. Nothing would fail: the UNIQUE constraint is on the
+# string, so the first scan against such a store simply re-files every
+# finding it already holds as new, with `first_seen_run` reset and the
+# operator's triage stranded on the old row. That is precisely the silent
+# outcome the 6 -> 7 comment above says this constant exists to make loud,
+# and "the column list did not change" is not the test -- whether an older
+# file still MEANS what this code assumes is. `engagement.open_`'s version
+# check is the only thing in the tree that can notice.
+SCHEMA_VERSION = 8
 
 TABLES: tuple[str, ...] = (
     "engagement",
@@ -1025,6 +1227,27 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
+# Connections `transaction()` currently owns the OUTER `BEGIN` for, tracked
+# by `id(conn)` rather than as an attribute ON the connection -- MEASURED:
+# `sqlite3.Connection` (and a bare subclass of it) refuses arbitrary
+# attribute assignment (`AttributeError: 'sqlite3.Connection' object has no
+# attribute ...`) and is not weak-referenceable either, so there is no
+# per-object place on the connection itself to record this. `id()`-keying is
+# safe against id-reuse specifically because the only code that ever inserts
+# a key also removes it, in a `finally`, before returning -- and for the
+# whole of that window the caller holds a live reference to `conn` on the
+# stack (it is the function's own argument), so the object cannot be
+# garbage-collected and its id() handed to something else while the key is
+# live. See F5 of the task-6 review for why this exists at all: `db.py`'s
+# previous version asked `conn.in_transaction`, which cannot distinguish an
+# OUTER `transaction()` call from sqlite3's own driver-implicit `BEGIN` (any
+# connection not opened with `isolation_level=None` opens one before its
+# first DML statement) -- and on such a connection, MEASURED, the old code
+# took the SAVEPOINT path, `RELEASE`d, and never `COMMIT`ted: a loud
+# `OperationalError` became silent data loss.
+_OPEN_TRANSACTIONS: set[int] = set()
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection):
     """Group statements into one all-or-nothing unit.
@@ -1038,18 +1261,89 @@ def transaction(conn: sqlite3.Connection):
     forgetting. `hx.capture.on_exchange` is the first of those and did forget
     -- it wrote four statements unwrapped, and `upsert_surface` failing left a
     committed exchange row with a NULL `surface_id` behind it.
+
+    REENTRANT, since Task 6. `conn.execute("BEGIN")` against a connection
+    already inside a transaction raises
+    `OperationalError: cannot start a transaction within a transaction` --
+    MEASURED, the first time `hx.scan.run` called `records.record_evidence`
+    (which wraps itself in `transaction(conn)`) from inside its own
+    `_write_finding`, itself wrapped in `transaction(conn)`. A caller
+    composing two already-atomic helpers into one atomic unit is exactly the
+    "more call sites... in later plans" this docstring already predicted, so
+    the helper -- not either call site -- is what learns to nest.
+
+    WHICH PATH RUNS IS DECIDED BY OUR OWN `_OPEN_TRANSACTIONS` MARKER, NEVER
+    BY `conn.in_transaction`. That flag reflects the DRIVER's state, not
+    OURS, and the two are different questions: it is true both when this
+    function opened the transaction and when sqlite3's own default isolation
+    mode auto-began one behind our back, and `transaction()` needs to answer
+    only the first. Outermost (this connection's id not in the marker set):
+    a plain `BEGIN`/`COMMIT`/`ROLLBACK`, unchanged from before -- MEASURED
+    against `hx.capture.on_exchange`, the merged, reviewed, non-nested
+    caller, whose own tests (`tests/test_capture.py`) still pass unmodified.
+    Nested (this connection's id already in the marker set, because an outer
+    `transaction()` call is still on the stack): a named `SAVEPOINT`,
+    released on success or rolled back to (then released) on failure, before
+    re-raising -- so an inner failure undoes only the inner block's writes
+    and the exception still propagates, while the OUTER transaction is left
+    exactly as if the inner block had never run, free to retry or to fail on
+    its own account.
+
+    A connection that never goes through an outer `transaction()` call at
+    all -- one where sqlite3's own driver opened an implicit transaction on
+    its own -- is never in the marker set, so it always takes the OUTERMOST
+    path here and gets the loud `OperationalError` a doubled `BEGIN`
+    produces, exactly as before this function existed. That is deliberate:
+    see F5 above for what happened when nesting was instead inferred from
+    `conn.in_transaction`.
+
+    RELEASING A SAVEPOINT IS NOT COMMITTING. SQLite only durably commits at
+    the outermost `COMMIT` -- a `RELEASE` just folds the inner block's writes
+    into the still-open outer transaction, so if the OUTER block later fails,
+    its `ROLLBACK` undoes the released inner work too, not just what the
+    outer block wrote itself. MEASURED both directions below (both are pinned
+    in `tests/test_db.py`):
+
+      * inner raises: the inner INSERT is gone, the exception propagates, and
+        a SEPARATE inner transaction run afterwards on the same connection
+        commits normally -- the savepoint stack was left clean, not wedged.
+      * outer raises, after a nested transaction already ran and released
+        cleanly inside it: the inner block's INSERT is ALSO gone. A savepoint
+        path that let it survive would make a partial write look atomic,
+        which is worse than the bug this replaces.
     """
-    conn.execute("BEGIN")
+    key = id(conn)
+    if key not in _OPEN_TRANSACTIONS:
+        _OPEN_TRANSACTIONS.add(key)
+        try:
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass  # transaction already gone; do not mask the original error
+                raise
+            else:
+                conn.execute("COMMIT")
+        finally:
+            _OPEN_TRANSACTIONS.discard(key)
+        return
+
+    name = f"sp_{uuid.uuid4().hex}"
+    conn.execute(f"SAVEPOINT {name}")
     try:
         yield conn
     except BaseException:
         try:
-            conn.execute("ROLLBACK")
+            conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            conn.execute(f"RELEASE SAVEPOINT {name}")
         except sqlite3.Error:
-            pass  # transaction already gone; do not mask the original error
+            pass  # savepoint already gone; do not mask the original error
         raise
     else:
-        conn.execute("COMMIT")
+        conn.execute(f"RELEASE SAVEPOINT {name}")
 ```
 
 - [ ] **Step 6: Run tests to verify they pass**
@@ -2695,6 +2989,7 @@ git commit -m "feat(engagement): isolated engagement directories with append-onl
 
 ```python
 # tests/test_cli.py
+import os
 import shutil
 from pathlib import Path
 
@@ -2705,6 +3000,7 @@ from hx import cli
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
 from hx import run as run_mod
+from hx import scan as scan_mod
 from hx.store import records as records_mod
 
 
@@ -3469,6 +3765,225 @@ def test_deleting_the_sentinel_by_hand_leaves_the_two_sides_disagreeing(engageme
     result = CliRunner().invoke(cli.main, ["resume", "--root", str(engagement)])
     assert result.exit_code == 0, result.output
     assert _halt_state(engagement)[0] is False
+
+
+# --- Task 7: `hx scan` ---
+
+
+@pytest.fixture
+def engagement_with_surface(engagement: Path) -> Path:
+    """One `surface` row and one `exchange` against it, so a passive check --
+    `active_safe`, `active_mutate` and `active_dos` all default to `probes`,
+    not `on_surface`, and this plan ships none of those -- has something to
+    read. Built on `engagement` the way `engagement_with_drops` and
+    `engagement_with_stale_run` are, per P2: this fixture did not exist
+    before this task."""
+    eng = eng_mod.open_(engagement)
+    try:
+        eng.db.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+            " port, path_template, discovered_by, normaliser_version)"
+            " VALUES('s1', ?, 'GET', 'https', 'app.acme.com', 443,"
+            " '/api/widgets', 'proxy', 1)",
+            (eng.id,))
+        records_mod.record_exchange(
+            eng.db, run_id=None, method="GET",
+            url="https://app.acme.com/api/widgets", status=200,
+            req_blob=None, resp_blob=None, ms=0, at_us=eng_mod.now_us(),
+            outcome="ok", surface_id="s1")
+    finally:
+        eng.db.close()
+    return engagement
+
+
+def test_scan_reports_what_it_ran(engagement_with_surface):
+    result = CliRunner().invoke(cli.main,
+                                ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    assert "surfaces" in result.output.lower()
+
+
+_FLAGLESS_COOKIE_RESPONSE = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Set-Cookie: session=abc; Path=/\r\n"
+    b"\r\n"
+)
+
+
+def test_scan_prints_the_number_of_findings_the_store_holds(engagement):
+    """D3 of the fix-round-A re-review. Forty surfaces of ONE host, all
+    setting one flagless cookie: `cookie_flags` is `scope_level='host'`, so
+    F3 of the whole-branch review makes the forty candidates land on ONE
+    finding row, and the line an operator reads has to say so.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against the
+    per-candidate counter: `findings  40` printed while `SELECT COUNT(*)
+    FROM finding` was 1 -- the exact forty tickets F3 exists to prevent,
+    removed from the report and left at the terminal. Forty rather than two
+    because a number that is wrong by one is a number someone argues about.
+    """
+    eng = eng_mod.open_(engagement)
+    try:
+        digest, length = eng.blobs.put(_FLAGLESS_COOKIE_RESPONSE)
+        for n in range(40):
+            eng.db.execute(
+                "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+                " port, path_template, discovered_by, normaliser_version)"
+                " VALUES(?, ?, 'GET', 'https', 'app.acme.com', 443, ?,"
+                " 'proxy', 1)",
+                (f"s{n}", eng.id, f"/p{n}"))
+            records_mod.record_exchange(
+                eng.db, run_id=None, method="GET",
+                url=f"https://app.acme.com/p{n}", status=200,
+                req_blob=None, resp_blob=digest, resp_len=length, ms=0,
+                at_us=eng_mod.now_us(), outcome="ok", surface_id=f"s{n}")
+    finally:
+        eng.db.close()
+
+    result = CliRunner().invoke(cli.main, ["scan", "--root", str(engagement)])
+
+    assert result.exit_code == 0, result.output
+    assert "findings  1" in result.output, result.output
+    eng = eng_mod.open_(engagement)
+    try:
+        held = eng.db.execute("SELECT COUNT(*) FROM finding").fetchone()[0]
+    finally:
+        eng.db.close()
+    assert held == 1, (
+        "the line the operator reads and the rows the report renders "
+        "disagreed")
+
+
+def test_scan_names_a_class_that_is_enabled_but_ships_no_checks(engagement_with_surface):
+    """config.DEFAULT_CHECKS turns `active_timing` ON by default and this
+    plan ships no checks in it. An operator reading `active_timing: enabled`
+    and seeing no rows would reasonably conclude it ran and found nothing.
+    The scan says so out loud instead."""
+    result = CliRunner().invoke(cli.main,
+                                ["scan", "--root", str(engagement_with_surface)])
+    assert "active_timing" in result.output
+    assert "no checks" in result.output.lower()
+
+
+def test_scan_with_no_surfaces_says_so_rather_than_reporting_success(engagement):
+    """Nothing captured yet is not the same as nothing found. An operator who
+    forgot to browse must not read `0 findings` as a clean bill."""
+    result = CliRunner().invoke(cli.main, ["scan", "--root", str(engagement)])
+    assert result.exit_code == 0, result.output
+    assert "no surfaces" in result.output.lower()
+
+
+def test_scan_refuses_a_root_that_is_not_an_engagement(tmp_path):
+    result = CliRunner().invoke(cli.main, ["scan", "--root", str(tmp_path)])
+    assert result.exit_code != 0
+    assert result.output.strip()
+
+
+def test_scan_max_seconds_reaches_the_runner(engagement_with_surface, monkeypatch):
+    """Row C of the sweep: none of the tests above ever pass `--max-seconds`,
+    so a CLI that silently dropped it in favour of `max_seconds=None` on the
+    call to `scan.run` would leave every test above green. A deadline already
+    in the past is the input that separates 'wired through' from 'ignored' --
+    it only truncates the scan if the CLI's own option actually reaches
+    `scan.run`. `time.monotonic` is patched the same way
+    `test_budget_exhaustion_writes_skipped_rows_for_the_remaining_surfaces`
+    in `tests/test_scan.py` does it: one call to compute the deadline, one
+    call for the single surface `engagement_with_surface` seeds."""
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setattr(scan_mod.time, "monotonic", lambda: next(ticks))
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface), "--max-seconds", "0",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "surfaces  0" in result.output
+    assert "skipped" in result.output.lower()
+
+
+# --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---
+# --- what that gap already cost -----------------------------------------
+
+def test_report_writes_a_file_and_says_where(engagement_with_surface):
+    result = CliRunner().invoke(cli.main,
+                                ["report", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    assert target.exists()
+    assert str(target) in result.output
+
+
+def test_report_default_export_is_never_looser_than_0o600(engagement_with_surface):
+    """§3, unconditional. F2: `write_text` then `chmod` used to leave the
+    file at `0o644` for the window between them; there is no window left to
+    measure from the outside once the file exists, so this pins the mode
+    the file ends at -- the live end-to-end half of F2's fix, the write-time
+    window itself is what `_write_export_secure`'s O_EXCL-at-final-mode
+    shape (`cli.py`) exists to close."""
+    CliRunner().invoke(cli.main,
+                       ["report", "--root", str(engagement_with_surface)])
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_report_out_creates_new_directories_at_0o700_not_the_umask(engagement_with_surface, tmp_path):
+    """F2's exact measured repro: `--out <somewhere>/nested/report.md`, where
+    neither `nested` directory exists yet. The old
+    `target.parent.mkdir(parents=True, exist_ok=True)` created both at the
+    ambient umask (`755` under `022`, measured in the review) -- including
+    when the path was inside the engagement root, which §3 governs
+    unconditionally. `secure_mkdir` must leave every directory it creates at
+    `0o700`, never looser, with no window.
+
+    R3 (fix round 2): the umask is set explicitly here, LOOSE (`022`), and
+    restored after. Without this the test's separating power depended on
+    whatever umask the developer's or CI's shell happened to have: under a
+    restrictive ambient umask (`077`), the OLD buggy `mkdir(parents=True)`
+    creates directories at `0o777 & ~0o077 == 0o700` too -- the same result
+    the fix produces -- so the mutation this test exists to catch would pass
+    vacuously there. A guard whose discriminating power depends on the
+    environment it happens to run in is one that will quietly stop testing.
+    """
+    old_umask = os.umask(0o022)
+    try:
+        target = tmp_path / "handoff" / "client" / "acme.md"
+        result = CliRunner().invoke(cli.main, [
+            "report", "--root", str(engagement_with_surface), "--out", str(target),
+        ])
+    finally:
+        os.umask(old_umask)
+    assert result.exit_code == 0, result.output
+    assert target.exists()
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    assert oct((tmp_path / "handoff").stat().st_mode & 0o777) == "0o700"
+    assert oct((tmp_path / "handoff" / "client").stat().st_mode & 0o777) == "0o700"
+
+
+def test_report_redacts_a_credential_reaching_the_export(engagement_with_surface):
+    """F1/F12: the export-side redaction the review found missing, exercised
+    through the real CLI command rather than `report.render` directly --
+    F2's own defect was found exactly this way, by driving the command
+    end-to-end rather than trusting the unit-level render tests alone. The
+    finding is hand-inserted rather than written through `records.py`'s own
+    writers, the same way `records.record_exchange`/`record_denial` already
+    redact at write time and would mask the gap this checks for."""
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        eng.db.execute(
+            "INSERT INTO finding(id, engagement_id, dedupe_key, title,"
+            " severity, confidence, created_by, status, scope_level)"
+            " VALUES('f-1', ?, 'k1',"
+            " 'Token leak: https://admin:hunter2@app.acme.com/x?access_token=SECRETTOKEN',"
+            " 'Medium', 'Firm', 'check', 'new', 'surface')",
+            (eng.id,))
+    finally:
+        eng.db.close()
+    result = CliRunner().invoke(cli.main,
+                                ["report", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    target = engagement_with_surface / "exports" / "acme-2026-09.md"
+    text = target.read_text(encoding="utf-8")
+    assert "SECRETTOKEN" not in text
+    assert "hunter2" not in text
+    assert "Token leak" in text
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3490,6 +4005,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import uuid
 from pathlib import Path
 
 import click
@@ -3497,8 +4013,12 @@ import click
 from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import report as report_mod
 from hx import run as run_mod
+from hx import scan as scan_mod
+from hx.checks import registry
 from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -3870,6 +4390,109 @@ def resume(root) -> None:
             f"resume failed and the halt still stands ({oh.sentinel_path}): {exc}"
         ) from exc
     click.echo(f"issuance resumed; the halt was: {was}")
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--max-seconds", type=int, default=None,
+              help="Stop after this long. Remaining checks are recorded as "
+                   "skipped, never left absent.")
+def scan(root, max_seconds) -> None:
+    """Run the enabled check corpus over everything captured so far."""
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        surfaces = eng.db.execute(
+            "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
+            (eng.id,)).fetchone()[0]
+        if surfaces == 0:
+            # NOT an error, and not silence either. Nothing captured is a
+            # different fact from nothing found, and an operator who forgot
+            # to browse must not read `0 findings` as a clean bill.
+            click.echo("no surfaces captured yet -- browse the target "
+                       "through the proxy first, then scan")
+            return
+
+        summary = scan_mod.run(
+            eng.db, engagement_id=eng.id, blobs=eng.blobs,
+            config=eng.config, max_seconds=max_seconds)
+        click.echo(f"surfaces  {summary.surfaces}")
+        click.echo(f"checks    {summary.checks_run}")
+        click.echo(f"findings  {summary.findings}")
+        if summary.skipped:
+            for reason, n in sorted(summary.by_reason.items()):
+                click.echo(f"skipped   {n} ({reason})")
+
+        # A class the operator enabled that this build ships nothing for.
+        # Without this line, `active_timing: true` plus no rows reads as
+        # "ran, found nothing".
+        for klass, on in sorted(eng.config.checks.items()):
+            if on and not any(c.klass == klass for c in registry.CHECKS):
+                click.echo(f"note      {klass} is enabled but this build "
+                           f"ships no checks in it")
+    finally:
+        eng.db.close()
+
+
+def _write_export_secure(path: Path, text: str) -> None:
+    """Atomically write the report at 0o600, never briefly looser.
+
+    Fix round 1, F2: `target.parent.mkdir(parents=True, exist_ok=True)`
+    followed by `write_text` then `chmod` created directories at the ambient
+    umask (`755` under `umask 022`, measured, including directories nested
+    inside the engagement root when `--out` named one) and left the file
+    itself at `0o644` for the window between the write and the chmod, on
+    every invocation. §3 is unconditional -- "engagement directories `0o700`,
+    files `0o600`, never looser" -- and a client report earns no less care
+    than `config.yaml` or the halt sentinel.
+
+    Same shape as `engagement._write_config_secure` and
+    `halt.OperatorHalt._write_sentinel`, for the same reasons: `O_EXCL` at
+    the final mode so the file never exists world-readable even for an
+    instant, and a rename so a reader never sees a partial write. Not a
+    shared import of either -- this codebase's own precedent
+    (`halt._write_sentinel`'s docstring: "Same shape as
+    `engagement._write_config_secure`, for the same reasons") is to
+    duplicate this exact shape per module with a cross-reference, not to
+    import a leading-underscore name across module boundaries.
+    """
+    path = Path(path)
+    tmp = path.parent / f".{uuid.uuid4().hex}.{path.name}"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--out", type=click.Path(path_type=Path), default=None,
+              help="Where to write it. Defaults to <engagement>/exports/.")
+def report(root, out) -> None:
+    """Render the engagement as one Markdown file."""
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        text = report_mod.render(eng.db, engagement_id=eng.id,
+                                 config=eng.config, blobs=eng.blobs)
+        target = out or (eng.root / "exports" / f"{eng.config.name}.md")
+        secure_mkdir(target.parent)   # S3: 0o700, never looser, no window
+        _write_export_secure(target, text)   # S3: 0o600, never looser
+        click.echo(f"wrote {target}")
+    finally:
+        eng.db.close()
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**

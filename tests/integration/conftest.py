@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import socket
 import subprocess
+import time
 import uuid
 import warnings
 from dataclasses import dataclass, field
@@ -337,6 +339,98 @@ class Rig:
         the old shape after any change to either.
         """
         return self.send(method, target_path, guarded=False, **kwargs)
+
+    # Long enough for a frame that crosses a Unix socket in under a
+    # millisecond once the response is complete (measured in
+    # tests/integration/test_proxy_capture.py, where this constant and the
+    # two methods below it lived until Task 9: the row was on disk 50 ms
+    # after the client's response on every run taken there), short enough
+    # that a wedged extension is a failure in seconds rather than a stalled
+    # suite.
+    SETTLE_S = 10.0
+
+    def browse(self, method: str, path: str, *, port: int | None = None,
+               to: "TargetServer | None" = None,
+               headers: Sequence[tuple[str, str]] = (), body: bytes = b"",
+               timeout: float = 30.0) -> bytes:
+        """One request through Burp's PROXY LISTENER, and the whole response
+        off the wire.
+
+        THE OTHER ROUTE. `send` goes through the bridge -- Burp's send call,
+        driven by an operator tool. This goes through the listener a real
+        browser would be pointed at, which is the one path `ProxyGate`
+        guards and the one a browsing session actually produces traffic on.
+        Nothing that only calls `send` has ever driven this side of the
+        extension.
+
+        THE FORWARD-PROXY form: the request line carries the absolute URI,
+        which is how a browser configured to use a proxy addresses one and
+        how the destination reaches Burp at all. The `Host` line is set to
+        match only so the target server sees a well-formed request.
+
+        Raw sockets rather than `http.client` for the same reason
+        `test_proxy_facts._Probe.raw_through_proxy` uses them: the byte
+        count of the FULL response is half of what a drop is recognised by,
+        and no http.client API exposes it. Reading to EOF is bounded twice
+        over -- the socket timeout above, and Burp closing the connection
+        itself.
+
+        `port` defaults to the OPERATOR listener. The crawler's is
+        `self.crawler_port` and the difference between them is the whole of
+        S4's source attribution.
+        """
+        dest = to or self.target
+        lines = [f"{method} {dest.origin}{path} HTTP/1.1",
+                 f"Host: {dest.host}:{dest.port}",
+                 "Connection: close"]
+        lines += [f"{name}: {value}" for name, value in headers]
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        # ISO-8859-1 for the same reason Sender.parse reads it that way: HTTP
+        # field values are octets, and one octet is one char here.
+        raw = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
+        sock = socket.create_connection(("127.0.0.1", port or self.proxy_port),
+                                        timeout=timeout)
+        try:
+            sock.sendall(raw)
+            chunks = []
+            while chunk := sock.recv(65536):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            sock.close()
+
+    def settle(self, predicate, what: str, timeout: float = SETTLE_S) -> None:
+        """Wait for a row to arrive, and say WHY it did not if it never does.
+
+        THE RECORD ARRIVES AFTER THE RESPONSE, so every row this waits for is
+        POLLED rather than read once. Measured (test_proxy_capture.py):
+        browsing five times and reading the table the instant each client
+        response completed gave 1, 1, 2, 3, 4 rows -- the capture frame
+        crosses the bridge on its own thread, behind the browser.
+
+        THE MESSAGE IS THE POINT, carried over unchanged from where this
+        lived before Task 9 moved it here. A sink that raises produces
+        exactly the same observable as an extension that sent nothing -- an
+        empty table -- and the two have opposite fixes. `exchange_errors`
+        and `exchange_callback_error` are the only things on this side that
+        can tell them apart, so they are in every timeout message rather
+        than left for whoever is debugging to find.
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            if predicate():
+                return
+            time.sleep(0.1)
+        pytest.fail(
+            f"{what} never arrived within {timeout}s. This side's sink failed "
+            f"{self.srv.exchange_errors} time(s), last: "
+            f"{self.srv.exchange_callback_error!r}. A sink that throws is caught, "
+            "counted and swallowed by BridgeServer._capture -- deliberately -- so "
+            "an empty table is what a BROKEN HARNESS looks like as well as a "
+            "silent extension. Read that number before reading Burp's log at "
+            f"{self.workdir / 'burp' / 'burp.log'}. Target log: "
+            f"{[(h.method, h.path) for h in self.target.hits]}")
 
 
 @pytest.fixture

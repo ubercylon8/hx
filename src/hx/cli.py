@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import uuid
 from pathlib import Path
 
 import click
@@ -15,8 +16,12 @@ import click
 from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import report as report_mod
 from hx import run as run_mod
+from hx import scan as scan_mod
+from hx.checks import registry
 from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -388,3 +393,106 @@ def resume(root) -> None:
             f"resume failed and the halt still stands ({oh.sentinel_path}): {exc}"
         ) from exc
     click.echo(f"issuance resumed; the halt was: {was}")
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--max-seconds", type=int, default=None,
+              help="Stop after this long. Remaining checks are recorded as "
+                   "skipped, never left absent.")
+def scan(root, max_seconds) -> None:
+    """Run the enabled check corpus over everything captured so far."""
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        surfaces = eng.db.execute(
+            "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
+            (eng.id,)).fetchone()[0]
+        if surfaces == 0:
+            # NOT an error, and not silence either. Nothing captured is a
+            # different fact from nothing found, and an operator who forgot
+            # to browse must not read `0 findings` as a clean bill.
+            click.echo("no surfaces captured yet -- browse the target "
+                       "through the proxy first, then scan")
+            return
+
+        summary = scan_mod.run(
+            eng.db, engagement_id=eng.id, blobs=eng.blobs,
+            config=eng.config, max_seconds=max_seconds)
+        click.echo(f"surfaces  {summary.surfaces}")
+        click.echo(f"checks    {summary.checks_run}")
+        click.echo(f"findings  {summary.findings}")
+        if summary.skipped:
+            for reason, n in sorted(summary.by_reason.items()):
+                click.echo(f"skipped   {n} ({reason})")
+
+        # A class the operator enabled that this build ships nothing for.
+        # Without this line, `active_timing: true` plus no rows reads as
+        # "ran, found nothing".
+        for klass, on in sorted(eng.config.checks.items()):
+            if on and not any(c.klass == klass for c in registry.CHECKS):
+                click.echo(f"note      {klass} is enabled but this build "
+                           f"ships no checks in it")
+    finally:
+        eng.db.close()
+
+
+def _write_export_secure(path: Path, text: str) -> None:
+    """Atomically write the report at 0o600, never briefly looser.
+
+    Fix round 1, F2: `target.parent.mkdir(parents=True, exist_ok=True)`
+    followed by `write_text` then `chmod` created directories at the ambient
+    umask (`755` under `umask 022`, measured, including directories nested
+    inside the engagement root when `--out` named one) and left the file
+    itself at `0o644` for the window between the write and the chmod, on
+    every invocation. §3 is unconditional -- "engagement directories `0o700`,
+    files `0o600`, never looser" -- and a client report earns no less care
+    than `config.yaml` or the halt sentinel.
+
+    Same shape as `engagement._write_config_secure` and
+    `halt.OperatorHalt._write_sentinel`, for the same reasons: `O_EXCL` at
+    the final mode so the file never exists world-readable even for an
+    instant, and a rename so a reader never sees a partial write. Not a
+    shared import of either -- this codebase's own precedent
+    (`halt._write_sentinel`'s docstring: "Same shape as
+    `engagement._write_config_secure`, for the same reasons") is to
+    duplicate this exact shape per module with a cross-reference, not to
+    import a leading-underscore name across module boundaries.
+    """
+    path = Path(path)
+    tmp = path.parent / f".{uuid.uuid4().hex}.{path.name}"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+@main.command()
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--out", type=click.Path(path_type=Path), default=None,
+              help="Where to write it. Defaults to <engagement>/exports/.")
+def report(root, out) -> None:
+    """Render the engagement as one Markdown file."""
+    path = root or default_root()
+    eng = _open_engagement(path)
+    try:
+        text = report_mod.render(eng.db, engagement_id=eng.id,
+                                 config=eng.config, blobs=eng.blobs)
+        target = out or (eng.root / "exports" / f"{eng.config.name}.md")
+        secure_mkdir(target.parent)   # S3: 0o700, never looser, no window
+        _write_export_secure(target, text)   # S3: 0o600, never looser
+        click.echo(f"wrote {target}")
+    finally:
+        eng.db.close()

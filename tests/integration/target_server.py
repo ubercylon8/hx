@@ -36,6 +36,20 @@ from urllib.parse import parse_qs, urlsplit
 # it, so a change here cannot leave one of them checking a stale literal.
 SESSION_COOKIE_VALUE = "s3cr3t-live-session-2f9a41c0"
 
+# `/login`'s own cookie, byte for byte: `session={SESSION_COOKIE_VALUE};
+# Path=/; HttpOnly; SameSite=Lax`. Task 9 measured `hx.passive.cookie-flags`
+# against it, expecting a finding the way the plan's own brief described the
+# route ("no Secure, HttpOnly or SameSite"), and got `clean`: HttpOnly and
+# SameSite ARE set, and the check does not demand Secure of an http:// origin
+# (`cookie_flags.py`'s own comment says so -- "a Secure cookie on an http://
+# origin is never sent at all"). `/login`'s exact Set-Cookie string is pinned
+# elsewhere -- `tests/test_target_server.py::test_the_login_route_sets_a_
+# cookie_worth_redacting` and `tests/integration/test_send_path.py`'s
+# redaction assertions both match it byte for byte -- so it is not this
+# route's to change. `/insecure-cookie` exists so a check with a real,
+# unambiguous absence to find has one, without touching the frozen string.
+FLAGLESS_COOKIE_VALUE = "s3cr3t-legacy-session-9b21fe70"
+
 # The most /slow will ever sleep, whatever the query string says. A typo in a
 # test ("ms=3600000") would otherwise wedge the suite for an hour with no
 # diagnostic; five seconds is longer than any deadline this suite sets and
@@ -219,6 +233,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(200, {"welcome": True}, extra=[
                 ("Set-Cookie",
                  f"session={SESSION_COOKIE_VALUE}; Path=/; HttpOnly; SameSite=Lax"),
+            ])
+        elif parts.path == "/insecure-cookie":
+            # A `session` cookie with NONE of the three flags
+            # `hx.passive.cookie-flags` looks for -- see FLAGLESS_COOKIE_VALUE's
+            # comment for why /login's own cookie cannot stand in for this.
+            self._reply(200, {"welcome": True}, extra=[
+                ("Set-Cookie", f"session={FLAGLESS_COOKIE_VALUE}"),
             ])
         elif parts.path == "/flaky":
             self._reply(_int_param(params, "status", 500), {"error": "upstream"})

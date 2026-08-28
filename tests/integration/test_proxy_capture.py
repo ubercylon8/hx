@@ -43,58 +43,12 @@ from tests.integration.target_server import SESSION_COOKIE_VALUE
 
 pytestmark = pytest.mark.integration
 
-# Long enough for a frame that crosses a Unix socket in under a millisecond
-# once the response is complete (measured: the row was on disk 50 ms after the
-# client's response on every run taken here), short enough that a wedged
-# extension is a failure in seconds rather than a stalled suite.
-SETTLE_S = 10.0
-
 # What Burp answers a client whose request it dropped. NOT evidence of
 # anything: a DELIVERED request returns 200 too. It is asserted where it
 # appears so that the trap is pinned rather than merely avoided -- if a future
 # Burp ever answers something a client CAN tell apart, that is a better world
 # and this is where it shows up. test_proxy_facts.py pins the byte count.
 DROP_LOOKS_LIKE = 200
-
-
-def browse(rig, path, *, port=None, method="GET", to=None, headers=(),
-           body=b"", timeout=30.0) -> bytes:
-    """One request through Burp's proxy, and the whole response off the wire.
-
-    The FORWARD-PROXY form: the request line carries the absolute URI, which is
-    how a browser configured to use a proxy addresses one and how the
-    destination reaches Burp at all. The `Host` line is set to match only so
-    the target server sees a well-formed request.
-
-    Raw sockets rather than `http.client` for the same reason
-    `test_proxy_facts._Probe.raw_through_proxy` uses them: the byte count of
-    the FULL response is half of what a drop is recognised by, and no
-    http.client API exposes it. Reading to EOF is bounded twice over -- the
-    socket timeout above, and Burp closing the connection itself.
-
-    `port` defaults to the OPERATOR listener. The crawler's is `rig.crawler_port`
-    and the difference between them is the whole of S4's source attribution.
-    """
-    dest = to or rig.target
-    lines = [f"{method} {dest.origin}{path} HTTP/1.1",
-             f"Host: {dest.host}:{dest.port}",
-             "Connection: close"]
-    lines += [f"{name}: {value}" for name, value in headers]
-    if body:
-        lines.append(f"Content-Length: {len(body)}")
-    # ISO-8859-1 for the same reason Sender.parse reads it that way: HTTP field
-    # values are octets, and one octet is one char here.
-    raw = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
-    sock = socket.create_connection(("127.0.0.1", port or rig.proxy_port),
-                                    timeout=timeout)
-    try:
-        sock.sendall(raw)
-        chunks = []
-        while chunk := sock.recv(65536):
-            chunks.append(chunk)
-        return b"".join(chunks)
-    finally:
-        sock.close()
 
 
 def status_of(raw: bytes) -> int:
@@ -117,29 +71,16 @@ def rows(rig, sql: str, args=()) -> list[dict]:
     return [dict(row) for row in rig.eng.db.execute(sql, args).fetchall()]
 
 
-def settle(rig, predicate, what: str, timeout: float = SETTLE_S) -> None:
-    """Wait for a row to arrive, and say WHY it did not if it never does.
-
-    The message is the point. A sink that raises produces exactly the same
-    observable as an extension that sent nothing -- an empty table -- and the
-    two have opposite fixes. `exchange_errors` and `exchange_callback_error`
-    are the only things on this side that can tell them apart, so they are in
-    every timeout message rather than left for whoever is debugging to find.
-    """
-    end = time.time() + timeout
-    while time.time() < end:
-        if predicate():
-            return
-        time.sleep(0.1)
-    pytest.fail(
-        f"{what} never arrived within {timeout}s. This side's sink failed "
-        f"{rig.srv.exchange_errors} time(s), last: "
-        f"{rig.srv.exchange_callback_error!r}. A sink that throws is caught, "
-        "counted and swallowed by BridgeServer._capture -- deliberately -- so "
-        "an empty table is what a BROKEN HARNESS looks like as well as a "
-        "silent extension. Read that number before reading Burp's log at "
-        f"{rig.workdir / 'burp' / 'burp.log'}. Target log: "
-        f"{[(h.method, h.path) for h in rig.target.hits]}")
+# `browse` and `settle` used to live here, as module-level functions taking
+# `rig` as their first argument -- `browse(rig, path, *, method="GET", ...)`.
+# Task 9 lifted both onto `Rig` itself (tests/integration/conftest.py), where
+# a third file needed the same polling loop and the same forward-proxy
+# request builder -- the point past which a copy is a third place to get the
+# bound wrong. `Rig.browse` takes `(method, path, ...)`, matching `Rig.send`'s
+# existing order rather than this file's old one, so every call site below was
+# rewritten from `browse(rig, path, ...)` to `rig.browse("GET", path, ...)`
+# (or `"POST"`, where the old call named `method=` explicitly). `settle`'s
+# signature and failure message did not change.
 
 
 def blob_tree(rig) -> list[bytes]:
@@ -177,7 +118,7 @@ def test_an_in_scope_browse_becomes_an_exchange_row_with_both_blobs(rig):
     """
     assert rig.configure() == 1
 
-    response = browse(rig, "/api/orders")
+    response = rig.browse("GET", "/api/orders")
     assert status_of(response) == 200
 
     # The target's own log FIRST. "hx recorded an exchange" and "the request
@@ -187,7 +128,7 @@ def test_an_in_scope_browse_becomes_an_exchange_row_with_both_blobs(rig):
     assert [(hit.method, hit.path) for hit in rig.target.hits] \
         == [("GET", "/api/orders")]
 
-    settle(rig, lambda: rows(rig, "SELECT id FROM exchange"), "the exchange row")
+    rig.settle(lambda: rows(rig, "SELECT id FROM exchange"), "the exchange row")
     row = rows(rig, "SELECT * FROM exchange")[0]
 
     assert row["method"] == "GET"
@@ -272,7 +213,7 @@ def test_an_out_of_scope_browse_never_reaches_the_target(rig):
     assert [(h.method, h.path) for h in rig.offside.hits] == [("GET", "/health")]
 
     # Control 2: this listener is carrying traffic right now.
-    assert status_of(browse(rig, "/health")) == 200
+    assert status_of(rig.browse("GET", "/health")) == 200
     assert rig.target.hits_for("/health"), \
         "the in-scope control never reached the target, so the refusal below " \
         "would be satisfied by a proxy that is not working at all"
@@ -282,10 +223,10 @@ def test_an_out_of_scope_browse_never_reaches_the_target(rig):
     # it is LISTENING throughout, so a refusal that merely failed to forward is
     # separable from one that stopped the bytes.
     before = len(rig.offside.hits)
-    refused = browse(rig, "/health?out-of-scope=1", to=rig.offside)
+    refused = rig.browse("GET", "/health?out-of-scope=1", to=rig.offside)
 
-    settle(rig, lambda: rows(rig, "SELECT id FROM denial WHERE via='proxy'"),
-           "the denial row")
+    rig.settle(lambda: rows(rig, "SELECT id FROM denial WHERE via='proxy'"),
+              "the denial row")
     # Settled, then given the same window again: the denial arriving proves the
     # extension decided, not that the bytes stayed put. A request that leaked
     # would reach a loopback server well inside this.
@@ -340,12 +281,12 @@ def test_two_ids_under_one_endpoint_are_one_surface(rig):
     assert rig.configure() == 1
 
     for order_id in (1, 2):
-        assert status_of(browse(rig, f"/api/orders/{order_id}")) == 404, \
+        assert status_of(rig.browse("GET", f"/api/orders/{order_id}")) == 404, \
             "the target has no such route, which is fine -- a 404 is an " \
             "exchange like any other and the surface is about the URL"
 
-    settle(rig, lambda: len(rows(rig, "SELECT id FROM exchange")) == 2,
-           "both exchange rows")
+    rig.settle(lambda: len(rows(rig, "SELECT id FROM exchange")) == 2,
+              "both exchange rows")
 
     urls = sorted(row["url"] for row in rows(rig, "SELECT url FROM exchange"))
     assert urls == [f"{rig.target.origin}/api/orders/1",
@@ -412,7 +353,7 @@ def test_a_live_cookie_reaches_the_target_and_never_the_blob_store(rig):
     assert rig.configure() == 1
 
     sent = f"session={SESSION_COOKIE_VALUE}"
-    assert status_of(browse(rig, "/login", headers=[("Cookie", sent)])) == 200
+    assert status_of(rig.browse("GET", "/login", headers=[("Cookie", sent)])) == 200
 
     # Guard 1: the value really was on the wire, in both directions. /login
     # answers with a Set-Cookie carrying the same value.
@@ -421,7 +362,7 @@ def test_a_live_cookie_reaches_the_target_and_never_the_blob_store(rig):
         "the request never carried the cookie, so its absence downstream " \
         "proves nothing at all"
 
-    settle(rig, lambda: rows(rig, "SELECT id FROM exchange"), "the exchange row")
+    rig.settle(lambda: rows(rig, "SELECT id FROM exchange"), "the exchange row")
     row = rows(rig, "SELECT * FROM exchange")[0]
     request_bytes = rig.eng.blobs.get(row["req_blob"])
     response_bytes = rig.eng.blobs.get(row["resp_blob"], row["resp_len"])
@@ -479,22 +420,22 @@ def test_the_operator_listener_allows_the_post_the_crawler_listener_refuses(rig)
     assert rig.configure() == 1
 
     # The operator's POST. Allowed -- scope, and nothing after it.
-    operator = browse(rig, "/api/orders", method="POST", body=b'{"item": 1}')
+    operator = rig.browse("POST", "/api/orders", body=b'{"item": 1}')
     assert status_of(operator) == 201, \
         "the operator branch must not be method-checked; 201 is the target's " \
         "own answer and 200 would be Burp's drop page"
 
-    settle(rig, lambda: rows(rig, "SELECT id FROM exchange WHERE method='POST'"),
-           "the operator's POST exchange")
+    rig.settle(lambda: rows(rig, "SELECT id FROM exchange WHERE method='POST'"),
+              "the operator's POST exchange")
 
     # The SAME request on the OTHER port. Refused: the crawler gets the agent's
     # rules in full and POST is not in `method.allow`.
     before = rig.target.hits_for("/api/orders")
-    crawler = browse(rig, "/api/orders", method="POST", body=b'{"item": 1}',
-                     port=rig.crawler_port)
+    crawler = rig.browse("POST", "/api/orders", body=b'{"item": 1}',
+                         port=rig.crawler_port)
 
-    settle(rig, lambda: rows(rig, "SELECT id FROM denial WHERE kind='method'"),
-           "the crawler's method denial")
+    rig.settle(lambda: rows(rig, "SELECT id FROM denial WHERE kind='method'"),
+              "the crawler's method denial")
     time.sleep(0.5)          # the same window again, for bytes in flight
 
     after = rig.target.hits_for("/api/orders")
@@ -558,11 +499,11 @@ def test_the_first_exchange_opens_a_browse_run_of_its_own(rig):
     manual = rows(rig, "SELECT * FROM run WHERE id=?", (rig.run_id,))[0]
     assert manual["kind"] == "manual" and manual["requests_issued"] == 0
 
-    assert status_of(browse(rig, "/health")) == 200
-    assert status_of(browse(rig, "/api/orders")) == 200
+    assert status_of(rig.browse("GET", "/health")) == 200
+    assert status_of(rig.browse("GET", "/api/orders")) == 200
 
-    settle(rig, lambda: len(rows(rig, "SELECT id FROM exchange")) == 2,
-           "both exchange rows")
+    rig.settle(lambda: len(rows(rig, "SELECT id FROM exchange")) == 2,
+              "both exchange rows")
 
     opened = rows(rig, "SELECT * FROM run WHERE kind='browse'")
     assert len(opened) == 1, \
@@ -631,8 +572,8 @@ def test_a_broken_recorder_does_not_gate_the_browser_but_a_dead_bridge_does(rig)
 
     # A working browse first, so what follows is a CHANGE rather than a state
     # the rig might have been in all along.
-    assert status_of(browse(rig, "/health")) == 200
-    settle(rig, lambda: rows(rig, "SELECT id FROM exchange"), "the first row")
+    assert status_of(rig.browse("GET", "/health")) == 200
+    rig.settle(lambda: rows(rig, "SELECT id FROM exchange"), "the first row")
 
     # --- half one: the recorder breaks, the browser does not ---------------
     def exploding(header, request, response):
@@ -643,7 +584,7 @@ def test_a_broken_recorder_does_not_gate_the_browser_but_a_dead_bridge_does(rig)
     rows_before = len(rows(rig, "SELECT id FROM exchange"))
 
     for i in range(3):
-        broken = browse(rig, f"/api/orders?while-broken={i}")
+        broken = rig.browse("GET", f"/api/orders?while-broken={i}")
         assert status_of(broken) == 200
         # The target's answer, not Burp's page: 41 bytes of orders JSON is
         # something only the target can produce.
@@ -680,7 +621,7 @@ def test_a_broken_recorder_does_not_gate_the_browser_but_a_dead_bridge_does(rig)
         instantaneous.
         """
         before = len(rig.target.hits)
-        browse(rig, "/health?after-the-bridge-died=1")
+        rig.browse("GET", "/health?after-the-bridge-died=1")
         time.sleep(0.3)
         return len(rig.target.hits) == before
 
@@ -697,7 +638,7 @@ def test_a_broken_recorder_does_not_gate_the_browser_but_a_dead_bridge_does(rig)
     # Held, not merely reached: two more browses must change nothing.
     frozen = len(rig.target.hits)
     for i in range(2):
-        after = browse(rig, f"/health?still-dead={i}")
+        after = rig.browse("GET", f"/health?still-dead={i}")
         assert status_of(after) == DROP_LOOKS_LIKE
     time.sleep(0.5)
     assert len(rig.target.hits) == frozen, (
@@ -778,8 +719,8 @@ def test_an_allowed_request_that_cannot_connect_leaves_no_trace_at_all(rig):
 
     # A live request first, so the failure below is a fact about the DEAD
     # target rather than about a path that never worked in this fixture.
-    assert status_of(browse(rig, "/api/orders")) == 200
-    settle(rig, lambda: rows(rig, "SELECT id FROM exchange"), "the live row")
+    assert status_of(rig.browse("GET", "/api/orders")) == 200
+    rig.settle(lambda: rows(rig, "SELECT id FROM exchange"), "the live row")
     live_rows = len(rows(rig, "SELECT id FROM exchange"))
 
     # The destination stays IN SCOPE -- the gate allows it, and the connection
@@ -788,7 +729,7 @@ def test_an_allowed_request_that_cannot_connect_leaves_no_trace_at_all(rig):
     rig.target.stop()
     time.sleep(0.5)
 
-    raw = browse(rig, "/api/orders?the-target-is-gone=1", timeout=20)
+    raw = rig.browse("GET", "/api/orders?the-target-is-gone=1", timeout=20)
     assert status_of(raw) == DROP_LOOKS_LIKE, (
         "Burp answered a failed connection with something other than its own "
         f"200 error page: {raw[:120]!r}")
@@ -796,7 +737,7 @@ def test_an_allowed_request_that_cannot_connect_leaves_no_trace_at_all(rig):
 
     # Long enough for a frame to have crossed the bridge and a row to have
     # been written. The live request above took well under this.
-    time.sleep(SETTLE_S)
+    time.sleep(rig.SETTLE_S)
 
     assert len(rows(rig, "SELECT id FROM exchange")) == live_rows, (
         "an exchange row appeared for a request that never connected. If the "
