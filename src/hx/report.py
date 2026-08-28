@@ -7,9 +7,12 @@ matrix.
 THE COVERAGE SECTION IS THE POINT. Findings are what a client reads first and
 what any tool can produce. What makes a report honest is the part that says
 which checks ran with which verdicts, and (via `_coverage`'s `Surfaces`
-column) how many distinct surfaces each answer covers -- because that is what
-lets someone answer "did you test the password reset flow?" -- and what makes
-a retest mean something. S12: a report that cannot distinguish "tested,
+column) how many distinct surfaces each answer covers, AND -- F2 of fix round
+B -- how many surfaces the engagement captured in the first place and which
+of them nothing ever answered for. A count with no denominator and no surface
+named cannot answer "did you test the password reset flow?", which is the
+question S12 gives as the reason this section exists; the "Never tested" list
+is the half that can. S12: a report that cannot distinguish "tested,
 clean" from "never reached" is worse than no report.
 
 PROVENANCE COMES FROM THE STORE, NEVER FROM `config`. S12's other
@@ -86,6 +89,34 @@ _ORDER = ("Critical", "High", "Medium", "Low", "Info")
 # `evidence`, unbounded, exactly as `record_evidence` left it.
 _EVIDENCE_LIMIT = 5
 
+# How many never-tested surfaces the Coverage section NAMES before it
+# summarises, on the same rule as `_EVIDENCE_LIMIT`: capped, and the cap
+# STATED when it bites, never a silent truncation. Twenty rather than five
+# because this list is the ACTIONABLE set -- "here is what we did not test"
+# is the sentence a client acts on, and a browse-heavy engagement routinely
+# leaves a dozen surfaces behind the last scan.
+_UNTESTED_LIMIT = 20
+
+# How many DISTINCT reasons one coverage row prints before it says how many
+# more there were. See `_coverage` for why the table no longer groups on the
+# reason itself.
+_REASON_LIMIT = 2
+
+# The `check_run.verdict` values that mean a check actually produced an
+# answer about a surface, and therefore that the surface was REACHED.
+#
+# `pending` is excluded because S5 says what it is for in as many words: "a
+# 'pending' row is written BEFORE the check runs, so a crash leaves evidence
+# that the surface was never reached". `skipped` is excluded because it is
+# the runner saying the check never ran -- `hx.scan._skip_rest` writes it
+# when a budget cuts a scan off -- and `hx.checks.base`'s own docstring puts
+# `pending`, `skipped` and `error` on the runner's side of exactly S12's
+# distinction. `error` IS included: the check reached the surface and raised,
+# which is a failure to answer rather than a failure to arrive, and the row
+# renders in the table as `error` where a reader can see no clean answer was
+# obtained.
+_ANSWERED = ("clean", "finding", "inconclusive", "error")
+
 
 def _redact(text) -> str | None:
     """The one choke point every rendered string that might carry a URL
@@ -94,6 +125,23 @@ def _redact(text) -> str | None:
     if text is None:
         return None
     return records.redact_url(str(text))
+
+
+def _flat(value) -> str:
+    """Free text on ONE line, whatever it arrived carrying.
+
+    A newline ends a Markdown table row outright and ends a bullet just as
+    finally, so every rendered free-text value is flattened -- not only the
+    ones that reach a table. Split out of `_cell` by F2 of fix round B,
+    which put free text (a surface's `method` and `path_template`) into
+    BULLETS for the first time: `_cell`'s `|` escaping is right for a table
+    cell and wrong inside a code span, where `\\|` renders as two literal
+    characters.
+    """
+    if value is None:
+        return ""
+    return (str(value).replace("\r\n", " ").replace("\n", " ")
+           .replace("\r", " "))
 
 
 def _cell(value) -> str:
@@ -111,8 +159,7 @@ def _cell(value) -> str:
     """
     if value is None:
         return ""
-    return (str(value).replace("\\", "\\\\").replace("|", "\\|")
-           .replace("\r\n", " ").replace("\n", " ").replace("\r", " "))
+    return _flat(value).replace("\\", "\\\\").replace("|", "\\|")
 
 
 def _when(us) -> str:
@@ -526,7 +573,52 @@ def _evidence(conn, finding_id) -> list[str]:
 
 
 def _coverage(conn, engagement_id, config, *, scanned) -> list[str]:
+    """Which checks answered for which surfaces, and -- F2 of fix round B --
+    which surfaces nothing answered for.
+
+    THE TABLE ALONE CANNOT ANSWER "WHAT DID YOU NOT TEST?". It was four
+    columns of counts with no surface named in any of them and no
+    denominator anywhere, under a sentence promising that "a surface absent
+    from this table was never reached". No surface was ever IN the table, so
+    the promise was unfalsifiable, and the everyday sequence that breaks it
+    is not exotic: browse, scan, browse more, report. Every surface captured
+    after the last scan vanished from coverage in silence. MEASURED by the
+    review: ten captured surfaces with one scanned rendered as four
+    `clean 1` rows and no note. This section now states the denominator and
+    NAMES the surfaces nothing answered for, which is the set a client acts
+    on.
+
+    THE TABLE GROUPS ON (check_id, verdict), NOT ON `reason`. It used to
+    group on the reason too, which was harmless only while a reason was a
+    short controlled word (`budget`). F6 of the previous round made a
+    passive check's `inconclusive` reason NAME THE UNREADABLE EXCHANGE IDS
+    -- `_http._detail`, "x-9f3a: outcome=timeout; x-11c4: no response was
+    stored" -- so two surfaces failing the same way for different exchanges
+    no longer group, and the table gained a row per surface and stopped
+    being a summary. `check_id` and `verdict` are controlled vocabularies
+    fixed by the registry and by `check_run`'s own CHECK constraint, so
+    grouping on them alone bounds the table at corpus x 6 rows however much
+    free text the reason column carries; grouping on attacker-influenced
+    text let one string per surface multiply rows without bound. The reason
+    stays ACTIONABLE by being carried into the row it belongs to: the
+    distinct reasons under a (check, verdict), commonest first, capped at
+    `_REASON_LIMIT` with the remainder counted -- the same cap-and-say-so
+    rule `_evidence` and `_http._detail` already use.
+    """
+    captured = conn.execute(
+        "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
+        (engagement_id,)).fetchone()[0]
+    untested = _untested_surfaces(conn, engagement_id)
+
     out = ["## Coverage\n"]
+    if captured:
+        out.append(f"This assessment captured **{captured} surface(s)**. "
+                   f"**{captured - len(untested)}** had at least one check "
+                   f"return a verdict; **{len(untested)}** had none.\n")
+    else:
+        out.append("**No surface was captured for this engagement**, so "
+                   "there is nothing here for a check to have covered.\n")
+
     if not scanned:
         out.append("This engagement has **not been scanned**. No check has run "
                    "against any surface, so nothing below should be read as "
@@ -540,22 +632,26 @@ def _coverage(conn, engagement_id, config, *, scanned) -> list[str]:
         # three surfaces scanned twice rendered "6". The error is always
         # upward, the one direction a coverage figure must not lie in.
         rows = conn.execute(
-            "SELECT cr.check_id, cr.verdict, COUNT(DISTINCT cr.surface_id),"
-            " cr.reason FROM check_run cr"
+            "SELECT cr.check_id, cr.verdict, COUNT(DISTINCT cr.surface_id)"
+            " FROM check_run cr"
             " JOIN run r ON r.id = cr.run_id WHERE r.engagement_id=?"
-            " GROUP BY cr.check_id, cr.verdict, cr.reason"
+            " GROUP BY cr.check_id, cr.verdict"
             " ORDER BY cr.check_id, cr.verdict", (engagement_id,)).fetchall()
+        reasons = _reasons_by_row(conn, engagement_id)
 
-        out.append("Which checks ran against how many distinct surfaces, "
-                   "and what they answered. A surface absent from this "
-                   "table was **never reached** — which is not the same "
-                   "as clean.\n")
+        out.append("Which checks ran, against how many distinct surfaces "
+                   "each, and what they answered — one row per check and "
+                   "verdict. This table COUNTS surfaces and does not name "
+                   "them; the surfaces no check answered for are named "
+                   "below it.\n")
         out.append("| Check | Verdict | Surfaces | Reason |")
         out.append("|---|---|---|---|")
-        for check_id, verdict, n, reason in rows:
+        for check_id, verdict, n in rows:
             out.append(f"| `{_cell(check_id)}` | {_cell(verdict)} | {n} |"
-                       f" {_cell(_redact(reason))} |")
+                       f" {_reason_cell(reasons.get((check_id, verdict), []))} |")
         out.append("")
+
+    out.extend(_untested(untested))
 
     # F11: a check CLASS the operator disabled, or one this build ships
     # nothing for, leaves no `check_run` row and so no trace in the table
@@ -574,6 +670,88 @@ def _coverage(conn, engagement_id, config, *, scanned) -> list[str]:
     if unshipped:
         out.append("")
     return out
+
+
+def _untested_surfaces(conn, engagement_id) -> list[tuple]:
+    """Every captured surface no check ever returned a verdict for.
+
+    NOT "no `check_run` row": see `_ANSWERED`. A surface whose only rows are
+    `pending` (the runner opened them and the process died) or `skipped`
+    (the budget cut the scan off before them) was never actually tested, and
+    counting either as coverage is S12's failure in the direction that
+    matters -- reading a row that exists to record a gap as though it
+    recorded an answer.
+
+    `method` + `path_template` is the surface's readable identity, the same
+    pair `_insertion_coverage` selects and the same one `surface`'s own
+    UNIQUE constraint builds identity from. Ordered by template then method
+    so two renders of one store cannot differ, for the reason `_findings`
+    has an `ORDER BY`.
+    """
+    marks = ",".join("?" for _ in _ANSWERED)
+    return conn.execute(
+        "SELECT s.method, s.path_template FROM surface s"
+        " WHERE s.engagement_id=? AND NOT EXISTS ("
+        "   SELECT 1 FROM check_run cr JOIN run r ON r.id = cr.run_id"
+        "   WHERE cr.surface_id = s.id AND r.engagement_id = s.engagement_id"
+        f"    AND cr.verdict IN ({marks}))"
+        " ORDER BY s.path_template, s.method, s.id",
+        (engagement_id, *_ANSWERED)).fetchall()
+
+
+def _untested(untested) -> list[str]:
+    if not untested:
+        return []
+    out = [f"**Never tested.** These {len(untested)} surface(s) were "
+           "captured and no check ever returned a verdict for them — a "
+           "`pending` or `skipped` row is not coverage. A surface named "
+           "here was **never reached**, which is not the same as clean.\n"]
+    shown = untested[:_UNTESTED_LIMIT]
+    for method, path_template in shown:
+        # `_redact` is identity for a path template -- there is no `://` in
+        # one for `records.redact_url` to find an authority behind -- and it
+        # is applied anyway, because the rule is that every free-text field
+        # rendered here passes the choke point, not that each caller argues
+        # its own field safe.
+        out.append(f"- `{_flat(method)} {_flat(_redact(path_template))}`")
+    omitted = len(untested) - len(shown)
+    if omitted:
+        out.append(f"- … {omitted} further surface(s) omitted (this list is "
+                   f"capped at the first {_UNTESTED_LIMIT} of "
+                   f"{len(untested)}). Every one is still recorded in the "
+                   "store.")
+    out.append("")
+    return out
+
+
+def _reasons_by_row(conn, engagement_id) -> dict:
+    """The distinct `check_run.reason` values under each (check, verdict),
+    commonest first.
+
+    Ordered by how many surfaces recorded each reason, then by the reason
+    text -- so the one a reader most needs is the one that survives
+    `_REASON_LIMIT`, and the tiebreak is stable across renders.
+    """
+    out: dict = {}
+    for check_id, verdict, reason, _surfaces in conn.execute(
+            "SELECT cr.check_id, cr.verdict, cr.reason,"
+            " COUNT(DISTINCT cr.surface_id) AS n FROM check_run cr"
+            " JOIN run r ON r.id = cr.run_id WHERE r.engagement_id=?"
+            " AND cr.reason IS NOT NULL AND cr.reason <> ''"
+            " GROUP BY cr.check_id, cr.verdict, cr.reason"
+            " ORDER BY cr.check_id, cr.verdict, n DESC, cr.reason",
+            (engagement_id,)).fetchall():
+        out.setdefault((check_id, verdict), []).append(reason)
+    return out
+
+
+def _reason_cell(reasons) -> str:
+    shown = reasons[:_REASON_LIMIT]
+    cell = "; ".join(_cell(_redact(r)) for r in shown)
+    omitted = len(reasons) - len(shown)
+    if omitted:
+        cell += f"; and {omitted} further distinct reason(s)"
+    return cell
 
 
 def _insertion_coverage(conn, engagement_id, blobs) -> list[str]:

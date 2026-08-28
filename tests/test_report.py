@@ -711,6 +711,167 @@ def test_an_engagement_with_no_check_runs_says_it_was_never_scanned(report_env):
     assert "not been scanned" in coverage_section.lower()
 
 
+# --- F2: the coverage section can show what was never reached --------------
+
+@pytest.fixture
+def report_env_browsed_after_the_scan():
+    """The everyday trigger, in four surfaces: browse, scan, browse more,
+    report. `s-0` was scanned; `/orders`, `/orders/{id}` and `/profile` were
+    captured after the scan and no check has ever looked at them. Before F2
+    the whole engagement rendered as one `clean 1` row with nothing said
+    about the other three."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _surface(conn, "s-0", path_template="/")
+    _surface(conn, "s-1", path_template="/orders")
+    _surface(conn, "s-2", path_template="/orders/{id}")
+    _surface(conn, "s-3", path_template="/profile")
+    _check_run(conn, "cr-1", run_id="r-1", surface_id="s-0",
+              check_id="hx.passive.cookie-flags", verdict="clean")
+    yield {"conn": conn, "engagement_id": "e-1", "config": _config(),
+          "blobs": None}
+    conn.close()
+
+
+def test_coverage_states_how_many_surfaces_were_captured_and_how_many_tested(
+        report_env_browsed_after_the_scan):
+    """1 of F2's three parts: the DENOMINATOR. `COUNT(DISTINCT surface_id)`
+    with nothing to divide it by cannot answer "what did you not test?" --
+    four `clean 1` rows read identically whether the engagement holds one
+    surface or a hundred."""
+    out = report.render(**report_env_browsed_after_the_scan)
+    assert "captured **4 surface(s)**" in out
+    assert "**1** had at least one check return a verdict" in out
+    assert "**3** had none" in out
+
+
+def test_coverage_names_the_surfaces_no_check_ever_answered_for(
+        report_env_browsed_after_the_scan):
+    """2 of F2's three parts: the ACTIONABLE SET, by name. `method` +
+    `path_template` is the surface's readable identity -- the pair
+    `_insertion_coverage` selects and the pair `surface`'s own UNIQUE
+    constraint builds identity from."""
+    out = report.render(**report_env_browsed_after_the_scan)
+    coverage = out[out.index("## Coverage"):]
+    assert "**Never tested.**" in coverage
+    assert "`GET /orders`" in coverage
+    assert "`GET /orders/{id}`" in coverage
+    assert "`GET /profile`" in coverage
+    # The separating half: the surface that WAS answered for must not be in
+    # the list, or "never tested" means nothing.
+    never = coverage[coverage.index("**Never tested.**"):]
+    assert "`GET /`" not in never
+
+
+def test_a_fully_covered_engagement_renders_no_never_tested_list(
+        report_env_scanned_clean):
+    """The separating case. A caveat that is always present is not a
+    caveat: one surface, one check, one `clean` verdict, nothing left."""
+    out = report.render(**report_env_scanned_clean)
+    assert "captured **1 surface(s)**" in out
+    assert "**1** had at least one check return a verdict" in out
+    assert "**0** had none" in out
+    assert "Never tested" not in out
+
+
+def test_the_prose_above_the_coverage_table_does_not_promise_what_it_omits(
+        report_env_browsed_after_the_scan):
+    """3 of F2's three parts. The old sentence -- "A surface absent from
+    this table was **never reached** — which is not the same as clean" --
+    could not be checked by a reader, because no surface was ever IN the
+    table. Whatever the table renders, the sentence above it has to be true
+    of it."""
+    out = report.render(**report_env_browsed_after_the_scan)
+    assert "A surface absent from this table" not in out
+    assert "This table COUNTS surfaces and does not name them" in out
+
+
+def test_a_surface_whose_only_check_was_skipped_counts_as_never_tested(
+        report_env_skipped):
+    """S12 in the direction that matters. A `skipped` row exists to record
+    that a check did NOT run -- `hx.scan._skip_rest` writes it when a budget
+    cuts the scan off -- and `pending` is written before a check runs so
+    that "a crash leaves evidence that the surface was never reached" (S5,
+    verbatim). Counting either as coverage reads a row that records a gap as
+    though it recorded an answer.
+
+    The row still appears in the table with its reason: the two statements
+    are not in conflict, and a reader needs both."""
+    out = report.render(**report_env_skipped)
+    assert "**0** had at least one check return a verdict" in out
+    assert "**1** had none" in out
+    assert "`GET /`" in out[out.index("**Never tested.**"):]
+    assert "budget" in out.lower()
+
+
+def test_a_surface_whose_check_errored_is_not_listed_as_never_reached(
+        report_env_with_credential_url):
+    """The separating case for `_ANSWERED`. An `error` verdict means the
+    check REACHED the surface and raised -- a failure to answer, not a
+    failure to arrive -- and the row renders as `error` where a reader can
+    see no clean answer was obtained. Filing it under "never reached" would
+    be a different untruth from the one F2 fixes."""
+    out = report.render(**report_env_with_credential_url)
+    assert "**1** had at least one check return a verdict" in out
+    assert "Never tested" not in out
+
+
+def test_the_never_tested_list_is_capped_and_says_by_how_much():
+    """`_findings` caps the evidence chain and STATES the cap; a list of
+    surfaces a client is meant to act on gets the same treatment and never a
+    silent truncation. 25 untested surfaces, 20 named, 5 accounted for."""
+    conn = _conn()
+    _run(conn, "r-1")
+    for i in range(25):
+        _surface(conn, f"s-{i:02d}", path_template=f"/page/{i:02d}")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+    listed = [l for l in out.splitlines() if l.startswith("- `GET /page/")]
+    assert len(listed) == 20
+    assert "5 further surface(s) omitted" in out
+    assert "capped at the first 20 of 25" in out
+
+
+def test_two_surfaces_failing_for_different_reasons_stay_one_coverage_row():
+    """CARRIED FROM FIX ROUND A, and it lands on this function. F6 of that
+    round made a passive check's `inconclusive` reason NAME the unreadable
+    exchange ids (`_http._detail`), so the old
+    `GROUP BY check_id, verdict, reason` stopped grouping: two surfaces
+    failing the same way for different exchanges became two rows, and a
+    hundred became a hundred. `check_id` and `verdict` are controlled
+    vocabularies, so grouping on them alone bounds the table however much
+    free text the reason carries -- and the reason stays actionable by being
+    carried into the row, commonest first, capped and counted."""
+    conn = _conn()
+    _run(conn, "r-1")
+    for i in range(3):
+        _surface(conn, f"s-{i}", path_template=f"/page/{i}")
+        _check_run(conn, f"cr-{i}", run_id="r-1", surface_id=f"s-{i}",
+                  check_id="hx.passive.stack-trace", verdict="inconclusive",
+                  reason=f"x-{i}: outcome=timeout")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+    rows = [l for l in out.splitlines()
+            if l.startswith("| `hx.passive.stack-trace`")]
+    assert len(rows) == 1, rows
+    assert "| inconclusive | 3 |" in rows[0]
+    # Two reasons named, the third counted -- never dropped in silence.
+    assert "x-0: outcome=timeout" in rows[0]
+    assert "x-1: outcome=timeout" in rows[0]
+    assert "and 1 further distinct reason(s)" in rows[0]
+
+
+def test_one_reason_shared_by_every_surface_is_printed_once(report_env_skipped):
+    """The separating case for the reason cap: a single distinct reason must
+    print plainly, with no "further distinct reason(s)" tail."""
+    out = report.render(**report_env_skipped)
+    row = [l for l in out.splitlines()
+           if l.startswith("| `hx.test.timing-probe`")]
+    assert len(row) == 1
+    assert "| skipped | 1 | budget |" in row[0]
+    assert "further distinct reason" not in row[0]
+
+
 # --- F5: the no-active-checks prose is derived from the corpus, not typed ---
 
 class _FakeActiveCheck:
