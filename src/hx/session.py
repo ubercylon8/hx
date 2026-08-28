@@ -682,7 +682,20 @@ def session(eng, *, instance: str, jar: Path | None = None,
                                   scope_sha256=scope_sha256,
                                   profile=eng.config.safety_profile)
         except Exception as exc:            # noqa: BLE001
-            raise SessionError(f"the extension refused the scope: {exc}") from exc
+            # "configure failed and the extension was never authorised", NOT
+            # "the extension refused the scope". Everything reaches here: a
+            # peer that refused the body, a bridge that died mid-request, a
+            # socket error. Naming the refusal sends an operator to the
+            # client's boundary -- the one document a consultant cannot change
+            # on their own -- when the truth may be that Burp went away. The
+            # peer's own words are appended, so a genuine refusal still says
+            # `peer refused configure: bad_config: ...`, and the half of the
+            # message that IS true whatever happened is the state Burp is left
+            # in: this is always the first configure of the session, so a
+            # failure here means the extension is still at DENY-ALL.
+            raise SessionError(
+                f"configure failed and the extension was never "
+                f"authorised: {exc}") from exc
 
         yield LiveSession(operator, crawler, epoch, srv, work)
     finally:

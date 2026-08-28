@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+import stat
 import threading
 from pathlib import Path
 
@@ -247,7 +248,6 @@ def test_one_connection_serves_both_callbacks(monkeypatch, an_engagement):
     assert stop_reason == "five 500s on a.test (10s)"
 
 
-
 # --- the context manager -------------------------------------------------
 
 
@@ -260,10 +260,19 @@ def test_a_failed_configure_leaves_no_burp_running(monkeypatch, an_engagement, a
     monkeypatch.setattr(session.BridgeServer, "configure",
                         lambda self, *a, **k: (_ for _ in ()).throw(
                             server.BridgeError("bad_config")))
-    with pytest.raises(session.SessionError):
+    with pytest.raises(session.SessionError) as exc:
         with session.session(an_engagement, instance="capture", jar=a_jar):
             pass
     assert killed, "configure failed and Burp was left running"
+    # The peer's own words survive the wrapping. `session()` cannot tell a
+    # refusal from a dead bridge, so its own message says only that the
+    # extension was never authorised -- the class the extension named is the
+    # half that says WHICH, and swallowing it sends the next reader to the
+    # wrong side of the socket.
+    assert "bad_config" in str(exc.value)
+    assert not (an_engagement.root / "session" / "hx.sock").exists(), (
+        "the bridge was not stopped: its socket outlives the session, and the "
+        "next `session()` on this engagement dies inside BridgeServer.start()")
 
 
 def test_listeners_that_are_not_loopback_only_refuse_the_session(
@@ -304,6 +313,27 @@ def test_burp_is_torn_down_when_the_body_raises(monkeypatch, an_engagement, a_ja
     assert live.epoch == 1
     assert live.workdir == an_engagement.root / "session"
     assert live.bridge.engagement_id == an_engagement.id
+    assert not (live.workdir / "hx.sock").exists(), (
+        "the bridge was not stopped on the raising path")
+
+    # WHAT THE SESSION HANDED THE BRIDGE, by identity. Everything else in this
+    # file measures what `session()` raises and what it kills, and a
+    # `BridgeServer` built with `on_exchange=None` fails none of it: its own
+    # `_capture` reads Plan 4's exchange, denial and dropped frames off the
+    # socket and DISCARDS them, so the observable is a live Burp, correctly
+    # configured, traffic flowing, an empty database and no error anywhere --
+    # this plan's own bug, one layer out from the one `ExchangeSink` fixes.
+    assert isinstance(live.bridge.on_exchange, session.ExchangeSink), (
+        "the bridge was constructed without a sink, so every frame Burp sends "
+        "is read and thrown away")
+    assert live.bridge.on_halted is not None, (
+        "S4's auto-halt frame has no writer again: `records.abort_run` is "
+        "never called and an aborted run renders as a clean one")
+    assert live.bridge.on_halted.__self__ is live.bridge.on_exchange, (
+        "one object must serve both callbacks -- two would open two "
+        "connections on the read thread, and both would work")
+    assert live.bridge.on_exchange._root == an_engagement.root
+    assert live.bridge.on_exchange._id == an_engagement.id
 
 
 def test_a_handshake_that_never_completes_points_at_burps_log(
@@ -316,3 +346,91 @@ def test_a_handshake_that_never_completes_points_at_burps_log(
             pass
     assert "burp.log" in str(exc.value)
     assert killed, "a Burp that never dialled in was left running anyway"
+
+
+def test_a_clean_exit_authorises_the_extension_and_stops_the_bridge(
+        monkeypatch, an_engagement, a_jar):
+    """The only test that runs `session()` to a CLEAN close.
+
+    Two things nothing else here reaches. S4's authorisation point -- the one
+    place in `src/` that calls `bridge.configure()` -- is proved to carry the
+    ENGAGEMENT's own scope: Task 5 proved `config_body` and
+    `stored_scope_sha256` in isolation, and nothing proved `session()` passes
+    those particular values, so a call authorising an empty body against a
+    made-up hash under a made-up profile was invisible. And the teardown is
+    proved to run on the path where nothing went wrong, where a `finally` is
+    not what carries it.
+
+    `configure` is replaced by a function with the REAL signature rather than
+    `*a, **k`, so the assertions below bind the same way whether `session()`
+    passes them positionally or by keyword.
+    """
+    killed, configured = [], []
+
+    def record_configure(self, pairs, scope_sha256, profile):
+        configured.append((pairs, scope_sha256, profile))
+        return 3
+
+    monkeypatch.setattr(session, "launch_burp", _launcher(killed))
+    monkeypatch.setattr(session, "wait_for", lambda *a, **k: True)
+    monkeypatch.setattr(session, "not_loopback_only", lambda pid, ports: None)
+    monkeypatch.setattr(session.BridgeServer, "configure", record_configure)
+
+    with session.session(an_engagement, instance="capture", jar=a_jar) as live:
+        work = live.workdir
+        assert live.epoch == 3, "the epoch is the extension's answer, not a constant"
+        assert (work / "hx.sock").exists(), "the bridge is not listening"
+
+    assert len(configured) == 1
+    pairs, scope_sha256, profile = configured[0]
+    assert pairs == session.config_body(an_engagement.config)
+    assert scope_sha256 == session.stored_scope_sha256(
+        an_engagement.db, an_engagement.id), (
+        "the extension must be authorised against the hash the store RECORDED, "
+        "never one recomputed from today's config")
+    assert profile == an_engagement.config.safety_profile
+
+    assert killed, "a clean exit left Burp running"
+    assert not (work / "hx.sock").exists(), (
+        "the bridge was not stopped on the clean path: the socket survives, "
+        "the accept thread leaks, and the next `session()` on this engagement "
+        "dies inside BridgeServer.start()")
+
+
+def test_the_workdir_is_0o700_before_anything_else_tightens_it(
+        monkeypatch, an_engagement, a_jar):
+    """0o700 from creation, not 0o700 by the time anyone looks.
+
+    MEASURING AFTER THE SESSION PROVES NOTHING, and that is the whole reason
+    this test is shaped like a spy. `BridgeServer.start()` chmods its socket's
+    parent -- which is this directory -- to 0o700 itself, so a session built
+    with a plain `mkdir` at the umask (measured on this machine: 0o755) ends
+    at 0o700 too and an assertion made afterwards passes either way.
+
+    So the mode is read at the moment `start()` is ENTERED, before its own
+    chmod. What that pins is that the directory never exists at a looser mode
+    than 0o700 even for an instant, that its permissions do not depend on a
+    side effect of an unrelated class, and that it is still 0o700 on the path
+    where `start()` itself raises. The directory goes on to hold the private
+    Burp home copied from the operator's own -- licence key included -- plus
+    Burp's log and the bridge socket.
+    """
+    seen = {}
+    real_start = session.BridgeServer.start
+
+    def spying_start(self):
+        seen["mode"] = stat.S_IMODE(self.socket_path.parent.stat().st_mode)
+        return real_start(self)
+
+    monkeypatch.setattr(session, "launch_burp", _launcher())
+    monkeypatch.setattr(session, "wait_for", lambda *a, **k: True)
+    monkeypatch.setattr(session, "not_loopback_only", lambda pid, ports: None)
+    monkeypatch.setattr(session.BridgeServer, "configure", lambda self, *a, **k: 1)
+    monkeypatch.setattr(session.BridgeServer, "start", spying_start)
+
+    with session.session(an_engagement, instance="capture", jar=a_jar):
+        pass
+
+    assert seen["mode"] == 0o700, (
+        f"the session workdir was created at {oct(seen.get('mode', 0))}; it "
+        "holds the Burp home copied from the operator's own")
