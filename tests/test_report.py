@@ -617,7 +617,7 @@ def test_evidence_accounts_for_rows_that_do_not_resolve(report_env_with_unresolv
     section = out[out.index("**Evidence.**"):]
     bullets = [l for l in section.splitlines() if l.startswith("- `GET")]
     assert len(bullets) == 1
-    assert "3 further observation(s) omitted" in out
+    assert "3 further evidence row(s) omitted" in out
     assert "first 5 of 8" in out
     assert "4 of the 5 shown could not be resolved" in out
 
@@ -633,6 +633,23 @@ def test_a_long_evidence_chain_is_capped_and_says_so(report_env_with_long_eviden
     assert 0 < len(bullets) < 8
     assert "omitted" in out.lower()
     assert "first 5 of 8" in out
+
+
+def test_the_evidence_cap_is_not_labelled_with_the_word_observation(
+        report_env_with_long_evidence_chain):
+    """F11 (fix round B): the cap line used to say "3 further observation(s)
+    omitted". `finding_observation` is this schema's word for PRESENCE PER
+    RUN -- what `_latest_observed` reads, and what the "appears fixed" marker
+    a few lines above is built from -- so a reader takes "the first 5 of 8"
+    as eight RUNS. They are unrelated numbers: `evidence` rows are exchanges
+    and one run contributes several. The caveat must not use the word at
+    all, and it must still say the two numbers it exists to say."""
+    out = report.render(**report_env_with_long_evidence_chain)
+    capped = [line for line in out.splitlines() if "omitted" in line]
+    assert len(capped) == 1
+    assert "observation" not in capped[0].lower()
+    assert "3 further evidence row(s) omitted" in capped[0]
+    assert "first 5 of 8" in capped[0]
 
 
 def test_a_short_evidence_chain_is_not_reported_as_capped(report_env_with_findings):

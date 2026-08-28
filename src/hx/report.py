@@ -55,7 +55,7 @@ from hx.store.blobs import CorruptBlob
 
 _ORDER = ("Critical", "High", "Medium", "Low", "Info")
 
-# The chain grows one row per genuine observation, across every run that ever
+# The chain grows one row per genuine capture, across every run that ever
 # saw the finding -- `records.record_evidence`'s own docstring says so and
 # says explicitly that bounding what gets RENDERED is this module's job, not
 # the writer's: "a finding seen in fifty runs holds fifty evidence rows...  a
@@ -266,8 +266,8 @@ def _evidence(conn, finding_id) -> list[str]:
             # today (a note/ref-only entry) -- this row has already
             # consumed one of the five slots in `shown`. It must be
             # counted as unresolved, not silently dropped: dropping it
-            # made "1 bullet, 3 further omitted, first 5 of 8" claim
-            # eight rows accounted for when only four were.
+            # made "1 bullet, 3 further evidence rows omitted, first 5 of
+            # 8" claim eight rows accounted for when only four were.
             unresolved += 1
             continue
         status_text = status if status is not None else "no status recorded"
@@ -278,7 +278,18 @@ def _evidence(conn, finding_id) -> list[str]:
         # STATED, not silent -- see `_EVIDENCE_LIMIT`. `total`, not
         # `len(shown)`: the true count in the store, pinned by
         # `test_a_long_evidence_chain_states_the_true_total`.
-        caveats.append(f"{omitted} further observation(s) omitted (this "
+        #
+        # F11 (fix round B): "observation(s)" collided with
+        # `finding_observation`, which is this schema's word for PRESENCE PER
+        # RUN -- the datum `_latest_observed` reads and the retest
+        # deliverable is built from. A reader who has just been told a
+        # finding "was not observed the last time its check tested this
+        # surface" takes "5 of 8 observations" as eight RUNS, and the two
+        # numbers are unrelated: `evidence` rows are exchanges, accumulated
+        # across every run that ever saw the finding, and a single run
+        # routinely contributes several. "evidence row(s)" is what these
+        # are, and it cannot be read as the other thing.
+        caveats.append(f"{omitted} further evidence row(s) omitted (this "
                        f"chain is capped at the first {_EVIDENCE_LIMIT} of "
                        f"{total})")
     if unresolved > 0:
@@ -286,7 +297,7 @@ def _evidence(conn, finding_id) -> list[str]:
                        "be resolved to a request")
     if caveats:
         out.append("- … " + "; ".join(caveats) +
-                   ". Every occurrence is still recorded in the store.")
+                   ". Every evidence row is still recorded in the store.")
     out.append("")
     return out
 
