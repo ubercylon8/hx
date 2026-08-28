@@ -711,6 +711,86 @@ def test_an_engagement_with_no_check_runs_says_it_was_never_scanned(report_env):
     assert "not been scanned" in coverage_section.lower()
 
 
+# --- F12: a live finding must not be rendered wearing stale prose ----------
+
+def test_a_partly_remediated_finding_renders_the_current_prose_not_run_ones():
+    """F12 (fix round B), measured end to end in the artifact that matters.
+
+    `records.upsert_finding`'s `ON CONFLICT ... DO UPDATE SET` refreshed
+    `severity` and `confidence` and not `title`, `description`, `impact`,
+    `remediation` or `cwe` -- so a re-scan updated how bad a finding was and
+    never what it SAID. After D1 of the fix-round-A re-review a cookie's
+    identity is the COOKIE and its missing flags are deliberately not in the
+    key, which is right and is exactly what makes the stale prose reachable:
+    one finding, two observations, and run 1's title after the client set
+    two of the three flags.
+
+    Built the way `hx.scan._write_finding` builds it -- one dedupe key,
+    fixed across both runs, and the candidate carrying that run's own state
+    -- because the key is what makes the two writes collide.
+    """
+    conn = _conn()
+    _run(conn, "r-1", started_us=1)
+    _run(conn, "r-2", started_us=2)
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/login")
+    _exchange(conn, "x-2", "r-2", "https://app.acme.test/login")
+    key = records.dedupe_key(
+        type_="hx.passive.cookie-flags", issue_type_id="cookie-session-flags",
+        scheme="https", host="app.acme.test", port=443, method="GET",
+        path_template="/", insertion_kind=None, insertion_name=None,
+        scope_level="host")
+
+    def write(run_id, exchange_id, missing, severity, cwe):
+        flags = ", ".join(missing)
+        c = base.Candidate(
+            title=f"Cookie session set without {flags}",
+            issue_type_id="cookie-session-flags", severity=severity,
+            confidence="Certain", insertion=None, scope_level="host",
+            exchange_ids=(exchange_id,), cwe=cwe,
+            description=f"The response set `session` without {flags}.",
+            impact=f"`session` is exposed because it lacks {flags}.",
+            remediation=f"Set {flags} on `session`.")
+        fid = records.upsert_finding(conn, engagement_id="e-1", candidate=c,
+                                     dedupe_key=key, run_id=run_id,
+                                     check_id="hx.passive.cookie-flags")
+        records.record_evidence(conn, finding_id=fid,
+                                exchange_ids=(exchange_id,), at_us=1)
+        records.record_observation(conn, finding_id=fid, run_id=run_id,
+                                   observed=True, exchange_id=exchange_id,
+                                   severity_at=severity,
+                                   confidence_at="Certain", at_us=1)
+        return fid
+
+    first = write("r-1", "x-1", ["HttpOnly", "SameSite", "Secure"],
+                  "Medium", "CWE-1004")
+    second = write("r-2", "x-2", ["SameSite"], "Low", "CWE-614")
+    assert first == second, "the cookie is the identity: this must be ONE finding"
+
+    counts = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM finding),"
+        " (SELECT COUNT(*) FROM finding_observation)").fetchone()
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert counts == (1, 2), "one finding, two observations"
+    # Every prose column, not just the title: each is current state and each
+    # was frozen at run 1.
+    assert "Cookie session set without SameSite" in out
+    assert "Cookie session set without HttpOnly, SameSite, Secure" not in out
+    assert "The response set `session` without SameSite." in out
+    assert "`session` is exposed because it lacks SameSite." in out
+    assert "Set SameSite on `session`." in out
+    assert "HttpOnly" not in out
+    # `cwe` is computed from the same current state `severity` is
+    # (`cookie_flags`: "CWE-1004" if HttpOnly is missing else "CWE-614"), so
+    # leaving it behind pairs a refreshed severity with a stale
+    # classification on one row.
+    assert "CWE-614" in out
+    assert "CWE-1004" not in out
+    assert "### Low" in out
+    assert "### Medium" not in out
+
+
 # --- F8: an aborted run must never render as a complete one ----------------
 
 def _unfinished_run(conn, run_id, *, status, stop_reason=None, started_us=1,
