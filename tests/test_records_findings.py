@@ -152,6 +152,41 @@ def test_upsert_is_idempotent_across_runs(engagement_conn):
     assert n == 1
 
 
+def test_an_upsert_never_moves_the_issue_type_off_its_own_key(engagement_conn):
+    """D5 of the fix-round-A re-review. `dedupe_key` arrives as a free
+    parameter, independent of `candidate`, and `issue_type_id` is the key's
+    2nd part -- so the only way a conflicting row can carry a DIFFERENT
+    issue type is a caller whose key and candidate disagree. That is a bug in
+    the caller, and `issue_type_id=excluded.issue_type_id` in the
+    `DO UPDATE SET` list silently resolved it in the wrong direction: the row
+    ended up stored under a key that no longer contained its own issue type.
+
+    The invariant asserted here is the one a reader can check by eye -- a
+    finding's `issue_type_id` is the 2nd part of its `dedupe_key` -- and it
+    holds for the second write as well as the first.
+    """
+    k = key(issue_type_id="reflected-xss")
+    good = base.Candidate(title="t", issue_type_id="reflected-xss",
+                          severity="Low", confidence="Firm",
+                          insertion=None, exchange_ids=("x-1",))
+    wrong = base.Candidate(title="t", issue_type_id="stored-xss",
+                           severity="Low", confidence="Firm",
+                           insertion=None, exchange_ids=("x-1",))
+
+    a = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                               candidate=good, dedupe_key=k, run_id="r-1")
+    b = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                               candidate=wrong, dedupe_key=k, run_id="r-2")
+
+    assert a == b
+    stored_key, stored_type = engagement_conn.execute(
+        "SELECT dedupe_key, issue_type_id FROM finding").fetchone()
+    assert stored_type == stored_key.split("|")[1], (
+        "the row's issue_type_id is no longer the one its own dedupe_key "
+        "was built from")
+    assert stored_type == "reflected-xss"
+
+
 def test_upsert_moves_last_seen_run_and_never_first_seen(engagement_conn):
     c = base.Candidate(title="t", issue_type_id="t-issue",
                        severity="Low", confidence="Firm",
