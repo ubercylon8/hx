@@ -12,11 +12,17 @@ database. Nothing raises, nothing logs, and the run reads as complete.
 leaves a Burp whose extension is at DENY-ALL: it looks like a working session
 and captures nothing, which is worse than no session at all.
 
-NO JVM IS STARTED HERE and no port is bound. `launch_burp`, `wait_for` and
-`not_loopback_only` are all replaced; the only socket any test in this file
-creates is the bridge's own AF_UNIX rendezvous inside `tmp_path`, which
-`BridgeServer.start()` makes and `stop()` unlinks. The real thing is exercised
-under `pytest -m integration`, against a real Burp, at about 200 seconds.
+NO JVM IS STARTED HERE. `launch_burp`, `wait_for` and `not_loopback_only` are
+replaced in most tests here; the last two sections replace `subprocess.Popen`
+instead, one level lower, so that `make_home` and `write_listener_config` are
+the PRODUCT's on the paths where their composition is the thing being pinned.
+Nothing in either case starts a JVM. The real thing is exercised under
+`pytest -m integration`, against a real Burp, at about 200 seconds.
+
+The only socket any test in this file creates is the bridge's own AF_UNIX
+rendezvous inside `tmp_path`, which `BridgeServer.start()` makes and `stop()`
+unlinks -- plus, in the one test that draws its ports for real, `_free_port`'s
+bind to `127.0.0.1:0`, which is closed before it returns and never listened on.
 """
 from __future__ import annotations
 
@@ -528,3 +534,104 @@ def test_the_seed_the_caller_names_reaches_the_launch(
         "an omitted seed must reach `make_home` as None so IT applies the "
         "operator's own home; a default resolved here would be a second "
         "answer to which home is copied")
+
+
+# --- the composition: two sessions, one engagement ------------------------
+
+
+@pytest.fixture
+def a_seed(tmp_path):
+    """A Burp home with an accepted licence, standing in for the operator's.
+
+    The twin of `tests/test_session_launch.py`'s and
+    `tests/test_session_home.py`'s, for the same reason both of those exist:
+    `make_home` runs FOR REAL in the test below, and a seed it was not handed
+    is the operator's own `$HOME`.
+    """
+    home = tmp_path / "seed"
+    prefs = home / ".java" / ".userPrefs" / "burp"
+    prefs.mkdir(parents=True)
+    (prefs / "prefs.xml").write_bytes(
+        b'<map><entry key="burp.eula" value="true"/></map>')
+    (home / ".BurpSuite").mkdir()
+    (home / ".BurpSuite" / "UserConfigCommunity.json").write_text("{}")
+    return home
+
+
+@pytest.fixture
+def built_extension(tmp_path, monkeypatch):
+    """A bridge jar newer than its sources, so `extension_problem()` passes.
+
+    `launch_burp` runs its pre-flight for real below; `extension/build/` is
+    gitignored, so without this the test would fail on a missing build product
+    it is not about.
+    """
+    jar = tmp_path / "ext" / "build" / "hx-bridge.jar"
+    jar.parent.mkdir(parents=True)
+    jar.write_bytes(b"not really a jar; nothing here launches a JVM")
+    src = tmp_path / "ext" / "src"
+    src.mkdir(parents=True)
+    monkeypatch.setattr(session, "EXT_JAR", jar)
+    monkeypatch.setattr(session, "EXT_SRC", src)
+    return jar
+
+
+def test_two_sessions_in_a_row_on_one_engagement_both_start(
+        monkeypatch, an_engagement, a_jar, a_seed, built_extension):
+    """F1's composition, which nine task reviews and this file both missed.
+
+    EVERY OTHER TEST HERE REPLACES `launch_burp`, so `make_home` never runs
+    and the second call never meets the directory the first one left. This one
+    replaces `subprocess.Popen` instead: `make_home` and
+    `write_listener_config` are the product's, and the only thing that never
+    happens is the JVM. Run twice, `hx capture start` exited 1 with EMPTY
+    output and a bare `FileExistsError` -- not a `SessionError`, so
+    `capture_start`'s handler missed it and click printed a traceback.
+
+    `_free_port` is replaced rather than allowed to bind, so this file's
+    promise that it opens no TCP socket still holds; it hands back the same
+    two distinctive numbers the fake launcher above writes.
+
+    The last assertion is the other half of F3. The copied home holds the
+    operator's licence prefs and their whole `~/.BurpSuite` bar the browser,
+    and `work` is inside the engagement directory a consultant archives or
+    hands to a client -- so it must not outlive the session that needed it.
+    """
+    ports = iter([OPERATOR_PORT, CRAWLER_PORT] * 2)
+    monkeypatch.setattr(session, "_free_port", lambda: next(ports))
+    monkeypatch.setattr(session.subprocess, "Popen",
+                        lambda cmd, **kw: _FakeProc())
+    monkeypatch.setattr(session, "wait_for", lambda *a, **k: True)
+    monkeypatch.setattr(session, "not_loopback_only", lambda pid, ports: None)
+    monkeypatch.setattr(session.BridgeServer, "configure", lambda self, *a, **k: 1)
+
+    # WHAT A SIGKILL LEAVES. `session()`'s teardown never ran, so the previous
+    # run's private home is still on disk -- and it is that state, not the
+    # clean one, that bricked the command: one handshake timeout and every
+    # later run on this engagement died on FileExistsError with no message.
+    # Planted rather than produced, because producing it means killing a
+    # session, and a test that kills a session is testing the killing.
+    stale = an_engagement.root / "session" / "burphome" / ".BurpSuite"
+    stale.mkdir(parents=True)
+    (stale / "left-by-a-killed-run").write_text("stale")
+
+    homes = []
+    for attempt in (1, 2):
+        with session.session(an_engagement, instance="capture", jar=a_jar,
+                             seed=a_seed) as live:
+            home = live.workdir / "burphome"
+            assert (home / ".BurpSuite" / "UserConfigCommunity.json").exists(), (
+                f"session {attempt} did not get a private Burp home")
+            assert not (home / ".BurpSuite" / "left-by-a-killed-run").exists(), (
+                f"session {attempt} adopted the home a killed run left behind, "
+                "including its .BurpSuite/sessions and its Java Preferences")
+            assert (live.operator_port, live.crawler_port) == (
+                OPERATOR_PORT, CRAWLER_PORT)
+            homes.append(home)
+
+    assert homes[0] == homes[1]
+    assert not homes[1].exists(), (
+        "the private Burp home outlived the session: the operator's licence "
+        "prefs and Burp state are left inside the client's engagement "
+        "directory, which is the thing a consultant archives")
+

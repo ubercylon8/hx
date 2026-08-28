@@ -168,6 +168,20 @@ def _eula_accepted(seed: Path) -> bool:
         return False
 
 
+def _clear_previous_home(home: Path) -> None:
+    """Remove whatever a previous run left at `home`, whatever shape it is.
+
+    A symlink is UNLINKED, never walked into: `shutil.rmtree` refuses a
+    symlinked root outright, and a version that did not would delete the tree
+    somebody pointed it at. The same for a plain file, which is not a home and
+    cannot become one by being copied into.
+    """
+    if home.is_symlink() or (home.exists() and not home.is_dir()):
+        home.unlink()
+    elif home.exists():
+        shutil.rmtree(home)
+
+
 def make_home(workdir: Path, *, seed: Path | None = None) -> Path:
     """A private $HOME per run.
 
@@ -175,6 +189,25 @@ def make_home(workdir: Path, *, seed: Path | None = None) -> Path:
     a sessions directory with any other Burp on the machine -- including one a
     developer left running. The prefs are 3 MB and cheap to copy; the embedded
     browser is 650 MB, read-mostly, and gets a symlink instead.
+
+    PER RUN MEANS PER RUN, so an existing `burphome` is REMOVED and copied
+    again rather than reused or merged into. Until this call did that, the
+    plain `mkdir(parents=True)` below raised `FileExistsError` the second time
+    `hx capture start` ran against one engagement -- not a `SessionError`, so
+    the CLI printed a traceback with no output at all, and any session that
+    died mid-flight (a handshake timeout, a refused configure, a SIGKILL) left
+    the directory behind and bricked the command for that engagement until the
+    operator found and deleted it by hand.
+
+    Reusing it instead was the other candidate and it is the worse one: the
+    tree holds the PREVIOUS run's Burp state -- its `.BurpSuite/sessions`, its
+    Java Preferences, whatever the last JVM wrote on the way down -- and a
+    second run adopting that silently is the one thing the sentence above says
+    this function exists to avoid. The workdir itself is kept (it is where the
+    bridge socket lives, and a stale `hx.sock` is REPORTED rather than removed,
+    which is how a still-running session is told from a dead one); only the
+    copied home is discarded, because only the copied home is per-run state
+    hx made and hx can replace.
 
     The seed is COPIED FROM, never run against -- see seed_home(). A seed
     that never accepted Burp's licence sits at the licence prompt and never
@@ -207,7 +240,21 @@ def make_home(workdir: Path, *, seed: Path | None = None) -> Path:
             "home, it does not run against it, and cannot accept the "
             "licence on your behalf")
     home = workdir / "burphome"
-    (home / ".BurpSuite").mkdir(parents=True)
+    try:
+        _clear_previous_home(home)
+    except OSError as exc:
+        raise SessionError(
+            f"the private Burp home a previous run left at {home} could not "
+            f"be removed: {exc}. hx copies a fresh one per run and will not "
+            "run against a stale one; remove that path by hand") from exc
+    # secure_mkdir, not mkdir(parents=True): these are the only two directories
+    # in the copy that this function CREATES rather than copies, and so the
+    # only two that landed at the umask -- measured at 0o755 against a seed
+    # whose own `.BurpSuite` is 0o700. Everything below is a copytree or a
+    # copy2 and carries the seed's modes with it. What lands here is the
+    # licence prefs and Burp's CA key, inside a client's engagement directory:
+    # the branch rule is 0o700, never widened.
+    secure_mkdir(home / ".BurpSuite")
     shutil.copytree(seed / ".java", home / ".java")
     for lock in (home / ".java" / ".userPrefs").glob(".user*"):
         lock.unlink()                 # a copied lock file belongs to the seed
@@ -773,4 +820,21 @@ def session(eng, *, instance: str, jar: Path | None = None,
                 with contextlib.suppress(Exception):
                     proc.wait(timeout=15)
         finally:
-            srv.stop()
+            try:
+                srv.stop()
+            finally:
+                # THE COPIED HOME DOES NOT OUTLIVE THE SESSION. It holds the
+                # operator's licence prefs and everything in their
+                # `~/.BurpSuite` bar the browser -- real client project state
+                # on a consultant's machine -- and `work` is inside the
+                # engagement directory, which is the thing a consultant
+                # archives or hands to a client. Burp's log stays: it is the
+                # evidence a failed session is diagnosed from, and it is this
+                # side's, not the previous client's.
+                #
+                # ignore_errors, and only here: a directory that will not
+                # delete must not replace whatever actually went wrong on the
+                # way out, and `make_home` removes it before the next copy
+                # anyway -- so the failure mode is a stale tree until the next
+                # run, not a session that cannot start.
+                shutil.rmtree(work / "burphome", ignore_errors=True)

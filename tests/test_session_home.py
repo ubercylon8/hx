@@ -1,3 +1,5 @@
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -102,3 +104,88 @@ def test_an_omitted_seed_still_means_the_operators_home(seeded_home, tmp_path):
     through `seed_home()` rather than becoming a required argument."""
     home = session.make_home(tmp_path / "work")
     assert (home / ".BurpSuite" / "UserConfigCommunity.json").exists()
+
+
+def test_a_second_run_copies_a_fresh_home_over_the_previous_one(
+        seeded_home, tmp_path):
+    """F1, in the shape an operator meets it: `hx capture start`, twice.
+
+    `session()` defaults its workdir to `<engagement>/session` and nothing
+    removes it, so the second `make_home` on one engagement hit
+    `mkdir(parents=True)` on an existing `.BurpSuite` and raised
+    `FileExistsError` -- not a `SessionError`, so the CLI's handler missed it
+    and click printed a traceback with EMPTY output. A session that died
+    mid-flight left the same directory behind, so one handshake timeout
+    bricked the command for that engagement until somebody deleted the tree
+    by hand.
+
+    The second half is the constraint that rules out the easy fix: the
+    previous run's home must not be REUSED either. It holds that run's
+    `.BurpSuite/sessions` and its Java Preferences, and the whole point of a
+    private home is that a run does not inherit another's state -- so the
+    marker written into the first copy must be gone from the second.
+    """
+    work = tmp_path / "work"
+    first = session.make_home(work)
+    (first / ".BurpSuite" / "left-by-the-previous-run").write_text("stale")
+
+    second = session.make_home(work)
+
+    assert second == first, "the home is per run, but its path is the workdir's"
+    assert (second / ".BurpSuite" / "UserConfigCommunity.json").exists(), (
+        "the second run did not get a copy of the seed at all")
+    assert not (second / ".BurpSuite" / "left-by-the-previous-run").exists(), (
+        "the second run adopted the first run's Burp state: a private home "
+        "that is reused is not a private home")
+
+
+def test_the_copy_is_0o700_from_creation_even_at_a_loose_umask(
+        seeded_home, tmp_path):
+    """The two directories `make_home` CREATES rather than copies.
+
+    Everything else in the tree arrives through `copytree`/`copy2` and carries
+    the seed's own modes. `burphome` and `burphome/.BurpSuite` are made here,
+    and at a plain `mkdir` they landed at the umask -- measured at 0o755 on
+    this machine against a seed whose `.BurpSuite` is 0o700. What they hold is
+    the operator's licence prefs and Burp's CA key, inside the engagement
+    directory a consultant archives; the branch rule is 0o700 and never
+    widened. The umask is forced loose here so the assertion is about the
+    creation mode rather than about this machine's default.
+    """
+    previous = os.umask(0o022)
+    try:
+        home = session.make_home(tmp_path / "work")
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700, (
+        f"burphome was created at {oct(stat.S_IMODE(home.stat().st_mode))}")
+    inner = home / ".BurpSuite"
+    assert stat.S_IMODE(inner.stat().st_mode) == 0o700, (
+        f"burphome/.BurpSuite was created at "
+        f"{oct(stat.S_IMODE(inner.stat().st_mode))}")
+
+
+def test_a_symlink_where_the_home_goes_is_removed_and_never_walked_into(
+        seeded_home, tmp_path):
+    """`shutil.rmtree` refuses a symlinked root, and must never be given one.
+
+    The elsewhere it points at is a real directory with a file in it. Clearing
+    the previous home must unlink the LINK and leave that file alone -- a
+    clear that followed it would delete whatever an operator had pointed the
+    path at, and one that did not handle it at all would raise `OSError` out
+    of a module whose contract is `SessionError`.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "precious").write_text("not ours to delete")
+    (work / "burphome").symlink_to(elsewhere)
+
+    home = session.make_home(work)
+
+    assert not home.is_symlink()
+    assert (home / ".BurpSuite" / "UserConfigCommunity.json").exists()
+    assert (elsewhere / "precious").exists(), (
+        "clearing the previous home followed a symlink out of the workdir")
