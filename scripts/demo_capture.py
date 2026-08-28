@@ -404,12 +404,13 @@ def browse(conn, operator_port, target, offside, session_dir) -> int:
     print(f"   Point your browser's HTTP proxy at {BOLD}127.0.0.1:{operator_port}{OFF}")
     print(f"   In scope:     {target.origin}/*   {DIM}(try /api/orders, /login){OFF}")
     print(f"   Out of scope: {offside.origin}/*  {DIM}(will be dropped){OFF}")
-    # The session's own directory -- it holds the private Burp home this run
-    # copied, Burp's log and the bridge socket. `live.workdir`, not a path
-    # this script picked: `session()` chooses it (the engagement's `session/`
-    # unless told otherwise) and it is created at 0o700.
+    # `burphome` UNDER the session directory, not the directory itself:
+    # `live.workdir` holds Burp's log, its listener config and the bridge
+    # socket as well, and `make_home` puts the copied home in `burphome/`.
+    # The CA certificate is inside that home, so naming the parent sends
+    # somebody hunting one directory up from it.
     print(f"   {DIM}Burp's private home for this run, CA certificate "
-          f"included: {session_dir}{OFF}")
+          f"included: {session_dir / 'burphome'}{OFF}")
     print(f"\n   {DIM}Ctrl-C to stop and print the summary.{OFF}\n")
     seen_x = seen_d = 0
     try:

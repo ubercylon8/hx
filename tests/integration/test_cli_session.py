@@ -129,23 +129,63 @@ def _settle(predicate, what: str, *, evidence, timeout: float = Rig.SETTLE_S):
     pytest.fail(f"{what} never arrived within {timeout}s.\n{evidence()}")
 
 
-def _terminate(proc: subprocess.Popen) -> None:
+def _group_survivors(pgid: int) -> list[str]:
+    """Every process still in the command's process group: `pid cmdline`.
+
+    THE COMMAND'S BURP IS ITS CHILD, and `start_new_session=True` made the
+    command a group leader, so the JVM inherits that pgid and this is the one
+    question that covers both: did anything the command started outlive it?
+
+    Read out of `/proc` rather than through `pgrep`, which is one more tool to
+    be missing at the moment a guard needs it -- and a guard that evaporates
+    when its tool is absent is the defect `not_loopback_only`'s docstring is
+    about. `/proc/<pid>/stat` is `pid (comm) state ppid pgrp ...`, and `comm`
+    can contain spaces and parentheses, so the fields are taken after the LAST
+    `)`. A process that vanishes mid-scan is skipped: it is not a survivor.
+    """
+    alive = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            fields = stat[stat.rindex(")") + 1:].split()
+            if int(fields[2]) != pgid:
+                continue
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+        except (OSError, ValueError, IndexError):
+            continue
+        alive.append(f"{entry.name} {cmdline.decode(errors='replace')[:120]}")
+    return alive
+
+
+def _terminate(proc: subprocess.Popen, pgid: int) -> None:
     """Leave nothing running, however this test ended.
 
     Registered on the ExitStack BEFORE the command is waited on, for the
     reason `conftest.py` records at the top: on this branch a kill that lived
     at the end of a try block was jumped over by a failing assertion twice,
-    leaving a 900 MB JVM behind per debugging attempt. `hx capture start`
-    tears its own Burp down on the way out, so this only fires when the
-    command never got there -- and then the JVM is its child, in the process
-    group `start_new_session=True` gave it, which is why the whole group goes
-    rather than the pid.
+    leaving a 900 MB JVM behind per debugging attempt.
+
+    TWO KILLS, and the second is not redundant. The first is the command
+    never having got to its own teardown -- a failed assertion above, a
+    timeout -- and the JVM is then its live child. The second covers the case
+    the test now ASSERTS against: the command exited and something it started
+    did not. That assertion has already failed by the time this runs, which is
+    the point (the test must report the orphan, not tidy it away), but a
+    failing test that leaks 900 MB per debugging attempt is exactly what this
+    file's clean-up discipline exists to prevent. Guarded on a survivor
+    actually being there, so a `killpg` is never sent to a group id that
+    nothing in this test owns any more.
     """
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=30)
+    if _group_survivors(pgid):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
 
 
 def test_capture_start_records_what_the_operator_browses(tmp_path):
@@ -187,7 +227,12 @@ def test_capture_start_records_what_the_operator_browses(tmp_path):
              "--burp-jar", str(bf.BURP_JAR)],
             stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             env=env, start_new_session=True)
-        stack.callback(_terminate, proc)
+        # READ, not assumed to be `proc.pid`. It is that today --
+        # `start_new_session=True` makes the command a group leader -- and
+        # reading it means the teardown and the survivor check below are
+        # asking the kernel which group this command is actually in.
+        pgid = os.getpgid(proc.pid)
+        stack.callback(_terminate, proc, pgid)
 
         def said(pattern):
             found = pattern.search(out.read_text(errors="replace"))
@@ -196,9 +241,22 @@ def test_capture_start_records_what_the_operator_browses(tmp_path):
         # ~15 s on this machine: a private Burp home is copied, a JVM starts,
         # the extension dials in and the configure is answered before the
         # command prints a thing.
-        assert bf.wait_for(lambda: said(RUN_LINE) is not None, 120), (
-            "`hx capture start` never reported a live run. It printed:\n"
-            + out.read_text(errors="replace"))
+        #
+        # THE EXIT IS PART OF THE PREDICATE. Polling stdout alone made every
+        # way this command can die IMMEDIATELY -- a jar it cannot find, a
+        # stale bridge socket, a seed home with no accepted EULA, all of
+        # which `session()` reports and exits on in under a second -- cost the
+        # full two minutes before failing, when `proc.poll()` already knew.
+        assert bf.wait_for(
+            lambda: said(RUN_LINE) is not None or proc.poll() is not None,
+            120), (
+            "`hx capture start` neither reported a live run nor exited within "
+            "120s. It printed:\n" + out.read_text(errors="replace"))
+        if said(RUN_LINE) is None:
+            pytest.fail(
+                f"`hx capture start` exited {proc.returncode} before reporting "
+                "a live run. It printed:\n"
+                + out.read_text(errors="replace"))
         port = int(said(PORT_LINE))
         run_id = said(RUN_LINE)
 
@@ -249,6 +307,29 @@ def test_capture_start_records_what_the_operator_browses(tmp_path):
         status, stop_reason = eng.db.execute(
             "SELECT status, stop_reason FROM run WHERE id=?", (run_id,)).fetchone()
         assert (status, stop_reason) == ("completed", "operator")
+
+        # HOW IT EXITED. 1 is Ctrl-C reaching a click command: the
+        # KeyboardInterrupt raised in `signal.pause()` unwinds the run-closing
+        # `finally`, click turns it into `Abort`, and `Abort` is `sys.exit(1)`.
+        # Pinned because the row above is written on the way out of a command
+        # that could also have DIED -- and a crash after `close_run` leaves
+        # exactly the row this test just read.
+        assert proc.returncode == 1, (
+            f"`hx capture start` exited {proc.returncode} on Ctrl-C, not 1. It "
+            "printed:\n" + out.read_text(errors="replace"))
+
+        # AND NOTHING IT STARTED OUTLIVED IT. Every assertion above is
+        # satisfied BEFORE `session()` tears Burp down, so a regression in
+        # that teardown -- anything raising between `close_run` and
+        # `proc.kill()` / `srv.stop()` -- would orphan a 900 MB JVM while this
+        # test reported green. `session()`'s whole contract is that every exit
+        # tears Burp down; this is the only place in the repository that
+        # measures it against a real JVM rather than a fake `kill()`.
+        survivors = _group_survivors(pgid)
+        assert not survivors, (
+            "`hx capture start` exited and left these processes behind:\n  "
+            + "\n  ".join(survivors)
+            + f"\nIt printed:\n{out.read_text(errors='replace')}")
 
 
 def test_the_authorised_hash_is_the_one_the_report_renders(tmp_path, monkeypatch):

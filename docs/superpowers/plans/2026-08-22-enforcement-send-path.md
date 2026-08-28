@@ -27751,17 +27751,29 @@ class Rig:
 
 
 # THERE IS NO SEED-HOME FIXTURE HERE, and its absence is deliberate. One round
-# of this task set `$HX_BURP_SEED_HOME` from an autouse fixture so that
+# of this task set `$HX_BURP_SEED_HOME` from an AUTOUSE FIXTURE so that
 # `hx.session.make_home` would copy the lab's home rather than the operator's.
-# It worked for everything pytest runs and for nothing else: `bf.launch_burp`'s
-# other two callers are `scripts/demo_capture.py` and `scripts/demo_gate.py`,
-# which guard on `bf.missing()` -- a check against the LAB's home -- and then
-# copied `~/.BurpSuite/sessions`, real client project state on a consultant's
-# machine. `make_home(workdir, *, seed=None)` moved the answer into the call,
-# so both fixture launchers now say `seed=SEED_HOME` in code, for every caller
-# rather than for the ones pytest owns. Nothing in this directory reaches
-# `seed_home()` any more, so an environment variable set beside it would be a
-# second answer to a question that already has one.
+# It worked for everything pytest runs and for nothing else: `bf.launch_burp`
+# is also called by `scripts/demo_gate.py`, which guards on `bf.missing()` --
+# a check against the LAB's home -- and then copied `~/.BurpSuite/sessions`,
+# real client project state on a consultant's machine. (`demo_capture.py` was
+# the second such caller until Task 9 moved it onto `hx.session.session()`,
+# where it names the same seed in code.) `make_home(workdir, *, seed=None)`
+# moved the answer into the call, so every launcher here says `seed=SEED_HOME`
+# in code, for every caller rather than for the ones pytest owns.
+#
+# THE ENVIRONMENT VARIABLE IS NOT DEAD, AND ONE TEST DEPENDS ON IT. This
+# paragraph used to end "nothing in this directory reaches `seed_home()` any
+# more", and that sentence is now an invitation to a fixed defect.
+# `tests/integration/test_cli_session.py` spawns the PRODUCT's own `hx capture
+# start`, which has no seed option and must not grow one for a test, so it
+# puts `HX_BURP_SEED_HOME=SEED_HOME` in that subprocess's environment -- the
+# only thing between a real Burp and the operator's real `$HOME`. Deleting
+# that line does not go red: a consultant's home has an accepted EULA and a
+# live `~/.BurpSuite/sessions`, so the run SUCCEEDS, copies real client
+# project state into a temporary directory, and reports green. What is true is
+# only the narrow claim: no fixture here sets that variable, and no launcher
+# in this file needs it, because they say the seed in code.
 
 
 @pytest.fixture
