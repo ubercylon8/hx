@@ -1521,3 +1521,89 @@ def test_a_findings_list_from_a_completed_run_carries_no_partial_note(
     findings = out[out.index("## Findings"):out.index("## Coverage")]
     assert "Reflected XSS in search" in findings
     assert "did not finish" not in findings
+
+
+# --- N4: the assessment window must not collapse to an instant -------------
+
+def test_an_in_flight_run_is_not_given_its_start_as_the_windows_end():
+    """`MAX(COALESCE(ended_us, started_us))` printed a still-open run's START
+    as the window's end, under the sentence "That window is the assessment:
+    nothing outside it was observed" -- false by construction, because
+    traffic captured after that instant is in the report and more arrives
+    while it renders. Reachable by the ordinary loop: browse in one terminal,
+    `hx report` in another.
+
+    The fix says the window is OPEN rather than inventing a close for it.
+    S12 asks this section to be read from the store, and neither a start
+    relabelled as an end nor a wall-clock instant nothing in the store holds
+    is something the store said."""
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, heartbeat_us, dropped_total)"
+        " VALUES('r-1','e-1','browse','staging',1756000100000000,'running',"
+        "1756000100000000,0)")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert "earliest starting 2025-08-24 01:48:20Z" in out
+    # The exact falsehood: the start rendered as the end.
+    assert "latest ending 2025-08-24 01:48:20Z" not in out
+    assert "That window is the assessment" not in out
+    assert "still open" in out
+    assert "traffic captured after it" in out
+
+
+def test_a_run_still_open_beside_a_closed_one_keeps_the_recorded_end():
+    """A closed run and an open one. The recorded end is a real datum and is
+    still printed -- the fix withholds the CLOSE of the window, not the last
+    thing the store actually knows."""
+    conn = _conn()
+    _run(conn, "r-1", started_us=1756000100000000,
+        ended_us=1756003700000000)
+    conn.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, heartbeat_us, dropped_total)"
+        " VALUES('r-2','e-1','browse','staging',1756004000000000,'running',"
+        "1756004000000000,0)")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert "latest run that did end ended 2025-08-24 02:48:20Z" in out
+    assert "still open" in out
+    assert "That window is the assessment" not in out
+
+
+def test_a_fully_closed_engagement_still_renders_the_plain_window():
+    """The separating case, and the one that keeps the open-window prose a
+    caveat rather than boilerplate: every run ended, so the window IS closed
+    and the original sentence is exactly right."""
+    conn = _conn()
+    _run(conn, "r-1", started_us=1756000100000000,
+        ended_us=1756003700000000)
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert "earliest starting 2025-08-24 01:48:20Z" in out
+    assert "latest ending 2025-08-24 02:48:20Z" in out
+    assert "That window is the assessment: nothing outside it was observed" \
+           in out
+    assert "still open" not in out
+
+
+def test_a_run_that_stopped_without_an_end_is_not_called_still_open():
+    """The other separating case, and the reason the fix reads `status` as
+    well as `ended_us`. A `killed` run with no `ended_us` has an UNKNOWN
+    close, not an open one -- nothing is still arriving through it -- and
+    calling it open would be the same class of error in the other
+    direction."""
+    conn = _conn()
+    _unfinished_run(conn, "r-1", status="killed",
+                   started_us=1756000100000000)
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert "**Not one of them has a recorded end.**" in out
+    assert "must not be quoted as a closed one" in out
+    assert "still open" not in out
+    assert "latest ending" not in out

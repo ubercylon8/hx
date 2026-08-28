@@ -355,15 +355,64 @@ def _provenance(conn, engagement_id, config, *, created_us,
     out = ["## Provenance\n",
            f"Engagement opened {_when(created_us)}.\n"]
 
+    # N4 (fix round C): `MAX(COALESCE(ended_us, started_us))` printed a still
+    # OPEN run's START as the window's end, under a sentence promising that
+    # "nothing outside it was observed" -- false by construction, because
+    # traffic captured after that instant is in this report and more is
+    # arriving while it renders. Reachable by the ordinary loop: browse in one
+    # terminal, `hx report` in another.
+    #
+    # The window is now read as three separate facts and no fourth is
+    # invented: how many runs, the earliest start, the latest RECORDED end
+    # (`MAX(ended_us)` ignores NULLs, so it is a real end or nothing at all),
+    # and how many runs have no end on record. S12's governing rule is that a
+    # report which cannot distinguish two states is worse than no report, and
+    # "this assessment ended at T" and "this assessment has not ended" are two
+    # states -- COALESCE collapsed the second into the first. Widening the
+    # window to the render clock was the other candidate and is rejected for
+    # the same rule: `_when` renders stored microseconds, and a wall-clock
+    # instant nothing in the store holds would be a fourth fact, invented at
+    # render time, in the one section S12 asks to be read FROM THE STORE.
     runs = conn.execute(
-        "SELECT COUNT(*), MIN(started_us), MAX(COALESCE(ended_us, started_us))"
+        "SELECT COUNT(*), MIN(started_us), MAX(ended_us),"
+        " SUM(CASE WHEN ended_us IS NULL THEN 1 ELSE 0 END),"
+        " SUM(CASE WHEN ended_us IS NULL AND status = 'running'"
+        "          THEN 1 ELSE 0 END)"
         " FROM run WHERE engagement_id=?", (engagement_id,)).fetchone()
-    if runs[0]:
-        out.append(f"{runs[0]} run(s) recorded, the earliest starting "
-                   f"{_when(runs[1])} and the latest ending {_when(runs[2])}. "
+    total_runs, first_us, last_end_us, endless, in_flight = runs
+    if total_runs and not endless:
+        out.append(f"{total_runs} run(s) recorded, the earliest starting "
+                   f"{_when(first_us)} and the latest ending "
+                   f"{_when(last_end_us)}. "
                    "That window is the assessment: nothing outside it was "
                    "observed, and this report says nothing about the "
                    "application before or after it.\n")
+    elif total_runs:
+        # `MAX(ended_us)` skips the NULLs, so this is a real recorded end or
+        # nothing -- never a start wearing an end's label. `last_end_us is
+        # None` is exactly the case where EVERY run is endless (a run with an
+        # end would have supplied one), so the two spellings do not overlap.
+        span = ("**Not one of them has a recorded end.**"
+                if last_end_us is None else
+                f"**{endless} run(s) here carry no recorded end**, and the "
+                f"latest run that did end ended {_when(last_end_us)}.")
+        # The two endings are DIFFERENT FACTS and the report must not merge
+        # them. A run still `running` means the window is open and growing;
+        # a run that stopped without an end being written means the close is
+        # simply unknown. Only the first justifies "traffic is still
+        # arriving", and only the store can say which this is.
+        tail = (" **This assessment window is therefore still open**: "
+                f"{in_flight} of those runs had not ended when this report "
+                "was rendered, so traffic captured after it — including "
+                "traffic arriving while it was being written — falls inside "
+                "the window too."
+                if in_flight else
+                " Nothing here establishes when observation stopped, so this "
+                "window must not be quoted as a closed one.")
+        out.append(f"{total_runs} run(s) recorded, the earliest starting "
+                   f"{_when(first_us)}. {span}{tail} Nothing before that "
+                   "earliest start was observed, and this report says "
+                   "nothing about the application before it.\n")
     else:
         out.append("**No run has been recorded for this engagement.** "
                    "Nothing below was observed by this tool.\n")
