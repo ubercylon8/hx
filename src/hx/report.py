@@ -239,8 +239,6 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
     out.append(f"# {_redact(eng[2])} — web application assessment\n")
     out.append(f"Engagement `{_redact(eng[1])}`.\n")
 
-    out.extend(_provenance(conn, engagement_id, config, created_us=eng[3]))
-
     # ONE SOURCE OF TRUTH FOR "HAS THIS ENGAGEMENT EVER BEEN SCANNED",
     # shared by `_findings` (F4 of fix round 1: an unscanned engagement's
     # "None recorded" must not read as a clean bill) and `_coverage` (the
@@ -251,15 +249,57 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
         "SELECT 1 FROM check_run cr JOIN run r ON r.id = cr.run_id"
         " WHERE r.engagement_id=? LIMIT 1", (engagement_id,)).fetchone())
 
+    # F8 (fix round B), and computed here for the same reason `scanned` is:
+    # two sections make a statement about it and neither may be free to
+    # disagree with the other. `_provenance` NAMES the runs that did not
+    # finish; `_coverage` marks its own numbers partial because of them.
+    unfinished = _unfinished_runs(conn, engagement_id)
+
+    out.extend(_provenance(conn, engagement_id, config, created_us=eng[3],
+                           unfinished=unfinished))
     out.extend(_findings(conn, engagement_id, scanned=scanned))
-    out.extend(_coverage(conn, engagement_id, config, scanned=scanned))
+    out.extend(_coverage(conn, engagement_id, config, scanned=scanned,
+                         unfinished=unfinished))
     if blobs is not None:
         out.extend(_insertion_coverage(conn, engagement_id, blobs))
     out.extend(_limits(conn, engagement_id))
     return "\n".join(out) + "\n"
 
 
-def _provenance(conn, engagement_id, config, *, created_us) -> list[str]:
+def _unfinished_runs(conn, engagement_id) -> list[tuple]:
+    """Every run behind this report that did not end `completed`.
+
+    F8 (fix round B). Nothing in this module read `run.status` or
+    `run.stop_reason`, and S5 says what that costs, of `run` itself:
+
+        an aborted run must never render as a clean one, and neither must
+        one that merely STOPPED BEING UPDATED: a run left `running` with a
+        stale heartbeat_us is a run whose harness died, and it resolves to
+        `error`, not `completed`.
+
+    A scan stopped by Ctrl-C, by a `sqlite3.Error` through `cli.scan`'s
+    `except`-less `try`/`finally`, or by a stale-heartbeat reap rendered its
+    partial coverage byte-identically to a complete pass. The abort path is
+    reachable today, and this is S12's governing rule again: a report that
+    cannot distinguish "tested, clean" from "never reached" is worse than no
+    report, and half a run is exactly the second thing wearing the first
+    thing's clothes.
+
+    `status <> 'completed'` rather than a list of the bad values, so all four
+    of `running | aborted | killed | error` are caught and a value added to
+    the CHECK constraint later cannot slip through as finished. `running` is
+    included deliberately: S5's own sentence says a run left running is a
+    dead harness, and a run genuinely still in flight while the report
+    renders has produced partial coverage too.
+    """
+    return conn.execute(
+        "SELECT id, kind, status, stop_reason, started_us FROM run"
+        " WHERE engagement_id=? AND status <> 'completed'"
+        " ORDER BY started_us, id", (engagement_id,)).fetchall()
+
+
+def _provenance(conn, engagement_id, config, *, created_us,
+                unfinished) -> list[str]:
     """When this engagement ran, what it was permitted to touch, and on whose
     authority -- read from the STORE.
 
@@ -324,6 +364,25 @@ def _provenance(conn, engagement_id, config, *, created_us) -> list[str]:
     else:
         out.append("**No run has been recorded for this engagement.** "
                    "Nothing below was observed by this tool.\n")
+
+    if unfinished:
+        out.append(f"**{len(unfinished)} of those runs did not finish.** "
+                   "Everything this report draws from them is what they had "
+                   "reached when they stopped, not what a completed run "
+                   "would have produced.\n")
+        for run_id, kind, status, stop_reason, started_us in unfinished:
+            line = (f"- run `{_flat(run_id)}` ({_flat(kind)}, started "
+                    f"{_when(started_us)}) ended `{_flat(status)}`")
+            if stop_reason:
+                # `stop_reason` is free text and attacker-influenceable:
+                # `hx.scan.run` writes `f"scan.run raised: {type(exc).__name__}:
+                # {exc}"`, an exception message that can quote a request
+                # target. Through `_redact` like every other such field.
+                line += f" — stop reason: {_flat(_redact(stop_reason))}"
+            else:
+                line += " and recorded no stop reason"
+            out.append(line)
+        out.append("")
 
     out.extend(_scope_of_record(conn, engagement_id, config))
     out.extend(_authorization(conn, engagement_id))
@@ -572,7 +631,7 @@ def _evidence(conn, finding_id) -> list[str]:
     return out
 
 
-def _coverage(conn, engagement_id, config, *, scanned) -> list[str]:
+def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
     """Which checks answered for which surfaces, and -- F2 of fix round B --
     which surfaces nothing answered for.
 
@@ -611,6 +670,17 @@ def _coverage(conn, engagement_id, config, *, scanned) -> list[str]:
     untested = _untested_surfaces(conn, engagement_id)
 
     out = ["## Coverage\n"]
+    if unfinished:
+        # F8: coverage drawn from a run that did not finish is coverage of
+        # what that run reached before it stopped. Said HERE as well as in
+        # Provenance because this is the section whose numbers are affected,
+        # and a reader who scrolled straight to it must not take them for a
+        # complete pass.
+        out.append(f"**These numbers are partial.** {len(unfinished)} of the "
+                   "runs behind this section did not finish (each is named "
+                   "under Provenance above), so a check that never opened "
+                   "for a surface may simply be a check the run never got "
+                   "to.\n")
     if captured:
         out.append(f"This assessment captured **{captured} surface(s)**. "
                    f"**{captured - len(untested)}** had at least one check "

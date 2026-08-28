@@ -711,6 +711,89 @@ def test_an_engagement_with_no_check_runs_says_it_was_never_scanned(report_env):
     assert "not been scanned" in coverage_section.lower()
 
 
+# --- F8: an aborted run must never render as a complete one ----------------
+
+def _unfinished_run(conn, run_id, *, status, stop_reason=None, started_us=1,
+                   kind="scan") -> None:
+    """A run that stopped. `run.status` is constrained to
+    `running|completed|aborted|killed|error` and every other fixture in this
+    file writes `completed`, which is why nothing here could tell a partial
+    pass from a whole one."""
+    conn.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, stop_reason, dropped_total)"
+        " VALUES(?,'e-1',?,'staging',?,?,?,0)",
+        (run_id, kind, started_us, status, stop_reason))
+
+
+def test_a_completed_run_renders_no_partial_warning(report_env_scanned_clean):
+    """The separating case, and the one that makes the rest a caveat rather
+    than boilerplate: a scan that ran to completion must say nothing about
+    having stopped."""
+    out = report.render(**report_env_scanned_clean)
+    assert "did not finish" not in out
+    assert "These numbers are partial" not in out
+
+
+@pytest.mark.parametrize("status", ["aborted", "killed", "error", "running"])
+def test_a_run_that_did_not_complete_is_named_and_marks_coverage_partial(status):
+    """S5, of `run`: "an aborted run must never render as a clean one, and
+    neither must one that merely STOPPED BEING UPDATED: a run left `running`
+    with a stale heartbeat_us is a run whose harness died, and it resolves
+    to `error`, not `completed`." Nothing in this module read `run.status`
+    or `run.stop_reason` at all, so a scan stopped by Ctrl-C, by a
+    `sqlite3.Error` through `cli.scan`'s `except`-less `try`/`finally`, or
+    by a stale-heartbeat reap rendered its partial coverage byte-identically
+    to a complete pass.
+
+    All four non-`completed` values, `running` included: a run still in
+    flight while the report renders has produced partial coverage too."""
+    conn = _conn()
+    _unfinished_run(conn, "r-1", status=status,
+                   stop_reason="KeyboardInterrupt")
+    _surface(conn, "s-1")
+    _check_run(conn, "cr-1", run_id="r-1", surface_id="s-1",
+              check_id="hx.passive.cookie-flags", verdict="clean")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert "1 of those runs did not finish" in out
+    assert f"ended `{status}`" in out
+    assert "run `r-1`" in out
+    assert "KeyboardInterrupt" in out
+    coverage = out[out.index("## Coverage"):]
+    assert "**These numbers are partial.**" in coverage
+
+
+def test_a_stopped_run_with_no_stop_reason_says_that_rather_than_nothing():
+    """`run.stop_reason` is nullable and a reaped run may carry none. The
+    line must still exist and must not silently render as though a reason
+    had been given."""
+    conn = _conn()
+    _unfinished_run(conn, "r-1", status="killed", stop_reason=None)
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+    assert "ended `killed` and recorded no stop reason" in out
+
+
+def test_a_credential_in_a_stop_reason_is_redacted():
+    """`hx.scan.run` writes `stop_reason` as
+    `f"scan.run raised: {type(exc).__name__}: {exc}"` -- an exception message
+    that can quote a request target, the same construction the coverage
+    `reason` cell carries. It is a newly rendered free-text field, so it
+    goes through the choke point like every other one."""
+    conn = _conn()
+    _unfinished_run(
+        conn, "r-1", status="error",
+        stop_reason="scan.run raised: OSError: GET "
+                    "https://admin:hunter2@app.acme.test/x?access_token=SECRETTOKEN")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+    assert "hunter2" not in out
+    assert "SECRETTOKEN" not in out
+    assert "scan.run raised: OSError" in out
+
+
 # --- F2: the coverage section can show what was never reached --------------
 
 @pytest.fixture
