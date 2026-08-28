@@ -1692,3 +1692,53 @@ def test_the_authorization_note_states_the_store_and_not_the_build(report_env):
         assert typed not in section, \
             f"the Authorization note claims {typed!r}, a build fact it " \
             "cannot check and no test can redden"
+
+
+# --- N3: a config matching a SUPERSEDED version is not "no row above" ------
+
+def test_a_config_matching_a_superseded_scope_version_says_which_one(
+        report_env):
+    """MEASURED before the fix: only `versions[-1]` was compared, so a config
+    matching an older recorded row printed "it hashes to `2205b1d2…`, which
+    matches no row above" with that exact hash sitting in the FIRST row three
+    lines higher. Self-contradicting on the page, and inverted in substance:
+    those patterns ARE a recorded boundary, a superseded one.
+
+    `hx report` cannot reach it -- `engagement.open_` refuses to open a store
+    whose config diverges from the newest `scope_version` -- but this branch
+    exists precisely because `render` is a public function whose sentence
+    above the patterns has to be true of EVERY caller, which is the rationale
+    the branch was built on."""
+    conn, cfg = report_env["conn"], report_env["config"]
+    _scope_version(conn, "sv-1", sha256=_digest(cfg),
+                  effective_from_us=1756000000000000, cfg=cfg,
+                  reason="engagement created")
+    _scope_version(conn, "sv-2", sha256="b" * 64,
+                  effective_from_us=1756003600000000, author="dana",
+                  reason="client added the staging host")
+    out = report.render(**report_env)
+
+    assert "SUPERSEDED scope version" in out
+    assert "matches no row above" not in out
+    # It is not the newest either, so the verified-newest sentence must not
+    # fire -- that would be the opposite falsehood.
+    assert "verified, not assumed" not in out
+    # And it must say WHICH row it is and when it stopped being the boundary.
+    assert _digest(cfg) in out
+    assert "effective from 2025-08-24 01:46:40Z" in out
+    assert "stopped being the boundary on 2025-08-24 02:46:40Z" in out
+
+
+def test_a_config_matching_the_newest_of_several_is_still_verified(
+        report_env):
+    """The separating case: matching the LAST row is the ordinary, reachable
+    state and must still read as the scope of record, not as superseded."""
+    conn, cfg = report_env["conn"], report_env["config"]
+    _scope_version(conn, "sv-1", sha256="a" * 64, effective_from_us=1)
+    _scope_version(conn, "sv-2", sha256=_digest(cfg), effective_from_us=2,
+                  cfg=cfg)
+    out = report.render(**report_env)
+
+    assert "verified, not assumed" in out
+    assert "SUPERSEDED" not in out
+    assert "matches no row above" not in out

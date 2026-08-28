@@ -517,10 +517,33 @@ def _scope_of_record(conn, engagement_id, config) -> list[str]:
                    f"The `Runs` column above accounts for {shown} run(s), so "
                    "a 0 in a row means no STAMPED run named that version.\n"))
 
-    if versions and digest == versions[-1][0]:
+    # N3 (fix round C): the digest is looked up against EVERY recorded row,
+    # not only the last. Comparing it to `versions[-1]` alone made a config
+    # matching a SUPERSEDED version print "it hashes to `2205b1d2…`, which
+    # matches no row above" with that exact hash sitting in the first row
+    # three lines higher -- self-contradicting on the page, and inverted in
+    # substance: those patterns ARE a recorded boundary, a superseded one.
+    # `hx report` cannot reach it (`engagement.open_` refuses to open a store
+    # whose config diverges from the newest `scope_version`), but this branch
+    # exists precisely because `render` is a public function whose sentence
+    # above the patterns has to be true of every caller. `matched[-1]` is the
+    # LAST row carrying the digest, so a config recorded twice is still read
+    # as the newest occurrence and the unchanged branch below fires.
+    matched = [i for i, v in enumerate(versions) if v[0] == digest]
+    if matched and matched[-1] == len(versions) - 1:
         out.append("The patterns below are the newest version in that table, "
                    f"`{digest}` — verified, not assumed: the configuration "
                    "this report was rendered from hashes to that row.\n")
+    elif matched:
+        at = matched[-1]
+        out.append("**The patterns below are a SUPERSEDED scope version.** "
+                   "They are the configuration this report was rendered from, "
+                   f"and it hashes to `{digest}` — the scope version above "
+                   f"effective from {_when(versions[at][1])}, which stopped "
+                   f"being the boundary on {_when(versions[at + 1][1])} when "
+                   "the next row took effect. They WERE a recorded boundary, "
+                   "but not the one in force at the end of this engagement: "
+                   "read that off the last row of the table above.\n")
     elif versions:
         out.append("**The patterns below are NOT the scope of record.** They "
                    "are the configuration this report was rendered from, and "
