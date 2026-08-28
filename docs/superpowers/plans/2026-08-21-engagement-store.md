@@ -875,9 +875,20 @@ CREATE TABLE IF NOT EXISTS finding (
   -- issue_type_id: WHAT KIND OF ISSUE THIS IS. Spec S10/S12: report text,
   -- severity and CWE mappings come from Burp's 183 vendored issue
   -- definitions, so a report reads in the same vocabulary a Pro user's
-  -- would. Unwritten by any code in this plan -- that mapping is a later
-  -- plan's job -- and NOT to be used for anything else, including the
-  -- column immediately below.
+  -- would. Adopting those ids is still a later plan's job; until then each
+  -- check names its own stable lowercase-kebab value (`missing-hsts`), and
+  -- swapping in Burp's vocabulary later is a change of SPELLING on this
+  -- axis, not a change of what the axis means. NOT to be used for anything
+  -- else, including the column immediately below.
+  --
+  -- WRITTEN, and part of identity, since F1 of the whole-branch review
+  -- (HIGH). It is the 2nd part of `finding.dedupe_key` (see
+  -- `records.dedupe_key`), because every other part of that key is fixed by
+  -- the check and the surface: without it, three security headers missing
+  -- from one response filed ONE finding wearing the first candidate's title
+  -- and the last candidate's severity. This column being DECLARED AND
+  -- UNWRITTEN is also what made it look like a free slot to the earlier fix
+  -- described below; it is neither free nor unwritten now.
   --
   -- check_id: WHICH hx CHECK FOUND THIS, added at SCHEMA_VERSION 7 (fix
   -- round 2 of Task 6). `hx.scan._mark_unobserved` needs to know, for a
@@ -1135,7 +1146,21 @@ from hx.store.paths import secure_mkdir
 # comment on `finding.check_id` for why the column exists: it is NOT the
 # same axis as `finding.issue_type_id`, and conflating the two was reachable
 # without one.
-SCHEMA_VERSION = 7
+# 7 -> 8 (2026-08-27, whole-branch review fix round A): NO DDL CHANGE, and
+# the bump is deliberate anyway. `finding.dedupe_key`'s FORMAT changed --
+# `records.dedupe_key` gained `issue_type_id` as its 2nd part (F1, HIGH),
+# and blanks `method`/`path_template` for a host-scoped finding and the
+# whole location for an engagement-scoped one (F3, MEDIUM) --
+# so every key an older store holds is spelled in a format this code will
+# never produce again. Nothing would fail: the UNIQUE constraint is on the
+# string, so the first scan against such a store simply re-files every
+# finding it already holds as new, with `first_seen_run` reset and the
+# operator's triage stranded on the old row. That is precisely the silent
+# outcome the 6 -> 7 comment above says this constant exists to make loud,
+# and "the column list did not change" is not the test -- whether an older
+# file still MEANS what this code assumes is. `engagement.open_`'s version
+# check is the only thing in the tree that can notice.
+SCHEMA_VERSION = 8
 
 TABLES: tuple[str, ...] = (
     "engagement",
