@@ -19,7 +19,6 @@ That has already happened twice on this branch from burp_fixture.missing().
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import socket
 import subprocess
 import time
@@ -31,12 +30,9 @@ from typing import Sequence
 
 import pytest
 
-from hx import capture as capture_mod
-from hx import config, engagement
+from hx import config, engagement, session
 from hx.bridge import server
 from hx.halt import OperatorHalt
-from hx.store import blobs as blobs_mod
-from hx.store import db as db_mod
 from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer
 
@@ -120,73 +116,52 @@ def _announce_skipped(terminalreporter) -> None:
             "trusting this suite.", yellow=True)
 
 
-class ReadThreadCapture:
-    """`hx.capture.Capture`, on a connection belonging to the thread that uses it.
+def build_config_body(cfg: config.Config, *, max_requests: int,
+                      rate_rps: int | None = None) -> dict[str, list[str]]:
+    """`hx.session.config_body`, plus the two things only a TEST wants.
 
-    THE SINK IS CALLED ON THE BRIDGE'S READ THREAD. `BridgeServer.__init__`
-    says so in as many words and adds the consequence: a callback there "may
-    not touch a sqlite3 connection opened elsewhere: it belongs to the thread
-    that created it and raises ProgrammingError anywhere else". `eng.db` is
-    opened by the fixture, on the main thread, so a `Capture(eng.db, ...)`
-    installed here raises on EVERY frame.
+    The body itself is the product's now. It had been spelled here as well --
+    a shorter body, with a two-entry `dangerous.path` where the engagement
+    config carries nine and no `scope.exclude`, `render.allow` or
+    `limit.concurrency` at all -- and this file's own comment already named
+    that hazard: "a config body spelled anywhere else is a second spelling
+    free to drift from this one". It had drifted. A test asserting a refusal
+    against a body the product would never send proves nothing about the
+    product.
 
-    MEASURED, because the failure is silent in the worst way. `_capture`
-    catches everything the sink throws -- deliberately; S4 says a lost record
-    changes what hx KNOWS, never what it ALLOWS -- keeps the exception in
-    `BridgeServer.exchange_callback_error`, and retries the loss as a `dropped`
-    frame, which raises identically. So the observable is a live Burp, a green
-    handshake, traffic flowing to the target, and ZERO rows: exactly the shape
-    whose natural diagnosis is "the extension never sent anything".
+    `limit.max_requests` is the first addition, and it is an addition rather
+    than a defect in `config_body`: `Limits.arm()` falls back to a documented
+    2000 per run and S4 says the budget binds the send path and the crawler,
+    neither of which the product starts yet, so a number there would have no
+    referent. The rig DOES exhaust a budget on purpose
+    (`test_the_run_budget_is_exhausted_and_stays_exhausted`), which needs a
+    number small enough to reach. It is a parameter rather than a constant
+    because every OTHER test wants it far above anything it issues, so the
+    per-run budget never trips first and quietly turns whatever is under test
+    into a budget test. `Limits.arm` only ever arms once per run (its own
+    docstring: "ARMED ONCE"), so a caller wanting a number other than the
+    default must pass it on the FIRST configure of the test -- a later
+    configure with a different value is silently ignored, by design, so that a
+    scope push mid-run can never hand a run more requests than it started with.
 
-        sqlite3.ProgrammingError: SQLite objects created in a thread can only
-        be used in that same thread.
+    `rate_rps` is the second, and it overrides the rate for ONE configure for
+    exactly one caller: the test that pushes a SECOND configure naming a
+    different `limit.rate_rps` mid-run and expects `bad_config`. Default None
+    means "the engagement's rate", which is what `config_body` reads from the
+    config and what every other caller wants.
 
-    So the connection is opened LAZILY, on the first call, which happens on the
-    read thread -- and every later call is on that same thread. The main thread
-    keeps reading through `eng.db`; two connections to one WAL database is the
-    ordinary arrangement and each sees the other's commits.
-
-    It is deliberately NOT closed at teardown. `Connection.close()` is thread-
-    affine as well (measured, same exception), so closing it from the fixture's
-    unwind would raise during teardown and replace whatever failed the test.
-    `srv.stop()` joins the read thread first, so nothing is still writing.
+    The distress thresholds are deliberately in neither: Plan 2's config-key
+    vocabulary (`codec.CONFIG_KEYS`) has no key for them and
+    `codec.build_config_body` refuses an unrecognised key outright, so the
+    auto-halt test is written against the S4 production defaults the extension
+    carries -- a 5xx rate above 20%, over a window that needs ten answered
+    samples on a host before it may trip.
     """
-
-    def __init__(self, root: Path, engagement_id: str, cfg: config.Config):
-        self._root = Path(root)
-        self._engagement_id = engagement_id
-        self._config = cfg
-        self._capture: capture_mod.Capture | None = None
-
-    def _lazy(self) -> capture_mod.Capture:
-        if self._capture is None:
-            self._capture = capture_mod.Capture(
-                db_mod.connect(self._root / "hx.db"),
-                blobs_mod.BlobStore(self._root / "blobs"),
-                self._engagement_id, self._config)
-        return self._capture
-
-    def __call__(self, header: dict, request: bytes, response: bytes):
-        return self._lazy().on_exchange(header, request, response)
-
-    def on_halted(self, header: dict):
-        """S4's auto-halt, on the same connection and the same thread.
-
-        This rig wired `on_hello` and `on_exchange` and NOT this one, which was
-        half of why `records.abort_run` had no caller outside tests: S4's "one
-        distressed host aborts the whole run" reached the wire, reached
-        `BridgeServer.last_halted`, and stopped there. A real Burp really does
-        emit this frame -- `test_five_hundreds_from_the_slow_route_abort_the_
-        whole_run` drives ten 500s and reads it off the socket -- so wiring it
-        here is what makes the ROW the thing a real auto-halt produces rather
-        than something a test wrote by hand beside it.
-
-        The connection is this class's own, opened lazily on the read thread,
-        for the reason the class docstring gives: `BridgeServer` catches the
-        `ProgrammingError` a foreign connection raises, so the observable of
-        getting this wrong is a green run and an empty table.
-        """
-        return self._lazy().on_halted(header)
+    body = session.config_body(cfg)
+    body["limit.max_requests"] = [str(max_requests)]
+    if rate_rps is not None:
+        body["limit.rate_rps"] = [str(rate_rps)]
+    return body
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -225,57 +200,32 @@ class Rig:
 
     def configure(self, *, max_requests: int = 2000,
                   rate_rps: int | None = None) -> int:
-        """Push the scope, the method allowlist and the limits this rig tests.
+        """The configure the PRODUCT sends, with the rig's two additions.
 
-        `limit.rate_rps` is taken from the engagement config rather than
-        written out here. S4 puts the limits inside the extension and the
-        configure body is how they get there, so the number in the config, the
-        number on the wire and the number a test computes its bounds from are
-        one number. Two of them written separately is how a test ends up
-        asserting against a rate nothing honours. The value the fixture picks
-        is 3 rather than the config default of 5, and the reason is at the
-        Config() call: 5 is what the extension falls back to on its own.
+        Everything about the body is `build_config_body`'s; see it for why
+        `max_requests` and `rate_rps` are the only two things this side adds.
+        `limit.rate_rps` reaching the extension from the engagement config is
+        what makes the number in the config, the number on the wire and the
+        number a test computes its bounds from one number: the rig sets 3
+        rather than hx.config's default of 5 at the Config() call, because 5
+        is also what the extension falls back to when the key is absent, so a
+        configured 5 and an ignored configure body would be the same
+        observation.
 
-        `limit.max_requests` has no engagement-config field yet, so this is the
-        rig's own choice, and it is a parameter rather than a second constant
-        for exactly one reason: every test but the budget test wants it far
-        above anything that test issues, so the per-run budget never trips
-        first and quietly turns whatever it is testing into a budget test.
-        `Limits.arm` only ever arms once per run (its own docstring: "ARMED
-        ONCE"), so a caller wanting a number other than the default must pass
-        it on the FIRST configure of the test -- a later configure with a
-        different value is silently ignored, by design, so that a scope push
-        mid-run can never hand a run more requests than it started with.
-
-        `rate_rps` overrides the rate for ONE configure and exists for exactly
-        one caller: the test that pushes a SECOND configure naming a different
-        `limit.rate_rps` mid-run and expects `bad_config`. That body has to be
-        built here rather than in the test -- a config body spelled anywhere
-        else is a second spelling free to drift from this one, and a test
-        asserting a refusal against a body the rig would never send proves
-        nothing about the rig. Default None means "the engagement's rate",
-        which is what every other caller wants and what the first configure of
-        that test uses.
-
-        The distress thresholds are deliberately NOT here. Plan 2's config-key
-        vocabulary (`codec.CONFIG_KEYS`) has no key for them and
-        `build_config_body` refuses an unrecognised key outright, so the
-        auto-halt test is written against the S4 production defaults the
-        extension carries: a 5xx rate above 20%, over a window that needs ten
-        answered samples on a host before it may trip.
+        THE SCOPE HASH IS READ, NOT RECOMPUTED, through the product's
+        `stored_scope_sha256`. This rig used to hash `config.dumps(cfg)` here.
+        The two agree today -- `engagement.create` writes that same hash into
+        `scope_version` -- and agreeing today is exactly the property Task 5
+        says not to rely on: `scope_version` is append-only so that a contract
+        dispute has one answer, and a rig that recomputes cannot notice a
+        session authorising the extension against one boundary while the
+        report renders another.
         """
-        pairs = {
-            "scope.include": [f"{self.target.origin}/*"],
-            "method.allow": ["GET", "HEAD", "OPTIONS"],
-            "dangerous.path": ["*/logout*", "*/password*"],
-            "limit.rate_rps": [str(self.eng.config.rate_limit_rps
-                                   if rate_rps is None else rate_rps)],
-            "limit.max_requests": [str(max_requests)],
-        }
-        scope_sha256 = hashlib.sha256(
-            config.dumps(self.eng.config).encode("utf-8")).hexdigest()
-        return self.srv.configure(pairs, scope_sha256=scope_sha256,
-                                  profile=self.eng.config.safety_profile)
+        return self.srv.configure(
+            build_config_body(self.eng.config, max_requests=max_requests,
+                              rate_rps=rate_rps),
+            scope_sha256=session.stored_scope_sha256(self.eng.db, self.eng.id),
+            profile=self.eng.config.safety_profile)
 
     def send(self, method: str, target_path: str, *,
              to: TargetServer | None = None,
@@ -433,8 +383,33 @@ class Rig:
             f"{[(h.method, h.path) for h in self.target.hits]}")
 
 
+@pytest.fixture(autouse=True)
+def _lab_seed_home(monkeypatch):
+    """Every Burp in this directory copies the LAB's home, not the operator's.
+
+    `hx.session.make_home` copies `seed_home()`, which is the operator's own
+    `$HOME` by default -- right for a consultant, whose accepted licence is
+    the only one hx may use, and wrong here twice over: this suite must not
+    read a developer's live Burp home (`prefs.xml` is 1.75 MB and gets
+    rewritten under a running Burp, which is where the torn-file bug came
+    from), and `burp_fixture.missing()` reports on `bf.SEED_HOME`, so a rig
+    that seeded from somewhere else would be checking one home and copying
+    another.
+
+    Said HERE, once, through the knob the product already publishes, rather
+    than at import in `burp_fixture`: this file is imported during COLLECTION
+    for the whole repository, and a module-level `os.environ` write would
+    reach the 968 tests that have nothing to do with Burp.
+
+    AUTOUSE because `test_real_burp.py` and `test_proxy_facts.py` launch their
+    own Burps without going through `rig`, and `rig` names it in its arguments
+    as well so the ordering is stated rather than inherited.
+    """
+    monkeypatch.setenv("HX_BURP_SEED_HOME", str(bf.SEED_HOME))
+
+
 @pytest.fixture
-def rig(tmp_path):
+def rig(tmp_path, _lab_seed_home):
     # Order matters: an unbuilt jar is a FAILURE and a missing Burp is a skip,
     # and asking the skip question first turns the former into the latter.
     if bf.unbuilt():
@@ -497,8 +472,12 @@ def rig(tmp_path):
         # ONE sink object for both callbacks, so both run on ONE connection
         # opened on the read thread. Two objects would open two, and the
         # second would be as thread-affine as the first with nothing making
-        # that obvious.
-        sink = ReadThreadCapture(eng.root, eng.id, cfg)
+        # that obvious. `ExchangeSink` IS this rig's sink, promoted: Task 6
+        # gave it `on_halted` for exactly this wiring, and the lesson it
+        # carries -- that a foreign connection's ProgrammingError is caught,
+        # counted and swallowed, so getting it wrong looks like a green
+        # handshake and an empty table -- was measured here first.
+        sink = session.ExchangeSink(eng.root, eng.id, cfg)
         srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id=eng.id,
                                   operator_halt=operator_halt,
                                   on_exchange=sink,

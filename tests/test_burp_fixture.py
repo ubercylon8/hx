@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from hx import session
 from tests.integration import burp_fixture as bf
 
 REPO = Path(__file__).resolve().parents[1]
@@ -58,8 +59,15 @@ def lab(tmp_path, monkeypatch):
     monkeypatch.setattr(bf, "LAB", root)
     monkeypatch.setattr(bf, "BURP_JAR", root / "burpsuite_desktop.jar")
     monkeypatch.setattr(bf, "SEED_HOME", root / "burphome")
-    monkeypatch.setattr(bf, "EXT_JAR", jar)
-    monkeypatch.setattr(bf, "EXT_SRC", tmp_path / "ext" / "src")
+    # BOTH modules, because EXT_JAR and EXT_SRC are DEFINED in hx.session now
+    # and the fixture re-exports them. `_newest_source_mtime` and `_jar_mtime`
+    # read hx.session's globals; `bf._missing` and `bf._jar_problem` read the
+    # fixture's own alias. Patch one and not the other and half the check is
+    # still pointed at the real repository -- and the half these tests then
+    # unlink() is the REAL extension jar.
+    for module in (bf, session):
+        monkeypatch.setattr(module, "EXT_JAR", jar)
+        monkeypatch.setattr(module, "EXT_SRC", tmp_path / "ext" / "src")
     return tmp_path
 
 
@@ -334,7 +342,7 @@ def _sockets(*addresses):
 
 
 def test_two_loopback_listeners_and_the_configured_ports_pass(monkeypatch):
-    monkeypatch.setattr(bf, "_listening_sockets",
+    monkeypatch.setattr(session, "_listening_sockets",
                         _sockets("[::ffff:127.0.0.1]:40421",
                                  "[::ffff:127.0.0.1]:41543"))
     assert bf.not_loopback_only(1234, [40421, 41543]) is None
@@ -346,7 +354,7 @@ def test_burps_own_third_listener_does_not_fail_the_check(monkeypatch):
     GET, `200 Connection established` to a CONNECT and `204` inside the tunnel,
     forwards nothing to the target and never reaches the extension's handler.
     It is not an enforcement hole and it must not turn every run red."""
-    monkeypatch.setattr(bf, "_listening_sockets",
+    monkeypatch.setattr(session, "_listening_sockets",
                         _sockets("[::ffff:127.0.0.1]:40421",
                                  "[::ffff:127.0.0.1]:41543",
                                  "[::ffff:127.0.0.1]:43719"))
@@ -355,7 +363,7 @@ def test_burps_own_third_listener_does_not_fail_the_check(monkeypatch):
 
 def test_a_wildcard_bound_listener_is_named(monkeypatch):
     """`all_interfaces` in the config file, which is what this reproduces."""
-    monkeypatch.setattr(bf, "_listening_sockets",
+    monkeypatch.setattr(session, "_listening_sockets",
                         _sockets("*:34777", "[::ffff:127.0.0.1]:38399"))
     reason = bf.not_loopback_only(1234, [34777, 38399])
     assert reason and "*:34777" in reason, reason
@@ -365,7 +373,7 @@ def test_a_wildcard_bound_listener_is_named(monkeypatch):
 def test_a_routable_listener_is_named_too(monkeypatch):
     """Not only the wildcard: a listener bound to this laptop's tailnet address
     is on a network as surely as `0.0.0.0` is."""
-    monkeypatch.setattr(bf, "_listening_sockets",
+    monkeypatch.setattr(session, "_listening_sockets",
                         _sockets("100.64.0.1:34777"))
     reason = bf.not_loopback_only(1234, [34777])
     assert reason and "100.64.0.1:34777" in reason
@@ -374,7 +382,7 @@ def test_a_routable_listener_is_named_too(monkeypatch):
 def test_a_configured_port_that_is_not_listening_is_not_a_pass(monkeypatch):
     """Otherwise the check passes vacuously against a Burp that bound nothing:
     every socket found is loopback when no socket was found at all."""
-    monkeypatch.setattr(bf, "_listening_sockets",
+    monkeypatch.setattr(session, "_listening_sockets",
                         _sockets("[::ffff:127.0.0.1]:40421"))
     reason = bf.not_loopback_only(1234, [40421, 41543])
     assert reason and "41543" in reason, reason
@@ -382,7 +390,7 @@ def test_a_configured_port_that_is_not_listening_is_not_a_pass(monkeypatch):
 
 def test_a_port_is_matched_whole_and_not_as_a_suffix(monkeypatch):
     """`endswith(":387")` against `...:46387` is the bug this rules out."""
-    monkeypatch.setattr(bf, "_listening_sockets",
+    monkeypatch.setattr(session, "_listening_sockets",
                         _sockets("[::ffff:127.0.0.1]:46387"))
     assert bf.not_loopback_only(1234, [387]) is not None
     assert bf.not_loopback_only(1234, [46387]) is None
@@ -400,7 +408,7 @@ def test_an_unreadable_ss_is_reported_rather_than_passed(monkeypatch):
 
 
 def test_no_socket_attributed_to_the_pid_is_reported_rather_than_passed(monkeypatch):
-    monkeypatch.setattr(bf, "_listening_sockets", _sockets())
+    monkeypatch.setattr(session, "_listening_sockets", _sockets())
     reason = bf.not_loopback_only(1234, [40421])
     assert reason and "no listening socket" in reason, reason
 

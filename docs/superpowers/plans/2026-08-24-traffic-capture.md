@@ -656,10 +656,6 @@ def launch_probe(workdir: Path, out: Path,
     proc.stdin.write(b"\n\n")
     proc.stdin.flush()
     return proc
-
-
-def listener_ports(workdir: Path) -> list[int]:
-    """The ports this run's Burp was TOLD to listen on, read back from its config.
 ```
 
 - [ ] **Step 5: Write the three measurement tests**
