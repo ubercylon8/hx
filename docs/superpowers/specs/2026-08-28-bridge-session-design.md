@@ -13,7 +13,10 @@ and the DENY-ALL default, §5 tables, §6 bridge with correlation ids and `confi
 - `hx capture start` (`cli.py:214-238`) opens a `run` row and prints a line. It does not
   launch Burp, serve the bridge, or configure anything.
 - `configure()` exists at `bridge/server.py:650` with no caller in `src/`. Its only callers
-  are `scripts/demo_capture.py:226` and the integration tests.
+  were `scripts/demo_capture.py:226` and the integration tests. **Both were rewired
+  onto `hx.session` by this plan's Task 9, so as of `1f23336` the demo does not call
+  `configure` at all** — the sentence above describes the gap that produced this
+  plan, not the tree after it.
 - The rig assembles the authorisation **inline in `Rig.configure`** — there was no
   named function to point at. (An earlier draft of this spec claimed a
   `build_config_body` in `tests/integration/conftest.py`; that was wrong. The only
