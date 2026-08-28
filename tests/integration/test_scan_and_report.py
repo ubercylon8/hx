@@ -199,12 +199,28 @@ def test_stopping_the_target_does_not_clear_a_finding_but_an_untested_surface_ge
     with the finding's own surface filtered OUT and finding the observation
     COUNT unchanged, not decremented and not incremented.
 
-    WOULD THIS FAIL IF ITS CLAIMS WERE FALSE? A regression that made
-    `_mark_unobserved` fire for a check that returned `finding` (rather than
-    `clean`) would turn the second assertion below into `[1, 1, 0]` and
-    redden it. A regression that wrote an observation row for a
-    `surface_filter`-excluded surface would move the THIRD scan's row count
-    and redden the final assertion.
+    WHAT THIS TEST PINS, AND WHAT IT DOES NOT. The `clean`-verdict filter in
+    `scan.py`'s `clean = {...WHERE run_id=? AND verdict='clean'...}` query is
+    NOT what this test pins: relaxing it alone to `verdict IN
+    ('clean','finding')` was tried and MEASURED not to redden this test,
+    because `_mark_unobserved`'s `if fid in seen: continue` guard
+    (`scan.py`, a few lines below the `clean` query) short-circuits first --
+    this finding IS re-detected by `summary2`, so its `fid` is in `seen` and
+    the loop never reaches the `clean` check for it at all. The `check_id`
+    axis of that same `clean` set is pinned instead by the unit test
+    `tests/test_scan.py::test_mark_unobserved_reads_check_id_not_issue_type_id`.
+    What THIS test pins is the fact one layer up: a still-live finding is
+    not reported as fixed merely because its target stopped answering.
+
+    WOULD THIS FAIL IF THAT CLAIM WERE FALSE? MEASURED: relaxing the
+    `clean` query to `verdict IN ('clean','finding')` AND ALSO deleting the
+    `if fid in seen: continue` guard turns the second assertion below into
+    `observed came back [0, 0]` and reddens it -- either mutation alone
+    leaves the guard (or the `clean` filter) still blocking the write, so
+    both together are what it actually takes to make `_mark_unobserved`
+    close this finding on a dead target. A regression that wrote an
+    observation row for a `surface_filter`-excluded surface would move the
+    THIRD scan's row count and redden the final assertion.
     """
     assert rig.configure() == 1
     rig.browse("GET", "/insecure-cookie")

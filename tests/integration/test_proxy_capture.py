@@ -43,12 +43,6 @@ from tests.integration.target_server import SESSION_COOKIE_VALUE
 
 pytestmark = pytest.mark.integration
 
-# Long enough for a frame that crosses a Unix socket in under a millisecond
-# once the response is complete (measured: the row was on disk 50 ms after the
-# client's response on every run taken here), short enough that a wedged
-# extension is a failure in seconds rather than a stalled suite.
-SETTLE_S = 10.0
-
 # What Burp answers a client whose request it dropped. NOT evidence of
 # anything: a DELIVERED request returns 200 too. It is asserted where it
 # appears so that the trap is pinned rather than merely avoided -- if a future
@@ -743,7 +737,7 @@ def test_an_allowed_request_that_cannot_connect_leaves_no_trace_at_all(rig):
 
     # Long enough for a frame to have crossed the bridge and a row to have
     # been written. The live request above took well under this.
-    time.sleep(SETTLE_S)
+    time.sleep(rig.SETTLE_S)
 
     assert len(rows(rig, "SELECT id FROM exchange")) == live_rows, (
         "an exchange row appeared for a request that never connected. If the "

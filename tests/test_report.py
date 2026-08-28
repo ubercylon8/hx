@@ -465,6 +465,21 @@ def test_the_limits_section_names_what_this_corpus_cannot_do(report_env):
     assert "blind" in out.lower()
 
 
+def test_the_limits_section_says_a_fix_cannot_be_shown_by_re_browsing(
+        report_env_with_findings):
+    """Every check this build ships is passive: `scan._exchanges_for` reads
+    an engagement's WHOLE captured history for a surface, not only its
+    newest traffic, so one recorded bad response keeps a finding live no
+    matter how much clean traffic follows it. `report_env_with_findings`
+    writes findings but no `finding_observation` row at all, which is the
+    point -- this bullet is a build fact, unconditional on any run having
+    retested anything, not a consequence of what a particular scan
+    observed."""
+    out = report.render(**report_env_with_findings)
+    assert "Limits" in out
+    assert "cannot be shown as fixed by re-browsing" in out
+
+
 def test_urls_are_redacted_on_export(report_env_with_credential_url):
     """S12: redaction runs on export. The blob was redacted at capture; the
     URL column was not necessarily, and the report is the artifact that leaves

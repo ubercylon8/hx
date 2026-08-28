@@ -401,6 +401,16 @@ def _limits(conn, engagement_id) -> list[str]:
                "safety profile: this side of the config has no "
                "`method.allow` key, so the extension's default method "
                "allowlist (GET, HEAD, OPTIONS) applies unconditionally.")
+    out.append("- **A fixed issue cannot be shown as fixed by re-browsing.** "
+               "Every check in this build is passive: it reads this "
+               "engagement's whole captured history for a surface, not only "
+               "the newest traffic. One recorded response is therefore enough "
+               "to keep a finding live for the life of the engagement, "
+               "however much clean traffic follows it. Re-running a scan "
+               "after a fix will still report the finding. A retest must be "
+               "run as a NEW engagement against the fixed application; this "
+               "one is a record of what was served during the assessment "
+               "window.")
 
     dropped = conn.execute(
         "SELECT COALESCE(SUM(dropped_total), 0) FROM run WHERE engagement_id=?",
