@@ -563,6 +563,16 @@ class ExchangeSink:
     The connection is therefore opened LAZILY, on the first call, which is
     already on the read thread.
 
+    ONE OBJECT SERVES BOTH CALLBACKS, and that is why this is a class and not
+    two functions. `BridgeServer` calls `on_exchange` AND `on_halted` on that
+    same read thread, and S4's auto-halt writer is `Capture.on_halted` -- so a
+    separate sink for the second callback would open a SECOND connection,
+    which would be (quoting `tests/integration/conftest.py`, which has wired
+    it this way against a real Burp since Plan 4) "as thread-affine as the
+    first with nothing making that obvious". Whichever callback arrives first
+    opens the connection through `_lazy()`; both then share it, and a third
+    callback added later belongs on this object for the same reason.
+
     ONE READ THREAD is what makes that safe, and it is `BridgeServer`'s
     guarantee rather than this class's: `_accept_loop` runs on a single thread
     and every callback comes from it. A second caller thread would get the
@@ -581,18 +591,34 @@ class ExchangeSink:
         self._root, self._id, self._cfg = Path(root), engagement_id, cfg
         self._capture = None
 
-    def __call__(self, header: dict, request: bytes, response: bytes) -> None:
+    def _lazy(self) -> capture_mod.Capture:
+        """The `Capture`, built once, on whichever thread calls first."""
         if self._capture is None:
             self._capture = capture_mod.Capture(
                 db_mod.connect(self._root / "hx.db"),
                 blobs_mod.BlobStore(self._root / "blobs"),
                 engagement_id=self._id, config=self._cfg)
+        return self._capture
+
+    def __call__(self, header: dict, request: bytes, response: bytes) -> None:
         # `on_exchange`, not a call on the Capture itself: `hx.capture.Capture`
         # is a dataclass with no `__call__`, so calling it raises TypeError --
         # which the bridge would catch and count like any other sink failure,
         # leaving exactly the live-Burp-and-empty-database this class was
         # written to prevent, one layer further out.
-        self._capture.on_exchange(header, request, response)
+        self._lazy().on_exchange(header, request, response)
+
+    def on_halted(self, header: dict) -> list[str]:
+        """S4's auto-halt, on the same connection and the same thread.
+
+        Returns the run ids this frame aborted -- `[]` when nothing was
+        recording -- and does not swallow them. `BridgeServer` ignores the
+        value, but `records.abort_run` is the writer S5 reads when it refuses
+        to render an aborted run as a clean one, and a wrapper that dropped
+        the answer would make this the one place in the tree that cannot tell
+        an abort from a no-op.
+        """
+        return self._lazy().on_halted(header)
 
 
 @contextlib.contextmanager
@@ -626,9 +652,14 @@ def session(eng, *, instance: str, jar: Path | None = None,
     # `eng.db`, before the bridge exists. See stored_scope_sha256.
     scope_sha256 = stored_scope_sha256(eng.db, eng.id)
 
+    # ONE sink object for BOTH callbacks, so both run on one connection opened
+    # on the read thread -- the shape `tests/integration/conftest.py` has used
+    # against a real Burp since Plan 4, and the reason `ExchangeSink` owns
+    # `on_halted` rather than leaving S4's auto-halt writer without a caller.
+    sink = ExchangeSink(eng.root, eng.id, eng.config)
     srv = BridgeServer(work / "hx.sock", engagement_id=eng.id,
                        operator_halt=halt,
-                       on_exchange=ExchangeSink(eng.root, eng.id, eng.config))
+                       on_exchange=sink, on_halted=sink.on_halted)
     srv.start()
     proc = None
     try:

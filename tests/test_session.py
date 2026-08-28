@@ -170,6 +170,84 @@ def test_the_sink_opens_its_connection_on_the_calling_thread(tmp_path, an_engage
         sink._capture.conn.execute("SELECT COUNT(*) FROM exchange")
 
 
+def test_one_connection_serves_both_callbacks(monkeypatch, an_engagement):
+    """`on_exchange` and `on_halted` are ONE object over ONE connection.
+
+    The bridge calls both on its read thread, so a second sink for the second
+    callback opens a second connection -- "as thread-affine as the first with
+    nothing making that obvious", as the integration rig's own comment puts
+    it. Both would even work, here and against a real Burp, which is why this
+    is measured by COUNTING the connections rather than by checking that the
+    rows landed.
+
+    The halted frame goes FIRST, before anything has opened anything: if
+    `on_halted` did not open the connection itself it would raise, and if it
+    opened a private one the count below would be two. It is then sent AGAIN
+    after the exchange, and that second call must abort the run the exchange
+    opened -- a no-op `[]` would mean the two callbacks were not looking at
+    the same store.
+    """
+    opened, built = [], []
+    real_connect, real_capture = db_mod.connect, session.capture_mod.Capture
+
+    def counting_connect(path, **kw):
+        opened.append(threading.get_ident())
+        return real_connect(path, **kw)
+
+    def counting_capture(*a, **kw):
+        built.append(threading.get_ident())
+        return real_capture(*a, **kw)
+
+    monkeypatch.setattr(session.db_mod, "connect", counting_connect)
+    monkeypatch.setattr(session.capture_mod, "Capture", counting_capture)
+
+    sink = session.ExchangeSink(an_engagement.root, an_engagement.id,
+                                an_engagement.config)
+    distress = {"t": "halted", "reason": "five 500s", "host": "a.test",
+                "window": "10s"}
+    errors, aborted = [], []
+
+    def on_read_thread():
+        try:
+            aborted.append(sink.on_halted(distress))
+            sink({"id": "x-1", "method": "GET", "url": "https://a.test/",
+                  "status": 200, "outcome": "ok"}, b"GET / HTTP/1.1\r\n\r\n",
+                 b"HTTP/1.1 200 OK\r\n\r\n")
+            aborted.append(sink.on_halted(distress))
+        except Exception as exc:            # noqa: BLE001
+            errors.append(exc)
+
+    t = threading.Thread(target=on_read_thread)
+    t.start(); t.join()
+
+    assert not errors, f"the sink raised off the main thread: {errors}"
+    assert opened == [t.ident], (
+        "both callbacks must share ONE connection, opened on the read thread "
+        f"by whichever arrived first; connections were opened by {opened} and "
+        f"this thread is {threading.get_ident()}")
+    assert built == [t.ident], (
+        f"one Capture, built on the read thread; got {len(built)}")
+
+    first, second = aborted
+    assert first == [], (
+        "a halted frame arriving when nothing is recording aborts nothing")
+    assert second, (
+        "the second halted frame did not abort the run the exchange opened, "
+        "so the two callbacks are not looking at the same store")
+
+    conn = real_connect(an_engagement.root / "hx.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM exchange").fetchone()[0] == 1
+        status, stop_reason = conn.execute(
+            "SELECT status, stop_reason FROM run WHERE id=?", (second[0],)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert status == "aborted"
+    assert stop_reason == "five 500s on a.test (10s)"
+
+
+
 # --- the context manager -------------------------------------------------
 
 
