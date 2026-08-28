@@ -20,15 +20,20 @@ table's `reason` cell all reached the export raw. `reason` is not a marginal
 vector: `hx.scan` builds it as `f"{type(exc).__name__}: {exc}"`
 (`scan.py:163`), an exception message that can quote a response body or a
 request target, so it is attacker-influenced by construction. Every field
-below that can carry a URL -- title, description, impact, remediation, an
-evidence URL, a coverage reason, AND (fix round 2, R1) every `scope.include`/
-`scope.exclude` PATTERN in the Scope section -- is routed through `_redact`
+below that can carry a URL -- a finding's title, description, impact and
+remediation, an evidence URL, a coverage reason, a run's `stop_reason`, a
+scope version's `author` and `reason`, AND (fix round 2, R1) every
+`scope.include`/`scope.exclude` PATTERN -- is routed through `_redact`
 before it reaches `out`. The Scope section was the one place F1's own fix
 missed: an operator can paste a credential straight into a scope pattern
 (`https://user:pass@app.test/*`), and until R1 that string reached the
 export verbatim, unredacted, because it is operator-authored rather than
 something a check or the scan wrote -- but S12 draws no such exception, and
-neither does `_redact`. `check_id`, severity, confidence, verdict, status
+neither does `_redact`. F10 (fix round B) closed the two that were left:
+`engagement.client`, which is the document's own TITLE, and
+`engagement.name` on the line under it -- both straight off `hx new`'s
+command line, both as operator-authored as a scope pattern, and the review
+named only the first. `check_id`, severity, confidence, verdict, status
 and cwe are controlled vocabularies fixed by the schema's own CHECK
 constraints; they never carry a URL and are not passed through it.
 
@@ -100,8 +105,18 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
         "SELECT id, name, client, created_us FROM engagement WHERE id=?",
         (engagement_id,)).fetchone()
 
-    out.append(f"# {eng[2]} — web application assessment\n")
-    out.append(f"Engagement `{eng[1]}`.\n")
+    # F10 (fix round B): the title's client name and the line under it --
+    # `engagement.client` and `engagement.name` -- were the last two rendered
+    # free-text fields still reaching the export raw. Standing ruling R1: text
+    # an OPERATOR authored is not exempt from redaction, because S12 draws no
+    # such exception and neither does `_redact`. `hx new --client` takes a
+    # string off the command line, and a credential pasted into it (the same
+    # way one reaches a scope pattern, which R1 was about) reached the title
+    # of the client deliverable verbatim. The review named `client` alone as
+    # "the last free-text rendered field"; `name` is rendered raw on the very
+    # next line and is exactly as operator-authored, so both move.
+    out.append(f"# {_redact(eng[2])} — web application assessment\n")
+    out.append(f"Engagement `{_redact(eng[1])}`.\n")
 
     out.append("## Scope\n")
     for pattern in config.scope_include:

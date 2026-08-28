@@ -530,6 +530,28 @@ def test_an_engagement_with_no_check_runs_says_it_was_never_scanned(report_env):
 
 # --- F1: redaction reaches every field that can carry a URL -----------------
 
+def test_a_credential_in_the_client_or_engagement_name_is_redacted(report_env):
+    """F10 (fix round B): `engagement.client` is the document's TITLE and
+    `engagement.name` is the line under it, and neither passed through
+    `_redact`. Standing ruling R1 -- operator-authored text is not exempt --
+    already made this a defect for scope patterns; `hx new --client` takes
+    its string off the same command line. The review called `client` "the
+    last free-text rendered field"; `name` was raw beside it, so both are
+    asserted here.
+
+    The host survives redaction (only the userinfo is cut), which is what
+    separates "redacted" from "the title vanished"."""
+    report_env["conn"].execute(
+        "UPDATE engagement SET client=?, name=? WHERE id='e-1'",
+        ("https://admin:hunter2@acme.test/portal — Acme Corp",
+         "acme-2026 https://svc:s3cr3t@ci.acme.test/job"))
+    out = report.render(**report_env)
+    assert "hunter2" not in out
+    assert "s3cr3t" not in out
+    assert "acme.test" in out
+    assert "Acme Corp" in out
+
+
 def test_a_credential_url_is_redacted_from_every_field_it_reaches(report_env_with_credential_url):
     """The five-vector render the review measured leaking at once: title,
     description, impact, remediation, and the coverage table's `reason`
