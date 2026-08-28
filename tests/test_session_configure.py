@@ -187,3 +187,39 @@ def test_the_latest_of_several_scope_versions_wins(engagement):
     second = session.stored_scope_sha256(conn, eng.id)
     assert second != first
     assert session.stored_scope_sha256(conn, eng.id) == second
+
+
+def test_two_rows_at_one_microsecond_break_the_tie_the_report_breaks_it(engagement):
+    """The one fact S5 says must not become two facts.
+
+    `stored_scope_sha256` authorises the extension; `report._scope_of_record`
+    renders the boundary a contract dispute is read off. They ordered
+    differently -- `effective_from_us DESC LIMIT 1` here against
+    `effective_from_us, rowid` there, taking the last -- so two rows stamped
+    in the same microsecond let the extension be authorised against one row
+    while the deliverable rendered the other, with nothing to notice.
+
+    `record_scope_version` stamps `engagement.now_us()`, so the tie is
+    possible rather than impossible; it is hand-inserted here because
+    producing it through that API means winning a race with the clock. The
+    assertion is not a hard-coded row: it is the report's OWN ordering,
+    executed here, so the two cannot drift apart again without this failing.
+    """
+    conn, eng = engagement
+    when, = conn.execute(
+        "SELECT effective_from_us FROM scope_version WHERE engagement_id=?",
+        (eng.id,)).fetchone()
+    conn.execute(
+        "INSERT INTO scope_version(id, engagement_id, yaml, sha256,"
+        " effective_from_us, author, reason)"
+        " VALUES('sv-same-us', ?, 'name: later', 'b' * 64, ?, 'jimx',"
+        " 'stamped in the same microsecond as the row before it')",
+        (eng.id, when))
+
+    boundary_of_record = conn.execute(
+        "SELECT sv.sha256 FROM scope_version sv WHERE sv.engagement_id=?"
+        " ORDER BY sv.effective_from_us, sv.rowid", (eng.id,)).fetchall()[-1][0]
+
+    assert session.stored_scope_sha256(conn, eng.id) == boundary_of_record, (
+        "the extension would be authorised against one scope_version row "
+        "while the report renders another as the boundary of record")

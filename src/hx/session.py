@@ -658,10 +658,22 @@ def stored_scope_sha256(conn, engagement_id: str) -> str:
     authorised boundary while the extension had been authorised against
     another -- two facts that usually agree, which is the failure mode worth
     designing out rather than testing for.
+
+    `, rowid DESC` IS THE SAME ARGUMENT ONE CLAUSE FURTHER DOWN. Without it
+    this query breaks a tie on `effective_from_us` however SQLite happens to
+    walk the table, while `report._scope_of_record` orders by
+    `effective_from_us, rowid` and renders the LAST row as the boundary of
+    record -- so two rows at the same microsecond let the extension be
+    authorised against one row while the deliverable renders the other.
+    `record_scope_version` stamps `engagement.now_us()` and the schema has no
+    uniqueness constraint on the column, so that is possible rather than
+    impossible; `engagement.open_` has spelled the tie-break this way since
+    Plan 2 and this was the one place that had not.
     """
     row = conn.execute(
         "SELECT sha256 FROM scope_version WHERE engagement_id=?"
-        " ORDER BY effective_from_us DESC LIMIT 1", (engagement_id,)).fetchone()
+        " ORDER BY effective_from_us DESC, rowid DESC LIMIT 1",
+        (engagement_id,)).fetchone()
     if row is None:
         raise SessionError(
             f"engagement {engagement_id} has no scope_version row, so there is "
