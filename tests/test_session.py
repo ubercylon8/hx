@@ -283,9 +283,18 @@ def test_a_failed_configure_leaves_no_burp_running(monkeypatch, an_engagement, a
 
 def test_listeners_that_are_not_loopback_only_refuse_the_session(
         monkeypatch, an_engagement, a_jar):
+    """A bind that will never become loopback still refuses -- and the wait
+    is set to zero so this costs the fast suite nothing.
+
+    `LISTENER_BIND_TIMEOUT` is the product's, not this test's: waiting cannot
+    turn a wildcard bind into a loopback one, so the 15 seconds a real session
+    would spend here are spent AFTER the check has already found something.
+    Zeroing it asks the same question in one `ss` call.
+    """
     killed = []
     monkeypatch.setattr(session, "launch_burp", _launcher(killed))
     monkeypatch.setattr(session, "wait_for", lambda *a, **k: True)
+    monkeypatch.setattr(session, "LISTENER_BIND_TIMEOUT", 0.0)
     monkeypatch.setattr(session, "not_loopback_only",
                         lambda pid, ports: "8080 is bound to 0.0.0.0")
     with pytest.raises(session.SessionError) as exc:
@@ -293,6 +302,49 @@ def test_listeners_that_are_not_loopback_only_refuse_the_session(
             pass
     assert "0.0.0.0" in str(exc.value)
     assert killed, "a session that refused to continue left Burp running"
+
+
+def test_a_listener_burp_has_not_bound_yet_is_waited_for(
+        monkeypatch, an_engagement, a_jar):
+    """F4: the product checked once where the rig polls for 15 seconds.
+
+    The handshake says the extension LOADED. It says nothing about when Burp
+    bound its proxy listeners, and `tests/integration/conftest.py` and
+    `tests/integration/test_proxy_facts.py` have both wrapped this exact call
+    in `wait_for(..., 15)` since Plan 4, with that reason written beside them.
+    `session()` asked once -- so a Burp a moment behind was refused and torn
+    down, and the rig was more robust than the product it certifies.
+
+    The fake reports the unbound-port answer twice and then the truth, which
+    is the sequence a slow bind produces. What is asserted is that the session
+    reached its body at all; the call count is asserted too, so a
+    `not_loopback_only` that stopped being consulted after the first answer
+    could not pass this by never looking again.
+    """
+    answers = ["burp pid 4242 was configured to listen on [31337] and is not",
+               "burp pid 4242 was configured to listen on [31337] and is not",
+               None]
+    asked = []
+
+    def slowly_binding(pid, ports):
+        asked.append(ports)
+        return answers[min(len(asked), len(answers)) - 1]
+
+    monkeypatch.setattr(session, "launch_burp", _launcher())
+    monkeypatch.setattr(session, "wait_for", lambda *a, **k: True)
+    monkeypatch.setattr(session, "LISTENER_BIND_INTERVAL", 0.0)
+    monkeypatch.setattr(session, "not_loopback_only", slowly_binding)
+    monkeypatch.setattr(session.BridgeServer, "configure", lambda self, *a, **k: 1)
+
+    with session.session(an_engagement, instance="capture", jar=a_jar) as live:
+        assert (live.operator_port, live.crawler_port) == (
+            OPERATOR_PORT, CRAWLER_PORT)
+
+    assert len(asked) == 3, (
+        f"the check was made {len(asked)} time(s); a session that asks once "
+        "refuses a healthy Burp that had not bound yet")
+    assert asked == [[OPERATOR_PORT, CRAWLER_PORT]] * 3, (
+        "every poll must ask about BOTH configured listeners")
 
 
 def test_burp_is_torn_down_when_the_body_raises(monkeypatch, an_engagement, a_jar):

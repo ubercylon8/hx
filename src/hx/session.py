@@ -551,6 +551,42 @@ def not_loopback_only(pid: int, ports: list[int]) -> str | None:
     return None
 
 
+# How long a launched Burp may take to BIND the listeners it was configured
+# with, and how often to look. Separate from the handshake's own timeout and
+# not derived from it: the handshake says the extension loaded and says
+# nothing about when Burp bound its proxy, and a session that read the sockets
+# once, immediately after the handshake, would refuse a healthy Burp that was
+# a moment behind. Both are module constants so a test can take the waiting
+# out; the numbers are the rig's, which has polled exactly this call for 15 s
+# since Plan 4.
+LISTENER_BIND_TIMEOUT = 15.0
+LISTENER_BIND_INTERVAL = 0.5
+
+
+def _wait_until_loopback_only(pid: int, ports: list[int]) -> str | None:
+    """None once every listener is up and on loopback -- or the last reason.
+
+    THE PRODUCT POLLS THIS BECAUSE THE RIG DOES, and until it did, the rig was
+    more robust than the product it certifies: `tests/integration/conftest.py`
+    and `tests/integration/test_proxy_facts.py` both wrap this exact call in a
+    15-second wait, with the reason written out beside it, while `session()`
+    asked once and turned a not-yet-bound listener into a refusal plus a torn
+    down Burp. That is the one step where "the code a consultant runs is the
+    code under test" was false, and it was false in the unsafe direction.
+
+    WAITING CANNOT TURN A WILDCARD BIND INTO A LOOPBACK ONE, which is what
+    makes the wait cheap as well as safe: the happy path costs one `ss` call,
+    and the seconds are only ever spent once the check has already found
+    something. A Burp that really is bound to `*` still refuses, 15 s later.
+    """
+    why = not_loopback_only(pid, ports)
+    end = time.time() + LISTENER_BIND_TIMEOUT
+    while why is not None and time.time() < end:
+        time.sleep(LISTENER_BIND_INTERVAL)
+        why = not_loopback_only(pid, ports)
+    return why
+
+
 def listener_ports(workdir: Path) -> list[int]:
     """The ports this run's Burp was TOLD to listen on, read back from its config.
 
@@ -819,7 +855,7 @@ def session(eng, *, instance: str, jar: Path | None = None,
                 "that is unbuilt or stale, and Burp starts happily without one")
 
         operator, crawler = proxy_port(work), second_proxy_port(work)
-        why = not_loopback_only(proc.pid, [operator, crawler])
+        why = _wait_until_loopback_only(proc.pid, [operator, crawler])
         if why:
             raise SessionError(f"refusing to continue: {why}")
 
