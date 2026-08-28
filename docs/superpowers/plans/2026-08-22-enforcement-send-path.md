@@ -27519,6 +27519,51 @@ def _reap(proc: subprocess.Popen) -> None:
         warnings.warn(f"Burp pid {proc.pid} survived kill(); it may still be running")
 
 
+def browse_through(port: int, method: str, url: str, *, host: str,
+                   headers: Sequence[tuple[str, str]] = (), body: bytes = b"",
+                   timeout: float = 30.0) -> bytes:
+    """One request through a Burp proxy listener, and the whole response off
+    the wire.
+
+    THE FORWARD-PROXY form: the request line carries the ABSOLUTE URI, which
+    is how a browser configured to use a proxy addresses one and how the
+    destination reaches Burp at all. The `Host` line is set to match only so
+    the target server sees a well-formed request.
+
+    Raw sockets rather than `http.client` for the same reason
+    `test_proxy_facts._Probe.raw_through_proxy` uses them: the byte count of
+    the FULL response is half of what a drop is recognised by, and no
+    http.client API exposes it. Reading to EOF is bounded twice over -- the
+    socket timeout, and Burp closing the connection itself.
+
+    A FUNCTION, NOT A METHOD, since Task 9: `Rig.browse` is the rig's caller
+    and `tests/integration/test_cli_session.py` is a caller with NO RIG AT
+    ALL -- it browses through a listener the product's own `session()` (or
+    `hx capture start` in another process) opened, which is the whole point
+    of that file. A second copy of these fifteen lines is a second place to
+    get the absolute-URI form or the read-to-EOF wrong, and the wrong one
+    looks like a drop.
+    """
+    lines = [f"{method} {url} HTTP/1.1",
+             f"Host: {host}",
+             "Connection: close"]
+    lines += [f"{name}: {value}" for name, value in headers]
+    if body:
+        lines.append(f"Content-Length: {len(body)}")
+    # ISO-8859-1 for the same reason Sender.parse reads it that way: HTTP
+    # field values are octets, and one octet is one char here.
+    raw = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        sock.sendall(raw)
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        sock.close()
+
+
 @dataclass
 class Rig:
     eng: engagement.Engagement
@@ -27658,42 +27703,19 @@ class Rig:
         Nothing that only calls `send` has ever driven this side of the
         extension.
 
-        THE FORWARD-PROXY form: the request line carries the absolute URI,
-        which is how a browser configured to use a proxy addresses one and
-        how the destination reaches Burp at all. The `Host` line is set to
-        match only so the target server sees a well-formed request.
-
-        Raw sockets rather than `http.client` for the same reason
-        `test_proxy_facts._Probe.raw_through_proxy` uses them: the byte
-        count of the FULL response is half of what a drop is recognised by,
-        and no http.client API exposes it. Reading to EOF is bounded twice
-        over -- the socket timeout above, and Burp closing the connection
-        itself.
-
         `port` defaults to the OPERATOR listener. The crawler's is
         `self.crawler_port` and the difference between them is the whole of
         S4's source attribution.
+
+        The request itself is `browse_through`'s, because a test that has no
+        rig needs the identical one -- see it for why the URI is absolute and
+        why this is a raw socket.
         """
         dest = to or self.target
-        lines = [f"{method} {dest.origin}{path} HTTP/1.1",
-                 f"Host: {dest.host}:{dest.port}",
-                 "Connection: close"]
-        lines += [f"{name}: {value}" for name, value in headers]
-        if body:
-            lines.append(f"Content-Length: {len(body)}")
-        # ISO-8859-1 for the same reason Sender.parse reads it that way: HTTP
-        # field values are octets, and one octet is one char here.
-        raw = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
-        sock = socket.create_connection(("127.0.0.1", port or self.proxy_port),
-                                        timeout=timeout)
-        try:
-            sock.sendall(raw)
-            chunks = []
-            while chunk := sock.recv(65536):
-                chunks.append(chunk)
-            return b"".join(chunks)
-        finally:
-            sock.close()
+        return browse_through(port or self.proxy_port, method,
+                              f"{dest.origin}{path}",
+                              host=f"{dest.host}:{dest.port}",
+                              headers=headers, body=body, timeout=timeout)
 
     def settle(self, predicate, what: str, timeout: float = SETTLE_S) -> None:
         """Wait for a row to arrive, and say WHY it did not if it never does.

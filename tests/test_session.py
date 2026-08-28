@@ -480,3 +480,51 @@ def test_a_stale_bridge_socket_is_reported_and_never_removed(
         "session that is still running, and unlinking another process's "
         "rendezvous is worse than an error message")
     assert not launched
+
+
+def test_the_seed_the_caller_names_reaches_the_launch(
+        monkeypatch, an_engagement, a_jar, tmp_path):
+    """Which Burp home gets copied travels IN THE CALL, and omitting it still
+    means the operator's own.
+
+    `make_home` copies `seed_home()` by default -- `$HX_BURP_SEED_HOME`, then
+    `Path.home()` -- which is right for a consultant and wrong for a caller
+    that has already checked a different home. `launch_burp` grew the
+    parameter for that in Task 8; `session()` did not forward it, so its
+    callers had only the environment variable, and an environment variable is
+    a second answer to a question the parameter already answers.
+
+    It is not hypothetical: `scripts/demo_capture.py` now runs through
+    `session()` and GUARDS on `burp_fixture.missing()`, which reports on the
+    lab's curated home. Unforwarded, the demo would check that home and copy
+    the operator's live `~/.BurpSuite/sessions` -- real client project state.
+
+    Both halves are here because either alone passes while the other is
+    false: a `session()` that ignored `seed` outright, and one that resolved
+    a default of its own instead of leaving `make_home` to own it.
+    """
+    seen: list[dict] = []
+
+    def launch(socket_path, engagement_id, workdir, **kw):
+        seen.append(kw)
+        _write_listener_config(workdir)
+        return _FakeProc()
+
+    monkeypatch.setattr(session, "launch_burp", launch)
+    monkeypatch.setattr(session, "wait_for", lambda *a, **k: True)
+    monkeypatch.setattr(session, "not_loopback_only", lambda pid, ports: None)
+    monkeypatch.setattr(session.BridgeServer, "configure", lambda self, *a, **k: 1)
+
+    lab_home = tmp_path / "lab" / "burphome"
+    with session.session(an_engagement, instance="demo", jar=a_jar,
+                         seed=lab_home):
+        pass
+    with session.session(an_engagement, instance="capture", jar=a_jar):
+        pass
+
+    named, omitted = seen
+    assert named["seed"] == lab_home
+    assert omitted["seed"] is None, (
+        "an omitted seed must reach `make_home` as None so IT applies the "
+        "operator's own home; a default resolved here would be a second "
+        "answer to which home is copied")

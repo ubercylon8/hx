@@ -649,7 +649,7 @@ class ExchangeSink:
 
 @contextlib.contextmanager
 def session(eng, *, instance: str, jar: Path | None = None,
-            workdir: Path | None = None):
+            workdir: Path | None = None, seed: Path | None = None):
     """A live, configured Burp -- or nothing at all.
 
     EVERY EXIT TEARS BURP DOWN, including a refused `configure` and a raise
@@ -663,6 +663,20 @@ def session(eng, *, instance: str, jar: Path | None = None,
     socket is bound or a JVM is launched -- an engagement with no
     `scope_version` row can never be authorised, and starting a Burp to find
     that out leaves one to kill.
+
+    `seed` IS FORWARDED TO `launch_burp` AND MEANS THE SAME THING THERE:
+    omitted, the operator's own Burp home is the one copied, which is right
+    for `hx capture start` and is why the CLI passes nothing. It exists here
+    for the same reason `launch_burp` and `make_home` carry it -- "a caller
+    that already knows the answer must be able to say so in code" -- and it
+    is not hypothetical at this level. Task 9 gave `scripts/demo_capture.py`
+    this context manager in place of its own assembly, and the demo GUARDS on
+    `burp_fixture.missing()`, which reports on the LAB's curated home. Without
+    a seed to pass, the demo would check one home and copy another: the
+    operator's live `~/.BurpSuite/sessions`, real client project state on a
+    consultant's machine. That is the exact disagreement Task 8 removed one
+    layer down, and an environment variable set beside the call would be a
+    second answer to a question this parameter already answers.
     """
     jar = find_burp_jar(jar)
     work = Path(workdir) if workdir else eng.root / "session"
@@ -716,7 +730,7 @@ def session(eng, *, instance: str, jar: Path | None = None,
     try:
         proc = launch_burp(sock, eng.id, work,
                            sentinel=halt.sentinel_path, jar=jar,
-                           instance=instance)
+                           instance=instance, seed=seed)
         if not wait_for(lambda: srv.state == "connected"):
             raise SessionError(
                 f"Burp never completed the bridge handshake. See "
