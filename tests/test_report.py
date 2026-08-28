@@ -11,6 +11,7 @@ the `surface` row it belongs to and sets `surface_id` on it -- `scan.py`'s
 a surface), and a fixture that skipped that no longer matches what production
 ever writes.
 """
+import hashlib
 import sqlite3
 
 import pytest
@@ -41,11 +42,36 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
-def _run(conn, run_id="r-1", *, dropped_total=0, started_us=1) -> None:
+def _run(conn, run_id="r-1", *, dropped_total=0, started_us=1,
+        scope_version_id=None, ended_us=None) -> None:
     conn.execute(
         "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
-        " status, dropped_total) VALUES(?,'e-1','manual','staging',?,"
-        "'completed',?)", (run_id, started_us, dropped_total))
+        " ended_us, status, dropped_total, scope_version_id)"
+        " VALUES(?,'e-1','manual','staging',?,?,'completed',?,?)",
+        (run_id, started_us, ended_us, dropped_total, scope_version_id))
+
+
+def _scope_version(conn, sv_id, *, sha256, effective_from_us, author="james",
+                  reason="engagement created", cfg=None) -> None:
+    """A row in the append-only scope table.
+
+    `sha256` is passed rather than computed so a test can make it DISAGREE
+    with `yaml` -- which is what separates "the report cites the recorded
+    hash" from "the report re-hashes whatever config it was handed and
+    prints that". The triggers on this table forbid UPDATE and DELETE, so
+    every row a test writes is one it must get right on the way in."""
+    conn.execute(
+        "INSERT INTO scope_version(id, engagement_id, yaml, sha256,"
+        " effective_from_us, author, reason) VALUES(?,'e-1',?,?,?,?,?)",
+        (sv_id, config_mod.dumps(cfg) if cfg is not None else "scope: {}",
+         sha256, effective_from_us, author, reason))
+
+
+def _digest(cfg) -> str:
+    """The sha256 `engagement._record_scope` stores for a config: the hash of
+    exactly what `config.dumps` produced. Spelled here the same way, so a
+    test can build a scope version that genuinely matches a config."""
+    return hashlib.sha256(config_mod.dumps(cfg).encode("utf-8")).hexdigest()
 
 
 def _surface(conn, surface_id="s-1", *, path_template="/",
@@ -118,6 +144,17 @@ def report_env():
     which is exactly the coincidence that let that mutation pass 14 tests."""
     conn = _conn()
     _run(conn, "r-1", dropped_total=0)
+    yield {"conn": conn, "engagement_id": "e-1", "config": _config(),
+          "blobs": None}
+    conn.close()
+
+
+@pytest.fixture
+def report_env_no_runs():
+    """An engagement created and never run: the separating case for the
+    assessment-window sentence, which must not be invented for a store with
+    no `run` row to draw it from."""
+    conn = _conn()
     yield {"conn": conn, "engagement_id": "e-1", "config": _config(),
           "blobs": None}
     conn.close()
@@ -397,9 +434,155 @@ def report_env_fixed_then_a_skipped_run():
 # --- Step 1's tests, verbatim (bar F3's tautology and F4's qualifier) -------
 
 def test_the_report_names_the_scope_and_its_hash(report_env):
+    """F4 (fix round B): THE HASH USED TO BE IN THIS TEST'S NAME ONLY. It
+    asserted that the word "Scope" and the pattern appeared, and passed
+    against a report that cited no hash at all, no scope version, no dates
+    and no authorization record -- which is how S12's provenance sentence
+    survived nine reviews unimplemented.
+
+    Here the store holds a scope version whose `sha256` genuinely is the
+    hash of this config (`_digest` spells it the way
+    `engagement._record_scope` does), so the report may say so; the
+    divergence case below is the separating one."""
+    cfg = report_env["config"]
+    _scope_version(report_env["conn"], "sv-1", sha256=_digest(cfg),
+                  effective_from_us=1, cfg=cfg)
     out = report.render(**report_env)
-    assert "Scope" in out
+    assert "Scope of record" in out
+    assert cfg.scope_include[0] in out
+    assert _digest(cfg) in out
+    assert "verified, not assumed" in out
+
+
+def test_the_scope_hash_is_the_recorded_one_not_a_hash_of_todays_config(report_env):
+    """The separating case, and the one that pins WHICH hash is rendered.
+
+    `render` takes `config` as a free parameter, so a report that simply
+    re-hashed whatever it was handed would print a hash on every render and
+    look identical to one that read the store. Here the recorded row's
+    `sha256` deliberately does not match the config, which is the shape a
+    hand-edited `config.yaml` has (`engagement.open_` refuses to open such a
+    store, so through `hx report` it cannot happen -- but `render` is a
+    public function and the claim above the patterns has to be true of every
+    caller). The recorded hash must appear, and the report must say the
+    patterns are not the scope of record rather than quietly presenting
+    them as it."""
+    recorded = "de" * 32
+    _scope_version(report_env["conn"], "sv-1", sha256=recorded,
+                  effective_from_us=1)
+    out = report.render(**report_env)
+    assert recorded in out
+    assert "NOT the scope of record" in out
+    assert "verified, not assumed" not in out
+
+
+def test_an_engagement_with_no_scope_version_says_the_patterns_are_unverified(report_env):
+    """The third case: nothing recorded at all. The patterns are still
+    rendered -- a report with no scope in it is useless -- but the sentence
+    above them must not let a reader take today's config for the boundary
+    that was in force when the traffic was captured."""
+    out = report.render(**report_env)
+    assert "No scope version is recorded" in out
     assert report_env["config"].scope_include[0] in out
+    assert "verified, not assumed" not in out
+
+
+def test_every_scope_version_is_rendered_not_only_the_latest(report_env):
+    """S5: "The one query that matters under dispute is 'what was in scope
+    when request X was issued', and it must be answerable." A second row in
+    this append-only table means the boundary MOVED mid-engagement, and
+    rendering only the newest as though it had always been the boundary
+    answers that query wrongly and silently.
+
+    Two versions, two runs, one stamped to each -- so the `Runs` column is
+    the part that makes the table answer the query at the grain the store
+    records it."""
+    conn = report_env["conn"]
+    _scope_version(conn, "sv-1", sha256="a" * 64, effective_from_us=1,
+                  author="james", reason="engagement created")
+    _scope_version(conn, "sv-2", sha256="b" * 64, effective_from_us=2,
+                  author="dana", reason="client added the staging host")
+    conn.execute("UPDATE run SET scope_version_id='sv-1' WHERE id='r-1'")
+    _run(conn, "r-2", started_us=3, scope_version_id="sv-2")
+    out = report.render(**report_env)
+    assert "a" * 64 in out
+    assert "b" * 64 in out
+    assert out.index("a" * 64) < out.index("b" * 64)
+    assert "client added the staging host" in out
+    assert "engagement created" in out
+    assert "2 scope version(s) are on file" in out
+    # One run under each, which is the datum `run.scope_version_id` carries
+    # and nothing rendered before this fix.
+    rows = [l for l in out.splitlines() if l.startswith("| 1970-01-01")]
+    assert len(rows) == 2
+    assert all("| 1 |" in row for row in rows), rows
+
+
+def test_a_run_stamped_with_no_scope_version_is_called_out(report_env):
+    """`run.scope_version_id` is nullable and every fixture in this file
+    leaves it NULL. A table of scope versions with a `Runs` column that adds
+    up to fewer runs than the engagement has is a table that quietly loses
+    them."""
+    _scope_version(report_env["conn"], "sv-1", sha256="a" * 64,
+                  effective_from_us=1)
+    out = report.render(**report_env)
+    assert "1 run(s) carry no `scope_version_id`" in out
+
+
+def test_the_report_dates_the_engagement_and_its_run_window(report_env):
+    """`engagement.created_us` was SELECTed and dropped on the floor, and no
+    date of any kind reached the document. A client deliverable that cannot
+    say when the assessment happened cannot be read against the application
+    it describes."""
+    conn = report_env["conn"]
+    conn.execute("UPDATE engagement SET created_us=1756000000000000"
+                 " WHERE id='e-1'")
+    conn.execute("UPDATE run SET started_us=1756000100000000,"
+                 " ended_us=1756003700000000 WHERE id='r-1'")
+    out = report.render(**report_env)
+    assert "Engagement opened 2025-08-24 01:46:40Z" in out
+    assert "1 run(s) recorded" in out
+    assert "earliest starting 2025-08-24 01:48:20Z" in out
+    assert "latest ending 2025-08-24 02:48:20Z" in out
+
+
+def test_an_engagement_with_no_runs_says_nothing_was_observed(report_env_no_runs):
+    """The separating case for the window sentence: an engagement that has
+    never run has no window, and rendering one would be inventing it."""
+    out = report.render(**report_env_no_runs)
+    assert "No run has been recorded" in out
+    assert "run(s) recorded, the earliest" not in out
+
+
+def test_the_absent_authorization_record_is_stated_not_omitted(report_env):
+    """S12: "The report cites `scope_version.sha256` and the `authorization`
+    record in force, so what you were permitted to touch is part of the
+    deliverable." Nothing in this repository writes an `authorization` row
+    -- the table is declared in `schema.sql`, named in `db.py`'s
+    expected-table set, and written by no code path in `src/`, `extension/`
+    or `tests/`. A deliverable that simply left the section out would read
+    as though a record existed and had not been included."""
+    out = report.render(**report_env)
+    assert "### Authorization" in out
+    assert "No authorization record is on file" in out
+    assert "Read nothing above as evidence that testing was authorised" in out
+
+
+def test_an_authorization_record_on_file_is_rendered(report_env):
+    """The separating case. No writer exists yet, so the row is built
+    directly -- the same way this file builds the note/ref-only `evidence`
+    row the schema allows and no writer produces. When a later plan adds a
+    writer, this is the assertion it has to satisfy."""
+    report_env["conn"].execute(
+        "INSERT INTO authorization(id, engagement_id, doc_blob, doc_sha256,"
+        " signatory, valid_from_us, valid_to_us, scope_sha256)"
+        " VALUES('auth-1','e-1','blob-1',?,'Dana Reyes, CISO',"
+        "1756000000000000,1758000000000000,?)", ("c" * 64, "a" * 64))
+    out = report.render(**report_env)
+    assert "No authorization record is on file" not in out
+    assert "Dana Reyes, CISO" in out
+    assert "c" * 64 in out
+    assert "2025-08-24 01:46:40Z" in out
 
 
 def test_a_credential_pasted_into_a_scope_pattern_is_redacted(report_env):

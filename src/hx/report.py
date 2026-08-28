@@ -12,6 +12,18 @@ lets someone answer "did you test the password reset flow?" -- and what makes
 a retest mean something. S12: a report that cannot distinguish "tested,
 clean" from "never reached" is worse than no report.
 
+PROVENANCE COMES FROM THE STORE, NEVER FROM `config`. S12's other
+requirement -- "The report cites `scope_version.sha256` and the
+`authorization` record in force, so what you were permitted to touch is part
+of the deliverable" -- was unimplemented until F4 of fix round B: `render`
+selected `engagement.created_us` and dropped it, and the Scope section
+iterated TODAY's `config.yaml`, which is a different object from the scope
+that was in force when the traffic was captured. `_provenance` reads
+`engagement.created_us`, the `run` window, every `scope_version` row with its
+hash and the runs stamped to it, and the `authorization` table -- which no
+code path in this repository writes, so the section says that in as many
+words rather than being omitted and reading as though a record existed.
+
 REDACTION RUNS ON EXPORT, THROUGH ONE FUNCTION: `_redact`. Fix round 1, F1 of
 the review found this docstring claiming redaction "runs over everything
 rendered" while `records.redact_url` was called at exactly one site (the
@@ -48,6 +60,10 @@ fixing it belongs to `records.py`.
 """
 from __future__ import annotations
 
+import datetime
+import hashlib
+
+from hx import config as config_mod
 from hx import insertion as insertion_mod
 from hx.checks import registry
 from hx.store import records
@@ -97,6 +113,22 @@ def _cell(value) -> str:
         return ""
     return (str(value).replace("\\", "\\\\").replace("|", "\\|")
            .replace("\r\n", " ").replace("\n", " ").replace("\r", " "))
+
+
+def _when(us) -> str:
+    """A stored microsecond timestamp as a UTC instant a client can read.
+
+    Every timestamp in this schema is "integer microseconds since epoch"
+    (`schema.sql`'s own opening line), and none of them is rendered anywhere
+    until F4. UTC with an explicit `Z`, never local time: the deliverable is
+    read by people in other timezones than the one it was rendered in, and a
+    naive local timestamp in a contractual document is a fact nobody can
+    check afterwards.
+    """
+    if us is None:
+        return "unknown"
+    return datetime.datetime.fromtimestamp(
+        us / 1_000_000, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
 def _by_class() -> tuple[tuple, tuple]:
@@ -160,12 +192,7 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
     out.append(f"# {_redact(eng[2])} — web application assessment\n")
     out.append(f"Engagement `{_redact(eng[1])}`.\n")
 
-    out.append("## Scope\n")
-    for pattern in config.scope_include:
-        out.append(f"- `{_redact(pattern)}`")
-    for pattern in config.scope_exclude:
-        out.append(f"- excluded: `{_redact(pattern)}`")
-    out.append("")
+    out.extend(_provenance(conn, engagement_id, config, created_us=eng[3]))
 
     # ONE SOURCE OF TRUTH FOR "HAS THIS ENGAGEMENT EVER BEEN SCANNED",
     # shared by `_findings` (F4 of fix round 1: an unscanned engagement's
@@ -183,6 +210,160 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
         out.extend(_insertion_coverage(conn, engagement_id, blobs))
     out.extend(_limits(conn, engagement_id))
     return "\n".join(out) + "\n"
+
+
+def _provenance(conn, engagement_id, config, *, created_us) -> list[str]:
+    """When this engagement ran, what it was permitted to touch, and on whose
+    authority -- read from the STORE.
+
+    F4 (fix round B). S12, in the sentence this function exists for:
+
+        Redaction runs on export. The report cites `scope_version.sha256`
+        and the `authorization` record in force, so what you were permitted
+        to touch is part of the deliverable.
+
+    None of it was here. `render` selected `engagement.created_us` and threw
+    it away, and the whole Scope section iterated `config.scope_include` /
+    `config.scope_exclude` -- TODAY's `config.yaml`, which is not the same
+    object as the scope that was in force when the traffic was captured. The
+    data was all there and simply unwired: `scope_version` is append-only
+    under two triggers and described in `schema.sql` as "tamper-evidence for
+    contract disputes", `run.scope_version_id` stamps each run with the
+    version it ran under, and `authorization` has held a place for the
+    signed permission since Plan 1.
+
+    EVERY VERSION, OLDEST FIRST, NOT JUST THE LATEST. A second row means the
+    boundary MOVED mid-engagement, which is the one case the append-only
+    table exists for -- S5: "The one query that matters under dispute is
+    'what was in scope when request X was issued', and it must be
+    answerable." Rendering only the newest as though it had always been the
+    boundary answers that query wrongly, and silently. The `Runs` column is
+    how the table answers it at the grain this store actually records:
+    `run.scope_version_id` per row.
+
+    THE PATTERNS ARE STILL READ FROM `config`, AND THE CLAIM MADE ABOUT THEM
+    IS CHECKED RATHER THAN ASSUMED. `scope_version.yaml` holds the config
+    text verbatim (`engagement._record_scope` hashes exactly what
+    `config.dumps` produced), so re-hashing the config this render was handed
+    says whether it IS the newest recorded version or merely today's file.
+    `engagement.open_` already refuses to open a store where the two diverge,
+    so through `hx report` the answer is yes -- but `render` takes `config`
+    as a free parameter, so the check is what makes the sentence above the
+    patterns true of every caller rather than of one. Parsing each historical
+    version's yaml back into patterns is deliberately NOT done here: that
+    would put a second reader of the config format in this module, and the
+    hash plus the version's own metadata is what S12 asks the report to cite.
+
+    THE AUTHORIZATION RECORD IS ABSENT AND SAYS SO. Nothing in this
+    repository writes an `authorization` row -- the table is declared in
+    `schema.sql`, named in `db.py`'s expected-table set, and written by no
+    code path in `src/`, `extension/` or `tests/`. A client deliverable that
+    simply omitted the section would read as though a record existed and had
+    been left out; saying it plainly is the only honest rendering, and
+    writing one is a later plan's job, not this fix's.
+    """
+    out = ["## Provenance\n",
+           f"Engagement opened {_when(created_us)}.\n"]
+
+    runs = conn.execute(
+        "SELECT COUNT(*), MIN(started_us), MAX(COALESCE(ended_us, started_us))"
+        " FROM run WHERE engagement_id=?", (engagement_id,)).fetchone()
+    if runs[0]:
+        out.append(f"{runs[0]} run(s) recorded, the earliest starting "
+                   f"{_when(runs[1])} and the latest ending {_when(runs[2])}. "
+                   "That window is the assessment: nothing outside it was "
+                   "observed, and this report says nothing about the "
+                   "application before or after it.\n")
+    else:
+        out.append("**No run has been recorded for this engagement.** "
+                   "Nothing below was observed by this tool.\n")
+
+    out.extend(_scope_of_record(conn, engagement_id, config))
+    out.extend(_authorization(conn, engagement_id))
+    return out
+
+
+def _scope_of_record(conn, engagement_id, config) -> list[str]:
+    versions = conn.execute(
+        "SELECT sv.sha256, sv.effective_from_us, sv.author, sv.reason,"
+        " (SELECT COUNT(*) FROM run r WHERE r.scope_version_id = sv.id)"
+        " FROM scope_version sv WHERE sv.engagement_id=?"
+        " ORDER BY sv.effective_from_us, sv.rowid", (engagement_id,)).fetchall()
+
+    out = ["### Scope of record\n"]
+    digest = hashlib.sha256(
+        config_mod.dumps(config).encode("utf-8")).hexdigest()
+
+    if versions:
+        out.append(f"{len(versions)} scope version(s) are on file, in the "
+                   "order they took effect. The table is append-only and "
+                   "cannot be rewritten, so a second row means the boundary "
+                   "MOVED during the engagement and traffic captured before "
+                   "it was governed by the row above.\n")
+        out.append("| Effective from (UTC) | `scope_version.sha256` |"
+                   " Author | Runs | Reason |")
+        out.append("|---|---|---|---|---|")
+        for sha256, effective_us, author, reason, run_count in versions:
+            out.append(f"| {_when(effective_us)} | `{_cell(sha256)}` |"
+                       f" {_cell(_redact(author))} | {run_count} |"
+                       f" {_cell(_redact(reason))} |")
+        out.append("")
+        unstamped = conn.execute(
+            "SELECT COUNT(*) FROM run WHERE engagement_id=?"
+            " AND scope_version_id IS NULL", (engagement_id,)).fetchone()[0]
+        if unstamped:
+            out.append(f"{unstamped} run(s) carry no `scope_version_id`, so "
+                       "which of the rows above was in force for them cannot "
+                       "be read off this store.\n")
+
+    if versions and digest == versions[-1][0]:
+        out.append("The patterns below are the newest version in that table, "
+                   f"`{digest}` — verified, not assumed: the configuration "
+                   "this report was rendered from hashes to that row.\n")
+    elif versions:
+        out.append("**The patterns below are NOT the scope of record.** They "
+                   "are the configuration this report was rendered from, and "
+                   f"it hashes to `{digest}`, which matches no row above. "
+                   "Read the boundary off the recorded versions.\n")
+    else:
+        out.append("**No scope version is recorded for this engagement.** "
+                   "The patterns below are the configuration this report was "
+                   f"rendered from (`{digest}`); nothing in this store "
+                   "establishes that they were the boundary when the traffic "
+                   "was captured.\n")
+
+    for pattern in config.scope_include:
+        out.append(f"- `{_redact(pattern)}`")
+    for pattern in config.scope_exclude:
+        out.append(f"- excluded: `{_redact(pattern)}`")
+    out.append("")
+    return out
+
+
+def _authorization(conn, engagement_id) -> list[str]:
+    rows = conn.execute(
+        "SELECT signatory, doc_sha256, valid_from_us, valid_to_us,"
+        " scope_sha256 FROM authorization WHERE engagement_id=?"
+        " ORDER BY valid_from_us, rowid", (engagement_id,)).fetchall()
+    out = ["### Authorization\n"]
+    if not rows:
+        out.append("**No authorization record is on file for this "
+                   "engagement.** Nothing in this build writes one, so this "
+                   "is true of every engagement it produces: the client's "
+                   "written permission, if any was given, is held outside "
+                   "this store and is not part of this deliverable. Read "
+                   "nothing above as evidence that testing was "
+                   "authorised.\n")
+        return out
+    out.append("| Valid from (UTC) | Valid to (UTC) | Signatory |"
+               " `doc_sha256` | `scope_sha256` |")
+    out.append("|---|---|---|---|---|")
+    for signatory, doc_sha256, valid_from_us, valid_to_us, scope_sha256 in rows:
+        out.append(f"| {_when(valid_from_us)} | {_when(valid_to_us)} |"
+                   f" {_cell(_redact(signatory))} | `{_cell(doc_sha256)}` |"
+                   f" `{_cell(scope_sha256)}` |")
+    out.append("")
+    return out
 
 
 def _latest_observed(conn, finding_id) -> bool | None:
