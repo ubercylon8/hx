@@ -10,6 +10,7 @@ import pytest
 
 from hx import scan
 from hx.checks import base
+from hx.checks.passive import security_headers
 
 
 class Boom:
@@ -83,7 +84,7 @@ def test_a_finding_verdict_writes_finding_observation_and_evidence(scan_env):
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
             return base.Verdict.finding(base.Candidate(
-                title="t", severity="Low", confidence="Firm",
+                title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=(exchanges[0].id,)))
 
     scan.run(**scan_env, checks=(Finds(),))
@@ -103,7 +104,7 @@ def test_a_finding_not_seen_this_run_is_marked_unobserved_if_its_surface_was_tes
             if not self.on:
                 return base.Verdict.clean()
             return base.Verdict.finding(base.Candidate(
-                title="t", severity="Low", confidence="Firm",
+                title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=(exchanges[0].id,)))
 
     scan.run(**scan_env, checks=(Finds(True),))
@@ -159,7 +160,7 @@ def test_mark_unobserved_leaves_a_finding_alone_when_its_surface_goes_untested(s
             if surface[0] != "s-2":
                 return base.Verdict.clean()
             return base.Verdict.finding(base.Candidate(
-                title="t", severity="Low", confidence="Firm",
+                title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=(exchanges[0].id,)))
 
     scan.run(**scan_env, checks=(FindsOnSecondSurface(),))
@@ -241,7 +242,7 @@ def test_a_surface_deleted_between_capture_and_scan_is_refused_by_the_schema(
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
             return base.Verdict.finding(base.Candidate(
-                title="t", severity="Low", confidence="Firm",
+                title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=(exchanges[0].id,)))
 
     scan.run(**scan_env, checks=(Finds(),))
@@ -273,7 +274,7 @@ def test_a_finding_whose_surface_vanished_is_left_alone_not_fabricated_against(
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
             return base.Verdict.finding(base.Candidate(
-                title="t", severity="Low", confidence="Firm",
+                title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=(exchanges[0].id,)))
 
     scan.run(**scan_env, checks=(Finds(),))
@@ -313,7 +314,7 @@ def _run1_finds(scan_env, check_id="hx.test.finds"):
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
             return base.Verdict.finding(base.Candidate(
-                title="t", severity="Low", confidence="Firm",
+                title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=(exchanges[0].id,)))
     scan.run(**scan_env, checks=(Finds(),))
 
@@ -457,7 +458,7 @@ def test_a_candidate_naming_a_purged_exchange_does_not_kill_the_scan(scan_env):
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
             return base.Verdict.finding(base.Candidate(
-                title="t", severity="Low", confidence="Firm",
+                title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=("x-does-not-exist",)))
 
     summary = scan.run(**scan_env, checks=(BadCandidate(), Quiet()))
@@ -580,21 +581,23 @@ def test_mark_unobserved_reads_check_id_not_issue_type_id(scan_env):
     same type, so nothing at the schema level or the type checker would
     catch it) must redden this, not pass silently.
 
-    Setup deliberately DISAGREES the two columns: after run 1 writes the
-    finding with `check_id='hx.test.finds'` (correct) and `issue_type_id`
-    left `NULL` (its real, unrelated purpose, untouched), directly corrupt
-    the row to the SHAPE a swap-back bug would produce -- `check_id=NULL`,
-    `issue_type_id='hx.test.finds'`. If `_mark_unobserved` ever reads
-    `issue_type_id` instead of `check_id`, run 2's clean re-run of the SAME
-    check on the SAME surface would match against the wrongly-populated
-    column and mark the finding `observed=0`. Reading the real `check_id`
-    column (`NULL` here) cannot match, so the finding stays alone.
+    Setup deliberately DISAGREES the two columns: run 1 writes the finding
+    with `check_id='hx.test.finds'` and `issue_type_id='t-issue'` -- the
+    candidate's OWN issue type, which since F1 of the whole-branch review is
+    written rather than left NULL, and which is nothing like a check id.
+    The row is then corrupted directly to the SHAPE a swap-back bug would
+    produce -- `check_id=NULL`, `issue_type_id='hx.test.finds'`. If
+    `_mark_unobserved` ever reads `issue_type_id` instead of `check_id`, run
+    2's clean re-run of the SAME check on the SAME surface would match
+    against the wrongly-populated column and mark the finding `observed=0`.
+    Reading the real `check_id` column (`NULL` here) cannot match, so the
+    finding stays alone.
     """
     _run1_finds(scan_env)
     conn = scan_env["conn"]
     assert conn.execute(
         "SELECT check_id, issue_type_id FROM finding").fetchone() == (
-        "hx.test.finds", None)
+        "hx.test.finds", "t-issue")
     conn.execute(
         "UPDATE finding SET check_id=NULL, issue_type_id='hx.test.finds'")
 
@@ -608,3 +611,85 @@ def test_mark_unobserved_reads_check_id_not_issue_type_id(scan_env):
     rows = [r[0] for r in conn.execute(
         "SELECT observed FROM finding_observation ORDER BY ts_us")]
     assert rows == [1]
+
+
+# --- Whole-branch review F1 (HIGH): every candidate one passive check yields
+# for one surface used to collapse onto ONE dedupe key, and
+# `upsert_finding`'s `DO UPDATE SET severity=excluded.severity` left the LAST
+# one standing.
+
+
+class _Blobs:
+    """The minimum `CheckContext.blobs` a real passive check needs."""
+
+    def __init__(self, **blobs):
+        self._b = blobs
+
+    def get(self, digest, expected_len=None):
+        return self._b[digest]
+
+
+_THREE_HEADERS_MISSING = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"\r\n"
+    b"<html></html>"
+)
+
+
+def test_several_candidates_from_one_check_on_one_surface_file_several_findings(
+    scan_env,
+):
+    """F1. One document response missing three security headers is THREE
+    findings, each keeping its own severity -- not one finding wearing
+    whichever severity the last candidate happened to carry.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against the tree
+    before `issue_type_id` joined the dedupe key, on exactly this input:
+    `summary.findings` said 3 while `finding` held ONE row --
+    `('Missing X-Content-Type-Options', 'Low', 'CWE-16')` on the single key
+    `hx.passive.security-headers|https|app.test|443|GET|/|-|-`. Note WHICH
+    halves of that row came from which candidate: `upsert_finding`'s
+    `DO UPDATE SET` moves `severity` and `confidence` but never `title` or
+    `cwe`, so the surviving row paired the FIRST candidate's title and CWE
+    with the LAST candidate's severity, and the Medium frame-protection
+    issue was gone from the store entirely. The assertion is on the SET of
+    (title, severity) pairs rather than a count precisely so a regression
+    that restored the count by some other route -- three rows all carrying
+    one candidate's severity -- still reddens it.
+    """
+    conn = scan_env["conn"]
+    conn.execute("UPDATE exchange SET resp_blob='d1' WHERE id='x-1'")
+    env = dict(scan_env, blobs=_Blobs(d1=_THREE_HEADERS_MISSING))
+
+    summary = scan.run(**env, checks=(security_headers.SecurityHeaders(),))
+
+    assert summary.findings == 3
+    assert conn.execute("SELECT COUNT(*) FROM finding").fetchone()[0] == 3, (
+        "summary.findings and the store disagreed: the runner counted three "
+        "candidates written and the store kept fewer")
+    got = set(conn.execute("SELECT title, severity FROM finding").fetchall())
+    assert got == {
+        ("Missing X-Content-Type-Options", "Low"),
+        ("Missing frame protection (X-Frame-Options or CSP frame-ancestors)",
+         "Medium"),
+        ("Missing Strict-Transport-Security", "Low"),
+    }
+
+
+def test_the_dedupe_key_of_two_issue_types_on_one_surface_differs(scan_env):
+    """The mechanism under the test above, asserted directly on the column
+    the UNIQUE constraint is built from. Three findings with three equal
+    dedupe keys is not a state the schema can even hold, so a count of three
+    distinct keys is what separates 'the key discriminates' from 'three rows
+    happened to survive'."""
+    conn = scan_env["conn"]
+    conn.execute("UPDATE exchange SET resp_blob='d1' WHERE id='x-1'")
+    env = dict(scan_env, blobs=_Blobs(d1=_THREE_HEADERS_MISSING))
+
+    scan.run(**env, checks=(security_headers.SecurityHeaders(),))
+
+    keys = [r[0] for r in conn.execute("SELECT dedupe_key FROM finding")]
+    assert len(set(keys)) == 3, keys
+    assert all("missing-hsts" in k or "missing-frame-protection" in k
+               or "missing-content-type-options" in k for k in keys), keys

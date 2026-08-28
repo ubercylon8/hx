@@ -708,10 +708,24 @@ def abort_run(conn: sqlite3.Connection, *, run_id: str,
     return False
 
 
-def dedupe_key(*, type_: str, scheme: str, host: str, port: int | None,
-               method: str, path_template: str,
+def dedupe_key(*, type_: str, issue_type_id: str, scheme: str, host: str,
+               port: int | None, method: str, path_template: str,
                insertion_kind: str | None, insertion_name: str | None) -> str:
-    """`type|scheme|host|port|method|path_template|insertion_kind|insertion_name`.
+    """`type|issue_type|scheme|host|port|method|path_template|insertion_kind|insertion_name`.
+
+    NINE PARTS, NOT S5'S EIGHT. `issue_type_id` was added by F1 of the
+    whole-branch review (HIGH) and is the only part that distinguishes two
+    candidates from ONE check against ONE surface: `type_` is the check,
+    everything after it is the surface, and a passive check routinely yields
+    several. MEASURED on the eight-part key, with one document response
+    missing three security headers: three candidates produced three
+    byte-identical keys, `upsert_finding` collapsed them onto one row, and
+    that row paired the FIRST candidate's title and CWE (`DO UPDATE SET`
+    does not move those) with the LAST candidate's severity (it moves that)
+    -- a Medium frame-protection issue stored and rendered as `Missing
+    X-Content-Type-Options`, Low. It sits immediately after `type_` because
+    the two answer the same question at two grains -- which check, and what
+    it found -- and everything after them is location.
 
     LITERAL `-` FOR ABSENT PARTS, NEVER `None`. `finding.dedupe_key` is
     `TEXT NOT NULL`, so this function must never itself hand back a bare
@@ -735,7 +749,7 @@ def dedupe_key(*, type_: str, scheme: str, host: str, port: int | None,
     template accepting mass-assignment are different findings with different
     remediations.
     """
-    parts = (type_, scheme, host, port, method, path_template,
+    parts = (type_, issue_type_id, scheme, host, port, method, path_template,
              insertion_kind, insertion_name)
     return "|".join("-" if p is None or p == "" else str(p) for p in parts)
 
@@ -753,12 +767,18 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
 
     `surface_id`, `host` AND `check_id` ARE KEYWORD-ONLY AND DEFAULT TO
     `None` -- BACKWARD COMPATIBLE with every call site that predates Task 6,
-    which is every test in `tests/test_records_findings.py`. `issue_type_id`
-    is deliberately NOT a parameter here: it is spec S10/S12's own column,
-    "which of Burp's 183 vendored issue definitions", and nothing in this
-    plan owns writing it -- that mapping is a later plan's job. See
-    schema.sql's comment on `finding.check_id`/`finding.issue_type_id` for
-    why the two must never share a value.
+    which is every test in `tests/test_records_findings.py`.
+
+    `issue_type_id` IS NOT A PARAMETER, AND IS NOW WRITTEN: it comes off the
+    candidate, like every other column here except the four above. It was
+    unwritten until F1 of the whole-branch review (HIGH), and a declared,
+    unwritten column is what made an earlier fix reach for it as a scratch
+    slot for `check.id` -- see schema.sql's comment on the pair. The two
+    remain different axes and must never share a value: `check_id` is WHICH
+    CHECK found this, `issue_type_id` is WHAT KIND OF ISSUE it is. Mapping
+    those values onto Burp's 183 vendored issue definitions is still a later
+    plan's job, and is a refinement of THIS axis -- a change of vocabulary
+    on one column, not a change of what the column means.
 
     `surface_id`/`host` exist because a retest needs to know WHICH surface a
     finding lives on. Before this parameter existed, `upsert_finding` never
@@ -795,19 +815,22 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
     """
     fid = new_id("f")
     conn.execute(
-        "INSERT INTO finding(id, engagement_id, dedupe_key, title, description,"
+        "INSERT INTO finding(id, engagement_id, dedupe_key, issue_type_id,"
+        " title, description,"
         " impact, remediation, cwe, severity, confidence, created_by, status,"
         " insertion_name, insertion_kind, scope_level, payload, surface_id,"
         " host, check_id, first_seen_run, last_seen_run)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?, 'check', 'new', ?,?,?,?,?,?,?,?,?)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?, 'check', 'new', ?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(engagement_id, dedupe_key) DO UPDATE SET"
         "   last_seen_run=excluded.last_seen_run,"
         "   severity=excluded.severity,"
         "   confidence=excluded.confidence,"
         "   surface_id=excluded.surface_id,"
         "   host=excluded.host,"
-        "   check_id=excluded.check_id",
-        (fid, engagement_id, dedupe_key, candidate.title, candidate.description,
+        "   check_id=excluded.check_id,"
+        "   issue_type_id=excluded.issue_type_id",
+        (fid, engagement_id, dedupe_key, candidate.issue_type_id,
+         candidate.title, candidate.description,
          candidate.impact, candidate.remediation, candidate.cwe,
          candidate.severity, candidate.confidence,
          candidate.insertion.name if candidate.insertion else None,

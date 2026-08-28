@@ -25,15 +25,32 @@ from hx.store import records
 
 
 def key(**over):
-    args = dict(type_="xss", scheme="https", host="app.test", port=443,
+    args = dict(type_="hx.passive.xss", issue_type_id="reflected-xss",
+                scheme="https", host="app.test", port=443,
                 method="GET", path_template="/api/orders/{id}",
                 insertion_kind="query", insertion_name="q")
     args.update(over)
     return records.dedupe_key(**args)
 
 
-def test_the_field_order_is_the_spec_s():
-    assert key() == "xss|https|app.test|443|GET|/api/orders/{id}|query|q"
+def test_the_field_order_is_the_canonical_one():
+    """S5 writes eight parts. The repository's key has NINE: `issue_type_id`
+    was added immediately after `type_` by F1 of the whole-branch review, and
+    `records.dedupe_key`'s own docstring is the authority on why. This test
+    is the transcription of that format, so a part quietly moving or being
+    dropped is a failure here rather than a silently re-filed engagement."""
+    assert key() == ("hx.passive.xss|reflected-xss|https|app.test|443|GET|"
+                     "/api/orders/{id}|query|q")
+
+
+def test_the_issue_type_is_part_of_identity():
+    """F1 of the whole-branch review, HIGH. `type_` is the CHECK; every part
+    after `issue_type_id` is the SURFACE. Without this part, every candidate
+    one passive check yields for one surface has a byte-identical key and
+    `upsert_finding` keeps one row -- measured, three security headers
+    missing from one response filed one finding at the wrong severity."""
+    assert key(issue_type_id="missing-hsts") != key(
+        issue_type_id="missing-frame-protection")
 
 
 def test_absent_parts_are_a_literal_dash_never_none():
@@ -61,7 +78,8 @@ def test_upsert_is_idempotent_across_runs(engagement_conn):
     concern, not `upsert_finding`'s -- see the `test_record_observation_*`
     tests below, corrected here in F2 of the task-5 review: this docstring
     used to claim "TWO observations" while the test below writes none."""
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     a = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                candidate=c, dedupe_key=key(), run_id="r-1")
@@ -73,7 +91,8 @@ def test_upsert_is_idempotent_across_runs(engagement_conn):
 
 
 def test_upsert_moves_last_seen_run_and_never_first_seen(engagement_conn):
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     records.upsert_finding(engagement_conn, engagement_id="e-1", candidate=c,
                            dedupe_key=key(), run_id="r-1")
@@ -87,7 +106,8 @@ def test_upsert_moves_last_seen_run_and_never_first_seen(engagement_conn):
 def test_a_check_written_finding_is_new_and_created_by_check(engagement_conn):
     """The trigger already forbids the agent writing confirmed or reported.
     This asserts the other half: what a check DOES write."""
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     records.upsert_finding(engagement_conn, engagement_id="e-1", candidate=c,
                            dedupe_key=key(), run_id="r-1")
@@ -99,7 +119,8 @@ def test_a_check_written_finding_is_new_and_created_by_check(engagement_conn):
 def test_a_re_upsert_does_not_reset_a_humans_triage(engagement_conn):
     """An operator marked it false_positive; the next scan must not undo that.
     Without this the triage in S11's UI would be erased by the next run."""
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -113,7 +134,8 @@ def test_a_re_upsert_does_not_reset_a_humans_triage(engagement_conn):
 
 
 def test_evidence_rows_are_ordered_by_seq(engagement_conn):
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1", "x-2"))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -139,7 +161,8 @@ def test_re_recording_evidence_does_not_grow_the_chain(engagement_conn):
     three. This asserts that property, reached the only way an append-only
     table allows -- skip what is already there.
     """
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1", "x-2"))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -160,7 +183,8 @@ def test_evidence_records_a_genuinely_new_exchange_on_a_later_run(engagement_con
     pass -- a chain that never grows is not the same as one that grows only
     for new evidence.
     """
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -184,7 +208,8 @@ def test_evidence_accumulates_one_row_per_genuinely_new_observation(engagement_c
     false claim -- deduping by finding_id rather than by exchange id, say --
     this is the test that would catch it.
     """
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -206,7 +231,8 @@ def test_a_mid_loop_failure_leaves_no_partial_chain(engagement_conn):
     failure, not a mock. Wrapped, the whole call rolls back and neither row
     survives; unwrapped, the first (`x-1`) would already be committed.
     """
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1", "x-2"))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -223,7 +249,8 @@ def test_record_observation_inserts_a_row(engagement_conn):
     """F2 of the task-5 review: `record_observation` had zero tests -- its
     entire body could be replaced with `return None` and the suite stayed
     green. This is the insert path."""
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -240,7 +267,8 @@ def test_record_observation_inserts_a_row(engagement_conn):
 def test_record_observation_false_is_its_own_case(engagement_conn):
     """`observed=False` must be stored as `0`, not silently treated the same
     as `observed=True` by a writer that never looks at the flag."""
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -257,7 +285,8 @@ def test_record_observation_upserts_on_conflict(engagement_conn):
     """The `ON CONFLICT(finding_id, run_id)` path: a second call for the same
     finding and run must UPDATE the one row `finding_observation`'s primary
     key allows, not raise and not duplicate."""
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")
@@ -283,7 +312,8 @@ def test_record_observation_refreshes_severity_and_confidence_together(engagemen
     FIRST call's values. A second call in the same run with a changed
     severity must not leave the row half-updated -- one row is one answer,
     and all five fields move together or none do."""
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
                                  candidate=c, dedupe_key=key(), run_id="r-1")

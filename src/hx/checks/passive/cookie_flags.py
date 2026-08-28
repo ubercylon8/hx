@@ -8,6 +8,8 @@ hand the client the same remediation forty times.
 """
 from __future__ import annotations
 
+import re
+
 from hx.checks import base
 from hx.checks.passive import _http
 
@@ -15,6 +17,31 @@ from hx.checks.passive import _http
 # `Secure` is demanded only over TLS: a Secure cookie on an http:// origin is
 # never sent at all, so demanding it of a target with no TLS is a finding the
 # client cannot act on.
+
+_NOT_KEBAB = re.compile(r"[^a-z0-9]+")
+
+
+def _issue_type(name: str, missing: list[str]) -> str:
+    """`cookie-<name>-missing-<flag>[-<flag>...]`, and the name is deliberate.
+
+    THIS CHECK'S ISSUE TYPE CARRIES THE COOKIE IT IS ABOUT, which no other
+    check in the corpus needs. `scope_level` is `host`, so the dedupe key's
+    `method` and `path_template` are both the literal `-` (see
+    `records.dedupe_key`), `insertion` is None per S5, and `type_` is this
+    check -- leaving the issue type as the ONLY part of the key that can
+    tell two findings apart. Without the name in it, a host setting
+    `session` and `csrf` both without HttpOnly files ONE finding, titled for
+    whichever cookie the response happened to list first and carrying one of
+    the two remediations. That is F1 of the whole-branch review exactly, on
+    a different axis, and the two cookies are two edits for the client to
+    make.
+
+    `missing` is not sorted here: its order comes from one literal tuple in
+    `on_surface`, so it is already stable, and re-deriving an order in a
+    second place is how two spellings of one identity get born.
+    """
+    slug = _NOT_KEBAB.sub("-", name.lower()).strip("-") or "unnamed"
+    return "-".join(["cookie", slug, "missing", *(f.lower() for f in missing)])
 
 
 class CookieFlags:
@@ -45,6 +72,7 @@ class CookieFlags:
                     continue
                 candidates.append(base.Candidate(
                     title=f"Cookie {name} set without {', '.join(missing)}",
+                    issue_type_id=_issue_type(name, missing),
                     severity="Medium" if "HttpOnly" in missing else "Low",
                     confidence="Certain",
                     insertion=None,

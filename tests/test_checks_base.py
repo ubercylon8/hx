@@ -68,7 +68,8 @@ def test_the_raw_constructor_also_refuses_a_reasonless_inconclusive():
 
 
 def test_candidate_defaults_to_surface_scope():
-    c = base.Candidate(title="t", severity="Low", confidence="Firm",
+    c = base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
     assert c.scope_level == "surface"
 
@@ -77,15 +78,29 @@ def test_candidate_refuses_a_severity_the_schema_will_not_take():
     """The schema's CHECK is Critical|High|Medium|Low|Info. Refusing here
     names the value; SQLite would answer `CHECK constraint failed: finding`."""
     with pytest.raises(ValueError, match="severity"):
-        base.Candidate(title="t", severity="Catastrophic", confidence="Firm",
+        base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Catastrophic", confidence="Firm",
                        insertion=None, exchange_ids=("x-1",))
+
+
+def test_candidate_requires_an_issue_type_id():
+    """F1 of the whole-branch review, HIGH. `issue_type_id` is the ONLY part
+    of the dedupe key that separates two candidates from ONE check against
+    ONE surface, so a check that forgets it collapses its own findings onto
+    one row. Refused at construction, the way an empty title is, rather than
+    discovered as a missing finding in a delivered report."""
+    with pytest.raises(ValueError, match="issue_type_id"):
+        base.Candidate(title="t", issue_type_id="", severity="Low",
+                       confidence="Firm", insertion=None,
+                       exchange_ids=("x-1",))
 
 
 def test_candidate_requires_evidence():
     """A finding with no exchange behind it cannot have an evidence chain, and
     S12's report renders one per finding."""
     with pytest.raises(ValueError, match="exchange"):
-        base.Candidate(title="t", severity="Low", confidence="Firm",
+        base.Candidate(title="t", issue_type_id="t-issue",
+                       severity="Low", confidence="Firm",
                        insertion=None, exchange_ids=())
 
 

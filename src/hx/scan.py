@@ -226,7 +226,8 @@ def _skip_rest(conn, run_id, surface, checks, reason, summary) -> int:
 def _write_finding(conn, engagement_id, run_id, surface, check, candidate) -> str:
     _, method, scheme, host, port, path_template, _exemplar = surface
     key = records.dedupe_key(
-        type_=check.id, scheme=scheme, host=host, port=port, method=method,
+        type_=check.id, issue_type_id=candidate.issue_type_id,
+        scheme=scheme, host=host, port=port, method=method,
         path_template=path_template,
         insertion_kind=candidate.insertion.kind if candidate.insertion else None,
         insertion_name=candidate.insertion.name if candidate.insertion else None)

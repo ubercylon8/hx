@@ -83,11 +83,13 @@ def _exchange(conn, exchange_id, run_id, url, *, req_blob=None,
 def _finding(conn, *, run_id, title, severity, exchange_ids,
             check_id=None, description=None, impact=None,
             remediation=None) -> str:
-    c = base.Candidate(title=title, severity=severity, confidence="Firm",
+    c = base.Candidate(title=title, issue_type_id=title.lower().replace(" ", "-"),
+                       severity=severity, confidence="Firm",
                        insertion=None, exchange_ids=tuple(exchange_ids),
                        description=description, impact=impact,
                        remediation=remediation)
-    key = records.dedupe_key(type_=title, scheme="https", host="app.acme.test",
+    key = records.dedupe_key(type_=title, issue_type_id=c.issue_type_id,
+                             scheme="https", host="app.acme.test",
                              port=443, method="GET", path_template="/",
                              insertion_kind=None, insertion_name=None)
     fid = records.upsert_finding(conn, engagement_id="e-1", candidate=c,
@@ -759,10 +761,12 @@ def test_findings_within_a_severity_are_ordered_deterministically():
     for title, exchange_id, tiebreak in (
         ("Zebra issue", "x-1", "aaa"), ("Alpha issue", "x-2", "zzz"),
     ):
-        c = base.Candidate(title=title, severity="Low", confidence="Firm",
+        c = base.Candidate(title=title, issue_type_id="ordering-fixture",
+                           severity="Low", confidence="Firm",
                            insertion=None, exchange_ids=(exchange_id,))
         key = records.dedupe_key(
-            type_="hx.test.order", scheme="https", host="app.acme.test",
+            type_="hx.test.order", issue_type_id="ordering-fixture",
+            scheme="https", host="app.acme.test",
             port=443, method="GET", path_template="/",
             insertion_kind="query", insertion_name=tiebreak)
         fid = records.upsert_finding(conn, engagement_id="e-1", candidate=c,

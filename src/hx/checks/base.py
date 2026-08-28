@@ -66,8 +66,29 @@ class Candidate:
     The check does NOT compute the dedupe key. That is one canonical string
     (S5) and one place must build it, or two checks will spell the same
     finding two ways and the UNIQUE constraint will hold two rows.
+
+    `issue_type_id` IS WHAT THE CHECK FOUND, and it is required for the same
+    reason `title` is. Every OTHER part of the dedupe key is fixed by the
+    check and the surface, so before this field existed every candidate one
+    check yielded for one surface produced a byte-identical key. MEASURED, on
+    one document response missing three security headers: `summary.findings`
+    said 3 and `finding` held ONE row, `('Missing X-Content-Type-Options',
+    'Low', 'CWE-16')` -- the FIRST candidate's title and CWE (which
+    `upsert_finding`'s `DO UPDATE SET` never moves) wearing the LAST
+    candidate's severity (which it does), with the Medium frame-protection
+    issue absent from the store altogether.
+
+    IT IS A STABLE IDENTITY STRING, NOT A LABEL. It goes in the dedupe key
+    and in `finding.issue_type_id`, so renaming one later re-files every
+    existing finding of that type as new. Lowercase kebab, describing the
+    ISSUE (`missing-hsts`) and never the code path that noticed it. It is a
+    DIFFERENT AXIS from the check's own `id`: `check_id` answers "which of
+    hx's checks found this", `issue_type_id` answers "what kind of issue is
+    this", and `hx.scan._mark_unobserved` and schema.sql both depend on the
+    two never being conflated.
     """
     title: str
+    issue_type_id: str
     severity: str
     confidence: str
     insertion: Insertion | None
@@ -82,6 +103,8 @@ class Candidate:
     def __post_init__(self) -> None:
         if not self.title:
             raise ValueError("a candidate must have a title")
+        if not self.issue_type_id:
+            raise ValueError("a candidate must have an issue_type_id")
         if self.severity not in SEVERITIES:
             raise ValueError(
                 f"unknown severity {self.severity!r}; the schema takes "
