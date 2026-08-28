@@ -561,12 +561,14 @@ Expected: FAIL — `module 'hx.session' has no attribute 'config_body'`.
 - [ ] **Step 3: Write both**
 
 ```python
-# S4's method allowlist, stated rather than defaulted. `Policy.DEFAULT_METHODS`
-# is these same three verbs, so sending them explicitly widens nothing and
-# says what the engagement authorised. `Config` has no `method` key and this
-# plan does not add one: an active_safe check is idempotent by S10's own
-# definition, and GET is what idempotent means.
 METHOD_ALLOW: tuple[str, ...] = ("GET", "HEAD", "OPTIONS")
+"""S4's method allowlist, stated rather than defaulted.
+
+`Policy.DEFAULT_METHODS` is these same three verbs, so sending them
+explicitly widens nothing and says what the engagement authorised. `Config`
+has no `method` key and this plan does not add one: an active_safe check is
+idempotent by S10's own definition, and GET is what idempotent means.
+"""
 
 
 def config_body(cfg) -> dict[str, list[str]]:
