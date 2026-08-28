@@ -23914,6 +23914,23 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
     plan's job, and is a refinement of THIS axis -- a change of vocabulary
     on one column, not a change of what the column means.
 
+    IT IS WRITTEN ON INSERT AND NOT MOVED ON CONFLICT, which is D5 of the
+    fix-round-A re-review. On the insert path it is the value the row is
+    identified BY; on the conflict path it is dead, because the conflict
+    target is `(engagement_id, dedupe_key)` and `dedupe_key` now contains
+    `issue_type_id` verbatim as its 2nd part -- `Candidate.__post_init__`
+    forbids an empty one, so `dedupe_key`'s `-`-for-absent branch cannot
+    fire for it -- so any row that conflicts already holds the identical
+    value, and `SCHEMA_VERSION` refuses to open a store written before the
+    column was populated. Dead is not why it is gone. It is gone because its
+    ONE reachable effect is harmful: `dedupe_key` arrives here as a free
+    parameter, independent of `candidate`, so a caller that built the key
+    from a DIFFERENT issue type would have had the disagreement silently
+    overwritten. Leaving it alone keeps the invariant a reader can check --
+    a row's `issue_type_id` is the 2nd part of its own `dedupe_key` -- and
+    turns that caller's bug into something visible instead of a quiet
+    overwrite.
+
     `surface_id`/`host` exist because a retest needs to know WHICH surface a
     finding lives on. Before this parameter existed, `upsert_finding` never
     wrote `surface_id` at all -- the column stayed NULL forever, no writer
@@ -23961,8 +23978,7 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
         "   confidence=excluded.confidence,"
         "   surface_id=excluded.surface_id,"
         "   host=excluded.host,"
-        "   check_id=excluded.check_id,"
-        "   issue_type_id=excluded.issue_type_id",
+        "   check_id=excluded.check_id",
         (fid, engagement_id, dedupe_key, candidate.issue_type_id,
          candidate.title, candidate.description,
          candidate.impact, candidate.remediation, candidate.cwe,
