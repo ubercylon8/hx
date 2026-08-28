@@ -461,3 +461,57 @@ def proxy_port(workdir: Path) -> int:
 def second_proxy_port(workdir: Path) -> int:
     """Burp's second proxy listener -- the other side of Q1's question."""
     return listener_ports(workdir)[1]
+
+
+# --- Task 5: the configure body, and the scope hash it is authorised against
+
+METHOD_ALLOW: tuple[str, ...] = ("GET", "HEAD", "OPTIONS")
+"""S4's method allowlist, stated rather than defaulted.
+
+`Policy.DEFAULT_METHODS` is these same three verbs, so sending them
+explicitly widens nothing and says what the engagement authorised. `Config`
+has no `method` key and this plan does not add one: an active_safe check is
+idempotent by S10's own definition, and GET is what idempotent means.
+"""
+
+
+def config_body(cfg) -> dict[str, list[str]]:
+    """The authorisation, built from the engagement's config.
+
+    `limit.max_requests` IS DELIBERATELY ABSENT. `Limits.arm()` falls back to
+    a documented default of 2000 per run, and S4 is explicit that the method
+    allowlist, dangerous-path denylist, rate limit and budget "apply to the
+    send path in full, and to crawler traffic in full. They do NOT apply to
+    traffic from the operator's own browser." Nothing this plan starts spends
+    the budget, so bounding it here would be a number with no referent.
+    """
+    return {
+        "scope.include": list(cfg.scope_include),
+        "scope.exclude": list(cfg.scope_exclude),
+        "dangerous.path": list(cfg.dangerous_paths),
+        "render.allow": list(cfg.render_allow),
+        "method.allow": list(METHOD_ALLOW),
+        "limit.rate_rps": [str(cfg.rate_limit_rps)],
+        "limit.concurrency": [str(cfg.max_concurrency)],
+    }
+
+
+def stored_scope_sha256(conn, engagement_id: str) -> str:
+    """The hash of the scope IN FORCE, read from `scope_version`.
+
+    NEVER RECOMPUTED FROM TODAY'S CONFIG. `scope_version` is append-only and
+    tamper-evident precisely so a contract dispute has one answer, and since
+    Plan 5's F4 fix the report renders this column as the engagement's
+    provenance. Recomputing would let the report show one hash as the
+    authorised boundary while the extension had been authorised against
+    another -- two facts that usually agree, which is the failure mode worth
+    designing out rather than testing for.
+    """
+    row = conn.execute(
+        "SELECT sha256 FROM scope_version WHERE engagement_id=?"
+        " ORDER BY effective_from_us DESC LIMIT 1", (engagement_id,)).fetchone()
+    if row is None:
+        raise SessionError(
+            f"engagement {engagement_id} has no scope_version row, so there is "
+            "no recorded boundary to authorise the extension against")
+    return row[0]
