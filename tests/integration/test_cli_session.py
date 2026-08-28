@@ -216,7 +216,24 @@ def test_capture_start_records_what_the_operator_browses(tmp_path):
         out = tmp_path / "capture-start.out"
         log = out.open("wb")
         stack.callback(log.close)
-        env = dict(os.environ, HX_BURP_SEED_HOME=str(bf.SEED_HOME))
+        # TWO ENTRIES, AND THE SECOND IS THE GUARD ON THE FIRST.
+        # `HX_BURP_SEED_HOME` is what makes the subprocess copy the LAB's home
+        # rather than the operator's -- `hx capture start` has no seed option
+        # and must not grow one for a test. On its own it was the only thing
+        # between a real Burp and a consultant's real `$HOME`, and DELETING IT
+        # WAS SILENTLY GREEN: this machine's `$HOME` has an accepted EULA, so
+        # the run succeeds, copies `~/.java` and `~/.BurpSuite` -- real client
+        # project state -- into `tmp_path`, and reports 32 passed.
+        #
+        # `HOME` pointed at a directory that does not exist turns that silence
+        # into a refusal: without the seed variable, `make_home` falls back to
+        # `Path.home()` and `_eula_accepted` says no, so the command exits
+        # before launching anything and this test fails naming the fake home.
+        # Nothing else in `hx capture start` reads `HOME` -- `--root` and
+        # `--burp-jar` are both explicit above, so `default_root()` is bypassed
+        # and `DEFAULT_LAB` is unused.
+        env = dict(os.environ, HX_BURP_SEED_HOME=str(bf.SEED_HOME),
+                   HOME=str(tmp_path / "not-a-home"))
         proc = subprocess.Popen(
             [str(HX), "capture", "start", "--kind", "browse",
              "--root", str(eng.root),

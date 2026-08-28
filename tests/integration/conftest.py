@@ -422,13 +422,16 @@ class Rig:
 # more", and that sentence is now an invitation to a fixed defect.
 # `tests/integration/test_cli_session.py` spawns the PRODUCT's own `hx capture
 # start`, which has no seed option and must not grow one for a test, so it
-# puts `HX_BURP_SEED_HOME=SEED_HOME` in that subprocess's environment -- the
-# only thing between a real Burp and the operator's real `$HOME`. Deleting
-# that line does not go red: a consultant's home has an accepted EULA and a
-# live `~/.BurpSuite/sessions`, so the run SUCCEEDS, copies real client
-# project state into a temporary directory, and reports green. What is true is
-# only the narrow claim: no fixture here sets that variable, and no launcher
-# in this file needs it, because they say the seed in code.
+# puts `HX_BURP_SEED_HOME=SEED_HOME` in that subprocess's environment. That
+# line used to be the only thing between a real Burp and the operator's real
+# `$HOME`, and deleting it did NOT go red -- a consultant's home has an
+# accepted EULA and a live `~/.BurpSuite/sessions`, so the run succeeded,
+# copied real client project state into a temporary directory, and reported
+# green. It is a guard now rather than a warning: the same env dict also sets
+# `HOME` to a directory that does not exist, so a seed variable that goes
+# missing fails loudly, in that test, naming the fake home. What is true here
+# is the narrow claim: no fixture in this directory sets that variable, and no
+# launcher in this file needs it, because they say the seed in code.
 
 
 @pytest.fixture
