@@ -38,6 +38,21 @@ _HOOKS = {
 }
 _ALL_HOOKS = ("on_surface", "probes", "on_corpus")
 
+# Which of those hooks `hx.scan.run` ACTUALLY CALLS. Today: one. `_HOOKS`
+# above answers "may this class implement this hook"; this answers "will
+# anything ever invoke it", and they are different questions that were being
+# asked as one. F7 of the whole-branch review: a check implementing only
+# `on_corpus` passed `validate()` and then produced an `error` row per
+# surface (`scan.run` calls `check.on_surface` unconditionally, so the
+# missing attribute raises inside the per-check try) -- verbatim the outcome
+# the "no hook" guard below exists to prevent, arrived at by a different
+# route. `probes` is in the same position and is refused for the same
+# reason; giving the corpus a probe pass, or a corpus pass, is design S5
+# work and belongs in a later plan. WHEN A RUNNER PASS IS ADDED, ADD ITS
+# HOOK HERE -- this tuple is what makes such a check runnable, and forgetting
+# it is a loud import error rather than a silent corpus.
+_RUNNER_CALLS = ("on_surface",)
+
 
 class RegistryError(Exception):
     """An entry in CHECKS that cannot be run as declared."""
@@ -69,6 +84,17 @@ def validate(checks) -> None:
                     f"{check.id}: class {check.klass!r} may not implement "
                     f"{hook!r}. Either the class is wrong or the hook is "
                     "one nothing will ever call")
+        if not any(hook in _RUNNER_CALLS for hook in implemented):
+            raise RegistryError(
+                f"{check.id}: implements only {implemented!r}, and the runner "
+                f"does not yet call {'it' if len(implemented) == 1 else 'any of them'}. "
+                f"`hx.scan.run` calls {list(_RUNNER_CALLS)} and nothing else, "
+                "so this check would open a check_run row for every surface "
+                "and end every one of them `error` -- the same outcome as "
+                "having no hook at all. The hook is legal for this class and "
+                "the runner pass that would drive it is not written yet; add "
+                "the pass and list its hook in `_RUNNER_CALLS` before "
+                "registering a check that needs it")
 
 
 CHECKS: tuple[base.Check, ...] = (

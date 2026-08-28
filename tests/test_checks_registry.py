@@ -79,3 +79,69 @@ def test_every_shipped_check_id_is_namespaced():
     change, and the prefix is what will keep the two apart without a rename."""
     for check in registry.CHECKS:
         assert check.id.startswith("hx."), check.id
+
+
+# --- Whole-branch review F7 (LOW): `_HOOKS` blessed `on_corpus` for every
+# class, and `hx.scan.run` calls no such hook.
+
+
+class _OnlyCorpus:
+    id, version, klass = "t.only-corpus", "1", "passive"
+    insertion_kinds = frozenset()
+
+    def on_corpus(self, ctx, surfaces):
+        return ()
+
+
+class _SurfaceAndCorpus(_Passive):
+    id = "t.surface-and-corpus"
+
+    def on_corpus(self, ctx, surfaces):
+        return ()
+
+
+class _ActiveThatOnlyProbes:
+    id, version, klass = "t.only-probes", "1", "active_safe"
+    insertion_kinds = frozenset()
+
+    def probes(self, ctx, surface, insertion):
+        return ()
+
+
+def test_a_check_whose_only_hook_the_runner_never_calls_is_refused():
+    """F7. `on_corpus` is LEGAL for a passive class -- `_HOOKS` says so, and
+    that is a statement about the class, not about the runner. `scan.run`
+    calls `on_surface` and nothing else, so this check passed validate() and
+    then wrote an `error` row per surface: `scan.run` calls
+    `check.on_surface` unconditionally and the missing attribute raises
+    inside the per-check try. That is verbatim the outcome the `no hook`
+    guard exists to prevent, reached by a different route."""
+    with pytest.raises(registry.RegistryError, match="does not yet call"):
+        registry.validate((_OnlyCorpus(),))
+
+
+def test_an_active_check_that_only_probes_is_refused_for_the_same_reason():
+    """The rule is about the RUNNER, not about one hook name. `probes` is
+    legal for `active_safe` and is equally uncalled today, so an active check
+    with only a `probes` method is refused too -- and the message says the
+    pass is not written rather than implying the check is malformed."""
+    with pytest.raises(registry.RegistryError, match="does not yet call"):
+        registry.validate((_ActiveThatOnlyProbes(),))
+
+
+def test_a_check_carrying_on_corpus_ALONGSIDE_on_surface_is_accepted():
+    """The separating case. The rule refuses a check the runner cannot drive
+    at all, not every mention of a hook a later plan will call -- rejecting
+    this one would forbid writing the corpus pass's checks incrementally."""
+    registry.validate((_SurfaceAndCorpus(),))
+
+
+def test_the_refusal_names_the_runner_rather_than_blaming_the_check():
+    """The next person to write a corpus check should learn WHY from the
+    error, not guess. It names the hooks the runner does call and where to
+    add one."""
+    with pytest.raises(registry.RegistryError) as exc:
+        registry.validate((_OnlyCorpus(),))
+    message = str(exc.value)
+    assert "on_surface" in message          # what the runner does call
+    assert "_RUNNER_CALLS" in message       # where to add a new one
