@@ -250,14 +250,17 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
         " WHERE r.engagement_id=? LIMIT 1", (engagement_id,)).fetchone())
 
     # F8 (fix round B), and computed here for the same reason `scanned` is:
-    # two sections make a statement about it and neither may be free to
-    # disagree with the other. `_provenance` NAMES the runs that did not
-    # finish; `_coverage` marks its own numbers partial because of them.
+    # several sections make a statement about it and none may be free to
+    # disagree with the others. `_provenance` NAMES the runs that did not
+    # finish; `_coverage` marks its own numbers partial because of them; and
+    # -- N2 of fix round C -- `_findings` qualifies "None recorded" with them,
+    # exactly as it already qualifies it with `scanned`.
     unfinished = _unfinished_runs(conn, engagement_id)
 
     out.extend(_provenance(conn, engagement_id, config, created_us=eng[3],
                            unfinished=unfinished))
-    out.extend(_findings(conn, engagement_id, scanned=scanned))
+    out.extend(_findings(conn, engagement_id, scanned=scanned,
+                         unfinished=unfinished))
     out.extend(_coverage(conn, engagement_id, config, scanned=scanned,
                          unfinished=unfinished))
     if blobs is not None:
@@ -534,7 +537,7 @@ def _latest_observed(conn, finding_id) -> bool | None:
     return bool(row[0])
 
 
-def _findings(conn, engagement_id, *, scanned) -> list[str]:
+def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
     # `ORDER BY title, id`: F13 of fix round 1. Without an ORDER BY, two
     # renders of the same store can list one severity's findings in a
     # different order -- SQLite makes no promise about it -- and a retest
@@ -555,9 +558,35 @@ def _findings(conn, engagement_id, *, scanned) -> list[str]:
             return ["## Findings\n",
                    "None recorded — this engagement has not been scanned "
                    "yet; see Coverage below.\n"]
+        if unfinished:
+            # N2 (fix round C), and the same qualifier pattern F4 established
+            # one branch up. MEASURED on an `aborted` run: this section
+            # emitted `## Findings` / `None recorded.`, BYTE-IDENTICAL to what
+            # a complete, genuinely clean scan emits. S5 is categorical --
+            # "an aborted run must never render as a clean one" -- and
+            # Findings is the section this module's own docstring says a
+            # client reads first. Coverage below already marks its numbers
+            # partial, so the information was in the document; the part read
+            # first did not carry it.
+            return ["## Findings\n",
+                   f"None recorded — but {len(unfinished)} of the runs behind "
+                    "this report did not finish (each is named under "
+                    "Provenance above), so this is not a clean bill: a check "
+                    "a stopped run never got to cannot have found anything. "
+                    "See Coverage below for what was and was not reached.\n"]
         return ["## Findings\n", "None recorded.\n"]
 
     out = ["## Findings\n"]
+    if unfinished:
+        # The same defect in the other direction, and the same fix: a LIST of
+        # findings drawn from runs that stopped renders byte-identically to
+        # one drawn from a completed pass, and reads as the whole of what
+        # there was. S5's rule is about the run, not about the emptiness of
+        # the list.
+        out.append(f"**{len(unfinished)} of the runs behind this report did "
+                   "not finish** (each is named under Provenance above), so "
+                   "what follows is what they had reached when they stopped, "
+                   "not what a completed run would have found.\n")
     by_sev = {s: [r for r in rows if r[2] == s] for s in _ORDER}
     for severity in _ORDER:
         if not by_sev[severity]:

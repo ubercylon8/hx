@@ -1422,3 +1422,102 @@ def test_a_null_exchange_status_does_not_render_as_the_bare_word_none(report_env
     conn.close()
     assert "→ None" not in out
     assert "no status recorded" in out
+
+
+# --- Fix round C ------------------------------------------------------------
+#
+# Four residual defects from fix round B's re-review, each with the separating
+# case its fix has to keep passing. The through-line is S12's governing rule
+# once more -- a report that cannot distinguish "tested, clean" from "never
+# reached" is worse than no report -- applied to four sentences that each
+# collapsed two states into one.
+
+
+# --- N2: an aborted run's Findings section must not read as a clean one ----
+
+@pytest.mark.parametrize("status", ["aborted", "killed", "error", "running"])
+def test_an_unfinished_run_with_no_findings_does_not_render_as_clean(status):
+    """MEASURED before the fix: an `aborted` run with zero findings emitted
+    `## Findings` / `None recorded.` -- byte-identical to what a complete,
+    genuinely clean scan emits. S5 is categorical ("an aborted run must never
+    render as a clean one") and Findings is the section `report`'s own
+    docstring says a client reads FIRST. Coverage below already carried
+    "These numbers are partial", so the fact was in the document; the part
+    read first did not have it.
+
+    All four non-`completed` values, for the reason `_unfinished_runs` takes
+    all four: a run still in flight has produced partial coverage too."""
+    conn = _conn()
+    _unfinished_run(conn, "r-1", status=status,
+                   stop_reason="KeyboardInterrupt")
+    _surface(conn, "s-1")
+    _check_run(conn, "cr-1", run_id="r-1", surface_id="s-1",
+              check_id="hx.passive.cookie-flags", verdict="clean")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    findings = out[out.index("## Findings"):out.index("## Coverage")]
+    assert "None recorded" in findings
+    assert "did not finish" in findings
+    assert "not a clean bill" in findings
+    # And the qualifier must not be the UNSCANNED one -- a check DID run
+    # here, so "has not been scanned yet" would be false of this store.
+    assert "has not been scanned yet" not in findings
+
+
+def test_an_aborted_findings_section_is_not_byte_identical_to_a_clean_one(
+        report_env_scanned_clean):
+    """The defect as the review measured it, stated as a comparison rather
+    than as a string: the two sections were the same bytes. One assertion
+    that cannot be satisfied by any wording that leaves them equal."""
+    clean = report.render(**report_env_scanned_clean)
+    clean_findings = clean[clean.index("## Findings"):
+                           clean.index("## Coverage")]
+
+    conn = _conn()
+    _unfinished_run(conn, "r-1", status="aborted",
+                   stop_reason="KeyboardInterrupt")
+    _surface(conn, "s-1")
+    _check_run(conn, "cr-1", run_id="r-1", surface_id="s-1",
+              check_id="hx.passive.cookie-flags", verdict="clean")
+    aborted = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+    aborted_findings = aborted[aborted.index("## Findings"):
+                               aborted.index("## Coverage")]
+
+    assert aborted_findings != clean_findings
+    # The separating half, and the one that keeps the qualifier a caveat
+    # rather than boilerplate: a completed clean run still says the plain
+    # thing. (`test_none_recorded_is_unqualified_once_a_clean_scan_has_run`
+    # pins the same sentence from the F4 side.)
+    assert clean_findings == "## Findings\n\nNone recorded.\n\n"
+
+
+def test_a_findings_list_from_an_unfinished_run_is_marked_partial():
+    """The same defect with the list non-empty. S5's rule is about the RUN,
+    not about the emptiness of the list: three findings drawn from a run that
+    stopped render byte-identically to three drawn from a completed pass, and
+    a client reads them as the whole of what there was."""
+    conn = _conn()
+    _unfinished_run(conn, "r-1", status="aborted", stop_reason="budget")
+    _surface(conn, "s-1")
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/login")
+    _finding(conn, run_id="r-1", title="Reflected XSS in search",
+            severity="High", exchange_ids=["x-1"])
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    findings = out[out.index("## Findings"):out.index("## Coverage")]
+    assert "Reflected XSS in search" in findings
+    assert "did not finish" in findings
+    assert "what they had reached when they stopped" in findings
+
+
+def test_a_findings_list_from_a_completed_run_carries_no_partial_note(
+        report_env_with_findings):
+    """The separating case for the bullet above: a completed run's findings
+    list says nothing about having stopped."""
+    out = report.render(**report_env_with_findings)
+    findings = out[out.index("## Findings"):out.index("## Coverage")]
+    assert "Reflected XSS in search" in findings
+    assert "did not finish" not in findings
