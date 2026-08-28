@@ -281,6 +281,12 @@ def make_home(workdir: Path, *, seed: Path | None = None) -> Path:
 
 PROXY_CONFIG = "proxy-listeners.json"
 
+# How many times write_listener_config() may redraw before giving up. The
+# first draw collides about once in 5000; eight is far past the point where a
+# ninth would mean something other than luck -- an exhausted ephemeral range,
+# or a `second_port` the caller named that _free_port() keeps handing back.
+_PORT_DRAWS = 8
+
 
 def _free_port() -> int:
     """A port nothing holds right now, for a listener Burp is about to bind.
@@ -325,9 +331,37 @@ def write_listener_config(workdir: Path, second_port: int = 0) -> list[int]:
     not_loopback_only() was written, and changing it to `all_interfaces` left
     the suite green with the proxy bound to `*`. Every caller must run that
     check once the listeners are up.
+
+    THE TWO PORTS MUST DIFFER, AND A DRAW THAT CANNOT MAKE THEM DIFFER IS
+    FATAL. Two consecutive ephemeral binds can return the same number --
+    measured at this call site on this machine, 4 collisions in 20 000 calls --
+    and a collision is silent all the way down. `Source.java` is `port ==
+    crawlerPort ? CRAWLER : OPERATOR`, so one port for both listeners
+    attributes THE CONSULTANT'S OWN BROWSING to the crawler and applies the
+    agent's rules to it: their POSTs dropped by the method allowlist, the
+    dangerous-path denylist, the rate limit and the request budget, none of
+    which S4 applies "to traffic from the operator's own browser". Every guard
+    downstream passes -- not_loopback_only() sees one listening port and asks
+    for one, the handshake completes, configure completes -- so the consultant
+    gets Burp's drop page on a form submission with nothing in the output
+    explaining it. Redrawn here, and raised rather than returned if the redraw
+    cannot separate them, because there is no later place that can tell.
     """
     workdir.mkdir(parents=True, exist_ok=True)
-    ports = [_free_port(), second_port or _free_port()]
+    for _ in range(_PORT_DRAWS):
+        ports = [_free_port(), second_port or _free_port()]
+        if ports[0] != ports[1]:
+            break
+    else:
+        raise SessionError(
+            f"could not draw two different proxy ports in {_PORT_DRAWS} tries: "
+            f"the operator's listener and the crawler's both came back as "
+            f"{ports[0]}. S4 tells the operator and the crawler apart by which "
+            "listener a request arrived on and by nothing else, so one port "
+            "for both would silently give the consultant's own browser the "
+            "agent's rules"
+            + (f". Try again without --crawler port {second_port}"
+               if second_port else ""))
     (workdir / PROXY_CONFIG).write_text(json.dumps({"proxy": {
         "request_listeners": [
             {"certificate_mode": "per_host", "listen_mode": "loopback_only",

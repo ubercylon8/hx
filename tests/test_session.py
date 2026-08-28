@@ -635,3 +635,37 @@ def test_two_sessions_in_a_row_on_one_engagement_both_start(
         "prefs and Burp state are left inside the client's engagement "
         "directory, which is the thing a consultant archives")
 
+
+
+def test_the_two_listeners_are_never_the_same_port(
+        monkeypatch, an_engagement, a_jar, a_seed, built_extension):
+    """F2, at the level that matters: what the session REPORTS.
+
+    `Source.forListenerPort` is `port == crawlerPort ? CRAWLER : OPERATOR`, so
+    a session that yielded one number for both would hand the consultant's own
+    browser the agent's rule set -- POSTs dropped, dangerous paths denied, the
+    rate limit and the budget applied -- none of which S4 applies to "traffic
+    from the operator's own browser". Nothing downstream compares the two, and
+    every guard in between passes on one port: `not_loopback_only` is asked
+    about one listening port and finds it, the handshake completes, configure
+    completes. So this is the comparison.
+
+    `_free_port` is the REAL one here -- the only test in this file that binds
+    anything -- because the draw is the thing under test. The ports are read
+    back out of the config file the launch was handed, never out of the return
+    value, so a `write_listener_config` that returned one pair and wrote
+    another would fail here too.
+    """
+    monkeypatch.setattr(session.subprocess, "Popen",
+                        lambda cmd, **kw: _FakeProc())
+    monkeypatch.setattr(session, "wait_for", lambda *a, **k: True)
+    monkeypatch.setattr(session, "not_loopback_only", lambda pid, ports: None)
+    monkeypatch.setattr(session.BridgeServer, "configure", lambda self, *a, **k: 1)
+
+    with session.session(an_engagement, instance="capture", jar=a_jar,
+                         seed=a_seed) as live:
+        assert live.operator_port != live.crawler_port, (
+            f"both listeners are :{live.operator_port}, so the extension reads "
+            "the operator's own browsing as the crawler's")
+        assert session.listener_ports(live.workdir) == [
+            live.operator_port, live.crawler_port]
