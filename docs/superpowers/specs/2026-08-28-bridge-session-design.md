@@ -12,17 +12,26 @@ and the DENY-ALL default, §5 tables, §6 bridge with correlation ids and `confi
 
 - `hx capture start` (`cli.py:214-238`) opens a `run` row and prints a line. It does not
   launch Burp, serve the bridge, or configure anything.
-- `configure()` exists at `bridge/server.py:650` with no caller in `src/`. Its only callers
-  were `scripts/demo_capture.py:226` and the integration tests. **Both were rewired
-  onto `hx.session` by this plan's Task 9, so as of `1f23336` the demo does not call
-  `configure` at all** — the sentence above describes the gap that produced this
-  plan, not the tree after it.
+- `configure()` exists at `bridge/server.py:650` with no caller in `src/`. Its callers were
+  `scripts/demo_capture.py:226`, `scripts/demo_gate.py:159` and the integration tests —
+  **three, not two**; an earlier correction here enumerated only the first and the tests,
+  and left `demo_gate` out of a sentence whose whole purpose was to enumerate. **As of
+  `1f23336` `demo_capture` calls `configure` through `hx.session.session()` and not
+  directly.** `demo_gate` still calls it: it narrates the gate one refusal at a time with a
+  hand-typed body (`limit.max_requests: 10`, a two-entry `dangerous.path`) that is the
+  point of the script rather than a second spelling of the product's — but its scope hash
+  is `hx.session.stored_scope_sha256`'s now, because a recomputed hash is the one thing §5
+  forbids and the demo an operator runs must not teach it. The sentence above describes
+  the gap that produced this plan, not the tree after it.
 - The rig assembles the authorisation **inline in `Rig.configure`** — there was no
   named function to point at. (An earlier draft of this spec claimed a
-  `build_config_body` in `tests/integration/conftest.py`; that was wrong. The only
-  `build_config_body` in the tree was `hx.bridge.codec`'s wire encoder, which a
-  conftest docstring mentions and which does something else entirely. Corrected
-  2026-08-28 after Task 8's implementer checked it.)
+  `build_config_body` in `tests/integration/conftest.py`. That was wrong *when it was
+  written*: the only `build_config_body` in the tree then was `hx.bridge.codec`'s wire
+  encoder, which a conftest docstring mentions and which does something else entirely.
+  It stopped being wrong on this branch — Task 8 created
+  `tests/integration/conftest.py:119 build_config_body`, which is
+  `hx.session.config_body` plus the two keys only a test wants. The claim was corrected
+  2026-08-28 and the correction is what is now out of date, in the other direction.)
 - `launch_burp`, `wait_for`, `proxy_port`, `second_proxy_port`, `not_loopback_only` and
   `_jar_problem` live in `tests/integration/burp_fixture.py`, and the demo script imports
   them **from the test tree**.
