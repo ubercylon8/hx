@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import sqlite3
 import uuid
 from pathlib import Path
@@ -19,6 +20,7 @@ from hx import halt as halt_mod
 from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
+from hx import session as session_mod
 from hx.checks import registry
 from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
@@ -211,6 +213,11 @@ def capture() -> None:
     """Start or stop traffic capture for an engagement."""
 
 
+def _block_until_interrupt() -> None:
+    """Separate so a test can drive the command without a real signal."""
+    signal.pause()
+
+
 @capture.command("start")
 @click.option(
     "--kind",
@@ -220,8 +227,21 @@ def capture() -> None:
     help="Run kind. The vocabulary is derived from the schema, not restated.",
 )
 @click.option("--root", type=click.Path(path_type=Path), default=None)
-def capture_start(kind, root) -> None:
-    """Open the live run of KIND, the deliberately-named path.
+@click.option(
+    "--burp-jar",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Which Burp jar to launch against. Default: $HX_BURP_JAR, then the "
+         "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
+         "a guess, because the report records the version under test.",
+)
+def capture_start(kind, root, burp_jar) -> None:
+    """Launch Burp, open the live run of KIND, and hold the session open
+    until interrupted.
+
+    THE SESSION OPENS BEFORE THE RUN. A run row opened in front of a
+    session that then fails to start is a run that never captured
+    anything, and `hx report` would go on to render it as a real one.
 
     This is `run.current_run`, not `run.open_run`: typing `start` twice
     resumes the one live run of that kind rather than opening a second one.
@@ -229,12 +249,30 @@ def capture_start(kind, root) -> None:
     path = root or default_root()
     eng = _open_engagement(path)
     try:
-        run_id = run_mod.current_run(
-            eng.db, engagement_id=eng.id, kind=kind,
-            safety_profile=eng.config.safety_profile)
-    except sqlite3.Error as exc:
-        raise click.ClickException(f"cannot write to the database at {path}: {exc}") from exc
-    click.echo(f"{kind} run {run_id} is live")
+        with session_mod.session(eng, instance="capture", jar=burp_jar) as live:
+            click.echo(f"operator proxy listening on 127.0.0.1:{live.operator_port}")
+            try:
+                run_id = run_mod.current_run(
+                    eng.db, engagement_id=eng.id, kind=kind,
+                    safety_profile=eng.config.safety_profile)
+            except sqlite3.Error as exc:
+                raise click.ClickException(
+                    f"cannot write to the database at {path}: {exc}") from exc
+            click.echo(f"{kind} run {run_id} is live")
+            try:
+                _block_until_interrupt()
+            finally:
+                # Runs even when the block above ends in a KeyboardInterrupt:
+                # a run left `status='running'` after the operator's Burp is
+                # gone would read as a live capture forever.
+                try:
+                    run_mod.close_run(eng.db, run_id=run_id, status="completed",
+                                      stop_reason="operator")
+                except sqlite3.Error as exc:
+                    raise click.ClickException(
+                        f"cannot write to the database at {path}: {exc}") from exc
+    except session_mod.SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @capture.command("stop")

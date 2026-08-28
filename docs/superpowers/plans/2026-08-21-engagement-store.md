@@ -3345,53 +3345,15 @@ def engagement_with_stale_run(engagement: Path) -> Path:
     return engagement
 
 
-def test_capture_start_opens_a_named_run(engagement):
-    result = CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
-    assert result.exit_code == 0, result.output
-    assert "browse" in result.output
-
-
-def test_capture_start_refuses_a_kind_the_schema_will_not_take(engagement):
-    """The vocabulary lives in run.RUN_KINDS and in a CHECK. A bad --kind must
-    be refused by the CLI with a readable message, not by SQLite with
-    `CHECK constraint failed: run`."""
-    result = CliRunner().invoke(cli.main,
-        ["capture", "start", "--kind", "scheduled", "--root", str(engagement)])
-    assert result.exit_code != 0
-    assert "scheduled" in result.output
-
-
-def test_capture_stop_closes_it(engagement):
-    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
-    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
-    assert result.exit_code == 0, result.output
-
-
-def test_capture_stop_closes_every_live_run(engagement):
-    """Two kinds live at once is the normal case, not the exotic one: a crawl
-    runs while a human browses. An operator typing `stop` means both."""
-    for kind in ("browse", "crawl"):
-        CliRunner().invoke(cli.main,
-            ["capture", "start", "--kind", kind, "--root", str(engagement)])
-    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
-    assert result.exit_code == 0, result.output
-    assert "2" in result.output
-    # ...and assert against the STORE, not the wording: no run of this
-    # engagement is left with status='running'.
-    eng = eng_mod.open_(engagement)
-    try:
-        still_running = eng.db.execute(
-            "SELECT COUNT(*) AS n FROM run WHERE status='running'").fetchone()["n"]
-        assert still_running == 0
-    finally:
-        eng.db.close()
-
-
-def test_capture_stop_with_no_run_says_so_rather_than_failing(engagement):
-    """An operator typing stop twice has made no mistake worth an error."""
-    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
-    assert result.exit_code == 0, result.output
-    assert "no" in result.output.lower()
+# Task 7 rewired `hx capture start` so it actually launches Burp (through
+# `session.session`), which means it now blocks for the life of the session
+# and a plain unstubbed `CliRunner` invocation is no longer safe in the
+# default suite -- this machine has exactly one jar under the default
+# `$HX_BURP_LAB`, so `find_burp_jar` would find it and launch a real Burp.
+# The `capture start`/`capture stop` tests that used to live here moved to
+# tests/test_cli_capture.py, which stubs `session.session` throughout; the
+# fixtures below (`engagement` and its variants) stay because the `info` and
+# `scan`/`report` tests further down still use them.
 
 
 def test_info_reports_drops_loudly_when_there_are_any(engagement_with_drops):
@@ -3420,68 +3382,11 @@ def test_info_reaps_stale_runs_before_reporting(engagement_with_stale_run):
     assert "error" in result.output.lower()
 
 
-def test_capture_start_is_idempotent(engagement):
-    """`start` calls `current_run`, not `open_run`: typing `start` twice must
-    resume the one live run of that kind, not open a second one. Row E of the
-    Task 8 sabotage table -- if `start` called `open_run` instead, nothing
-    else here would catch it."""
-    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
-    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
-    eng = eng_mod.open_(engagement)
-    try:
-        running = eng.db.execute(
-            "SELECT COUNT(*) AS n FROM run WHERE status='running' AND kind='browse'"
-        ).fetchone()["n"]
-        assert running == 1
-    finally:
-        eng.db.close()
-
-
-# --- Fix round 1: four requirements the brief named, correctly implemented,
-# pinned by no test until now. ---
-
-
-def test_capture_stop_writes_completed_status_and_operator_reason(engagement):
-    """F1: the brief is explicit -- 'the close is status=\'completed\',
-    stop_reason=\'operator\''. `status != 'running'` (the existing
-    assertion in test_capture_stop_closes_every_live_run) is satisfied by
-    `aborted`, `killed` or `error` too, and those mean the harness or the
-    auto-halt ended the run, not an operator. Assert against the STORE."""
-    CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
-    result = CliRunner().invoke(cli.main, ["capture", "stop", "--root", str(engagement)])
-    assert result.exit_code == 0, result.output
-    eng = eng_mod.open_(engagement)
-    try:
-        row = eng.db.execute(
-            "SELECT status, stop_reason FROM run WHERE kind='browse'"
-        ).fetchone()
-        assert row["status"] == "completed"
-        assert row["stop_reason"] == "operator"
-    finally:
-        eng.db.close()
-
-
-def test_capture_stop_with_kind_only_closes_that_kind(engagement):
-    """F2: the mirror of test_capture_stop_closes_every_live_run. Two kinds
-    live at once, `stop --kind crawl` must close only the crawl run and
-    leave the browse run untouched -- `hx capture stop --kind crawl`
-    closing a browse run must be visible to something."""
-    for kind in ("browse", "crawl"):
-        CliRunner().invoke(cli.main,
-            ["capture", "start", "--kind", kind, "--root", str(engagement)])
-    result = CliRunner().invoke(cli.main,
-        ["capture", "stop", "--kind", "crawl", "--root", str(engagement)])
-    assert result.exit_code == 0, result.output
-    eng = eng_mod.open_(engagement)
-    try:
-        browse_status = eng.db.execute(
-            "SELECT status FROM run WHERE kind='browse'").fetchone()["status"]
-        crawl_status = eng.db.execute(
-            "SELECT status FROM run WHERE kind='crawl'").fetchone()["status"]
-        assert browse_status == "running"
-        assert crawl_status == "completed"
-    finally:
-        eng.db.close()
+# `test_capture_start_is_idempotent`, F1
+# (`test_capture_stop_writes_completed_status_and_operator_reason`) and F2
+# (`test_capture_stop_with_kind_only_closes_that_kind`) moved to
+# tests/test_cli_capture.py along with the rest of the `capture`
+# start/stop family -- see the note above `test_info_reports_drops_loudly...`.
 
 
 @pytest.fixture
@@ -4004,6 +3909,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import sqlite3
 import uuid
 from pathlib import Path
@@ -4016,6 +3922,7 @@ from hx import halt as halt_mod
 from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
+from hx import session as session_mod
 from hx.checks import registry
 from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
@@ -4208,6 +4115,11 @@ def capture() -> None:
     """Start or stop traffic capture for an engagement."""
 
 
+def _block_until_interrupt() -> None:
+    """Separate so a test can drive the command without a real signal."""
+    signal.pause()
+
+
 @capture.command("start")
 @click.option(
     "--kind",
@@ -4217,8 +4129,21 @@ def capture() -> None:
     help="Run kind. The vocabulary is derived from the schema, not restated.",
 )
 @click.option("--root", type=click.Path(path_type=Path), default=None)
-def capture_start(kind, root) -> None:
-    """Open the live run of KIND, the deliberately-named path.
+@click.option(
+    "--burp-jar",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Which Burp jar to launch against. Default: $HX_BURP_JAR, then the "
+         "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
+         "a guess, because the report records the version under test.",
+)
+def capture_start(kind, root, burp_jar) -> None:
+    """Launch Burp, open the live run of KIND, and hold the session open
+    until interrupted.
+
+    THE SESSION OPENS BEFORE THE RUN. A run row opened in front of a
+    session that then fails to start is a run that never captured
+    anything, and `hx report` would go on to render it as a real one.
 
     This is `run.current_run`, not `run.open_run`: typing `start` twice
     resumes the one live run of that kind rather than opening a second one.
@@ -4226,12 +4151,30 @@ def capture_start(kind, root) -> None:
     path = root or default_root()
     eng = _open_engagement(path)
     try:
-        run_id = run_mod.current_run(
-            eng.db, engagement_id=eng.id, kind=kind,
-            safety_profile=eng.config.safety_profile)
-    except sqlite3.Error as exc:
-        raise click.ClickException(f"cannot write to the database at {path}: {exc}") from exc
-    click.echo(f"{kind} run {run_id} is live")
+        with session_mod.session(eng, instance="capture", jar=burp_jar) as live:
+            click.echo(f"operator proxy listening on 127.0.0.1:{live.operator_port}")
+            try:
+                run_id = run_mod.current_run(
+                    eng.db, engagement_id=eng.id, kind=kind,
+                    safety_profile=eng.config.safety_profile)
+            except sqlite3.Error as exc:
+                raise click.ClickException(
+                    f"cannot write to the database at {path}: {exc}") from exc
+            click.echo(f"{kind} run {run_id} is live")
+            try:
+                _block_until_interrupt()
+            finally:
+                # Runs even when the block above ends in a KeyboardInterrupt:
+                # a run left `status='running'` after the operator's Burp is
+                # gone would read as a live capture forever.
+                try:
+                    run_mod.close_run(eng.db, run_id=run_id, status="completed",
+                                      stop_reason="operator")
+                except sqlite3.Error as exc:
+                    raise click.ClickException(
+                        f"cannot write to the database at {path}: {exc}") from exc
+    except session_mod.SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @capture.command("stop")
