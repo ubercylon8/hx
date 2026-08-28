@@ -63,3 +63,42 @@ def test_a_copied_preferences_lock_is_removed(seeded_home, tmp_path):
     # leaving it makes Java Preferences fight a Burp that is not running.
     home = session.make_home(tmp_path / "work")
     assert not list((home / ".java" / ".userPrefs").glob(".user*"))
+
+
+def test_a_named_seed_beats_the_environment_and_the_home(monkeypatch, tmp_path):
+    """A caller that knows which home to copy says so in code.
+
+    `$HX_BURP_SEED_HOME` is the operator's override and `Path.home()` is the
+    default, and neither can serve a caller that must not read the machine at
+    all. Both are pointed somewhere fatal here: a `make_home` that consulted
+    either would raise, since neither has accepted a licence.
+
+    The gap this closes was measured. While the seed could ONLY be steered by
+    the environment, `tests/integration/burp_fixture.py` set the variable from
+    an autouse pytest fixture -- so `scripts/demo_capture.py` and
+    `scripts/demo_gate.py`, which call the same launcher outside pytest,
+    checked the lab's home in `missing()` and then copied the operator's live
+    `~/.BurpSuite/sessions` into a temporary directory.
+    """
+    named = tmp_path / "named"
+    prefs = named / ".java" / ".userPrefs" / "burp"
+    prefs.mkdir(parents=True)
+    (prefs / "prefs.xml").write_bytes(
+        b'<map><entry key="burp.eula" value="true"/></map>')
+    (named / ".BurpSuite").mkdir()
+    (named / ".BurpSuite" / "UserConfigCommunity.json").write_text("{}")
+
+    monkeypatch.setenv("HX_BURP_SEED_HOME", str(tmp_path / "env-seed-no-eula"))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+
+    home = session.make_home(tmp_path / "work", seed=named)
+    assert (home / ".BurpSuite" / "UserConfigCommunity.json").exists(), (
+        "make_home copied something other than the seed it was handed")
+
+
+def test_an_omitted_seed_still_means_the_operators_home(seeded_home, tmp_path):
+    """The default is unchanged, and that matters: a consultant's accepted
+    licence is the only one hx may use, so `seed=None` must keep resolving
+    through `seed_home()` rather than becoming a required argument."""
+    home = session.make_home(tmp_path / "work")
+    assert (home / ".BurpSuite" / "UserConfigCommunity.json").exists()

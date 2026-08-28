@@ -383,33 +383,22 @@ class Rig:
             f"{[(h.method, h.path) for h in self.target.hits]}")
 
 
-@pytest.fixture(autouse=True)
-def _lab_seed_home(monkeypatch):
-    """Every Burp in this directory copies the LAB's home, not the operator's.
-
-    `hx.session.make_home` copies `seed_home()`, which is the operator's own
-    `$HOME` by default -- right for a consultant, whose accepted licence is
-    the only one hx may use, and wrong here twice over: this suite must not
-    read a developer's live Burp home (`prefs.xml` is 1.75 MB and gets
-    rewritten under a running Burp, which is where the torn-file bug came
-    from), and `burp_fixture.missing()` reports on `bf.SEED_HOME`, so a rig
-    that seeded from somewhere else would be checking one home and copying
-    another.
-
-    Said HERE, once, through the knob the product already publishes, rather
-    than at import in `burp_fixture`: this file is imported during COLLECTION
-    for the whole repository, and a module-level `os.environ` write would
-    reach the 968 tests that have nothing to do with Burp.
-
-    AUTOUSE because `test_real_burp.py` and `test_proxy_facts.py` launch their
-    own Burps without going through `rig`, and `rig` names it in its arguments
-    as well so the ordering is stated rather than inherited.
-    """
-    monkeypatch.setenv("HX_BURP_SEED_HOME", str(bf.SEED_HOME))
+# THERE IS NO SEED-HOME FIXTURE HERE, and its absence is deliberate. One round
+# of this task set `$HX_BURP_SEED_HOME` from an autouse fixture so that
+# `hx.session.make_home` would copy the lab's home rather than the operator's.
+# It worked for everything pytest runs and for nothing else: `bf.launch_burp`'s
+# other two callers are `scripts/demo_capture.py` and `scripts/demo_gate.py`,
+# which guard on `bf.missing()` -- a check against the LAB's home -- and then
+# copied `~/.BurpSuite/sessions`, real client project state on a consultant's
+# machine. `make_home(workdir, *, seed=None)` moved the answer into the call,
+# so both fixture launchers now say `seed=SEED_HOME` in code, for every caller
+# rather than for the ones pytest owns. Nothing in this directory reaches
+# `seed_home()` any more, so an environment variable set beside it would be a
+# second answer to a question that already has one.
 
 
 @pytest.fixture
-def rig(tmp_path, _lab_seed_home):
+def rig(tmp_path):
     # Order matters: an unbuilt jar is a FAILURE and a missing Burp is a skip,
     # and asking the skip question first turns the former into the latter.
     if bf.unbuilt():

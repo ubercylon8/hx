@@ -8463,10 +8463,11 @@ LAB = Path(os.environ.get("HX_BURP_LAB", session.DEFAULT_LAB))
 SEED_HOME = LAB / "burphome"          # copied from, never run against
 
 # The rig's seed is the lab's curated home rather than the operator's own,
-# which is what `hx.session.seed_home()` returns by default. That is not this
-# module's to decide at import: `tests/integration/conftest.py` says it once,
-# for the whole directory, through the knob the product already publishes
-# ($HX_BURP_SEED_HOME) -- see `_lab_seed_home` there.
+# which is what `hx.session.seed_home()` returns by default. Both launchers
+# below say so with `seed=SEED_HOME`, in code, on every call -- NOT through
+# `$HX_BURP_SEED_HOME`, which only an autouse pytest fixture could set and
+# which therefore left this module's two non-pytest callers, the demo scripts,
+# checking this home and copying the operator's.
 
 try:
     BURP_JAR: Path | None = find_burp_jar()
@@ -8699,12 +8700,24 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
     these thirty tests as the code a consultant's `hx capture start` runs,
     rather than as a copy of it that agreed on the day it was written.
 
-    Two arguments are still this side's. `jar` is the one this lab holds --
+    Three arguments are still this side's. `jar` is the one this lab holds --
     resolved once at import, so a test's failure names the same jar
     `missing()` does. `instance` is "integration" because the rig identifies
     itself as the rig: `test_real_burp` asserts on `hello["instance_id"]`, and
     an operator reading a bridge log should be able to tell a test run from a
     session they started.
+
+    `seed=SEED_HOME` IS THE ONE `missing()` CHECKED, and passing it is not
+    tidiness. `session.make_home` copies `seed_home()` by default -- the
+    operator's own `$HOME` -- which is right for a consultant and wrong for
+    every caller here, and for one round of this task it was steered by an
+    autouse fixture setting `$HX_BURP_SEED_HOME`. A fixture only runs under
+    pytest. `scripts/demo_capture.py` and `scripts/demo_gate.py` call this
+    function too: they guarded on `missing()`, which reports on `SEED_HOME`,
+    and then copied the operator's live `~/.BurpSuite/sessions` -- real client
+    project state on a consultant's machine -- into a temporary directory.
+    Checking one home and copying another is the exact disagreement this
+    argument removes, for every caller rather than for the ones pytest owns.
     """
     return session.launch_burp(
         socket_path, engagement_id, workdir,
@@ -8714,7 +8727,8 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
         # names all three places it looked.
         jar=BURP_JAR if BURP_JAR is not None else find_burp_jar(),
         instance="integration",
-        crawler_port=crawler_port)
+        crawler_port=crawler_port,
+        seed=SEED_HOME)
 
 
 # ---------------------------------------------------------------------------
@@ -8838,7 +8852,9 @@ def launch_probe(workdir: Path, out: Path,
     the suite green with the proxy bound to `*`. Callers must run that check
     once the listeners are up -- test_proxy_facts.py's fixture does.
     """
-    home = make_home(workdir)
+    # seed=SEED_HOME for the same reason bf.launch_burp passes it: make_home's
+    # default is the operator's own home, and this is the one missing() checked.
+    home = make_home(workdir, seed=SEED_HOME)
     classes = _compile_probe(workdir)
     write_listener_config(workdir, extra_listener_port)
     log = (workdir / "burp.log").open("wb")

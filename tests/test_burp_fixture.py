@@ -236,6 +236,36 @@ def test_a_stale_nfs_mount_is_reported_not_raised(lab, monkeypatch):
     assert reasons and "could not be checked" in reasons[0]
 
 
+def test_a_jar_search_that_failed_at_import_is_reported_not_raised(lab, monkeypatch):
+    """`BURP_JAR is None` is a real state and nothing else exercises it.
+
+    `find_burp_jar()` runs at IMPORT and raises when the lab holds no jar, or
+    two, or one that cannot be read. The module catches that, leaves
+    `BURP_JAR` as None and holds the message -- and every jar check downstream
+    has to cope with the None, because `None.exists()` is an AttributeError,
+    which is NOT an OSError and so would sail straight out of `missing()`.
+    That is not a red test: it is `Interrupted: 1 error during collection` for
+    the whole repository, with nothing anywhere going red to say so, which has
+    already happened twice here from other causes.
+
+    The `lab` fixture always patches a real Path, so without this row a later
+    simplification back to a bare `if not BURP_JAR.exists()` would pass every
+    test in this file and break every pytest run in the repo.
+    """
+    monkeypatch.setattr(bf, "BURP_JAR", None)
+    monkeypatch.setattr(bf, "_NO_BURP_JAR",
+                        "no Burp jar found. Pass --burp-jar, set HX_BURP_JAR")
+
+    reasons = bf.missing()                      # must not raise
+    assert reasons == ["no Burp jar found. Pass --burp-jar, set HX_BURP_JAR"], reasons
+    assert bf.burp_available() is False
+    # And the environment subset, which probe_missing() takes, says it too:
+    # the probe compiles against the Burp jar, so a missing one is its row as
+    # much as it is missing()'s.
+    assert bf._environment_missing() == [
+        "no Burp jar found. Pass --burp-jar, set HX_BURP_JAR"]
+
+
 # ---- a future mtime is a broken clock, not a stale jar ----------------
 
 

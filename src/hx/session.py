@@ -168,7 +168,7 @@ def _eula_accepted(seed: Path) -> bool:
         return False
 
 
-def make_home(workdir: Path) -> Path:
+def make_home(workdir: Path, *, seed: Path | None = None) -> Path:
     """A private $HOME per run.
 
     Sharing one Burp home across runs means sharing a Java Preferences lock and
@@ -180,8 +180,26 @@ def make_home(workdir: Path) -> Path:
     that never accepted Burp's licence sits at the licence prompt and never
     dials in, which without this check surfaces as a bare 90-second handshake
     timeout; checked here, before the copy, so it is reported instead.
+
+    `seed` NAMES THE HOME TO COPY, and omitting it means `seed_home()` -- the
+    operator's own, which is the right default for a consultant because the
+    licence they accepted is the only one hx may use. It is a PARAMETER, not
+    only an environment variable, because a caller that already knows the
+    answer must be able to say so in code:
+
+      - `tests/integration/burp_fixture.py` copies the LAB's curated home. It
+        checks that home in `missing()` and then launches, and while the seed
+        could only be steered through `$HX_BURP_SEED_HOME` the check and the
+        copy were two different homes for any caller outside pytest --
+        `scripts/demo_capture.py` and `scripts/demo_gate.py` verified the lab
+        and then copied the operator's live `~/.BurpSuite/sessions`, which on
+        a consultant's machine is real client project state.
+      - a unit test may not read `Path.home()` AT ALL. `tests/test_session_
+        launch.py` faked only `Popen`, so three tests in the DEFAULT suite
+        copied the developer's live Burp home into `tmp_path` and passed only
+        because this machine's `$HOME` had accepted the EULA.
     """
-    seed = seed_home()
+    seed = Path(seed) if seed is not None else seed_home()
     if not _eula_accepted(seed):
         raise SessionError(
             f"{seed} has not accepted the Burp Suite licence. Run Burp by "
@@ -274,7 +292,8 @@ def write_listener_config(workdir: Path, second_port: int = 0) -> list[int]:
 
 def launch_burp(socket_path: Path, engagement_id: str, workdir: Path, *,
                 sentinel: Path, jar: Path, instance: str,
-                crawler_port: int = 0) -> subprocess.Popen:
+                crawler_port: int = 0,
+                seed: Path | None = None) -> subprocess.Popen:
     """Burp's output goes to workdir/burp.log, never to a pipe.
 
     An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
@@ -299,11 +318,18 @@ def launch_burp(socket_path: Path, engagement_id: str, workdir: Path, *,
 
     `crawler_port=0` means "any free port"; read the real ones back with
     proxy_port() and second_proxy_port().
+
+    `seed` is handed straight to make_home() and means the same thing there:
+    omitted, the operator's own Burp home is copied. A caller that knows
+    better -- the integration rig, which verified a different home before
+    calling -- says so rather than checking one home and copying another.
     """
     problem = extension_problem()
     if problem is not None:
         raise SessionError(problem)
-    home = make_home(workdir)
+    # `seed` FORWARDED, not resolved here: make_home owns the default so that
+    # there is one answer to "which home is copied" rather than two that agree.
+    home = make_home(workdir, seed=seed)
     ports = write_listener_config(workdir, crawler_port)
     log = (workdir / "burp.log").open("wb")
     cmd = [
