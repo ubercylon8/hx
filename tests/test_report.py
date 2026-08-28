@@ -527,6 +527,12 @@ def test_a_run_stamped_with_no_scope_version_is_called_out(report_env):
                   effective_from_us=1)
     out = report.render(**report_env)
     assert "1 run(s) carry no `scope_version_id`" in out
+    # And it must say WHICH absence a `Runs` count of 0 is. `run.open_run`
+    # never writes `scope_version_id` -- no code path in this repository
+    # does -- so 0 is what every store this build produces will show, beside
+    # a paragraph two above saying how many runs were recorded. Left
+    # unexplained that reads as a contradiction in a client document.
+    assert "Nothing in this build writes that link" in out
 
 
 def test_the_report_dates_the_engagement_and_its_run_window(report_env):

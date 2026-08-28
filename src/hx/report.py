@@ -418,9 +418,22 @@ def _scope_of_record(conn, engagement_id, config) -> list[str]:
             "SELECT COUNT(*) FROM run WHERE engagement_id=?"
             " AND scope_version_id IS NULL", (engagement_id,)).fetchone()[0]
         if unstamped:
+            # Measured, not hypothetical: `run.open_run` writes `id`,
+            # `engagement_id`, `kind`, `safety_profile`, `started_us`,
+            # `status`, `heartbeat_us`, `requests_issued` and
+            # `dropped_total`, and no code path in this repository ever sets
+            # `run.scope_version_id`. So the `Runs` column reads 0 on every
+            # store this build produces, and a client seeing 0 beside "2
+            # run(s) recorded" two paragraphs above would read a
+            # contradiction. It is the absence of a LINK, not of runs, and
+            # the report has to say which -- the same reason the
+            # authorization section states its own absence rather than being
+            # omitted.
             out.append(f"{unstamped} run(s) carry no `scope_version_id`, so "
                        "which of the rows above was in force for them cannot "
-                       "be read off this store.\n")
+                       "be read off this store. Nothing in this build writes "
+                       "that link, so a `Runs` count of 0 above is a missing "
+                       "record and not an absence of runs.\n")
 
     if versions and digest == versions[-1][0]:
         out.append("The patterns below are the newest version in that table, "
