@@ -13,6 +13,7 @@ unconfigured extension refuses everything.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shutil
@@ -333,3 +334,130 @@ def wait_for(predicate, timeout: float = 90.0, interval: float = 0.5) -> bool:
             return True
         time.sleep(interval)
     return False
+
+
+# --- F1: loopback_only, checked ------------------------------------------
+
+def _listening_sockets(pid: int) -> list[str]:
+    """Every local `address:port` this pid holds a LISTENING socket on.
+
+    `ss -ltnpH`: -l listening, -t tcp, -n numeric (a resolved `localhost`
+    would defeat the address parsing below), -p with the owning process, -H
+    without the header row. The process column reads
+    `users:(("java",pid=123,fd=8))`, so the pid is matched with its trailing
+    comma -- a bare `pid=123` also matches pid 1234.
+    """
+    out = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True,
+                         check=True).stdout
+    return [line.split()[3] for line in out.splitlines()
+            if f"pid={pid}," in line]
+
+
+def _is_loopback(local: str) -> bool:
+    """Is this `ss` local-address field on 127.0.0.0/8 or ::1?
+
+    The forms that actually turn up here, all measured on this machine:
+    `127.0.0.1:8080`, `[::1]:631`, `[::ffff:127.0.0.1]:40421` (what Burp's own
+    listeners look like), `0.0.0.0:8443`, `*:8444` and `127.0.0.53%lo:53`.
+
+    Anything unparseable -- `*` above all -- is NOT loopback. That direction
+    matters: `*` is the wildcard bind this whole check exists to catch, and a
+    parser that fell through to True for what it did not understand would
+    report an open relay as safe.
+    """
+    host = local.rsplit(":", 1)[0].strip("[]").split("%")[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    # Both halves, and the second is not redundant belt-and-braces. Whether
+    # IPv6Address.is_loopback answers True for an IPv4-MAPPED address is a
+    # property of the interpreter: the 3.12.13 running this suite says True
+    # (measured), and CPython has not always. `::ffff:127.0.0.1` is the form
+    # EVERY Burp listener takes here, so an interpreter that answered False
+    # would fail every honest run. The explicit test costs nothing and does
+    # not depend on which CPython this is.
+    return bool(addr.is_loopback or (mapped is not None and mapped.is_loopback))
+
+
+def not_loopback_only(pid: int, ports: list[int]) -> str | None:
+    """Why this Burp is not listening on loopback alone -- or None when it is.
+
+    `listen_mode: loopback_only` is written into every listener launch_probe
+    configures, three places in this tree call it non-optional, and until this
+    function existed NOTHING checked it. Changing that one string to
+    `all_interfaces` left `test_proxy_facts.py` reporting `3 passed in 38.03s`
+    while `ss` showed the two configured listeners bound to `*:34777` and
+    `*:38399` -- a forward proxy open to whatever network this laptop is
+    attached to, for the 38 s those three tests take. Reproduced here.
+
+    Two claims, because either one alone passes while the other is false:
+
+      - every port the config named is LISTENING for this pid, so the check
+        cannot pass vacuously against a Burp that bound nothing at all;
+      - every socket this pid listens on is on a loopback address, INCLUDING
+        the ones the config did not ask for. Burp opens a third listener of
+        its own on an ephemeral loopback port every run -- measured: it
+        answers `HTTP/1.1 204 No Content` to an absolute-URI GET, `200
+        Connection established` to a CONNECT and `204` again inside the
+        tunnel, forwards nothing to the target, and never reaches the
+        extension's handler. Harmless, and it must not fail this check; but a
+        check written only against the configured ports would also miss a
+        future listener that is not harmless.
+    """
+    try:
+        sockets = _listening_sockets(pid)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # NOT a pass. A guard that evaporates when its tool is missing is the
+        # defect this function was written to fix, one level down.
+        return (f"the listening sockets of burp pid {pid} could not be read, so "
+                f"`listen_mode: loopback_only` is unverified: {exc}")
+    if not sockets:
+        return (f"`ss -ltnpH` attributes no listening socket to burp pid {pid}, "
+                "so nothing here can say whether its proxy is on loopback. Burp "
+                "is running and its extension has loaded -- `PROBE READY` is on "
+                "disk -- so read this as a broken check before reading it as a "
+                "Burp that bound nothing.")
+    unbound = [port for port in ports
+               if not any(sock.endswith(f":{port}") for sock in sockets)]
+    if unbound:
+        return (f"burp pid {pid} was configured to listen on {unbound} and is "
+                f"not: it holds {sockets}. A check for `loopback_only` against "
+                "a port nothing bound would pass without measuring anything.")
+    off = [sock for sock in sockets if not _is_loopback(sock)]
+    if off:
+        return (f"burp pid {pid} is listening on {off}, which is not loopback. "
+                "A proxy listener on a wildcard or routable address is an open "
+                "forward relay on whatever network this machine is attached to, "
+                "for as long as the run lasts. Check `listen_mode` in "
+                f"{PROXY_CONFIG}: it must be loopback_only.")
+    return None
+
+
+def listener_ports(workdir: Path) -> list[int]:
+    """The ports this run's Burp was TOLD to listen on, read back from its config.
+
+    Discovered rather than hard-coded, and from the file Burp itself was handed
+    rather than from a variable this module kept -- so the number a test dials
+    is the number Burp was asked for, with nothing in between that could drift.
+    """
+    cfg = json.loads((workdir / PROXY_CONFIG).read_text())
+    return [listener["listener_port"]
+            for listener in cfg["proxy"]["request_listeners"]]
+
+
+def proxy_port(workdir: Path) -> int:
+    """Burp's first proxy listener for this run.
+
+    NOT 8080. Burp Community does default to 8080, but a default is where a
+    listener goes when nobody says otherwise, and this fixture says otherwise
+    precisely because 8080 on a developer's machine is whatever else claimed it
+    first -- here, the local LLM router. See _free_port().
+    """
+    return listener_ports(workdir)[0]
+
+
+def second_proxy_port(workdir: Path) -> int:
+    """Burp's second proxy listener -- the other side of Q1's question."""
+    return listener_ports(workdir)[1]
