@@ -23892,12 +23892,41 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
                    dedupe_key: str, run_id: str, surface_id: str | None = None,
                    host: str | None = None,
                    check_id: str | None = None) -> str:
-    """Insert the finding, or move `last_seen_run` if it is already known.
+    """Insert the finding, or refresh it if it is already known.
 
     WHAT AN UPSERT MUST NOT TOUCH: `status`, and `first_seen_run`. An operator
     who marked something `false_positive` has made a judgement the next scan
     has no standing to reverse, and the run something was FIRST seen in is a
     historical fact. The DO UPDATE clause names exactly what moves.
+
+    WHAT IT MUST TOUCH IS EVERYTHING THAT IS CURRENT STATE, and until F12 of
+    fix round B that was half true: `severity` and `confidence` moved and
+    `title`, `description`, `impact`, `remediation` and `cwe` did not, so a
+    re-scan updated how bad a finding was and never what it SAID.
+
+    The rule that settles which is which: the finding's IDENTITY is whatever
+    `dedupe_key` spells, and everything else on the row is the latest
+    answer about it. For `hx.checks.passive.cookie_flags` after D1 of the
+    fix-round-A re-review, identity is THE COOKIE and the set of missing
+    flags is deliberately not in it. MEASURED after fix round A2, one cookie
+    over two runs (run 1 missing HttpOnly, SameSite and Secure; run 2 with
+    SameSite and Secure set): correctly ONE finding with two observations --
+    still wearing run 1's title, `Cookie session set without HttpOnly,
+    SameSite, Secure`, after the client had fixed two of the three. The
+    client is told they still have a problem they have fixed, on a finding
+    the retest machinery is otherwise handling correctly.
+
+    `cwe` MOVES WITH THE REST, and it is the one worth arguing. It looks
+    like a property of the issue type -- which IS identity, since
+    `issue_type_id` is the 2nd part of the key -- but it is not written from
+    the issue type: `cookie_flags` computes it as `"CWE-1004" if "HttpOnly"
+    in missing else "CWE-614"`, off the same current state that decides
+    `severity`. Leaving it behind pairs a refreshed severity with a stale
+    classification on one row, which is the chimera F1 of the whole-branch
+    review was about, one column over. The columns that stay put are the
+    ones the key is built FROM (`issue_type_id`, `insertion_name`,
+    `insertion_kind`, `scope_level`), the ones a human owns (`status`), and
+    the ones that are history (`first_seen_run`).
 
     `surface_id`, `host` AND `check_id` ARE KEYWORD-ONLY AND DEFAULT TO
     `None` -- BACKWARD COMPATIBLE with every call site that predates Task 6,
@@ -23974,6 +24003,11 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
         " VALUES(?,?,?,?,?,?,?,?,?,?,?, 'check', 'new', ?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(engagement_id, dedupe_key) DO UPDATE SET"
         "   last_seen_run=excluded.last_seen_run,"
+        "   title=excluded.title,"
+        "   description=excluded.description,"
+        "   impact=excluded.impact,"
+        "   remediation=excluded.remediation,"
+        "   cwe=excluded.cwe,"
         "   severity=excluded.severity,"
         "   confidence=excluded.confidence,"
         "   surface_id=excluded.surface_id,"
