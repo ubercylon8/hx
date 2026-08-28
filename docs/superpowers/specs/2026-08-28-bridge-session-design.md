@@ -14,8 +14,12 @@ and the DENY-ALL default, §5 tables, §6 bridge with correlation ids and `confi
   launch Burp, serve the bridge, or configure anything.
 - `configure()` exists at `bridge/server.py:650` with no caller in `src/`. Its only callers
   are `scripts/demo_capture.py:226` and the integration tests.
-- `build_config_body`, which assembles the authorisation, lives in
-  `tests/integration/conftest.py` — the test rig.
+- The rig assembles the authorisation **inline in `Rig.configure`** — there was no
+  named function to point at. (An earlier draft of this spec claimed a
+  `build_config_body` in `tests/integration/conftest.py`; that was wrong. The only
+  `build_config_body` in the tree was `hx.bridge.codec`'s wire encoder, which a
+  conftest docstring mentions and which does something else entirely. Corrected
+  2026-08-28 after Task 8's implementer checked it.)
 - `launch_burp`, `wait_for`, `proxy_port`, `second_proxy_port`, `not_loopback_only` and
   `_jar_problem` live in `tests/integration/burp_fixture.py`, and the demo script imports
   them **from the test tree**.
