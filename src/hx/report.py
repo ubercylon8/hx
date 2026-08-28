@@ -99,6 +99,48 @@ def _cell(value) -> str:
            .replace("\r\n", " ").replace("\n", " ").replace("\r", " "))
 
 
+def _by_class() -> tuple[tuple, tuple]:
+    """This build's checks, split into `(passive, active)`.
+
+    F5 (fix round B). `_limits` and `_insertion_coverage` hardcoded three
+    sentences -- "None were probed", "this build ships no active checks",
+    "Every check in this build is passive" -- in a module that ALREADY
+    derives its unshipped-class note from `registry.CHECKS` two functions
+    away. The first entry of Plan 6's active corpus makes all three false in
+    a client deliverable, with no test to redden: the Limits section would
+    tell a client no request carrying a payload was ever issued while
+    `check_run.requests_sent` said otherwise, and the passive-retest
+    disclosure added in fix round 2 -- true only while every shipped check is
+    passive -- would decay in the same silence.
+
+    READ AT CALL TIME, not captured at import, for the same reason the
+    unshipped-class note reads `registry.CHECKS` at call time: the corpus is
+    the authority for these sentences, and a module-level snapshot taken at
+    import is a second one that can disagree with it.
+
+    `klass != "passive"` rather than a list of the four active class names.
+    `registry.KNOWN_CLASSES` is S10's five and `registry.validate` refuses
+    anything outside it at import, so a check that is not passive is active
+    by construction -- INCLUDING a class S10 has not named yet, which a
+    hardcoded list of names would silently file as passive and re-open this
+    exact defect.
+    """
+    checks = tuple(registry.CHECKS)
+    return (tuple(c for c in checks if c.klass == "passive"),
+            tuple(c for c in checks if c.klass != "passive"))
+
+
+def _names(checks) -> str:
+    """A comma-separated list of check ids, for a sentence that names them.
+
+    `check_id` is a controlled vocabulary fixed by the registry (`validate`
+    refuses a duplicate, and every id in this build is a literal in a check
+    class), so it needs neither `_redact` nor `_cell` -- the same reason the
+    coverage table's `check_id` column does not get them.
+    """
+    return ", ".join(f"`{c.id}`" for c in checks)
+
+
 def render(conn, *, engagement_id, config, blobs=None) -> str:
     out: list[str] = []
     eng = conn.execute(
@@ -389,9 +431,25 @@ def _insertion_coverage(conn, engagement_id, blobs) -> list[str]:
             counted[point.kind] = counted.get(point.kind, 0) + 1
     if not counted:
         return []
+    _passive, active = _by_class()
+    if active:
+        # F5: the moment Plan 6 registers its first active check, "None were
+        # probed" is a sentence this module cannot support. It does not
+        # become "all were probed" either -- `check_run.insertion_name`
+        # exists but this build's coverage query does not read it, and
+        # `requests_sent` is deferred -- so the honest replacement says what
+        # is known (active checks ship) and what is not (which points they
+        # reached), rather than either claim.
+        probed = (f"**{len(active)} active check(s) ship in this build** "
+                  f"({_names(active)}), so a point below may have been "
+                  "probed. This build records no per-insertion probe "
+                  "attribution, so this table cannot say which were and "
+                  "which were not.")
+    else:
+        probed = "**None were probed** — this build ships no active checks."
     out = ["### Insertion points\n",
            "Places a payload could go, derived from the traffic captured. "
-           "**None were probed** — this build ships no active checks.\n",
+           f"{probed}\n",
            "| Kind | Found |", "|---|---|"]
     for kind, n in sorted(counted.items()):
         out.append(f"| `{_cell(kind)}` | {n} |")
@@ -420,23 +478,62 @@ def _limits(conn, engagement_id) -> list[str]:
     # engagement this CLI can build, staging included. The bullet is
     # therefore unconditional, like its two neighbours above -- a build
     # fact, not a per-run one.
-    out.append("- **Request-body parameters were recorded but not "
-               "probed.** This build ships no active checks, so no request "
-               "carrying a payload was ever issued. Even a future active "
-               "check would be limited the same way regardless of a run's "
-               "safety profile: this side of the config has no "
-               "`method.allow` key, so the extension's default method "
-               "allowlist (GET, HEAD, OPTIONS) applies unconditionally.")
-    out.append("- **A fixed issue cannot be shown as fixed by re-browsing.** "
-               "Every check in this build is passive: it reads this "
-               "engagement's whole captured history for a surface, not only "
-               "the newest traffic. One recorded response is therefore enough "
-               "to keep a finding live for the life of the engagement, "
-               "however much clean traffic follows it. Re-running a scan "
-               "after a fix will still report the finding. A retest must be "
-               "run as a NEW engagement against the fixed application; this "
-               "one is a record of what was served during the assessment "
-               "window.")
+    # F5 (fix round B): the two bullets below used to hardcode "this build
+    # ships no active checks" and "Every check in this build is passive".
+    # Both were true of this build and neither was derived from it, so Plan
+    # 6's first active check makes a client deliverable say something false
+    # with nothing to redden. The method-allowlist half of the first bullet
+    # is NOT conditional on the corpus and does not move: `Policy.java`'s
+    # GET/HEAD/OPTIONS default applies whenever `method.allow` is absent from
+    # the config body, and Python's `Config` has no such field, so no check
+    # this build can register -- active or not -- can put a payload in a
+    # request BODY. What an active check does change is "no request carrying
+    # a payload was ever issued", which is about payloads anywhere.
+    passive, active = _by_class()
+    if active:
+        out.append("- **Request-body parameters were recorded but not "
+                   f"probed.** This build ships {len(active)} active "
+                   f"check(s) ({_names(active)}), and none of them can reach "
+                   "a request body: this side of the config has no "
+                   "`method.allow` key, so the extension's default method "
+                   "allowlist (GET, HEAD, OPTIONS) applies unconditionally, "
+                   "whatever safety profile a run named.")
+    else:
+        out.append("- **Request-body parameters were recorded but not "
+                   "probed.** This build ships no active checks, so no "
+                   "request carrying a payload was ever issued. Even a "
+                   "future active check would be limited the same way "
+                   "regardless of a run's safety profile: this side of the "
+                   "config has no `method.allow` key, so the extension's "
+                   "default method allowlist (GET, HEAD, OPTIONS) applies "
+                   "unconditionally.")
+    if passive and not active:
+        out.append("- **A fixed issue cannot be shown as fixed by "
+                   "re-browsing.** "
+                   "Every check in this build is passive: it reads this "
+                   "engagement's whole captured history for a surface, not "
+                   "only the newest traffic. One recorded response is "
+                   "therefore enough to keep a finding live for the life of "
+                   "the engagement, however much clean traffic follows it. "
+                   "Re-running a scan after a fix will still report the "
+                   "finding. A retest must be run as a NEW engagement "
+                   "against the fixed application; this one is a record of "
+                   "what was served during the assessment window.")
+    elif passive:
+        # A mixed corpus: the disclosure still holds for every finding a
+        # PASSIVE check raised, and is false of the rest. Naming which
+        # checks it covers is what keeps it a disclosure rather than a
+        # blanket that has quietly stopped being true.
+        out.append("- **A fixed issue may not be shown as fixed by "
+                   "re-browsing.** The passive checks in this build "
+                   f"({_names(passive)}) read this engagement's whole "
+                   "captured history for a surface, not only the newest "
+                   "traffic, so one recorded response keeps a finding of "
+                   "theirs live for the life of the engagement however much "
+                   "clean traffic follows it; a retest of one must be run as "
+                   "a NEW engagement against the fixed application. The "
+                   f"active checks ({_names(active)}) re-issue requests and "
+                   "are not limited this way.")
 
     dropped = conn.execute(
         "SELECT COALESCE(SUM(dropped_total), 0) FROM run WHERE engagement_id=?",

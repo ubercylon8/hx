@@ -528,6 +528,66 @@ def test_an_engagement_with_no_check_runs_says_it_was_never_scanned(report_env):
     assert "not been scanned" in coverage_section.lower()
 
 
+# --- F5: the no-active-checks prose is derived from the corpus, not typed ---
+
+class _FakeActiveCheck:
+    """An `active_safe` entry shaped exactly like a registry entry.
+
+    Only `id` and `klass` are read by `report`; `version` and
+    `insertion_kinds` are here so this is a check by the same description
+    `registry.validate` uses, not a stub that happens to satisfy one caller.
+    It is NOT put through `registry.validate` (it implements no hook), which
+    is deliberate: the point is to make the REPORT face a corpus containing
+    an active check, and a check that cannot run would still be a check the
+    Limits section must not deny the existence of.
+    """
+    id = "hx.active_safe.reflected-input"
+    version = "1"
+    klass = "active_safe"
+    insertion_kinds = frozenset({"query"})
+
+
+def test_the_shipped_corpus_is_all_passive_and_the_prose_says_so(
+        report_env_with_blobs):
+    """The separating case, and the reason F5 survived nine reviews: every
+    one of these sentences is TRUE of the build as it stands. What was wrong
+    is that none of them was derived from it."""
+    out = report.render(**report_env_with_blobs)
+    assert "**None were probed** — this build ships no active checks." in out
+    assert "no request carrying a payload was ever issued" in out
+    assert "Every check in this build is passive" in out
+
+
+def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
+        report_env_with_blobs, monkeypatch):
+    """THE ACTUAL DELIVERABLE OF F5. Plan 6's first active check is what
+    makes the three hardcoded sentences false, and before this test nothing
+    reddened when it did -- a client would be told no payload was ever
+    issued while `check_run.requests_sent` said otherwise, and the
+    passive-retest disclosure (true only while every shipped check is
+    passive) would decay in the same silence.
+
+    `registry.CHECKS` is patched rather than a real check being registered,
+    because registering one is Plan 6's job and this test must fail TODAY if
+    the prose stops being derived. All three sentences are asserted absent
+    and their replacements asserted present: a fix that deleted the
+    sentences instead of deriving them would pass the absence half alone."""
+    monkeypatch.setattr(report.registry, "CHECKS",
+                        tuple(report.registry.CHECKS) + (_FakeActiveCheck(),))
+    out = report.render(**report_env_with_blobs)
+
+    assert "this build ships no active checks" not in out
+    assert "no request carrying a payload was ever issued" not in out
+    assert "Every check in this build is passive" not in out
+
+    # And it must say what IS true instead, naming the check by id in each
+    # of the three places -- Insertion points, and both Limits bullets.
+    assert out.count("`hx.active_safe.reflected-input`") == 3
+    assert "active check(s) ship in this build" in out
+    assert "none of them can reach a request body" in out
+    assert "are not limited this way" in out
+
+
 # --- F1: redaction reaches every field that can carry a URL -----------------
 
 def test_a_credential_in_the_client_or_engagement_name_is_redacted(report_env):
