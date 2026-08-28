@@ -32,6 +32,18 @@ from hx.store import records
 
 @dataclass
 class ScanSummary:
+    """What a scan did, in the words `hx scan` prints at the operator.
+
+    `findings` IS DISTINCT FINDINGS, NOT CANDIDATES WRITTEN -- D3 of the
+    fix-round-A re-review (MEDIUM). It counted one per candidate upserted,
+    which agreed with the store only while every finding was surface-scoped.
+    F3 of the whole-branch review made a host-scoped candidate collapse onto
+    ONE row however many surfaces of that host produced it, and the counter
+    did not: MEASURED, 40 surfaces of one host with one flagless cookie, the
+    CLI printed `findings  40` while the store and the report held 1 -- the
+    exact forty tickets F3 removed, reappearing at the terminal. A number an
+    operator reads must be the number the report will show.
+    """
     surfaces: int = 0
     checks_run: int = 0
     findings: int = 0
@@ -157,8 +169,19 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                         for candidate in verdict.candidates:
                             fid = _write_finding(conn, engagement_id, run_id,
                                                  surface, check, candidate)
+                            # BEFORE the `add`, and that ordering is the fix:
+                            # `upsert_finding` returns the id of the row the
+                            # candidate landed on, which for a host-scoped
+                            # finding is the SAME row every surface of that
+                            # host resolves to. `seen_findings` is already the
+                            # set of distinct findings this run (it is what
+                            # `_mark_unobserved` reads), so membership in it
+                            # is exactly "this candidate re-found something
+                            # already counted". D3 of the fix-round-A
+                            # re-review.
+                            if fid not in seen_findings:
+                                summary.findings += 1
                             seen_findings.add(fid)
-                            summary.findings += 1
                 except Exception as exc:                    # noqa: BLE001
                     _close_row(conn, row_id, "error",
                                f"{type(exc).__name__}: {exc}")

@@ -812,6 +812,57 @@ def test_scan_reports_what_it_ran(engagement_with_surface):
     assert "surfaces" in result.output.lower()
 
 
+_FLAGLESS_COOKIE_RESPONSE = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Set-Cookie: session=abc; Path=/\r\n"
+    b"\r\n"
+)
+
+
+def test_scan_prints_the_number_of_findings_the_store_holds(engagement):
+    """D3 of the fix-round-A re-review. Forty surfaces of ONE host, all
+    setting one flagless cookie: `cookie_flags` is `scope_level='host'`, so
+    F3 of the whole-branch review makes the forty candidates land on ONE
+    finding row, and the line an operator reads has to say so.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against the
+    per-candidate counter: `findings  40` printed while `SELECT COUNT(*)
+    FROM finding` was 1 -- the exact forty tickets F3 exists to prevent,
+    removed from the report and left at the terminal. Forty rather than two
+    because a number that is wrong by one is a number someone argues about.
+    """
+    eng = eng_mod.open_(engagement)
+    try:
+        digest, length = eng.blobs.put(_FLAGLESS_COOKIE_RESPONSE)
+        for n in range(40):
+            eng.db.execute(
+                "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+                " port, path_template, discovered_by, normaliser_version)"
+                " VALUES(?, ?, 'GET', 'https', 'app.acme.com', 443, ?,"
+                " 'proxy', 1)",
+                (f"s{n}", eng.id, f"/p{n}"))
+            records_mod.record_exchange(
+                eng.db, run_id=None, method="GET",
+                url=f"https://app.acme.com/p{n}", status=200,
+                req_blob=None, resp_blob=digest, resp_len=length, ms=0,
+                at_us=eng_mod.now_us(), outcome="ok", surface_id=f"s{n}")
+    finally:
+        eng.db.close()
+
+    result = CliRunner().invoke(cli.main, ["scan", "--root", str(engagement)])
+
+    assert result.exit_code == 0, result.output
+    assert "findings  1" in result.output, result.output
+    eng = eng_mod.open_(engagement)
+    try:
+        held = eng.db.execute("SELECT COUNT(*) FROM finding").fetchone()[0]
+    finally:
+        eng.db.close()
+    assert held == 1, (
+        "the line the operator reads and the rows the report renders "
+        "disagreed")
+
+
 def test_scan_names_a_class_that_is_enabled_but_ships_no_checks(engagement_with_surface):
     """config.DEFAULT_CHECKS turns `active_timing` ON by default and this
     plan ships no checks in it. An operator reading `active_timing: enabled`
