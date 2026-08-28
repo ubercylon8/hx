@@ -46,10 +46,35 @@ def test_the_launch_command_carries_every_required_property(monkeypatch, tmp_pat
 
 def test_the_crawler_port_is_the_one_burp_was_actually_given(monkeypatch, tmp_path):
     # Read back out of the config file, never from the argument, which may be
-    # the 0 that means "choose one for me".
-    monkeypatch.setattr(session.subprocess, "Popen", lambda cmd, **kw: _FakeProc())
-    ports = session.write_listener_config(tmp_path / "w", 0)
-    assert ports[1] != 0
+    # the 0 that means "choose one for me". A launch that instead interpolates
+    # the raw crawler_port argument still passes every other assertion here,
+    # so this pins the exact substring rather than "-Dhx.crawler_port=" alone.
+    seen = {}
+
+    def fake_popen(cmd, **kw):
+        seen["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(session.subprocess, "Popen", fake_popen)
+
+    # A distinctive non-zero port: the command must carry exactly this value,
+    # not a substring match that "-Dhx.crawler_port=0" would also satisfy.
+    session.launch_burp(tmp_path / "hx.sock", "e-1", tmp_path / "w",
+                        sentinel=tmp_path / "HALTED", jar=tmp_path / "b.jar",
+                        instance="capture", crawler_port=54321)
+    joined = " ".join(seen["cmd"])
+    assert "-Dhx.crawler_port=54321" in joined
+
+    # crawler_port=0 means "choose one for me" -- the command must carry
+    # whatever write_listener_config actually bound, never the literal 0.
+    session.launch_burp(tmp_path / "hx.sock", "e-1", tmp_path / "w2",
+                        sentinel=tmp_path / "HALTED", jar=tmp_path / "b.jar",
+                        instance="capture", crawler_port=0)
+    joined = " ".join(seen["cmd"])
+    assert "-Dhx.crawler_port=0" not in joined, (
+        "0 means choose one for me -- the raw argument must never reach the "
+        "command line, or Source.forListenerPort answers OPERATOR for every "
+        "request however many listeners are running")
 
 
 def test_output_goes_to_a_file_not_a_pipe(monkeypatch, tmp_path):
