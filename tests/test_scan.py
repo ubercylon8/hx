@@ -791,6 +791,96 @@ def test_a_host_scoped_issue_on_two_hosts_still_files_two(scan_env):
     assert hosts == ["app.test", "other.test"], hosts
 
 
+# --- Fix-round-A re-review D1 (MEDIUM): the SET OF MISSING FLAGS was part of
+# `cookie_flags`' `issue_type_id`, and therefore of the dedupe key. A flag set
+# is instance state that changes as the client remediates, so identity moved
+# under the finding and the old row was stranded.
+
+
+_COOKIE_MISSING_ONLY_HTTPONLY = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Set-Cookie: session=abc; Path=/; SameSite=Lax; Secure\r\n"
+    b"\r\n"
+)
+
+
+def test_a_partly_remediated_cookie_stays_one_finding(scan_env):
+    """D1. One cookie, two runs, a partial fix in between: ONE finding, and
+    it carries an observation from BOTH runs.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against the tree with
+    the flag set in the issue type, on exactly this input: TWO findings,
+    keyed `...|cookie-session-missing-httponly-samesite-secure|...` and
+    `...|cookie-session-missing-httponly|...`, and `finding_observation`
+    held one row for each -- the run-1 row got NOTHING for run 2, because
+    the check returned `finding` rather than `clean` and
+    `_mark_unobserved` only ever considers a clean verdict. `observed=0` is
+    the datum `report._latest_observed` renders as "appears fixed", so a
+    stranded row with no run-2 observation at all renders as LIVE: the
+    client is told the cookie still lacks SameSite and Secure after setting
+    both.
+
+    The `COUNT(o.run_id)` per finding is the assertion that says it: one
+    finding, observed twice, is "the store tracked one thing across two
+    runs". Two findings observed once each is the stranding.
+
+    NOT asserted, and a residual this round does not own:
+    `upsert_finding`'s `DO UPDATE SET` moves `severity` and `confidence`
+    but not `title`, `description` or `cwe`, so the surviving row keeps run
+    1's prose ("set without HttpOnly, SameSite, Secure") while its severity
+    tracks. That is one stale sentence on a live finding, against a whole
+    phantom finding before this fix, and closing it means refreshing prose
+    on upsert -- a change to every check's rows, not this one's.
+    """
+    conn = scan_env["conn"]
+    conn.execute("UPDATE exchange SET resp_blob='d1' WHERE id='x-1'")
+    scan.run(**dict(scan_env, blobs=_Blobs(d1=_FLAGLESS_COOKIE)),
+             checks=(cookie_flags.CookieFlags(),))
+    first = conn.execute("SELECT id, dedupe_key FROM finding").fetchall()
+    assert len(first) == 1, first
+
+    conn.execute("UPDATE exchange SET resp_blob='d2' WHERE id='x-1'")
+    scan.run(**dict(scan_env, blobs=_Blobs(d2=_COOKIE_MISSING_ONLY_HTTPONLY)),
+             checks=(cookie_flags.CookieFlags(),))
+
+    assert conn.execute(
+        "SELECT id, dedupe_key FROM finding").fetchall() == first, (
+        "the cookie's identity moved when two of its three flags were set")
+    assert conn.execute(
+        "SELECT f.id, COUNT(o.run_id) FROM finding f"
+        " LEFT JOIN finding_observation o ON o.finding_id = f.id"
+        " GROUP BY f.id").fetchall() == [(first[0][0], 2)], (
+        "a finding row was left with no observation from the second run, so "
+        "`report._latest_observed` still reads the first run's `True` and "
+        "renders it live")
+
+
+def test_two_flag_sets_of_one_cookie_share_one_dedupe_key(scan_env):
+    """The mechanism under the test above, asserted on the column the UNIQUE
+    constraint is built from: what a cookie is MISSING may not appear in its
+    key. Two surfaces of one host, one with `Secure` already set, is the
+    same defect without the second run -- one cookie, one remediation, and
+    before this fix two host-scoped tickets."""
+    conn = scan_env["conn"]
+    conn.execute("UPDATE exchange SET resp_blob='d1' WHERE id='x-1'")
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, discovered_by, normaliser_version)"
+        " VALUES('s-2','e-1','GET','https','app.test',443,'/login','proxy',1)")
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url, resp_blob) VALUES('x-2', NULL, 's-2', 'proxy', 'ok',"
+        " 1, 'GET', 'https://app.test/login', 'd2')")
+    env = dict(scan_env, blobs=_Blobs(d1=_FLAGLESS_COOKIE,
+                                      d2=_COOKIE_MISSING_ONLY_HTTPONLY))
+
+    scan.run(**env, checks=(cookie_flags.CookieFlags(),))
+
+    keys = [r[0] for r in conn.execute("SELECT dedupe_key FROM finding")]
+    assert len(keys) == 1, keys
+    assert "missing" not in keys[0], keys[0]
+
+
 # --- Whole-branch review F6 (MEDIUM): `_exchanges_for` did not carry the
 # exchange's `outcome`, so a check could not tell a response that came back
 # whole from one that never did.
