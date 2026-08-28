@@ -5,6 +5,13 @@ somewhere a payload goes, it is something the response did. `insertion` is
 None and `scope_level` is `host`, because a cookie is set for a host and
 fixing it fixes every surface under it -- filing one finding per surface would
 hand the client the same remediation forty times.
+
+THAT SENTENCE WAS A CLAIM ABOUT A FIELD NOTHING READ until F3 of the
+whole-branch review. `scope_level` was written to the row and never consulted
+when the identity was built, so this check filed exactly the forty tickets it
+says here that it does not: MEASURED, one flagless cookie on three surfaces
+of one host gave three findings whose keys differed only in `path_template`.
+`records.dedupe_key` is where the field is now honoured.
 """
 from __future__ import annotations
 

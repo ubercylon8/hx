@@ -28,7 +28,8 @@ def key(**over):
     args = dict(type_="hx.passive.xss", issue_type_id="reflected-xss",
                 scheme="https", host="app.test", port=443,
                 method="GET", path_template="/api/orders/{id}",
-                insertion_kind="query", insertion_name="q")
+                insertion_kind="query", insertion_name="q",
+                scope_level="surface")
     args.update(over)
     return records.dedupe_key(**args)
 
@@ -70,6 +71,67 @@ def test_method_is_part_of_identity():
 
 def test_insertion_kind_is_part_of_identity():
     assert key(insertion_kind="query") != key(insertion_kind="header")
+
+
+# --- Whole-branch review F3 (MEDIUM): `scope_level` was stored on the row
+# and never consulted here, so a host-scoped finding filed once per surface.
+
+
+def test_every_scope_level_has_a_key_rule():
+    """`_SCOPE_BLANKS` and the vocabulary must not drift apart. A new
+    scope_level added to `base.SCOPE_LEVELS` without a decision here would
+    otherwise raise at the first finding that used it -- or, worse, quietly
+    take `surface`'s behaviour had this been written with a `.get` default."""
+    assert set(records._SCOPE_BLANKS) == set(base.SCOPE_LEVELS)
+
+
+def test_host_scope_drops_the_path_and_the_method_from_the_key():
+    """The finding IS the host. One flagless cookie on forty pages is one
+    remediation, and forty keys differing only in `path_template` is forty
+    tickets for it -- see `cookie_flags`' own docstring."""
+    a = key(scope_level="host", path_template="/a", method="GET")
+    b = key(scope_level="host", path_template="/b", method="POST")
+    assert a == b
+    assert "|-|-|" in a          # method and path_template, both blanked
+
+
+def test_host_scope_keeps_the_host_scheme_and_port():
+    """The separating case in the other direction: blanking the host too
+    would make two clients' hosts one finding."""
+    assert key(scope_level="host", host="a.test") != key(
+        scope_level="host", host="b.test")
+    assert key(scope_level="host", scheme="http") != key(
+        scope_level="host", scheme="https")
+    assert key(scope_level="host", port=443) != key(
+        scope_level="host", port=8443)
+
+
+def test_engagement_scope_drops_the_host_as_well():
+    """`engagement` is the widest scope S5 has. Nothing about WHERE the
+    finding was seen can be identity, or it is not engagement-wide."""
+    a = key(scope_level="engagement", host="a.test", path_template="/a")
+    b = key(scope_level="engagement", host="b.test", path_template="/b")
+    assert a == b
+
+
+def test_surface_and_insertion_scope_keep_every_part():
+    """An insertion point is NARROWER than a surface, not wider, so it drops
+    nothing a surface keeps -- and `surface` is S5's key exactly as written.
+    Anti-vacuity for the two tests above: if blanking were unconditional,
+    both of these would collapse too."""
+    for scope in ("surface", "insertion"):
+        assert key(scope_level=scope, path_template="/a") != key(
+            scope_level=scope, path_template="/b")
+        assert key(scope_level=scope, method="GET") != key(
+            scope_level=scope, method="POST")
+
+
+def test_an_unknown_scope_level_is_refused():
+    """`Candidate.__post_init__` already refuses one, but this function is
+    also called directly, and a scope it does not know must not silently
+    become a key with nothing blanked."""
+    with pytest.raises(ValueError, match="scope_level"):
+        key(scope_level="galaxy")
 
 
 def test_upsert_is_idempotent_across_runs(engagement_conn):

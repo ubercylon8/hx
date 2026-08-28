@@ -38,7 +38,9 @@ from hx.store.paths import secure_mkdir
 # without one.
 # 7 -> 8 (2026-08-27, whole-branch review fix round A): NO DDL CHANGE, and
 # the bump is deliberate anyway. `finding.dedupe_key`'s FORMAT changed --
-# `records.dedupe_key` gained `issue_type_id` as its 2nd part (F1, HIGH) --
+# `records.dedupe_key` gained `issue_type_id` as its 2nd part (F1, HIGH),
+# and blanks `method`/`path_template` for a host-scoped finding and the
+# whole location for an engagement-scoped one (F3, MEDIUM) --
 # so every key an older store holds is spelled in a format this code will
 # never produce again. Nothing would fail: the UNIQUE constraint is on the
 # string, so the first scan against such a store simply re-files every

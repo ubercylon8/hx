@@ -10,7 +10,7 @@ import pytest
 
 from hx import scan
 from hx.checks import base
-from hx.checks.passive import security_headers
+from hx.checks.passive import cookie_flags, security_headers
 
 
 class Boom:
@@ -693,3 +693,99 @@ def test_the_dedupe_key_of_two_issue_types_on_one_surface_differs(scan_env):
     assert len(set(keys)) == 3, keys
     assert all("missing-hsts" in k or "missing-frame-protection" in k
                or "missing-content-type-options" in k for k in keys), keys
+
+
+# --- Whole-branch review F3 (MEDIUM): `Candidate.scope_level` was stored and
+# then ignored. `path_template` was in the dedupe key unconditionally, so a
+# host-scoped finding filed once per surface.
+
+
+_FLAGLESS_COOKIE = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Set-Cookie: session=abc; Path=/\r\n"
+    b"\r\n"
+)
+
+
+def _three_surfaces_of_one_host(conn, blob="d1"):
+    """s-1 (already there) plus s-2 and s-3, same host, same response."""
+    conn.execute("UPDATE exchange SET resp_blob=? WHERE id='x-1'", (blob,))
+    for surface_id, exchange_id, path in (
+        ("s-2", "x-2", "/orders"), ("s-3", "x-3", "/profile"),
+    ):
+        conn.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+            " port, path_template, discovered_by, normaliser_version)"
+            " VALUES(?,'e-1','GET','https','app.test',443,?,'proxy',1)",
+            (surface_id, path))
+        conn.execute(
+            "INSERT INTO exchange(id, run_id, surface_id, via, outcome,"
+            " sent_us, method, url, resp_blob)"
+            " VALUES(?, NULL, ?, 'proxy', 'ok', 1, 'GET', ?, ?)",
+            (exchange_id, surface_id, f"https://app.test{path}", blob))
+
+
+def test_one_host_scoped_issue_on_three_surfaces_files_one_finding(scan_env):
+    """F3. `cookie_flags`' own docstring: a cookie "is set for a host and
+    fixing it fixes every surface under it -- filing one finding per surface
+    would hand the client the same remediation forty times".
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED before `scope_level`
+    reached the key: THREE finding rows, one per surface, with three keys
+    differing only in `path_template` (`/`, `/orders`, `/profile`) --
+    identical titles, identical severities, identical remediation.
+    """
+    conn = scan_env["conn"]
+    _three_surfaces_of_one_host(conn)
+    env = dict(scan_env, blobs=_Blobs(d1=_FLAGLESS_COOKIE))
+
+    scan.run(**env, checks=(cookie_flags.CookieFlags(),))
+
+    rows = conn.execute("SELECT dedupe_key, scope_level FROM finding").fetchall()
+    assert len(rows) == 1, rows
+    assert rows[0][1] == "host"
+    # The blanked parts are the literal `-` the key already uses for an
+    # absent part, not the surface's own values.
+    assert "|app.test|443|-|-|" in rows[0][0], rows[0][0]
+
+
+def test_a_surface_scoped_issue_on_three_surfaces_still_files_three(scan_env):
+    """The separating case. Without it, blanking `path_template` for EVERY
+    finding would satisfy the test above and collapse the whole corpus onto
+    one row per host."""
+    conn = scan_env["conn"]
+    _three_surfaces_of_one_host(conn)
+
+    class SurfaceScoped:
+        id, version, klass = "hx.test.surface-scoped", "1", "passive"
+        insertion_kinds = frozenset()
+        def on_surface(self, ctx, surface, exchanges):
+            return base.Verdict.finding(base.Candidate(
+                title="t", issue_type_id="t-issue", severity="Low",
+                confidence="Firm", insertion=None, scope_level="surface",
+                exchange_ids=(exchanges[0].id,)))
+
+    scan.run(**scan_env, checks=(SurfaceScoped(),))
+    assert conn.execute("SELECT COUNT(*) FROM finding").fetchone()[0] == 3
+
+
+def test_a_host_scoped_issue_on_two_hosts_still_files_two(scan_env):
+    """The other separating case: `host` scope blanks the PATH, never the
+    host. A single finding here would mean one client host's cookie problem
+    hid another's."""
+    conn = scan_env["conn"]
+    conn.execute("UPDATE exchange SET resp_blob='d1' WHERE id='x-1'")
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, discovered_by, normaliser_version)"
+        " VALUES('s-2','e-1','GET','https','other.test',443,'/','proxy',1)")
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url, resp_blob) VALUES('x-2', NULL, 's-2', 'proxy', 'ok',"
+        " 1, 'GET', 'https://other.test/', 'd1')")
+    env = dict(scan_env, blobs=_Blobs(d1=_FLAGLESS_COOKIE))
+
+    scan.run(**env, checks=(cookie_flags.CookieFlags(),))
+
+    hosts = sorted(r[0] for r in conn.execute("SELECT host FROM finding"))
+    assert hosts == ["app.test", "other.test"], hosts

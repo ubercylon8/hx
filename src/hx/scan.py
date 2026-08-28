@@ -230,7 +230,8 @@ def _write_finding(conn, engagement_id, run_id, surface, check, candidate) -> st
         scheme=scheme, host=host, port=port, method=method,
         path_template=path_template,
         insertion_kind=candidate.insertion.kind if candidate.insertion else None,
-        insertion_name=candidate.insertion.name if candidate.insertion else None)
+        insertion_name=candidate.insertion.name if candidate.insertion else None,
+        scope_level=candidate.scope_level)
     at = now_us()
     with db_mod.transaction(conn):
         fid = records.upsert_finding(conn, engagement_id=engagement_id,

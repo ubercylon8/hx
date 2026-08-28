@@ -91,7 +91,8 @@ def _finding(conn, *, run_id, title, severity, exchange_ids,
     key = records.dedupe_key(type_=title, issue_type_id=c.issue_type_id,
                              scheme="https", host="app.acme.test",
                              port=443, method="GET", path_template="/",
-                             insertion_kind=None, insertion_name=None)
+                             insertion_kind=None, insertion_name=None,
+                             scope_level=c.scope_level)
     fid = records.upsert_finding(conn, engagement_id="e-1", candidate=c,
                                  dedupe_key=key, run_id=run_id,
                                  check_id=check_id)
@@ -768,7 +769,8 @@ def test_findings_within_a_severity_are_ordered_deterministically():
             type_="hx.test.order", issue_type_id="ordering-fixture",
             scheme="https", host="app.acme.test",
             port=443, method="GET", path_template="/",
-            insertion_kind="query", insertion_name=tiebreak)
+            insertion_kind="query", insertion_name=tiebreak,
+            scope_level="surface")
         fid = records.upsert_finding(conn, engagement_id="e-1", candidate=c,
                                      dedupe_key=key, run_id="r-1")
         records.record_evidence(conn, finding_id=fid,

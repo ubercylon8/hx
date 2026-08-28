@@ -708,9 +708,41 @@ def abort_run(conn: sqlite3.Connection, *, run_id: str,
     return False
 
 
+# Which parts of the key a `scope_level` must NOT let distinguish two
+# findings, keyed by S5's own `finding.scope_level` vocabulary. Identity has
+# to be exactly as wide as the thing being reported: a cookie set for a host
+# is ONE remediation whatever page happened to draw it, and a key that still
+# carried the page filed it once per page.
+#
+# `-`, the same literal this function already uses for an absent part, and
+# deliberately not a second placeholder: "this part does not apply here" and
+# "this part is not present" are the same fact about the key, and two
+# spellings of it would be two identities for one finding.
+#
+# EVERY VALUE IN `base.SCOPE_LEVELS` HAS AN ENTRY, and
+# `test_every_scope_level_has_a_key_rule` pins that it stays true -- a new
+# scope level added to the vocabulary without a decision here would silently
+# take `surface`'s behaviour by way of a `.get(..., frozenset())`.
+_SCOPE_BLANKS: dict[str, frozenset[str]] = {
+    # The whole engagement: nothing about WHERE it was seen is identity.
+    "engagement": frozenset({"scheme", "host", "port", "method",
+                             "path_template"}),
+    # One host, every surface under it. Scheme, host and port stay: two
+    # hosts' cookies are two clients' problems and two tickets.
+    "host": frozenset({"method", "path_template"}),
+    # One surface: S5's key as written, nothing dropped.
+    "surface": frozenset(),
+    # Narrower than a surface, not wider. Every part of a surface's identity
+    # is still true of the insertion point inside it, and the two insertion
+    # parts are what make it narrower.
+    "insertion": frozenset(),
+}
+
+
 def dedupe_key(*, type_: str, issue_type_id: str, scheme: str, host: str,
                port: int | None, method: str, path_template: str,
-               insertion_kind: str | None, insertion_name: str | None) -> str:
+               insertion_kind: str | None, insertion_name: str | None,
+               scope_level: str) -> str:
     """`type|issue_type|scheme|host|port|method|path_template|insertion_kind|insertion_name`.
 
     NINE PARTS, NOT S5'S EIGHT. `issue_type_id` was added by F1 of the
@@ -748,10 +780,32 @@ def dedupe_key(*, type_: str, issue_type_id: str, scheme: str, host: str,
     `GET /api/order/{n}` leaking another tenant's data and `POST` on the same
     template accepting mass-assignment are different findings with different
     remediations.
+
+    ...EXCEPT WHERE `scope_level` SAYS THE FINDING IS WIDER THAN ONE SURFACE.
+    F3 of the whole-branch review (MEDIUM): `Candidate.scope_level` was
+    stored on the row and never consulted here, so `path_template` was in
+    the key unconditionally and a host-scoped finding filed once per surface.
+    MEASURED, one flagless cookie across three surfaces of one host: THREE
+    rows, keys differing only in `/`, `/orders`, `/profile`, with identical
+    titles, severities and remediation -- the "same remediation forty times"
+    that `hx.checks.passive.cookie_flags`' own docstring says host scope
+    exists to prevent. `_SCOPE_BLANKS` above is the rule, one entry per
+    value of the vocabulary rather than an `if host` and an implicit else.
     """
-    parts = (type_, issue_type_id, scheme, host, port, method, path_template,
-             insertion_kind, insertion_name)
-    return "|".join("-" if p is None or p == "" else str(p) for p in parts)
+    try:
+        blanks = _SCOPE_BLANKS[scope_level]
+    except KeyError:
+        raise ValueError(
+            f"unknown scope_level {scope_level!r}; the schema takes "
+            f"{sorted(_SCOPE_BLANKS)}") from None
+    parts = (("type_", type_), ("issue_type_id", issue_type_id),
+             ("scheme", scheme), ("host", host), ("port", port),
+             ("method", method), ("path_template", path_template),
+             ("insertion_kind", insertion_kind),
+             ("insertion_name", insertion_name))
+    return "|".join(
+        "-" if name in blanks or value is None or value == "" else str(value)
+        for name, value in parts)
 
 
 def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
