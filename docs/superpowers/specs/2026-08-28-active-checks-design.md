@@ -6,6 +6,15 @@
 **Builds on:** Plan 3 (enforcement and the send path), Plan 4 (traffic capture),
 Plan 5 (passive corpus and Markdown reporting), merged at `a28649d`.
 
+**Blocked on the bridge session, discovered 2026-08-28 while planning.** Nothing in
+`src/hx/` calls `bridge.configure()`. `hx capture start` writes a `run` row and nothing
+else; `scripts/demo_capture.py:226` and `tests/integration/conftest.py`'s
+`build_config_body` each stand up their own session because the product has none. The
+extension defaults to DENY-ALL, so an unconfigured one refuses everything — and an active
+check cannot send through a bridge that was never configured. **The session plan lands
+first; this design is implemented after it.** The `max_requests` wiring in §8 belongs to
+that plan, since it is the plan that first builds a configure body in the product.
+
 ## 1. Purpose
 
 Plan 5 shipped the passive corpus and a report that is honest about what it did not test.
