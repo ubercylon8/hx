@@ -13,6 +13,7 @@ ever writes.
 """
 import hashlib
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -32,14 +33,42 @@ from hx.store import records
 # `finding`, `finding_observation`, `evidence`, `check_run`, `surface`), and
 # no existing fixture seeds all of them in the combinations these tests need.
 
-def _conn() -> sqlite3.Connection:
+def _conn(*, name="acme-2026", client="Acme Corp") -> sqlite3.Connection:
+    """`name` and `client` are parameters (fix round D). Both are free text
+    on the way in -- `config.load` requires only "a non-empty string", and
+    `cli._NAME_RE` constrains `name` at ONE entry point while `render` reads
+    the row -- and both reach the deliverable's first two lines, one of them
+    a `#` heading."""
     conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.execute("PRAGMA foreign_keys=ON")
     db_mod.init_schema(conn)
     conn.execute(
         "INSERT INTO engagement(id, name, client, created_us, status)"
-        " VALUES('e-1','acme-2026','Acme Corp',1,'active')")
+        " VALUES('e-1',?,?,1,'active')", (name, client))
     return conn
+
+
+# --- fix round D: the structural invariant every injection test measures ----
+#
+# `## ` with the trailing space, so `### Scope of record` and the `####`
+# finding headings are not counted: those nest UNDER a section and cannot be
+# confused with one. A render of any store this build can produce has exactly
+# these four, in this order, and `render` emits every one of them
+# unconditionally -- Provenance, Findings and Limits from `render` itself,
+# Coverage from `_coverage`. A hostile value that ADDS one has written
+# structure into a document whose structure is the contract.
+_SECTIONS = ["## Provenance", "## Findings", "## Coverage", "## Limits"]
+
+# The payload every test below plants. It is not a backtick trick: it is a
+# newline followed by a heading and the exact sentence a clean report prints
+# under it, so a document that swallows it reads as a SECOND, empty Findings
+# section -- "None recorded." -- which is the one claim S12 says a report may
+# never make by accident.
+_INJECT = "\n\n## Findings\n\nNone recorded."
+
+
+def _sections(out) -> list[str]:
+    return [l for l in out.splitlines() if l.startswith("## ")]
 
 
 def _run(conn, run_id="r-1", *, dropped_total=0, started_us=1,
@@ -99,21 +128,30 @@ def _check_run(conn, check_run_id, *, run_id, surface_id, check_id,
 
 
 def _exchange(conn, exchange_id, run_id, url, *, req_blob=None,
-             status=200) -> None:
+             status=200, method="GET") -> None:
+    """`method` and `status` are parameters (fix round D) because both are as
+    captured as `url` is: `exchange.method` carries no CHECK constraint, and
+    `status` reaches `record_exchange` as `header.get("status")` off a bridge
+    frame that `codec._check_header` admits as a `str`, which SQLite's INTEGER
+    affinity then stores as TEXT. A fixture that could only write `'GET'` and
+    an int could not measure either."""
     conn.execute(
         "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method,"
-        " url, req_blob, status) VALUES(?,?,'proxy','ok',1,'GET',?,?,?)",
-        (exchange_id, run_id, url, req_blob, status))
+        " url, req_blob, status) VALUES(?,?,'proxy','ok',1,?,?,?,?)",
+        (exchange_id, run_id, method, url, req_blob, status))
 
 
 def _finding(conn, *, run_id, title, severity, exchange_ids,
             check_id=None, description=None, impact=None,
-            remediation=None) -> str:
+            remediation=None, cwe=None) -> str:
+    """`cwe` is a parameter (fix round D): `finding.cwe` carries no CHECK
+    constraint and nothing validates the string a check hands over, so it is
+    free text that reaches the deliverable like the other four."""
     c = base.Candidate(title=title, issue_type_id=title.lower().replace(" ", "-"),
                        severity=severity, confidence="Firm",
                        insertion=None, exchange_ids=tuple(exchange_ids),
                        description=description, impact=impact,
-                       remediation=remediation)
+                       remediation=remediation, cwe=cwe)
     key = records.dedupe_key(type_=title, issue_type_id=c.issue_type_id,
                              scheme="https", host="app.acme.test",
                              port=443, method="GET", path_template="/",
@@ -1802,3 +1840,440 @@ def test_a_newline_in_a_path_template_is_still_flattened():
     headings = [l for l in out.splitlines() if l.startswith("## Findings")]
     assert len(headings) == 1
     assert "- `GET /a  ## Findings  None recorded.`" in out
+
+
+# --- fix round D: the sweep --------------------------------------------------
+#
+# Fix round C fixed ONE hand-written code span (`_untested`'s bullet) and
+# justified leaving the rest on the grounds that "they carry registry ids,
+# minted run ids, hex digests and derived insertion kinds". That was wrong
+# about at least three of them, and the re-review measured two. This block is
+# the sweep the module needed instead: every value `report.py` interpolates
+# whose origin is NOT a CHECK constraint, a minted id, a hex digest or a
+# module literal, planted with `_INJECT` and asserted unable to move the
+# document's own structure.
+#
+# THE ASSERTION IS THE SECTION COUNT, not "a backtick was escaped". A test
+# that only pins the backtick passes while a newline splits the deliverable
+# in two, which is exactly how this defect survived three rounds.
+
+def test_a_clean_report_has_exactly_the_four_top_level_sections(report_env):
+    """The separating case for every test below it: the baseline the hostile
+    renders are compared against, pinned by equality and not by a count, so a
+    fix that DROPPED a section would redden here rather than reading as a
+    success everywhere else."""
+    assert _sections(report.render(**report_env)) == _SECTIONS
+
+
+def test_a_newline_in_an_evidence_url_cannot_add_a_section():
+    """C-1. `_evidence` built its bullet as ``- `{method} {url}` → {status}``
+    with no `_flat` and no `_code`. `exchange.url` is captured traffic, the
+    schema puts no CHECK on it, and `record_exchange` applies `redact_url`
+    and nothing else -- so a newline in the URL ended the bullet and put a
+    live `## Findings` / `None recorded.` in the deliverable.
+
+    THIS IS THE ENTRY POINT, not a second instance of the path-template fix:
+    `surface.path_template` is DERIVED FROM `exchange.url`, so the very
+    request that motivated round C's accepted fix reaches this line first."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/a" + _INJECT)
+    _finding(conn, run_id="r-1", title="Reflected XSS in search",
+            severity="High", exchange_ids=["x-1"])
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+    # Inert, not dropped: the whole URL is still in the deliverable, on one
+    # line, inside one code span. A client can still see what was captured.
+    assert "## Findings  None recorded." in out
+
+
+def test_a_backtick_in_an_evidence_url_does_not_break_its_code_span():
+    """The other half of C-1, and the line's whole job is at stake: this is
+    the bullet a client uses to REPRODUCE the finding. Measured before the
+    fix as ``- `GET https://app.acme.test/a`b?q=1` → 200`` -- the span closes
+    at the embedded backtick, `b?q=1` renders as prose, and the trailing
+    backtick opens a new span, on every finding on that surface."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/a`b?q=1")
+    _finding(conn, run_id="r-1", title="Reflected XSS in search",
+            severity="High", exchange_ids=["x-1"])
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert "- ``GET https://app.acme.test/a`b?q=1`` → 200" in out
+
+
+def test_an_ordinary_evidence_url_keeps_its_plain_single_backtick_span(
+        report_env_with_findings):
+    """The separating case: no backtick in the URL, so the bullet is exactly
+    the single-backtick span it always was. A fix that widened every fence
+    unconditionally would pass the test above and quietly change every
+    evidence line in every report this tool has produced."""
+    out = report.render(**report_env_with_findings)
+    assert "- `GET https://app.acme.test/login` → 200" in out
+
+
+def test_a_hostile_method_or_status_on_an_evidence_row_cannot_add_a_section():
+    """`exchange.method` carries no CHECK either, and `status` is an INTEGER
+    column that nothing coerces: it arrives as `header.get("status")` off a
+    bridge frame, `codec._check_header` admits a `str` there, and SQLite's
+    INTEGER affinity stores a non-numeric string as TEXT. Neither is a
+    registry id, a minted id or a digest, so neither is exempt."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/a",
+             method="GET" + _INJECT, status="200" + _INJECT)
+    _finding(conn, run_id="r-1", title="Reflected XSS in search",
+            severity="High", exchange_ids=["x-1"])
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+
+
+def test_a_newline_in_a_scope_pattern_cannot_add_a_section():
+    """C-2. R1 put `_redact` on these two bullets and stopped there.
+    `config.py`'s `_string_list` applies NO character validation to
+    `scope.include` / `scope.exclude` beyond "a non-empty list of non-blank
+    strings", and YAML carries a multi-line scalar happily, so this is
+    reachable from the file an operator edits. Standing ruling R1 is the
+    reason operator-authored text gets no exemption: S12 draws no such
+    exception, and neither does `_code`."""
+    conn = _conn()
+    _run(conn, "r-1")
+    cfg = _config(scope_include=["https://app.acme.test/*",
+                                 "https://b.test/*" + _INJECT],
+                  scope_exclude=["https://c.test/*" + _INJECT])
+    out = report.render(conn=conn, engagement_id="e-1", config=cfg)
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+    assert "- `https://b.test/*  ## Findings  None recorded.`" in out
+    assert "- excluded: `https://c.test/*  ## Findings  None recorded.`" in out
+
+
+def test_a_backtick_in_a_scope_pattern_does_not_break_its_code_span():
+    """The same bullet, the same helper the never-tested list already uses.
+    An operator writing a glob is one keystroke from a backtick, and the
+    scope patterns are the part of the deliverable a contract dispute reads
+    first."""
+    conn = _conn()
+    _run(conn, "r-1")
+    cfg = _config(scope_include=["https://app.acme.test/`*"],
+                  scope_exclude=["`x`"])
+    out = report.render(conn=conn, engagement_id="e-1", config=cfg)
+    conn.close()
+
+    assert "- ``https://app.acme.test/`*``" in out
+    assert "- excluded: `` `x` ``" in out
+
+
+def test_an_ordinary_scope_pattern_keeps_its_plain_single_backtick_span(
+        report_env):
+    """The separating case, and the reason it matters here more than
+    anywhere: every report this tool has ever produced renders these
+    bullets, so an unconditional fence change would be visible in all of
+    them."""
+    out = report.render(**report_env)
+    assert "- `https://app.acme.test/*`" in out
+
+
+def test_a_newline_in_the_client_name_cannot_add_a_section():
+    """F10 moved `engagement.client` behind `_redact` and left the
+    flattening behind, which is R1's half-fix again -- on the document's own
+    TITLE. `hx new --client` checks only that the string is non-empty, so a
+    newline puts a second live heading ABOVE the real Provenance section, in
+    the `#` line a client reads first."""
+    conn = _conn(client="Acme" + _INJECT)
+    _run(conn, "r-1")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+    assert out.splitlines()[0] == (
+        "# Acme  ## Findings  None recorded. — web application assessment")
+
+
+def test_a_hostile_engagement_name_cannot_break_its_span_or_add_a_section():
+    """The line under the title, and a HAND-WRITTEN code span.
+    `cli._NAME_RE` refuses both characters today -- but at one entry point,
+    and `render` reads the `engagement` row rather than the command line. A
+    guard that only fires where the current writer happens to be careless is
+    not a guard, which is `_cell`'s own rule for why it escapes columns that
+    are controlled vocabularies today."""
+    conn = _conn(name="acme`2026" + _INJECT)
+    _run(conn, "r-1")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+    assert ("Engagement ``acme`2026  ## Findings  None recorded.``."
+            in out)
+
+
+def test_an_ordinary_engagement_name_keeps_its_plain_single_backtick_span(
+        report_env):
+    """The separating case for the line above."""
+    assert "Engagement `acme-2026`." in report.render(**report_env)
+
+
+def test_a_newline_in_a_finding_title_cannot_add_a_section():
+    """C-5, and the re-review's own judgement on it was wrong. It read the
+    `####` framing as making a newline unreachable "because of HTTP header
+    framing"; `_http.header_values` splits the head on `\\r\\n` and `.strip()`s
+    the value, so a BARE `\\n` inside a header line survives both. Verified
+    directly: a head carrying `Set-Cookie: se\\nssion=1` yields the cookie
+    name `se\\nssion`, and `cookie_flags.py:153` interpolates that straight
+    into the title. This is injection, not mangling."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/login")
+    _finding(conn, run_id="r-1",
+            title="Cookie se" + _INJECT + "ssion set without HttpOnly",
+            severity="Medium", exchange_ids=["x-1"])
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+    # One heading, at the level it belongs at: a grandchild of `## Findings`.
+    assert len([l for l in out.splitlines() if l.startswith("#### ")]) == 1
+
+
+def test_a_newline_in_a_findings_prose_field_cannot_add_a_section():
+    """`description`, `impact` and `remediation` reached `out` with `_redact`
+    and no `_flat`, against `_flat`'s own docstring: "every rendered
+    free-text value is flattened -- not only the ones that reach a table".
+    They are free text by the same route the title is --
+    `cookie_flags.py:161` interpolates the same server-controlled cookie name
+    into `description`."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/login")
+    _finding(conn, run_id="r-1", title="Cookie set without HttpOnly",
+            severity="Medium", exchange_ids=["x-1"],
+            description="The response set it." + _INJECT,
+            impact="Session theft." + _INJECT,
+            remediation="Set HttpOnly." + _INJECT)
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+    # Nothing dropped: all three fields are still rendered, on one line each.
+    assert out.count("## Findings  None recorded.") == 3
+
+
+def test_a_newline_in_a_findings_cwe_cannot_add_a_section():
+    """`finding.cwe` is the one field on that metadata line with no CHECK
+    constraint behind it -- `confidence` and `status` are controlled
+    vocabularies the schema enforces, `cwe` is whatever string a check hands
+    over."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/login")
+    _finding(conn, run_id="r-1", title="Cookie set without HttpOnly",
+            severity="Medium", exchange_ids=["x-1"], cwe="CWE-1004" + _INJECT)
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+    assert "*CWE-1004  ## Findings  None recorded.*" in out
+
+
+def test_a_hostile_authorization_digest_keeps_its_row_and_its_span():
+    """`authorization.doc_sha256` and `scope_sha256` were the last
+    hand-written code spans over columns NOTHING writes: the table has no
+    writer anywhere in `src/`, `extension/` or `tests/`, and neither column
+    carries a CHECK, so there is no evidence at all that what lands there is
+    a digest. `_cell` alone kept the TABLE intact and could not stop a
+    backtick closing the span inside the cell; `_cell(_code(...))` does
+    both, and is byte-identical for a value that really is a digest -- which
+    the next test pins."""
+    conn = _conn()
+    _run(conn, "r-1")
+    conn.execute(
+        "INSERT INTO authorization(id, engagement_id, doc_sha256, signatory,"
+        " valid_from_us, valid_to_us, scope_sha256) VALUES('a-1','e-1',?,?,"
+        " 1, 2, 'deadbeef')",
+        ("ab`cd|ef" + _INJECT, "J|Doe" + _INJECT))
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+    # One row, five cells, and the digest still inside one code span.
+    rows = [l for l in out.splitlines() if l.startswith("| 1970")]
+    assert len(rows) == 1
+    assert rows[0].count("|") - rows[0].count("\\|") == 6
+    assert "``ab`cd\\|ef  ## Findings  None recorded.``" in rows[0]
+
+
+def test_an_ordinary_authorization_digest_keeps_its_plain_span():
+    """The separating case: a real digest renders exactly as it did before
+    the fix, so no shipped report's Authorization table moves."""
+    conn = _conn()
+    _run(conn, "r-1")
+    conn.execute(
+        "INSERT INTO authorization(id, engagement_id, doc_sha256, signatory,"
+        " valid_from_us, valid_to_us, scope_sha256) VALUES('a-1','e-1',"
+        " 'abc123', 'J Doe', 1, 2, 'deadbeef')")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    assert "| J Doe | `abc123` | `deadbeef` |" in out
+
+
+def test_hostile_values_at_every_swept_site_at_once_leave_four_sections():
+    """THE SWEEP'S OWN DELIVERABLE. Every site this round changed, planted in
+    ONE store and rendered once. Fixing two sites and leaving a third is the
+    failure pattern that produced this finding four times on this branch; a
+    test that renders each site alone cannot catch the third one being
+    missed, and this one can."""
+    conn = _conn(name="acme`2026" + _INJECT, client="Acme" + _INJECT)
+    _run(conn, "r-1")
+    _surface(conn, "s-1", path_template="/a`b" + _INJECT)
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/a`b" + _INJECT,
+             method="GET" + _INJECT, status="200" + _INJECT)
+    _finding(conn, run_id="r-1", title="Cookie `x`" + _INJECT,
+            severity="Medium", exchange_ids=["x-1"],
+            description="d" + _INJECT, impact="i" + _INJECT,
+            remediation="r" + _INJECT, cwe="CWE-1004" + _INJECT)
+    conn.execute(
+        "INSERT INTO authorization(id, engagement_id, doc_sha256, signatory,"
+        " valid_from_us, valid_to_us, scope_sha256) VALUES('a-1','e-1',?,?,"
+        " 1, 2, ?)",
+        ("d`1" + _INJECT, "J|Doe" + _INJECT, "s`2" + _INJECT))
+    cfg = _config(scope_include=["https://app.acme.test/`*" + _INJECT],
+                  scope_exclude=["`x`" + _INJECT])
+    out = report.render(conn=conn, engagement_id="e-1", config=cfg)
+    conn.close()
+
+    assert _sections(out) == _SECTIONS
+
+    # And no new heading at ANY level, not only the top one. The same store
+    # with every payload removed is rendered as the control: the two
+    # documents must have the SAME heading skeleton, because `_flat` and
+    # `_code` leave every injected `##` inert, mid-line, inside the value it
+    # arrived in. Comparing against a control rather than a typed number is
+    # what keeps this assertion honest when the report grows a section.
+    clean = _conn()
+    _run(clean, "r-1")
+    _surface(clean, "s-1", path_template="/ab")
+    _exchange(clean, "x-1", "r-1", "https://app.acme.test/ab")
+    _finding(clean, run_id="r-1", title="Cookie x", severity="Medium",
+            exchange_ids=["x-1"], description="d", impact="i",
+            remediation="r", cwe="CWE-1004")
+    clean.execute(
+        "INSERT INTO authorization(id, engagement_id, doc_sha256, signatory,"
+        " valid_from_us, valid_to_us, scope_sha256) VALUES('a-1','e-1','d1',"
+        " 'JDoe', 1, 2, 's2')")
+    control = report.render(clean, engagement_id="e-1", config=_config())
+    clean.close()
+
+    def _levels(text):
+        return [l.split(" ", 1)[0] for l in text.splitlines()
+                if l.startswith("#")]
+
+    assert _levels(out) == _levels(control)
+
+
+# --- fix round D: the two typed build negatives in `_limits` ----------------
+
+def test_the_no_blind_only_checks_claim_is_pinned_to_the_spec_that_mandates_it(
+        report_env):
+    """C-4, first half. This bullet is NOT the same case as N1's two, and
+    does not get the same answer: S13's deferral table requires it in as many
+    words -- "v1 ships no blind-only checks and says so in the report" -- so
+    deleting it is dropping a required disclosure, not applying N1b's
+    standard. N1b removed a sentence that EXCUSED a missing authorisation
+    record; this one DISCLOSES a limitation, and its failure mode the day an
+    out-of-band collector lands is telling a client that less was tested than
+    was.
+
+    Nothing in the store, the registry or the schema records whether a check
+    detects by external interaction, so the sentence cannot be derived. What
+    it can have is something that reddens, and this is it: the claim is a
+    SPEC-level fact, so the spec sentence that mandates it is what the report
+    text is held against. Amend S13 -- move OAST into scope -- and this test
+    fails until the bullet moves with it."""
+    spec = (Path(__file__).resolve().parents[1] / "docs" / "superpowers" /
+            "specs" / "2026-08-21-hx-design.md").read_text(encoding="utf-8")
+    assert "v1 ships no blind-only checks and says so in the report" in spec
+
+    out = report.render(**report_env)
+    assert "**No blind-only checks.**" in out
+    assert "ships no out-of-band collector" in out
+
+
+def test_an_engagement_that_crawled_is_not_told_no_crawl_happened(report_env):
+    """C-4, second half, and the half that IS derivable: `run.kind` is
+    CHECK-constrained to `browse | crawl | manual | scan` (S5, and the
+    constraint is in `schema.sql`), so whether this engagement crawled is a
+    question THIS STORE answers. The bullet used to be typed -- "No automated
+    crawl. Attack surface here is what was browsed through the proxy" -- so
+    the day a crawler lands, a report on an engagement that crawled would
+    still have told the client no crawl happened, with nothing to redden.
+
+    Nothing writes `kind='crawl'` today, so this fixture writes the row the
+    way `_unfinished_run` writes a status no shipped code path produces
+    either: the trigger is scheduled, and the test has to exist before it
+    fires, not after."""
+    conn = report_env["conn"]
+    conn.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " ended_us, status, dropped_total) VALUES('r-2','e-1','crawl',"
+        "'staging',1,2,'completed',0)")
+    out = report.render(**report_env)
+
+    assert "**No automated crawl.**" not in out
+    assert "1 of the run(s) recorded for this engagement carry" in out
+    assert "`kind = 'crawl'`" in out
+
+
+def test_an_engagement_that_did_not_crawl_states_the_absence_from_the_store(
+        report_env):
+    """The separating case, and the one that keeps the fix a DERIVATION
+    rather than a deletion: with no crawl run the client is still told
+    plainly that nothing crawled, and the sentence now names the store fact
+    it is read off so a reader can check it."""
+    out = report.render(**report_env)
+    assert "**No automated crawl.**" in out
+    assert "No run recorded for this engagement has `kind = 'crawl'`" in out
+
+
+# --- fix round D: P3, a note that attributed findings to the wrong runs -----
+
+def test_the_partial_findings_note_is_scoped_to_the_unfinished_runs():
+    """P3. N2's non-empty note read "what follows is what THEY had reached
+    when they stopped", and `unfinished` is ENGAGEMENT-WIDE while the list is
+    not. Measured on the ordinary shape -- one `completed` scan run that
+    raised a finding, plus a `browse` run left `running` -- the note told the
+    client the finding shown was what the unfinished run reached, which is
+    false twice over: a browse run raises no findings at all, and the finding
+    came from the completed run.
+
+    The correctly scoped wording was already one function up, in
+    `_provenance`: "Everything this report draws FROM THEM is what they had
+    reached when they stopped." The scoping is the "drawn from them", and the
+    `_findings` copy had dropped it. The note still FIRES on the same
+    condition -- an unfinished run may have contributed and nothing here
+    separates which findings did."""
+    conn = _conn()
+    _run(conn, "r-1", ended_us=2)
+    conn.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, dropped_total) VALUES('r-2','e-1','browse','staging',3,"
+        "'running',0)")
+    _exchange(conn, "x-1", "r-1", "https://app.acme.test/login")
+    _finding(conn, run_id="r-1", title="Reflected XSS in search",
+            severity="High", exchange_ids=["x-1"])
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+
+    findings = out[out.index("## Findings"):out.index("## Coverage")]
+    assert "did not finish" in findings
+    # The claim is scoped to what is DRAWN FROM the unfinished runs, and no
+    # longer to the list as a whole.
+    assert "anything below drawn from them is what they had reached" in findings
+    assert "what follows is what they had reached" not in findings

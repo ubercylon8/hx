@@ -270,8 +270,20 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
     # of the client deliverable verbatim. The review named `client` alone as
     # "the last free-text rendered field"; `name` is rendered raw on the very
     # next line and is exactly as operator-authored, so both move.
-    out.append(f"# {_redact(eng[2])} — web application assessment\n")
-    out.append(f"Engagement `{_redact(eng[1])}`.\n")
+    #
+    # D1 (fix round D): `_redact` was carried across and the FLATTENING was
+    # not, which is the same half-fix R1 left on the scope patterns. A
+    # newline in `engagement.client` ends the `#` heading and everything
+    # after it starts a line of its own -- `hx new --client $'Acme\n##
+    # Findings'` puts a second live `## Findings` heading above the real
+    # one, in the document's TITLE. `engagement.name` is the same value one
+    # line down inside a HAND-WRITTEN code span, so it takes `_code` for the
+    # reason `_untested`'s bullet does. `cli._NAME_RE` happens to refuse
+    # both characters in `name` today, but `render` reads the row and not
+    # the command line, and a guard that only fires where the current writer
+    # happens to be careless is not a guard (`_cell`'s own rule).
+    out.append(f"# {_flat(_redact(eng[2]))} — web application assessment\n")
+    out.append(f"Engagement {_code(_redact(eng[1]))}.\n")
 
     # ONE SOURCE OF TRUTH FOR "HAS THIS ENGAGEMENT EVER BEEN SCANNED",
     # shared by `_findings` (F4 of fix round 1: an unscanned engagement's
@@ -590,10 +602,22 @@ def _scope_of_record(conn, engagement_id, config) -> list[str]:
                    "establishes that they were the boundary when the traffic "
                    "was captured.\n")
 
+    # D2 (fix round D). R1 put `_redact` on these two bullets and stopped
+    # there; `_flat` and `_code` -- the other half of the same rule -- were
+    # never carried across. `config.py`'s `_string_list` applies NO character
+    # validation to `scope.include` / `scope.exclude` beyond "a non-empty
+    # list of non-blank strings", and YAML carries a multi-line scalar
+    # happily, so both defects are reachable from the file an operator
+    # edits: a backtick closes the span and spills the rest of the pattern
+    # into prose, and a newline ends the BULLET and puts whatever follows it
+    # at the top level of the document -- MEASURED as a second live
+    # `## Findings` / `None recorded.` under the real one. R1's own argument
+    # is why operator-authored text gets no exemption here: S12 draws no
+    # such exception, and neither does `_code`.
     for pattern in config.scope_include:
-        out.append(f"- `{_redact(pattern)}`")
+        out.append(f"- {_code(_redact(pattern))}")
     for pattern in config.scope_exclude:
-        out.append(f"- excluded: `{_redact(pattern)}`")
+        out.append(f"- excluded: {_code(_redact(pattern))}")
     out.append("")
     return out
 
@@ -633,10 +657,24 @@ def _authorization(conn, engagement_id) -> list[str]:
     out.append("| Valid from (UTC) | Valid to (UTC) | Signatory |"
                " `doc_sha256` | `scope_sha256` |")
     out.append("|---|---|---|---|---|")
+    # D3 (fix round D). The two digest columns are the only hand-written code
+    # spans left in this module over a column NOTHING writes: `authorization`
+    # has no writer anywhere in `src/`, `extension/` or `tests/`, and neither
+    # column carries a CHECK constraint, so there is no evidence at all that
+    # what lands here is a hex digest -- unlike `scope_version.sha256` two
+    # sections up, which `engagement._record_scope` mints with
+    # `hashlib.sha256(...).hexdigest()` and which is therefore left alone.
+    # `_cell` already keeps a hostile value from breaking the TABLE (it
+    # flattens and escapes `|`); what it cannot do is stop a backtick closing
+    # the span early inside the cell. `_code` chooses a fence that survives
+    # one, and `_cell` outside it keeps the pipe escaping the row needs --
+    # the composition is byte-identical to what shipped for any value that is
+    # actually a digest.
     for signatory, doc_sha256, valid_from_us, valid_to_us, scope_sha256 in rows:
         out.append(f"| {_when(valid_from_us)} | {_when(valid_to_us)} |"
-                   f" {_cell(_redact(signatory))} | `{_cell(doc_sha256)}` |"
-                   f" `{_cell(scope_sha256)}` |")
+                   f" {_cell(_redact(signatory))} |"
+                   f" {_cell(_code(doc_sha256))} |"
+                   f" {_cell(_code(scope_sha256))} |")
     out.append("")
     return out
 
@@ -736,10 +774,25 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
         # one drawn from a completed pass, and reads as the whole of what
         # there was. S5's rule is about the run, not about the emptiness of
         # the list.
+        #
+        # P3 (fix round D): "what follows is what THEY had reached" said
+        # something `unfinished` cannot support. `unfinished` is
+        # ENGAGEMENT-WIDE and this list is not: the ordinary shape -- one
+        # `completed` scan that raised a finding, plus a `browse` run left
+        # `running` -- made the note attribute the finding to the run that
+        # did not finish, and a browse run raises no findings at all. The
+        # correctly scoped wording was already one function up, in
+        # `_provenance`: "Everything this report draws FROM THEM is what they
+        # had reached when they stopped." The scoping is the "drawn from
+        # them", and this copy had dropped it. Wording only -- the note still
+        # fires on exactly the same condition, because the warning is still
+        # true: an unfinished run MAY have contributed to this list and
+        # nothing here separates which findings did.
         out.append(f"**{len(unfinished)} of the runs behind this report did "
                    "not finish** (each is named under Provenance above), so "
-                   "what follows is what they had reached when they stopped, "
-                   "not what a completed run would have found.\n")
+                   "anything below drawn from them is what they had reached "
+                   "when they stopped, not what a completed run would have "
+                   "found. This list is not a complete one.\n")
     by_sev = {s: [r for r in rows if r[2] == s] for s in _ORDER}
     for severity in _ORDER:
         if not by_sev[severity]:
@@ -752,22 +805,53 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             fid, title, _sev, confidence, desc, impact, fix, cwe, status = r
             # `####`, one level deeper again, to stay a grandchild of
             # `## Findings` now that the severity group moved to `###`.
-            out.append(f"#### {_redact(title)}\n")
+            #
+            # D4 (fix round D). `finding.title` carries SERVER-CONTROLLED
+            # text: `cookie_flags.py:153` builds it as "Cookie {name} set
+            # without ...", and `name` is the cookie name off a `Set-Cookie`
+            # RESPONSE header. The re-review judged a newline unreachable
+            # there on HTTP framing; it is not. `_http.header_values` splits
+            # the head on `\r\n` and `.strip()`s the value, so a BARE `\n`
+            # inside a header line survives both -- `Set-Cookie: se\nssion=1`
+            # yields the name `se\nssion` -- and this heading then ends at
+            # the newline with the remainder starting a line of its own.
+            # `_flat` is the whole fix: the heading is not a code span, so
+            # `_code` does not apply, and a backtick or a `**` in a heading
+            # is mangling that `_flat` deliberately does not touch (this
+            # module escapes, it does not drop).
+            out.append(f"#### {_flat(_redact(title))}\n")
             marker = ""
             observed = _latest_observed(conn, fid)
             if observed is False:
                 marker = (" · **not observed the last time its check "
                           "tested this surface — appears fixed; verify "
                           "before closing**")
+            # `confidence` and `status` are CHECK-constrained vocabularies
+            # (`finding.confidence IN ('Certain','Firm','Tentative')`,
+            # `finding.status IN ('new','triaged',...)`) and are rendered
+            # bare for the reason `check_id` is. `cwe` is NOT: the column
+            # carries no CHECK and nothing validates the string a check
+            # hands over, so it goes through `_flat` -- D4 again, in the same
+            # paragraph. A real `CWE-1004` is unchanged by it.
             out.append(f"*Confidence: {confidence}*"
-                       + (f" · *{cwe}*" if cwe else "")
+                       + (f" · *{_flat(cwe)}*" if cwe else "")
                        + (f" · *status: {status}*" if status != "new" else "")
                        + marker
                        + "\n")
+            # D4. These three reached `out` with `_redact` and no `_flat`,
+            # and `_flat`'s own docstring says why that is wrong: "every
+            # rendered free-text value is flattened -- not only the ones
+            # that reach a table". They are free text by the same route the
+            # title is (`cookie_flags.py:161` interpolates the same
+            # server-controlled cookie name into `description`), and a
+            # newline in one starts a line at the top level of the
+            # document. Flattening prose costs nothing a Markdown renderer
+            # would have kept: a paragraph's own line breaks are already
+            # collapsed to spaces when it is rendered.
             for label, text in (("", desc), ("**Impact.** ", impact),
                                 ("**Remediation.** ", fix)):
                 if text:
-                    out.append(f"{label}{_redact(text)}\n")
+                    out.append(f"{label}{_flat(_redact(text))}\n")
             out.extend(_evidence(conn, fid))
     return out
 
@@ -795,7 +879,27 @@ def _evidence(conn, finding_id) -> list[str]:
             unresolved += 1
             continue
         status_text = status if status is not None else "no status recorded"
-        out.append(f"- `{method} {_redact(url)}` → {status_text}")
+        # D5 (fix round D), and the ENTRY POINT for the backtick fix round C
+        # applied downstream. `surface.path_template` is DERIVED FROM
+        # `exchange.url` -- the same request that puts a backtick in a path
+        # puts it in the URL first, and this is the bullet a client uses to
+        # REPRODUCE the finding. MEASURED, with one backtick in the URL:
+        # the bullet came back as ``- `GET https://app.acme.test/a`b?q=1` ->
+        # 200``, whose span closes at the embedded backtick and renders the
+        # rest as prose -- on every finding on that surface. A newline ended
+        # the bullet outright and put a second live `## Findings` heading in
+        # the document instead. Neither column carries a CHECK, and
+        # `record_exchange` applies `redact_url` and nothing else.
+        #
+        # `_code(_flat(method) + " " + _redact(url))` is `_untested`'s bullet
+        # exactly, for the same reasons and with the same helpers. `status`
+        # is an INTEGER column by declaration but nothing coerces it: it
+        # arrives as `header.get("status")` off a bridge frame, which
+        # `codec._check_header` admits as a `str`, and SQLite's INTEGER
+        # affinity stores a non-numeric string as TEXT. It carries no URL, so
+        # `_flat` and not `_redact`.
+        out.append(f"- {_code(f'{_flat(method)} {_redact(url)}')} → "
+                   f"{_flat(status_text)}")
     omitted = total - len(shown)
     caveats = []
     if omitted > 0:
@@ -1094,12 +1198,54 @@ def _insertion_coverage(conn, engagement_id, blobs) -> list[str]:
 def _limits(conn, engagement_id) -> list[str]:
     out = ["## Limits\n",
            "What this assessment did not cover, stated rather than implied.\n"]
+    # C-4 (fix round D), and N1's rule applied one function further down than
+    # N1 reached. Both bullets here were claims about the BUILD, typed rather
+    # than derived. They are NOT the same case and they do not get the same
+    # answer.
+    #
+    # THE FIRST IS KEPT, VERBATIM, BECAUSE THE SPEC MANDATES IT. S13's
+    # deferral table, on the OAST row: "v1 ships no blind-only checks AND
+    # SAYS SO IN THE REPORT." Deleting it is not applying N1b's standard, it
+    # is dropping a required disclosure. N1b removed a sentence that EXCUSED
+    # a missing authorisation record -- it converted an operator's omission
+    # into an apparent tool limitation, which is the one direction a
+    # deliverable must not lean. This sentence leans the other way: it
+    # DISCLOSES a limitation, and its failure mode the day an out-of-band
+    # collector lands is telling a client that LESS was tested than was.
+    # Nothing in the store, the registry or the schema records whether a
+    # check detects by external interaction, so it cannot be derived here --
+    # what it can have is something that reddens, and
+    # `test_the_no_blind_only_checks_claim_is_pinned_to_the_spec_that_...`
+    # is it: the claim is a SPEC-level fact, so the spec sentence that
+    # mandates it is what the test holds this text against. Amend S13 --
+    # move OAST into scope -- and the test fails until this bullet moves
+    # with it.
     out.append("- **No blind-only checks.** This build ships no out-of-band "
                "collector, so vulnerabilities detectable only by an external "
                "interaction were not tested for.")
-    out.append("- **No automated crawl.** Attack surface here is what was "
-               "browsed through the proxy; anything never visited was never "
-               "tested.")
+    # THE SECOND IS DERIVABLE AND IS NOW DERIVED. `run.kind` is CHECK-
+    # constrained to `browse | crawl | manual | scan` (S5, and the constraint
+    # is in `schema.sql`), so whether this engagement crawled is a question
+    # THIS STORE answers. Nothing writes `kind='crawl'` today, so the
+    # unchanged sentence is what renders -- with its ground now stated, so a
+    # reader can check it -- and the day a crawler lands, an engagement that
+    # crawled stops being told no crawl happened.
+    crawls = conn.execute(
+        "SELECT COUNT(*) FROM run WHERE engagement_id=? AND kind='crawl'",
+        (engagement_id,)).fetchone()[0]
+    if crawls:
+        out.append(f"- **{crawls} of the run(s) recorded for this engagement "
+                   "carry `kind = 'crawl'`.** Attack surface here is "
+                   "therefore not only what was browsed through the proxy. "
+                   "Coverage above states how many surfaces were captured in "
+                   "total and how many no check answered for; read the "
+                   "denominator there, not this bullet, for what was "
+                   "reached.")
+    else:
+        out.append("- **No automated crawl.** No run recorded for this "
+                   "engagement has `kind = 'crawl'`: attack surface here is "
+                   "what was browsed through the proxy, and anything never "
+                   "visited was never tested.")
     # F7: this used to read `config.safety_profile` -- TODAY's config, not
     # the profile any run in the store actually ran under -- and only
     # showed the bullet for `production`. Both halves were wrong.
