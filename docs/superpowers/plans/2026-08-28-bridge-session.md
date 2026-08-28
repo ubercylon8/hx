@@ -973,7 +973,7 @@ If a test fails, read it before changing it. A test that broke because the produ
 - [ ] **Step 5: Run both suites**
 
 Run: `.venv/bin/pytest -q && .venv/bin/pytest -m integration -q`
-Expected: `958 passed, 1 skipped, 30 deselected` and `30 passed`.
+Expected: `961 passed, 1 skipped, 30 deselected` and `30 passed`.
 
 - [ ] **Step 6: Commit**
 
@@ -1048,7 +1048,7 @@ def test_the_authorised_hash_is_the_one_the_report_renders(tmp_path, target):
 ./extension/test.sh 2>&1 | tail -3
 ```
 
-Expected: `958 passed, 1 skipped, 30 deselected`; `32 passed`; and for Java `13 ALL PASS` with **2352 output lines and 2330 `ok`** — check the line count, not just rc.
+Expected: `961 passed, 1 skipped, 30 deselected`; `32 passed`; and for Java `13 ALL PASS` with **2352 output lines and 2330 `ok`** — check the line count, not just rc.
 
 - [ ] **Step 5: Commit**
 
