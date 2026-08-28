@@ -117,12 +117,17 @@ def test_the_scope_hash_is_read_from_the_store(engagement):
     assert session.stored_scope_sha256(conn, eng.id) == stored
 
 
-def test_a_hand_edited_config_does_not_change_the_authorised_hash(engagement):
-    """The failure this rule prevents.
+def test_a_hand_edited_comment_does_not_change_the_authorised_hash(engagement):
+    """A weak but cheap check: appending a comment does not disturb the
+    stored hash.
 
-    If the session recomputed the hash from today's config, the report would
-    render one hash as the authorised scope while the extension had been
-    authorised against another -- and nothing would notice.
+    NOT the test that distinguishes "read from the store" from "recompute
+    from the file". `config.dumps()` is a canonical re-serialisation of the
+    parsed `Config` -- comments and key order are discarded before hashing,
+    so `dumps(load(x + "# comment"))` is byte-identical to `dumps(load(x))`.
+    A recompute-from-config implementation passes this test too. See
+    `test_a_field_edit_that_survives_reserialisation_does_not_change_the_authorised_hash`
+    below for the one that actually pins "read, never recompute".
     """
     conn, eng = engagement
     before = session.stored_scope_sha256(conn, eng.id)
@@ -131,7 +136,54 @@ def test_a_hand_edited_config_does_not_change_the_authorised_hash(engagement):
     assert session.stored_scope_sha256(conn, eng.id) == before
 
 
+def test_a_field_edit_that_survives_reserialisation_does_not_change_the_authorised_hash(engagement):
+    """The failure this rule prevents, proved by a mutation that a
+    recompute-from-config implementation cannot pass.
+
+    Unlike a bare comment, `rate_limit_rps: 5 -> 10` SURVIVES a
+    `config.load()` / `config.dumps()` round trip: it is a real field on the
+    parsed `Config`, not discarded formatting. A `stored_scope_sha256` that
+    read `engagement.config_path`, reloaded it and re-hashed `dumps(cfg)`
+    would return a DIFFERENT hash here -- only a read of the stored
+    `scope_version` row returns the same one recorded at `create()` time.
+
+    If the session recomputed the hash from today's config, the report would
+    render one hash as the authorised scope while the extension had been
+    authorised against another -- and nothing would notice.
+    """
+    conn, eng = engagement
+    before = session.stored_scope_sha256(conn, eng.id)
+    config_path = eng.root / "config.yaml"
+    text = config_path.read_text()
+    assert "rate_limit_rps: 5" in text, "fixture assumption changed; edit no longer applies"
+    config_path.write_text(text.replace("rate_limit_rps: 5", "rate_limit_rps: 10"))
+    assert session.stored_scope_sha256(conn, eng.id) == before
+
+
 def test_an_engagement_with_no_scope_version_is_an_error(empty_engagement):
     conn, eng = empty_engagement
     with pytest.raises(session.SessionError):
         session.stored_scope_sha256(conn, eng.id)
+
+
+def test_the_latest_of_several_scope_versions_wins(engagement):
+    """`ORDER BY effective_from_us DESC LIMIT 1`, actually exercised against
+    more than one row.
+
+    Follows `tests/test_engagement.py`'s use of
+    `engagement.record_scope_version()` to append a second, real row rather
+    than hand-inserting one -- that call is the only legitimate way a second
+    `scope_version` row comes to exist, and it stamps `effective_from_us`
+    itself (`engagement.now_us()`), so a hand-inserted row would either have
+    to guess that or risk two rows landing at the same microsecond.
+    """
+    conn, eng = engagement
+    first = session.stored_scope_sha256(conn, eng.id)
+
+    eng.config.scope_include.append("https://api.acme.com/*")
+    engagement_mod.record_scope_version(
+        eng, author="jimx", reason="client added API host")
+
+    second = session.stored_scope_sha256(conn, eng.id)
+    assert second != first
+    assert session.stored_scope_sha256(conn, eng.id) == second
