@@ -948,7 +948,7 @@ In `tests/integration/burp_fixture.py`, delete the promoted definitions and impo
 ```python
 from hx.session import (           # noqa: F401  -- re-exported for the rig
     ADD_OPENS, EXT_JAR, EXT_SRC, PROXY_CONFIG, SessionError,
-    _free_port, _jar_is_stale, _jar_mtime, _newest_source_mtime,
+    _free_port, _jar_mtime, _newest_source_mtime,
     extension_problem, find_burp_jar, seed_home,
     launch_burp, listener_ports, make_home, not_loopback_only,
     proxy_port, second_proxy_port, wait_for, write_listener_config,
