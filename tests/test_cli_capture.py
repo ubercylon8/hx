@@ -43,6 +43,9 @@ and adjusted:
 from __future__ import annotations
 
 import contextlib
+import os
+import signal
+import time
 from pathlib import Path
 
 import pytest
@@ -69,30 +72,53 @@ from hx import session as session_mod
 
 
 class _FakeLiveSession:
-    """The handful of `session.LiveSession` fields `capture_start` reads."""
+    """The handful of `session.LiveSession` fields `capture_start` reads.
 
-    def __init__(self, operator_port: int = 0):
+    `gone` is one of them now. The real one answers from `proc.poll()` and the
+    bridge's state; here it answers from a list the test supplies, so a test
+    can say "live, live, then Burp died" without a JVM.
+    """
+
+    def __init__(self, operator_port: int = 0, gone: str | None = None,
+                 gone_after: int = 0):
         self.operator_port = operator_port
-        self.crawler_port = 0
+        self.crawler_port = 1
         self.epoch = 1
         self.bridge = None
         self.workdir = None
+        self._gone, self._gone_after, self._asked = gone, gone_after, 0
+
+    def gone(self) -> str | None:
+        self._asked += 1
+        return self._gone if self._asked > self._gone_after else None
 
 
-def _fake_session(operator_port: int = 0, calls: list | None = None):
+def _fake_session(operator_port: int = 0, calls: list | None = None,
+                  gone: str | None = None, gone_after: int = 0,
+                  torn_down: list | None = None):
     """A stand-in for `session.session` that launches nothing and yields a
     fake `LiveSession` with the given `operator_port`.
 
     `calls`, when given, gets one dict appended per invocation recording the
     keyword arguments `capture_start` actually passed through -- in
     particular `jar`, which nothing asserted on before this fix round:
-    mutating `jar=burp_jar` to `jar=None` in the command reddened nothing."""
+    mutating `jar=burp_jar` to `jar=None` in the command reddened nothing.
+
+    `torn_down`, when given, gets one entry appended in the factory's own
+    `finally` -- which is where the real `session()` kills Burp and stops the
+    bridge. A command that exits without unwinding this `with` would leave it
+    empty, which is what orphaning a JVM looks like from here."""
 
     @contextlib.contextmanager
     def factory(eng, *, instance, jar=None, workdir=None):
         if calls is not None:
             calls.append({"instance": instance, "jar": jar, "workdir": workdir})
-        yield _FakeLiveSession(operator_port=operator_port)
+        try:
+            yield _FakeLiveSession(operator_port=operator_port, gone=gone,
+                                   gone_after=gone_after)
+        finally:
+            if torn_down is not None:
+                torn_down.append("torn down")
 
     return factory
 
@@ -150,7 +176,7 @@ def an_engagement(tmp_path):
 def test_capture_start_reports_the_port_to_browse_through(monkeypatch, an_engagement):
     monkeypatch.setattr(cli.session_mod, "session",
                         _fake_session(operator_port=18080))
-    monkeypatch.setattr(cli, "_block_until_interrupt", lambda: None)
+    monkeypatch.setattr(cli, "_block_until_interrupt", lambda live: None)
     result = CliRunner().invoke(cli.main, ["capture", "start",
                                            "--root", str(an_engagement.root)])
     assert result.exit_code == 0, result.output
@@ -161,7 +187,7 @@ def test_capture_start_reports_the_port_to_browse_through(monkeypatch, an_engage
 
 def test_ctrl_c_closes_the_run(monkeypatch, an_engagement):
     monkeypatch.setattr(cli.session_mod, "session", _fake_session())
-    def interrupt():
+    def interrupt(live):
         raise KeyboardInterrupt
     monkeypatch.setattr(cli, "_block_until_interrupt", interrupt)
     CliRunner().invoke(cli.main, ["capture", "start",
@@ -206,7 +232,7 @@ def test_burp_jar_flag_reaches_session(monkeypatch, an_engagement, tmp_path):
     in `capture_start` reddens only this test."""
     calls: list = []
     monkeypatch.setattr(cli.session_mod, "session", _fake_session(calls=calls))
-    monkeypatch.setattr(cli, "_block_until_interrupt", lambda: None)
+    monkeypatch.setattr(cli, "_block_until_interrupt", lambda live: None)
     jar = tmp_path / "burpsuite_desktop_v0.0.0.jar"
     jar.write_bytes(b"not a jar; session.session is faked in this test")
     result = CliRunner().invoke(cli.main, [
@@ -217,12 +243,128 @@ def test_burp_jar_flag_reaches_session(monkeypatch, an_engagement, tmp_path):
     assert calls[0]["jar"] == jar
 
 
+# --- S8: Burp dies mid-session, and SIGTERM -------------------------------
+
+
+def test_a_burp_that_dies_mid_session_ends_the_run_and_says_so(
+        monkeypatch, an_engagement):
+    """S8 names "Burp dies mid-session" and nothing implemented it.
+
+    `_block_until_interrupt` was `signal.pause()`, so a Burp that died left
+    the command blocked forever: the browser got connection-refused, nothing
+    was printed, and the run row stayed `status='running'` until the operator
+    gave up and pressed Ctrl-C -- which then closed the run as `completed`,
+    `stop_reason='operator'`, the row that says a consultant ended a capture
+    on purpose. The report renders that as a clean run.
+
+    Three things are therefore asserted: the operator is TOLD, the exit is
+    non-zero, and the row says `error` with the reason on it rather than
+    `completed`.
+    """
+    monkeypatch.setattr(
+        cli.session_mod, "session",
+        _fake_session(gone="Burp exited (status 143) while the session was live",
+                      gone_after=2))
+    monkeypatch.setattr(cli, "_HEALTH_POLL_S", 0.0)
+
+    result = CliRunner().invoke(cli.main, ["capture", "start",
+                                           "--root", str(an_engagement.root)])
+
+    assert result.exit_code != 0, result.output
+    assert "Burp exited (status 143)" in result.output, (
+        "the consultant is told nothing: the only witness that capture "
+        "stopped is their proxy no longer answering")
+    row = an_engagement.db.execute(
+        "SELECT status, stop_reason FROM run"
+        " ORDER BY started_us DESC LIMIT 1").fetchone()
+    assert row["status"] == "error", (
+        "a session that died halfway closed its run as `completed`; run.py's "
+        "own rule is that a run whose harness died resolves to `error`, "
+        "because a report claiming a half-run is complete is the worst output "
+        "this project could produce")
+    assert "Burp exited" in row["stop_reason"]
+
+
+def test_the_health_check_is_what_ends_the_wait_not_a_timer(
+        monkeypatch, an_engagement):
+    """`_block_until_interrupt` asks the SESSION, repeatedly.
+
+    A version that asked once and then paused would pass the test above by
+    accident whenever the first answer happened to be the death -- so the fake
+    here stays alive for two polls first, and the number of times it was asked
+    is the assertion.
+    """
+    live = _FakeLiveSession(gone="Burp exited (status 1)", gone_after=3)
+    monkeypatch.setattr(cli, "_HEALTH_POLL_S", 0.0)
+
+    assert cli._block_until_interrupt(live) == "Burp exited (status 1)"
+    assert live._asked == 4, (
+        f"the session was asked {live._asked} time(s); a command that asks "
+        "once and then blocks never finds out Burp went away")
+
+
+def test_sigterm_tears_the_session_down_instead_of_orphaning_burp(
+        monkeypatch, an_engagement):
+    """S7: "A Burp process is never orphaned." SIGTERM orphaned it.
+
+    `capture_start` covered Ctrl-C and exceptions only, so a `kill`, a
+    terminal closing or a service manager stopping the unit killed the command
+    where it stood and left a 900 MB JVM and a bridge socket behind -- and the
+    next run then met the stale-socket refusal.
+
+    The signal is real: this sends SIGTERM to the test process itself, from
+    inside the wait, which is exactly where an operator's `kill` would land.
+    """
+    torn_down: list = []
+    monkeypatch.setattr(cli.session_mod, "session",
+                        _fake_session(torn_down=torn_down))
+
+    def kill_me(live):
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(5)      # unreachable unless the signal is ignored
+        return None
+
+    monkeypatch.setattr(cli, "_block_until_interrupt", kill_me)
+
+    result = CliRunner().invoke(cli.main, ["capture", "start",
+                                           "--root", str(an_engagement.root)])
+
+    assert torn_down == ["torn down"], (
+        "SIGTERM killed the command without unwinding the session: Burp is "
+        "still running and its bridge socket is still on disk")
+    assert result.exit_code != 0
+    row = an_engagement.db.execute(
+        "SELECT status, stop_reason FROM run"
+        " ORDER BY started_us DESC LIMIT 1").fetchone()
+    assert (row["status"], row["stop_reason"]) == ("completed", "operator"), (
+        "a SIGTERM is somebody stopping this command, which is what Ctrl-C "
+        "is; the run closes the same way")
+
+
+def test_the_previous_sigterm_handler_is_restored(monkeypatch, an_engagement):
+    """The handler belongs to the session, not to the process.
+
+    `capture start` is one command in a CLI that may be embedded, and a
+    handler left installed after it returns would turn a later SIGTERM
+    anywhere in the process into a KeyboardInterrupt out of nowhere.
+    """
+    before = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(cli.session_mod, "session", _fake_session())
+    monkeypatch.setattr(cli, "_block_until_interrupt", lambda live: None)
+
+    result = CliRunner().invoke(cli.main, ["capture", "start",
+                                           "--root", str(an_engagement.root)])
+
+    assert result.exit_code == 0, result.output
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
 # --- moved from tests/test_cli.py, adjusted not to touch a real Burp ------
 
 
 def test_capture_start_opens_a_named_run(monkeypatch, engagement):
     monkeypatch.setattr(cli.session_mod, "session", _fake_session())
-    monkeypatch.setattr(cli, "_block_until_interrupt", lambda: None)
+    monkeypatch.setattr(cli, "_block_until_interrupt", lambda live: None)
     result = CliRunner().invoke(cli.main, ["capture", "start", "--root", str(engagement)])
     assert result.exit_code == 0, result.output
     assert "browse" in result.output
@@ -252,7 +394,7 @@ def test_capture_start_resumes_rather_than_opens_a_second_run(monkeypatch, engag
     resume behaviour is pinned directly in tests/test_run.py; this test pins
     only that the CLI is wired to it."""
     monkeypatch.setattr(cli.session_mod, "session", _fake_session())
-    monkeypatch.setattr(cli, "_block_until_interrupt", lambda: None)
+    monkeypatch.setattr(cli, "_block_until_interrupt", lambda live: None)
     eng = eng_mod.open_(engagement)
     try:
         existing_id = run_mod.open_run(

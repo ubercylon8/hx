@@ -721,3 +721,53 @@ def test_the_two_listeners_are_never_the_same_port(
             "the operator's own browsing as the crawler's")
         assert session.listener_ports(live.workdir) == [
             live.operator_port, live.crawler_port]
+
+
+# --- S8: the session knows when it has stopped being one ------------------
+
+
+class _Bridge:
+    def __init__(self, state):
+        self.state = state
+
+
+class _Proc:
+    def __init__(self, code=None):
+        self.pid = 4242
+        self._code = code
+
+    def poll(self):
+        return self._code
+
+
+def _live(proc, bridge, tmp_path):
+    return session.LiveSession(OPERATOR_PORT, CRAWLER_PORT, 1, bridge,
+                               tmp_path, proc)
+
+
+def test_a_live_session_is_live_while_burp_runs_and_the_extension_is_configured(
+        tmp_path):
+    assert _live(_Proc(), _Bridge("configured"), tmp_path).gone() is None
+    # An operator halt is a LIVE session that has stopped issuing. Reading it
+    # as a dead one would end the capture every time somebody touched the
+    # sentinel, which S4 makes a path an operator can take from any shell.
+    assert _live(_Proc(), _Bridge("halted"), tmp_path).gone() is None
+
+
+def test_a_dead_burp_is_named_with_its_status_and_its_log(tmp_path):
+    why = _live(_Proc(143), _Bridge("configured"), tmp_path).gone()
+    assert why and "143" in why
+    assert str(tmp_path / "burp.log") in why, (
+        "the one thing an operator can act on is Burp's own log")
+
+
+def test_an_extension_that_dropped_the_bridge_is_not_a_live_session(tmp_path):
+    """A JVM that is still up while its extension has gone is NOT healthy.
+
+    `BridgeServer._reset` puts the state back to `waiting` and the epoch back
+    to 0 when the peer disconnects, so a reconnect lands at DENY-ALL: a Burp
+    that looks alive, proxies nothing and records nothing -- the exact
+    live-Burp-and-empty-database this module keeps designing out.
+    """
+    why = _live(_Proc(), _Bridge("waiting"), tmp_path).gone()
+    assert why and "DENY-ALL" in why

@@ -3907,10 +3907,12 @@ rather than in the agent-facing tool layer.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import signal
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -4115,9 +4117,66 @@ def capture() -> None:
     """Start or stop traffic capture for an engagement."""
 
 
-def _block_until_interrupt() -> None:
-    """Separate so a test can drive the command without a real signal."""
-    signal.pause()
+# How often `capture start` asks whether the session it is holding open is
+# still a session. A second is far below anything a human notices and far
+# above anything the check costs: `Popen.poll()` is a non-blocking waitpid and
+# the bridge state is an attribute read.
+_HEALTH_POLL_S = 1.0
+
+
+def _block_until_interrupt(live) -> str | None:
+    """Hold the session open until the operator interrupts -- or Burp dies.
+
+    Returns None when the wait ended the way it usually does (Ctrl-C, which
+    arrives as a KeyboardInterrupt out of `time.sleep`), or the reason the
+    session stopped being one.
+
+    NOT `signal.pause()` ANY MORE, and that is S8's "Burp dies mid-session"
+    path. Paused, a command whose Burp had died blocked forever: the browser
+    got connection-refused, nothing was printed, and the run row stayed
+    `status='running'` until the operator gave up and pressed Ctrl-C, which
+    then closed the run as though they had ended it on purpose. Nothing polled
+    `proc.poll()` or re-read the bridge state, so the only witness was the
+    consultant noticing their proxy had stopped answering.
+
+    Separate so a test can drive the command without a real signal.
+    """
+    while True:
+        why = live.gone()
+        if why is not None:
+            return why
+        time.sleep(_HEALTH_POLL_S)
+
+
+@contextlib.contextmanager
+def _sigterm_ends_the_session():
+    """SIGTERM tears Burp down instead of orphaning it.
+
+    S7: "A Burp process is never orphaned." `capture_start` covered Ctrl-C and
+    exceptions, and SIGTERM -- a `kill`, a terminal closing, a service manager
+    stopping the unit -- killed the command where it stood, leaving a 900 MB
+    JVM and a bridge socket behind. The next run then got the (good) stale
+    socket refusal naming the path to remove.
+
+    Raised as KeyboardInterrupt deliberately: a SIGTERM is somebody stopping
+    this command, which is what Ctrl-C is, and giving the two paths one
+    meaning keeps one teardown and one `stop_reason` rather than two that have
+    to agree. The previous handler is restored on the way out, and a
+    non-main-thread caller (where `signal.signal` raises) simply does not get
+    the handler -- an inability to install one must not stop the session.
+    """
+    def handler(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 @capture.command("start")
@@ -4151,7 +4210,8 @@ def capture_start(kind, root, burp_jar) -> None:
     path = root or default_root()
     eng = _open_engagement(path)
     try:
-        with session_mod.session(eng, instance="capture", jar=burp_jar) as live:
+        with _sigterm_ends_the_session(), \
+                session_mod.session(eng, instance="capture", jar=burp_jar) as live:
             click.echo(f"operator proxy listening on 127.0.0.1:{live.operator_port}")
             try:
                 run_id = run_mod.current_run(
@@ -4160,6 +4220,7 @@ def capture_start(kind, root, burp_jar) -> None:
             except sqlite3.Error as exc:
                 raise click.ClickException(
                     f"cannot write to the database at {path}: {exc}") from exc
+            died = None
             try:
                 # The echo lives IN the try, not between it and current_run's:
                 # `hx capture start | head` closes the pipe once `head` has
@@ -4168,18 +4229,37 @@ def capture_start(kind, root, burp_jar) -> None:
                 # try that BrokenPipeError would escape past the finally
                 # below, leaving the run open and never closed.
                 click.echo(f"{kind} run {run_id} is live")
-                _block_until_interrupt()
+                died = _block_until_interrupt(live)
             finally:
                 # Runs even when the block above ends in a KeyboardInterrupt
                 # or a BrokenPipeError: a run left `status='running'` after
                 # the operator's Burp is gone would read as a live capture
                 # forever.
+                #
+                # A DEAD BURP IS NOT A COMPLETED RUN. `run.py`'s own rule --
+                # "a run whose harness DIED resolves to `error`, never to
+                # `completed`, because a report generated from a session that
+                # stopped halfway and claims to be complete is the worst
+                # output this project could produce" -- and the reason
+                # `stop_reason` carries the message rather than the word
+                # "operator": S5 renders it, and an operator reading the
+                # report should find out there that Burp went away.
                 try:
-                    run_mod.close_run(eng.db, run_id=run_id, status="completed",
-                                      stop_reason="operator")
+                    run_mod.close_run(
+                        eng.db, run_id=run_id,
+                        status="error" if died else "completed",
+                        stop_reason=died or "operator")
                 except sqlite3.Error as exc:
                     raise click.ClickException(
                         f"cannot write to the database at {path}: {exc}") from exc
+            if died:
+                # Raised INSIDE the `with`, so `session()`'s teardown still
+                # runs: a Burp that died is a Burp whose bridge socket and
+                # accept thread are still this process's to clean up. S8 asks
+                # for a distinct message and a non-zero exit; ClickException
+                # is both, and it is not a SessionError, so the handler below
+                # does not re-wrap it.
+                raise click.ClickException(died)
     except session_mod.SessionError as exc:
         raise click.ClickException(str(exc)) from exc
 

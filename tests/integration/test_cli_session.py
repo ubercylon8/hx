@@ -309,8 +309,9 @@ def test_capture_start_records_what_the_operator_browses(tmp_path):
         assert (status, stop_reason) == ("completed", "operator")
 
         # HOW IT EXITED. 1 is Ctrl-C reaching a click command: the
-        # KeyboardInterrupt raised in `signal.pause()` unwinds the run-closing
-        # `finally`, click turns it into `Abort`, and `Abort` is `sys.exit(1)`.
+        # KeyboardInterrupt raised out of the health-poll's `time.sleep`
+        # unwinds the run-closing `finally`, click turns it into `Abort`, and
+        # `Abort` is `sys.exit(1)`.
         # Pinned because the row above is written on the way out of a command
         # that could also have DIED -- and a crash after `close_run` leaves
         # exactly the row this test just read.

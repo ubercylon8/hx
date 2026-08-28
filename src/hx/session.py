@@ -684,6 +684,11 @@ class LiveSession:
     `epoch` is the config epoch the extension answered with. It is never 0
     here: 0 is what the extension reports at DENY-ALL, and a session that
     reached this object got a `configure` the extension accepted.
+
+    `proc` is the JVM, and it is here so that a caller HOLDING this session
+    open can find out it has stopped being one -- see `gone()`. It is not
+    handed out for killing: teardown is `session()`'s, unconditionally, and a
+    caller that kills the process itself gets a `finally` that kills it again.
     """
 
     operator_port: int
@@ -691,6 +696,40 @@ class LiveSession:
     epoch: int
     bridge: object
     workdir: Path
+    proc: subprocess.Popen
+
+    def gone(self) -> str | None:
+        """Why this is no longer a live session -- or None while it still is.
+
+        S8 requires "Burp dies mid-session" to produce a distinct message and
+        a non-zero exit, and nothing implemented it: `hx capture start` held
+        the session open in `signal.pause()`, so a Burp that died left the
+        command blocked forever, the browser getting connection-refused,
+        nothing printed, and the run row `status='running'` until the operator
+        gave up and pressed Ctrl-C -- at which point the exit code said
+        "operator", because that is what Ctrl-C means everywhere else.
+
+        TWO WAYS TO STOP BEING LIVE, and the second is not the first. A dead
+        JVM is the obvious one. The other is a JVM that is still up while its
+        extension has dropped the bridge: `BridgeServer._reset` puts the state
+        back to `waiting` and the config epoch back to 0 when the peer goes
+        away, so a reconnect lands at DENY-ALL -- a Burp that looks alive,
+        proxies nothing, and records nothing. `configured` and `halted` are
+        the two states a session in this object's hands is allowed to be in;
+        `halted` is an operator halt, which is a live session that has stopped
+        issuing, not a dead one.
+        """
+        code = self.proc.poll()
+        if code is not None:
+            return (f"Burp exited (status {code}) while the session was live, "
+                    f"so nothing has been captured since. Its log is "
+                    f"{self.workdir / 'burp.log'}")
+        state = getattr(self.bridge, "state", None)
+        if state not in ("configured", "halted"):
+            return ("Burp's extension dropped the bridge connection (state is "
+                    f"{state!r}); it reconnects at DENY-ALL, which refuses "
+                    "everything, so this session is no longer capturing")
+        return None
 
 
 class ExchangeSink:
@@ -879,7 +918,7 @@ def session(eng, *, instance: str, jar: Path | None = None,
                 f"configure failed and the extension was never "
                 f"authorised: {exc}") from exc
 
-        yield LiveSession(operator, crawler, epoch, srv, work)
+        yield LiveSession(operator, crawler, epoch, srv, work, proc)
     finally:
         # Nested, so that `srv.stop()` runs even if killing Burp raises. The
         # guarantee this function makes is that nothing is left running, and a
