@@ -193,9 +193,14 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
 
 
 def _exchanges_for(conn, surface_id):
+    # `outcome` is in the SELECT, and the column order is `ExchangeRow`'s --
+    # the row is built positionally, so the two lists are one contract. F6 of
+    # the whole-branch review: without `outcome` here, a check could not tell
+    # an exchange that came back whole from one that timed out or was cut
+    # off, and read the silence as `clean`.
     return tuple(base.ExchangeRow(*r) for r in conn.execute(
-        "SELECT id, method, url, status, req_blob, resp_blob FROM exchange"
-        " WHERE surface_id=? ORDER BY rowid", (surface_id,)))
+        "SELECT id, method, url, status, outcome, req_blob, resp_blob"
+        " FROM exchange WHERE surface_id=? ORDER BY rowid", (surface_id,)))
 
 
 def _open_row(conn, run_id, surface, check) -> str:

@@ -218,10 +218,23 @@ class ExchangeRow:
     otherwise pull two hundred response bodies into memory before any check
     decided it wanted one, and most checks want a handful. `ctx.blobs.get`
     is the fetch, and it is the check's decision when to call it.
+
+    `outcome` IS CARRIED AND HAS NO DEFAULT, added by F6 of the whole-branch
+    review. S5 says why, in the schema comment on the column itself: "a
+    transport failure has no HTTP status; without `outcome` a check reads
+    silence as 'not vulnerable'". This row used to stop at `resp_blob`, so a
+    check could not tell a response that came back whole from one that timed
+    out, was cut off mid-body, or never had its final status read -- and
+    MEASURED, a surface holding one readable response beside one
+    `status_unreadable` exchange recorded `check_run` = `('clean', NULL)`,
+    byte for byte what a wholly tested surface says. A DEFAULT would have
+    let a construction site quietly claim `ok` for an exchange nobody asked
+    about, which is the same silence one layer up.
     """
     id: str
     method: str
     url: str
     status: int | None
+    outcome: str
     req_blob: str | None
     resp_blob: str | None

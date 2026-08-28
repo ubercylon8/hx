@@ -28,13 +28,9 @@ class SecurityHeaders:
     insertion_kinds = frozenset()
 
     def on_surface(self, ctx, surface, exchanges) -> base.Verdict:
-        bodies = _http.responses(ctx, exchanges)
-        if bodies is None:
-            return base.Verdict.inconclusive(
-                "no response body could be read for this surface")
-
+        seen = _http.responses(ctx, exchanges)
         candidates = []
-        for row, head in bodies:
+        for row, head in seen.entries:
             ctype = " ".join(_http.header_values(head, "content-type")).lower()
             if not any(t in ctype for t in _DOCUMENT_TYPES):
                 continue
@@ -68,4 +64,4 @@ class SecurityHeaders:
                 ))
             if missing:
                 break      # one document per surface is enough to say it
-        return base.Verdict.finding(*candidates) if candidates else base.Verdict.clean()
+        return _http.verdict(seen, candidates)

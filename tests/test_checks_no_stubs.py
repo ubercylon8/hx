@@ -47,9 +47,10 @@ def test_the_placeholder_string_is_gone_from_the_tree():
 
 
 class _UnreadableBlobs:
-    """Every real passive check turns an unreadable blob into its OWN
-    `inconclusive` reason (see `passive/_http.py`), never Task 2's literal --
-    so this drives every check without needing a real capture to exist."""
+    """Every real passive check turns an unreadable blob into the corpus's
+    shared `inconclusive` reason (see `passive/_http.py`'s `verdict`), never
+    Task 2's literal -- so this drives every check without needing a real
+    capture to exist."""
 
     def get(self, digest, expected_len=None):
         raise KeyError(digest)
@@ -59,7 +60,8 @@ def test_no_registered_check_returns_the_stub_reason():
     ctx = base.CheckContext(config=None, blobs=_UnreadableBlobs(), run_id="r-1",
                              log=lambda s: None)
     row = base.ExchangeRow(id="x-1", method="GET", url="https://app.test/",
-                            status=200, req_blob=None, resp_blob="missing")
+                            status=200, outcome="ok", req_blob=None,
+                            resp_blob="missing")
     for check in registry.CHECKS:
         on_surface = getattr(check, "on_surface", None)
         if not callable(on_surface):

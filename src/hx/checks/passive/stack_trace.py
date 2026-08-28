@@ -43,12 +43,8 @@ class StackTrace:
 
     def on_surface(self, ctx, surface, exchanges) -> base.Verdict:
         seen = _http.bodies(ctx, exchanges)
-        if seen is None:
-            return base.Verdict.inconclusive(
-                "no response body could be read for this surface")
-
         candidates = []
-        for row, body in seen:
+        for row, body in seen.entries:
             for pattern, what, issue_type_id in _PATTERNS:
                 if not pattern.search(body):
                     continue
@@ -66,4 +62,4 @@ class StackTrace:
                                 "detail server-side.",
                 ))
                 break     # one trace per exchange is the finding
-        return base.Verdict.finding(*candidates) if candidates else base.Verdict.clean()
+        return _http.verdict(seen, candidates)

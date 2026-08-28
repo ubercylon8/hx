@@ -789,3 +789,47 @@ def test_a_host_scoped_issue_on_two_hosts_still_files_two(scan_env):
 
     hosts = sorted(r[0] for r in conn.execute("SELECT host FROM finding"))
     assert hosts == ["app.test", "other.test"], hosts
+
+
+# --- Whole-branch review F6 (MEDIUM): `_exchanges_for` did not carry the
+# exchange's `outcome`, so a check could not tell a response that came back
+# whole from one that never did.
+
+
+def test_an_exchange_that_never_answered_makes_the_scan_say_inconclusive(
+    scan_env,
+):
+    """F6, at the runner. `tests/test_checks_passive.py` pins the RULE; this
+    pins that `_exchanges_for`'s SELECT actually hands the check the column
+    the rule is built on -- a query that dropped `outcome` would leave every
+    passive test above green and every real scan blind.
+
+    MEASURED before the fix, on exactly this database: `check_run` came back
+    `('hx.passive.security-headers', 'clean', None)` -- a surface holding one
+    unreadable exchange recorded as tested and clean, which is S12's rule
+    ("a report that cannot distinguish 'tested, clean' from 'never reached'
+    is worse than no report") broken at the level the coverage section reads
+    from.
+    """
+    conn = scan_env["conn"]
+    conn.execute("UPDATE exchange SET resp_blob='d1' WHERE id='x-1'")
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url) VALUES('x-2', NULL, 's-1', 'proxy',"
+        " 'status_unreadable', 1, 'GET', 'https://app.test/')")
+    fully_headed = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/html\r\n"
+        b"X-Content-Type-Options: nosniff\r\n"
+        b"X-Frame-Options: DENY\r\n"
+        b"Strict-Transport-Security: max-age=1\r\n"
+        b"\r\n<html></html>"
+    )
+    env = dict(scan_env, blobs=_Blobs(d1=fully_headed))
+
+    scan.run(**env, checks=(security_headers.SecurityHeaders(),))
+
+    verdict, reason = conn.execute(
+        "SELECT verdict, reason FROM check_run").fetchone()
+    assert verdict == "inconclusive", (verdict, reason)
+    assert "x-2" in reason and "status_unreadable" in reason, reason

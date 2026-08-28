@@ -58,13 +58,9 @@ class CookieFlags:
     insertion_kinds = frozenset()
 
     def on_surface(self, ctx, surface, exchanges) -> base.Verdict:
-        bodies = _http.responses(ctx, exchanges)
-        if bodies is None:
-            return base.Verdict.inconclusive(
-                "no response body could be read for this surface")
-
+        seen = _http.responses(ctx, exchanges)
         candidates = []
-        for row, head in bodies:
+        for row, head in seen.entries:
             https = row.url.lower().startswith("https://")
             for cookie in _http.header_values(head, "set-cookie"):
                 name = cookie.split("=", 1)[0].strip()
@@ -95,4 +91,4 @@ class CookieFlags:
                         "cross-site submission; Secure prevents it being sent "
                         "over plaintext."),
                 ))
-        return base.Verdict.finding(*candidates) if candidates else base.Verdict.clean()
+        return _http.verdict(seen, candidates)
