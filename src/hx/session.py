@@ -13,6 +13,7 @@ unconfigured extension refuses everything.
 """
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import os
@@ -20,7 +21,15 @@ import shutil
 import socket
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
+
+from hx import capture as capture_mod
+from hx import halt as halt_mod
+from hx.bridge.server import BridgeServer
+from hx.store import blobs as blobs_mod
+from hx.store import db as db_mod
+from hx.store.paths import secure_mkdir
 
 JAR_GLOB = "burpsuite_desktop_v*.jar"
 DEFAULT_LAB = Path.home() / "F0RT1KA" / "burp-lab"
@@ -515,3 +524,144 @@ def stored_scope_sha256(conn, engagement_id: str) -> str:
             f"engagement {engagement_id} has no scope_version row, so there is "
             "no recorded boundary to authorise the extension against")
     return row[0]
+
+
+# --- Task 6: the session itself ------------------------------------------
+
+@dataclass(frozen=True)
+class LiveSession:
+    """A Burp that is up, verified loopback-only, and authorised.
+
+    `operator_port` and `crawler_port` are S4's two listeners and are NOT
+    interchangeable: the operator's browsing and an agent's crawl are told
+    apart by WHICH ONE a request arrived on and by nothing in the traffic, so
+    a caller that dials the wrong one has silently swapped the two rule sets.
+    Both are read back out of the config file Burp was handed.
+
+    `epoch` is the config epoch the extension answered with. It is never 0
+    here: 0 is what the extension reports at DENY-ALL, and a session that
+    reached this object got a `configure` the extension accepted.
+    """
+
+    operator_port: int
+    crawler_port: int
+    epoch: int
+    bridge: object
+    workdir: Path
+
+
+class ExchangeSink:
+    """`hx.capture.Capture` on a connection owned by the thread that uses it.
+
+    THE BRIDGE CALLS ITS SINK ON THE READ THREAD, and a sqlite connection
+    belongs to the thread that opened it -- so a `Capture` built over the main
+    thread's connection raises `ProgrammingError` on every frame. The bridge
+    catches everything the sink throws, BY DESIGN (S4: a lost record changes
+    what hx KNOWS, never what it ALLOWS), so the observable is not an error:
+    it is a live Burp, traffic flowing, and an empty database.
+
+    The connection is therefore opened LAZILY, on the first call, which is
+    already on the read thread.
+
+    ONE READ THREAD is what makes that safe, and it is `BridgeServer`'s
+    guarantee rather than this class's: `_accept_loop` runs on a single thread
+    and every callback comes from it. A second caller thread would get the
+    ProgrammingError this class exists to avoid, which is why nothing but a
+    bridge should hold one of these.
+
+    IT IS NEVER CLOSED, and that is not an oversight. `Connection.close()` is
+    thread-affine too, so closing it from the thread that BUILT the sink
+    raises the very error the laziness exists to prevent, during teardown,
+    where it would replace whatever actually went wrong. `srv.stop()` joins
+    the read thread first, so nothing is still writing; the connection is
+    released with the sink.
+    """
+
+    def __init__(self, root: Path, engagement_id: str, cfg) -> None:
+        self._root, self._id, self._cfg = Path(root), engagement_id, cfg
+        self._capture = None
+
+    def __call__(self, header: dict, request: bytes, response: bytes) -> None:
+        if self._capture is None:
+            self._capture = capture_mod.Capture(
+                db_mod.connect(self._root / "hx.db"),
+                blobs_mod.BlobStore(self._root / "blobs"),
+                engagement_id=self._id, config=self._cfg)
+        # `on_exchange`, not a call on the Capture itself: `hx.capture.Capture`
+        # is a dataclass with no `__call__`, so calling it raises TypeError --
+        # which the bridge would catch and count like any other sink failure,
+        # leaving exactly the live-Burp-and-empty-database this class was
+        # written to prevent, one layer further out.
+        self._capture.on_exchange(header, request, response)
+
+
+@contextlib.contextmanager
+def session(eng, *, instance: str, jar: Path | None = None,
+            workdir: Path | None = None):
+    """A live, configured Burp -- or nothing at all.
+
+    EVERY EXIT TEARS BURP DOWN, including a refused `configure` and a raise
+    from the body. The alternative to tearing down after a failed configure is
+    a running Burp whose extension is at DENY-ALL: it looks like a working
+    session and captures nothing.
+
+    THE ORDER OF THE FIRST FOUR LINES IS THE CHEAPEST REFUSAL FIRST. Locating
+    the jar and reading the authorised scope hash both fail against facts that
+    are already true before anything is started, so they are settled before a
+    socket is bound or a JVM is launched -- an engagement with no
+    `scope_version` row can never be authorised, and starting a Burp to find
+    that out leaves one to kill.
+    """
+    jar = find_burp_jar(jar)
+    work = Path(workdir) if workdir else eng.root / "session"
+    # secure_mkdir, not mkdir: this directory holds the private Burp home
+    # (copied from the operator's own, licence key included), Burp's log, and
+    # the bridge socket. It is created at 0o700 rather than created at the
+    # umask and tightened afterwards -- `BridgeServer.start()` does chmod its
+    # socket's parent, but only once it gets there.
+    secure_mkdir(work)
+
+    halt = halt_mod.OperatorHalt(eng.root, eng.db)
+    # READ, never recomputed, and read HERE -- on the thread that owns
+    # `eng.db`, before the bridge exists. See stored_scope_sha256.
+    scope_sha256 = stored_scope_sha256(eng.db, eng.id)
+
+    srv = BridgeServer(work / "hx.sock", engagement_id=eng.id,
+                       operator_halt=halt,
+                       on_exchange=ExchangeSink(eng.root, eng.id, eng.config))
+    srv.start()
+    proc = None
+    try:
+        proc = launch_burp(work / "hx.sock", eng.id, work,
+                           sentinel=halt.sentinel_path, jar=jar,
+                           instance=instance)
+        if not wait_for(lambda: srv.state == "connected"):
+            raise SessionError(
+                f"Burp never completed the bridge handshake. See "
+                f"{work / 'burp.log'} -- the usual cause is an extension jar "
+                "that is unbuilt or stale, and Burp starts happily without one")
+
+        operator, crawler = proxy_port(work), second_proxy_port(work)
+        why = not_loopback_only(proc.pid, [operator, crawler])
+        if why:
+            raise SessionError(f"refusing to continue: {why}")
+
+        try:
+            epoch = srv.configure(config_body(eng.config),
+                                  scope_sha256=scope_sha256,
+                                  profile=eng.config.safety_profile)
+        except Exception as exc:            # noqa: BLE001
+            raise SessionError(f"the extension refused the scope: {exc}") from exc
+
+        yield LiveSession(operator, crawler, epoch, srv, work)
+    finally:
+        # Nested, so that `srv.stop()` runs even if killing Burp raises. The
+        # guarantee this function makes is that nothing is left running, and a
+        # teardown where one half can cancel the other does not make it.
+        try:
+            if proc is not None:
+                proc.kill()
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=15)
+        finally:
+            srv.stop()
