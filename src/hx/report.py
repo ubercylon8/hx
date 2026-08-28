@@ -318,9 +318,15 @@ def _provenance(conn, engagement_id, config, *, created_us,
     object as the scope that was in force when the traffic was captured. The
     data was all there and simply unwired: `scope_version` is append-only
     under two triggers and described in `schema.sql` as "tamper-evidence for
-    contract disputes", `run.scope_version_id` stamps each run with the
-    version it ran under, and `authorization` has held a place for the
-    signed permission since Plan 1.
+    contract disputes", `run.scope_version_id` is the column that WOULD stamp
+    each run with the version it ran under -- nothing in this build writes
+    it, which is why the `Runs` column reads 0 on every store this build
+    produces and why `_scope_of_record` says so from the store's own numbers
+    rather than from a claim about the build -- and `authorization` has held
+    a place for the signed permission since Plan 1. (N5 of fix round B's
+    re-review: this docstring asserted the stamp as settled fact a hundred
+    lines above a comment that correctly denied it. The code was right and
+    the docstring was what a future reader would have trusted.)
 
     EVERY VERSION, OLDEST FIRST, NOT JUST THE LATEST. A second row means the
     boundary MOVED mid-engagement, which is the one case the append-only
@@ -470,22 +476,46 @@ def _scope_of_record(conn, engagement_id, config) -> list[str]:
             "SELECT COUNT(*) FROM run WHERE engagement_id=?"
             " AND scope_version_id IS NULL", (engagement_id,)).fetchone()[0]
         if unstamped:
-            # Measured, not hypothetical: `run.open_run` writes `id`,
-            # `engagement_id`, `kind`, `safety_profile`, `started_us`,
-            # `status`, `heartbeat_us`, `requests_issued` and
-            # `dropped_total`, and no code path in this repository ever sets
-            # `run.scope_version_id`. So the `Runs` column reads 0 on every
-            # store this build produces, and a client seeing 0 beside "2
-            # run(s) recorded" two paragraphs above would read a
-            # contradiction. It is the absence of a LINK, not of runs, and
-            # the report has to say which -- the same reason the
+            # A client seeing 0 in the `Runs` column beside "2 run(s)
+            # recorded" two paragraphs above reads a contradiction, and the
+            # report has to say which absence the 0 is -- the same reason the
             # authorization section states its own absence rather than being
             # omitted.
-            out.append(f"{unstamped} run(s) carry no `scope_version_id`, so "
-                       "which of the rows above was in force for them cannot "
-                       "be read off this store. Nothing in this build writes "
-                       "that link, so a `Runs` count of 0 above is a missing "
-                       "record and not an absence of runs.\n")
+            #
+            # N1 (fix round C). This used to say "Nothing in this build
+            # writes that link", which is a claim about the BUILD, typed
+            # rather than derived, and exactly the defect F5 was raised for
+            # one section further down. The trigger is scheduled: the day a
+            # plan stamps `run.scope_version_id`, a genuine `Runs` count of 0
+            # -- no run under that version -- would still be declared "a
+            # missing record and not an absence of runs", with nothing to
+            # redden.
+            #
+            # Both numbers below are read off THIS STORE, and the claim is
+            # read off THE TABLE JUST RENDERED: `shown` is the sum of the
+            # `Runs` column a reader can see. When it is 0 the strong
+            # sentence is provable from the page itself; when it is not, the
+            # sentence that fires says only what is true of a partly stamped
+            # store. A writer landing later moves this text by moving the
+            # data, and when every run is stamped `unstamped` is 0 and none
+            # of it renders at all.
+            total_runs = conn.execute(
+                "SELECT COUNT(*) FROM run WHERE engagement_id=?",
+                (engagement_id,)).fetchone()[0]
+            shown = sum(v[4] for v in versions)
+            how_many = (f"All {total_runs} run(s) recorded for this "
+                        "engagement carry"
+                        if unstamped == total_runs else
+                        f"{unstamped} of the {total_runs} run(s) recorded "
+                        "carry")
+            out.append(
+                f"{how_many} no `scope_version_id`, so which of the rows "
+                "above was in force for them cannot be read off this store. "
+                + ("Every `Runs` count above is 0 for that reason alone: it "
+                   "is a missing link, not an absence of runs.\n"
+                   if shown == 0 else
+                   f"The `Runs` column above accounts for {shown} run(s), so "
+                   "a 0 in a row means no STAMPED run named that version.\n"))
 
     if versions and digest == versions[-1][0]:
         out.append("The patterns below are the newest version in that table, "
@@ -518,13 +548,30 @@ def _authorization(conn, engagement_id) -> list[str]:
         " ORDER BY valid_from_us, rowid", (engagement_id,)).fetchall()
     out = ["### Authorization\n"]
     if not rows:
+        # N1 (fix round C). This used to add "Nothing in this build writes
+        # one, so this is true of every engagement it produces" -- a claim
+        # about the BUILD, typed rather than derived, with nothing that
+        # reddens when it stops being true. Unlike the `Runs` count above,
+        # there is no store fact to derive it from: an empty `authorization`
+        # table looks identical whether no writer exists or an operator
+        # simply recorded no document. So the claim is not made. The trigger
+        # is scheduled -- a later plan wires the writer the rendered-row
+        # branch below was built for -- and on that day this sentence would
+        # have told every client whose operator recorded nothing that the
+        # TOOL cannot record it, converting an operator's omission into an
+        # apparent tool limitation. That is the direction that EXCUSES a
+        # missing authorisation record, which is the one direction a
+        # deliverable must not lean in.
+        #
+        # What is left is read entirely off the query above: the table is
+        # empty, and the conservative reading of an empty table is the one a
+        # client is given. It stays true under every future build.
         out.append("**No authorization record is on file for this "
-                   "engagement.** Nothing in this build writes one, so this "
-                   "is true of every engagement it produces: the client's "
-                   "written permission, if any was given, is held outside "
-                   "this store and is not part of this deliverable. Read "
-                   "nothing above as evidence that testing was "
-                   "authorised.\n")
+                   "engagement.** The `authorization` table in this store "
+                   "holds no row for it: the client's written permission, if "
+                   "any was given, is held outside this store and is not "
+                   "part of this deliverable. Read nothing above as evidence "
+                   "that testing was authorised.\n")
         return out
     out.append("| Valid from (UTC) | Valid to (UTC) | Signatory |"
                " `doc_sha256` | `scope_sha256` |")

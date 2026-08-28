@@ -526,13 +526,21 @@ def test_a_run_stamped_with_no_scope_version_is_called_out(report_env):
     _scope_version(report_env["conn"], "sv-1", sha256="a" * 64,
                   effective_from_us=1)
     out = report.render(**report_env)
-    assert "1 run(s) carry no `scope_version_id`" in out
-    # And it must say WHICH absence a `Runs` count of 0 is. `run.open_run`
-    # never writes `scope_version_id` -- no code path in this repository
-    # does -- so 0 is what every store this build produces will show, beside
-    # a paragraph two above saying how many runs were recorded. Left
-    # unexplained that reads as a contradiction in a client document.
-    assert "Nothing in this build writes that link" in out
+    assert "All 1 run(s) recorded for this engagement carry no" \
+           " `scope_version_id`" in out
+    # And it must say WHICH absence a `Runs` count of 0 is: left unexplained,
+    # a 0 beside a paragraph two above saying how many runs were recorded
+    # reads as a contradiction in a client document.
+    #
+    # N1 (fix round C) rewrote this claim so it is DERIVED. It used to read
+    # "Nothing in this build writes that link" -- a typed claim about the
+    # build, which `test_a_partly_stamped_store_makes_no_claim_about_the_
+    # build` below is the separating case for. What it says now is provable
+    # from the table three lines above it: every `Runs` count there is 0,
+    # and the store says every run is unstamped, so the 0s are the missing
+    # link and nothing else.
+    assert "Every `Runs` count above is 0 for that reason alone" in out
+    assert "Nothing in this build writes" not in out
 
 
 def test_the_report_dates_the_engagement_and_its_run_window(report_env):
@@ -1607,3 +1615,80 @@ def test_a_run_that_stopped_without_an_end_is_not_called_still_open():
     assert "must not be quoted as a closed one" in out
     assert "still open" not in out
     assert "latest ending" not in out
+
+
+# --- N1: the two hardcoded negatives, derived or dropped -------------------
+
+def test_a_partly_stamped_store_makes_no_blanket_claim_about_a_zero(
+        report_env):
+    """THE DELIVERABLE OF N1's first half. The sentence used to read
+    "Nothing in this build writes that link, so a `Runs` count of 0 above is
+    a missing record and not an absence of runs" -- a claim about the BUILD,
+    typed rather than derived, exactly the defect F5 was raised for. The
+    trigger is scheduled: the day a plan stamps `run.scope_version_id`, a
+    `Runs` count of 0 is a genuine absence of runs under that version, and
+    the old sentence would still have denied it with nothing to redden.
+
+    Here one run is stamped and one is not, which is the shape that store
+    has. The blanket claim must be gone, and what replaces it must be
+    readable off the table three lines above."""
+    conn = report_env["conn"]
+    _scope_version(conn, "sv-1", sha256="a" * 64, effective_from_us=1)
+    _run(conn, "r-2", started_us=3, scope_version_id="sv-1")
+    out = report.render(**report_env)
+
+    assert "1 of the 2 run(s) recorded carry no `scope_version_id`" in out
+    assert "The `Runs` column above accounts for 1 run(s)" in out
+    assert "Every `Runs` count above is 0" not in out
+    # The typed negative itself, in any of the shapes it could come back as.
+    assert "Nothing in this build writes" not in out
+    assert "a missing record and not an absence of runs" not in out
+
+
+def test_a_fully_stamped_store_says_nothing_about_a_missing_link(report_env):
+    """The far side of the same scheduled trigger: once every run carries the
+    link there is no absence to explain, and the paragraph must not render at
+    all rather than explaining an absence that is not there."""
+    conn = report_env["conn"]
+    _scope_version(conn, "sv-1", sha256="a" * 64, effective_from_us=1)
+    conn.execute("UPDATE run SET scope_version_id='sv-1' WHERE id='r-1'")
+    out = report.render(**report_env)
+
+    assert "carry no `scope_version_id`" not in out
+    assert "Nothing in this build writes" not in out
+    # And the run is counted against its version, which is the whole point of
+    # the column.
+    assert "| 1 |" in out
+
+
+def test_the_authorization_note_states_the_store_and_not_the_build(report_env):
+    """THE DELIVERABLE OF N1's second half. The absent-record note used to
+    add "Nothing in this build writes one, so this is true of every
+    engagement it produces" -- the same typed claim about the build, with the
+    same scheduled trigger (a later plan wires the writer the rendered-row
+    branch below was built for). On that day every engagement whose operator
+    simply recorded no document would have told the client the TOOL cannot
+    record one, converting an operator's omission into an apparent tool
+    limitation -- the direction that EXCUSES a missing authorisation record.
+
+    Unlike the `Runs` count above there is no store fact to derive the claim
+    from: an empty `authorization` table looks identical whether no writer
+    exists or an operator recorded nothing. So the claim is not made, and
+    this test is what keeps it from coming back -- a claim that is never made
+    cannot decay. What is left is read entirely off the query that ran."""
+    out = report.render(**report_env)
+    # Sliced to the end of the section, not to the end of the document: the
+    # Limits section further down legitimately says "this build" about the
+    # check corpus, and a slice that swallowed it would make the negative
+    # assertions below unsatisfiable for a reason that is not this defect.
+    section = out[out.index("### Authorization"):out.index("## Findings")]
+
+    assert "No authorization record is on file" in section
+    assert "The `authorization` table in this store holds no row for it" \
+           in section
+    assert "Read nothing above as evidence that testing was authorised" \
+           in section
+    for typed in ("this build", "every engagement it produces"):
+        assert typed not in section, \
+            f"the Authorization note claims {typed!r}, a build fact it " \
+            "cannot check and no test can redden"
