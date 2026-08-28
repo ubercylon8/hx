@@ -100,28 +100,6 @@ def _newest_source_mtime() -> float:
     return newest
 
 
-def _jar_is_stale() -> bool:
-    """True when any extension source is newer than the jar built from it.
-
-    Nothing in the suite runs build.sh and the jar is gitignored, so an edit
-    to BridgeClient.java without a rebuild leaves `-m integration` reporting
-    2 passed while certifying this plan's central claim against an artifact
-    that no longer matches the code. mtime is a coarse signal, and it errs in
-    the safe direction: a touched but unchanged source skips the run with a
-    reason that names the fix, rather than passing it silently.
-    """
-    try:
-        return _newest_source_mtime() > _jar_mtime()
-    except OSError:
-        # A missing jar is the caller's row, not ours. The broader catch is
-        # the lesson from _eula_accepted() above: anything raised out of
-        # missing() is not a skip, it is a collection error for the entire
-        # repository. A source that vanishes between the glob and the stat --
-        # a rebuild or a checkout running alongside the suite -- is no
-        # evidence that the jar is stale, so say nothing and let the run go.
-        return False
-
-
 def extension_problem() -> str | None:
     """Why the bridge extension jar cannot be used, or None.
 
