@@ -81,7 +81,11 @@ class Candidate:
     IT IS A STABLE IDENTITY STRING, NOT A LABEL. It goes in the dedupe key
     and in `finding.issue_type_id`, so renaming one later re-files every
     existing finding of that type as new. Lowercase kebab, describing the
-    ISSUE (`missing-hsts`) and never the code path that noticed it. It is a
+    ISSUE (`missing-hsts`) and never the code path that noticed it -- EXCEPT
+    where the issue type must carry a name the protocol itself treats as
+    case-sensitive, which is why `hx.checks.passive.cookie_flags` preserves
+    the cookie's case (RFC 6265: `Session` and `session` are two cookies, and
+    folding them gave them one finding). It is a
     DIFFERENT AXIS from the check's own `id`: `check_id` answers "which of
     hx's checks found this", `issue_type_id` answers "what kind of issue is
     this", and `hx.scan._mark_unobserved` and schema.sql both depend on the

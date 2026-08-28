@@ -15,8 +15,6 @@ of one host gave three findings whose keys differed only in `path_template`.
 """
 from __future__ import annotations
 
-import re
-
 from hx.checks import base
 from hx.checks.passive import _http
 
@@ -25,7 +23,62 @@ from hx.checks.passive import _http
 # never sent at all, so demanding it of a target with no TLS is a finding the
 # client cannot act on.
 
-_NOT_KEBAB = re.compile(r"[^a-z0-9]+")
+# The bytes a cookie name keeps as themselves inside `issue_type_id`.
+# Everything else -- INCLUDING `%` itself, and including the `|` that
+# separates the parts of `finding.dedupe_key` -- is escaped by `_encode_name`.
+_SAFE = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._")
+
+
+def _encode_name(name: str) -> str:
+    """A cookie name, escaped so TWO NAMES CAN NEVER SHARE ONE ENCODING.
+
+    D4 of the fix-round-A re-review (LOW, and it dropped a finding in
+    silence). The transform here was `[^a-z0-9]+ -> "-"`, lowercased,
+    stripped, `or "unnamed"`. It was LOSSY in four ways, each of which merges
+    two real cookies into one stored finding while `summary.findings` counts
+    both: `session_id` and `session.id` (punctuation classes collapse);
+    `Session` and `session` (RFC 6265 makes a cookie name case-SENSITIVE, so
+    those are two cookies); `__Host-a` and `__host_a`; and every
+    all-punctuation name onto the literal `unnamed`, which a cookie may also
+    simply be called. That is F1 of the whole-branch review verbatim -- the
+    chimera row, the second candidate's severity on the first's title -- on
+    the one check whose `issue_type_id` was supposed to close it, and the
+    dropped finding is silent.
+
+    THE ESCAPE, and why it cannot collide. The name is taken to UTF-8 bytes;
+    each byte is either one `_SAFE` character, spelled as itself, or three
+    characters `%XX` with XX its uppercase hex. That per-byte code is
+    PREFIX-FREE and one-to-one: a `%` escape is the only code that starts
+    with `%` (`%` is not in `_SAFE`, so a literal `%` in a name is `%25`),
+    and every other code is a single non-`%` character. A concatenation of
+    codes from a prefix-free one-to-one code is uniquely decodable, so the
+    byte string can be read straight back off the encoding; UTF-8 is
+    one-to-one on names; therefore two distinct names cannot encode alike.
+    The fixed `cookie-` prefix and `-flags` suffix `_issue_type` wraps it in
+    are constants, which cannot make two distinct middles equal.
+
+    NOT A HASH, and not a slug-plus-truncated-digest. A digest short enough
+    to read is short enough to collide, and this value is IDENTITY -- a
+    collision here is two clients' cookies sharing one ticket, silently,
+    which is the defect rather than a fix for it. Escaping keeps the common
+    case literally readable (`cookie-session_id-flags`, `cookie-JSESSIONID-flags`)
+    and pays three characters only for the bytes that are genuinely unusual
+    in a name.
+
+    THE LOSSY VERSION WAS STILL RIGHT ABOUT ONE THING: attacker-influenced
+    bytes must not reach the dedupe key raw, because `|` is that key's
+    separator and a cookie named `a|b` could otherwise forge a key belonging
+    to another finding. `|` is not in `_SAFE`, so it becomes `%7C`, and so
+    does every other byte outside the set.
+
+    An empty name (a response of `Set-Cookie: =v`) encodes to the empty
+    string and needs no placeholder: it is the only name that does, which is
+    exactly what `or "unnamed"` broke.
+    """
+    return "".join(
+        chr(b) if chr(b) in _SAFE else f"%{b:02X}"
+        for b in name.encode("utf-8", "surrogatepass"))
 
 
 def _issue_type(name: str) -> str:
@@ -66,9 +119,12 @@ def _issue_type(name: str) -> str:
 
     The flag list stays in `title` and `description`, where a reader needs it
     and nothing keys off it.
+
+    The name is spelled by `_encode_name`, which is INJECTIVE and preserves
+    case: identity is worth nothing if two different cookies can reach the
+    same one.
     """
-    slug = _NOT_KEBAB.sub("-", name.lower()).strip("-") or "unnamed"
-    return f"cookie-{slug}-flags"
+    return f"cookie-{_encode_name(name)}-flags"
 
 
 class CookieFlags:

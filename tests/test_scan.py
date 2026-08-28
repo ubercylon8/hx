@@ -881,6 +881,51 @@ def test_two_flag_sets_of_one_cookie_share_one_dedupe_key(scan_env):
     assert "missing" not in keys[0], keys[0]
 
 
+# --- Fix-round-A re-review D4 (LOW, and it dropped a finding in silence): the
+# cookie-name slug lowercased and collapsed every run of punctuation, so two
+# genuinely different cookies could file one finding while `summary.findings`
+# counted both.
+
+
+def _two_cookies(first: bytes, second: bytes) -> bytes:
+    return (b"HTTP/1.1 200 OK\r\n"
+            b"Set-Cookie: " + first + b"=a; SameSite=Lax; Secure\r\n"
+            b"Set-Cookie: " + second + b"=b; SameSite=Lax; Secure\r\n"
+            b"\r\n")
+
+
+@pytest.mark.parametrize("first, second", [
+    (b"session_id", b"session.id"),     # two punctuation classes, one slug
+    (b"Session", b"session"),           # RFC 6265: cookie names are case-sensitive
+])
+def test_two_cookies_that_slugged_alike_file_two_findings(scan_env, first, second):
+    """D4. Both cookies are on one host and are missing exactly HttpOnly, so
+    the ONLY thing that can tell their findings apart is the name inside
+    `issue_type_id`.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against the lossy slug
+    on exactly this input: `summary.findings` said 2 and `finding` held ONE
+    row, keyed `...|cookie-session-id-missing-httponly|...`. That is F1 of
+    the whole-branch review verbatim -- the second candidate's severity on
+    the first candidate's title -- on the one check whose `issue_type_id`
+    was supposed to make it impossible, and the dropped finding is silent.
+    The store count is asserted beside `summary.findings` for that reason:
+    the count alone was never the thing that was wrong.
+    """
+    conn = scan_env["conn"]
+    conn.execute("UPDATE exchange SET resp_blob='d1' WHERE id='x-1'")
+    env = dict(scan_env, blobs=_Blobs(d1=_two_cookies(first, second)))
+
+    summary = scan.run(**env, checks=(cookie_flags.CookieFlags(),))
+
+    keys = sorted(r[0] for r in conn.execute("SELECT dedupe_key FROM finding"))
+    assert len(keys) == 2, keys
+    assert summary.findings == 2, (
+        "summary.findings and the store disagreed: one of the two cookies "
+        "was written over the other")
+    assert len(set(keys)) == 2, keys
+
+
 # --- Whole-branch review F6 (MEDIUM): `_exchanges_for` did not carry the
 # exchange's `outcome`, so a check could not tell a response that came back
 # whole from one that never did.

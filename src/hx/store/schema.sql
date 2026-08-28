@@ -170,9 +170,11 @@ CREATE TABLE IF NOT EXISTS finding (
   -- severity and CWE mappings come from Burp's 183 vendored issue
   -- definitions, so a report reads in the same vocabulary a Pro user's
   -- would. Adopting those ids is still a later plan's job; until then each
-  -- check names its own stable lowercase-kebab value (`missing-hsts`), and
-  -- swapping in Burp's vocabulary later is a change of SPELLING on this
-  -- axis, not a change of what the axis means. NOT to be used for anything
+  -- check names its own stable value -- lowercase kebab (`missing-hsts`)
+  -- unless the id has to carry a name the protocol treats as case-sensitive,
+  -- as `cookie_flags` does for the cookie -- and swapping in Burp's
+  -- vocabulary later is a change of SPELLING on this axis, not a change of
+  -- what the axis means. NOT to be used for anything
   -- else, including the column immediately below.
   --
   -- WRITTEN, and part of identity, since F1 of the whole-branch review

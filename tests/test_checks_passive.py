@@ -88,6 +88,54 @@ def test_a_second_set_cookie_header_is_still_checked():
     assert "b" in v.candidates[0].title
 
 
+def test_the_issue_type_carries_the_cookie_but_not_the_missing_flags():
+    """D1 and D4 at the unit the dedupe key is built from.
+
+    The cookie NAME is in the issue type because with `scope_level='host'`
+    and no insertion point it is the only part of the key left that can tell
+    `session` from `csrf`. What the cookie is MISSING is not, because that
+    changes as the client fixes it and identity may not.
+    """
+    assert cookie_flags._issue_type("session") == "cookie-session-flags"
+    assert cookie_flags._issue_type("JSESSIONID") == "cookie-JSESSIONID-flags"
+
+
+@pytest.mark.parametrize("name, encoded", [
+    ("session", "session"),          # the common case stays literally readable
+    ("session_id", "session_id"),
+    ("session.id", "session.id"),    # NOT the same as session_id
+    ("Session", "Session"),          # RFC 6265: names are case-sensitive
+    ("__Host-a", "__Host-a"),
+    ("a|b", "a%7Cb"),                # the dedupe key's own separator
+    ("a%b", "a%25b"),                # the escape character itself
+    ("", ""),                        # `Set-Cookie: =v`, and no placeholder
+    ("\u00e9", "%C3%A9"),             # non-ASCII, by its UTF-8 bytes
+])
+def test_the_cookie_name_escape_is_readable_and_reversible(name, encoded):
+    """D4. The escape is the injectivity argument, so it is asserted as a
+    mapping rather than through a property test that could pass by luck."""
+    assert cookie_flags._encode_name(name) == encoded
+
+
+def test_no_two_cookie_names_share_an_issue_type():
+    """D4, stated as the property that matters. `issue_type_id` is IDENTITY:
+    it goes in `finding.dedupe_key`, so two names sharing one means two
+    clients' cookies sharing one ticket -- silently, since `summary.findings`
+    still counts both candidates.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against the previous
+    `[^a-z0-9]+ -> "-"` slug: this list of 10 names produced FOUR distinct
+    issue types -- `cookie-session-flags`, `cookie-session-id-flags`,
+    `cookie-host-a-flags` and `cookie-unnamed-flags` -- so six of the ten
+    cookies would have been filed onto another cookie's finding.
+    """
+    names = ["session", "Session", "SESSION", "session_id", "session.id",
+             "session-id", "__Host-a", "__host_a", "unnamed", "..."]
+    types = {cookie_flags._issue_type(n) for n in names}
+    assert len(types) == len(names), sorted(types)
+    assert not any("|" in t for t in types), types
+
+
 # ---- security headers -------------------------------------------------
 
 def test_missing_nosniff_and_frame_protection_are_findings():
