@@ -434,3 +434,49 @@ def test_the_workdir_is_0o700_before_anything_else_tightens_it(
     assert seen["mode"] == 0o700, (
         f"the session workdir was created at {oct(seen.get('mode', 0))}; it "
         "holds the Burp home copied from the operator's own")
+
+
+def test_a_stale_bridge_socket_is_reported_and_never_removed(
+        monkeypatch, an_engagement, a_jar):
+    """`srv.start()` is inside the module's error contract, and only reports.
+
+    A killed session leaves `hx.sock` behind and `BridgeServer.start()`
+    refuses it "rather than adopt a path another process may own". That is a
+    `BridgeError`, and it is raised OUTSIDE the `try` that turns everything
+    else here into a `SessionError` -- so without the wrap it escapes a module
+    whose entire exception contract is `SessionError` with a message naming
+    the fix, and Task 7's CLI shows a traceback or learns about bridge
+    internals to avoid one.
+
+    The stale socket is left EXACTLY WHERE IT WAS. A socket that is still live
+    belongs to a session that is still running, and unlinking another
+    process's rendezvous to make an error go away is worse than the error.
+
+    No monkeypatch stands in for the failure: the file is really there and
+    `BridgeServer.start()` really refuses it. `launch_burp` is replaced only
+    to make sure no JVM starts if the refusal ever stops happening.
+    """
+    launched = []
+
+    def never_launched(*a, **k):
+        launched.append(a)
+        raise AssertionError("Burp was launched after the bridge failed to start")
+
+    monkeypatch.setattr(session, "launch_burp", never_launched)
+
+    work = an_engagement.root / "session"
+    work.mkdir(mode=0o700)
+    stale = work / "hx.sock"
+    stale.write_bytes(b"")
+
+    with pytest.raises(session.SessionError) as exc:
+        with session.session(an_engagement, instance="capture", jar=a_jar):
+            pass
+
+    assert str(stale) in str(exc.value), "the message must name the path to remove"
+    assert "did not shut down cleanly" in str(exc.value)
+    assert stale.exists(), (
+        "hx removed the socket. It must not: a live socket belongs to a "
+        "session that is still running, and unlinking another process's "
+        "rendezvous is worse than an error message")
+    assert not launched

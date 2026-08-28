@@ -657,13 +657,38 @@ def session(eng, *, instance: str, jar: Path | None = None,
     # against a real Burp since Plan 4, and the reason `ExchangeSink` owns
     # `on_halted` rather than leaving S4's auto-halt writer without a caller.
     sink = ExchangeSink(eng.root, eng.id, eng.config)
-    srv = BridgeServer(work / "hx.sock", engagement_id=eng.id,
-                       operator_halt=halt,
+    sock = work / "hx.sock"
+    srv = BridgeServer(sock, engagement_id=eng.id, operator_halt=halt,
                        on_exchange=sink, on_halted=sink.on_halted)
-    srv.start()
+    try:
+        srv.start()
+    except Exception as exc:            # noqa: BLE001
+        # INSIDE THE CONTRACT. `srv.start()` is the one step of this function
+        # that a caller can reach without a `SessionError`, and its commonest
+        # failure is one a killed session leaves behind: a stale `hx.sock`,
+        # which `BridgeServer.start()` refuses "rather than adopt a path
+        # another process may own". Raw, that is a `BridgeError` escaping a
+        # module whose whole exception contract is `SessionError` with a
+        # message naming the fix -- and the next caller is the CLI, which
+        # would have to learn about bridge internals to print it, spreading
+        # that knowledge outward to compensate for a promise made here.
+        #
+        # REPORTED, NEVER REMEDIATED. hx does not unlink the path: a socket
+        # that is still live belongs to a session that is still RUNNING, and
+        # silently removing another process's rendezvous is worse than any
+        # error message. Nothing is cleaned up here either -- `srv.stop()`
+        # would be the obvious reflex and it is exactly wrong, because it
+        # unlinks `socket_path`, which in the case that brings us here is a
+        # file this call did not create.
+        raise SessionError(
+            f"the bridge could not start on {sock}: {exc}. If no other hx "
+            "session is running against this engagement, a previous one did "
+            "not shut down cleanly -- remove that path by hand and try "
+            "again. hx will not remove it for you: a live socket belongs to "
+            "a session that is still running") from exc
     proc = None
     try:
-        proc = launch_burp(work / "hx.sock", eng.id, work,
+        proc = launch_burp(sock, eng.id, work,
                            sentinel=halt.sentinel_path, jar=jar,
                            instance=instance)
         if not wait_for(lambda: srv.state == "connected"):
