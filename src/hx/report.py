@@ -721,8 +721,6 @@ def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
                        f" {_reason_cell(reasons.get((check_id, verdict), []))} |")
         out.append("")
 
-    out.extend(_untested(untested))
-
     # F11: a check CLASS the operator disabled, or one this build ships
     # nothing for, leaves no `check_run` row and so no trace in the table
     # above -- `hx scan` already tells the operator this at the terminal
@@ -739,6 +737,14 @@ def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
                    "nothing above is coverage for it.")
     if unshipped:
         out.append("")
+
+    # LAST IN THE SECTION, and after the unshipped notes rather than before
+    # them: these are bullets too, and a blank line between two bullet lists
+    # is not a separation a reader sees. The notes qualify the TABLE and
+    # belong beside it; the untested list is the section's conclusion, and
+    # putting the notes under it made them read as three more untested
+    # surfaces.
+    out.extend(_untested(untested))
     return out
 
 
