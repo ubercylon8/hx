@@ -2118,7 +2118,7 @@ If a test fails, read it before changing it. A test that broke because the produ
 - [ ] **Step 5: Run both suites**
 
 Run: `.venv/bin/pytest -q && .venv/bin/pytest -m integration -q`
-Expected: `961 passed, 1 skipped, 30 deselected` and `30 passed`.
+Expected at the time this step was written: `961 passed, 1 skipped, 30 deselected` and `30 passed`. Task 9 and the whole-branch fix wave both added tests; the branch's finished totals are the ones in Task 9's Step 4 below.
 
 - [ ] **Step 6: Commit**
 
@@ -2326,7 +2326,7 @@ def test_capture_start_records_what_the_operator_browses(tmp_path):
 ./extension/test.sh 2>&1 | tail -3
 ```
 
-Expected: `961 passed, 1 skipped, 30 deselected`; `32 passed`; and for Java `13 ALL PASS` with **2352 output lines and 2330 `ok`** — check the line count, not just rc.
+Expected: `1006 passed, 1 skipped, 32 deselected`; `32 passed` (~211 s); and for Java `13 ALL PASS` with **2352 output lines and 2330 `ok`** — check the line count, not just rc. The Python totals are the branch's finished ones, measured after the whole-branch fix wave: the number this step carried until then was `961 passed, 1 skipped, 30 deselected`, which was stale on the day it was written and is the fourth such arithmetic on this plan. The Java numbers have not moved and must not — `extension/` is untouched by this plan.
 
 - [ ] **Step 5: Commit**
 
