@@ -51,7 +51,6 @@ from click.testing import CliRunner
 from hx import cli
 from hx import config as config_mod
 from hx import engagement as eng_mod
-from hx import engagement as engagement_mod
 from hx import run as run_mod
 from hx import session as session_mod
 
@@ -80,12 +79,19 @@ class _FakeLiveSession:
         self.workdir = None
 
 
-def _fake_session(operator_port: int = 0):
+def _fake_session(operator_port: int = 0, calls: list | None = None):
     """A stand-in for `session.session` that launches nothing and yields a
-    fake `LiveSession` with the given `operator_port`."""
+    fake `LiveSession` with the given `operator_port`.
+
+    `calls`, when given, gets one dict appended per invocation recording the
+    keyword arguments `capture_start` actually passed through -- in
+    particular `jar`, which nothing asserted on before this fix round:
+    mutating `jar=burp_jar` to `jar=None` in the command reddened nothing."""
 
     @contextlib.contextmanager
     def factory(eng, *, instance, jar=None, workdir=None):
+        if calls is not None:
+            calls.append({"instance": instance, "jar": jar, "workdir": workdir})
         yield _FakeLiveSession(operator_port=operator_port)
 
     return factory
@@ -132,7 +138,7 @@ def an_engagement(tmp_path):
     cfg = config_mod.Config(
         name="acme-2026-09", client="Acme Corp",
         scope_include=["https://a.test/*"])
-    eng = engagement_mod.create(tmp_path / "acme", cfg, author="jimx")
+    eng = eng_mod.create(tmp_path / "acme", cfg, author="jimx")
     yield eng
     eng.db.close()
 
@@ -160,9 +166,16 @@ def test_ctrl_c_closes_the_run(monkeypatch, an_engagement):
     monkeypatch.setattr(cli, "_block_until_interrupt", interrupt)
     CliRunner().invoke(cli.main, ["capture", "start",
                                   "--root", str(an_engagement.root)])
-    status = an_engagement.db.execute(
-        "SELECT status FROM run ORDER BY started_us DESC LIMIT 1").fetchone()[0]
-    assert status != "running", "Ctrl-C left the run open"
+    row = an_engagement.db.execute(
+        "SELECT status, stop_reason FROM run ORDER BY started_us DESC LIMIT 1").fetchone()
+    # `status != 'running'` alone is satisfied by `aborted`, `killed` or
+    # `error` too -- those mean the harness or S4's auto-halt ended the run,
+    # not the operator. Verbatim the argument the moved F1 test already made
+    # for `capture stop`; `capture_start`'s own close path had been left
+    # with the weaker assertion. Mutating the close to
+    # `status="error", stop_reason="harness fell over"` reddens only this.
+    assert row["status"] == "completed", "Ctrl-C left the run open"
+    assert row["stop_reason"] == "operator"
 
 
 def test_a_session_error_exits_non_zero_and_says_why(monkeypatch, an_engagement):
@@ -172,6 +185,36 @@ def test_a_session_error_exits_non_zero_and_says_why(monkeypatch, an_engagement)
                                            "--root", str(an_engagement.root)])
     assert result.exit_code != 0
     assert "no Burp jar found" in result.output
+    # The property this task exists for: the session opens BEFORE the run.
+    # Moving `current_run` above the `with` in `capture_start` reddens
+    # nothing else in the suite -- only this assertion and the byte-identity
+    # check in test_plan_matches_repo (which reddens on any edit and proves
+    # nothing about behaviour) catch it.
+    assert an_engagement.db.execute("SELECT COUNT(*) FROM run").fetchone()[0] == 0, \
+        "a run row was opened in front of a session that never started"
+
+
+def test_burp_jar_flag_reaches_session(monkeypatch, an_engagement, tmp_path):
+    """`--burp-jar` is documented as how an operator with two jars in
+    `$HX_BURP_LAB` (or one they want to override) says which Burp this
+    engagement runs against -- `find_burp_jar`'s docstring calls silently
+    guessing between two "not a choice hx may make for you". Silently
+    dropping the flag would give that operator the "two jars is an error"
+    refusal from the very flag meant to resolve it, or -- with one jar --
+    would assess against a Burp other than the one they named while the
+    report records the wrong version. Mutating `jar=burp_jar` to `jar=None`
+    in `capture_start` reddens only this test."""
+    calls: list = []
+    monkeypatch.setattr(cli.session_mod, "session", _fake_session(calls=calls))
+    monkeypatch.setattr(cli, "_block_until_interrupt", lambda: None)
+    jar = tmp_path / "burpsuite_desktop_v0.0.0.jar"
+    jar.write_bytes(b"not a jar; session.session is faked in this test")
+    result = CliRunner().invoke(cli.main, [
+        "capture", "start", "--root", str(an_engagement.root),
+        "--burp-jar", str(jar)])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0]["jar"] == jar
 
 
 # --- moved from tests/test_cli.py, adjusted not to touch a real Burp ------

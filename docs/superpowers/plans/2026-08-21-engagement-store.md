@@ -4160,13 +4160,20 @@ def capture_start(kind, root, burp_jar) -> None:
             except sqlite3.Error as exc:
                 raise click.ClickException(
                     f"cannot write to the database at {path}: {exc}") from exc
-            click.echo(f"{kind} run {run_id} is live")
             try:
+                # The echo lives IN the try, not between it and current_run's:
+                # `hx capture start | head` closes the pipe once `head` has
+                # what it wants, Python does not restore SIGPIPE, and this
+                # echo is the first write after the run opens -- outside the
+                # try that BrokenPipeError would escape past the finally
+                # below, leaving the run open and never closed.
+                click.echo(f"{kind} run {run_id} is live")
                 _block_until_interrupt()
             finally:
-                # Runs even when the block above ends in a KeyboardInterrupt:
-                # a run left `status='running'` after the operator's Burp is
-                # gone would read as a live capture forever.
+                # Runs even when the block above ends in a KeyboardInterrupt
+                # or a BrokenPipeError: a run left `status='running'` after
+                # the operator's Burp is gone would read as a live capture
+                # forever.
                 try:
                     run_mod.close_run(eng.db, run_id=run_id, status="completed",
                                       stop_reason="operator")
