@@ -144,6 +144,40 @@ def _flat(value) -> str:
            .replace("\r", " "))
 
 
+def _code(value) -> str:
+    """Free text as a Markdown code span that survives a backtick inside it.
+
+    Split out of the "Never tested" bullet by fix round C. A bullet built as
+    `- \\`GET /a\\`b\\`` closes its span at the embedded backtick and renders
+    the rest as prose: the surface's own identity, corrupted on the one line
+    whose whole job is to name a surface a client must go and test.
+    `surface.path_template` is DERIVED FROM CAPTURED TRAFFIC and the schema
+    puts no CHECK on the column, so a backtick in a path is one request
+    away.
+
+    CommonMark's own escape hatch, not an escape sequence: a code span may be
+    delimited by any run of backticks not occurring in the content, so the
+    fence is one longer than the longest run inside it. The padding space is
+    the second half of the same rule -- a span whose content begins or ends
+    with a backtick needs one space each side, and CommonMark strips exactly
+    that pair back off when it renders. Nothing is dropped or altered, which
+    is `_cell`'s rule for the same reason: the text still matters when it is
+    inconvenient to a code span.
+
+    NEWLINES ARE STILL `_flat`'s JOB and are handled before the fence is
+    chosen -- a newline inside a code span ends the bullet outright, which no
+    amount of backticks fixes.
+    """
+    text = _flat(value)
+    longest = run = 0
+    for ch in text:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    fence = "`" * (longest + 1)
+    pad = " " if not text or text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
 def _cell(value) -> str:
     """A Markdown table cell, safe against the free text that can reach one.
 
@@ -950,7 +984,11 @@ def _untested(untested) -> list[str]:
         # is applied anyway, because the rule is that every free-text field
         # rendered here passes the choke point, not that each caller argues
         # its own field safe.
-        out.append(f"- `{_flat(method)} {_flat(_redact(path_template))}`")
+        #
+        # `_code`, not a hand-written pair of backticks: a backtick in the
+        # template used to close the span early and spill the rest of the
+        # surface's identity into prose. See `_code`.
+        out.append(f"- {_code(f'{_flat(method)} {_redact(path_template)}')}")
     omitted = len(untested) - len(shown)
     if omitted:
         out.append(f"- … {omitted} further surface(s) omitted (this list is "

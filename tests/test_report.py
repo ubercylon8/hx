@@ -1742,3 +1742,63 @@ def test_a_config_matching_the_newest_of_several_is_still_verified(
     assert "verified, not assumed" in out
     assert "SUPERSEDED" not in out
     assert "matches no row above" not in out
+
+
+# --- A backtick in a path template must not break its code span ------------
+
+def test_a_backtick_in_a_path_template_does_not_break_the_code_span():
+    """A bullet built as `- \\`GET /a\\`b\\`` closes its span at the embedded
+    backtick and renders the rest as prose: the surface's own identity
+    corrupted on the one line whose whole job is to name a surface the client
+    must go and test. `surface.path_template` is derived from captured
+    traffic and the schema puts no CHECK on it, so a backtick in a path is
+    one request away.
+
+    CommonMark's own rule, not an escape sequence: the fence is one backtick
+    longer than the longest run inside the content. Nothing is dropped."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _surface(conn, "s-1", path_template="/a`b")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+    assert "- ``GET /a`b``" in out
+
+
+def test_a_path_template_that_begins_and_ends_with_a_backtick_is_padded():
+    """The second half of the same CommonMark rule: a span whose content
+    starts or ends with a backtick needs one space each side, which the
+    renderer strips back off. Without it the fence and the content run
+    together and the span breaks again."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _surface(conn, "s-1", path_template="`x``y`")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+    assert "- ``` GET `x``y` ```" in out
+
+
+def test_an_ordinary_path_template_keeps_its_plain_single_backtick_span(
+        report_env_browsed_after_the_scan):
+    """The separating case: no backtick in the template, so the bullet is
+    exactly the single-backtick span it always was. A fix that widened every
+    fence unconditionally would pass the two tests above and quietly change
+    every ordinary bullet."""
+    out = report.render(**report_env_browsed_after_the_scan)
+    assert "- `GET /orders`" in out
+
+
+def test_a_newline_in_a_path_template_is_still_flattened():
+    """Not disturbed by the code-span fix, and asserted so it stays that way:
+    a newline ends the bullet outright, which no amount of backticks fixes.
+    `_flat` runs first, before the fence is chosen."""
+    conn = _conn()
+    _run(conn, "r-1")
+    _surface(conn, "s-1", path_template="/a\n\n## Findings\n\nNone recorded.")
+    out = report.render(conn=conn, engagement_id="e-1", config=_config())
+    conn.close()
+    # The injected heading is INERT, not absent: it is still rendered (this
+    # module escapes, it does not drop), but it sits inside one bullet's code
+    # span on one line and starts no line of its own.
+    headings = [l for l in out.splitlines() if l.startswith("## Findings")]
+    assert len(headings) == 1
+    assert "- `GET /a  ## Findings  None recorded.`" in out
