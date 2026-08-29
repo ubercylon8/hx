@@ -322,7 +322,7 @@ def test_a_stale_excerpt_is_caught_where_a_whole_file_compare_never_looked(tmp_p
 # intended, not collateral. A pending plan is a plan whose blocks are NOT being
 # compared, and how many stopped being compared should be a decision somebody
 # wrote down rather than a number that quietly moved.
-EXPECTED_BLOCKS = 100
+EXPECTED_BLOCKS = 115
 
 
 def test_the_check_actually_found_some_blocks():

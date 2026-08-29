@@ -27219,49 +27219,43 @@ Replace `launch_burp` in `tests/integration/burp_fixture.py` with this:
 # tests/integration/burp_fixture.py -- launch_burp gains the halt sentinel
 def launch_burp(socket_path: Path, engagement_id: str, workdir: Path,
                 sentinel: Path, crawler_port: int = 0) -> subprocess.Popen:
-    """Burp's output goes to workdir/burp.log, never to a pipe.
+    """`hx.session.launch_burp`, with the two facts that are the RIG's to say.
 
-    An unread subprocess.PIPE is a latent deadlock -- Burp blocks once the pipe
-    buffer fills and the test hangs with no diagnostic. A file also means a
-    failing test can quote what Burp actually said.
+    The launcher itself is the product's, which is the whole point: the
+    `--add-opens` list, the `-Dhx.*` properties, the two loopback-only
+    listeners and the log-to-a-file-never-a-pipe rule are now certified by
+    these thirty tests as the code a consultant's `hx capture start` runs,
+    rather than as a copy of it that agreed on the day it was written.
 
-    TWO PROXY LISTENERS, and the SECOND one is the crawler's. S4 tells the
-    operator and the crawler apart by WHICH LISTENER a request arrived on and
-    by nothing in the traffic itself, so a rig with one listener cannot
-    exercise the split at all -- `Source.forListenerPort` would answer OPERATOR
-    for every request and the two rule sets would never be told apart.
+    Three arguments are still this side's. `jar` is the one this lab holds --
+    resolved once at import, so a test's failure names the same jar
+    `missing()` does. `instance` is "integration" because the rig identifies
+    itself as the rig: `test_real_burp` asserts on `hello["instance_id"]`, and
+    an operator reading a bridge log should be able to tell a test run from a
+    session they started.
 
-    `-Dhx.crawler_port` IS THE OTHER HALF OF THAT AND IT IS NOT OPTIONAL.
-    `HxExtension` reads it with a default of 0, and `Source.forListenerPort`
-    reads 0 as "no crawler configured" -- so a launch that omits it attributes
-    EVERY request to the operator however many listeners are running, and a
-    test of the split passes while measuring nothing. This is the
-    `-Dhx.halt_sentinel` incident that this function's own comment below
-    records, one plan later; the property is passed from the config file Burp
-    was actually handed, never from the argument, so the number the extension
-    compares against and the number Burp bound cannot drift.
-
-    `crawler_port=0` means "any free port"; read the real ones back with
-    proxy_port() and second_proxy_port().
+    `seed=SEED_HOME` IS THE ONE `missing()` CHECKED, and passing it is not
+    tidiness. `session.make_home` copies `seed_home()` by default -- the
+    operator's own `$HOME` -- which is right for a consultant and wrong for
+    every caller here, and for one round of this task it was steered by an
+    autouse fixture setting `$HX_BURP_SEED_HOME`. A fixture only runs under
+    pytest. `scripts/demo_capture.py` and `scripts/demo_gate.py` call this
+    function too: they guarded on `missing()`, which reports on `SEED_HOME`,
+    and then copied the operator's live `~/.BurpSuite/sessions` -- real client
+    project state on a consultant's machine -- into a temporary directory.
+    Checking one home and copying another is the exact disagreement this
+    argument removes, for every caller rather than for the ones pytest owns.
     """
-    home = make_home(workdir)
-    ports = write_listener_config(workdir, crawler_port)
-    log = (workdir / "burp.log").open("wb")
-    cmd = [
-        "java",
-        "-Djava.awt.headless=true",
-        f"-Duser.home={home}",
-        f"-Dhx.socket={socket_path}",
-        f"-Dhx.engagement={engagement_id}",
-        "-Dhx.instance=integration",
-        # Required, not optional: HxExtension.initialize() returns early
-        # ("extension idle") without it, so the extension never dials and the
-        # handshake never happens. Task 6 made it mandatory and this fixture
-        # was not updated -- the integration tests are deselected from the
-        # default run, so nothing said so for a day.
-        f"-Dhx.halt_sentinel={sentinel}",
-        # Read back out of the config above rather than from `crawler_port`,
-        # which may be the 0 that means "choose one for me".
+    return session.launch_burp(
+        socket_path, engagement_id, workdir,
+        sentinel=sentinel,
+        # Not `BURP_JAR` outright: when the import-time search failed this is
+        # None, and calling through raises find_burp_jar's own message, which
+        # names all three places it looked.
+        jar=BURP_JAR if BURP_JAR is not None else find_burp_jar(),
+        instance="integration",
+        crawler_port=crawler_port,
+        seed=SEED_HOME)
 ```
 
 **The block above is now stale in one respect, deliberately left rather than
@@ -27370,7 +27364,6 @@ That has already happened twice on this branch from burp_fixture.missing().
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import socket
 import subprocess
 import time
@@ -27382,12 +27375,9 @@ from typing import Sequence
 
 import pytest
 
-from hx import capture as capture_mod
-from hx import config, engagement
+from hx import config, engagement, session
 from hx.bridge import server
 from hx.halt import OperatorHalt
-from hx.store import blobs as blobs_mod
-from hx.store import db as db_mod
 from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer
 
@@ -27471,73 +27461,52 @@ def _announce_skipped(terminalreporter) -> None:
             "trusting this suite.", yellow=True)
 
 
-class ReadThreadCapture:
-    """`hx.capture.Capture`, on a connection belonging to the thread that uses it.
+def build_config_body(cfg: config.Config, *, max_requests: int,
+                      rate_rps: int | None = None) -> dict[str, list[str]]:
+    """`hx.session.config_body`, plus the two things only a TEST wants.
 
-    THE SINK IS CALLED ON THE BRIDGE'S READ THREAD. `BridgeServer.__init__`
-    says so in as many words and adds the consequence: a callback there "may
-    not touch a sqlite3 connection opened elsewhere: it belongs to the thread
-    that created it and raises ProgrammingError anywhere else". `eng.db` is
-    opened by the fixture, on the main thread, so a `Capture(eng.db, ...)`
-    installed here raises on EVERY frame.
+    The body itself is the product's now. It had been spelled here as well --
+    a shorter body, with a two-entry `dangerous.path` where the engagement
+    config carries nine and no `scope.exclude`, `render.allow` or
+    `limit.concurrency` at all -- and this file's own comment already named
+    that hazard: "a config body spelled anywhere else is a second spelling
+    free to drift from this one". It had drifted. A test asserting a refusal
+    against a body the product would never send proves nothing about the
+    product.
 
-    MEASURED, because the failure is silent in the worst way. `_capture`
-    catches everything the sink throws -- deliberately; S4 says a lost record
-    changes what hx KNOWS, never what it ALLOWS -- keeps the exception in
-    `BridgeServer.exchange_callback_error`, and retries the loss as a `dropped`
-    frame, which raises identically. So the observable is a live Burp, a green
-    handshake, traffic flowing to the target, and ZERO rows: exactly the shape
-    whose natural diagnosis is "the extension never sent anything".
+    `limit.max_requests` is the first addition, and it is an addition rather
+    than a defect in `config_body`: `Limits.arm()` falls back to a documented
+    2000 per run and S4 says the budget binds the send path and the crawler,
+    neither of which the product starts yet, so a number there would have no
+    referent. The rig DOES exhaust a budget on purpose
+    (`test_the_run_budget_is_exhausted_and_stays_exhausted`), which needs a
+    number small enough to reach. It is a parameter rather than a constant
+    because every OTHER test wants it far above anything it issues, so the
+    per-run budget never trips first and quietly turns whatever is under test
+    into a budget test. `Limits.arm` only ever arms once per run (its own
+    docstring: "ARMED ONCE"), so a caller wanting a number other than the
+    default must pass it on the FIRST configure of the test -- a later
+    configure with a different value is silently ignored, by design, so that a
+    scope push mid-run can never hand a run more requests than it started with.
 
-        sqlite3.ProgrammingError: SQLite objects created in a thread can only
-        be used in that same thread.
+    `rate_rps` is the second, and it overrides the rate for ONE configure for
+    exactly one caller: the test that pushes a SECOND configure naming a
+    different `limit.rate_rps` mid-run and expects `bad_config`. Default None
+    means "the engagement's rate", which is what `config_body` reads from the
+    config and what every other caller wants.
 
-    So the connection is opened LAZILY, on the first call, which happens on the
-    read thread -- and every later call is on that same thread. The main thread
-    keeps reading through `eng.db`; two connections to one WAL database is the
-    ordinary arrangement and each sees the other's commits.
-
-    It is deliberately NOT closed at teardown. `Connection.close()` is thread-
-    affine as well (measured, same exception), so closing it from the fixture's
-    unwind would raise during teardown and replace whatever failed the test.
-    `srv.stop()` joins the read thread first, so nothing is still writing.
+    The distress thresholds are deliberately in neither: Plan 2's config-key
+    vocabulary (`codec.CONFIG_KEYS`) has no key for them and
+    `codec.build_config_body` refuses an unrecognised key outright, so the
+    auto-halt test is written against the S4 production defaults the extension
+    carries -- a 5xx rate above 20%, over a window that needs ten answered
+    samples on a host before it may trip.
     """
-
-    def __init__(self, root: Path, engagement_id: str, cfg: config.Config):
-        self._root = Path(root)
-        self._engagement_id = engagement_id
-        self._config = cfg
-        self._capture: capture_mod.Capture | None = None
-
-    def _lazy(self) -> capture_mod.Capture:
-        if self._capture is None:
-            self._capture = capture_mod.Capture(
-                db_mod.connect(self._root / "hx.db"),
-                blobs_mod.BlobStore(self._root / "blobs"),
-                self._engagement_id, self._config)
-        return self._capture
-
-    def __call__(self, header: dict, request: bytes, response: bytes):
-        return self._lazy().on_exchange(header, request, response)
-
-    def on_halted(self, header: dict):
-        """S4's auto-halt, on the same connection and the same thread.
-
-        This rig wired `on_hello` and `on_exchange` and NOT this one, which was
-        half of why `records.abort_run` had no caller outside tests: S4's "one
-        distressed host aborts the whole run" reached the wire, reached
-        `BridgeServer.last_halted`, and stopped there. A real Burp really does
-        emit this frame -- `test_five_hundreds_from_the_slow_route_abort_the_
-        whole_run` drives ten 500s and reads it off the socket -- so wiring it
-        here is what makes the ROW the thing a real auto-halt produces rather
-        than something a test wrote by hand beside it.
-
-        The connection is this class's own, opened lazily on the read thread,
-        for the reason the class docstring gives: `BridgeServer` catches the
-        `ProgrammingError` a foreign connection raises, so the observable of
-        getting this wrong is a green run and an empty table.
-        """
-        return self._lazy().on_halted(header)
+    body = session.config_body(cfg)
+    body["limit.max_requests"] = [str(max_requests)]
+    if rate_rps is not None:
+        body["limit.rate_rps"] = [str(rate_rps)]
+    return body
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -27548,6 +27517,51 @@ def _reap(proc: subprocess.Popen) -> None:
         # Warn rather than raise: this runs during unwind, and an exception
         # here would REPLACE the assertion that actually failed the test.
         warnings.warn(f"Burp pid {proc.pid} survived kill(); it may still be running")
+
+
+def browse_through(port: int, method: str, url: str, *, host: str,
+                   headers: Sequence[tuple[str, str]] = (), body: bytes = b"",
+                   timeout: float = 30.0) -> bytes:
+    """One request through a Burp proxy listener, and the whole response off
+    the wire.
+
+    THE FORWARD-PROXY form: the request line carries the ABSOLUTE URI, which
+    is how a browser configured to use a proxy addresses one and how the
+    destination reaches Burp at all. The `Host` line is set to match only so
+    the target server sees a well-formed request.
+
+    Raw sockets rather than `http.client` for the same reason
+    `test_proxy_facts._Probe.raw_through_proxy` uses them: the byte count of
+    the FULL response is half of what a drop is recognised by, and no
+    http.client API exposes it. Reading to EOF is bounded twice over -- the
+    socket timeout, and Burp closing the connection itself.
+
+    A FUNCTION, NOT A METHOD, since Task 9: `Rig.browse` is the rig's caller
+    and `tests/integration/test_cli_session.py` is a caller with NO RIG AT
+    ALL -- it browses through a listener the product's own `session()` (or
+    `hx capture start` in another process) opened, which is the whole point
+    of that file. A second copy of these fifteen lines is a second place to
+    get the absolute-URI form or the read-to-EOF wrong, and the wrong one
+    looks like a drop.
+    """
+    lines = [f"{method} {url} HTTP/1.1",
+             f"Host: {host}",
+             "Connection: close"]
+    lines += [f"{name}: {value}" for name, value in headers]
+    if body:
+        lines.append(f"Content-Length: {len(body)}")
+    # ISO-8859-1 for the same reason Sender.parse reads it that way: HTTP
+    # field values are octets, and one octet is one char here.
+    raw = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        sock.sendall(raw)
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        sock.close()
 
 
 @dataclass
@@ -27576,57 +27590,32 @@ class Rig:
 
     def configure(self, *, max_requests: int = 2000,
                   rate_rps: int | None = None) -> int:
-        """Push the scope, the method allowlist and the limits this rig tests.
+        """The configure the PRODUCT sends, with the rig's two additions.
 
-        `limit.rate_rps` is taken from the engagement config rather than
-        written out here. S4 puts the limits inside the extension and the
-        configure body is how they get there, so the number in the config, the
-        number on the wire and the number a test computes its bounds from are
-        one number. Two of them written separately is how a test ends up
-        asserting against a rate nothing honours. The value the fixture picks
-        is 3 rather than the config default of 5, and the reason is at the
-        Config() call: 5 is what the extension falls back to on its own.
+        Everything about the body is `build_config_body`'s; see it for why
+        `max_requests` and `rate_rps` are the only two things this side adds.
+        `limit.rate_rps` reaching the extension from the engagement config is
+        what makes the number in the config, the number on the wire and the
+        number a test computes its bounds from one number: the rig sets 3
+        rather than hx.config's default of 5 at the Config() call, because 5
+        is also what the extension falls back to when the key is absent, so a
+        configured 5 and an ignored configure body would be the same
+        observation.
 
-        `limit.max_requests` has no engagement-config field yet, so this is the
-        rig's own choice, and it is a parameter rather than a second constant
-        for exactly one reason: every test but the budget test wants it far
-        above anything that test issues, so the per-run budget never trips
-        first and quietly turns whatever it is testing into a budget test.
-        `Limits.arm` only ever arms once per run (its own docstring: "ARMED
-        ONCE"), so a caller wanting a number other than the default must pass
-        it on the FIRST configure of the test -- a later configure with a
-        different value is silently ignored, by design, so that a scope push
-        mid-run can never hand a run more requests than it started with.
-
-        `rate_rps` overrides the rate for ONE configure and exists for exactly
-        one caller: the test that pushes a SECOND configure naming a different
-        `limit.rate_rps` mid-run and expects `bad_config`. That body has to be
-        built here rather than in the test -- a config body spelled anywhere
-        else is a second spelling free to drift from this one, and a test
-        asserting a refusal against a body the rig would never send proves
-        nothing about the rig. Default None means "the engagement's rate",
-        which is what every other caller wants and what the first configure of
-        that test uses.
-
-        The distress thresholds are deliberately NOT here. Plan 2's config-key
-        vocabulary (`codec.CONFIG_KEYS`) has no key for them and
-        `build_config_body` refuses an unrecognised key outright, so the
-        auto-halt test is written against the S4 production defaults the
-        extension carries: a 5xx rate above 20%, over a window that needs ten
-        answered samples on a host before it may trip.
+        THE SCOPE HASH IS READ, NOT RECOMPUTED, through the product's
+        `stored_scope_sha256`. This rig used to hash `config.dumps(cfg)` here.
+        The two agree today -- `engagement.create` writes that same hash into
+        `scope_version` -- and agreeing today is exactly the property Task 5
+        says not to rely on: `scope_version` is append-only so that a contract
+        dispute has one answer, and a rig that recomputes cannot notice a
+        session authorising the extension against one boundary while the
+        report renders another.
         """
-        pairs = {
-            "scope.include": [f"{self.target.origin}/*"],
-            "method.allow": ["GET", "HEAD", "OPTIONS"],
-            "dangerous.path": ["*/logout*", "*/password*"],
-            "limit.rate_rps": [str(self.eng.config.rate_limit_rps
-                                   if rate_rps is None else rate_rps)],
-            "limit.max_requests": [str(max_requests)],
-        }
-        scope_sha256 = hashlib.sha256(
-            config.dumps(self.eng.config).encode("utf-8")).hexdigest()
-        return self.srv.configure(pairs, scope_sha256=scope_sha256,
-                                  profile=self.eng.config.safety_profile)
+        return self.srv.configure(
+            build_config_body(self.eng.config, max_requests=max_requests,
+                              rate_rps=rate_rps),
+            scope_sha256=session.stored_scope_sha256(self.eng.db, self.eng.id),
+            profile=self.eng.config.safety_profile)
 
     def send(self, method: str, target_path: str, *,
              to: TargetServer | None = None,
@@ -27714,42 +27703,19 @@ class Rig:
         Nothing that only calls `send` has ever driven this side of the
         extension.
 
-        THE FORWARD-PROXY form: the request line carries the absolute URI,
-        which is how a browser configured to use a proxy addresses one and
-        how the destination reaches Burp at all. The `Host` line is set to
-        match only so the target server sees a well-formed request.
-
-        Raw sockets rather than `http.client` for the same reason
-        `test_proxy_facts._Probe.raw_through_proxy` uses them: the byte
-        count of the FULL response is half of what a drop is recognised by,
-        and no http.client API exposes it. Reading to EOF is bounded twice
-        over -- the socket timeout above, and Burp closing the connection
-        itself.
-
         `port` defaults to the OPERATOR listener. The crawler's is
         `self.crawler_port` and the difference between them is the whole of
         S4's source attribution.
+
+        The request itself is `browse_through`'s, because a test that has no
+        rig needs the identical one -- see it for why the URI is absolute and
+        why this is a raw socket.
         """
         dest = to or self.target
-        lines = [f"{method} {dest.origin}{path} HTTP/1.1",
-                 f"Host: {dest.host}:{dest.port}",
-                 "Connection: close"]
-        lines += [f"{name}: {value}" for name, value in headers]
-        if body:
-            lines.append(f"Content-Length: {len(body)}")
-        # ISO-8859-1 for the same reason Sender.parse reads it that way: HTTP
-        # field values are octets, and one octet is one char here.
-        raw = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
-        sock = socket.create_connection(("127.0.0.1", port or self.proxy_port),
-                                        timeout=timeout)
-        try:
-            sock.sendall(raw)
-            chunks = []
-            while chunk := sock.recv(65536):
-                chunks.append(chunk)
-            return b"".join(chunks)
-        finally:
-            sock.close()
+        return browse_through(port or self.proxy_port, method,
+                              f"{dest.origin}{path}",
+                              host=f"{dest.host}:{dest.port}",
+                              headers=headers, body=body, timeout=timeout)
 
     def settle(self, predicate, what: str, timeout: float = SETTLE_S) -> None:
         """Wait for a row to arrive, and say WHY it did not if it never does.
@@ -27782,6 +27748,35 @@ class Rig:
             "silent extension. Read that number before reading Burp's log at "
             f"{self.workdir / 'burp' / 'burp.log'}. Target log: "
             f"{[(h.method, h.path) for h in self.target.hits]}")
+
+
+# THERE IS NO SEED-HOME FIXTURE HERE, and its absence is deliberate. One round
+# of this task set `$HX_BURP_SEED_HOME` from an AUTOUSE FIXTURE so that
+# `hx.session.make_home` would copy the lab's home rather than the operator's.
+# It worked for everything pytest runs and for nothing else: `bf.launch_burp`
+# is also called by `scripts/demo_gate.py`, which guards on `bf.missing()` --
+# a check against the LAB's home -- and then copied `~/.BurpSuite/sessions`,
+# real client project state on a consultant's machine. (`demo_capture.py` was
+# the second such caller until Task 9 moved it onto `hx.session.session()`,
+# where it names the same seed in code.) `make_home(workdir, *, seed=None)`
+# moved the answer into the call, so every launcher here says `seed=SEED_HOME`
+# in code, for every caller rather than for the ones pytest owns.
+#
+# THE ENVIRONMENT VARIABLE IS NOT DEAD, AND ONE TEST DEPENDS ON IT. This
+# paragraph used to end "nothing in this directory reaches `seed_home()` any
+# more", and that sentence is now an invitation to a fixed defect.
+# `tests/integration/test_cli_session.py` spawns the PRODUCT's own `hx capture
+# start`, which has no seed option and must not grow one for a test, so it
+# puts `HX_BURP_SEED_HOME=SEED_HOME` in that subprocess's environment. That
+# line used to be the only thing between a real Burp and the operator's real
+# `$HOME`, and deleting it did NOT go red -- a consultant's home has an
+# accepted EULA and a live `~/.BurpSuite/sessions`, so the run succeeded,
+# copied real client project state into a temporary directory, and reported
+# green. It is a guard now rather than a warning: the same env dict also sets
+# `HOME` to a directory that does not exist, so a seed variable that goes
+# missing fails loudly, in that test, naming the fake home. What is true here
+# is the narrow claim: no fixture in this directory sets that variable, and no
+# launcher in this file needs it, because they say the seed in code.
 
 
 @pytest.fixture
@@ -27848,8 +27843,12 @@ def rig(tmp_path):
         # ONE sink object for both callbacks, so both run on ONE connection
         # opened on the read thread. Two objects would open two, and the
         # second would be as thread-affine as the first with nothing making
-        # that obvious.
-        sink = ReadThreadCapture(eng.root, eng.id, cfg)
+        # that obvious. `ExchangeSink` IS this rig's sink, promoted: Task 6
+        # gave it `on_halted` for exactly this wiring, and the lesson it
+        # carries -- that a foreign connection's ProgrammingError is caught,
+        # counted and swallowed, so getting it wrong looks like a green
+        # handshake and an empty table -- was measured here first.
+        sink = session.ExchangeSink(eng.root, eng.id, cfg)
         srv = server.BridgeServer(tmp_path / "hx.sock", engagement_id=eng.id,
                                   operator_halt=operator_halt,
                                   on_exchange=sink,

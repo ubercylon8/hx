@@ -8,7 +8,8 @@ Plan 5 (passive corpus and Markdown reporting), merged at `a28649d`.
 
 **Blocked on the bridge session, discovered 2026-08-28 while planning.** Nothing in
 `src/hx/` calls `bridge.configure()`. `hx capture start` writes a `run` row and nothing
-else; `scripts/demo_capture.py:226` and `tests/integration/conftest.py`'s
+else; `scripts/demo_capture.py:226` (as it stood then — the bridge-session plan
+rewired it) and `tests/integration/conftest.py`'s
 `build_config_body` each stand up their own session because the product has none. The
 extension defaults to DENY-ALL, so an unconfigured one refuses everything — and an active
 check cannot send through a bridge that was never configured. **The session plan lands

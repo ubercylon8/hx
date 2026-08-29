@@ -5,9 +5,12 @@ rather than in the agent-facing tool layer.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import signal
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -19,6 +22,7 @@ from hx import halt as halt_mod
 from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
+from hx import session as session_mod
 from hx.checks import registry
 from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
@@ -211,6 +215,68 @@ def capture() -> None:
     """Start or stop traffic capture for an engagement."""
 
 
+# How often `capture start` asks whether the session it is holding open is
+# still a session. A second is far below anything a human notices and far
+# above anything the check costs: `Popen.poll()` is a non-blocking waitpid and
+# the bridge state is an attribute read.
+_HEALTH_POLL_S = 1.0
+
+
+def _block_until_interrupt(live) -> str | None:
+    """Hold the session open until the operator interrupts -- or Burp dies.
+
+    Returns None when the wait ended the way it usually does (Ctrl-C, which
+    arrives as a KeyboardInterrupt out of `time.sleep`), or the reason the
+    session stopped being one.
+
+    NOT `signal.pause()` ANY MORE, and that is S8's "Burp dies mid-session"
+    path. Paused, a command whose Burp had died blocked forever: the browser
+    got connection-refused, nothing was printed, and the run row stayed
+    `status='running'` until the operator gave up and pressed Ctrl-C, which
+    then closed the run as though they had ended it on purpose. Nothing polled
+    `proc.poll()` or re-read the bridge state, so the only witness was the
+    consultant noticing their proxy had stopped answering.
+
+    Separate so a test can drive the command without a real signal.
+    """
+    while True:
+        why = live.gone()
+        if why is not None:
+            return why
+        time.sleep(_HEALTH_POLL_S)
+
+
+@contextlib.contextmanager
+def _sigterm_ends_the_session():
+    """SIGTERM tears Burp down instead of orphaning it.
+
+    S7: "A Burp process is never orphaned." `capture_start` covered Ctrl-C and
+    exceptions, and SIGTERM -- a `kill`, a terminal closing, a service manager
+    stopping the unit -- killed the command where it stood, leaving a 900 MB
+    JVM and a bridge socket behind. The next run then got the (good) stale
+    socket refusal naming the path to remove.
+
+    Raised as KeyboardInterrupt deliberately: a SIGTERM is somebody stopping
+    this command, which is what Ctrl-C is, and giving the two paths one
+    meaning keeps one teardown and one `stop_reason` rather than two that have
+    to agree. The previous handler is restored on the way out, and a
+    non-main-thread caller (where `signal.signal` raises) simply does not get
+    the handler -- an inability to install one must not stop the session.
+    """
+    def handler(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 @capture.command("start")
 @click.option(
     "--kind",
@@ -220,8 +286,21 @@ def capture() -> None:
     help="Run kind. The vocabulary is derived from the schema, not restated.",
 )
 @click.option("--root", type=click.Path(path_type=Path), default=None)
-def capture_start(kind, root) -> None:
-    """Open the live run of KIND, the deliberately-named path.
+@click.option(
+    "--burp-jar",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Which Burp jar to launch against. Default: $HX_BURP_JAR, then the "
+         "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
+         "a guess, because the report records the version under test.",
+)
+def capture_start(kind, root, burp_jar) -> None:
+    """Launch Burp, open the live run of KIND, and hold the session open
+    until interrupted.
+
+    THE SESSION OPENS BEFORE THE RUN. A run row opened in front of a
+    session that then fails to start is a run that never captured
+    anything, and `hx report` would go on to render it as a real one.
 
     This is `run.current_run`, not `run.open_run`: typing `start` twice
     resumes the one live run of that kind rather than opening a second one.
@@ -229,12 +308,58 @@ def capture_start(kind, root) -> None:
     path = root or default_root()
     eng = _open_engagement(path)
     try:
-        run_id = run_mod.current_run(
-            eng.db, engagement_id=eng.id, kind=kind,
-            safety_profile=eng.config.safety_profile)
-    except sqlite3.Error as exc:
-        raise click.ClickException(f"cannot write to the database at {path}: {exc}") from exc
-    click.echo(f"{kind} run {run_id} is live")
+        with _sigterm_ends_the_session(), \
+                session_mod.session(eng, instance="capture", jar=burp_jar) as live:
+            click.echo(f"operator proxy listening on 127.0.0.1:{live.operator_port}")
+            try:
+                run_id = run_mod.current_run(
+                    eng.db, engagement_id=eng.id, kind=kind,
+                    safety_profile=eng.config.safety_profile)
+            except sqlite3.Error as exc:
+                raise click.ClickException(
+                    f"cannot write to the database at {path}: {exc}") from exc
+            died = None
+            try:
+                # The echo lives IN the try, not between it and current_run's:
+                # `hx capture start | head` closes the pipe once `head` has
+                # what it wants, Python does not restore SIGPIPE, and this
+                # echo is the first write after the run opens -- outside the
+                # try that BrokenPipeError would escape past the finally
+                # below, leaving the run open and never closed.
+                click.echo(f"{kind} run {run_id} is live")
+                died = _block_until_interrupt(live)
+            finally:
+                # Runs even when the block above ends in a KeyboardInterrupt
+                # or a BrokenPipeError: a run left `status='running'` after
+                # the operator's Burp is gone would read as a live capture
+                # forever.
+                #
+                # A DEAD BURP IS NOT A COMPLETED RUN. `run.py`'s own rule --
+                # "a run whose harness DIED resolves to `error`, never to
+                # `completed`, because a report generated from a session that
+                # stopped halfway and claims to be complete is the worst
+                # output this project could produce" -- and the reason
+                # `stop_reason` carries the message rather than the word
+                # "operator": S5 renders it, and an operator reading the
+                # report should find out there that Burp went away.
+                try:
+                    run_mod.close_run(
+                        eng.db, run_id=run_id,
+                        status="error" if died else "completed",
+                        stop_reason=died or "operator")
+                except sqlite3.Error as exc:
+                    raise click.ClickException(
+                        f"cannot write to the database at {path}: {exc}") from exc
+            if died:
+                # Raised INSIDE the `with`, so `session()`'s teardown still
+                # runs: a Burp that died is a Burp whose bridge socket and
+                # accept thread are still this process's to clean up. S8 asks
+                # for a distinct message and a non-zero exit; ClickException
+                # is both, and it is not a SessionError, so the handler below
+                # does not re-wrap it.
+                raise click.ClickException(died)
+    except session_mod.SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @capture.command("stop")

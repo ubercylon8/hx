@@ -24,8 +24,10 @@ Run it:
     .venv/bin/python scripts/demo_capture.py --browse    # waits for your browser
 
 Everything it creates is a temporary directory it removes on the way out, and
-every target is loopback. It never touches your real Burp home: the fixture
-copies a seed home per run, which is also why the first launch takes a moment.
+every target is loopback. It never touches your real Burp home: the session is
+handed the LAB's seed home -- `seed=bf.SEED_HOME`, the same home `bf.missing()`
+checks before anything starts -- and copies it per run, which is also why the
+first launch takes a moment.
 
 It needs what the integration tests need -- a Burp jar, a built extension jar,
 and an accepted EULA in the seed home. If something is missing it says which,
@@ -35,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import shutil
 import sys
 import tempfile
@@ -46,13 +47,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "src"))
 
-from hx import capture as capture_mod            # noqa: E402
 from hx import config as config_mod              # noqa: E402
 from hx import engagement as eng_mod             # noqa: E402
-from hx.bridge import server                     # noqa: E402
-from hx.halt import OperatorHalt                 # noqa: E402
+from hx import session as session_mod            # noqa: E402
 from hx.store import blobs as blobs_mod          # noqa: E402
-from hx.store import db as db_mod                # noqa: E402
 from tests.integration import burp_fixture as bf                # noqa: E402
 from tests.integration.target_server import TargetServer        # noqa: E402
 
@@ -82,21 +80,25 @@ def note(what: str) -> None:
     print(f"   {YELLOW}note {OFF}{what}")
 
 
-class Sink:
-    """`hx.capture.Capture`, on a connection owned by the thread that uses it.
+class BreakableSink(session_mod.ExchangeSink):
+    """The PRODUCT's capture sink, with a switch step 6 can throw.
 
-    The bridge calls its exchange sink ON THE READ THREAD, and a sqlite
-    connection belongs to the thread that opened it -- so a Capture built over
-    the main thread's connection raises `ProgrammingError` on every frame. The
-    bridge catches everything the sink throws, by design (s4: a lost record
-    changes what hx KNOWS, never what it ALLOWS), so the observable would be a
-    live Burp, traffic flowing, and an empty database. Opened lazily here, on
-    the first call, which is already on the read thread.
+    SUBCLASSED, NOT REIMPLEMENTED, and that is the difference between step 6
+    demonstrating something about hx and demonstrating something about this
+    file. Steps 1 to 5 have to run on the sink a consultant's session
+    actually runs -- `hx.session.ExchangeSink`, whose docstring carries the
+    lesson this class used to restate: the bridge calls its sink ON THE READ
+    THREAD, a sqlite connection belongs to the thread that opened it, and the
+    bridge swallows everything the sink throws by design, so getting it wrong
+    looks like a live Burp, traffic flowing and an empty database.
+
+    What is added is a boolean and a counter. Step 6 flips the boolean and
+    the claim it makes -- the bridge keeps the exception, files the loss, and
+    the browser does not notice -- is then a claim about the real thing.
     """
 
     def __init__(self, root: Path, engagement_id: str, cfg: config_mod.Config):
-        self._root, self._id, self._cfg = Path(root), engagement_id, cfg
-        self._capture: capture_mod.Capture | None = None
+        super().__init__(root, engagement_id, cfg)
         self.failing = False
         self.refused = 0
 
@@ -106,12 +108,7 @@ class Sink:
             # loss, and the browser must not notice.
             self.refused += 1
             raise RuntimeError("demo: the sink is deliberately broken")
-        if self._capture is None:
-            self._capture = capture_mod.Capture(
-                db_mod.connect(self._root / "hx.db"),
-                blobs_mod.BlobStore(self._root / "blobs"),
-                self._id, self._cfg)
-        return self._capture.on_exchange(header, request, response)
+        return super().__call__(header, request, response)
 
 
 def through_proxy(port: int, method: str, url: str, headers: dict | None = None,
@@ -192,62 +189,71 @@ def main() -> int:
         stack.callback(eng.db.close)
         did(f"engagement {eng.id}  {DIM}scope: {target.origin}/*{OFF}")
 
-        halt = OperatorHalt(eng.root, eng.db)
-        sink = Sink(eng.root, eng.id, cfg)
-        srv = server.BridgeServer(workdir / "hx.sock", engagement_id=eng.id,
-                                  operator_halt=halt, on_exchange=sink)
-        stack.callback(srv.stop)
-        srv.start()
+        # ONE CALL, where this script used to assemble a session by hand: an
+        # OperatorHalt, a BridgeServer, a launch, a handshake wait, the
+        # loopback check and a configure body typed out here. All six are
+        # `hx.session.session()`'s now, which is the point of Task 9 -- what
+        # a consultant's `hx capture start` runs is what this demo narrates,
+        # rather than a second assembly that agreed with it on the day it was
+        # written. It also always tears Burp down, including on the paths
+        # below that return 1.
+        #
+        # `seed=bf.SEED_HOME` is the home `bf.missing()` checked above.
+        # Omitted, `make_home` would copy the OPERATOR's own $HOME -- right
+        # for the product, and here it would mean checking one home and
+        # copying another, including a consultant's live
+        # `~/.BurpSuite/sessions`.
+        try:
+            with session_mod.session(eng, instance="demo",
+                                     seed=bf.SEED_HOME) as live:
+                did(f"Burp up, bridge connected  {DIM}operator "
+                    f":{live.operator_port}  crawler :{live.crawler_port}{OFF}")
+                # NOT a check this script performs any more, and not a claim
+                # it makes on its own: `session()` reads `ss` for the launched
+                # pid and REFUSES to yield unless every listening socket it
+                # holds is on loopback. Reaching this line is the evidence.
+                saw("both listeners are loopback-only  "
+                    f"{DIM}(the session refuses to yield otherwise){OFF}",
+                    good=True)
+                saw(f"scope authorised, config epoch {live.epoch}", good=True)
+                # READ from `scope_version`, never recomputed from today's
+                # config -- which is what this script used to do, hashing
+                # `config.dumps(cfg)` right here. The two agree today; the
+                # rule exists because they stop agreeing the moment a config
+                # is hand-edited, and then the extension would be enforcing
+                # one boundary while the report renders another.
+                authorised = session_mod.stored_scope_sha256(eng.db, eng.id)
+                note(f"authorised against the hash the STORE recorded, "
+                     f"{CYAN}{authorised[:16]}...{OFF}\n        -- read from "
+                     f"`scope_version`, never recomputed, so the boundary the "
+                     f"extension\n        enforces is the one the report renders.")
 
-        crawler_port = bf._free_port()
-        proc = bf.launch_burp(srv.socket_path, eng.id, workdir / "burp",
-                              sentinel=halt.sentinel_path,
-                              crawler_port=crawler_port)
-        stack.callback(bf_reap, proc)
-        if not bf.wait_for(lambda: srv.state == "connected"):
-            print(f"{RED}Burp never completed the handshake.{OFF} "
-                  f"See {workdir / 'burp' / 'burp.log'}")
+                # THE SESSION OWNS ITS SINK, so step 6 -- a capture sink that
+                # throws on every frame -- has to replace it. Both callbacks
+                # move together: `ExchangeSink` is one object precisely so
+                # that both run on ONE connection opened on the read thread,
+                # and leaving `on_halted` on the session's own sink would put
+                # a second connection behind the second callback. Installed
+                # before any traffic exists, and `BridgeServer` reads both
+                # attributes at call time.
+                sink = BreakableSink(eng.root, eng.id, cfg)
+                live.bridge.on_exchange = sink
+                live.bridge.on_halted = sink.on_halted
+
+                conn = eng.db
+                if args.browse:
+                    return browse(conn, live.operator_port, target, offside,
+                                  live.workdir)
+                return drive(conn, sink, live.bridge, live.operator_port,
+                             live.crawler_port, target, offside,
+                             blobs_mod.BlobStore(eng.root / "blobs"))
+        except session_mod.SessionError as exc:
+            # The message names the fix -- an unbuilt jar, a stale socket, a
+            # listener that is not loopback-only, a handshake that never
+            # completed and which log to read. Printed rather than raised
+            # because this is a script an operator runs.
+            print(f"\n{RED}the session could not be established:{OFF} {exc}")
             return 1
-
-        operator_port = bf.proxy_port(workdir / "burp")
-        crawler_port = bf.second_proxy_port(workdir / "burp")
-        did(f"Burp up, bridge connected  {DIM}operator :{operator_port}  "
-            f"crawler :{crawler_port}{OFF}")
-
-        why = bf.not_loopback_only(proc.pid, [operator_port, crawler_port])
-        if why:
-            print(f"{RED}refusing to continue: {why}{OFF}")
-            return 1
-        saw("both listeners are loopback-only", good=True)
-
-        # The same body shape the integration rig sends. `method.allow` and
-        # `dangerous.path` are the AGENT's rules -- step 5 is the demonstration
-        # that they bind crawler traffic and not the operator's own browsing.
-        epoch = srv.configure(
-            {
-                "scope.include": [f"{target.origin}/*"],
-                "method.allow": ["GET", "HEAD", "OPTIONS"],
-                "dangerous.path": ["*/logout*", "*/password*"],
-                "limit.rate_rps": [str(cfg.rate_limit_rps)],
-                "limit.max_requests": ["500"],
-            },
-            scope_sha256=hashlib.sha256(
-                config_mod.dumps(cfg).encode("utf-8")).hexdigest(),
-            profile=cfg.safety_profile)
-        saw(f"scope authorised, config epoch {epoch}", good=True)
-
-        conn = eng.db
-        if args.browse:
-            return browse(conn, operator_port, target, offside, workdir)
-        return drive(conn, sink, srv, operator_port, crawler_port,
-                     target, offside,
-                     blobs_mod.BlobStore(eng.root / "blobs"))
-
-
-def bf_reap(proc) -> None:
-    proc.kill()
-    with contextlib.suppress(Exception):
-        proc.wait(timeout=15)
 
 
 def drive(conn, sink, srv, operator_port, crawler_port, target, offside,
@@ -393,13 +399,18 @@ def read_blob(store: blobs_mod.BlobStore, digest: str | None) -> bytes | None:
     return None
 
 
-def browse(conn, operator_port, target, offside, workdir) -> int:
+def browse(conn, operator_port, target, offside, session_dir) -> int:
     print(f"\n{BOLD}Browsing mode.{OFF}")
     print(f"   Point your browser's HTTP proxy at {BOLD}127.0.0.1:{operator_port}{OFF}")
     print(f"   In scope:     {target.origin}/*   {DIM}(try /api/orders, /login){OFF}")
     print(f"   Out of scope: {offside.origin}/*  {DIM}(will be dropped){OFF}")
-    print(f"   {DIM}Burp's CA certificate, if you need HTTPS: "
-          f"{workdir / 'burp'}{OFF}")
+    # `burphome` UNDER the session directory, not the directory itself:
+    # `live.workdir` holds Burp's log, its listener config and the bridge
+    # socket as well, and `make_home` puts the copied home in `burphome/`.
+    # The CA certificate is inside that home, so naming the parent sends
+    # somebody hunting one directory up from it.
+    print(f"   {DIM}Burp's private home for this run, CA certificate "
+          f"included: {session_dir / 'burphome'}{OFF}")
     print(f"\n   {DIM}Ctrl-C to stop and print the summary.{OFF}\n")
     seen_x = seen_d = 0
     try:

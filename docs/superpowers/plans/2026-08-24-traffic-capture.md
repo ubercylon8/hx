@@ -633,7 +633,9 @@ def launch_probe(workdir: Path, out: Path,
     the suite green with the proxy bound to `*`. Callers must run that check
     once the listeners are up -- test_proxy_facts.py's fixture does.
     """
-    home = make_home(workdir)
+    # seed=SEED_HOME for the same reason bf.launch_burp passes it: make_home's
+    # default is the operator's own home, and this is the one missing() checked.
+    home = make_home(workdir, seed=SEED_HOME)
     classes = _compile_probe(workdir)
     write_listener_config(workdir, extra_listener_port)
     log = (workdir / "burp.log").open("wb")
@@ -656,10 +658,6 @@ def launch_probe(workdir: Path, out: Path,
     proc.stdin.write(b"\n\n")
     proc.stdin.flush()
     return proc
-
-
-def listener_ports(workdir: Path) -> list[int]:
-    """The ports this run's Burp was TOLD to listen on, read back from its config.
 ```
 
 - [ ] **Step 5: Write the three measurement tests**

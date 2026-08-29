@@ -27,7 +27,6 @@ starting anything.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import shutil
 import sys
 import tempfile
@@ -41,6 +40,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from hx import config as config_mod          # noqa: E402
 from hx import engagement as eng_mod         # noqa: E402
+from hx import session as session_mod        # noqa: E402
 from hx.bridge import server                 # noqa: E402
 from hx.halt import OperatorHalt             # noqa: E402
 from tests.integration import burp_fixture as bf   # noqa: E402
@@ -155,7 +155,15 @@ def main() -> int:
             "limit.rate_rps": ["3"],
             "limit.max_requests": ["10"],
         }
-        sha = hashlib.sha256(config_mod.dumps(cfg).encode()).hexdigest()
+        # READ from `scope_version`, never recomputed. This script used to
+        # hash `config.dumps(cfg)` right here, which is the one thing S5
+        # forbids: the report renders `scope_version.sha256` as the boundary
+        # of record, so a recomputed hash lets the extension be authorised
+        # against one boundary while the deliverable shows another -- two
+        # facts that agree until a config is hand-edited. `hx.session` is the
+        # product's answer and the demo an operator runs should not teach a
+        # different one.
+        sha = session_mod.stored_scope_sha256(eng.db, eng.id)
         epoch = srv.configure(pairs, scope_sha256=sha,
                               profile=cfg.safety_profile)
         asked("scope, method allowlist, dangerous paths, 3 req/s, budget 10")
