@@ -1174,6 +1174,50 @@ def test_scan_max_requests_still_reaches_an_active_session(
     assert seen["max_requests"] == 23
 
 
+def test_scan_passes_its_burp_jar_to_the_session(
+        engagement_with_surface, monkeypatch, tmp_path):
+    """F6 of the whole-branch review. `hx scan` opens a Burp on every
+    default-configured run now, and had no `--burp-jar`: an operator with two
+    jars in `$HX_BURP_LAB` and no `$HX_BURP_JAR` could not scan at all,
+    because `find_burp_jar` refuses to guess between them on purpose -- the
+    report records the version under test.
+
+    Asserted by IDENTITY at the session boundary, not by the command
+    exiting 0: a flag that parsed and was then dropped on the floor would
+    pass any weaker test while leaving the operator exactly as stuck."""
+    _register_active(monkeypatch)
+    jar = tmp_path / "burpsuite_community.jar"
+    jar.write_bytes(b"")
+    seen = {}
+
+    @contextlib.contextmanager
+    def fake(eng, *, instance, jar=None, workdir=None, seed=None):
+        seen["jar"] = jar
+        yield SimpleNamespace(operator_port=1, crawler_port=2, epoch=1,
+                              bridge=object(), workdir=None, proc=None)
+
+    monkeypatch.setattr(cli.session_mod, "session", fake)
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface),
+        "--burp-jar", str(jar)])
+    assert result.exit_code == 0, result.output
+    assert seen["jar"] == jar
+
+
+def test_scan_and_capture_spell_the_jar_flag_the_same_way():
+    """Two commands launching the same Burp for the same reason must not ask
+    for it two ways -- an operator who learnt `--burp-jar` on `capture start`
+    should not have to learn a second spelling, and a help text that drifted
+    would document two different defaults for one `find_burp_jar`."""
+    def option(command, name):
+        return next(p for p in command.params if p.name == name)
+
+    scan_jar = option(cli.scan, "burp_jar")
+    capture_jar = option(cli.capture_start, "burp_jar")
+    assert scan_jar.opts == capture_jar.opts
+    assert scan_jar.help == capture_jar.help
+
+
 # --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---
 # --- what that gap already cost -----------------------------------------
 

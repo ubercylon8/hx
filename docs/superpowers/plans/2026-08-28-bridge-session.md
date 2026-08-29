@@ -1472,7 +1472,7 @@ def test_a_failed_configure_leaves_no_burp_running(monkeypatch, an_engagement, a
     # half that says WHICH, and swallowing it sends the next reader to the
     # wrong side of the socket.
     assert "bad_config" in str(exc.value)
-    assert not (an_engagement.root / "session" / "hx.sock").exists(), (
+    assert not (an_engagement.root / "session" / "capture" / "hx.sock").exists(), (
         "the bridge was not stopped: its socket outlives the session, and the "
         "next `session()` on this engagement dies inside BridgeServer.start()")
 
@@ -1565,7 +1565,7 @@ def test_burp_is_torn_down_when_the_body_raises(monkeypatch, an_engagement, a_ja
     live, = seen
     assert (live.operator_port, live.crawler_port) == (OPERATOR_PORT, CRAWLER_PORT)
     assert live.epoch == 1
-    assert live.workdir == an_engagement.root / "session"
+    assert live.workdir == an_engagement.root / "session" / "capture"
     assert live.bridge.engagement_id == an_engagement.id
     assert not (live.workdir / "hx.sock").exists(), (
         "the bridge was not stopped on the raising path")
@@ -1775,7 +1775,34 @@ def session(eng, *, instance: str, jar: Path | None = None,
     second answer to a question this parameter already answers.
     """
     jar = find_burp_jar(jar)
-    work = Path(workdir) if workdir else eng.root / "session"
+    # ONE WORKDIR PER COMMAND, NAMESPACED BY `instance`. F6 of the
+    # whole-branch review. Both callers defaulted to `eng.root / "session"`,
+    # so `hx capture start` and `hx scan` shared a bridge socket path: the
+    # second to start found the first's live `hx.sock`, and `BridgeServer.
+    # start()` refuses to adopt a path another process may own -- correctly,
+    # and the refusal reads as "a previous run did not shut down cleanly"
+    # when nothing is wrong at all. It was a corner case while `hx scan`
+    # stayed offline; `active_safe` is on by default in `DEFAULT_CHECKS` and
+    # five active checks now ship, so every default `hx scan` opens a session
+    # and the documented browse-then-scan workflow collided unconditionally.
+    # Plan 6's governing decision is "each command owns its own Burp", and
+    # this is the directory layout that decision implies: the same string
+    # that tells the extension which instance it is (`-Dhx.instance`) names
+    # the directory that instance owns.
+    #
+    # ONE PATH SEGMENT, CHECKED. This value becomes a directory under the
+    # engagement root -- which is 0o700 and holds the private Burp home, the
+    # licence key inside it, and the client's captured traffic -- so a
+    # caller's `../..` may not choose where that lands. Refused rather than
+    # sanitised: silently rewriting a caller's argument would make the
+    # directory and the `-Dhx.instance` the extension reports two different
+    # strings.
+    if instance != Path(instance).name or instance in ("", ".", ".."):
+        raise SessionError(
+            f"instance must be a single path segment, got {instance!r}: it "
+            "names both this session's `-Dhx.instance` and the directory "
+            "under the engagement root that this session owns")
+    work = Path(workdir) if workdir else eng.root / "session" / instance
     # secure_mkdir, not mkdir: this directory holds the private Burp home
     # (copied from the operator's own, licence key included), Burp's log, and
     # the bridge socket. It is created at 0o700 rather than created at the

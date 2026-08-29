@@ -276,7 +276,7 @@ def test_a_failed_configure_leaves_no_burp_running(monkeypatch, an_engagement, a
     # half that says WHICH, and swallowing it sends the next reader to the
     # wrong side of the socket.
     assert "bad_config" in str(exc.value)
-    assert not (an_engagement.root / "session" / "hx.sock").exists(), (
+    assert not (an_engagement.root / "session" / "capture" / "hx.sock").exists(), (
         "the bridge was not stopped: its socket outlives the session, and the "
         "next `session()` on this engagement dies inside BridgeServer.start()")
 
@@ -369,7 +369,7 @@ def test_burp_is_torn_down_when_the_body_raises(monkeypatch, an_engagement, a_ja
     live, = seen
     assert (live.operator_port, live.crawler_port) == (OPERATOR_PORT, CRAWLER_PORT)
     assert live.epoch == 1
-    assert live.workdir == an_engagement.root / "session"
+    assert live.workdir == an_engagement.root / "session" / "capture"
     assert live.bridge.engagement_id == an_engagement.id
     assert not (live.workdir / "hx.sock").exists(), (
         "the bridge was not stopped on the raising path")
@@ -522,8 +522,8 @@ def test_a_stale_bridge_socket_is_reported_and_never_removed(
 
     monkeypatch.setattr(session, "launch_burp", never_launched)
 
-    work = an_engagement.root / "session"
-    work.mkdir(mode=0o700)
+    work = an_engagement.root / "session" / "capture"
+    work.mkdir(mode=0o700, parents=True)
     stale = work / "hx.sock"
     stale.write_bytes(b"")
 
@@ -589,6 +589,65 @@ def test_the_seed_the_caller_names_reaches_the_launch(
 
 
 # --- the composition: two sessions, one engagement ------------------------
+
+
+def test_two_commands_hold_two_sessions_on_one_engagement(
+        monkeypatch, an_engagement, a_jar):
+    """F6 of the whole-branch review, and the workflow it broke.
+
+    Both callers defaulted their workdir to `eng.root / "session"`, so `hx
+    scan` run while `hx capture start` held a session open found the capture
+    session's LIVE `hx.sock` and died inside `BridgeServer.start()`, which
+    refuses to adopt a path another process may own. The message says "a
+    previous one did not shut down cleanly", which is the wrong diagnosis
+    for two commands each correctly owning their own Burp -- Plan 6's
+    governing decision, and now the directory layout too.
+
+    It was a deferred minor while `hx scan` stayed offline. `active_safe` is
+    on by default and five active checks ship, so every default `hx scan`
+    opens a session and this was the common path, not a corner of it.
+
+    The bridge sockets here are REAL -- `BridgeServer.start()` binds them,
+    and the collision this test is about happens in that bind. Only Burp is
+    faked.
+    """
+    monkeypatch.setattr(session, "launch_burp", _launcher())
+    monkeypatch.setattr(session, "wait_for", lambda *a, **k: True)
+    monkeypatch.setattr(session, "not_loopback_only", lambda pid, ports: None)
+    monkeypatch.setattr(session.BridgeServer, "configure",
+                        lambda self, *a, **k: 1)
+
+    with session.session(an_engagement, instance="capture", jar=a_jar) as cap:
+        with session.session(an_engagement, instance="scan", jar=a_jar) as scn:
+            assert cap.workdir != scn.workdir
+            assert (cap.workdir / "hx.sock").exists()
+            assert (scn.workdir / "hx.sock").exists()
+            # The engagement root's own rule is not relaxed to make room for
+            # the extra level: S3 is unconditional.
+            for d in (cap.workdir, scn.workdir, cap.workdir.parent):
+                assert d.stat().st_mode & 0o777 == 0o700, d
+
+
+def test_an_instance_that_is_not_one_path_segment_is_refused(
+        monkeypatch, an_engagement, a_jar):
+    """`instance` names a directory under the engagement root now, and that
+    root is 0o700 and holds the private Burp home (licence key included) and
+    the client's captured traffic. Refused rather than sanitised: rewriting
+    the caller's string would make the directory and the `-Dhx.instance` the
+    extension reports two different things.
+
+    No JVM: the check is ahead of every side effect, which the launcher
+    below proves by failing if it is ever reached.
+    """
+    monkeypatch.setattr(
+        session, "launch_burp",
+        lambda *a, **k: pytest.fail("Burp launched for a refused instance"))
+    for bad in ("../elsewhere", "a/b", "", ".", ".."):
+        with pytest.raises(session.SessionError) as exc:
+            with session.session(an_engagement, instance=bad, jar=a_jar):
+                pass
+        assert "single path segment" in str(exc.value)
+
 
 
 @pytest.fixture
@@ -663,7 +722,7 @@ def test_two_sessions_in_a_row_on_one_engagement_both_start(
     # later run on this engagement died on FileExistsError with no message.
     # Planted rather than produced, because producing it means killing a
     # session, and a test that kills a session is testing the killing.
-    stale = an_engagement.root / "session" / "burphome" / ".BurpSuite"
+    stale = an_engagement.root / "session" / "capture" / "burphome" / ".BurpSuite"
     stale.mkdir(parents=True)
     (stale / "left-by-a-killed-run").write_text("stale")
 

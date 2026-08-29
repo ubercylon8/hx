@@ -4198,6 +4198,50 @@ def test_scan_max_requests_still_reaches_an_active_session(
     assert seen["max_requests"] == 23
 
 
+def test_scan_passes_its_burp_jar_to_the_session(
+        engagement_with_surface, monkeypatch, tmp_path):
+    """F6 of the whole-branch review. `hx scan` opens a Burp on every
+    default-configured run now, and had no `--burp-jar`: an operator with two
+    jars in `$HX_BURP_LAB` and no `$HX_BURP_JAR` could not scan at all,
+    because `find_burp_jar` refuses to guess between them on purpose -- the
+    report records the version under test.
+
+    Asserted by IDENTITY at the session boundary, not by the command
+    exiting 0: a flag that parsed and was then dropped on the floor would
+    pass any weaker test while leaving the operator exactly as stuck."""
+    _register_active(monkeypatch)
+    jar = tmp_path / "burpsuite_community.jar"
+    jar.write_bytes(b"")
+    seen = {}
+
+    @contextlib.contextmanager
+    def fake(eng, *, instance, jar=None, workdir=None, seed=None):
+        seen["jar"] = jar
+        yield SimpleNamespace(operator_port=1, crawler_port=2, epoch=1,
+                              bridge=object(), workdir=None, proc=None)
+
+    monkeypatch.setattr(cli.session_mod, "session", fake)
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface),
+        "--burp-jar", str(jar)])
+    assert result.exit_code == 0, result.output
+    assert seen["jar"] == jar
+
+
+def test_scan_and_capture_spell_the_jar_flag_the_same_way():
+    """Two commands launching the same Burp for the same reason must not ask
+    for it two ways -- an operator who learnt `--burp-jar` on `capture start`
+    should not have to learn a second spelling, and a help text that drifted
+    would document two different defaults for one `find_burp_jar`."""
+    def option(command, name):
+        return next(p for p in command.params if p.name == name)
+
+    scan_jar = option(cli.scan, "burp_jar")
+    capture_jar = option(cli.capture_start, "burp_jar")
+    assert scan_jar.opts == capture_jar.opts
+    assert scan_jar.help == capture_jar.help
+
+
 # --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---
 # --- what that gap already cost -----------------------------------------
 
@@ -4846,7 +4890,23 @@ def resume(root) -> None:
          "unset) -- this flag overrides that number for this run only, it "
          "does not rewrite config.yaml.",
 )
-def scan(root, max_seconds, max_requests) -> None:
+# F6 of the whole-branch review. THE SAME OPTION `capture start` HAS, spelt
+# the same way and with the same help text, because it answers the same
+# question about the same launch. `hx scan` opens a Burp on every default
+# run now (`active_safe` is on in `DEFAULT_CHECKS` and five active checks
+# ship), and without this an operator with two jars in `$HX_BURP_LAB` and no
+# `$HX_BURP_JAR` could not scan at all: `find_burp_jar` refuses to guess,
+# deliberately -- the report records the version under test -- and this was
+# the only command with no way to answer it.
+@click.option(
+    "--burp-jar",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Which Burp jar to launch against. Default: $HX_BURP_JAR, then the "
+         "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
+         "a guess, because the report records the version under test.",
+)
+def scan(root, max_seconds, max_requests, burp_jar) -> None:
     """Run the enabled check corpus over everything captured so far."""
     path = root or default_root()
     eng = _open_engagement(path)
@@ -4876,8 +4936,17 @@ def scan(root, max_seconds, max_requests) -> None:
         #
         # ONLY WHEN SOMETHING WILL SEND, because a passive scan that paid
         # Burp's ~10 s startup to send nothing would be a cost with no answer
-        # attached -- and the corpus this build ships is still all passive,
-        # so the common `hx scan` stays entirely offline.
+        # attached. THE COMMON `hx scan` IS NOT THAT SCAN ANY MORE, and the
+        # sentence here used to say it was: "the corpus this build ships is
+        # still all passive, so the common `hx scan` stays entirely offline"
+        # survived Tasks 7 through 13 and both of Task 13's fix rounds, by
+        # which time five `active_safe` checks were registered and
+        # `config.DEFAULT_CHECKS` had `active_safe: True`. A default-
+        # configured engagement opens a Burp on every scan; what stays
+        # offline is a scan of an engagement whose config has switched the
+        # active classes off, which is now the exception rather than the
+        # rule. The guard below is unchanged -- it was always the right
+        # guard, and only its justification was stale.
         #
         # TWO FILTERS, TWO DIFFERENT QUESTIONS, AND NEITHER IS RESTATED HERE.
         # `registry.enabled` is the one place "switched on for this
@@ -4897,7 +4966,8 @@ def scan(root, max_seconds, max_requests) -> None:
                         if scan_mod.needs_a_bridge(c))
         try:
             if sending:
-                with session_mod.session(eng, instance="scan") as live:
+                with session_mod.session(eng, instance="scan",
+                                          jar=burp_jar) as live:
                     summary = scan_mod.run(
                         eng.db, engagement_id=eng.id, blobs=eng.blobs,
                         config=eng.config, max_seconds=max_seconds,
