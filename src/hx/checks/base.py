@@ -208,6 +208,15 @@ class Verdict:
     # DEFAULTS EMPTY, AND THAT IS THE SAFE DIRECTION: a check that populates
     # nothing retires nothing. The failure mode is a finding staying live,
     # never one falsely closed.
+    #
+    # NECESSARY, NOT SUFFICIENT, since fix round 5. This is what the CHECK
+    # examined; whether the runner may act on it is `hx.scan.
+    # _unauthenticated_view`'s question, and on a surface whose captured
+    # request carried a credential header the answer is no -- the check
+    # examined a view of the application that the client's users are not in.
+    # A check author populates this the same way either way and has nothing
+    # to decide: the rule is at the runner precisely so that a sixth active
+    # check cannot forget it.
     considered: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
