@@ -142,8 +142,9 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # This does NOT mean nothing else can close a scan run -- `hx capture
     # stop` (cli.py) closes every live run by default, `--kind scan` included
     # (F6 of the task-6 review: an earlier version of this comment claimed
-    # otherwise, which was false -- MEASURED against cli.py:246-262, whose
-    # default query is `WHERE status='running'` with no kind filter at all).
+    # otherwise, which was false -- MEASURED against `cli.stop`, whose
+    # default query is `SELECT id FROM run WHERE status='running'` with no
+    # kind filter at all).
     # What nothing else does is close a scan run AUTOMATICALLY AT THE END OF
     # ITS OWN PASS, which is the sentence this paragraph should have said the
     # first time: without the close below, a scan that finishes cleanly stays

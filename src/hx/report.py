@@ -32,8 +32,9 @@ the review found this docstring claiming redaction "runs over everything
 rendered" while `records.redact_url` was called at exactly one site (the
 evidence URL) -- title, description, impact, remediation and the coverage
 table's `reason` cell all reached the export raw. `reason` is not a marginal
-vector: `hx.scan` builds it as `f"{type(exc).__name__}: {exc}"`
-(`scan.py:163`), an exception message that can quote a response body or a
+vector: `hx.scan` builds it as `f"{type(exc).__name__}: {exc}"` (`run`'s
+per-check `except Exception`), an exception message that can quote a
+response body or a
 request target, so it is attacker-influenced by construction. Every field
 below that can carry a URL -- a finding's title, description, impact and
 remediation, an evidence URL, a coverage reason, a run's `stop_reason`, a
@@ -809,8 +810,9 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # `## Findings` now that the severity group moved to `###`.
             #
             # D4 (fix round D). `finding.title` carries SERVER-CONTROLLED
-            # text: `cookie_flags.py:153` builds it as "Cookie {name} set
-            # without ...", and `name` is the cookie name off a `Set-Cookie`
+            # text: `cookie_flags.CookieFlags.on_surface` builds it as
+            # "Cookie {name} set without ...", and `name` is the cookie name
+            # off a `Set-Cookie`
             # RESPONSE header. The re-review judged a newline unreachable
             # there on HTTP framing; that was wrong AT THE TIME. `_http.
             # header_values` used to split the head on `\r\n` and `.strip()`
@@ -853,8 +855,9 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # and `_flat`'s own docstring says why that is wrong: "every
             # rendered free-text value is flattened -- not only the ones
             # that reach a table". They are free text by the same route the
-            # title is (`cookie_flags.py:161` interpolates the same
-            # server-controlled cookie name into `description`), and a
+            # title is (`cookie_flags.CookieFlags.on_surface` interpolates
+            # the same server-controlled cookie name into `description` a few
+            # lines below the title it builds), and a
             # newline in one starts a line at the top level of the
             # document. Flattening prose costs nothing a Markdown renderer
             # would have kept: a paragraph's own line breaks are already

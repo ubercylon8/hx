@@ -124,9 +124,11 @@ def test_every_refusal_raises_and_names_itself(cls):
 # `hx.policy.Limiter.check` increments `issued` on the ALLOW path only and
 # says so in its own words -- "Refusals are not issuances and do not appear
 # here" -- so a request the gate refused never left the JVM and the target
-# never saw it. `check_run.requests_sent` reaches a client's report as the
-# traffic hx generated, and it is also what a bounded retry would otherwise
-# double-count.
+# never saw it. `check_run.requests_sent` is this build's record of hx's own
+# traffic -- NOT something a report renders, which is what this comment used
+# to say and `hx.report._insertion_coverage` contradicts in as many words
+# (finding 7 of the final review) -- and it is also what a bounded retry
+# would otherwise double-count.
 
 
 @pytest.mark.parametrize("cls", [

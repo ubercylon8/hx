@@ -82,6 +82,20 @@ A small `ProbeSender`, constructed per `check_run`, wrapping the bridge:
 - counts every attempt into `check_run.requests_sent`;
 - translates the extension's refusals into the verdict the check must return.
 
+**Amended 2026-08-29 (final review, finding 6).** The first bullet is withdrawn as
+written: the seam counts ISSUANCES, not attempts. `probe._NOT_ISSUED` excludes eight
+refusal classes from `check_run.requests_sent` — six of the seven named in the very
+next paragraph (`budget_exhausted`, `halted`, `rate_limited`, `scope_denied`,
+`method_denied`, `dangerous_denied`), plus `not_configured` and, since F8 of the
+whole-branch review, `unmanaged_credential`. Each is decided BEFORE a request is
+issued, so none of them is traffic the target saw, and counting them would also make
+the bounded rate-limit retry double-count. The seventh item of that list, "any
+transport error", still counts, as do `timeout`, `bridge_lost` and
+`status_unreadable`: each may already have reached the target. The set is an
+EXCLUSION list precisely so an unrecognised class counts — overstating traffic is the
+safe direction, understating what hx put on a client's system is not. The code was
+changed under F8 and the spec was not moved with it.
+
 **A refusal is never `clean`.** `budget_exhausted`, `halted`, `rate_limited`,
 `scope_denied`, `method_denied`, `dangerous_denied`, and any transport error mean the check
 did not get its answer, so it returns `inconclusive(reason)`. §10 states this as a rule for
@@ -148,6 +162,18 @@ the exemplar, which is the FIRST sighting, so a surface browsed logged-out and t
 logged-in stayed "anonymous" and went on retiring — the unsafe direction — and S7 redacts a
 credential header's value before the bytes are hashed, so only the NAME survives and an
 analytics or consent cookie is indistinguishable from a session.
+
+**Amended 2026-08-29 (final review, findings 1 and 2).** `_probe_util._NOT_AN_ANSWER`
+no longer exists, and the sentence above stands only with its name replaced. It was an
+ENUMERATION, so every status outside it read as the application answering — 422 above
+all, which is the ordinary reply to a probe that dropped the endpoint's other
+parameters, and that dropping is what every probe this build sends does. Measured at
+the final review: a target refusing every probe with 422, 410, 407, 406 or 414 recorded
+`clean` for all five active checks and rendered as tested Coverage, under a Limits
+bullet stating that a rejection of the request itself is recorded as `inconclusive`.
+The doctrine is now `_probe_util.unanswered` and it is an ALLOWLIST — only a 2xx is an
+answer a check may reason about — so it still catches a login *redirect*, still cannot
+catch a login *page*, and now also catches every refusal nobody thought to enumerate.
 
 The passive corpus is untouched and the bullets above still hold for it: a passive check
 reads the captured traffic itself, session and all, so it was never looking at a different
@@ -278,6 +304,10 @@ Beyond per-check tests, two properties need their own:
    probes that really went, and not one finding closed.
 2. **The seam refuses correctly.** Each refusal class produces `inconclusive` with that
    reason and never `clean`, and `requests_sent` counts attempts including refused ones.
+   **Amended 2026-08-29 (final review, finding 6):** the last clause is withdrawn —
+   `requests_sent` counts issuances, and `probe._NOT_ISSUED` excludes the eight classes
+   that are decided before a request is issued. See §4's amendment. The first clause stands
+   unchanged and is what the tests hold.
 
 ## 13. Decisions taken
 

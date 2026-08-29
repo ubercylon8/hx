@@ -843,9 +843,11 @@ def test_every_refusal_raises_and_names_itself(cls):
 # `hx.policy.Limiter.check` increments `issued` on the ALLOW path only and
 # says so in its own words -- "Refusals are not issuances and do not appear
 # here" -- so a request the gate refused never left the JVM and the target
-# never saw it. `check_run.requests_sent` reaches a client's report as the
-# traffic hx generated, and it is also what a bounded retry would otherwise
-# double-count.
+# never saw it. `check_run.requests_sent` is this build's record of hx's own
+# traffic -- NOT something a report renders, which is what this comment used
+# to say and `hx.report._insertion_coverage` contradicts in as many words
+# (finding 7 of the final review) -- and it is also what a bounded retry
+# would otherwise double-count.
 
 
 @pytest.mark.parametrize("cls", [
@@ -1184,8 +1186,9 @@ scan by answering with a huge number. The clamp costs nothing real:
 `Limiter` cannot legitimately ask for more than one second. Attempts are
 bounded at `_RATE_LIMIT_ATTEMPTS`, which puts a ceiling of roughly two
 seconds on what any one probe can add. `hx.scan.run` does NOT bound the run
-by `max_seconds` -- it consults its deadline only at the top of the surface
-loop (`scan.py:144`), so `max_seconds` bounds when the next surface starts,
+by `max_seconds` -- it consults its deadline only at the top of its surface
+loop (`run`'s `if deadline is not None`), so `max_seconds` bounds when the
+next surface starts,
 not when the run ends: once a surface is in flight every check on it runs
 to completion, and this retry can add its ceiling to each probe issued
 there. That overshoot is accepted, not fixed: it is bounded (one surface's
@@ -1194,9 +1197,23 @@ probes, worst case tens of seconds), the safety envelope is
 `_skip_rest(..., "budget", ...)` already records a skipped row for every
 check a deadline miss does cut off. No deadline is threaded through here.
 
-THE COUNT IS OF ISSUANCES, NOT ATTEMPTS. `check_run.requests_sent` reaches a
-client's report as the traffic hx generated, so it has to be true of the
-requests that were actually made. `Limiter` decides `scope_denied`,
+THE COUNT IS OF ISSUANCES, NOT ATTEMPTS. `check_run.requests_sent` is the
+column this build keeps its record of hx's OWN traffic in, and a record of
+what hx put on a client's system has to be true of the requests that were
+actually made.
+
+WHAT THAT DOES NOT REST ON, because an earlier version of this sentence did:
+`requests_sent` does not reach a client's report. Nothing in `hx.report`
+renders it -- `_insertion_coverage` says in as many words that it is deferred
+-- so the ground is the column and not a page, and the two comments said
+opposite things until finding 7 of the final review caught it. What does turn
+on the column: `hx.scan._close_row` writes it for every row, so it is what an
+operator answering "what did hx send against this surface" reads out of the
+database, and a report section that starts rendering it inherits the rule
+that is here rather than getting to choose one. The rule below is right on
+those grounds; it was never right on the one it used to give.
+
+`Limiter` decides `scope_denied`,
 `method_denied`, `dangerous_denied`, `rate_limited` and `budget_exhausted`
 BEFORE issuing and never increments `issued` for them; `halted` /
 `not_configured` are refused on this side before a frame is written at all;
