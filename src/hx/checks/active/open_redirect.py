@@ -14,7 +14,7 @@ this check received.
 
 CANARY-FIRST, BECAUSE THE BUDGET IS REAL. `insertions` carries only `kind`
 and `name` (`hx.checks.base.Insertion`) -- the surface row `probes()`
-receives (`hx.scan._insertions_for`) derives insertion points from the
+receives (`hx.scan.run`, off `_exemplar_request`) derives them from the
 exemplar request's structure, not its values, so this check has no access
 to what a query parameter currently holds. The canary-first filter is
 therefore NAME-based: a parameter is probed only when its name contains one
@@ -54,6 +54,23 @@ learned about this engagement could make it redirect there on its own. A
 host is not: the parameter was not used to build the response's target, or
 the target validated it, and that is what "clean" says here.
 
+THE PROBE GOES TO THE EXEMPLAR'S OWN PATH (`sender.path`), NOT TO THE SURFACE
+ROW'S `path_template`. F1 of the whole-branch review: `_probe_path` used to
+build its request line out of `surface[5]`, which on any templated surface is
+an identity (`/order/{id}/doc`) rather than an address, so the probe reached a
+URL that cannot exist, the 404 carried no `Location`, and this check answered
+`clean` with `open-redirect` in `considered` -- retiring a live finding.
+`hx.checks.probe.ProbeSender` now refuses a path still carrying a placeholder
+and is bound to the exemplar's concrete path instead.
+
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE, EITHER. A 403, a 429, a 5xx or a
+404 has no `Location` for the same reason a properly validating target has
+none. `_probe_util.unanswered` names those, `_probe_util.verdict` turns them
+into `inconclusive`, and the doctrine is shared by all five active checks
+rather than spelt here -- see `_probe_util.py`. Note what is NOT in that set:
+3xx, which is this check's own finding condition, and 2xx, which is the
+ordinary answer from a target that validated the parameter.
+
 CONSIDERED, NAMED HONESTLY. `_ISSUE_TYPE` is only added to `considered`
 when this check actually issued at least one probe on this surface. A
 surface with query parameters but none of them canary-shaped, or with no
@@ -81,6 +98,7 @@ from __future__ import annotations
 from urllib.parse import quote, urlsplit
 
 from hx.checks import base
+from hx.checks.active import _probe_util
 from hx.checks.passive import _http
 
 # RFC 2606: `.test` is reserved and guaranteed never to be a real,
@@ -117,16 +135,18 @@ def _looks_like_redirect_target(name: str) -> bool:
     return any(hint in low for hint in _REDIRECT_NAME_HINTS)
 
 
-def _probe_path(path_template: str, name: str, value: str) -> str:
+def _probe_path(path: str, name: str, value: str) -> str:
     """The path, with one query parameter carrying the marker.
 
-    `path_template` never carries a query string (`hx.surface.normalise`
-    derives it from `parts.path` alone), so this always appends the first
-    and only `?`. Percent-encoded by hand -- `ProbeSender.get()` sends
-    `path` verbatim onto the request line -- so an unescaped `/` or `:` in
-    `_MARKER_URL` cannot be mistaken for structure the wire did not intend.
+    `path` is `sender.path`, the exemplar request's own path, and it never
+    carries a query string of its own (`hx.insertion.request_path` returns
+    `urlsplit(target).path` alone) -- so this always appends the first and
+    only `?`, exactly as it did when the argument was the surface's template.
+    Percent-encoded by hand -- `ProbeSender.get()` sends `path` verbatim onto
+    the request line -- so an unescaped `/` or `:` in `_MARKER_URL` cannot be
+    mistaken for structure the wire did not intend.
     """
-    return f"{path_template}?{quote(name, safe='')}={quote(value, safe='')}"
+    return f"{path}?{quote(name, safe='')}={quote(value, safe='')}"
 
 
 def _redirect_host(status: int | None, head: bytes) -> str | None:
@@ -167,6 +187,7 @@ class OpenRedirect:
     def probes(self, ctx, surface, insertions, sender) -> base.Verdict:
         exemplar_exchange_id = surface[6]
         candidates = []
+        gaps = []
         probed_any = False
 
         for insertion in insertions:
@@ -175,7 +196,7 @@ class OpenRedirect:
             if not _looks_like_redirect_target(insertion.name):
                 continue
             probed_any = True
-            path = _probe_path(surface[5], insertion.name, _MARKER_URL)
+            path = _probe_path(sender.path, insertion.name, _MARKER_URL)
             # No `try`/`except` here: `ProbeSender.get()` RAISES
             # `ProbeRefused` on every refusal and never returns one (see
             # `hx/checks/probe.py`), and that is deliberate -- it must
@@ -192,7 +213,15 @@ class OpenRedirect:
             # redirect, and `RedirectionMode.NEVER` exists precisely so a
             # check cannot casually add that back.
             host = _redirect_host(resp.status, resp.head)
-            if host is not None and host.lower() == _MARKER_HOST:
+            if host is None or host.lower() != _MARKER_HOST:
+                # ASKED ONLY WHERE NOTHING WAS FOUND: a `Location` naming the
+                # marker answered this check's question whatever the status
+                # line said elsewhere, which is `_probe_util.verdict`'s "a
+                # candidate wins over a gap" one step earlier.
+                refusal = _probe_util.unanswered(resp)
+                if refusal is not None:
+                    gaps.append(f"{insertion.name}: {refusal}")
+            else:
                 candidates.append(base.Candidate(
                     title=f"Open redirect via {insertion.name!r}",
                     issue_type_id=_ISSUE_TYPE,
@@ -200,7 +229,7 @@ class OpenRedirect:
                     insertion=insertion,
                     exchange_ids=(exemplar_exchange_id,), cwe="CWE-601",
                     description=(
-                        f"Requesting {surface[5]} with {insertion.name}="
+                        f"Requesting {path} with {insertion.name}="
                         f"{_MARKER_URL} (a host this target cannot have "
                         f"expected) drew back status {resp.status} with "
                         f"Location: {_location_value(resp.head)}. A browser "
@@ -214,6 +243,4 @@ class OpenRedirect:
                         "before using it to build a redirect target.")))
 
         considered = (_ISSUE_TYPE,) if probed_any else ()
-        if candidates:
-            return base.Verdict.finding(*candidates, considered=considered)
-        return base.Verdict.clean(considered=considered)
+        return _probe_util.verdict(candidates, gaps, considered=considered)

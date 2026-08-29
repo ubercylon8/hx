@@ -86,6 +86,27 @@ and `reflected_input.py` both give: `records.dedupe_key` folds
 parameters that each independently disclose a database error must stay two
 rows, not collapse into one.
 
+THE PROBE GOES TO THE EXEMPLAR'S OWN PATH (`sender.path`), NOT TO THE SURFACE
+ROW'S `path_template`, AND THE PATH-SEGMENT SUBSTITUTION IS BY INDEX BECAUSE
+OF IT. F1 of the whole-branch review: `_for_insertion` used to build its
+request line out of `surface[5]`, which on a templated surface is an identity
+(`/order/{id}/doc`) and not an address -- a query probe went to a URL that
+cannot exist, the 404 carried no driver wording, and this check answered
+`clean` with its issue type in `considered`, retiring live findings. The
+concrete path does not contain the placeholder a `path_segment` probe has to
+replace, so `str.replace` against it silently substitutes NOTHING and sends
+the exemplar's own value back; `_probe_util.substitute_segment` aligns the
+two paths by segment index instead and returns `None` rather than a probe
+that tests nothing.
+
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 403, a 429 or a 404 carries no
+driver wording for the same reason a parameterised query carries none. 5xx is
+in that set too and the ordering below is what keeps that honest: `_match` is
+consulted FIRST, so a driver error disclosed ON a 500 -- which is exactly
+where one usually arrives -- is a finding, and only a 5xx that disclosed
+nothing becomes a gap. See `_probe_util.py` for the doctrine all five active
+checks share.
+
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
 same reason every active check in this corpus gives: nothing in this build
 records a probe's own request and response anywhere, so `surface[6]` is the
@@ -144,23 +165,30 @@ def _probe_value() -> str:
     return f"{_probe_util.canary()}'"
 
 
-def _for_insertion(path_template: str, insertion: base.Insertion,
-                   value: str) -> str:
+def _for_insertion(path: str, path_template: str,
+                   insertion: base.Insertion, value: str) -> str | None:
     """The path for one probe, `value` in exactly the place `insertion`
     names. Percent-encoded (`quote(..., safe="")`) because the value rides
     the request line -- the same discipline `open_redirect.py`'s
     `_probe_path` and `reflected_input.py`'s `_for_insertion` document.
 
+    `path` IS THE ADDRESS AND `path_template` IS ONLY THE MAP: everything sent
+    is built on the exemplar's concrete path, and the template is consulted
+    for one thing, which segment index a `path_segment` insertion names.
+
     `path_segment` replaces EVERY occurrence of the placeholder, matching
     `reflected_input.py`'s own handling of a template that repeats
     `{id}` -- `hx.insertion.derive` yields one `Insertion` per name, so both
     occurrences are the same insertion point and both must carry the value.
+    `None` when that substitution cannot be made at all; the caller records a
+    gap rather than probing an address assembled out of a mismatch.
     """
     if insertion.kind == "query":
-        return (f"{path_template}?{quote(insertion.name, safe='')}="
+        return (f"{path}?{quote(insertion.name, safe='')}="
                 f"{quote(value, safe='')}")
     if insertion.kind == "path_segment":
-        return path_template.replace(insertion.name, quote(value, safe=""))
+        return _probe_util.substitute_segment(
+            path, path_template, insertion.name, quote(value, safe=""))
     raise ValueError(f"sql_error does not probe insertion kind {insertion.kind!r}")
 
 
@@ -213,15 +241,22 @@ class SqlError:
         exemplar_exchange_id = surface[6]
         path_template = surface[5]
         candidates = []
+        gaps = []
         probed_any = False
 
         for insertion in insertions:
             if insertion.kind not in self.insertion_kinds:
                 continue
-            probed_any = True
 
             value = _probe_value()
-            path = _for_insertion(path_template, insertion, value)
+            path = _for_insertion(sender.path, path_template, insertion, value)
+            if path is None:
+                # Nothing was sent, so nothing was examined: a gap, and
+                # `probed_any` deliberately not set.
+                gaps.append(f"{insertion.name}: no probe could be built for "
+                            "this insertion point")
+                continue
+            probed_any = True
             # No `try`/`except`: `ProbeSender.get()` RAISES `ProbeRefused`
             # on every refusal and never returns one (see
             # `hx/checks/probe.py`), and letting it propagate is what turns
@@ -231,6 +266,14 @@ class SqlError:
 
             found = _match(resp)
             if found is None:
+                # ASKED ONLY WHERE NOTHING MATCHED, and that ordering is what
+                # keeps a 500 usable: driver wording disclosed on one IS the
+                # finding, and only a 5xx (or 403, 404, 429) that disclosed
+                # nothing is a gap. `_probe_util.verdict`'s "a candidate wins
+                # over a gap", one step earlier.
+                refusal = _probe_util.unanswered(resp)
+                if refusal is not None:
+                    gaps.append(f"{insertion.name}: {refusal}")
                 continue
             signature, vendor = found
 
@@ -248,6 +291,4 @@ class SqlError:
                     "server-side instead of returning it to the client).")))
 
         considered = (_ISSUE_TYPE,) if probed_any else ()
-        if candidates:
-            return base.Verdict.finding(*candidates, considered=considered)
-        return base.Verdict.clean(considered=considered)
+        return _probe_util.verdict(candidates, gaps, considered=considered)

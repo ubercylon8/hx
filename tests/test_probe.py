@@ -49,6 +49,11 @@ class FakeBridge:
         self.calls = 0
         self.last_req: dict | None = None
         self.last_body: bytes | None = None
+        # EVERY body, not only the last. A check probes once per insertion
+        # point, and "no request line carried a template placeholder" (F1) is
+        # a claim about all of them -- `last_body` alone would let four
+        # requests out of five go unlooked at.
+        self.bodies: list[bytes] = []
 
     def reply(self, header: dict, body: bytes = b"") -> None:
         self._header = header
@@ -66,6 +71,7 @@ class FakeBridge:
         self.calls += 1
         self.last_req = req
         self.last_body = body
+        self.bodies.append(body)
         if self._refusal is not None and self._refusals_left != 0:
             if self._refusals_left is not None:
                 self._refusals_left -= 1
@@ -76,9 +82,9 @@ class FakeBridge:
         return {**self._header, server.BridgeServer.BODY_KEY: self._body}
 
 
-def _sender(bridge):
+def _sender(bridge, path="/a"):
     return probe.ProbeSender(bridge, scheme="https", host="app.test",
-                             port=443, path_template="/a")
+                             port=443, path=path)
 
 
 def _ok(fb: FakeBridge) -> None:
@@ -339,3 +345,67 @@ def test_the_sender_cannot_be_pointed_at_another_host():
     assert not hasattr(s, "host")
     with pytest.raises(ValueError):
         s.get("https://evil.test/a")
+
+
+# --- the path a probe is allowed to go to ----------------------------------
+#
+# F1 of the whole-branch review, made structural. A surface's identity is its
+# `path_template` -- `hx.surface` normalises `/user/12345/profile` to
+# `/user/{id}/profile` -- and every active check built its probe out of that
+# string, so on any templated surface the request went to a URL that cannot
+# exist and the 404 was recorded as `clean` with `considered` populated,
+# retiring live findings. The sender is bound to the exemplar's CONCRETE path
+# now, and refuses to carry a placeholder however it was handed one.
+
+
+def test_the_sender_carries_the_exemplars_concrete_path():
+    fb = FakeBridge()
+    s = _sender(fb, path="/user/12345/profile")
+    assert s.path == "/user/12345/profile"
+
+
+def test_the_bound_path_cannot_be_reassigned():
+    """Read-only, so a check cannot move a sender off the surface the runner
+    bound it to -- the same construction argument as
+    `test_the_sender_cannot_be_pointed_at_another_host`."""
+    s = _sender(FakeBridge(), path="/user/12345/profile")
+    with pytest.raises(AttributeError):
+        s.path = "/somewhere/else"
+
+
+@pytest.mark.parametrize("path", [
+    "/user/{id}/profile",           # the whole template
+    "/user/{id}/doc/{uuid}",        # two placeholders, neither substituted
+    "/order/9/doc/{uuid}",          # one substituted, one left behind
+    "/user/{id}/profile?q=1",       # a query appended to a template
+    "/{slug}",                      # the placeholder is the whole path
+])
+def test_a_path_still_holding_a_placeholder_is_refused(path):
+    """MEASURED, before this guard, against the real modules with a fake
+    sender on surface `/order/{id}/doc/{uuid}`: `hx.active.cors` sent `GET
+    /order/{id}/doc/{uuid}` and answered `clean` naming three issue types.
+    Nothing on the wire said no -- there was nothing there to say it -- so
+    this is a `ValueError` about a programmer's mistake and not a
+    `ProbeRefused`, which `hx.scan.run` would file as an ordinary
+    `inconclusive` row beside a rate limit."""
+    fb = FakeBridge()
+    _ok(fb)
+    s = _sender(fb, path=path)
+    with pytest.raises(ValueError, match="placeholder"):
+        s.get(path)
+    assert fb.calls == 0, "a request left despite the refusal"
+    assert s.sent == 0
+
+
+def test_a_concrete_path_that_merely_contains_braces_is_sent():
+    """The guard is per SEGMENT (`hx.insertion.is_placeholder`), not "any
+    brace anywhere": a percent-encoded brace and a brace inside a longer
+    segment are ordinary data, and `hx.surface._kept_segment` escapes a
+    literal `{` when it templates one, so a segment like this cannot BE a
+    placeholder in the surface row this sender was built from."""
+    fb = FakeBridge()
+    _ok(fb)
+    s = _sender(fb, path="/a%7Bid%7D/b")
+    s.get("/report/build{2026}x/view")
+    assert fb.calls == 1
+    assert fb.last_body.startswith(b"GET /report/build{2026}x/view ")

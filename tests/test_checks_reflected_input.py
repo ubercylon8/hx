@@ -48,10 +48,20 @@ class _FakeSender:
 
     `exc`, if set, is raised on every call instead of answering -- mirrors
     `test_checks_open_redirect.py`'s `_sender_raising`.
+
+    `path` is what the real `ProbeSender` exposes as its own: the CONCRETE
+    path of the surface's exemplar request, which is what a check builds
+    every probe out of. It defaults to this file's own `surface`'s
+    `path_template` because that surface is not templated -- the two are the
+    same string for it -- and the tests that need them to differ pass it
+    explicitly.
     """
 
     def __init__(self, *, mode: str = "raw",
-                exc: Exception | None = None) -> None:
+                exc: Exception | None = None,
+                path: str = "/search", status: int = 200) -> None:
+        self.path = path
+        self._status = status
         self._mode = mode
         self._exc = exc
         self.sent = 0
@@ -79,8 +89,8 @@ class _FakeSender:
             if self._mode == "escaped":
                 text = html.escape(text)
             body = text.encode("utf-8", errors="ignore")
-        return probe.ProbeResponse(status=200, head=_head(), body=body,
-                                   outcome="ok")
+        return probe.ProbeResponse(status=self._status, head=_head(),
+                                   body=body, outcome="ok")
 
 
 def _sender_raising(exc: Exception) -> _FakeSender:
@@ -177,6 +187,8 @@ def test_a_header_only_reflection_says_so_not_the_body():
     response body -- the two are different risks and the description must
     say which one this check actually saw."""
     class _HeaderEcho:
+        path = "/search"
+
         def __init__(self):
             self.sent = 0
 
@@ -263,6 +275,8 @@ def test_a_refusal_on_the_escalation_request_also_propagates():
     first -- the baseline canary reflects, and then the escalation itself is
     refused. Still a raise, still never a verdict."""
     class _ReflectsThenRefuses:
+        path = "/search"
+
         def __init__(self):
             self.sent = 0
             self.calls = []
@@ -297,6 +311,17 @@ def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
     assert v.considered == ()
 
 
+# A TEMPLATED SURFACE AND THE CONCRETE ADDRESS IT WAS NORMALISED FROM. These
+# used to be one string: the surface below carried `/items/{id}` and the
+# probe was built out of it, so every assertion about "the placeholder was
+# filled in" was answered by a request that could never have been served.
+# The sender is bound to `/items/12345` now -- what `hx.surface` templated
+# INTO that row -- and the substitution has to land in it.
+_TEMPLATED_SURFACE = ("s-1", "GET", "https", "app.test", 443,
+                      "/items/{id}", "x-1")
+_TEMPLATED_ADDRESS = "/items/12345"
+
+
 @pytest.mark.parametrize("insertion,expect_in_path,expect_in_headers", [
     (_QUERY_A, "q=", None),
     (_PATH_SEGMENT, None, None),
@@ -305,10 +330,8 @@ def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
 ])
 def test_each_kind_places_its_value_where_it_belongs(
         insertion, expect_in_path, expect_in_headers):
-    surface_with_id = ("s-1", "GET", "https", "app.test", 443,
-                       "/items/{id}", "x-1")
-    sender = _FakeSender(mode="off")
-    ri.ReflectedInput().probes(ctx, surface_with_id, (insertion,), sender)
+    sender = _FakeSender(mode="off", path=_TEMPLATED_ADDRESS)
+    ri.ReflectedInput().probes(ctx, _TEMPLATED_SURFACE, (insertion,), sender)
     assert sender.sent == 1
     path, headers = sender.calls[0]
     if expect_in_path:
@@ -317,6 +340,14 @@ def test_each_kind_places_its_value_where_it_belongs(
         assert expect_in_headers in headers
     if insertion.kind == "path_segment":
         assert "{id}" not in path, "the template placeholder must be filled in"
+        assert "12345" not in path, (
+            "the exemplar's own id is still in the request line, so this "
+            "probe carries no payload at all -- which is what a `str.replace` "
+            "of `{id}` against a CONCRETE path does")
+    else:
+        assert path.startswith(_TEMPLATED_ADDRESS), (
+            "a probe that is not a path-segment probe must still go to the "
+            "exemplar's own address")
 
 
 def test_a_repeated_path_placeholder_is_filled_in_at_every_occurrence():
@@ -324,15 +355,33 @@ def test_a_repeated_path_placeholder_is_filled_in_at_every_occurrence():
     so a template repeating `{id}` twice yields ONE `Insertion` for it --
     both occurrences are the same insertion point and both must carry the
     probe value, or the request would still name the real value at the spot
-    left untouched."""
+    left untouched. The two occurrences hold DIFFERENT values in the concrete
+    address, so a substitution that reached only one of them leaves a
+    recognisable string behind."""
     surface_with_repeat = ("s-1", "GET", "https", "app.test", 443,
                            "/a/{id}/b/{id}", "x-1")
-    sender = _FakeSender(mode="off")
+    sender = _FakeSender(mode="off", path="/a/11111/b/22222")
     ri.ReflectedInput().probes(ctx, surface_with_repeat, (_PATH_SEGMENT,),
                                sender)
     assert sender.sent == 1
     path, _headers = sender.calls[0]
     assert "{id}" not in path
+    assert "11111" not in path and "22222" not in path, path
+
+
+def test_a_placeholder_the_address_cannot_carry_is_a_gap_never_a_clean():
+    """The substitution's own failure mode, and the direction it has to fail
+    in. `_probe_util.substitute_segment` answers `None` when the address and
+    the template disagree about how many segments they have -- which should
+    be unreachable for a template derived from this very request -- and the
+    alternative to a gap is a probe assembled out of the mismatch, or a
+    `clean` claiming to have examined a point nothing was sent to."""
+    sender = _FakeSender(mode="off", path="/items/12345/extra")
+    v = ri.ReflectedInput().probes(ctx, _TEMPLATED_SURFACE, (_PATH_SEGMENT,),
+                                   sender)
+    assert sender.sent == 0
+    assert v.state == "inconclusive"
+    assert v.considered == ()
 
 
 def test_two_reflecting_insertion_points_are_two_findings():
@@ -385,3 +434,35 @@ def test_the_marker_never_contains_meta_characters_before_escalation():
     for path, headers in sender.calls:
         haystack = path + " ".join(headers.values())
         assert not any(c in haystack for c in ri._META_CHARS)
+
+
+# ---- a refusal from the target is not a clean answer ---------------------
+#
+# F4 of the whole-branch review. The doctrine lives in `_probe_util`; this is
+# this check's end of it.
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
+def test_a_status_that_refused_is_inconclusive_not_clean(status):
+    """A WAF block page reflects nothing, and so does a target that encodes
+    its output properly. Only the second may retire a finding."""
+    v = ri.ReflectedInput().probes(
+        ctx, surface, (_QUERY_A,), _FakeSender(mode="off", status=status))
+    assert v.state == "inconclusive"
+    assert str(status) in v.reason
+    assert v.considered == ()
+
+
+def test_a_marker_that_came_back_on_a_refusing_status_is_still_a_finding():
+    """A candidate wins over a gap: the canary being in the response proves
+    this target reflected it, whatever the status line said."""
+    v = ri.ReflectedInput().probes(
+        ctx, surface, (_QUERY_A,), _FakeSender(mode="raw", status=500))
+    assert v.state == "finding"
+
+
+def test_nothing_reflected_on_a_200_is_still_clean():
+    v = ri.ReflectedInput().probes(
+        ctx, surface, (_QUERY_A,), _FakeSender(mode="off", status=200))
+    assert v.state == "clean"
+    assert v.considered == (ri._ISSUE_TYPE,)

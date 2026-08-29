@@ -32,10 +32,18 @@ class _FakeSender:
     `Exception` to raise on the first call. Calls beyond the list re-answer
     with the last entry -- convenient for tests that only care about the
     first response a canary-shaped parameter draws.
+
+    `path` is what the real `ProbeSender` exposes as its own: the CONCRETE
+    path of the surface's exemplar request, which is what a check builds
+    every probe out of. It defaults to this file's own `surface`'s
+    `path_template` because that surface is not templated -- the two are the
+    same string for it -- and the tests that need them to differ pass it
+    explicitly.
     """
 
     def __init__(self, *, responses: list[tuple[int, dict[str, str]]] | None = None,
-                exc: Exception | None = None) -> None:
+                exc: Exception | None = None, path: str = "/go") -> None:
+        self.path = path
         self._responses = responses or []
         self._exc = exc
         self.sent = 0
@@ -282,3 +290,39 @@ def test_two_canary_shaped_parameters_that_both_redirect_are_two_findings():
     assert v.state == "finding"
     assert len(v.candidates) == 2
     assert {c.insertion for c in v.candidates} == {_REDIRECT_INSERTION, other}
+
+
+# ---- a refusal from the target is not a clean answer ---------------------
+#
+# F4 of the whole-branch review. The doctrine lives in `_probe_util`; these
+# are this check's end of it, and the 3xx case is why the set had to be
+# chosen rather than "every status that is not 2xx".
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
+def test_a_status_that_refused_is_inconclusive_not_clean(status):
+    """A response with no `Location` because a WAF answered instead is not a
+    target that validated the parameter, and only one of those may retire a
+    finding."""
+    v = oredir.OpenRedirect().probes(
+        ctx, surface, (_REDIRECT_INSERTION,), _sender_returning(status, {}))
+    assert v.state == "inconclusive"
+    assert str(status) in v.reason
+    assert v.considered == ()
+
+
+def test_a_redirect_status_is_this_checks_finding_and_never_a_gap():
+    """The separating case, and the reason 3xx is deliberately outside
+    `_probe_util._NOT_AN_ANSWER`: a doctrine that read every non-2xx as a
+    refusal would delete this check."""
+    v = oredir.OpenRedirect().probes(
+        ctx, surface, (_REDIRECT_INSERTION,),
+        _sender_returning(302, {"Location": oredir._MARKER_URL}))
+    assert v.state == "finding"
+
+
+def test_a_two_hundred_with_no_location_is_still_clean():
+    v = oredir.OpenRedirect().probes(
+        ctx, surface, (_REDIRECT_INSERTION,), _sender_returning(200, {}))
+    assert v.state == "clean"
+    assert v.considered == (oredir._ISSUE_TYPE,)

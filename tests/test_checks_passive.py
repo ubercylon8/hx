@@ -399,6 +399,40 @@ def test_a_partly_unreadable_surface_that_finds_something_still_says_finding():
     assert "session" in v.candidates[0].title
 
 
+def test_a_finding_from_partial_evidence_retires_nothing_beside_it():
+    """F5 of the whole-branch review. `_http.verdict` used to pass
+    `considered` on the finding branch unconditionally while the `clean`
+    branch required zero gaps, and `considered` is exactly what
+    `hx.scan._mark_unobserved` retires by -- so a surface with one unreadable
+    exchange and one candidate found in another claimed to have EXAMINED
+    every issue type this check names, including the one whose only evidence
+    was the exchange nobody could read. The finding stays (the test above);
+    what it may not do is close its neighbours.
+    """
+    c = cookie_flags.CookieFlags()
+    v = c.on_surface(ctx_for(d1=resp(b"Set-Cookie: session=abc; Path=/")), None,
+                     two_rows(second_outcome="conn_refused", second_blob=None))
+    assert v.state == "finding"
+    assert v.considered == (), (
+        "a finding built on partial evidence claimed to have examined "
+        f"{v.considered}, every one of which `_mark_unobserved` would retire")
+
+
+def test_the_same_finding_on_whole_evidence_does_consider_what_it_examined():
+    """The separating case for the test above: withholding `considered`
+    unconditionally would make every finding un-retirable, which is the
+    other direction S12 forbids -- a client who fixes a flagless cookie
+    would never see it close."""
+    c = cookie_flags.CookieFlags()
+    rows_ok = (base.ExchangeRow(id="x-1", method="GET",
+                                url="https://app.test/x", status=200,
+                                outcome="ok", req_blob=None, resp_blob="d1"),)
+    v = c.on_surface(ctx_for(d1=resp(b"Set-Cookie: session=abc; Path=/")),
+                     None, rows_ok)
+    assert v.state == "finding"
+    assert v.considered, "a finding nothing considered can never be retired"
+
+
 def test_a_truncated_response_is_read_for_what_it_holds_and_still_not_clean():
     """`truncated` and `status_unreadable` DID bring bytes back -- `capture`'s
     own docstring lists them with `ok` as the outcomes meaning a response

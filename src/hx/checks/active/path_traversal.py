@@ -87,6 +87,25 @@ EACH CANDIDATE CARRIES ITS `Insertion`, for the same reason
 finding's identity, and two parameters that each independently disclose
 file content must stay two rows.
 
+THE PROBE GOES TO THE EXEMPLAR'S OWN PATH (`sender.path`), NOT TO THE SURFACE
+ROW'S `path_template`, AND THE PATH-SEGMENT SUBSTITUTION IS BY INDEX BECAUSE
+OF IT. F1 of the whole-branch review: `_for_insertion` used to build its
+request line out of `surface[5]`, which on a templated surface is an identity
+(`/order/{id}/doc`) and not an address -- the probe reached a URL that cannot
+exist, the 404 carried no file content, and this check answered `clean` with
+its issue type in `considered`, retiring live findings. The concrete path
+does not contain the placeholder a `path_segment` probe has to replace, so
+`str.replace` against it silently substitutes NOTHING and sends the
+exemplar's own value back; `_probe_util.substitute_segment` aligns the two
+paths by segment index instead and returns `None` rather than a probe that
+tests nothing.
+
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 403, a 429, a 5xx or a 404
+carries no `/etc/passwd` line for the same reason a target that canonicalises
+its paths carries none, and the two must not record the same verdict. `_match`
+is consulted first, so a signature disclosed on any status is still the
+finding. See `_probe_util.py` for the doctrine all five active checks share.
+
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
 same reason every active check in this corpus gives: nothing in this build
 records a probe's own request and response anywhere -- the extension
@@ -140,19 +159,27 @@ def _looks_like_file_target(name: str) -> bool:
     return any(hint in low for hint in _FILE_NAME_HINTS)
 
 
-def _for_insertion(path_template: str, insertion: base.Insertion,
-                   value: str) -> str:
+def _for_insertion(path: str, path_template: str,
+                   insertion: base.Insertion, value: str) -> str | None:
     """The path for one probe, `value` in exactly the place `insertion`
     names -- percent-encoded, matching `sql_error.py`'s `_for_insertion`
-    and the module docstring's safety section on why. `path_segment`
-    replaces every occurrence of the placeholder, matching
-    `reflected_input.py`'s handling of a repeated `{id}`.
+    and the module docstring's safety section on why.
+
+    `path` IS THE ADDRESS AND `path_template` IS ONLY THE MAP: everything
+    sent is built on the exemplar's concrete path, and the template is
+    consulted for one thing, which segment index a `path_segment` insertion
+    names. `path_segment` replaces every occurrence of the placeholder
+    (`_probe_util.substitute_segment` does, and says why), matching
+    `reflected_input.py`'s handling of a repeated `{id}`, and answers `None`
+    when it cannot -- which the caller records as a gap rather than probing
+    an address assembled out of a mismatch.
     """
     if insertion.kind == "query":
-        return (f"{path_template}?{quote(insertion.name, safe='')}="
+        return (f"{path}?{quote(insertion.name, safe='')}="
                 f"{quote(value, safe='')}")
     if insertion.kind == "path_segment":
-        return path_template.replace(insertion.name, quote(value, safe=""))
+        return _probe_util.substitute_segment(
+            path, path_template, insertion.name, quote(value, safe=""))
     raise ValueError(
         f"path_traversal does not probe insertion kind {insertion.kind!r}")
 
@@ -205,6 +232,7 @@ class PathTraversal:
         exemplar_exchange_id = surface[6]
         path_template = surface[5]
         candidates = []
+        gaps = []
         probed_any = False
 
         for insertion in insertions:
@@ -212,9 +240,16 @@ class PathTraversal:
                 continue
             if not _looks_like_file_target(insertion.name):
                 continue
-            probed_any = True
 
-            path = _for_insertion(path_template, insertion, _TRAVERSAL_PAYLOAD)
+            path = _for_insertion(sender.path, path_template, insertion,
+                                  _TRAVERSAL_PAYLOAD)
+            if path is None:
+                # Nothing was sent, so nothing was examined: a gap, and
+                # `probed_any` deliberately not set.
+                gaps.append(f"{insertion.name}: no probe could be built for "
+                            "this insertion point")
+                continue
+            probed_any = True
             # No `try`/`except`: `ProbeSender.get()` RAISES `ProbeRefused`
             # on every refusal and never returns one (see
             # `hx/checks/probe.py`), and letting it propagate is what turns
@@ -224,6 +259,13 @@ class PathTraversal:
 
             found = _match(resp)
             if found is None:
+                # ASKED ONLY WHERE NOTHING MATCHED: a file's own content
+                # coming back proves the traversal landed whatever the status
+                # line said. `_probe_util.verdict`'s "a candidate wins over a
+                # gap", one step earlier.
+                refusal = _probe_util.unanswered(resp)
+                if refusal is not None:
+                    gaps.append(f"{insertion.name}: {refusal}")
                 continue
             signature, what = found
 
@@ -243,6 +285,4 @@ class PathTraversal:
                     "input directly into a filesystem path.")))
 
         considered = (_ISSUE_TYPE,) if probed_any else ()
-        if candidates:
-            return base.Verdict.finding(*candidates, considered=considered)
-        return base.Verdict.clean(considered=considered)
+        return _probe_util.verdict(candidates, gaps, considered=considered)

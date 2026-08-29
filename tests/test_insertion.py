@@ -3,7 +3,9 @@
 S5: derived, not stored. The derivation is pure -- bytes in, insertion points
 out -- so it is testable without a database, a surface row or a Burp.
 """
-from hx import insertion
+import pytest
+
+from hx import insertion, surface
 from hx.checks.base import Insertion
 
 REQ = (
@@ -106,3 +108,89 @@ def test_derivation_is_deterministic_and_ordered():
     b = insertion.derive(REQ, "/api/orders/{id}")
     assert a == b
     assert list(a) == sorted(a, key=lambda i: (i.kind, i.name))
+
+
+# ---- request_path() -------------------------------------------------------
+#
+# THE ADDRESS, NOT THE TEMPLATE. `hx.scan.run` reads this off a surface's
+# exemplar request and binds `probe.ProbeSender` to it. Before F1 of the
+# whole-branch review nothing read it at all: every active check built its
+# probe out of `surface.path_template`, so on a templated surface the request
+# went to `/api/orders/{id}` -- a URL that cannot exist -- and the 404 was
+# recorded as `clean`.
+
+
+def test_the_concrete_path_is_read_off_the_request_line():
+    assert insertion.request_path(REQ) == "/api/orders/1001"
+
+
+def test_the_query_string_is_not_part_of_the_path():
+    """`open_redirect._probe_path` and every other query probe append the
+    first and only `?` themselves; a path that already carried one would put
+    two on the request line."""
+    assert "?" not in insertion.request_path(REQ)
+
+
+def test_an_absolute_form_request_line_still_yields_its_path():
+    """A browser addresses a PROXY with the absolute URI, and the proxy is
+    the only way anything reaches `hx.capture` today -- so this is not an
+    exotic shape, it is the ordinary one for half the captures."""
+    raw = (b"GET http://app.test/api/orders/1001?page=2 HTTP/1.1\r\n"
+           b"Host: app.test\r\n\r\n")
+    assert insertion.request_path(raw) == "/api/orders/1001"
+
+
+def test_a_bare_lf_request_line_is_still_read():
+    """RFC 9112 s2.2 requires a recipient to accept a bare LF. `derive`
+    itself yields nothing for such a capture (it splits the head on CRLF),
+    and the two disagreeing is deliberate: a surface with no insertion points
+    is skipped `no_insertion_point`, which is a better row than
+    `no_probe_path` for a request whose address was perfectly readable."""
+    assert insertion.request_path(b"GET /a/b HTTP/1.1\nHost: app.test\n\n") \
+        == "/a/b"
+
+
+@pytest.mark.parametrize("raw", [
+    b"OPTIONS * HTTP/1.1\r\nHost: app.test\r\n\r\n",   # asterisk-form
+    b"CONNECT app.test:443 HTTP/1.1\r\n\r\n",            # authority-form
+    b"GET\r\n\r\n",                                      # no target at all
+    b"",
+])
+def test_a_request_with_no_absolute_path_yields_None(raw):
+    """`None` rather than a guess. The caller's answer is a `skipped` row
+    naming it -- never a probe aimed at something invented here."""
+    assert insertion.request_path(raw) is None
+
+
+# ---- is_placeholder() -----------------------------------------------------
+#
+# One definition of the shape, read by `derive` above and by
+# `hx.checks.probe.ProbeSender.get`, which REFUSES to put one on the wire.
+
+
+@pytest.mark.parametrize("segment", ["{id}", "{uuid}", "{hex}", "{slug}"])
+def test_every_placeholder_the_normaliser_mints_is_recognised(segment):
+    """Read out of `hx.surface` rather than trusted: a fifth placeholder
+    added there without this set knowing would be a segment `derive` never
+    turns into an insertion point and `ProbeSender` happily sends."""
+    assert insertion.is_placeholder(segment)
+
+
+def test_the_normalisers_whole_vocabulary_is_the_four_above():
+    minted = {surface.path_template(f"/{seg}", preserve=frozenset(),
+                                    slug_threshold=12).lstrip("/")
+              for seg in ("1", "0f8c8b1e-1e2a-4b3c-8d4e-5f60718293a4",
+                          "a" * 32, "hello-world-2026-edition")}
+    assert minted == {"{id}", "{uuid}", "{hex}", "{slug}"}
+    assert all(insertion.is_placeholder(m) for m in minted)
+
+
+@pytest.mark.parametrize("segment", [
+    "", "id", "{}", "{", "}", "%7Bid%7D", "a{b}c", "{id}x", "x{id}",
+])
+def test_nothing_else_is_a_placeholder(segment):
+    """`{}` is excluded because nothing mints it, and `%7Bid%7D` is what
+    `hx.surface._kept_segment` turns a literal `{id}` segment into -- so a
+    captured path cannot forge one."""
+    assert not insertion.is_placeholder(segment)
+

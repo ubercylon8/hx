@@ -26,10 +26,21 @@ def _head(headers: dict[str, str]) -> bytes:
 
 
 class _FakeSender:
-    """A `ProbeSender`-shaped double. Exactly one of `headers`/`exc` is set."""
+    """A `ProbeSender`-shaped double. Exactly one of `headers`/`exc` is set.
+
+    `path` is what the real `ProbeSender` exposes as its own: the CONCRETE
+    path of the surface's exemplar request, which is where this check sends
+    its one probe. It defaults to this file's own `surface`'s
+    `path_template` because that surface is not templated -- the two are the
+    same string for it -- and the tests that need them to differ pass it
+    explicitly.
+    """
 
     def __init__(self, *, headers: dict[str, str] | None = None,
-                exc: Exception | None = None) -> None:
+                exc: Exception | None = None, path: str = "/",
+                status: int = 200) -> None:
+        self.path = path
+        self._status = status
         self._headers = headers
         self._exc = exc
         self.sent = 0
@@ -50,7 +61,8 @@ class _FakeSender:
         self.last_headers = headers
         if self._exc is not None:
             raise self._exc
-        return probe.ProbeResponse(status=200, head=_head(self._headers or {}),
+        return probe.ProbeResponse(status=self._status,
+                                   head=_head(self._headers or {}),
                                    body=b"", outcome="ok")
 
 
@@ -292,3 +304,32 @@ def test_every_finding_has_an_insertion_of_none(headers):
     v = cors.Cors().probes(ctx, surface, (), _sender_returning(headers))
     assert v.state == "finding"
     assert all(c.insertion is None for c in v.candidates)
+
+
+# ---- a refusal from the target is not a clean answer ---------------------
+#
+# F4 of the whole-branch review: every active check treated ANY status as a
+# conclusive negative, so a WAF's 403, a 500 or a maintenance page recorded
+# `clean` with `considered` populated and retired live findings. The doctrine
+# lives in `_probe_util`; these two tests are this check's end of it.
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
+def test_a_status_that_refused_is_inconclusive_not_clean(status):
+    """A response with no CORS headers because nothing answered looks
+    identical, header for header, to one from a correctly configured target.
+    `inconclusive` carries no `considered`, so nothing is retired."""
+    v = cors.Cors().probes(ctx, surface, (), _FakeSender(headers={},
+                                                         status=status))
+    assert v.state == "inconclusive"
+    assert str(status) in v.reason
+    assert v.considered == ()
+
+
+def test_the_same_missing_headers_on_a_200_are_still_clean():
+    """The separating case. Treating every status as a refusal would mean no
+    CORS finding could ever be retired, which is S12's other direction."""
+    v = cors.Cors().probes(ctx, surface, (), _FakeSender(headers={},
+                                                         status=200))
+    assert v.state == "clean"
+    assert v.considered

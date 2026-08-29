@@ -139,11 +139,14 @@ def verdict(evidence: Evidence, candidates, *,
 
     A CANDIDATE STILL WINS OVER A GAP. What was found was found; incomplete
     coverage does not un-find it, and downgrading a real finding to "could
-    not test" would lose the one thing the surface did prove. (What that
-    leaves open: `Verdict.finding` carries no reason, so a partially-covered
-    surface that DID find something records no trace of the gap. Closing that
-    means a reason on a finding verdict, which is a schema-visible change to
-    `check_run` semantics and not this fix's.)
+    not test" would lose the one thing the surface did prove. What a gap DOES
+    take from a finding is `considered`: the finding is reported, and the
+    surface's other issue types are not retired on evidence that was never
+    read. (What that leaves open: `Verdict.finding` carries no reason, so a
+    partially-covered surface that DID find something records no trace of the
+    gap in its own row. Closing that means a reason on a finding verdict,
+    which is a schema-visible change to `check_run` semantics and not this
+    fix's.)
 
     `considered` NAMES WHAT THE CHECK EXAMINED, and only the two conclusive
     returns carry it. An `inconclusive` verdict deliberately does not: the
@@ -152,22 +155,44 @@ def verdict(evidence: Evidence, candidates, *,
     response it could not read.
     """
     if candidates:
-        return base.Verdict.finding(*candidates, considered=considered)
+        # F5 of the whole-branch review. This used to pass `considered`
+        # unconditionally while the `clean` return below required zero gaps,
+        # and the asymmetry retires findings: `considered` is what
+        # `hx.scan._mark_unobserved` reads, so a surface holding one
+        # unreadable exchange and one candidate found elsewhere claimed to
+        # have EXAMINED every issue type this check names -- including,
+        # exactly, the type whose only evidence was the exchange that could
+        # not be read. The finding is still reported (a candidate wins over a
+        # gap, above); what it may not do is retire its neighbours on
+        # evidence nobody could read.
+        return base.Verdict.finding(
+            *candidates, considered=() if evidence.gaps else considered)
     if not evidence.entries:
         return base.Verdict.inconclusive(
-            "no response could be read for this surface" + _detail(evidence))
+            "no response could be read for this surface"
+            + _detail(evidence.gaps))
     if evidence.gaps:
         return base.Verdict.inconclusive(
             "this surface's evidence is incomplete, so nothing found here "
-            "separates `tested, clean` from `never reached`" + _detail(evidence))
+            "separates `tested, clean` from `never reached`"
+            + _detail(evidence.gaps))
     return base.Verdict.clean(considered=considered)
 
 
-def _detail(evidence: Evidence) -> str:
-    if not evidence.gaps:
+def _detail(gaps: tuple[str, ...]) -> str:
+    """The gap list as a coverage row shows it -- at most `_GAPS_SHOWN`, then
+    a count.
+
+    TAKES THE GAPS AND NOT AN `Evidence`, so that the active corpus can use
+    it too: `hx.checks.active._probe_util.verdict` collects a gap per probe
+    that came back without answering, and an operator reading a coverage row
+    must see them spelt the same way whichever half of the corpus wrote the
+    row.
+    """
+    if not gaps:
         return ""
-    shown = list(evidence.gaps[:_GAPS_SHOWN])
-    hidden = len(evidence.gaps) - len(shown)
+    shown = list(gaps[:_GAPS_SHOWN])
+    hidden = len(gaps) - len(shown)
     if hidden > 0:
         shown.append(f"and {hidden} more")
     return ": " + "; ".join(shown)

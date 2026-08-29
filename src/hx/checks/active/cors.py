@@ -3,14 +3,16 @@
 ONE REQUEST, NO INSERTION POINT. This check carries the cheapest possible
 proof that the whole active path works: a single GET carrying an `Origin`
 header the target cannot have expected, and the answer sits entirely in the
-response headers -- no payload, no reflection analysis over a body, nothing
-to derive from an exemplar. `insertion_kinds = frozenset()` on purpose: a
+response headers -- no payload, no reflection analysis over a body, no
+insertion point to fill in. `insertion_kinds = frozenset()` on purpose: a
 CORS finding has no insertion point because the request is shaped by a
-header THIS CHECK adds, not by a parameter it found on the surface. That is
-the same reasoning S5 gives for TLS and cookie-flag findings, and it is why
-`hx.scan.run`'s probe pass runs a check declaring no kinds instead of
-skipping it for having none of what it never asked for (see the comment
-above `usable = tuple(...)` in `scan.py`).
+header THIS CHECK adds, not by a parameter it found on the surface. (It is
+still handed the exemplar's own concrete path to send that header AT, and
+skipped when the surface has no exemplar to cite: "no insertion point" is
+not "nothing from the exemplar".) That is the same reasoning S5 gives for
+TLS and cookie-flag findings, and it is why `hx.scan.run`'s probe pass runs
+a check declaring no kinds instead of skipping it for having none of what it
+never asked for (see the comment above `usable = tuple(...)` in `scan.py`).
 
 `_PROBE_ORIGIN` USES `.test`, RFC 2606's reserved TLD for exactly this: a
 value guaranteed never to resolve and never to be a real, in-scope
@@ -40,6 +42,24 @@ WHAT THE PAIR OF HEADERS MEANS, AND WHY THE SEVERITIES DIFFER:
   * `*` alone, with no credentials, is the ordinary shape of a public,
     unauthenticated API and is not reported at all.
 
+THE PROBE GOES TO THE EXEMPLAR'S OWN PATH (`sender.path`), NOT TO THE SURFACE
+ROW'S `path_template`. F1 of the whole-branch review: this check used to send
+`surface[5]`, which on any templated surface is a string like
+`/order/{id}/doc/{uuid}` -- an identity, not an address. The 404 that came
+back carried no CORS headers, this check answered `clean` with all three
+types in `considered`, and `hx.scan._mark_unobserved` retired the client's
+live CORS finding on the strength of it. `hx.checks.probe.ProbeSender` now
+refuses a path still carrying a placeholder, so the mistake cannot be made
+again silently.
+
+A RESPONSE THAT REFUSED IS NOT A RESPONSE THAT ANSWERED. A 403 from a WAF, a
+500, a 429 or a 404 carries no CORS headers for the same reason a correctly
+configured target carries none, and the two must not record the same verdict:
+`_probe_util.unanswered` names the first, and `_probe_util.verdict` turns it
+into `inconclusive` -- which carries no `considered` and therefore retires
+nothing. See `_probe_util.py`'s own docstring for why that doctrine is shared
+across all five checks rather than spelt here.
+
 `considered` NAMES ALL THREE, on every clean or finding answer, because
 `hx.scan._mark_unobserved` retires a finding whose issue type is in
 `considered` and was not re-emitted this run: naming fewer than all three
@@ -62,6 +82,7 @@ no current task.
 from __future__ import annotations
 
 from hx.checks import base
+from hx.checks.active import _probe_util
 from hx.checks.passive import _http
 
 # RFC 2606: `.test` is reserved and guaranteed never to be a real,
@@ -125,7 +146,7 @@ class Cors:
 
     def probes(self, ctx, surface, insertions, sender) -> base.Verdict:
         exemplar_exchange_id = surface[6]
-        resp = sender.get(surface[5], headers={"Origin": _PROBE_ORIGIN})
+        resp = sender.get(sender.path, headers={"Origin": _PROBE_ORIGIN})
 
         allow_origin = _http.header_values(resp.head,
                                            "access-control-allow-origin")
@@ -188,6 +209,14 @@ class Cors:
                     "Either drop Access-Control-Allow-Credentials or reflect "
                     "a validated, non-wildcard origin instead of *."))
 
-        if candidate is not None:
-            return base.Verdict.finding(candidate, considered=_CONSIDERED)
-        return base.Verdict.clean(considered=_CONSIDERED)
+        # ASKED ONLY WHERE NOTHING WAS FOUND, which is `_probe_util.verdict`'s
+        # "a candidate wins over a gap" one step earlier: a response carrying
+        # `Access-Control-Allow-Origin` answered the question this check asked,
+        # whatever its status line said about the rest of the request.
+        candidates = [] if candidate is None else [candidate]
+        gaps = []
+        if not candidates:
+            refusal = _probe_util.unanswered(resp)
+            if refusal is not None:
+                gaps.append(refusal)
+        return _probe_util.verdict(candidates, gaps, considered=_CONSIDERED)

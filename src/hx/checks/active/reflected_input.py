@@ -75,6 +75,24 @@ back absent IS the examination, the same way a clean answer from `cors.py`'s
 one request means its three issue types were all looked at and none applied
 -- "examined" never meant "found something", here or in either predecessor.
 
+THE PROBE GOES TO THE EXEMPLAR'S OWN PATH (`sender.path`), NOT TO THE SURFACE
+ROW'S `path_template`, AND THE PATH-SEGMENT SUBSTITUTION IS BY INDEX BECAUSE
+OF IT. F1 of the whole-branch review: `_for_insertion` used to build every
+probe out of `surface[5]`, so on a templated surface a query, header or
+cookie probe went to `/order/{id}/doc` -- an address that cannot exist --
+and the 404 came back with nothing reflected, `clean`, `considered`
+populated, retiring live findings. The path is now the exemplar's concrete
+one, which does NOT contain the placeholder to replace: `str.replace` there
+finds nothing, leaves the exemplar's own value in place, and sends a probe
+that tests nothing. `_probe_util.substitute_segment` aligns the two paths by
+segment index instead, and returns `None` -- a gap, never a silent
+substitution-that-did-not-happen -- when it cannot.
+
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 403, a 429, a 5xx or a 404
+reflects nothing for the same reason a properly encoding target reflects
+nothing, and the two must not record the same verdict. See `_probe_util.py`
+for the doctrine, which all five active checks share.
+
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
 same reason `cors.py` and `open_redirect.py` give: nothing in this build
 records a probe's own request and response anywhere, so `surface[6]` is the
@@ -108,10 +126,14 @@ _PLAIN_TITLE = "Input reflected via {name!r}"
 _UNESCAPED_TITLE = "Input reflected via {name!r}, unescaped"
 
 
-def _for_insertion(path_template: str, insertion: base.Insertion,
-                   value: str) -> tuple[str, dict[str, str]]:
+def _for_insertion(path: str, path_template: str, insertion: base.Insertion,
+                   value: str) -> tuple[str, dict[str, str]] | None:
     """The path and headers for one probe: `value` in exactly the place
     `insertion` names.
+
+    `path` IS THE ADDRESS AND `path_template` IS ONLY THE MAP. Everything
+    sent is built on the exemplar's concrete path; the template is consulted
+    for one thing, which segment index a `path_segment` insertion names.
 
     Query and path segment values are percent-encoded (`quote(..., safe="")`)
     because they ride the request line, the same discipline
@@ -122,21 +144,27 @@ def _for_insertion(path_template: str, insertion: base.Insertion,
     percent-encoding in a header, a different and uninteresting question.
 
     `path_segment` REPLACES EVERY OCCURRENCE of the placeholder, not just
-    the first. `hx.insertion.derive` collects placeholders into a SET keyed
-    by name, so a template repeating `{id}` twice yields ONE `Insertion` for
-    it -- both occurrences are the same insertion point and both must carry
-    the probe value, or the request would still name the real value at the
-    spot this call left untouched.
+    the first (`_probe_util.substitute_segment` does, and says why): a
+    template repeating `{id}` twice yields ONE `Insertion` for it, both
+    occurrences are the same insertion point, and a request still naming the
+    real value at the spot a substitution skipped is not the probe this
+    check thinks it sent.
+
+    `None` when the substitution could not be made at all -- the caller
+    records it as a gap rather than probing an address assembled out of a
+    mismatch.
     """
     if insertion.kind == "query":
-        return (f"{path_template}?{quote(insertion.name, safe='')}="
+        return (f"{path}?{quote(insertion.name, safe='')}="
                 f"{quote(value, safe='')}", {})
     if insertion.kind == "path_segment":
-        return path_template.replace(insertion.name, quote(value, safe="")), {}
+        substituted = _probe_util.substitute_segment(
+            path, path_template, insertion.name, quote(value, safe=""))
+        return None if substituted is None else (substituted, {})
     if insertion.kind == "header":
-        return path_template, {insertion.name: value}
+        return path, {insertion.name: value}
     if insertion.kind == "cookie":
-        return path_template, {"Cookie": f"{insertion.name}={value}"}
+        return path, {"Cookie": f"{insertion.name}={value}"}
     raise ValueError(f"unknown insertion kind {insertion.kind!r}")
 
 
@@ -200,15 +228,24 @@ class ReflectedInput:
         exemplar_exchange_id = surface[6]
         path_template = surface[5]
         candidates = []
+        gaps = []
         probed_any = False
 
         for insertion in insertions:
             if insertion.kind not in self.insertion_kinds:
                 continue
-            probed_any = True
 
             marker = _probe_util.canary()
-            path, headers = _for_insertion(path_template, insertion, marker)
+            built = _for_insertion(sender.path, path_template, insertion,
+                                   marker)
+            if built is None:
+                # Nothing was sent, so nothing was examined: a gap, and
+                # `probed_any` deliberately not set.
+                gaps.append(f"{insertion.name}: no probe could be built for "
+                            "this insertion point")
+                continue
+            probed_any = True
+            path, headers = built
             # No `try`/`except`: `ProbeSender.get()` RAISES `ProbeRefused` on
             # every refusal and never returns one (see `hx/checks/probe.py`),
             # and letting it propagate is what turns this into
@@ -216,12 +253,22 @@ class ReflectedInput:
             # check mistook a refusal for.
             resp = sender.get(path, headers=headers)
             if not _probe_util.reflected(resp, marker):
+                # ASKED ONLY WHERE NOTHING CAME BACK: a canary that reflected
+                # proves the response carried this input, whatever its status
+                # line said. `_probe_util.verdict`'s "a candidate wins over a
+                # gap", one step earlier.
+                refusal = _probe_util.unanswered(resp)
+                if refusal is not None:
+                    gaps.append(f"{insertion.name}: {refusal}")
                 continue
 
             escalation_marker = _probe_util.canary()
             wrapped = f"{_META_CHARS}{escalation_marker}{_META_CHARS}"
-            esc_path, esc_headers = _for_insertion(path_template, insertion,
-                                                   wrapped)
+            # Not `None`: the same insertion point built a probe a moment ago
+            # and `substitute_segment` is a pure function of the same three
+            # arguments.
+            esc_path, esc_headers = _for_insertion(
+                sender.path, path_template, insertion, wrapped)
             esc_resp = sender.get(esc_path, headers=esc_headers)
             unescaped = _probe_util.reflected(esc_resp, wrapped)
 
@@ -243,6 +290,4 @@ class ReflectedInput:
                     "echoed at all.")))
 
         considered = (_ISSUE_TYPE,) if probed_any else ()
-        if candidates:
-            return base.Verdict.finding(*candidates, considered=considered)
-        return base.Verdict.clean(considered=considered)
+        return _probe_util.verdict(candidates, gaps, considered=considered)

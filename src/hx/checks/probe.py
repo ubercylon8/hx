@@ -6,7 +6,7 @@ A check does not own a socket and cannot construct one. It is handed a
 unchanged: every byte that leaves this machine still crosses one of two
 points inside the JVM, and this module adds neither.
 
-TWO RULES, BOTH STRUCTURAL RATHER THAN DOCUMENTED.
+THREE RULES, ALL STRUCTURAL RATHER THAN DOCUMENTED.
 
 A REFUSAL RAISES. S10 says a check that cannot run returns `inconclusive`,
 never `clean`. A sender that RETURNED a refusal would leave a check free to
@@ -19,6 +19,25 @@ writes `check_run.requests_sent` when it closes the row, so
 `hx.checks.base.CheckContext`'s guarantee -- "a check that can write is a
 check that can write the wrong thing" -- stays literally true of everything a
 check can reach.
+
+A PROBE GOES TO A CONCRETE PATH, NEVER TO A TEMPLATE. A surface's identity
+is `path_template` -- `hx.surface` normalises `/user/12345/profile` into
+`/user/{id}/profile`, and S5 says that merge is the point -- but a template
+is an identity and not an address: `GET /user/{id}/profile` reaches a URL
+that cannot exist, and the 404 that comes back carries none of the headers,
+reflections or signatures a check is looking for. Every active check in this
+build answered `clean` from exactly that request, with `considered`
+populated, so `hx.scan._mark_unobserved` retired live findings on the
+strength of a probe that tested nothing. The sender is therefore bound at
+construction to the CONCRETE path of the surface's exemplar request
+(`hx.insertion.request_path`, resolved by `hx.scan.run`, which skips the
+check outright when it cannot be read), exposes it as `path`, and `get()`
+REFUSES a path still carrying a placeholder. That refusal is a `ValueError`
+and not a `ProbeRefused`, like the origin-form guard beside it and for the
+same reason: nothing on the wire said no, a caller made a mistake, and a
+`ProbeRefused` would land it in `check_run` as an ordinary `inconclusive`
+row indistinguishable from a rate limit. A future check cannot reintroduce
+the defect by reading `surface[5]`, because the seam will not send it.
 
 `BridgeServer.send` DOES NOT RETURN A REFUSAL AS A DICT. It raises
 `hx.bridge.server.BridgeError` -- with the wire's class on `.error_class` --
@@ -116,6 +135,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from hx import insertion as insertion_mod
 from hx.bridge.server import BridgeError, BridgeServer
 from hx.checks.passive import _http
 
@@ -140,6 +160,29 @@ _NOT_ISSUED = frozenset({
     "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
     "budget_exhausted", "halted", "not_configured",
 })
+
+
+def _placeholder_in(path: str) -> str | None:
+    """The first template placeholder segment in `path`, or None.
+
+    `hx.insertion.is_placeholder` decides the shape, because that module is
+    already the one that turns a placeholder into an insertion point and two
+    spellings of the test could disagree. The query string is not examined:
+    every check percent-encodes what it puts there (`quote(safe="")` escapes
+    `{` to `%7B`), so a brace can only reach the request line's PATH.
+
+    A target that genuinely serves a `{...}` path segment is refused here
+    too, which is a false positive with no better answer available: the
+    segment is indistinguishable from an unsubstituted template, and the
+    refusal is an `error` row -- visible, and retiring nothing -- while
+    guessing the other way is F1 again. `hx.surface._kept_segment`
+    percent-encodes such a segment when it templates it, so that surface's
+    own `path_template` does not carry braces either.
+    """
+    for segment in path.partition("?")[0].split("/"):
+        if insertion_mod.is_placeholder(segment):
+            return segment
+    return None
 
 
 class ProbeRefused(Exception):
@@ -178,17 +221,31 @@ class ProbeSender:
     """Bound to one surface for the life of one `check_run`."""
 
     def __init__(self, bridge, *, scheme: str, host: str, port: int,
-                 path_template: str) -> None:
+                 path: str) -> None:
         self._bridge = bridge
         self._scheme = scheme
         self._host = host
         self._port = port
-        self._path_template = path_template
+        self._path = path
         self._sent = 0
 
     @property
     def sent(self) -> int:
         return self._sent
+
+    @property
+    def path(self) -> str:
+        """The concrete path this surface's exemplar request asked for.
+
+        WHAT A CHECK BUILDS ITS PROBE FROM, in place of `surface[5]`. The
+        surface row carries the TEMPLATE, which is an identity rather than an
+        address -- see the module docstring's third rule -- and this is the
+        address the capture that proved this surface exists actually used.
+        Read-only: a sender is bound to one surface for the life of one
+        `check_run`, and a check that could move it could point it somewhere
+        the operator never authorised.
+        """
+        return self._path
 
     def get(self, path: str, *, headers: dict[str, str] | None = None,
             timeout: float = 30.0) -> ProbeResponse:
@@ -197,6 +254,18 @@ class ProbeSender:
                 f"path must be origin-form and start with '/', got {path!r}; "
                 "a sender is bound to one surface and cannot be pointed "
                 "somewhere else")
+        placeholder = _placeholder_in(path)
+        if placeholder is not None:
+            # STRUCTURAL, NOT DOCUMENTED. A check that reaches for
+            # `surface[5]` -- or substitutes one placeholder of two -- is
+            # asking to send a request to an address that cannot exist and
+            # then to read the 404 as an answer. The one thing that makes
+            # that unrepeatable is a seam that will not carry it.
+            raise ValueError(
+                f"path still holds the template placeholder {placeholder!r}: "
+                f"{path!r}. A surface's `path_template` is its identity, not "
+                "an address; build the probe from `sender.path` -- the "
+                "exemplar's own concrete path -- and substitute into that")
         raw = self._request_bytes(path, headers or {})
         attempts_left = _RATE_LIMIT_ATTEMPTS
         while True:

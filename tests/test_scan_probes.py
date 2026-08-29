@@ -29,7 +29,7 @@ import pytest
 from hx import config as config_mod
 from hx import insertion as insertion_mod
 from hx import scan
-from hx.checks import base, probe
+from hx.checks import base, probe, registry
 from hx.checks.active import cors
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
@@ -52,13 +52,19 @@ REQ_WITHOUT_QUERY = (
 )
 
 
-def _env(tmp_path, *, request_bytes=REQ_WITH_QUERY, exemplar=True):
+def _env(tmp_path, *, request_bytes=REQ_WITH_QUERY, exemplar=True,
+         path_template="/"):
     """An in-memory engagement with one surface, one exchange, one blob.
 
     `exemplar=False` writes the exchange and leaves `surface.
     exemplar_exchange_id` NULL -- a surface whose first sighting was purged,
-    which is the case `_insertions_for` has to survive without taking the
+    which is the case `_exemplar_request` has to survive without taking the
     scan down.
+
+    `path_template` is the surface row's own, and it is a SEPARATE argument
+    from `request_bytes` on purpose: a templated surface and the concrete
+    request it was normalised from are two different strings, and the whole
+    of F1 was code that treated them as one.
     """
     conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.execute("PRAGMA foreign_keys=ON")
@@ -69,7 +75,8 @@ def _env(tmp_path, *, request_bytes=REQ_WITH_QUERY, exemplar=True):
     conn.execute(
         "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
         " path_template, discovered_by, normaliser_version)"
-        " VALUES('s-1','e-1','GET','https','app.test',443,'/','proxy',1)")
+        " VALUES('s-1','e-1','GET','https','app.test',443,?,'proxy',1)",
+        (path_template,))
     store = blobs_mod.BlobStore(tmp_path / "blobs")
     digest, _ = store.put(request_bytes)
     conn.execute(
@@ -206,7 +213,9 @@ class _NoPointsFinds:
     Both halves matter and neither is arbitrary. A check with declared kinds
     never reaches a missing exemplar -- `_insertions_for` derives nothing from
     an exemplar it cannot read and the runner skips it -- so the empty
-    `insertion_kinds` is what makes this shape the one that gets there. And
+    `insertion_kinds` is what makes this shape the one that gets there (a
+    check WITH kinds is skipped `no_insertion_point`, deriving nothing from an
+    exemplar the runner could not read). And
     `exchange_ids=(surface[6],)` is not this test's invention: it is what every
     active check in this corpus writes, because nothing in this build records
     an exchange for a probe's own traffic.
@@ -727,3 +736,149 @@ def test_the_shipped_cors_check_cannot_file_a_finding_it_could_not_evidence(
     assert summary.by_reason == {"no_exemplar": 1}
     assert purged["conn"].execute(
         "SELECT COUNT(*) FROM finding").fetchone()[0] == 0
+
+
+# --- the address a probe is sent to ---------------------------------------
+#
+# F1 of the whole-branch review, at the runner's end. A surface's identity is
+# its `path_template` -- `hx.surface` normalises `/user/12345/profile` to
+# `/user/{id}/profile` -- and every active check built its probe out of that
+# string, so on any templated surface the request went to a URL that cannot
+# exist, the 404 carried nothing any check looks for, and `clean` was
+# recorded with `considered` populated. 35 integration tests and 1262 unit
+# tests stayed green because every surface either suite ever built was
+# UNTEMPLATED: `path_template == path` for all of them, so the two strings
+# this defect confuses were the same string.
+
+# The exemplar of a templated surface: a concrete request line, whose path
+# `hx.surface` would normalise to `TEMPLATED_SURFACE` below.
+REQ_TEMPLATED = (
+    b"GET /user/12345/profile?q=1 HTTP/1.1\r\n"
+    b"Host: app.test\r\n"
+    b"\r\n"
+)
+TEMPLATED = "/user/{id}/profile"
+ADDRESS = "/user/12345/profile"
+
+
+def _templated_env(tmp_path):
+    return _env(tmp_path, request_bytes=REQ_TEMPLATED, path_template=TEMPLATED)
+
+
+def _paths_on_the_wire(fb):
+    """The request-line target of every request the bridge was handed."""
+    return [body.split(b" ")[1].decode("latin-1") for body in fb.bodies]
+
+
+def test_the_sender_is_bound_to_the_exemplars_path_not_the_template(tmp_path):
+    env = _templated_env(tmp_path)
+    check = _Probe()
+    scan.run(**env, checks=(check,), bridge=_replying_bridge())
+    assert check.seen["sender"].path == ADDRESS
+    assert check.seen["surface"][5] == TEMPLATED, (
+        "the check is still handed the template -- it is the surface's "
+        "identity and what a path_segment insertion is named against")
+
+
+def test_no_shipped_active_check_puts_a_placeholder_on_the_wire(tmp_path):
+    """THE WHOLE CORPUS, against a templated surface, with the bridge as the
+    witness. Driven through the real registry rather than a stand-in: F1 was
+    in all five checks at once, and a test naming one of them would have gone
+    green on a fix that reached only that one.
+
+    MEASURED before the fix, with this exact surface: `hx.active.cors` sent
+    `GET /user/{id}/profile`, `hx.active.sql-error` sent
+    `GET /user/{id}/profile?q=<value>%27`, and both answered `clean` with
+    their issue types in `considered`.
+    """
+    env = _templated_env(tmp_path)
+    fb = _replying_bridge()
+    checks = tuple(c for c in registry.CHECKS if c.klass != "passive")
+    assert len(checks) == 5, checks
+    scan.run(**env, checks=checks, bridge=fb)
+
+    sent = _paths_on_the_wire(fb)
+    assert sent, "no active check sent anything; this test would prove nothing"
+    address = ADDRESS.split("/")          # ['', 'user', '12345', 'profile']
+    for path in sent:
+        assert "{" not in path and "}" not in path, path
+        # Built FROM the address, not merely free of braces: the same
+        # segments, except index 2 -- the one `{id}` names -- where a
+        # path-segment probe substitutes its payload. A path assembled out of
+        # anything else fails this whatever it is spelt with.
+        segments = path.split("?")[0].split("/")
+        assert len(segments) == len(address), path
+        differing = [i for i, (seg, want) in enumerate(zip(segments, address))
+                     if seg != want]
+        assert differing in ([], [2]), path
+
+    rows = env["conn"].execute(
+        "SELECT check_id, verdict FROM check_run").fetchall()
+    assert [r for r in rows if r[1] == "error"] == []
+
+
+def test_a_check_that_probes_the_template_errors_rather_than_answering_clean(
+        tmp_path):
+    """THE STRUCTURAL HALF. The four tests above say the shipped checks build
+    the right path today; this one says a check that goes back to reading
+    `surface[5]` CANNOT answer `clean` from it. `ProbeSender.get` raises a
+    `ValueError` -- a programmer's mistake, not a refusal from the wire -- so
+    the row lands `error`, which is visible in coverage and retires nothing.
+    """
+    env = _templated_env(tmp_path)
+    fb = _replying_bridge()
+
+    class ProbesTheTemplate(_Probe):
+        id = "hx.test.probes-the-template"
+
+        def probes(self, ctx, surface, insertions, send):
+            self.calls += 1
+            send.get(surface[5])
+            return base.Verdict.clean(considered=("probed",))
+
+    scan.run(**env, checks=(ProbesTheTemplate(),), bridge=fb)
+    verdict, reason, _sent = _row(env["conn"])
+    assert verdict == "error", reason
+    assert "placeholder" in reason
+    assert fb.calls == 0, "a request to a URL that cannot exist still left"
+    assert env["conn"].execute(
+        "SELECT COUNT(*) FROM finding_observation").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("request_bytes,why", [
+    (b"OPTIONS * HTTP/1.1\r\nHost: app.test\r\n\r\n",
+     "asterisk-form: a request target with no path at all"),
+    (b"\r\n\r\n", "no request line to read"),
+])
+def test_a_surface_with_no_concrete_path_is_skipped_never_clean(
+        tmp_path, request_bytes, why):
+    """S12 again, one column further in. The surface row's `path_template` is
+    an identity, so a surface whose exemplar yields no ADDRESS has nowhere a
+    probe could honestly go -- and the alternative to this skip is sending
+    one at the template, which is F1."""
+    env = _env(tmp_path, request_bytes=request_bytes)
+    fb = _replying_bridge()
+    check = _Probe()
+    summary = scan.run(**env, checks=(check,), bridge=fb)
+
+    verdict, reason, sent = _row(env["conn"])
+    assert (verdict, sent) == ("skipped", 0), why
+    assert "path" in reason
+    assert check.calls == 0
+    assert fb.calls == 0, "the skip is decided before a sender exists"
+    assert summary.by_reason == {"no_probe_path": 1}
+
+
+def test_a_surface_whose_exemplar_request_was_never_stored_is_skipped(tmp_path):
+    """The same skip from the other direction: the exchange row is there, so
+    `_citable_exemplar` is satisfied and a finding WOULD have something to
+    cite, but its request blob is not -- so there is no address to send to.
+    `hx.capture` writes `req_blob` NULL for a request it never saw the bytes
+    of."""
+    env = _env(tmp_path)
+    env["conn"].execute("UPDATE exchange SET req_blob=NULL WHERE id='x-1'")
+    summary = scan.run(**env, checks=(_NoPointsFinds(),),
+                       bridge=_replying_bridge())
+    assert _row(env["conn"])[0] == "skipped"
+    assert summary.by_reason == {"no_probe_path": 1}
+

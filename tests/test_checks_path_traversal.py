@@ -25,11 +25,21 @@ def _head(headers: dict[str, str] | None = None) -> bytes:
 
 class _FakeSender:
     """A `ProbeSender`-shaped double, matching
-    `test_checks_sql_error.py`'s own."""
+    `test_checks_sql_error.py`'s own.
+
+    `path` is what the real `ProbeSender` exposes as its own: the CONCRETE
+    path of the surface's exemplar request, which is what a check builds
+    every probe out of. It defaults to this file's own `surface`'s
+    `path_template` because that surface is not templated -- the two are the
+    same string for it -- and the tests that need them to differ pass it
+    explicitly.
+    """
 
     def __init__(self, *,
                 responses: list[tuple[int, dict[str, str], bytes]] | None = None,
-                exc: Exception | None = None) -> None:
+                exc: Exception | None = None,
+                path: str = "/download/report-2026.pdf") -> None:
+        self.path = path
         self._responses = responses or []
         self._exc = exc
         self.sent = 0
@@ -74,7 +84,19 @@ ctx = ctx_for()
 # the exact 7-tuple `hx.scan.run` selects and hands to `check.probes` (see
 # `scan.py`'s `"SELECT id, method, scheme, host, port, path_template,
 # exemplar_exchange_id FROM surface"`).
-surface = ("s-1", "GET", "https", "app.test", 443, "/download", "x-1")
+# TEMPLATED, AND THE SENDER'S DEFAULT `path` IS WHAT IT WAS TEMPLATED FROM.
+# This row used to read `/download` while `_PATH_SEGMENT` below named
+# `{filename}`, so the substitution had nothing to replace and
+# `test_a_path_segment_placeholder_is_filled_in` was vacuous -- the shape F1
+# hid. `{filename}` is not a placeholder `hx.surface._template_segment` can
+# mint (its vocabulary is `{id}`, `{uuid}`, `{hex}`, `{slug}`, none of which
+# `_looks_like_file_target` accepts); it is the fiction this file needs to
+# exercise the path-segment branch at all, and it was here before this row
+# was templated.
+# `/download/report-2026.pdf` is the concrete address this row stands for,
+# and it is what `_FakeSender` defaults its `path` to.
+surface = ("s-1", "GET", "https", "app.test", 443,
+           "/download/{filename}", "x-1")
 
 _FILE_PARAM = base.Insertion("query", "file")
 _UNRELATED_PARAM = base.Insertion("query", "id")
@@ -98,8 +120,13 @@ def test_the_root_account_line_in_the_body_is_a_finding():
 
 
 def test_a_response_with_no_signature_anywhere_is_clean():
+    """THE STATUS USED TO BE 404 HERE, and that is now `inconclusive`: a 404
+    is the target refusing rather than answering, and a check that read it as
+    a conclusive negative retired findings (F4 of the whole-branch review).
+    200 is the answer this test always meant -- the application served
+    something and it carried no file content."""
     v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
-                                     _sender_returning(404, _CLEAN_BODY))
+                                     _sender_returning(200, _CLEAN_BODY))
     assert v.state == "clean"
     assert v.considered == (ptrav._ISSUE_TYPE,), (
         "the point WAS probed, so the issue type must be considered or a "
@@ -277,7 +304,37 @@ def test_two_file_shaped_parameters_that_both_disclose_are_two_findings():
     assert {c.insertion for c in v.candidates} == {_FILE_PARAM, other}
 
 
-def test_a_path_segment_placeholder_is_filled_in():
+def test_a_path_segment_probe_replaces_the_addresss_own_segment():
+    """RENAMED FROM `test_a_path_segment_placeholder_is_filled_in`, for the
+    reason `tests/test_checks_sql_error.py`'s namesake gives: the old
+    assertion held against a probe that carried no payload at all. The
+    address's own segment being gone is what separates them."""
     sender = _sender_returning(200, _CLEAN_BODY)
     ptrav.PathTraversal().probes(ctx, surface, (_PATH_SEGMENT,), sender)
+    assert sender.paths[0].startswith("/download/")
     assert "{filename}" not in sender.paths[0]
+    assert "report-2026.pdf" not in sender.paths[0], sender.paths[0]
+
+
+# ---- a refusal from the target is not a clean answer ---------------------
+#
+# F4 of the whole-branch review. A 404 is the ordinary answer to a traversal
+# a target refused to serve AND to a resource that has simply gone, and the
+# second is not evidence the first was fixed.
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
+def test_a_status_that_refused_with_no_signature_is_inconclusive(status):
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(status, _CLEAN_BODY))
+    assert v.state == "inconclusive"
+    assert str(status) in v.reason
+    assert v.considered == ()
+
+
+def test_file_content_on_a_refusing_status_is_still_a_finding():
+    """A candidate wins over a gap: `/etc/passwd`'s own content coming back
+    proves the traversal landed whatever the status line said."""
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(500, _PASSWD_BODY))
+    assert v.state == "finding"

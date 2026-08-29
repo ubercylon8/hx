@@ -162,12 +162,20 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
             # `surfaces` already advance in.
             run_mod.heartbeat(conn, run_id=run_id)
             exchanges = _exchanges_for(conn, surface[0])
-            # DERIVED ONCE PER SURFACE, AND ONLY IF SOMETHING ASKS.
-            # `insertion.derive` reads a blob off disk and parses a whole
-            # request; a passive-only scan must not pay for that, and neither
-            # must an active check that declared no insertion kinds. `None`
-            # here means "not derived yet", which is a different fact from
-            # `()`, "derived, and this surface has none".
+            # READ ONCE PER SURFACE, AND ONLY IF SOMETHING ASKS. The exemplar
+            # request is a blob off disk; a passive-only scan must not pay for
+            # it. `_UNREAD` is the third state the two obvious ones cannot
+            # spell: `None` from `_exemplar_request` means "read, and there is
+            # nothing there", which is a different fact from "not read yet"
+            # and has to stay different or an unreadable blob is re-read once
+            # per check.
+            #
+            # BOTH ACTIVE DERIVATIONS COME OFF THESE BYTES -- the concrete
+            # probe path and the insertion points -- so they are one read and
+            # not two. `insertions` keeps its own lazy `None`, because a check
+            # declaring no kinds must still not pay for `insertion.derive`'s
+            # parse of the whole request.
+            exemplar_request = _UNREAD
             insertions = None
 
             for check in checks:
@@ -221,8 +229,8 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             # check declaring no insertion kinds (which is
                             # `hx.active.cors`, the one that reaches this at
                             # all -- a check WITH declared kinds already skips,
-                            # because `_insertions_for` can derive nothing from
-                            # an exemplar it cannot read):
+                            # because `_exemplar_request` reads nothing from
+                            # an exemplar that is not there):
                             #
                             #   * NULL: `Candidate(exchange_ids=(None,))`
                             #     constructed, `evidence` took a row with a
@@ -250,11 +258,37 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                                   "finding would have had no exchange to "
                                   "chain to")
                             continue
+                        if exemplar_request is _UNREAD:
+                            exemplar_request = _exemplar_request(
+                                blobs, surface, exchanges)
+                        probe_path = (
+                            None if exemplar_request is None
+                            else insertion_mod.request_path(exemplar_request))
+                        if probe_path is None:
+                            # THE SURFACE ROW IS AN IDENTITY, NOT AN ADDRESS.
+                            # `path_template` is what `hx.surface` normalised
+                            # this endpoint to -- `/user/{id}/profile` for
+                            # every id -- and a probe sent there reaches a URL
+                            # that cannot exist. The address is the exemplar
+                            # request's own path, and when that cannot be read
+                            # (no blob, a corrupt one, a request line with no
+                            # target, `OPTIONS *`) there is nowhere honest to
+                            # send anything. Decided BEFORE a sender exists,
+                            # like the `no_exemplar` skip above it, so no
+                            # traffic is spent on a question that could not
+                            # have been asked.
+                            _skip(conn, row_id, summary, "no_probe_path",
+                                  "this surface's exemplar request does not "
+                                  "yield a concrete path to probe, and a "
+                                  "surface's path_template is its identity "
+                                  "rather than an address; the check was not "
+                                  "run, not run clean")
+                            continue
                         wanted = frozenset(getattr(
                             check, "insertion_kinds", frozenset()) or ())
                         if wanted and insertions is None:
-                            insertions = _insertions_for(
-                                blobs, surface, exchanges)
+                            insertions = insertion_mod.derive(
+                                exemplar_request, surface[5])
                         # A check declaring NO insertion kinds is not skipped
                         # for having no points: it shapes its own request --
                         # a header it adds, a method it re-issues -- rather
@@ -276,7 +310,7 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             continue
                         sender = probe.ProbeSender(
                             bridge, scheme=surface[2], host=surface[3],
-                            port=surface[4], path_template=surface[5])
+                            port=surface[4], path=probe_path)
                         verdict = check.probes(ctx, surface, usable, sender)
                     else:
                         verdict = check.on_surface(ctx, surface, exchanges)
@@ -468,7 +502,7 @@ def _citable_exemplar(surface, exchanges) -> str | None:
     `_exchanges_for` has just read every exchange of this surface, and the
     exemplar is by definition one of them -- `hx.capture` writes the exchange
     and then points the surface at it -- so a `SELECT` here would be a second
-    trip to ask something the caller is already holding. `_insertions_for`
+    trip to ask something the caller is already holding. `_exemplar_request`
     resolves the same id the same way, a few lines down, for the same reason.
     """
     exemplar_id = surface[6]
@@ -477,8 +511,15 @@ def _citable_exemplar(surface, exchanges) -> str | None:
     return exemplar_id if any(x.id == exemplar_id for x in exchanges) else None
 
 
-def _insertions_for(blobs, surface, exchanges) -> tuple:
-    """Insertion points derived from this surface's exemplar request.
+# "Not read yet", and it cannot be `None` -- see the surface loop. Both facts
+# a caller needs (the concrete probe path, the insertion points) come off one
+# blob read, and `None` is already the answer to "read it; there is nothing
+# there".
+_UNREAD = object()
+
+
+def _exemplar_request(blobs, surface, exchanges) -> bytes | None:
+    """This surface's exemplar REQUEST bytes, or None if they cannot be read.
 
     `surface.exemplar_exchange_id` -> that exchange's `req_blob` -> bytes is
     the path `hx.insertion`'s own docstring names, and the same one
@@ -487,33 +528,38 @@ def _insertions_for(blobs, surface, exchanges) -> tuple:
     first exchange that proved the surface exists (`hx.capture`), so it is
     one of them.
 
-    EVERY FAILURE IS AN EMPTY TUPLE, not a raise. A surface whose blob is
-    gone, or whose captured request had no head terminator, is a surface with
-    no derivable points -- which the caller already has a word for, `skipped`
-    with a reason -- and taking the whole scan down over one unreadable row is
-    the trade S12 argues against. `CorruptBlob` is caught by name for the
-    reason F8 gives one layer up: a bare `except Exception` here would swallow
-    `blobs=None`, and a caller's own programming error is meant to surface.
+    TWO DERIVATIONS, ONE READ. `insertion.derive` turns these bytes into the
+    points a check may fill in, and `insertion.request_path` turns them into
+    the address a probe is sent to. Reading the blob once per surface rather
+    than once per question is why this returns the bytes instead of either
+    answer.
+
+    EVERY FAILURE IS `None`, not a raise. A surface whose blob is gone is a
+    surface no active check can probe -- which the caller has words for,
+    `skipped` with a reason -- and taking the whole scan down over one
+    unreadable row is the trade S12 argues against. `CorruptBlob` is caught by
+    name for the reason F8 gives one layer up: a bare `except Exception` here
+    would swallow `blobs=None`, and a caller's own programming error is meant
+    to surface.
 
     THE MISSING-EXEMPLAR CASE NO LONGER ARRIVES HERE, and the two lines that
     answer it are kept anyway. `run()` skips an active check on a surface whose
     exemplar is NULL or dangling before this is called (`_citable_exemplar`),
     because that surface has no evidence for a finding to cite whether or not
-    an insertion point could be derived from it. This function is still pure
-    and still total for the same input, so the guard costs two lines and means
-    a second caller cannot inherit a crash.
+    a probe could be built from it. This function is still pure and still
+    total for the same input, so the guard costs two lines and means a second
+    caller cannot inherit a crash.
     """
     exemplar_id = surface[6]
     if not exemplar_id:
-        return ()
+        return None
     digest = next((x.req_blob for x in exchanges if x.id == exemplar_id), None)
     if not digest:
-        return ()
+        return None
     try:
-        raw = blobs.get(digest)
+        return blobs.get(digest)
     except blobs_mod.CorruptBlob:
-        return ()
-    return insertion_mod.derive(raw, surface[5])
+        return None
 
 
 def _skip(conn, row_id, summary, key, reason) -> None:

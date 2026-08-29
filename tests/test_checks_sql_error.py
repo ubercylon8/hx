@@ -33,11 +33,20 @@ class _FakeSender:
     single `Exception` to raise on the first call. Calls beyond the list
     re-answer with the last entry, matching
     `test_checks_open_redirect.py`'s own `_FakeSender`.
+
+    `path` is what the real `ProbeSender` exposes as its own: the CONCRETE
+    path of the surface's exemplar request, which is what a check builds
+    every probe out of. It defaults to this file's own `surface`'s
+    `path_template` because that surface is not templated -- the two are the
+    same string for it -- and the tests that need them to differ pass it
+    explicitly.
     """
 
     def __init__(self, *,
                 responses: list[tuple[int, dict[str, str], bytes]] | None = None,
-                exc: Exception | None = None) -> None:
+                exc: Exception | None = None,
+                path: str = "/items/12345") -> None:
+        self.path = path
         self._responses = responses or []
         self._exc = exc
         self.sent = 0
@@ -82,7 +91,17 @@ ctx = ctx_for()
 # the exact 7-tuple `hx.scan.run` selects and hands to `check.probes` (see
 # `scan.py`'s `"SELECT id, method, scheme, host, port, path_template,
 # exemplar_exchange_id FROM surface"`).
-surface = ("s-1", "GET", "https", "app.test", 443, "/items", "x-1")
+# TEMPLATED, AND THE SENDER'S DEFAULT `path` IS WHAT IT WAS TEMPLATED FROM.
+# This row used to read `/items` while `_PATH_SEGMENT` below named `{id}`,
+# so `path_template.replace("{id}", value)` had nothing to replace and
+# `test_a_path_segment_placeholder_is_filled_in` asserted `"{id}" not in
+# "/items"` -- true of a request that carried no payload at all. A templated
+# surface beside the concrete address it came from is what a real scan hands
+# this check, and it is the shape F1 hid.
+# `/items/12345` is what `hx.surface` templated INTO this row -- `12345` is
+# the segment `_DIGITS` matched -- and it is the address `_FakeSender`
+# defaults its `path` to.
+surface = ("s-1", "GET", "https", "app.test", 443, "/items/{id}", "x-1")
 
 _QUERY = base.Insertion("query", "id")
 _PATH_SEGMENT = base.Insertion("path_segment", "{id}")
@@ -273,7 +292,46 @@ def test_two_points_that_both_disclose_errors_are_two_findings():
     assert {c.insertion for c in v.candidates} == {_QUERY, _PATH_SEGMENT}
 
 
-def test_a_path_segment_placeholder_is_filled_in():
+def test_a_path_segment_probe_replaces_the_addresss_own_segment():
+    """RENAMED FROM `test_a_path_segment_placeholder_is_filled_in`, which
+    asserted `"{id}" not in sender.paths[0]` against a probe built from a
+    template that had no `{id}` in it either -- vacuously true, and true as
+    well of the probe this check would send today if `substitute_segment`
+    did nothing. The separating assertion is that the ADDRESS's own segment
+    is gone: a `str.replace` of the placeholder against a concrete path
+    leaves `12345` exactly where it was and sends the exemplar's own request
+    back with no payload in it."""
     sender = _sender_returning(200, _CLEAN_BODY)
     sqle.SqlError().probes(ctx, surface, (_PATH_SEGMENT,), sender)
+    assert sender.paths[0].startswith("/items/")
     assert "{id}" not in sender.paths[0]
+    assert "12345" not in sender.paths[0], sender.paths[0]
+    # The quote is what makes it this check's probe rather than any other's.
+    assert "%27" in sender.paths[0]
+
+
+# ---- a refusal from the target is not a clean answer ---------------------
+#
+# F4 of the whole-branch review. 5xx is in the refusal set AND is where a
+# driver error usually arrives, so the ordering inside `probes()` -- match
+# first, ask about the status only when nothing matched -- is what these two
+# separate.
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
+def test_a_status_that_refused_with_no_signature_is_inconclusive(status):
+    v = sqle.SqlError().probes(ctx, surface, (_QUERY,),
+                               _sender_returning(status, _CLEAN_BODY))
+    assert v.state == "inconclusive"
+    assert str(status) in v.reason
+    assert v.considered == ()
+
+
+def test_a_driver_error_on_a_five_hundred_is_still_a_finding():
+    """The case that decides the ordering: a database error is
+    overwhelmingly disclosed ON a 500, so a doctrine applied before the match
+    would turn this check's own finding into a gap."""
+    v = sqle.SqlError().probes(ctx, surface, (_QUERY,),
+                               _sender_returning(500, _MYSQL_BODY))
+    assert v.state == "finding"
+    assert v.considered == (sqle._ISSUE_TYPE,)
