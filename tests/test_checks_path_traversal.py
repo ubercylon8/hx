@@ -1,0 +1,276 @@
+"""`hx.checks.active.path_traversal`.
+
+No pytest fixtures: this project's tests use plain helper functions rather
+than `conftest.py` fixtures -- see `tests/test_checks_cors.py`'s own note,
+which this file follows. `_FakeSender` below is adapted from
+`test_checks_sql_error.py`'s own (itself adapted from
+`test_checks_open_redirect.py`'s): a fixed `(status, headers, body)` per
+call, since this check reads a signature out of the body/head it is handed.
+
+NO JVM AND NO SOCKET. `PathTraversal` is driven directly with a fake sender;
+the real Burp path is Task 13's (`tests/integration/`).
+"""
+from __future__ import annotations
+
+import pytest
+
+from hx.checks import base, probe
+from hx.checks.active import path_traversal as ptrav
+
+
+def _head(headers: dict[str, str] | None = None) -> bytes:
+    lines = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
+    return f"HTTP/1.1 200 OK\r\n{lines}".encode("latin-1")
+
+
+class _FakeSender:
+    """A `ProbeSender`-shaped double, matching
+    `test_checks_sql_error.py`'s own."""
+
+    def __init__(self, *,
+                responses: list[tuple[int, dict[str, str], bytes]] | None = None,
+                exc: Exception | None = None) -> None:
+        self._responses = responses or []
+        self._exc = exc
+        self.sent = 0
+        self.paths: list[str] = []
+
+    def get(self, path, *, headers=None, timeout=30.0):
+        self.sent += 1          # a refused attempt still spent the budget,
+                                 # matching the real sender's own ordering.
+        self.paths.append(path)
+        if self._exc is not None:
+            raise self._exc
+        idx = min(self.sent - 1, len(self._responses) - 1)
+        status, hdrs, body = self._responses[idx]
+        return probe.ProbeResponse(status=status, head=_head(hdrs), body=body,
+                                   outcome="ok")
+
+
+def _sender_returning(status: int, body: bytes,
+                      headers: dict[str, str] | None = None) -> _FakeSender:
+    return _FakeSender(responses=[(status, headers or {}, body)])
+
+
+def _sender_raising(exc: Exception) -> _FakeSender:
+    return _FakeSender(exc=exc)
+
+
+def ctx_for():
+    return base.CheckContext(config=None, blobs=None, run_id="r-1",
+                             log=lambda s: None)
+
+
+ctx = ctx_for()
+
+# (id, method, scheme, host, port, path_template, exemplar_exchange_id) --
+# the exact 7-tuple `hx.scan.run` selects and hands to `check.probes` (see
+# `scan.py`'s `"SELECT id, method, scheme, host, port, path_template,
+# exemplar_exchange_id FROM surface"`).
+surface = ("s-1", "GET", "https", "app.test", 443, "/download", "x-1")
+
+_FILE_PARAM = base.Insertion("query", "file")
+_UNRELATED_PARAM = base.Insertion("query", "id")
+_PATH_SEGMENT = base.Insertion("path_segment", "{filename}")
+
+_PASSWD_BODY = (
+    b"root:x:0:0:root:/root:/bin/bash\n"
+    b"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n")
+_CLEAN_BODY = b"<html>no such file</html>"
+
+
+# ---- the five sketched cases -----------------------------------------
+
+
+def test_the_root_account_line_in_the_body_is_a_finding():
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(200, _PASSWD_BODY))
+    assert v.state == "finding"
+    assert v.candidates[0].issue_type_id == ptrav._ISSUE_TYPE
+    assert v.candidates[0].insertion == _FILE_PARAM
+
+
+def test_a_response_with_no_signature_anywhere_is_clean():
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(404, _CLEAN_BODY))
+    assert v.state == "clean"
+    assert v.considered == (ptrav._ISSUE_TYPE,), (
+        "the point WAS probed, so the issue type must be considered or a "
+        "later fix can never be seen as retiring anything")
+
+
+def test_a_parameter_that_does_not_look_like_a_file_is_not_probed():
+    """Budget: name-based canary-first, like `open_redirect.py`."""
+    sender = _sender_returning(200, _CLEAN_BODY)
+    v = ptrav.PathTraversal().probes(ctx, surface, (_UNRELATED_PARAM,),
+                                     sender)
+    assert sender.sent == 0
+    assert v.state == "clean"
+    assert v.considered == (), (
+        "nothing was actually examined on this surface, so nothing may be "
+        "considered -- naming the issue type here would let a real, "
+        "never-tested finding be silently retired")
+
+
+def test_only_file_shaped_parameters_are_probed_among_a_mix():
+    sender = _sender_returning(200, _CLEAN_BODY)
+    ptrav.PathTraversal().probes(
+        ctx, surface, (_FILE_PARAM, _UNRELATED_PARAM), sender)
+    assert sender.sent == 1
+    assert "file=" in sender.paths[0]
+    assert "id=" not in sender.paths[0]
+
+
+def test_one_request_per_point_regardless_of_table_size():
+    sender = _sender_returning(200, _CLEAN_BODY)
+    ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM, _PATH_SEGMENT),
+                                 sender)
+    assert sender.sent == 2
+    assert len(ptrav._SIGNATURES) >= 3
+
+
+# ---- honesty: the description reports what matched, not a generic claim --
+
+
+def test_the_description_names_the_matched_line_and_the_file():
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(200, _PASSWD_BODY))
+    description = v.candidates[0].description
+    assert "root:x:0:0:" in description
+    assert "/etc/passwd" in description
+    assert "root account" in description
+
+
+def test_the_description_names_the_response_body_when_that_is_where_it_matched():
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(200, _PASSWD_BODY))
+    assert "the response body" in v.candidates[0].description
+
+
+def test_the_description_names_a_response_header_when_that_is_where_it_matched():
+    v = ptrav.PathTraversal().probes(
+        ctx, surface, (_FILE_PARAM,),
+        _sender_returning(200, b"nothing in the body",
+                          headers={"X-Debug": "root:x:0:0:"}))
+    assert v.state == "finding"
+    assert "a response header" in v.candidates[0].description
+    assert "the response body" not in v.candidates[0].description
+
+
+def test_a_different_matched_line_names_that_account_not_a_generic_one():
+    daemon_only = b"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(200, daemon_only))
+    description = v.candidates[0].description
+    assert "daemon:x:1:1:" in description
+    assert "daemon account" in description
+
+
+def test_the_description_does_not_claim_arbitrary_file_access():
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(200, _PASSWD_BODY))
+    description = v.candidates[0].description.lower()
+    assert "does not show" in description
+    for overclaim in ("arbitrary file read confirmed", "full filesystem access",
+                      "remote code execution"):
+        assert overclaim not in description
+
+
+# ---- refusal and budget ---------------------------------------------------
+
+
+def test_a_refusal_propagates_rather_than_becoming_a_verdict():
+    sender = _sender_raising(probe.ProbeRefused("rate_limited"))
+    with pytest.raises(probe.ProbeRefused) as exc:
+        ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,), sender)
+    assert exc.value.reason == "rate_limited"
+
+
+def test_a_refused_attempt_still_spent_the_budget():
+    sender = _sender_raising(probe.ProbeRefused("budget_exhausted"))
+    with pytest.raises(probe.ProbeRefused):
+        ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,), sender)
+    assert sender.sent == 1
+
+
+# ---- the payload sent ---------------------------------------------------
+
+
+def test_the_payload_never_appears_as_a_raw_dot_dot_slash_on_the_wire():
+    """The safety property: the literal `../` is percent-encoded before it
+    ever reaches `path`, so hx's own request line never carries a raw
+    traversal segment for some intermediate proxy to normalise."""
+    sender = _sender_returning(200, _CLEAN_BODY)
+    ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,), sender)
+    assert "../" not in sender.paths[0]
+    assert "%2F" in sender.paths[0] or "%2f" in sender.paths[0]
+
+
+def test_the_traversal_depth_is_bounded_not_excessive():
+    assert 1 <= ptrav._TRAVERSAL_DEPTH <= 10
+
+
+def test_the_target_file_is_the_deliberately_harmless_one():
+    assert ptrav._TARGET_FILE == "/etc/passwd"
+
+
+# ---- insertion kinds and identity --------------------------------------
+
+
+def test_the_check_is_wired_for_the_registry():
+    c = ptrav.PathTraversal()
+    assert c.id == "hx.active.path-traversal"
+    assert c.klass == "active_safe"
+    assert c.insertion_kinds == frozenset({"query", "path_segment"})
+
+
+def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
+    header_insertion = base.Insertion("header", "file")
+    sender = _sender_returning(200, _CLEAN_BODY)
+    v = ptrav.PathTraversal().probes(ctx, surface, (header_insertion,),
+                                     sender)
+    assert sender.sent == 0
+    assert v.state == "clean"
+    assert v.considered == ()
+
+
+def test_a_finding_names_the_insertion_it_came_from():
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(200, _PASSWD_BODY))
+    assert v.candidates[0].insertion == _FILE_PARAM
+
+
+def test_the_finding_cites_the_surfaces_exemplar_exchange():
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(200, _PASSWD_BODY))
+    assert v.candidates[0].exchange_ids == ("x-1",)
+
+
+def test_a_findings_issue_type_is_one_it_considered():
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
+                                     _sender_returning(200, _PASSWD_BODY))
+    assert v.state == "finding"
+    for candidate in v.candidates:
+        assert candidate.issue_type_id in v.considered
+
+
+def test_two_file_shaped_parameters_that_both_disclose_are_two_findings():
+    """Two parameters, independently disclosing file content, must not
+    collapse into one row -- `records.dedupe_key` distinguishes them by
+    `candidate.insertion`, and this check must actually set it."""
+    other = base.Insertion("query", "template")
+    sender = _FakeSender(responses=[
+        (200, {}, _PASSWD_BODY),
+        (200, {}, _PASSWD_BODY),
+    ])
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM, other),
+                                     sender)
+    assert v.state == "finding"
+    assert len(v.candidates) == 2
+    assert {c.insertion for c in v.candidates} == {_FILE_PARAM, other}
+
+
+def test_a_path_segment_placeholder_is_filled_in():
+    sender = _sender_returning(200, _CLEAN_BODY)
+    ptrav.PathTraversal().probes(ctx, surface, (_PATH_SEGMENT,), sender)
+    assert "{filename}" not in sender.paths[0]
