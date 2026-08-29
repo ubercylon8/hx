@@ -773,7 +773,7 @@ git commit -m "fix(checks): a bare-LF response is parsed, not read as empty"
 - Produces:
   - `ProbeRefused(Exception)` with `.reason: str`
   - `ProbeResponse(status: int | None, head: bytes, body: bytes, outcome: str)`
-  - `ProbeSender(bridge, *, scheme, host, port, path_template)` with `.get(path, *, headers=None, timeout=30.0) -> ProbeResponse` and `.sent: int`
+  - `ProbeSender(bridge, *, scheme, host, port, path)` with `.get(path, *, headers=None, timeout=30.0) -> ProbeResponse`, `.path: str` and `.sent: int`. The keyword was `path_template` as this task was first written and is the surface's CONCRETE address now — F1 of the whole-branch review: five checks built their request line out of the template, so on a templated surface every probe went to a URL that cannot exist and its 404 was recorded as `clean`.
 
 **The two design rules, and why.** The sender **raises** on refusal rather than returning a marker: §10 says a check that cannot run returns `inconclusive`, never `clean`, and a check that receives a refusal as a value can mistake it for an answer. Raising makes the rule structural. And the sender **counts in memory** — the runner writes `check_run.requests_sent` when it closes the row — so `base.CheckContext`'s guarantee that no check ever holds a database connection stays literally true.
 
