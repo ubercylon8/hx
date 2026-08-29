@@ -231,6 +231,42 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                                   "session, so this active check had no "
                                   "route to the target and sent nothing")
                             continue
+                        if surface[1] not in _PROBEABLE_METHODS:
+                            # A GET IS THE ONLY REQUEST THIS BUILD CAN BUILD.
+                            # N2 of the scoped re-review: `ProbeSender.
+                            # _request_bytes` emits a GET and nothing else --
+                            # body-parameter and mutating probes were excluded
+                            # from this plan at design time -- and this loop
+                            # read `surface.method` only to build a dedupe
+                            # key. So `POST /cart/add` was probed with `GET
+                            # /cart/add` and closed `clean` with `considered`
+                            # populated, MEASURED: three GETs on the wire and
+                            # five `clean` rows naming a surface none of them
+                            # addressed. A surface's method is part of its
+                            # identity (`hx.surface.normalise`), so that
+                            # request tested a DIFFERENT surface and
+                            # `_mark_unobserved` stood ready to retire this
+                            # one's findings on the strength of it.
+                            #
+                            # Decided here, before a sender exists, for the
+                            # reason `no_probe_path` is: a question that
+                            # cannot be asked must not cost a request. `kind`
+                            # (`schema.sql`, `idempotent_read` /
+                            # `state_changing` / `unknown`) records the same
+                            # fact and is not in this SELECT; the method is,
+                            # it is what `surface.kind_for` derives `kind`
+                            # FROM, and it is the narrower test -- `kind`
+                            # calls OPTIONS an idempotent read, and `GET /x`
+                            # is still not the surface `OPTIONS /x` names.
+                            _skip(conn, row_id, summary, "not_a_get_surface",
+                                  f"this surface was captured as a "
+                                  f"{surface[1]} request and this build can "
+                                  "send nothing but a GET, which would be a "
+                                  "request to a different surface; body and "
+                                  "mutating probes are outside this build by "
+                                  "design, so the check was not run, not run "
+                                  "clean")
+                            continue
                         if _citable_exemplar(surface, exchanges) is None:
                             # THE EVIDENCE AN ACTIVE CHECK WILL CITE HAS TO
                             # EXIST BEFORE IT IS WORTH SENDING ANYTHING.
@@ -464,12 +500,13 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # complete scan is not itself misreported as "truncated for a reason".
     #
     # `by_reason` CARRIES MORE THAN `budget` NOW. The probe pass adds
-    # `no_bridge`, `no_exemplar`, `no_probe_path`, `no_insertion_point` and
-    # `no_probeable_insertion_point`, and all belong in this sentence for the
-    # reason the budget one does: a pass that left rows `skipped` did not do
-    # everything it set out to do, and the run row is where a report decides
-    # whether to trust it. The word stays `truncated` and the KEY is what
-    # distinguishes them -- `truncated: skipped no_bridge=4` says which four
+    # `no_bridge`, `not_a_get_surface`, `no_exemplar`, `no_probe_path`,
+    # `no_insertion_point` and `no_probeable_insertion_point`, and all belong
+    # in this sentence for the reason the budget one does: a pass that left
+    # rows `skipped` did not do everything it set out to do, and the run row
+    # is where a report decides whether to trust it. The word stays
+    # `truncated` and the KEY is what distinguishes them --
+    # `truncated: skipped no_bridge=4` says which four
     # rows to go and read, which is more than a differently-worded prefix
     # would have said.
     #
@@ -586,6 +623,18 @@ def _citable_exemplar(surface, exchanges) -> str | None:
 # blob read, and `None` is already the answer to "read it; there is nothing
 # there".
 _UNREAD = object()
+
+# The surface methods a probe can honestly address. `ProbeSender.
+# _request_bytes` builds a GET and only a GET, and a surface's method is part
+# of its identity -- so a GET probe answers for a `GET` surface, and for a
+# `HEAD` one (RFC 9110 s9.3.2: HEAD is GET without the body, so the probe
+# sees everything the captured request could have shown and more). It answers
+# for nothing else, `OPTIONS` included: S4's method allowlist permits OPTIONS
+# and `surface.kind_for` calls it an idempotent read, but `OPTIONS /x` and
+# `GET /x` are two surface rows and a check may not close one by testing the
+# other. Case-sensitive, for the reason `surface.kind_for` gives: `get` is
+# not GET, and a lowercase verb must not inherit a safe method's permissions.
+_PROBEABLE_METHODS = frozenset({"GET", "HEAD"})
 
 
 def _exemplar_request(blobs, surface, exchanges) -> bytes | None:

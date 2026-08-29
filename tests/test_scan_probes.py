@@ -55,7 +55,7 @@ REQ_WITHOUT_QUERY = (
 
 
 def _env(tmp_path, *, request_bytes=REQ_WITH_QUERY, exemplar=True,
-         path_template="/"):
+         path_template="/", method="GET"):
     """An in-memory engagement with one surface, one exchange, one blob.
 
     `exemplar=False` writes the exchange and leaves `surface.
@@ -67,6 +67,13 @@ def _env(tmp_path, *, request_bytes=REQ_WITH_QUERY, exemplar=True,
     from `request_bytes` on purpose: a templated surface and the concrete
     request it was normalised from are two different strings, and the whole
     of F1 was code that treated them as one.
+
+    `method` is the SURFACE's, which is part of its identity -- `POST /x` and
+    `GET /x` are two surfaces (`hx.surface.normalise`) -- and it is what
+    decides whether this build can probe it at all. The caller passing a
+    non-GET method is expected to pass matching `request_bytes`; nothing here
+    derives one from the other, because the whole of N2 was code that assumed
+    the two agreed.
     """
     conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.execute("PRAGMA foreign_keys=ON")
@@ -76,15 +83,15 @@ def _env(tmp_path, *, request_bytes=REQ_WITH_QUERY, exemplar=True,
         " VALUES('e-1','T','T',1,'active')")
     conn.execute(
         "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
-        " path_template, discovered_by, normaliser_version)"
-        " VALUES('s-1','e-1','GET','https','app.test',443,?,'proxy',1)",
-        (path_template,))
+        " path_template, kind, discovered_by, normaliser_version)"
+        " VALUES('s-1','e-1',?,'https','app.test',443,?,?,'proxy',1)",
+        (method, path_template, surface_mod.kind_for(method)))
     store = blobs_mod.BlobStore(tmp_path / "blobs")
     digest, _ = store.put(request_bytes)
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
         " method, url, req_blob) VALUES('x-1', NULL, 's-1', 'proxy', 'ok', 1,"
-        " 'GET', 'https://app.test/?q=1', ?)", (digest,))
+        " ?, 'https://app.test/?q=1', ?)", (method, digest))
     if exemplar:
         conn.execute(
             "UPDATE surface SET exemplar_exchange_id='x-1' WHERE id='s-1'")
@@ -250,6 +257,78 @@ def test_a_no_bridge_skip_retires_nothing(tmp_path):
     observed = [r[0] for r in env["conn"].execute(
         "SELECT observed FROM finding_observation ORDER BY ts_us")]
     assert observed == [1], "a check that never ran retired its own finding"
+
+
+# --- a surface this build cannot send a request to ------------------------
+#
+# N2 of the scoped re-review. `ProbeSender._request_bytes` can build nothing
+# but a GET -- body-parameter and mutating probes were excluded from this
+# plan at design time -- and `scan.run` read `surface.method` only to build a
+# dedupe key. So a `POST /cart/add` surface was probed with `GET /cart/add`
+# and the row closed `clean` with `considered` populated, on the strength of
+# a request to a DIFFERENT surface.
+
+REQ_POST = (
+    b"POST /cart/add?sku=1 HTTP/1.1\r\n"
+    b"Host: app.test\r\n"
+    b"\r\n"
+)
+
+
+def test_a_surface_this_build_cannot_send_to_is_skipped_not_probed(tmp_path):
+    """Decided BEFORE a sender exists, the same shape as `no_probe_path` and
+    `no_exemplar`: nothing is spent, nothing goes on the wire, and the row
+    says the check was not run rather than run clean."""
+    env = _env(tmp_path, request_bytes=REQ_POST, path_template="/cart/add",
+               method="POST")
+    check = _Probe()
+    fb = _replying_bridge()
+    summary = scan.run(**env, checks=(check,), bridge=fb)
+
+    verdict, reason, sent = _row(env["conn"])
+    assert verdict == "skipped", f"{verdict}: {reason}"
+    assert "POST" in reason and "GET" in reason
+    assert check.calls == 0, "a check was handed a surface it cannot address"
+    assert fb.calls == 0, "a GET went on the wire for a POST surface"
+    assert sent == 0
+    assert summary.by_reason == {"not_a_get_surface": 1}
+
+
+def test_no_active_check_answers_clean_for_a_state_changing_surface(tmp_path):
+    """The registry's own corpus, and the measurement N2 records: five rows
+    reading `clean` for `POST /cart/add`, three GETs on the wire, and
+    `_mark_unobserved` ready to retire a finding recorded against the POST
+    surface on the strength of them."""
+    env = _env(tmp_path, request_bytes=REQ_POST, path_template="/cart/add",
+               method="POST")
+    fb = _replying_bridge()
+    active = tuple(c for c in registry.CHECKS if c.klass != "passive")
+    scan.run(**env, checks=active, bridge=fb)
+
+    verdicts = {v for (v,) in env["conn"].execute(
+        "SELECT DISTINCT verdict FROM check_run")}
+    assert verdicts == {"skipped"}, verdicts
+    assert fb.bodies == [], fb.bodies
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_a_read_surface_is_still_probed(method):
+    """The separating case. HEAD is in because a GET is a HEAD plus a body
+    (RFC 9110 s9.3.2): the probe sees everything the captured request could
+    have shown and more, so it tests the surface the row names."""
+    assert method in scan._PROBEABLE_METHODS
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE",
+                                    "OPTIONS", "get"])
+def test_no_other_method_is(method):
+    """`OPTIONS` is out even though `hx.surface.kind_for` calls it an
+    idempotent read and S4's allowlist permits it: `GET /x` and `OPTIONS /x`
+    are two surfaces, and a GET tests the first one whichever row it is
+    filed under. `get` is out because `kind_for` is case-sensitive per RFC
+    9110 s9.1 and a lowercase verb must not inherit a safe method's
+    permissions."""
+    assert method not in scan._PROBEABLE_METHODS
 
 
 def test_a_surface_with_no_insertion_points_is_skipped_with_a_reason(tmp_path):
