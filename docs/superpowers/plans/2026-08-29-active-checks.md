@@ -74,6 +74,7 @@ not pay Burp's startup.
 - [ ] **Step 1: Write the failing tests**
 
 ```python
+# tests/test_checks_base.py -- Task 1: what a verdict may say it considered
 def test_a_clean_verdict_can_name_what_it_considered():
     v = base.Verdict.clean(considered=("missing-hsts", "missing-xcto"))
     assert v.state == "clean"
@@ -83,6 +84,19 @@ def test_a_clean_verdict_can_name_what_it_considered():
 def test_a_finding_verdict_can_name_what_it_considered(a_candidate):
     v = base.Verdict.finding(a_candidate, considered=("missing-hsts",))
     assert v.considered == ("missing-hsts",)
+
+
+def test_a_finding_verdict_that_names_nothing_considered_retires_nothing(a_candidate):
+    # The safe default for `finding()` is the same as for `clean()`: an empty
+    # `considered`. Two failure directions are possible for this default, and
+    # only one of them is acceptable -- an empty default leaves a finding
+    # live (safe: nothing is retired that wasn't examined), while a default
+    # DERIVED from the emitted candidates' own issue types would retire
+    # every OTHER issue type the check never looked at (unsafe: a check
+    # emitting one of three candidates would silently close the other two,
+    # telling a client a still-open issue is fixed because the check merely
+    # stopped finding it, not because it looked and confirmed it gone).
+    assert base.Verdict.finding(a_candidate).considered == ()
 
 
 def test_considered_defaults_to_empty_so_an_unaware_check_retires_nothing():
@@ -115,6 +129,7 @@ Expected: FAIL — `Verdict.clean() got an unexpected keyword argument 'consider
 In `src/hx/checks/base.py`, add to `Verdict` after `reason`:
 
 ```python
+# src/hx/checks/base.py -- Task 1: the considered field
     # What this check EXAMINED on this subject and reached a conclusion about,
     # as `issue_type_id` strings. `hx.scan._mark_unobserved` retires a finding
     # whose issue type is in here and was NOT re-emitted this run.
@@ -139,6 +154,7 @@ In `src/hx/checks/base.py`, add to `Verdict` after `reason`:
 Add to `__post_init__`, after the existing checks:
 
 ```python
+# src/hx/checks/base.py -- Task 1: considered is validated like every other field
         for issue_type in self.considered:
             if not isinstance(issue_type, str) or not issue_type:
                 raise ValueError(
@@ -150,6 +166,7 @@ Add to `__post_init__`, after the existing checks:
 Replace the two classmethods (leave `inconclusive` exactly as it is):
 
 ```python
+# src/hx/checks/base.py -- Task 1: clean() and finding() carry it, inconclusive does not
     @classmethod
     def clean(cls, *, considered: tuple[str, ...] = ()) -> "Verdict":
         return cls("clean", (), None, tuple(considered))
@@ -165,6 +182,7 @@ Replace the two classmethods (leave `inconclusive` exactly as it is):
 The first paragraph of `src/hx/checks/base.py` reads "A check is pure. It reads a surface and the exchanges captured against it and returns a verdict. It does not build requests, write rows, compute dedupe keys, learn its own `check_run` id, or reach the bridge". An active check builds requests. Replace that paragraph with:
 
 ```python
+# src/hx/checks/base.py -- Task 1: the module docstring an active check made false
 """The types a check speaks in, and the ones it deliberately cannot.
 
 A PASSIVE check is pure: it reads a surface and the exchanges captured
@@ -178,7 +196,6 @@ What NO check does, active or passive: write rows, compute dedupe keys,
 learn its own `check_run` id, or hold a database connection. Each of those
 belongs to the runner, and each is a place where ONE implementation must
 serve every check or the guarantees stop being uniform.
-"""
 ```
 
 - [ ] **Step 5: Run the whole suite**
@@ -209,15 +226,19 @@ git commit -m "feat(checks): Verdict carries what the check considered"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-def test_a_check_retires_the_one_issue_it_no_longer_finds(tmp_path):
+# tests/test_scan.py -- Task 2: retirement follows examination, not absence
+def test_a_check_retires_the_one_issue_it_no_longer_finds(scan_env):
     """The defect this task exists for.
 
     A check that finds one of three issues answers `finding`, so the
     clean-only gate never fired and the two fixed issues rendered live off
     their stale run-1 observations, with no "appears fixed" marker.
     """
-    conn, eng = _engagement(tmp_path)
-    surface = _surface(conn, eng)
+    def _candidate(ctx, exchanges, issue_type_id):
+        return base.Candidate(
+            title=f"t-{issue_type_id}", issue_type_id=issue_type_id,
+            severity="Low", confidence="Firm", insertion=None,
+            exchange_ids=(exchanges[0].id,))
 
     class Finds:
         id, version, klass = "hx.test.three", "1", "passive"
@@ -228,16 +249,15 @@ def test_a_check_retires_the_one_issue_it_no_longer_finds(tmp_path):
 
         def on_surface(self, ctx, surface_row, exchanges):
             return base.Verdict.finding(
-                *[_candidate(issue_type_id=t) for t in self.emit],
+                *[_candidate(ctx, exchanges, t) for t in self.emit],
                 considered=("a", "b", "c"))
 
     check = Finds()
-    scan.run(conn, engagement_id=eng.id, config=eng.config,
-             blobs=eng.blobs, checks=(check,))
+    scan.run(**scan_env, checks=(check,))
     check.emit = ("a",)                      # b and c are fixed
-    scan.run(conn, engagement_id=eng.id, config=eng.config,
-             blobs=eng.blobs, checks=(check,))
+    scan.run(**scan_env, checks=(check,))
 
+    conn = scan_env["conn"]
     observed = dict(conn.execute(
         "SELECT f.issue_type_id, o.observed FROM finding f"
         " JOIN finding_observation o ON o.finding_id = f.id"
@@ -246,15 +266,18 @@ def test_a_check_retires_the_one_issue_it_no_longer_finds(tmp_path):
     assert observed == {"a": 1, "b": 0, "c": 0}
 
 
-def test_an_issue_type_the_check_never_considered_is_not_retired(tmp_path):
+def test_an_issue_type_the_check_never_considered_is_not_retired(scan_env):
     """The separating case. Retirement must follow examination, not absence.
 
     A check that stops looking at something has not established it is fixed,
     and a report that closed a finding on that basis would be inventing a
     fact the run does not hold.
     """
-    conn, eng = _engagement(tmp_path)
-    surface = _surface(conn, eng)
+    def _candidate(ctx, exchanges, issue_type_id):
+        return base.Candidate(
+            title=f"t-{issue_type_id}", issue_type_id=issue_type_id,
+            severity="Low", confidence="Firm", insertion=None,
+            exchange_ids=(exchanges[0].id,))
 
     class Narrows:
         id, version, klass = "hx.test.narrow", "1", "passive"
@@ -266,16 +289,15 @@ def test_an_issue_type_the_check_never_considered_is_not_retired(tmp_path):
         def on_surface(self, ctx, surface_row, exchanges):
             emit = [t for t in ("a", "b") if t in self.considered]
             return base.Verdict.finding(
-                *[_candidate(issue_type_id=t) for t in emit],
+                *[_candidate(ctx, exchanges, t) for t in emit],
                 considered=self.considered)
 
     check = Narrows()
-    scan.run(conn, engagement_id=eng.id, config=eng.config,
-             blobs=eng.blobs, checks=(check,))
+    scan.run(**scan_env, checks=(check,))
     check.considered = ("a",)                # b is no longer examined at all
-    scan.run(conn, engagement_id=eng.id, config=eng.config,
-             blobs=eng.blobs, checks=(check,))
+    scan.run(**scan_env, checks=(check,))
 
+    conn = scan_env["conn"]
     rows = conn.execute(
         "SELECT o.observed FROM finding f"
         " JOIN finding_observation o ON o.finding_id = f.id"
@@ -295,6 +317,7 @@ Expected: first FAILS with `{'a': 1}` (b and c absent — no observation row wri
 In `scan.run`, beside `seen_findings: set[str] = set()`, add:
 
 ```python
+# src/hx/scan.py -- Task 2: the considered set the runner collects
         # (surface_id, check_id, issue_type_id) this run actually examined and
         # concluded about. Retirement reads this, NOT `check_run.verdict ==
         # 'clean'`: a check filing one of three findings answers `finding`,
@@ -306,6 +329,7 @@ After the `isinstance(verdict, base.Verdict)` guard and before the
 `verdict.state == "finding"` branch, add:
 
 ```python
+# src/hx/scan.py -- Task 2: every accepted verdict contributes to it
                     # An `inconclusive` verdict carries no `considered` -- the
                     # classmethod does not offer it -- so this loop is empty
                     # for exactly the state that must retire nothing.
@@ -316,6 +340,7 @@ After the `isinstance(verdict, base.Verdict)` guard and before the
 Change the call at the end of the run from `_mark_unobserved(conn, engagement_id, run_id, seen_findings)` to:
 
 ```python
+# src/hx/scan.py -- Task 2: the call at the end of the run
         _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
 ```
 
@@ -324,6 +349,7 @@ Change the call at the end of the run from `_mark_unobserved(conn, engagement_id
 Replace the `clean` query and the `(surface_id, check_id) not in clean` filter with a `considered` lookup. The function becomes:
 
 ```python
+# src/hx/scan.py -- Task 2: _mark_unobserved's new gate
 def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
     """`observed = 0` for a finding whose issue type was EXAMINED this run and
     not re-emitted.
@@ -342,9 +368,33 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
     simply stopped looking retires nothing, because "I did not examine this"
     is not evidence of a fix, and S12 forbids rendering the second as the
     first.
+
+    `considered` is built by `scan.run` from every accepted `Verdict`'s own
+    `considered` field (Task 1), keyed `(surface_id, check_id, issue_type_id)`.
+    An `inconclusive` verdict contributes nothing to it -- the classmethod
+    does not accept `considered` at all -- so a check that raised, went
+    inconclusive, was skipped by the budget, or was simply absent from this
+    run's `checks` retires none of its prior findings: none of those states
+    ever added an entry for them.
+
+    Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
+    the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses
+    a plain `DELETE FROM surface` the instant anything depends on the row --
+    `tests/test_scan.py::test_a_surface_deleted_between_capture_and_scan_is_refused_by_the_schema`
+    pins that. Reaching this case at all needs `PRAGMA foreign_keys=OFF`
+    around the delete, the shape a bulk purge/retention job takes. Once it
+    happens, `considered` is built from THIS run's own surface loop -- a
+    vanished surface never appears in it, so it is simply absent, never
+    looked up, never guessed about.
     """
     if not considered:
         return
+    # `finding.check_id` and `finding.issue_type_id` are different axes (see
+    # schema.sql): `check_id` answers "which of hx's checks found this",
+    # `issue_type_id` answers "what kind of issue is this", and both are read
+    # here because `considered` is keyed on both --
+    # `tests/test_scan.py::test_mark_unobserved_reads_check_id_not_issue_type_id`
+    # pins that a swap of the two columns must not let this match wrongly.
     rows = conn.execute(
         "SELECT id, surface_id, check_id, issue_type_id FROM finding"
         " WHERE engagement_id=?", (engagement_id,)).fetchall()
@@ -393,8 +443,15 @@ git commit -m "fix(scan): retire what a check considered, not what it called cle
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-def test_security_headers_reports_every_header_it_examined(a_clean_surface):
-    v = security_headers.SecurityHeaders().on_surface(*a_clean_surface)
+# tests/test_checks_passive.py -- Task 3: what security-headers examined, and what an inconclusive verdict did not
+def test_security_headers_reports_every_header_it_examined():
+    c = security_headers.SecurityHeaders()
+    blob = resp(b"Content-Type: text/html",
+                b"Strict-Transport-Security: max-age=31536000",
+                b"X-Content-Type-Options: nosniff",
+                b"X-Frame-Options: DENY")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
+    assert v.state == "clean"
     assert set(v.considered) == {
         "missing-content-type-options",
         "missing-frame-protection",
@@ -402,19 +459,32 @@ def test_security_headers_reports_every_header_it_examined(a_clean_surface):
     }, "a clean answer that names nothing retires nothing, so a fixed header stays live forever"
 
 
-def test_cookie_flags_considers_every_cookie_the_surface_set(a_two_cookie_surface):
-    v = cookie_flags.CookieFlags().on_surface(*a_two_cookie_surface)
-    # Per-cookie issue types: exactly why `considered` is run-time and not a
-    # class-level declaration.
-    assert len(v.considered) == 2
-
-
-def test_an_inconclusive_verdict_considers_nothing(a_surface_with_an_unreadable_blob):
-    v = security_headers.SecurityHeaders().on_surface(*a_surface_with_an_unreadable_blob)
+def test_an_inconclusive_verdict_considers_nothing():
+    """S10: never `clean` when the check could not run, and never with
+    `considered` populated either -- a check that could not read the
+    evidence has concluded nothing, and retiring on that basis would close a
+    finding on missing data."""
+    c = security_headers.SecurityHeaders()
+    v = c.on_surface(ctx_for(), None, rows())      # d1 absent from the store
     assert v.state == "inconclusive"
-    assert v.considered == (), (
-        "a check that could not read the evidence has concluded nothing, and "
-        "retiring on that basis would close a finding on missing data")
+    assert v.considered == ()
+```
+The cookie check's own case is not beside those two in the file -- it sits with the rest of `cookie_flags`' tests -- so it is a second excerpt rather than a gap in the first:
+
+```python
+# tests/test_checks_passive.py -- Task 3: a cookie is considered even when it is fine
+def test_cookie_flags_considers_every_cookie_the_surface_set():
+    """Per-cookie issue types: exactly why `considered` is run-time and not a
+    class-level declaration. Both cookies are considered even though only
+    one of them is missing anything -- a check that examined a cookie and
+    found it fine still examined it."""
+    c = cookie_flags.CookieFlags()
+    blob = resp(b"Set-Cookie: a=1; Path=/; Secure; HttpOnly; SameSite=Lax",
+                b"Set-Cookie: b=2; Path=/")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
+    assert len(v.considered) == 2
+    assert set(v.considered) == {cookie_flags._issue_type("a"),
+                                 cookie_flags._issue_type("b")}
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -427,16 +497,19 @@ Expected: FAIL — `considered` is `()` for the first two.
 In `src/hx/checks/passive/_http.py`, change the signature and the two constructing returns. Leave both `inconclusive` returns exactly as they are:
 
 ```python
+# src/hx/checks/passive/_http.py -- Task 3: verdict's signature
 def verdict(evidence: Evidence, candidates, *,
             considered: tuple[str, ...] = ()) -> base.Verdict:
 ```
 
 ```python
+# src/hx/checks/passive/_http.py -- Task 3: the finding return
     if candidates:
         return base.Verdict.finding(*candidates, considered=considered)
 ```
 
 ```python
+# src/hx/checks/passive/_http.py -- Task 3: the clean return
     return base.Verdict.clean(considered=considered)
 ```
 
@@ -481,13 +554,17 @@ Report the line you actually saw. (When this plan was written the arithmetic her
 Add one test that would catch the silent drift Step 4 warns about:
 
 ```python
-def test_a_cookie_flag_candidates_issue_type_is_one_it_considered(a_flagless_cookie_surface):
-    v = cookie_flags.CookieFlags().on_surface(*a_flagless_cookie_surface)
+# tests/test_checks_passive.py -- Task 3: a candidate's issue type is one the check considered
+def test_a_cookie_flag_candidates_issue_type_is_one_it_considered():
+    """The silent-drift hazard: a candidate whose issue type is not in
+    `considered` can never be retired, and nothing else in the suite would
+    notice."""
+    c = cookie_flags.CookieFlags()
+    blob = resp(b"Set-Cookie: session=abc; Path=/")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
     assert v.state == "finding"
     for candidate in v.candidates:
-        assert candidate.issue_type_id in v.considered, (
-            "a candidate whose issue type is not in `considered` can never be "
-            "retired, and nothing else in the suite would notice")
+        assert candidate.issue_type_id in v.considered
 ```
 
 - [ ] **Step 7: Commit**
@@ -519,36 +596,52 @@ All four are wrong, in both directions, and the tool reports clean because it fa
 - [ ] **Step 1: Write the failing tests**
 
 ```python
+# tests/test_checks_http.py -- Task 5: the bare-LF corpus and the ordinary path it must not disturb
 _LF_RESPONSE = (b"HTTP/1.1 200 OK\n"
                 b"Content-Type: text/html\n"
                 b"Set-Cookie: session=1\n"
                 b"\n"
                 b"<html>AKIAIOSFODNN7EXAMPLE</html>")
 
+# The ordinary path this fix must leave alone.
+_CRLF_RESPONSE = (b"HTTP/1.1 200 OK\r\n"
+                  b"Content-Type: text/html\r\n"
+                  b"\r\n"
+                  b"<html>ok</html>")
 
-def test_a_bare_lf_response_still_yields_its_body(ctx_with(_LF_RESPONSE)):
-    ev = _http.bodies(ctx, exchanges)
+
+def test_a_bare_lf_response_still_yields_its_body():
+    ev = _http.bodies(ctx_for(d1=_LF_RESPONSE), rows())
     assert b"AKIAIOSFODNN7EXAMPLE" in ev.entries[0][1], (
         "the body came back empty, so every body-searching check answers "
         "clean on this server -- a false negative in an assessment")
 
 
-def test_a_bare_lf_response_still_yields_its_headers(ctx_with(_LF_RESPONSE)):
-    ev = _http.responses(ctx, exchanges)
+def test_a_bare_lf_response_still_yields_its_headers():
+    ev = _http.responses(ctx_for(d1=_LF_RESPONSE), rows())
     head = ev.entries[0][1]
     assert _http.header_values(head, "content-type") == ["text/html"]
     assert _http.header_values(head, "set-cookie") == ["session=1"]
+    assert _http.header_names(head) == ["Content-Type", "Set-Cookie"]
 
 
-def test_a_crlf_response_is_unchanged(ctx_with(_CRLF_RESPONSE)):
-    # The separating case: the fix must not alter the ordinary path.
-    ev = _http.responses(ctx, exchanges)
+def test_a_crlf_response_is_unchanged():
+    """The separating case: the fix must not alter the ordinary path."""
+    ev = _http.responses(ctx_for(d1=_CRLF_RESPONSE), rows())
     assert _http.header_values(ev.entries[0][1], "content-type") == ["text/html"]
 
 
+def test_a_crlf_response_body_is_unchanged():
+    """The separating case for `bodies()`: an ordinary CRLF body must come
+    back exactly as before, not merely "non-empty"."""
+    ev = _http.bodies(ctx_for(d1=_CRLF_RESPONSE), rows())
+    assert ev.entries[0][1] == b"<html>ok</html>"
+
+
 def test_a_lone_cr_inside_a_header_value_does_not_split_it():
-    # Guard against over-splitting: normalising must not invent header
-    # boundaries that the wire did not carry.
+    """Guard against over-splitting: normalising must not invent header
+    boundaries the wire did not carry. A bare CR is data, not a terminator
+    -- RFC 9112 only recognises CRLF and a bare LF as ending a line."""
     head = b"HTTP/1.1 200 OK\r\nX-Note: a\rb\r\n"
     assert _http.header_values(head, "x-note") == ["a\rb"]
 ```
@@ -563,19 +656,20 @@ Expected: the body test FAILS on an empty body; the header test FAILS with `[]`.
 Add to `_http.py`:
 
 ```python
+# src/hx/checks/passive/_http.py -- Task 5: the split, and the header lines it feeds
 def _split_head_body(raw: bytes) -> tuple[bytes, bytes]:
-    """Head and body, accepting either terminator.
+    """Head and body, accepting either line terminator.
 
     RFC 9112 s2.2 requires a recipient to accept a bare LF as a line
     terminator. `partition(b"\\r\\n\\r\\n")` on a bare-LF response matches
-    nothing and returns `(raw, b"", b"")`, which handed every body-searching
+    nothing and returns `(raw, b"", b"")`, which hands every body-searching
     check an EMPTY body and every header-reading check the whole response as
-    one unsplit head. The tool then answered `clean` because it had failed to
+    one unsplit head. The tool then answers `clean` because it failed to
     read, which is the one direction an assessment must never be wrong in.
 
     Whichever terminator appears FIRST is the real one, so a body that
-    contains `\\r\\n\\r\\n` cannot pull the boundary backwards past a head
-    that ended with `\\n\\n`.
+    happens to contain `\\r\\n\\r\\n` cannot pull the boundary backwards past
+    a head that actually ended with a bare `\\n\\n`.
     """
     crlf = raw.find(b"\r\n\r\n")
     lf = raw.find(b"\n\n")
@@ -589,9 +683,9 @@ def _split_head_body(raw: bytes) -> tuple[bytes, bytes]:
 def _header_lines(head: bytes) -> list[bytes]:
     """Header lines, minus the status line, for either terminator.
 
-    Splits on LF and strips ONE trailing CR per line rather than splitting on
-    CR as well: a bare CR inside a header value is data, and splitting on it
-    would invent a header boundary the wire did not carry.
+    Splits on LF and strips at most one trailing CR per line, rather than
+    also splitting on a bare CR: a lone CR inside a header value is data, and
+    splitting on it would invent a header boundary the wire did not carry.
     """
     return [line[:-1] if line.endswith(b"\r") else line
             for line in head.split(b"\n")[1:]]
@@ -600,6 +694,7 @@ def _header_lines(head: bytes) -> list[bytes]:
 Rewrite the four consumers to use them:
 
 ```python
+# src/hx/checks/passive/_http.py -- Task 5: the two evidence readers
 def bodies(ctx, exchanges) -> Evidence:
     """`(row, body_bytes)` per readable exchange, plus what could not be read."""
     got = _fetch(ctx, exchanges)
@@ -615,13 +710,23 @@ def responses(ctx, exchanges) -> Evidence:
         tuple((row, _split_head_body(raw)[0]) for row, raw in got.entries),
         got.gaps)
 
+```
+`verdict()` and `_detail()` sit between those and the header readers in the file, so the other two consumers are a second excerpt:
 
+```python
+# src/hx/checks/passive/_http.py -- Task 5: the two header readers
 def header_names(head: bytes) -> list[str]:
     return [line.partition(b":")[0].decode("latin-1").strip()
             for line in _header_lines(head) if b":" in line]
 
 
 def header_values(head: bytes, name: str) -> list[str]:
+    """Every value for one header name, ASCII-case-insensitively.
+
+    A list, not a value: `Set-Cookie` legitimately repeats, and a parser that
+    returned the first would check one cookie of five and report the surface
+    clean.
+    """
     want = name.lower()
     out = []
     for line in _header_lines(head):
@@ -664,11 +769,12 @@ git commit -m "fix(checks): a bare-LF response is parsed, not read as empty"
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-def test_a_probe_returns_the_response_and_counts_the_request(fake_bridge):
-    fake_bridge.reply({"status": 200, "outcome": "ok"},
-                      b"HTTP/1.1 200 OK\r\nX-A: b\r\n\r\nhi")
-    s = probe.ProbeSender(fake_bridge, scheme="https", host="app.test",
-                          port=443, path_template="/a")
+# tests/test_probe.py -- Task 6: the sender's whole contract
+def test_a_probe_returns_the_response_and_counts_the_request():
+    fb = FakeBridge()
+    fb.reply({"status": 200, "outcome": "ok"},
+             b"HTTP/1.1 200 OK\r\nX-A: b\r\n\r\nhi")
+    s = _sender(fb)
     r = s.get("/a?q=1")
     assert r.status == 200 and r.body == b"hi"
     assert probe._http.header_values(r.head, "x-a") == ["b"]
@@ -680,44 +786,58 @@ def test_a_probe_returns_the_response_and_counts_the_request(fake_bridge):
     "method_denied", "dangerous_denied", "transport_error", "timeout",
     "bridge_lost", "not_configured",
 ])
-def test_every_refusal_raises_and_names_itself(fake_bridge, cls):
-    fake_bridge.refuse(cls)
-    s = probe.ProbeSender(fake_bridge, scheme="https", host="app.test",
-                          port=443, path_template="/a")
+def test_every_refusal_raises_and_names_itself(cls):
+    fb = FakeBridge()
+    fb.refuse(cls)
+    s = _sender(fb)
     with pytest.raises(probe.ProbeRefused) as exc:
         s.get("/a")
     assert exc.value.reason == cls
 
 
-def test_a_refused_attempt_is_still_counted(fake_bridge):
+def test_a_refused_attempt_is_still_counted():
     # The budget was spent whether or not an answer came back, and a
     # requests_sent that undercounts refusals understates the traffic this
     # tool put on a client's system.
-    fake_bridge.refuse("rate_limited")
-    s = probe.ProbeSender(fake_bridge, scheme="https", host="app.test",
-                          port=443, path_template="/a")
+    fb = FakeBridge()
+    fb.refuse("rate_limited")
+    s = _sender(fb)
     with pytest.raises(probe.ProbeRefused):
         s.get("/a")
     assert s.sent == 1
 
 
-def test_the_sender_only_ever_issues_GET(fake_bridge):
+def test_a_response_that_did_not_come_back_whole_is_also_refused():
+    # A `result` frame is not automatically a whole answer: Sender.java sets
+    # outcome="status_unreadable" when the peer's status line could not be
+    # read, and _http.py treats that the same way -- a gap, not proof of
+    # absence. get() applies the same rule at the wire rather than handing a
+    # check a response it could misread as clean.
+    fb = FakeBridge()
+    fb.reply({"status": 599, "outcome": "status_unreadable"}, b"")
+    s = _sender(fb)
+    with pytest.raises(probe.ProbeRefused) as exc:
+        s.get("/a")
+    assert exc.value.reason == "status_unreadable"
+
+
+def test_the_sender_only_ever_issues_GET():
     # S7: the method allowlist is GET/HEAD/OPTIONS and Config carries no
     # method key. A sender that could emit POST would be refused by the
     # extension anyway -- this pins that hx does not even try.
-    fake_bridge.reply({"status": 200, "outcome": "ok"}, b"HTTP/1.1 200 OK\r\n\r\n")
-    s = probe.ProbeSender(fake_bridge, scheme="https", host="app.test",
-                          port=443, path_template="/a")
+    fb = FakeBridge()
+    fb.reply({"status": 200, "outcome": "ok"}, b"HTTP/1.1 200 OK\r\n\r\n")
+    s = _sender(fb)
     s.get("/a")
-    assert fake_bridge.last_body.startswith(b"GET ")
+    assert fb.last_body.startswith(b"GET ")
 
 
-def test_the_sender_cannot_be_pointed_at_another_host(fake_bridge):
+def test_the_sender_cannot_be_pointed_at_another_host():
     # A check receives a sender already bound to its surface. Redirect
     # following and cross-host probing are both out of reach by construction,
     # not by convention.
-    s = probe.ProbeSender(fake_bridge, scheme="https", host="app.test",
-                          port=443, path_template="/a")
+    fb = FakeBridge()
+    s = _sender(fb)
     assert not hasattr(s, "host")
     with pytest.raises(ValueError):
         s.get("https://evil.test/a")
@@ -731,13 +851,14 @@ Expected: FAIL — `No module named 'hx.checks.probe'`.
 - [ ] **Step 3: Write the seam**
 
 ```python
+# src/hx/checks/probe.py
 """The one route from a check to the wire.
 
 A check does not own a socket and cannot construct one. It is handed a
 `ProbeSender` already bound to its surface, and every request goes through
-`hx.bridge`'s `send` into the extension -- so S4 holds unchanged: every byte
-that leaves this machine still crosses one of two points inside the JVM, and
-this module adds neither.
+`hx.bridge.server.BridgeServer.send` into the extension -- so S4 holds
+unchanged: every byte that leaves this machine still crosses one of two
+points inside the JVM, and this module adds neither.
 
 TWO RULES, BOTH STRUCTURAL RATHER THAN DOCUMENTED.
 
@@ -752,12 +873,32 @@ writes `check_run.requests_sent` when it closes the row, so
 `hx.checks.base.CheckContext`'s guarantee -- "a check that can write is a
 check that can write the wrong thing" -- stays literally true of everything a
 check can reach.
+
+`BridgeServer.send` DOES NOT RETURN A REFUSAL AS A DICT. It raises
+`hx.bridge.server.BridgeError` -- with the wire's class on `.error_class` --
+for every one of them: this side's own local enforcement (`halted`,
+`not_configured`), a timed-out or disconnected peer (`timeout`,
+`bridge_lost`), and every `error` frame the extension answers with
+(`scope_denied`, `method_denied`, `dangerous_denied`, `rate_limited`,
+`budget_exhausted`, `transport_error`, ...). `get()` below is what turns that
+raised `BridgeError` into a raised `ProbeRefused`, so rule one above holds
+against the bridge as it actually behaves, not against a dict shape it never
+produces.
+
+A SUCCESSFUL SEND CAN STILL NOT BE A WHOLE ANSWER. The result frame carries
+its own `outcome` (`ok`, or `status_unreadable` when the peer's status line
+could not be read -- see `Sender.java`), the same field
+`hx.checks.passive._http` reads off a stored `exchange` row and treats as a
+gap rather than proof of absence. `get()` applies the identical rule at the
+wire: only `outcome == "ok"` is handed back as a `ProbeResponse`, and
+anything else raises `ProbeRefused` too, for the same reason -- a check must
+not be able to read an incomplete response as a clean one.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from hx.bridge import codec
+from hx.bridge.server import BridgeError, BridgeServer
 from hx.checks.passive import _http
 
 
@@ -806,18 +947,25 @@ class ProbeSender:
                                  # spent the budget and still touched the
                                  # target, and a count that omitted refusals
                                  # would understate the traffic hx generated.
-        result = self._bridge.send(
-            {"target_host": self._host, "target_port": self._port,
-             "tls": self._scheme == "https"},
-            raw, timeout=timeout)
-        if result.get("class"):
-            raise ProbeRefused(result["class"], result.get("detail", ""))
+        try:
+            result = self._bridge.send(
+                {"target_host": self._host, "target_port": self._port,
+                 "tls": self._scheme == "https"},
+                raw, timeout=timeout)
+        except BridgeError as exc:
+            # BridgeServer.send() never returns a refusal -- it raises this,
+            # with the wire's class on .error_class (None only for a
+            # malformed call, which a correctly bound sender never makes).
+            # Translating it here is what makes rule one hold in practice.
+            raise ProbeRefused(exc.error_class or "transport_error",
+                               str(exc)) from exc
         outcome = result.get("outcome", "ok")
         if outcome != "ok":
             raise ProbeRefused(
                 outcome, "the response did not come back whole, so nothing "
                          "found in it separates tested from unreachable")
-        head, body = _http._split_head_body(result.get(codec.BODY_KEY, b""))
+        head, body = _http._split_head_body(
+            result.get(BridgeServer.BODY_KEY, b""))
         return ProbeResponse(result.get("status"), head, body, outcome)
 
     def _request_bytes(self, path: str, headers: dict[str, str]) -> bytes:
@@ -899,6 +1047,7 @@ Expected: FAIL — `Config` has no attribute `max_requests`.
 - [ ] **Step 4: Emit the key**
 
 ```python
+# src/hx/session.py -- Task 7: the budget key in the configure body
         "limit.max_requests": [str(cfg.max_requests)],
 ```
 
@@ -1005,6 +1154,7 @@ Expected: FAIL — `scan.run() got an unexpected keyword argument 'bridge'`.
 - [ ] **Step 3: Add the hook to the registry**
 
 ```python
+# src/hx/checks/registry.py -- Task 8: probes joins the hooks the runner calls
 _RUNNER_CALLS = ("on_surface", "probes")
 ```
 
