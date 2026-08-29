@@ -623,6 +623,14 @@ def scan(root, max_seconds, max_requests) -> None:
         if summary.skipped:
             for reason, n in sorted(summary.by_reason.items()):
                 click.echo(f"skipped   {n} ({reason})")
+        # A DIFFERENT LINE FROM `skipped`, and F11's reason for existing: a
+        # skipped row is one the runner never ran, a refused probe is one it
+        # ran and the extension or the bridge said no to. `budget_exhausted`
+        # here is the operator's warning that everything after some point in
+        # the corpus was reported `inconclusive` -- the same sentence the
+        # run row's `stop_reason` now carries.
+        for reason, n in sorted(summary.refused.items()):
+            click.echo(f"refused   {n} ({reason})")
 
         # A class the operator enabled that this build ships nothing for.
         # Without this line, `active_timing: true` plus no rows reads as

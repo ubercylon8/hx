@@ -62,12 +62,25 @@ class ScanSummary:
     row can end, which is a claim a test can make and an operator can check.
     "Checks that actually executed" is NOT this number and is not lost --
     it is `checks_run` minus `skipped`, and the CLI prints both lines.
+
+    `refused` IS NOT `by_reason`, AND MIXING THEM WOULD MISREPORT BOTH. F11
+    of the whole-branch review. `by_reason` counts rows the runner SKIPPED --
+    it never called the check -- and the CLI prints each as `skipped N
+    (key)`. This counts probes the extension or the bridge REFUSED, keyed by
+    the wire's own class, on rows where the check did run and answered
+    `inconclusive` or reported what the surviving points found. A
+    `budget_exhausted` folded into `by_reason` would print as a skipped
+    check, which is a row an operator can go and read and would not find.
+    Both feed the run's `stop_reason`, separately labelled, because a run
+    that says `completed` after spending its whole budget at surface 10 of
+    500 overstates its own coverage.
     """
     surfaces: int = 0
     checks_run: int = 0
     findings: int = 0
     skipped: int = 0
     by_reason: dict = field(default_factory=dict)
+    refused: dict = field(default_factory=dict)
 
 
 def run(conn, *, engagement_id, blobs, config, checks=None,
@@ -419,15 +432,15 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                     # `hx.checks.probe`'s `_NOT_ISSUED`.
                     _close_row(conn, row_id, "inconclusive",
                                f"probe refused: {exc}",
-                               requests_sent=sender.sent if sender else 0)
+                               requests_sent=_spent(summary, sender))
                     continue
                 except Exception as exc:                    # noqa: BLE001
                     _close_row(conn, row_id, "error",
                                f"{type(exc).__name__}: {exc}",
-                               requests_sent=sender.sent if sender else 0)
+                               requests_sent=_spent(summary, sender))
                     continue
                 _close_row(conn, row_id, verdict.state, verdict.reason,
-                           requests_sent=sender.sent if sender else 0)
+                           requests_sent=_spent(summary, sender))
 
         _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
     except BaseException as exc:
@@ -450,17 +463,34 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     #
     # `by_reason` CARRIES MORE THAN `budget` NOW. The probe pass adds
     # `no_bridge`, `no_exemplar`, `no_probe_path`, `no_insertion_point` and
-    # `no_probeable_insertion_point`,
-    # and all belong in this sentence for the reason the budget one does: a
-    # pass that left rows `skipped` did not do everything it set out to do,
-    # and the run row is where a report decides whether to trust it. The word
-    # stays `truncated` and the KEY is what distinguishes them --
-    # `truncated: no_bridge=4` says which four rows to go and read, which is
-    # more than a differently-worded prefix would have said.
-    stop_reason = None
+    # `no_probeable_insertion_point`, and all belong in this sentence for the
+    # reason the budget one does: a pass that left rows `skipped` did not do
+    # everything it set out to do, and the run row is where a report decides
+    # whether to trust it. The word stays `truncated` and the KEY is what
+    # distinguishes them -- `truncated: skipped no_bridge=4` says which four
+    # rows to go and read, which is more than a differently-worded prefix
+    # would have said.
+    #
+    # AND A SKIP IS NOT THE ONLY WAY TO STOP SHORT -- F11 of the whole-branch
+    # review. `budget_exhausted` never reaches `by_reason`: it arrives as a
+    # refusal, closes its `check_run` row `inconclusive`, and left a scan
+    # that spent its whole `max_requests` at surface 10 of 500 closing
+    # `('completed', NULL)`, byte-identical at the run row to a pass that
+    # covered all 500. It was recoverable from the coverage rows, so the run
+    # row was incomplete rather than false -- but S12's subject is exactly
+    # telling a complete pass from an incomplete one, and `stop_reason` is
+    # where that is said. The two tallies are labelled rather than merged:
+    # `skipped` names rows the runner never ran, `probes refused` names the
+    # wire's own classes on rows that did run, and an operator chasing one
+    # looks in a different place from an operator chasing the other.
+    parts = []
     if summary.by_reason:
-        parts = ", ".join(f"{k}={v}" for k, v in sorted(summary.by_reason.items()))
-        stop_reason = f"truncated: {parts}"
+        parts.append("skipped " + ", ".join(
+            f"{k}={v}" for k, v in sorted(summary.by_reason.items())))
+    if summary.refused:
+        parts.append("probes refused " + ", ".join(
+            f"{k}={v}" for k, v in sorted(summary.refused.items())))
+    stop_reason = f"truncated: {'; '.join(parts)}" if parts else None
     run_mod.close_run(conn, run_id=run_id, status="completed",
                       stop_reason=stop_reason)
     return summary
@@ -612,6 +642,29 @@ def _skip(conn, row_id, summary, key, reason) -> None:
     _close_row(conn, row_id, "skipped", reason)
     summary.skipped += 1
     summary.by_reason[key] = summary.by_reason.get(key, 0) + 1
+
+
+def _spent(summary, sender) -> int:
+    """What this check's sender issued, folding what it was refused into the
+    run's tally on the way past.
+
+    ONE CALL PER ROW, at each of the three places a probing row can close.
+    `requests_sent` and `summary.refused` are two halves of the same fact --
+    what this check spent, and what it did not get to spend -- and reading
+    them at one point is what keeps the second from being counted twice or
+    missed on the `error` path.
+
+    THE RUNNER CANNOT SEE THESE REFUSALS ANY MORE, which is why they are read
+    off the sender rather than counted where `except ProbeRefused` sits.
+    Since F2 a check catches its own refusals per insertion point and returns
+    a verdict, so most refusals never propagate here at all -- and the run row
+    still has to be able to say the pass ran out of budget.
+    """
+    if sender is None:
+        return 0
+    for cls, n in sender.refused.items():
+        summary.refused[cls] = summary.refused.get(cls, 0) + n
+    return sender.sent
 
 
 def _open_row(conn, run_id, surface, check) -> str:

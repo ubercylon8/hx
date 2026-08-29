@@ -1129,3 +1129,84 @@ def test_a_point_that_answered_and_found_nothing_still_retires(tmp_path):
              bridge=_EchoBridge(blind_to="q"))
     assert _observations(env["conn"]) == [("q", 1), ("q", 0), ("r", 1),
                                           ("r", 1)]
+
+
+# --- a truncated run may not close as a completed one ---------------------
+#
+# F11 of the whole-branch review. `stop_reason` was built from `by_reason`,
+# which counts SKIPS. `budget_exhausted` is not a skip: it arrives as a
+# refusal and closes its `check_run` row `inconclusive`, so a scan that spent
+# its whole `max_requests` at surface 10 of 500 closed `('completed', NULL)`
+# -- byte-identical at the run row to a pass that covered all 500.
+
+
+def _run_row(conn):
+    return conn.execute(
+        "SELECT status, stop_reason FROM run WHERE kind='scan'").fetchone()
+
+
+def test_a_budget_exhausted_scan_says_so_at_the_run_row(tmp_path):
+    """The run row is where a report decides whether to trust a pass, and a
+    pass that ran out of budget did not do what it set out to do."""
+    env = _env(tmp_path)
+    fb = FakeBridge()
+    fb.refuse("budget_exhausted", "the run's request budget is spent")
+    summary = scan.run(**env, checks=(_reflected_input(),), bridge=fb)
+
+    status, stop_reason = _run_row(env["conn"])
+    assert status == "completed"
+    assert stop_reason is not None, (
+        "a scan that spent its whole budget closed identically to one that "
+        "covered every surface")
+    assert "budget_exhausted" in stop_reason
+    assert summary.refused == {"budget_exhausted": 1}
+    # The row itself is unchanged: still `inconclusive`, still not a skip.
+    assert _row(env["conn"])[0] == "inconclusive"
+    assert summary.by_reason == {}
+
+
+def test_a_refusal_the_check_swallowed_still_reaches_the_run_row(tmp_path):
+    """THE SEAM F11 ACTUALLY CROSSES. Since F2 a check catches its own
+    refusals per insertion point and answers with a verdict, so `scan.run`'s
+    `except ProbeRefused` never fires for them -- counting refusals there
+    would have recorded nothing at all for the case this fix is about. The
+    count is read off the sender instead. Here the check reports a finding
+    from the point that answered, so nothing raised anywhere, and the run row
+    must still say a probe was refused."""
+    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
+    refusing = _EchoBridge()
+    refusing.refuse("budget_exhausted", "the run's request budget is spent",
+                    times=1)
+    summary = scan.run(**env, checks=(_reflected_input(),), bridge=refusing)
+
+    assert _row(env["conn"])[0] == "finding", "nothing was found; retest me"
+    assert summary.refused == {"budget_exhausted": 1}
+    assert "budget_exhausted" in _run_row(env["conn"])[1]
+
+
+def test_a_scan_that_was_neither_skipped_nor_refused_has_no_stop_reason(
+        tmp_path):
+    """The other half, as with the budget skip: an always-set reason tells a
+    report nothing about which scans to trust."""
+    env = _env(tmp_path)
+    summary = scan.run(**env, checks=(_reflected_input(),),
+                       bridge=_replying_bridge())
+    assert summary.refused == {}
+    assert _run_row(env["conn"]) == ("completed", None)
+
+
+def test_a_paced_rate_limit_is_not_reported_as_a_truncation(tmp_path,
+                                                            monkeypatch):
+    """THE SEPARATING CASE for "terminal refusals only". `ProbeSender` waits
+    out a `rate_limited` refusal and retries; a scan that was merely paced
+    ran everything it set out to run, and a run row calling that truncated
+    would train an operator to ignore the field."""
+    monkeypatch.setattr(scan.probe.time, "sleep", lambda s: None)
+    env = _env(tmp_path)
+    fb = _replying_bridge()
+    fb.refuse("rate_limited", "rate limit 3/s", retry_after_us=1000, times=1)
+    summary = scan.run(**env, checks=(_reflected_input(),), bridge=fb)
+
+    assert _row(env["conn"])[0] == "clean"
+    assert summary.refused == {}
+    assert _run_row(env["conn"]) == ("completed", None)

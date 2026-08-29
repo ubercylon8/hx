@@ -298,10 +298,38 @@ class ProbeSender:
         self._port = port
         self._path = path
         self._sent = 0
+        self._refused: dict[str, int] = {}
 
     @property
     def sent(self) -> int:
         return self._sent
+
+    @property
+    def refused(self) -> dict[str, int]:
+        """How many probes ended in a refusal, by the wire's own class.
+
+        F11 of the whole-branch review. `hx.scan.run` builds the run row's
+        `stop_reason` from what it can SEE, and what it could see was skips:
+        a `budget_exhausted` arrives as a raised `ProbeRefused`, lands the
+        `check_run` row `inconclusive`, and left the run itself closing
+        `('completed', NULL)` -- byte-identical at the run row to a pass that
+        covered every surface. A scan that spent its whole budget at surface
+        10 of 500 overstated its own coverage, which is S12's core
+        prohibition.
+
+        COUNTED HERE BECAUSE THE RUNNER CANNOT SEE THEM ANY MORE. Since F2,
+        a check catches its own refusals per insertion point
+        (`_probe_util.send_or_gap`) and answers with a verdict, so the
+        runner's `except ProbeRefused` is no longer where most refusals
+        arrive. This dict is what crosses that seam. It counts TERMINAL
+        refusals only -- a `rate_limited` attempt that was waited out and
+        then answered is not one, or a paced scan would report itself
+        truncated for having worked.
+
+        A COPY, like `sent` is a number: a caller that could mutate this
+        could make the run row say something the pass did not do.
+        """
+        return dict(self._refused)
 
     @property
     def path(self) -> str:
@@ -368,6 +396,11 @@ class ProbeSender:
                 # `hx.scan.run` then prefixes a third time on its way into
                 # `check_run.reason` and the report's coverage rows.
                 detail = str(exc).removeprefix(f"{cls}: ")
+                # AFTER the retry decision, so a `rate_limited` that was
+                # waited out and then answered is not recorded as one: this
+                # count reaches the run row as a reason the pass was
+                # truncated, and a paced scan was not.
+                self._refused[cls] = self._refused.get(cls, 0) + 1
                 raise ProbeRefused(cls, "" if detail == cls else detail) from exc
             # The send returned a `result` frame, so a request was issued --
             # whatever the frame then says about how much of the answer came
@@ -375,6 +408,7 @@ class ProbeSender:
             self._sent += 1
             outcome = result.get("outcome", "ok")
             if outcome != "ok":
+                self._refused[outcome] = self._refused.get(outcome, 0) + 1
                 raise ProbeRefused(
                     outcome, "the response did not come back whole, so nothing "
                              "found in it separates tested from unreachable")
