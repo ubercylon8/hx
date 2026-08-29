@@ -10,6 +10,13 @@ import pytest
 from hx.checks import base
 
 
+@pytest.fixture
+def a_candidate():
+    return base.Candidate(title="t", issue_type_id="t-issue",
+                           severity="Low", confidence="Firm",
+                           insertion=None, exchange_ids=("x-1",))
+
+
 def test_a_clean_verdict_carries_no_candidates_and_no_reason():
     v = base.Verdict.clean()
     assert v.state == "clean"
@@ -121,3 +128,34 @@ def test_an_insertion_refuses_an_unknown_kind():
 def test_an_insertion_refuses_an_empty_name():
     with pytest.raises(ValueError, match="name"):
         base.Insertion(kind="query", name="")
+
+
+def test_a_clean_verdict_can_name_what_it_considered():
+    v = base.Verdict.clean(considered=("missing-hsts", "missing-xcto"))
+    assert v.state == "clean"
+    assert v.considered == ("missing-hsts", "missing-xcto")
+
+
+def test_a_finding_verdict_can_name_what_it_considered(a_candidate):
+    v = base.Verdict.finding(a_candidate, considered=("missing-hsts",))
+    assert v.considered == ("missing-hsts",)
+
+
+def test_considered_defaults_to_empty_so_an_unaware_check_retires_nothing():
+    # The failure mode of a check that never populates `considered` must be a
+    # finding staying live, never a finding falsely closed.
+    assert base.Verdict.clean().considered == ()
+
+
+def test_inconclusive_cannot_name_considered_issue_types():
+    # S10: a check that cannot run says so. It concluded nothing, so it may
+    # not retire anything -- the classmethod does not offer the argument.
+    with pytest.raises(TypeError):
+        base.Verdict.inconclusive("bridge_lost", considered=("missing-hsts",))
+
+
+def test_considered_must_be_a_tuple_of_non_empty_strings():
+    with pytest.raises(ValueError):
+        base.Verdict("clean", (), None, ("",))
+    with pytest.raises(ValueError):
+        base.Verdict("clean", (), None, ("ok", 3))

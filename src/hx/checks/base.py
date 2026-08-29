@@ -1,10 +1,16 @@
 """The types a check speaks in, and the ones it deliberately cannot.
 
-A check is pure. It reads a surface and the exchanges captured against it and
-returns a verdict. It does not build requests, write rows, compute dedupe
-keys, learn its own `check_run` id, or reach the bridge -- each of those
-belongs to the runner, and each is a place where ONE implementation must serve
-every check or the guarantees stop being uniform.
+A PASSIVE check is pure: it reads a surface and the exchanges captured
+against it and returns a verdict. An ACTIVE check additionally builds
+requests -- but it does not own a socket, and cannot construct one. It is
+handed a `hx.checks.probe.ProbeSender` by the runner, which is the only
+route to the wire and which enforces S4 by going through the extension
+like everything else.
+
+What NO check does, active or passive: write rows, compute dedupe keys,
+learn its own `check_run` id, or hold a database connection. Each of those
+belongs to the runner, and each is a place where ONE implementation must
+serve every check or the guarantees stop being uniform.
 
 THE VERDICT VOCABULARY IS NARROWER THAN THE COLUMN, ON PURPOSE.
 `check_run.verdict` carries six values. A check may return three. `pending`,
@@ -156,6 +162,25 @@ class Verdict:
     state: str
     candidates: tuple[Candidate, ...] = ()
     reason: str | None = None
+    # What this check EXAMINED on this subject and reached a conclusion about,
+    # as `issue_type_id` strings. `hx.scan._mark_unobserved` retires a finding
+    # whose issue type is in here and was NOT re-emitted this run.
+    #
+    # It exists because the retirement gate it replaces was sound only while a
+    # check filed at most ONE finding per surface. `issue_type_id` (F1 of Plan
+    # 5's whole-branch review) made N-per-surface the norm, and a check that
+    # finds one of three issues answers `finding` -- so under the old
+    # clean-only gate the other two were never retired and rendered live off
+    # stale observations, telling a client a fixed issue was still open.
+    #
+    # RUN-TIME, NOT DECLARED. A class-level list cannot express
+    # `hx.checks.passive.cookie_flags`, which mints an issue type per cookie
+    # NAME; what it considered is whatever cookies this surface actually set.
+    #
+    # DEFAULTS EMPTY, AND THAT IS THE SAFE DIRECTION: a check that populates
+    # nothing retires nothing. The failure mode is a finding staying live,
+    # never one falsely closed.
+    considered: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.state not in _VERDICT_STATES:
@@ -172,14 +197,21 @@ class Verdict:
                 "inconclusive requires a reason: S10 says a check that cannot "
                 "run says so, and a reason-less one tells the operator "
                 "nothing they can act on")
+        for issue_type in self.considered:
+            if not isinstance(issue_type, str) or not issue_type:
+                raise ValueError(
+                    f"considered holds {issue_type!r}; it is a tuple of "
+                    "issue_type_id strings, and a blank or non-string entry "
+                    "would retire a finding nothing can be matched against")
 
     @classmethod
-    def clean(cls) -> "Verdict":
-        return cls("clean")
+    def clean(cls, *, considered: tuple[str, ...] = ()) -> "Verdict":
+        return cls("clean", (), None, tuple(considered))
 
     @classmethod
-    def finding(cls, *candidates: Candidate) -> "Verdict":
-        return cls("finding", tuple(candidates))
+    def finding(cls, *candidates: Candidate,
+                considered: tuple[str, ...] = ()) -> "Verdict":
+        return cls("finding", tuple(candidates), None, tuple(considered))
 
     @classmethod
     def inconclusive(cls, reason: str) -> "Verdict":
