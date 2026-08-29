@@ -87,3 +87,26 @@ def test_a_lone_cr_inside_a_header_value_does_not_split_it():
     -- RFC 9112 only recognises CRLF and a bare LF as ending a line."""
     head = b"HTTP/1.1 200 OK\r\nX-Note: a\rb\r\n"
     assert _http.header_values(head, "x-note") == ["a\rb"]
+
+
+def test_a_bare_lf_head_is_not_pulled_forward_by_crlfcrlf_in_the_body():
+    """`_split_head_body` picks the EARLIEST of the two terminators. A body
+    that happens to contain `\\r\\n\\r\\n` later must not pull the boundary
+    forward past a head that already ended on a bare `\\n\\n`. This is the
+    direction a "try CRLF first, fall back to LF" rewrite gets wrong: that
+    version would find the later `\\r\\n\\r\\n` first and cut there instead,
+    leaving `BODY` stuck onto the head as if it were another header line."""
+    raw = b"HTTP/1.1 200 OK\n\nBODY\r\n\r\nMORE"
+    ev = _http.bodies(ctx_for(d1=raw), rows())
+    assert ev.entries[0][1] == b"BODY\r\n\r\nMORE"
+
+
+def test_a_crlf_head_is_not_pulled_forward_by_lflf_in_the_body():
+    """The other direction of the same property: a body that happens to
+    contain a bare `\\n\\n` later must not pull the boundary forward past a
+    head that already ended on `\\r\\n\\r\\n`. A "try CRLF first" rewrite
+    happens to get this direction right by construction, but a naive
+    "whichever `.find()` is not -1, preferring LF" rewrite would not."""
+    raw = b"HTTP/1.1 200 OK\r\n\r\nBODY\n\nMORE"
+    ev = _http.bodies(ctx_for(d1=raw), rows())
+    assert ev.entries[0][1] == b"BODY\n\nMORE"
