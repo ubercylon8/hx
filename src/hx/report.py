@@ -1378,8 +1378,9 @@ def _limits(conn, engagement_id) -> list[str]:
         # conditional on a blob store this function does not have, and a
         # bullet naming a section that may not have rendered is a worse
         # disclosure than one that stands alone.
-        credential_headers = ", ".join(
-            f"`{h}`" for h in sorted(probe.CREDENTIAL_HEADERS))
+        names = [f"`{h}`" for h in sorted(probe.CREDENTIAL_HEADERS)]
+        credential_headers = " or ".join(
+            [", ".join(names[:-1]), names[-1]] if len(names) > 1 else names)
         out.append("- **Cookie and credential-header insertion points were "
                    "not probed.** The extension refuses any request carrying "
                    f"an {credential_headers} header it did not inject "

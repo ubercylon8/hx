@@ -66,9 +66,11 @@ class ScanSummary:
     `refused` IS NOT `by_reason`, AND MIXING THEM WOULD MISREPORT BOTH. F11
     of the whole-branch review. `by_reason` counts rows the runner SKIPPED --
     it never called the check -- and the CLI prints each as `skipped N
-    (key)`. This counts probes the extension or the bridge REFUSED, keyed by
-    the wire's own class, on rows where the check did run and answered
-    `inconclusive` or reported what the surviving points found. A
+    (key)`. This counts probes that ended in a `ProbeRefused` -- a refusal
+    from the extension or the bridge, or an answer that did not come back
+    whole -- keyed by the wire's own class, on rows where the check DID run
+    and then answered `inconclusive` or reported what the surviving points
+    found. A
     `budget_exhausted` folded into `by_reason` would print as a skipped
     check, which is a row an operator can go and read and would not find.
     Both feed the run's `stop_reason`, separately labelled, because a run
