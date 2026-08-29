@@ -68,6 +68,8 @@ import hashlib
 
 from hx import config as config_mod
 from hx import insertion as insertion_mod
+from hx import surface as surface_mod
+from hx.checks import probe
 from hx.checks import registry
 from hx.store import records
 from hx.store.blobs import CorruptBlob
@@ -1345,6 +1347,65 @@ def _limits(conn, engagement_id) -> list[str]:
                    "not the request that demonstrated the flaw; reproduce one "
                    "from the finding's description and insertion point rather "
                    "than by replaying its evidence bullet.")
+    if active:
+        # F3 OF THE WHOLE-BRANCH REVIEW: DISCLOSE, DO NOT FIX. `ProbeSender.
+        # _request_bytes` emits a request line, a `Host`, and at most the one
+        # header the check is probing -- nothing carries the exemplar's
+        # cookies, its `Authorization`, or the endpoint's OTHER parameters.
+        # Fix round 1 closed the safety half of this (a login redirect or a
+        # 403 is `inconclusive` now, never a false `clean`), so what is left
+        # is a coverage fact with nothing on the page saying it. Wiring
+        # identities into the sender reaches the identity model this build
+        # deliberately excludes; the client is told instead.
+        out.append("- **Every probe was sent unauthenticated.** The "
+                   f"{len(active)} active check(s) in this build "
+                   f"({_names(active)}) build each probe from the affected "
+                   "surface's captured request line and send nothing else "
+                   "with it: no cookie, no `Authorization`, and none of the "
+                   "endpoint's other parameters. Against an application that "
+                   "requires a session, a probe therefore tests the "
+                   "logged-out view of it. A login redirect or an "
+                   "authorisation refusal is recorded as `inconclusive` "
+                   "rather than as a clean result, so nothing is claimed for "
+                   "those surfaces -- but nothing was covered on them "
+                   "either.")
+        # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
+        # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
+        # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.
+        # `hx.scan.run` declines these points before a check is handed them,
+        # so no budget is spent proving what the send path already refuses.
+        # The insertion-point table is NOT cross-referenced here: it is
+        # conditional on a blob store this function does not have, and a
+        # bullet naming a section that may not have rendered is a worse
+        # disclosure than one that stands alone.
+        credential_headers = ", ".join(
+            f"`{h}`" for h in sorted(probe.CREDENTIAL_HEADERS))
+        out.append("- **Cookie and credential-header insertion points were "
+                   "not probed.** The extension refuses any request carrying "
+                   f"an {credential_headers} header it did not inject "
+                   "itself, so no active check can put a payload in one. "
+                   "Wherever the captured traffic held a cookie or one of "
+                   "those headers, that input was skipped rather than "
+                   "tested.")
+    # A NAME FILTER THAT CANNOT MATCH A PLACEHOLDER. Derived from the two
+    # halves that make it true: the check declares `path_segment`, and its own
+    # `probes_templated_segments` is the answer to running its name filter
+    # over `hx.surface.PLACEHOLDERS`. Either half changing removes this
+    # bullet, which is the point -- a typed sentence here would outlive the
+    # gap it describes.
+    unreachable = tuple(
+        c for c in active
+        if "path_segment" in (getattr(c, "insertion_kinds", None) or ())
+        and not getattr(c, "probes_templated_segments", True))
+    if unreachable:
+        placeholders = ", ".join(f"`{p}`" for p in surface_mod.PLACEHOLDERS)
+        out.append(f"- **{_names(unreachable)} probed no templated path "
+                   "segment.** It declares that insertion kind, but it probes "
+                   "a point only when the point's name looks like it names a "
+                   "file, and every templated segment hx can mint is one of "
+                   f"{placeholders} -- none of which does. Where this report "
+                   "says that check examined a surface, it examined that "
+                   "surface's query parameters.")
     if passive and not active:
         out.append("- **A fixed issue cannot be shown as fixed by "
                    "re-browsing.** "

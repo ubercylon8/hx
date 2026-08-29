@@ -117,6 +117,7 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
+from hx import surface as surface_mod
 from hx.checks import base
 from hx.checks.active import _probe_util
 
@@ -227,6 +228,22 @@ class PathTraversal:
     version = "1"
     klass = "active_safe"
     insertion_kinds = frozenset({"query", "path_segment"})
+
+    # DERIVED AT IMPORT, NOT ASSERTED IN PROSE: this check's own name filter
+    # run over every placeholder the normaliser can mint. It is `False`, and
+    # that is a real coverage gap rather than a curiosity -- `path_segment`
+    # is declared above, but `hx.surface` templates an identifier-shaped
+    # segment to `{id}`, `{uuid}`, `{hex}` or `{slug}`, and not one of those
+    # contains a `_FILE_NAME_HINTS` substring, so in production this check
+    # tests query parameters and nothing else. Pre-existing and harmless in
+    # direction (a false negative: `considered` stays empty for a point that
+    # was never probed, so nothing retires), and a report that implied
+    # otherwise would be claiming coverage it does not have --
+    # `hx.report._limits` reads this attribute and discloses it. Fixing it is
+    # a check-design question: either the filter widens or the normaliser
+    # learns a `{file}` shape, and both are decisions beyond a fix round.
+    probes_templated_segments = any(
+        _looks_like_file_target(p) for p in surface_mod.PLACEHOLDERS)
 
     def probes(self, ctx, surface, insertions, sender) -> base.Verdict:
         exemplar_exchange_id = surface[6]

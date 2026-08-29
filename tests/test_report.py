@@ -19,6 +19,9 @@ import pytest
 
 from hx import config as config_mod
 from hx import report
+from hx import surface as surface_mod
+from hx.checks import probe as probe_mod
+from hx.checks.active import path_traversal
 from hx.checks import base
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
@@ -1173,17 +1176,20 @@ def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
     assert "Every check in this build is passive" not in out
 
     # And it must say what IS true instead, naming the check by id in each
-    # of the four places -- Insertion points, and the three Limits bullets
+    # of the five places -- Insertion points, and the four Limits bullets
     # that are conditional on an active corpus. The fourth arrived in fix
     # round A: an active finding's evidence is a captured proxy request to
     # the affected surface, never the probe that proved it, and that
     # disclosure is derived from the same two sources as its neighbours (the
-    # corpus, and this store's own `exchange.via`).
-    assert out.count("`hx.active_safe.reflected-input`") == 4
+    # corpus, and this store's own `exchange.via`). The fifth is fix round 2,
+    # F3: a probe carries none of the exemplar's credentials, so on an
+    # authenticated target the whole active corpus tested a logged-out view.
+    assert out.count("`hx.active_safe.reflected-input`") == 5
     assert "active check(s) ship in this build" in out
     assert "none of them can reach a request body" in out
     assert "are not limited this way" in out
     assert "not the probe that proved it" in out
+    assert "Every probe was sent unauthenticated" in out
 
 
 # --- F1: redaction reaches every field that can carry a URL -----------------
@@ -2393,3 +2399,85 @@ def test_an_all_passive_build_makes_no_claim_about_probe_evidence(
     assert "not the probe that proved it" not in out
     # And the all-passive prose it makes room for is back.
     assert "Every check in this build is passive" in out
+
+
+# --- fix round 2, F3: the three coverage gaps the page did not carry --------
+#
+# All three are true of what this build DOES; none of them was on the page.
+# S12's rule is that a report which cannot tell "tested, clean" from "never
+# reached" is worse than no report, and each of these is a way the coverage
+# table's `clean` rows meant less than they looked like.
+
+
+def test_limits_disclose_that_every_probe_was_unauthenticated(
+        report_env_with_blobs):
+    """`ProbeSender._request_bytes` emits a request line, a `Host` and at
+    most the one header the check is probing -- no cookie, no
+    `Authorization`, none of the endpoint's other parameters. Against an
+    authenticated application that is a logged-out view of the app, and
+    nothing on the page said so."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "Every probe was sent unauthenticated" in limits
+    assert "no cookie, no `Authorization`" in limits
+    assert "`hx.active.cors`" in limits
+
+
+def test_limits_disclose_that_credential_insertion_points_are_not_probed(
+        report_env_with_blobs):
+    """The three names come from `probe.CREDENTIAL_HEADERS`, which is this
+    side's copy of `Redactor.CREDENTIAL_HEADERS` -- so a fourth credential
+    header the extension learns to refuse appears here without anyone
+    remembering to type it."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "Cookie and credential-header insertion points were not probed" \
+        in limits
+    for name in probe_mod.CREDENTIAL_HEADERS:
+        assert f"`{name}`" in limits, name
+
+
+def test_limits_disclose_that_path_traversal_reaches_no_templated_segment(
+        report_env_with_blobs):
+    """A pre-existing false negative, found while fixing F1 and disclosed
+    rather than fixed: `path_traversal` declares `path_segment` and probes a
+    point only when its name looks like a filename, while every placeholder
+    `hx.surface` mints is `{id}`, `{uuid}`, `{hex}` or `{slug}`."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "`hx.active.path-traversal` probed no templated path segment" \
+        in limits
+    for placeholder in surface_mod.PLACEHOLDERS:
+        assert f"`{placeholder}`" in limits, placeholder
+
+
+def test_that_last_bullet_is_derived_from_the_check_not_typed(
+        report_env_with_blobs, monkeypatch):
+    """THE ANTI-VACUITY HALF, and the one that matters most of the three:
+    this bullet describes a gap somebody will eventually close, and a typed
+    sentence would go on telling clients about it afterwards. Both halves
+    are derived -- the check must declare `path_segment` AND report that its
+    own name filter cannot match a placeholder -- so widening the filter
+    removes the bullet with no prose to remember."""
+    widened = path_traversal.PathTraversal()
+    widened.probes_templated_segments = True
+    monkeypatch.setattr(report.registry, "CHECKS", tuple(
+        widened if c.id == widened.id else c for c in report.registry.CHECKS))
+    out = report.render(**report_env_with_blobs)
+    assert "probed no templated path segment" not in out
+    # The check is still in the corpus, so its OTHER disclosures stand: this
+    # is a bullet disappearing, not a check.
+    assert "`hx.active.path-traversal`" in out
+
+
+def test_an_all_passive_build_makes_none_of_these_three_claims(
+        report_env_with_blobs, monkeypatch):
+    """All three are about what an ACTIVE check does. A build with none must
+    not tell a client its probes were unauthenticated -- it sent none."""
+    monkeypatch.setattr(
+        report.registry, "CHECKS",
+        tuple(c for c in report.registry.CHECKS if c.klass == "passive"))
+    out = report.render(**report_env_with_blobs)
+    assert "Every probe was sent unauthenticated" not in out
+    assert "credential-header insertion points" not in out
+    assert "probed no templated path segment" not in out

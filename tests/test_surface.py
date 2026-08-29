@@ -396,3 +396,38 @@ def test_the_version_is_pinned_to_the_ruleset_in_this_file():
     saying which ruleset produced a row unpinned by anything.
     """
     assert surface.NORMALISER_VERSION == 2
+
+
+# --- the placeholder vocabulary, pinned in both directions -----------------
+#
+# `surface.PLACEHOLDERS` is read by `hx.checks.active.path_traversal` (can my
+# name filter ever match one?) and, through it, by the Limits section of a
+# client deliverable. A constant that drifted from what `_template_segment`
+# actually mints would make that disclosure say something about a vocabulary
+# the normaliser no longer has.
+
+
+def _template(path):
+    return surface.path_template(path, preserve=frozenset(),
+                                 slug_threshold=12)
+
+
+def test_every_placeholder_in_the_vocabulary_is_one_the_normaliser_mints():
+    """Each entry, reached by a real path. An entry nothing can produce is a
+    claim no input separates from its absence."""
+    produced = {
+        _template("/a/12345").rsplit("/", 1)[-1],
+        _template("/a/3f2504e0-4f89-11d3-9a0c-0305e82c3301").rsplit("/", 1)[-1],
+        _template("/a/" + "deadbeefcafe1234" * 2).rsplit("/", 1)[-1],
+        _template("/a/hello-world-2026-edition").rsplit("/", 1)[-1],
+    }
+    assert produced == set(surface.PLACEHOLDERS)
+
+
+def test_a_segment_the_normaliser_keeps_is_never_one_of_them():
+    """The other direction: `_kept_segment` escapes a literal brace, so no
+    captured segment can forge a placeholder and the tuple stays exhaustive
+    of what a template can contain."""
+    for path in ("/a/documentation-index", "/a/{id}", "/a/orders", "/a/v2"):
+        segment = _template(path).rsplit("/", 1)[-1]
+        assert segment not in surface.PLACEHOLDERS, path
