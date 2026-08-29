@@ -258,49 +258,6 @@ def unprobeable(insertion) -> str | None:
     return None
 
 
-def credentials_carried(request_bytes: bytes) -> tuple[str, ...]:
-    """Which of `CREDENTIAL_HEADERS` this CAPTURED request carried, sorted.
-
-    THE QUESTION IS "WAS THIS THE SAME VIEW?", NOT "CAN WE PROBE IT?".
-    `unprobeable` above answers for one insertion POINT -- may a probe put a
-    payload here -- and `hx.scan.run` uses it to drop points. This answers for
-    the whole captured REQUEST: did the browser that produced this surface
-    carry an identity that a probe from this build does not? `ProbeSender.
-    _request_bytes` emits a request line, a `Host` and at most the one header
-    the check is probing, so the answer being non-empty means the probe and
-    the capture are two different views of the application, and whatever the
-    probe did or did not find says nothing about the one the client's users
-    see. `hx.scan.run` withholds `considered` on such a surface, so nothing
-    there is retired; F3 of the whole-branch review is the disclosure of the
-    underlying gap, and `hx.report._limits` carries it.
-
-    THE SAME THREE NAMES, READ FROM `CREDENTIAL_HEADERS` RATHER THAN SPELT
-    AGAIN. Two modules disagreeing about what a credential header is would be
-    the F2 family of defect over again, from the other side.
-
-    NAMES ONLY, AND THE STORE IS WHY THAT IS THE ONLY OPTION AS WELL AS THE
-    RIGHT ONE. `Redactor.redactObservedRequest` replaces each of these
-    headers' VALUES with `{{observed:<name>}}` before the bytes are hashed and
-    stored (S7), so a captured request on disk reads `Cookie:
-    {{observed:cookie}}` -- the name survives and the credential does not, and
-    a caller reading this function's answer never had a value available to it
-    in the first place. Which is also why nothing here can tell a live session
-    from an expired one, an empty `Cookie:` header from a full one, or a
-    first-party cookie from an analytics one. All of them answer "carried",
-    which is the safe direction: the cost is a retirement withheld, and the
-    alternative is a live finding reported to a client as fixed.
-
-    A REQUEST WITH NO HEAD TERMINATOR IS READ WHOLE, for the same reason.
-    `_http._split_head_body` returns the entire input as the head when it can
-    find neither terminator (a truncated capture), so a `Cookie:` anywhere in
-    it counts. That is a false positive whose only cost is the retirement, on
-    a blob that is malformed to begin with.
-    """
-    head = _http._split_head_body(request_bytes)[0]
-    return tuple(sorted({name.lower() for name in _http.header_names(head)
-                         if name.lower() in CREDENTIAL_HEADERS}))
-
-
 def _placeholder_in(path: str) -> str | None:
     """The first template placeholder segment in `path`, or None.
 

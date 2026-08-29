@@ -27378,7 +27378,8 @@ TEMPLATED_SURFACE = "/user/{id}/profile"
 # `TargetServer.require_login()` then puts the wall up for the rest of the run
 # and the next probe of that same surface meets the 302. A wall in front of a
 # surface nothing was ever found on could show that no check answers `clean`;
-# it could not show a retirement, and the retirement is the harm.
+# it could not show what a `clean` there would have COST, which until fix
+# round 6 was the retirement and is now the coverage row.
 #
 # NOT in `VULNERABLE_ROUTES`, for `TEMPLATED_ROUTE`'s reason: that map holds
 # one route per check and `hx.active.reflected-input` already has `/search`.
@@ -27967,11 +27968,14 @@ class TargetServer:
 
         NOT A SECOND `fix()`, and the difference is the whole point. `fix()`
         removes a flaw and the route goes on ANSWERING, which is what lets a
-        check say `clean` and retire the finding. This removes the ANSWER: the
-        flaw is untouched and may well still be there, and a probe that meets
-        the 302 has tested nothing. A build that reads the two as the same
-        thing tells a client a live vulnerability is fixed, which is N1 of the
-        scoped re-review and the reason this method exists.
+        check say `clean` at all. This removes the ANSWER: the flaw is
+        untouched and may well still be there, and a probe that meets the 302
+        has tested nothing. A build that reads the two as the same thing
+        records `tested, clean` for a surface it never reached, which is N1 of
+        the scoped re-review and the reason this method exists. (N1's own harm
+        was a live finding retired behind that 302; no active check retires
+        anything since fix round 6, and the coverage row is what is left --
+        S12 forbids both.)
 
         ONE DIRECTION ONLY, for `fix()`'s reason, and the asymmetry bites
         harder here: a knob that could take the wall back down would let a
@@ -28530,8 +28534,11 @@ class Rig:
         a browser, session and all, while everything hx itself issues is
         refused a credential header it did not inject. Traffic captured
         through this method is therefore the only way an AUTHENTICATED surface
-        reaches the store, which is what `hx.scan._unauthenticated_view` reads
-        and what `test_active_checks.py`'s section 5 is built on.
+        -- and so the only way a `cookie` insertion point -- reaches the
+        store, which is what `test_active_checks.py`'s section 5 is built on.
+        (Fix round 5 read the same fact at the runner, to decide whether a row
+        could retire; fix round 6 removed that rule, and the derivation and
+        the send path's refusal of it are what is left.)
         """
         dest = to or self.target
         return browse_through(port or self.proxy_port, method,

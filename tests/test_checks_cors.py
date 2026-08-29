@@ -107,10 +107,13 @@ def test_an_arbitrary_origin_reflected_with_credentials_is_a_finding():
     assert v.candidates[0].payload == cors._PROBE_ORIGIN
 
 
-def test_a_target_that_ignores_the_origin_is_clean_and_says_what_it_considered():
+def test_a_target_that_ignores_the_origin_is_clean():
     v = cors.Cors().probes(ctx, surface, (), _sender_returning({}))
     assert v.state == "clean"
-    assert v.considered, "a clean answer that names nothing can never retire a fixed header"
+    assert v.considered == (), (
+        "an active check may not retire anything, so no verdict it returns "
+        "may carry `considered` -- `hx.scan._retirable` refuses one that "
+        "does")
 
 
 def test_a_refusal_propagates_rather_than_becoming_a_verdict():
@@ -239,28 +242,33 @@ def test_an_allowlisted_origin_that_does_not_reflect_is_clean():
     assert v.state == "clean"
 
 
-# ---- considered / dedupe identity ----------------------------------------
+# ---- examined / dedupe identity ------------------------------------------
 
 
-def test_every_issue_type_this_check_can_conclude_is_considered_on_a_clean_answer():
-    v = cors.Cors().probes(ctx, surface, (), _sender_returning({}))
-    assert v.state == "clean"
-    assert set(v.considered) == {
+def test_every_issue_type_this_check_can_conclude_is_in_examined():
+    """`_EXAMINED` is what `_probe_util.verdict` is told, and naming fewer
+    than all three would understate this check's coverage on every row it
+    closes `clean`. It was `considered` and therefore what could be retired
+    until fix round 6; an active check retires nothing now, and the set is
+    still the check's own statement of what it looked for."""
+    assert set(cors._EXAMINED) == {
         cors._REFLECTS_WITH_CREDENTIALS,
         cors._REFLECTS_NO_CREDENTIALS,
         cors._WILDCARD_WITH_CREDENTIALS,
-    }, "a fixed CORS header must be retirable, which needs every issue type named here"
+    }
 
 
-def test_a_cors_candidates_issue_type_is_one_it_considered():
+def test_a_cors_candidates_issue_type_is_one_it_examined():
     """The drift-catching test this whole suite of checks carries: a
-    candidate whose issue type is not in `considered` can never be retired."""
+    candidate minting an issue type the check does not list as examined is
+    two spellings of one question, and `report._coverage` would show a row
+    claiming to have looked for something no finding is ever filed under."""
     v = cors.Cors().probes(ctx, surface, (), _sender_returning(
         {"Access-Control-Allow-Origin": cors._PROBE_ORIGIN,
          "Access-Control-Allow-Credentials": "true"}))
     assert v.state == "finding"
     for candidate in v.candidates:
-        assert candidate.issue_type_id in v.considered
+        assert candidate.issue_type_id in cors._EXAMINED
 
 
 def test_a_refusal_propagates_rather_than_becoming_a_verdict():
@@ -314,15 +322,18 @@ def test_every_finding_has_an_insertion_of_none(headers):
 #
 # F4 of the whole-branch review: every active check treated ANY status as a
 # conclusive negative, so a WAF's 403, a 500 or a maintenance page recorded
-# `clean` with `considered` populated and retired live findings. The doctrine
-# lives in `_probe_util`; these two tests are this check's end of it.
+# `clean` with `considered` populated and retired live findings. Retirement
+# is gone from the active corpus since fix round 6 and the doctrine is not:
+# `clean` still asserts a test happened, and the coverage table is what a
+# client reads it off. It lives in `_probe_util`; these two tests are this
+# check's end of it.
 
 
 @pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
 def test_a_status_that_refused_is_inconclusive_not_clean(status):
     """A response with no CORS headers because nothing answered looks
-    identical, header for header, to one from a correctly configured target.
-    `inconclusive` carries no `considered`, so nothing is retired."""
+    identical, header for header, to one from a correctly configured target,
+    and `clean` would claim the second of those."""
     v = cors.Cors().probes(ctx, surface, (), _FakeSender(headers={},
                                                          status=status))
     assert v.state == "inconclusive"
@@ -331,9 +342,9 @@ def test_a_status_that_refused_is_inconclusive_not_clean(status):
 
 
 def test_the_same_missing_headers_on_a_200_are_still_clean():
-    """The separating case. Treating every status as a refusal would mean no
-    CORS finding could ever be retired, which is S12's other direction."""
+    """The separating case. Treating every status as a refusal would leave
+    this check unable to report a tested surface at all, which is S12's
+    other direction on the coverage axis."""
     v = cors.Cors().probes(ctx, surface, (), _FakeSender(headers={},
                                                          status=200))
     assert v.state == "clean"
-    assert v.considered

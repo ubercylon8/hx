@@ -209,14 +209,16 @@ class Verdict:
     # nothing retires nothing. The failure mode is a finding staying live,
     # never one falsely closed.
     #
-    # NECESSARY, NOT SUFFICIENT, since fix round 5. This is what the CHECK
-    # examined; whether the runner may act on it is `hx.scan.
-    # _unauthenticated_view`'s question, and on a surface whose captured
-    # request carried a credential header the answer is no -- the check
-    # examined a view of the application that the client's users are not in.
-    # A check author populates this the same way either way and has nothing
-    # to decide: the rule is at the runner precisely so that a sixth active
-    # check cannot forget it.
+    # PASSIVE CHECKS ONLY, SINCE FIX ROUND 6, AND THE RUNNER ENFORCES IT.
+    # `hx.scan._retirable` returns nothing for a check driven through the
+    # `probes` hook and RAISES if such a check populated this at all: every
+    # probe this build sends is unauthenticated, so an active check's
+    # conclusion is about the logged-out view of the application and cannot
+    # close a finding about the view the client's users are in. An active
+    # check names what it examined to `hx.checks.active._probe_util.verdict`
+    # as `examined` instead -- which is what lets it say `clean` -- and that
+    # value deliberately never reaches this field. See `_retirable` for the
+    # argument and for the two narrower rules that were tried first.
     considered: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:

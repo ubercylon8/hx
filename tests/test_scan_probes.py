@@ -103,6 +103,16 @@ def _env(tmp_path, *, request_bytes=REQ_WITH_QUERY, exemplar=True,
             "config": cfg}
 
 
+def _last_verdict(conn):
+    """The verdict of the most recently written `check_run` row.
+
+    `_row` takes the FIRST row for a check id, which is the right answer for
+    a one-scan test and the wrong one for the two-scan tests that assert what
+    the SECOND pass wrote."""
+    return conn.execute(
+        "SELECT verdict FROM check_run ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+
+
 def _row(conn, check_id=None):
     if check_id is None:
         return conn.execute(
@@ -126,7 +136,7 @@ class _Probe:
         self.seen["insertions"] = insertions
         self.seen["sender"] = send
         self.seen["surface"] = surface
-        return base.Verdict.clean(considered=("probed",))
+        return base.Verdict.clean()
 
 
 def _replying_bridge(body=b"HTTP/1.1 200 OK\r\n\r\nhi"):
@@ -177,7 +187,7 @@ def test_the_sender_is_bound_to_this_surface_and_not_to_the_target_at_large(
     class Sends(_Probe):
         def probes(self, ctx, surface, insertions, send):
             send.get("/?q=1")
-            return base.Verdict.clean(considered=("probed",))
+            return base.Verdict.clean()
 
     scan.run(**env, checks=(Sends(),), bridge=fb)
     assert fb.last_req == {"target_host": "app.test", "target_port": 443,
@@ -242,19 +252,26 @@ class _NoPointsFinds:
         return base.Verdict.finding(base.Candidate(
             title="t", issue_type_id="probed", severity="Low",
             confidence="Firm", insertion=None,
-            exchange_ids=(surface[6],)), considered=("probed",))
+            exchange_ids=(surface[6],)))
 
 
 def test_a_no_bridge_skip_retires_nothing(tmp_path):
     """The consequence that makes the `skipped` row worth writing. A check
-    that never ran examined nothing, so `considered` gains nothing and
+    that never ran examined nothing, so it enters nothing for retirement and
     `_mark_unobserved` closes none of its prior findings -- "I did not look"
     must not read as "it is fixed". Two real scans rather than a hand-built
     `finding` row: the first one is what puts the finding there, so the
-    dedupe key and the observation are the runner's own."""
+    dedupe key and the observation are the runner's own.
+
+    OVER-DETERMINED SINCE FIX ROUND 6 and kept for the day it is not: this
+    check is active, and `scan._retirable` would empty its contribution even
+    if it HAD been called. What still separates something here is the
+    `skipped` row -- the alternative to a skip is an `error` or a silence,
+    and only one of the three is what a no-bridge scan should write."""
     env = _env(tmp_path)
     scan.run(**env, checks=(_Finds(),), bridge=_replying_bridge())
     scan.run(**env, checks=(_Finds(),), bridge=None)
+    assert _last_verdict(env["conn"]) == "skipped"
     observed = [r[0] for r in env["conn"].execute(
         "SELECT observed FROM finding_observation ORDER BY ts_us")]
     assert observed == [1], "a check that never ran retired its own finding"
@@ -476,7 +493,7 @@ def test_a_check_declaring_no_insertion_kinds_runs_on_a_bare_surface(tmp_path):
 
         def probes(self, ctx, surface, insertions, send):
             self.calls += 1
-            return base.Verdict.clean(considered=("probed",))
+            return base.Verdict.clean()
 
     check = NoPoints()
     scan.run(**env, checks=(check,), bridge=_replying_bridge())
@@ -500,7 +517,7 @@ def test_a_refusal_becomes_inconclusive_never_clean(tmp_path):
     class Sends(_Probe):
         def probes(self, ctx, surface, insertions, send):
             send.get("/?q=1")
-            return base.Verdict.clean(considered=("probed",))
+            return base.Verdict.clean()
 
     scan.run(**env, checks=(Sends(),), bridge=fb)
     verdict, reason, sent = _row(env["conn"])
@@ -535,7 +552,7 @@ def test_a_refusal_after_the_request_left_is_counted(tmp_path):
     class Sends(_Probe):
         def probes(self, ctx, surface, insertions, send):
             send.get("/?q=1")
-            return base.Verdict.clean(considered=("probed",))
+            return base.Verdict.clean()
 
     scan.run(**env, checks=(Sends(),), bridge=fb)
     verdict, _reason, sent = _row(env["conn"])
@@ -555,7 +572,7 @@ def test_a_refusal_is_not_an_error_row(tmp_path):
     class Sends(_Probe):
         def probes(self, ctx, surface, insertions, send):
             send.get("/?q=1")
-            return base.Verdict.clean(considered=("probed",))
+            return base.Verdict.clean()
 
     scan.run(**env, checks=(Sends(),), bridge=fb)
     assert _row(env["conn"])[0] != "error"
@@ -565,7 +582,13 @@ def test_a_refusal_retires_nothing(tmp_path):
     """`Verdict.inconclusive` takes no `considered`, and a refusal never
     reaches a verdict at all -- so a check whose probes were denied must
     close none of its earlier findings. The alternative is telling a client
-    an issue is fixed because Burp refused to test it."""
+    an issue is fixed because Burp refused to test it.
+
+    OVER-DETERMINED SINCE FIX ROUND 6, like the no-bridge skip above: this
+    check is active and `scan._retirable` would empty its contribution
+    anyway. The `inconclusive` row is what still separates something -- a
+    refusal that landed as `error` would send an operator looking for a bug
+    in hx, and one that landed as `clean` would be F4 again."""
     env = _env(tmp_path)
     scan.run(**env, checks=(_Finds(),), bridge=_replying_bridge())
 
@@ -577,6 +600,7 @@ def test_a_refusal_retires_nothing(tmp_path):
     fb = FakeBridge()
     fb.refuse("rate_limited")
     scan.run(**env, checks=(Refused(),), bridge=fb)
+    assert _last_verdict(env["conn"]) == "inconclusive"
     observed = [r[0] for r in env["conn"].execute(
         "SELECT observed FROM finding_observation ORDER BY ts_us")]
     assert observed == [1], "a refused check retired its own finding"
@@ -621,7 +645,7 @@ def test_requests_sent_is_written_when_the_row_closes(tmp_path):
             for _ in range(3):
                 send.get("/?q=1")
             spent["n"] = send.sent
-            return base.Verdict.clean(considered=("probed",))
+            return base.Verdict.clean()
 
     scan.run(**env, checks=(Sends(),), bridge=_replying_bridge())
     assert spent["n"] == 3
@@ -943,7 +967,7 @@ def test_a_check_that_probes_the_template_errors_rather_than_answering_clean(
         def probes(self, ctx, surface, insertions, send):
             self.calls += 1
             send.get(surface[5])
-            return base.Verdict.clean(considered=("probed",))
+            return base.Verdict.clean()
 
     scan.run(**env, checks=(ProbesTheTemplate(),), bridge=fb)
     verdict, reason, _sent = _row(env["conn"])
@@ -1159,37 +1183,36 @@ def test_the_shipped_reflected_input_check_probes_a_cookie_bearing_surface(
     assert "Accept" in _headers_on_the_wire(fb)
 
 
-# --- `considered` names only what was actually tested ---------------------
+# --- an active check retires nothing ---------------------------------------
 #
-# POINT TWO OF F2, and the one that matters: a refusal on one insertion point
-# must not abort the check, AND the check must not then claim to have
-# examined the surface. `considered` is what `_mark_unobserved` retires from,
-# so a partial pass that populated it would tell a client an issue is fixed
-# on the strength of a probe that was never issued.
+# FIX ROUND 6, AND IT IS A CAPABILITY REMOVED ON PURPOSE. Retirement is
+# `_mark_unobserved` writing `observed = 0`, which `report._findings` renders
+# to a client as "appears fixed; verify before closing". Every probe this
+# build sends is unauthenticated, so an active check's `clean` is a statement
+# about the LOGGED-OUT view of the application -- and the shape that made
+# that fatal is an application answering a logged-out request with a 200
+# login PAGE, which no set of statuses can tell from an answer. Fix round 5
+# tried to suppress retirement only where the capture carried a credential
+# header; that predicate keyed on the FIRST sighting and could only read a
+# header NAME (the value is redacted before the digest, S7), so it could not
+# tell a session cookie from an analytics one. The rule is now flat, lives at
+# the runner (`scan._retirable`), and the tests below drive it from three
+# directions: a real check that would have retired, a synthetic one that
+# tries to, and the whole registry.
+#
+# POINT TWO OF F2 IS STILL HERE, in the first test: a refusal on one
+# insertion point must not abort the check, so the point that DID answer is
+# still probed and its finding still re-found.
 
-# NO COOKIE, AND THAT IS LOAD-BEARING SINCE FIX ROUND 5. This constant
-# carried `Cookie: session=abc` when F2 introduced it, to look like the
-# authenticated engagement F2 was about. `scan._unauthenticated_view` now
-# withholds `considered` from every active row on a surface whose capture
-# carried a credential header -- so on the old bytes NOTHING retires, and both
-# tests below assert that something does or does not retire. The refusal test
-# would have gone on passing for the wrong reason (its "not retired" satisfied
-# by the cookie rather than by the refusal it names), and the separating case
-# would simply be unreachable. An anonymous capture is the only surface on
-# which either question is still a question.
+# An ordinary anonymous capture with two reflecting parameters. It carried
+# `Cookie: session=abc` from F2 until fix round 5, which removed it because
+# the rule of the day keyed on that header; nothing keys on it now, and the
+# constant stays anonymous because the surface it stands for -- a search page
+# a browser reached without logging in -- is the simplest thing that produces
+# two findings.
 REQ_TWO_PARAMS = (
     b"GET /search?q=hello&r=world HTTP/1.1\r\n"
     b"Host: app.test\r\n"
-    b"\r\n"
-)
-
-# The same surface, captured by a browser that WAS logged in. One header
-# apart from the constant above, so a test pair built on the two differs in
-# nothing else -- which is what makes the retirement the header's doing.
-REQ_TWO_PARAMS_WITH_SESSION = (
-    b"GET /search?q=hello&r=world HTTP/1.1\r\n"
-    b"Host: app.test\r\n"
-    b"Cookie: session=abc\r\n"
     b"\r\n"
 )
 
@@ -1198,13 +1221,13 @@ class _EchoBridge(FakeBridge):
     """A reflecting target: the request line's target comes back in the body,
     percent-decoded the way an application's own framework hands it to a
     template. `hx.active.reflected-input` finds a reflection on every query
-    parameter against this, which is what gives the retirement tests below
-    something real to retire.
+    parameter against this, which is what gives the tests below something
+    real that a retirement would have closed.
 
     `blind_to` names a query parameter this target does NOT echo -- one of
-    two reflections fixed. It is the separating case: without it, "nothing
-    was retired" cannot be told apart from "this corpus can never retire
-    anything".
+    two reflections genuinely fixed. It is the separating case: without it,
+    "nothing was retired" cannot be told apart from "this scan never had a
+    fixed issue in front of it".
     """
 
     def __init__(self, blind_to: str | None = None) -> None:
@@ -1234,15 +1257,22 @@ def _reflected_input():
                 if c.id == "hx.active.reflected-input")
 
 
-def test_a_refused_point_withholds_considered_from_the_points_that_answered(
-        tmp_path):
-    """Two reflecting parameters, then a rescan in which the first is
-    refused and the second answers and is re-found. The refused parameter's
-    finding must NOT be retired: nothing looked at it this run.
+def test_a_refusal_on_one_point_does_not_cost_the_other_its_probe(tmp_path):
+    """POINT TWO OF F2, which is what survives of this test after fix round
+    6. Two reflecting parameters, then a rescan in which the first point is
+    refused: the second must still be probed and still be re-found, which is
+    the third `("r", 1)` row below. Before F2 the refusal propagated out of
+    the check's own loop and took every point after it, so there was no third
+    row at all.
 
     `budget_exhausted` rather than `rate_limited` because the sender retries
     the second -- three attempts and two waits -- so a `times=1` rate limit
     would be paced out and answered rather than refused.
+
+    IT NO LONGER SEPARATES ANYTHING ABOUT RETIREMENT. It used to: `q`'s
+    finding staying live was the refusal withholding `considered`. Nothing an
+    active check says retires anything now, so that half is guaranteed by the
+    runner and asserted where the runner is -- see the two tests below.
     """
     env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
     scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
@@ -1258,80 +1288,66 @@ def test_a_refused_point_withholds_considered_from_the_points_that_answered(
     verdict, reason, _sent = _row(env["conn"])
     assert verdict == "finding", f"{verdict}: {reason}"
     assert _observations(env["conn"]) == [("q", 1), ("r", 1), ("r", 1)], (
-        "a point that was refused had its finding retired, or the point "
-        "that answered was never reached")
+        "the point that answered was never reached, so the refusal took the "
+        "whole check down with it")
 
 
-def test_a_point_that_answered_and_found_nothing_still_retires(tmp_path):
-    """THE SEPARATING CASE. Withholding `considered` unconditionally would
-    be just as wrong in the other direction: a fixed issue could then never
-    be shown as fixed, whatever the rescan saw. Same two parameters, no
-    refusal, and the target has stopped reflecting `q` -- so `q`'s finding
-    IS retired and `r`'s is not."""
+def test_a_point_that_answered_and_found_nothing_does_not_retire(tmp_path):
+    """THE CAPABILITY REMOVED, on the sharpest case available: a REAL check,
+    a REAL probe, and a flaw that is genuinely gone.
+
+    Same two parameters, no refusal, and the target has stopped reflecting
+    `q`. The check sends, gets an ordinary 200, finds nothing in it and says
+    `clean` for `q` -- and `q`'s finding still may not close, because the
+    request that produced that `clean` carried no session and an application
+    that answers a logged-out request with a 200 login page is
+    indistinguishable from this one here.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? This is the test that reddened.
+    Up to fix round 5 it was `test_a_point_that_answered_and_found_nothing_
+    still_retires` and asserted `[("q", 1), ("q", 0), ("r", 1), ("r", 1)]`,
+    against this exact bridge and this exact check. `("q", 0)` is the
+    retirement, and it is what `report._findings` renders as "appears fixed;
+    verify before closing".
+
+    NOT VACUOUS: the row proves the probe really went and really answered
+    (`clean`, with requests on the wire), and
+    `test_a_passive_check_still_retires` below shows the retirement machinery
+    itself is still live on the same store.
+    """
     env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
     scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
     assert _observations(env["conn"]) == [("q", 1), ("r", 1)]
 
     scan.run(**env, checks=(_reflected_input(),),
              bridge=_EchoBridge(blind_to="q"))
-    assert _observations(env["conn"]) == [("q", 1), ("q", 0), ("r", 1),
-                                          ("r", 1)]
 
-
-# --- an unauthenticated probe of an authenticated surface ------------------
-#
-# THE SEVENTH SPELLING, and the one no status set can reach. Six ways an
-# active check could answer `clean` from a probe that tested nothing were
-# closed by `_probe_util._NOT_AN_ANSWER` and by the runner's skips. The
-# seventh is an application that answers a logged-out request with a 200
-# LOGIN PAGE: a complete, well-formed, application-composed response that no
-# status can tell from an answer (measured in fix round 3 -- all five checks
-# `clean`, `considered` populated, a live finding retired).
-#
-# The fix is not a status rule. Every probe this build sends is
-# unauthenticated (F3, disclosed rather than fixed), so where the CAPTURE
-# carried a credential header the probe and the capture are two different
-# views of the application -- and `hx.scan._unauthenticated_view` withholds
-# `considered` there. The verdict is untouched: a finding is still a finding
-# and a clean is still clean. Only the retirement goes.
-
-
-def test_a_fixed_reflection_on_an_authenticated_surface_is_not_retired(
-        tmp_path):
-    """The pair. `test_a_point_that_answered_and_found_nothing_still_retires`
-    above is this test with one header removed from the capture, and it
-    retires `q`; this one may not.
-
-    WOULD THIS FAIL IF THE CLAIM WERE FALSE? The two tests share a target
-    (`_EchoBridge(blind_to="q")` -- `q` genuinely stopped reflecting), a
-    check, a surface and a scan. The ONLY difference is `Cookie: session=abc`
-    on the captured request, so the missing `("q", 0)` here can be nothing
-    else's doing. Without the fix this file's own anonymous test and this one
-    produce identical observations, which is what made the harm invisible."""
-    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS_WITH_SESSION,
-               path_template="/search")
-    scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
-    assert _observations(env["conn"]) == [("q", 1), ("r", 1)], (
-        "the first scan did not find both reflections; a surface nothing "
-        "was found on cannot demonstrate a retirement either way")
-
-    scan.run(**env, checks=(_reflected_input(),),
-             bridge=_EchoBridge(blind_to="q"))
+    verdict, reason, sent = _row(env["conn"])
+    assert verdict == "finding", f"{verdict}: {reason}"
+    assert sent > 0, (
+        "the second scan sent nothing, so the `q` row is not a real `clean` "
+        "and this measures a skip rather than a suppressed retirement")
     assert _observations(env["conn"]) == [("q", 1), ("r", 1), ("r", 1)], (
-        "a probe carrying no session reported the logged-out view of an "
-        "authenticated surface as evidence that `q` is fixed; the client "
-        "reads that as `appears fixed; verify before closing`")
+        "an active check retired a finding: a client is told a live "
+        "vulnerability appears fixed on the strength of a probe that saw "
+        "only the logged-out view")
 
 
-def test_the_verdict_is_untouched_and_the_row_says_which_view_it_tested(
-        tmp_path):
-    """WHAT IS AND IS NOT SUPPRESSED. The finding is still filed and the row
-    still says `finding` -- withholding evidence of a real issue would be
-    strictly worse than reporting it from the logged-out view. What changes is
-    the Reason cell, which `report._coverage` renders: a row that retired
-    nothing must not read as a bare `tested, clean`."""
-    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS_WITH_SESSION,
-               path_template="/search")
+def test_the_verdict_and_the_row_are_exactly_what_the_check_said(tmp_path):
+    """WHAT IS AND IS NOT SUPPRESSED. Only the retirement goes. The finding
+    is still filed, the row still says `finding`, `requests_sent` is still
+    the traffic that went, and the Reason cell is still what the verdict
+    carried -- which for a `finding` is nothing.
+
+    THE LAST ASSERTION IS THE ONE WITH HISTORY. Fix round 5 appended a
+    sentence to this cell on every row it suppressed ("...UNAUTHENTICATED
+    view of an authenticated surface: it is reported, and it retires nothing
+    here"), because retirement was CONDITIONAL then and a reader of one row
+    could not tell which kind it was. It is unconditional now: every active
+    row behaves the same way, `report._limits` says so once, and a constant
+    string repeated on every active row would be noise in the cell that
+    carries gap lists and skip reasons."""
+    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
     scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
 
     verdict, reason, sent = _row(env["conn"])
@@ -1340,63 +1356,77 @@ def test_the_verdict_is_untouched_and_the_row_says_which_view_it_tested(
     # character-bearing value through.
     assert (verdict, sent) == ("finding", 4), (verdict, reason, sent)
     assert env["conn"].execute("SELECT COUNT(*) FROM finding").fetchone()[0] == 2
-    assert "UNAUTHENTICATED view" in reason, reason
-    assert "['cookie']" in reason, reason
-    assert "retires nothing here" in reason, reason
+    assert reason is None, reason
 
 
-def test_an_anonymous_capture_leaves_the_reason_alone(tmp_path):
-    """The other half of the row assertion: the sentence is not on every row.
-    Same check, same bridge, same finding -- one header fewer on the capture,
-    and the Reason cell is what a `finding` verdict carries, which is
-    nothing."""
+def test_an_active_check_that_populates_considered_is_an_error_row(tmp_path):
+    """THE RUNNER REFUSES IT RATHER THAN DROPPING IT, and this is the half a
+    future active check meets. The five shipped checks name what they
+    examined to `_probe_util.verdict` as `examined`, which never reaches
+    `Verdict.considered` -- so a probing check arriving here with a populated
+    one is an author who believed it would retire something, and silently
+    discarding it would leave that belief in the tree unfalsified. It lands
+    as an `error` row through `run`'s per-check `except Exception`: loud,
+    scoped to the one check, and retiring nothing.
+
+    The message names both ends, because an author reading it has to know
+    where to put the value instead."""
     env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
-    scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
 
-    verdict, reason, _sent = _row(env["conn"])
-    assert (verdict, reason) == ("finding", None), (verdict, reason)
+    class Retires(_Probe):
+        id = "hx.test.retires"
+
+        def probes(self, ctx, surface, insertions, send):
+            self.calls += 1
+            return base.Verdict.clean(considered=("probed",))
+
+    check = Retires()
+    scan.run(**env, checks=(check,), bridge=_replying_bridge())
+
+    assert check.calls == 1, "the check never ran, so nothing was refused"
+    verdict, reason, _sent = _row(env["conn"], "hx.test.retires")
+    assert verdict == "error", (verdict, reason)
+    assert "considered" in reason and "examined" in reason, reason
 
 
-def test_no_probing_check_retires_anything_on_an_authenticated_surface(
-        tmp_path):
-    """THE WHOLE CORPUS, not one check, and driven through the runner rather
-    than the checks -- which is where the rule lives, so that the sixth active
-    check inherits it without being told.
+def test_no_probing_check_in_the_corpus_retires_anything(tmp_path):
+    """THE WHOLE REGISTRY, and driven through the runner rather than the
+    checks -- which is where the rule lives, so that a sixth active check
+    inherits it without being told.
 
     Every check gets an ordinary 200 that its own filter accepts, so each of
-    them WOULD have answered `clean` (or `finding`) with `considered`
-    populated: the surface carries `q`, `redirect_uri` and `file`. Measured
-    with `_unauthenticated_view` returning "": every id below appears in
-    `considered` and every finding on this surface is retirable."""
-    env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE_WITH_SESSION,
-               path_template="/search")
+    them answers `clean` (or `finding`) having genuinely examined something:
+    the surface carries `q`, `redirect_uri` and `file`. The capture is
+    ANONYMOUS, which is the case fix round 5's rule deliberately left
+    retiring -- so this is the measurement that moved.
+
+    Read off `scan.run`'s own call to `_mark_unobserved` rather than
+    reconstructed from the rows: `check_run.verdict` is NOT the retirement
+    gate (a check filing one of three findings answers `finding` and the
+    other two would still retire), so a test that read the verdicts would be
+    asserting against the mechanism this fix does not touch."""
+    env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE, path_template="/search")
     active = tuple(c for c in registry.CHECKS if c.klass != "passive")
     assert len(active) == 5, "the corpus changed shape; re-read this test"
 
     considered = _considered_by(env, active, _replying_bridge())
     assert considered == set(), (
-        "an active check named an issue type it examined on a surface whose "
-        f"capture carried a session; `_mark_unobserved` retires on it: "
-        f"{sorted(considered)}")
+        "an active check entered an issue type into the set "
+        "`_mark_unobserved` retires on; every probe this build sends is "
+        f"unauthenticated: {sorted(considered)}")
 
-    # NOT VACUOUS: the same corpus, the same bridge, the same request with the
-    # cookie line removed, and every one of them contributes.
-    anonymous = _env(tmp_path / "anon", request_bytes=REQ_EVERY_SHAPE,
-                     path_template="/search")
-    assert _considered_by(anonymous, active, _replying_bridge()), (
-        "no active check considered anything even on an anonymous surface, "
-        "so the assertion above is satisfied by a corpus that never retires")
+    # NOT VACUOUS: the same store, the same helper, one passive check, and it
+    # contributes. A `_considered_by` that saw nothing whatever it was handed
+    # would satisfy the assertion above for the wrong reason.
+    passive = _env(tmp_path / "passive", request_bytes=REQ_EVERY_SHAPE,
+                   path_template="/search")
+    assert _considered_by(passive, (_PassiveOnce(),), None), (
+        "the spy saw nothing even from a passive check, so the assertion "
+        "above is satisfied by a broken measurement")
 
 
 def _considered_by(env, checks, bridge) -> set:
-    """The `(check_id, issue_type_id)` pairs one scan would retire on.
-
-    Read off `scan.run`'s own call to `_mark_unobserved` rather than
-    reconstructed from the rows: `check_run.verdict` is NOT the retirement
-    gate (a check filing one of three findings answers `finding` and the other
-    two still retire), so a test that read the verdicts would be asserting
-    against the mechanism this fix does not touch.
-    """
+    """The `(check_id, issue_type_id)` pairs one scan would retire on."""
     seen = set()
     real = scan._mark_unobserved
 
@@ -1412,24 +1442,23 @@ def _considered_by(env, checks, bridge) -> set:
     return seen
 
 
-def test_a_passive_check_retires_on_an_authenticated_surface_as_before(
-        tmp_path):
-    """THE RULE IS THE PROBE'S, NOT THE SURFACE'S. A passive check reads the
-    captured exchanges themselves -- the ones the logged-in browser produced
-    -- so it is already looking at the view the client's users are in, and
-    nothing about it changed. A suppression keyed on the surface rather than
-    on the hook would have retired nothing here either, and the passive
-    corpus's whole retest story would have gone with it."""
-    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS_WITH_SESSION,
-               path_template="/search")
+def test_a_passive_check_still_retires(tmp_path):
+    """THE RULE IS THE PROBE'S, NOT THE FINDING'S OR THE SURFACE'S. A passive
+    check reads the captured exchanges themselves -- the very traffic the
+    operator's own browser produced, session and all -- so it was never
+    looking at a different view of the application, and nothing about it
+    changed. A rule keyed on the finding, or on the surface, or written into
+    `_mark_unobserved` rather than into what reaches it would have taken the
+    passive corpus's whole retest story with it."""
+    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
     check = _PassiveOnce()
     scan.run(**env, checks=(check,), bridge=None)
     assert _observations(env["conn"]) == [("q", 1)]
 
     scan.run(**env, checks=(check,), bridge=None)
     assert _observations(env["conn"]) == [("q", 1), ("q", 0)], (
-        "a passive check stopped being able to show a fix on an "
-        "authenticated surface, which is not what this rule is about")
+        "a passive check stopped being able to show a fix, which is not what "
+        "this rule is about")
 
 
 class _PassiveOnce:
@@ -1486,14 +1515,22 @@ def _latest_row(conn):
         " ORDER BY ended_us DESC, started_us DESC LIMIT 1").fetchone()
 
 
-def test_a_login_redirect_does_not_retire_a_live_finding(tmp_path):
+def test_a_login_redirect_is_not_a_clean_result(tmp_path):
     """MEASURED END TO END, the way the re-review measured it. Run 1 the
     target reflects and two findings are filed; run 2 the same target sits
     behind a login wall and answers 302 to everything. Nothing was tested,
-    so nothing may be retired -- `observed = 0` is what `report._findings`
-    renders as "appears fixed; verify before closing", and a client reading
-    that about a live cross-site scripting vector on the strength of a probe
-    that reached a login page is the whole of S12's harm."""
+    so the row may not say `clean`: `report._coverage` groups on (check_id,
+    verdict) and counts surfaces, and a client reading `clean` there is
+    reading a coverage claim no request backs.
+
+    THE OBSERVATION ASSERTION IS NO LONGER WHAT THIS SEPARATES, and the name
+    changed with it. Until fix round 6 the harm was the RETIREMENT -- a
+    `clean` here populated `considered` and `_mark_unobserved` wrote
+    `observed = 0`, which `report._findings` renders as "appears fixed;
+    verify before closing" for a live cross-site scripting vector. No active
+    check retires anything now, so that row is guarded by the runner whatever
+    this doctrine does; it is asserted below as the consequence and the
+    `inconclusive` verdict is the claim."""
     env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
     scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
     assert _observations(env["conn"]) == [("q", 1), ("r", 1)], (
@@ -1507,7 +1544,8 @@ def test_a_login_redirect_does_not_retire_a_live_finding(tmp_path):
     assert sent > 0, "the second scan probed nothing, so it proves nothing"
     assert _observations(env["conn"]) == [("q", 1), ("r", 1)], (
         "a live finding was retired on the strength of a probe that reached "
-        "a login page")
+        "a login page -- which the runner now forbids outright, so this is "
+        "the second guard failing as well as the first")
 
 
 # One request carrying a point every probing check's own name filter accepts,
@@ -1519,22 +1557,12 @@ REQ_EVERY_SHAPE = (
     b"\r\n"
 )
 
-# The same three parameters, captured by a logged-in browser. Used by the
-# corpus-wide retirement test above, whose anti-vacuity half is the constant
-# directly above this one -- the two differ by the `Cookie` line and nothing
-# else.
-REQ_EVERY_SHAPE_WITH_SESSION = (
-    b"GET /search?q=hello&redirect_uri=/home&file=notes.txt HTTP/1.1\r\n"
-    b"Host: app.test\r\n"
-    b"Cookie: session=abc\r\n"
-    b"\r\n"
-)
-
 
 def test_every_probing_check_reads_a_login_wall_as_a_gap(tmp_path):
     """The whole active corpus, not one check. The registry's own checks are
     driven against a target that 302s everything; not one of them may close
-    `clean`, because `clean` with `considered` populated is what retires."""
+    `clean`, because `clean` is the coverage table's claim that this surface
+    was tested and none of them tested anything."""
     env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE,
                path_template="/search")
     active = tuple(c for c in registry.CHECKS if c.klass != "passive")

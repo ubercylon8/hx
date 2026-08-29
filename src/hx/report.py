@@ -1369,37 +1369,20 @@ def _limits(conn, engagement_id) -> list[str]:
         # application that answers a logged-out request with a 200 login PAGE
         # is not distinguishable here from one that answered.
         #
-        # AND SINCE FIX ROUND 5 THE BULLET DISCLOSES A BEHAVIOUR AS WELL AS A
-        # GAP. F3 was decided as DISCLOSE, NOT FIX -- and a disclosure does
-        # not stop a retirement, which is the actual harm the 200-login-page
-        # shape does. `hx.scan._unauthenticated_view` now withholds
-        # `considered` for an active check on any surface whose captured
-        # request carried one of `probe.CREDENTIAL_HEADERS`, so nothing there
-        # is closed. This paragraph and that function have to move together:
-        # the sentence below claims a behaviour of the runner, not a property
-        # of the checks, and `tests/test_report.py::test_the_unauthenticated_
-        # bullet_says_retirement_is_suppressed_and_it_is` holds it against the
-        # code -- it asks `scan._unauthenticated_view` about a capture
-        # carrying each name the bullet lists, and about one carrying none.
+        # AND SINCE FIX ROUND 6 THE BULLET BELOW IT DISCLOSES A BEHAVIOUR AS
+        # WELL AS A GAP. F3 was decided as DISCLOSE, NOT FIX -- and a
+        # disclosure does not stop a retirement, which is the actual harm the
+        # 200-login-page shape does. Fix round 5 suppressed retirement only
+        # where the captured request carried a credential header; that
+        # predicate keyed on the first sighting and could read only a header
+        # NAME, so it could not tell a session cookie from an analytics one.
+        # `hx.scan._retirable` now refuses retirement for EVERY active check,
+        # so no shape of this can close a finding and the residual below is a
+        # coverage gap rather than a wrong closure. The bullet after this one
+        # is where the client is told, and `tests/test_report.py::test_the_
+        # bullet_that_says_active_findings_never_retire_is_one_the_code_
+        # honours` holds it against `scan._retirable` itself.
         #
-        # THE RESIDUAL IS NARROWED, NOT CLOSED, AND THE SENTENCE SAYS WHICH.
-        # On a surface whose capture carried NO credential header the probe
-        # and the capture are the same view, so the suppression does not
-        # apply -- and a 200 login page there is still indistinguishable from
-        # an answer. Writing "the login page is handled" would be this
-        # branch's ninth false comment.
-        #
-        # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
-        # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
-        # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.
-        # `hx.scan.run` declines these points before a check is handed them,
-        # so no budget is spent proving what the send path already refuses,
-        # and `hx.scan._unauthenticated_view` asks the same list whether the
-        # CAPTURE carried one. Computed here rather than beside the third
-        # bullet it feeds, because the first of them is now this one.
-        names = [f"`{h}`" for h in sorted(probe.CREDENTIAL_HEADERS)]
-        credential_headers = " or ".join(
-            [", ".join(names[:-1]), names[-1]] if len(names) > 1 else names)
         out.append("- **Every probe was sent unauthenticated.** The "
                    f"{len(active)} active check(s) in this build "
                    f"({_names(active)}) build each probe from the affected "
@@ -1415,27 +1398,39 @@ def _limits(conn, engagement_id) -> list[str]:
                    "shape escapes that: an application that answers a "
                    "logged-out request with a 200 login PAGE cannot be told "
                    "apart here from one that answered, so a probe against it "
-                   "is recorded as a clean result.")
-        out.append("- **On an authenticated surface, an active check reports "
-                   "but retires nothing.** Where the request this assessment "
-                   f"captured for a surface carried an {credential_headers} "
-                   "header, the probe sent to it did not, so the two are "
-                   "different views of the application and what the probe saw "
-                   "says nothing about the view your users are in. Those "
-                   "rows are still reported — anything found is real — but "
-                   "no finding on such a surface is marked as no longer "
-                   "observed, whatever a later scan sees; the Coverage table "
-                   "above says so on each row it applies to. **A finding on "
-                   "an authenticated surface therefore stays live until it "
-                   "is retested by hand.** Only surfaces whose captured "
-                   "traffic carried none of those headers can be shown as "
-                   "fixed by re-running a scan here, and on those the 200 "
-                   "login PAGE above is still indistinguishable from an "
-                   "answer.")
+                   "is recorded as a clean result. That costs coverage and "
+                   "nothing more — the bullet below is why no clean result "
+                   "from an active check can close anything.")
+        out.append("- **An active finding is never automatically marked as "
+                   f"fixed.** The {len(active)} active check(s) in this build "
+                   f"({_names(active)}) re-issue requests, so a later scan "
+                   "does see the application as it is now — but it sees the "
+                   "logged-out view of it, for the reason above, and that is "
+                   "not the view your users are in. hx therefore never "
+                   "records a finding from one of these checks as no longer "
+                   "observed, however many times it is re-scanned and "
+                   "whatever those scans see. **Verify an active finding "
+                   "against the fixed application yourself before closing "
+                   "it.** Where the Coverage table shows one of these checks "
+                   "as `clean`, that means it ran and found nothing this "
+                   "time; it is not a statement that a previously reported "
+                   "issue is gone.")
+        # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
+        # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
+        # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.
+        # `hx.scan.run` declines these points before a check is handed them,
+        # so no budget is spent proving what the send path already refuses.
+        # Computed beside the one bullet that renders them: fix round 5 had a
+        # second reader (its suppression named the same three names at the
+        # client) and fix round 6 removed it.
+        #
         # The insertion-point table is NOT cross-referenced here: it is
         # conditional on a blob store this function does not have, and a
         # bullet naming a section that may not have rendered is a worse
         # disclosure than one that stands alone.
+        names = [f"`{h}`" for h in sorted(probe.CREDENTIAL_HEADERS)]
+        credential_headers = " or ".join(
+            [", ".join(names[:-1]), names[-1]] if len(names) > 1 else names)
         out.append("- **Cookie and credential-header insertion points were "
                    "not probed.** The extension refuses any request carrying "
                    f"an {credential_headers} header it did not inject "
@@ -1480,28 +1475,32 @@ def _limits(conn, engagement_id) -> list[str]:
         # checks it covers is what keeps it a disclosure rather than a
         # blanket that has quietly stopped being true.
         #
-        # AND THE ACTIVE HALF OF THIS SENTENCE STOPPED BEING TRUE IN FIX
-        # ROUND 5. It read "the active checks re-issue requests and are not
-        # limited this way", which was a claim about EVERY active finding;
-        # `hx.scan._unauthenticated_view` now means it holds only where the
-        # captured request carried no credential header. Left unqualified it
-        # would be this section contradicting the unauthenticated-probe
-        # bullets above it, in the exact direction a client would act on --
-        # "the active findings will retire, so re-run the scan" -- for a
-        # corpus that will now rarely retire anything on a real engagement.
-        out.append("- **A fixed issue may not be shown as fixed by "
-                   "re-browsing.** The passive checks in this build "
-                   f"({_names(passive)}) read this engagement's whole "
+        # AND THE ACTIVE HALF OF THIS SENTENCE HAS NOW BEEN WRONG TWICE. It
+        # read "the active checks re-issue requests and are not limited this
+        # way" -- a claim about EVERY active finding -- until fix round 5
+        # qualified it by the credential header the capture carried, and fix
+        # round 6 removed retirement from the active corpus altogether. Both
+        # earlier versions pointed the client the same way ("the active
+        # findings will retire, so re-run the scan"), which is the direction
+        # a deliverable must not lean when it is false. The two halves now
+        # reach the same conclusion by different routes, and the sentence
+        # says which route each takes rather than merging them: a passive
+        # finding cannot retire because the offending exchange stays on file,
+        # an active one because hx will not close what an unauthenticated
+        # probe saw.
+        out.append("- **No finding in this report can be shown as fixed by "
+                   "re-running this assessment.** The passive checks in this "
+                   f"build ({_names(passive)}) read this engagement's whole "
                    "captured history for a surface, not only the newest "
                    "traffic, so one recorded response keeps a finding of "
                    "theirs live for the life of the engagement however much "
                    "clean traffic follows it; a retest of one must be run as "
                    "a NEW engagement against the fixed application. The "
-                   f"active checks ({_names(active)}) re-issue requests, so a "
-                   "rescan can show one of theirs as fixed — but only on a "
-                   "surface whose captured request carried no credential "
-                   "header, for the reason the unauthenticated-probe bullet "
-                   "above gives.")
+                   f"active checks ({_names(active)}) do re-issue requests, "
+                   "but hx never marks one of their findings as no longer "
+                   "observed, for the reason the bullet above gives. Either "
+                   "way, a fix is confirmed by re-testing the application "
+                   "and not by re-reading this document.")
 
     dropped = conn.execute(
         "SELECT COALESCE(SUM(dropped_total), 0) FROM run WHERE engagement_id=?",

@@ -88,17 +88,19 @@ says whether it looked at this parameter at all. So this check answers
 `clean` only on a NON-REDIRECTING 2xx, which is the one response that is a
 genuine test: the endpoint took the marker and chose not to redirect to it.
 
-CONSIDERED, NAMED HONESTLY -- AND THE VERDICT SAYS SO TOO. `_ISSUE_TYPE` is
-only added to `considered` when this check actually issued at least one probe
-on this surface, so `hx.scan._mark_unobserved` cannot retire a finding on the
-strength of a question this check never asked. N3 of the scoped re-review
-added the other half: a surface with query parameters but none of them
-canary-shaped used to answer `clean` with an empty `considered` and
-`requests_sent = 0`. Nothing retired -- but `report._coverage` groups on
-(check_id, verdict) and counts SURFACES, so a real engagement rendered most
-of the corpus as `open-redirect | clean` for a check that probed a handful.
-That surface answers `inconclusive` now, with `_NOTHING_PROBEABLE` naming the
-filter that declined it.
+EXAMINED, NAMED HONESTLY -- AND THE VERDICT SAYS SO TOO. `_ISSUE_TYPE` is
+passed to `_probe_util.verdict` as `examined` only when this check actually
+issued at least one probe on this surface. Until fix round 6 that was the
+verdict's `considered` and the reason mattered most for retirement -- a
+finding could not be closed on the strength of a question this check never
+asked. An active check retires nothing now, and the branch stays because the
+coverage half was always the other reason for it: N3 of the scoped re-review,
+where a surface with query parameters but none of them canary-shaped answered
+`clean` with `requests_sent = 0`. Nothing was retired even then -- but
+`report._coverage` groups on (check_id, verdict) and counts SURFACES, so a
+real engagement rendered most of the corpus as `open-redirect | clean` for a
+check that probed a handful. That surface answers `inconclusive` now, with
+`_NOTHING_PROBEABLE` naming the filter that declined it.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
 same reason `cors.py` gives: nothing in this build records a probe's own
@@ -146,9 +148,9 @@ _REDIRECT_NAME_HINTS = (
 # its `Location` to mean anything at all.
 _REDIRECT_STATUSES = range(300, 400)
 
-# Minted once, so a candidate's `issue_type_id` and the verdict's
-# `considered` cannot spell the set two different ways (see `cors.py`'s
-# identical reasoning for `_CONSIDERED`).
+# Minted once, so a candidate's `issue_type_id` and what `_probe_util.verdict`
+# is told this check examined cannot spell the set two different ways (see
+# `cors.py`'s identical reasoning for `_EXAMINED`).
 _ISSUE_TYPE = "open-redirect"
 
 
@@ -288,10 +290,10 @@ class OpenRedirect:
             # name is `q` or `page` rather than redirect-shaped. Both are
             # "this check did not look here", and a `clean` row for it claimed
             # coverage in `report._coverage` (which counts surfaces per
-            # check and verdict) that no request backs. `considered` was
-            # already empty, so nothing was ever retired on this path; the
-            # coverage sentence is what was false.
+            # check and verdict) that no request backs. Nothing was ever
+            # retired on this path -- what it passed as `considered` was
+            # already empty -- so the coverage sentence is what was false.
             return _probe_util.verdict(candidates, gaps,
                                        unprobed=_NOTHING_PROBEABLE)
         return _probe_util.verdict(candidates, gaps,
-                                   considered=(_ISSUE_TYPE,))
+                                   examined=(_ISSUE_TYPE,))

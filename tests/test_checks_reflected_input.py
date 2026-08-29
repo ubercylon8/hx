@@ -141,16 +141,15 @@ def test_a_canary_that_does_not_come_back_is_clean():
     assert v.state == "clean"
 
 
-def test_a_clean_answer_names_every_insertion_point_it_probed():
-    """Otherwise a fixed parameter can never be retired."""
+def test_a_clean_answer_probes_every_insertion_point_it_was_handed():
+    """A `clean` row claims this surface was tested, and `report._coverage`
+    counts it as one -- so every point handed over has to have been sent to
+    before the check may say it."""
     sender = _FakeSender(mode="off")
     v = ri.ReflectedInput().probes(
         ctx, surface, (_QUERY_A, _HEADER, _COOKIE), sender)
     assert v.state == "clean"
     assert sender.sent == 3, "every declared insertion point was examined"
-    assert v.considered == (ri._ISSUE_TYPE,), (
-        "the surface WAS probed, so the issue type must be considered or a "
-        "later fix can never be seen as retiring anything")
 
 
 def test_each_insertion_point_gets_its_own_canary():
@@ -307,9 +306,6 @@ def test_a_refusal_ends_one_point_and_never_the_whole_check():
         f"{sender.calls}")
     assert v.state == "finding"
     assert [c.insertion for c in v.candidates] == [_QUERY_B]
-    assert v.considered == (), (
-        "one point was refused, so this surface's issue type was NOT fully "
-        "examined and `_mark_unobserved` must retire nothing from it")
 
 
 def test_a_refusal_with_nothing_found_is_inconclusive_never_clean():
@@ -327,9 +323,9 @@ def test_a_refused_escalation_still_files_the_finding_it_already_proved():
     """The refusal can land on the SECOND request just as easily as the
     first, and by then the finding is already proved: the baseline canary
     came back, which is the whole of what this check claims. What the refusal
-    costs is the CONTEXT answer -- so the title stays the plain one, the
+    costs is the CONTEXT answer -- so the title stays the plain one and the
     description says the escalation was refused rather than that the
-    metacharacters did not survive, and `considered` is still withheld."""
+    metacharacters did not survive."""
     sender = _RefusesThenReflects(refuse_on=2)
     v = ri.ReflectedInput().probes(ctx, surface, (_QUERY_A,), sender)
 
@@ -340,7 +336,6 @@ def test_a_refused_escalation_still_files_the_finding_it_already_proved():
     assert c.severity == "Low"
     assert "refused before it was sent" in c.description
     assert "did not come back intact" not in c.description
-    assert v.considered == ()
 
 
 # ---- insertion kinds --------------------------------------------------
@@ -358,7 +353,6 @@ def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
     v = ri.ReflectedInput().probes(ctx, surface, (body_form,), sender)
     assert sender.sent == 0
     assert v.state == "inconclusive"
-    assert v.considered == ()
     # DERIVED, not typed: the sentence names the kinds off the declaration
     # itself, so a check that learns a fifth cannot keep claiming four.
     for kind in ri.ReflectedInput.insertion_kinds:
@@ -435,7 +429,6 @@ def test_a_placeholder_the_address_cannot_carry_is_a_gap_never_a_clean():
                                    sender)
     assert sender.sent == 0
     assert v.state == "inconclusive"
-    assert v.considered == ()
 
 
 def test_two_reflecting_insertion_points_are_two_findings():
@@ -461,15 +454,16 @@ def test_the_check_is_wired_for_the_registry():
         {"query", "path_segment", "header", "cookie"})
 
 
-def test_a_findings_issue_type_is_one_it_considered():
+def test_a_findings_issue_type_is_the_one_it_examines_for():
     """The drift-catching test this whole suite of checks carries: a
-    candidate whose issue type is not in `considered` can never be
-    retired."""
+    candidate minting an issue type the check does not name as `examined`
+    is two spellings of one question, and a coverage row would claim to have
+    looked for something no finding is ever filed under."""
     v = ri.ReflectedInput().probes(ctx, surface, (_QUERY_A,),
                                    _FakeSender(mode="raw"))
     assert v.state == "finding"
     for candidate in v.candidates:
-        assert candidate.issue_type_id in v.considered
+        assert candidate.issue_type_id == ri._ISSUE_TYPE
 
 
 def test_the_finding_cites_the_surfaces_exemplar_exchange():
@@ -499,12 +493,11 @@ def test_the_marker_never_contains_meta_characters_before_escalation():
 @pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
 def test_a_status_that_refused_is_inconclusive_not_clean(status):
     """A WAF block page reflects nothing, and so does a target that encodes
-    its output properly. Only the second may retire a finding."""
+    its output properly. Only the second is a tested surface."""
     v = ri.ReflectedInput().probes(
         ctx, surface, (_QUERY_A,), _FakeSender(mode="off", status=status))
     assert v.state == "inconclusive"
     assert str(status) in v.reason
-    assert v.considered == ()
 
 
 def test_a_marker_that_came_back_on_a_refusing_status_is_still_a_finding():
@@ -519,4 +512,3 @@ def test_nothing_reflected_on_a_200_is_still_clean():
     v = ri.ReflectedInput().probes(
         ctx, surface, (_QUERY_A,), _FakeSender(mode="off", status=200))
     assert v.state == "clean"
-    assert v.considered == (ri._ISSUE_TYPE,)

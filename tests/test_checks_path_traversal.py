@@ -142,9 +142,6 @@ def test_a_response_with_no_signature_anywhere_is_clean():
     v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
                                      _sender_returning(200, _CLEAN_BODY))
     assert v.state == "clean"
-    assert v.considered == (ptrav._ISSUE_TYPE,), (
-        "the point WAS probed, so the issue type must be considered or a "
-        "later fix can never be seen as retiring anything")
 
 
 def test_a_parameter_that_does_not_look_like_a_file_is_not_probed():
@@ -157,10 +154,6 @@ def test_a_parameter_that_does_not_look_like_a_file_is_not_probed():
                                      sender)
     assert sender.sent == 0
     assert v.state == "inconclusive"
-    assert v.considered == (), (
-        "nothing was actually examined on this surface, so nothing may be "
-        "considered -- naming the issue type here would let a real, "
-        "never-tested finding be silently retired")
     assert "file" in v.reason
 
 
@@ -244,7 +237,6 @@ def test_a_refusal_ends_one_point_and_never_the_whole_check():
     assert sender.sent == 2, "the refusal took the second point down with it"
     assert v.state == "finding"
     assert v.candidates[0].insertion == _SECOND_FILE_PARAM
-    assert v.considered == ()
 
 
 def test_a_refusal_with_nothing_found_is_inconclusive_never_clean():
@@ -306,7 +298,6 @@ def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
                                      sender)
     assert sender.sent == 0
     assert v.state == "inconclusive"
-    assert v.considered == ()
 
 
 def test_a_finding_names_the_insertion_it_came_from():
@@ -321,12 +312,12 @@ def test_the_finding_cites_the_surfaces_exemplar_exchange():
     assert v.candidates[0].exchange_ids == ("x-1",)
 
 
-def test_a_findings_issue_type_is_one_it_considered():
+def test_a_findings_issue_type_is_the_one_it_examines_for():
     v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,),
                                      _sender_returning(200, _PASSWD_BODY))
     assert v.state == "finding"
     for candidate in v.candidates:
-        assert candidate.issue_type_id in v.considered
+        assert candidate.issue_type_id == ptrav._ISSUE_TYPE
 
 
 def test_two_file_shaped_parameters_that_both_disclose_are_two_findings():
@@ -370,7 +361,6 @@ def test_a_status_that_refused_with_no_signature_is_inconclusive(status):
                                      _sender_returning(status, _CLEAN_BODY))
     assert v.state == "inconclusive"
     assert str(status) in v.reason
-    assert v.considered == ()
 
 
 def test_file_content_on_a_refusing_status_is_still_a_finding():

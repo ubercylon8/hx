@@ -67,14 +67,12 @@ all ones the send path refuses with `no_probeable_insertion_point`, before
 this check is ever reached -- see the `usable`/`wanted` guard in `scan.py`),
 so in practice every call this check receives is handed at least one point it
 could send to. `probed_any` is
-still tracked explicitly, defensively, rather than assumed: a `considered`
-that named the issue type on a call that genuinely probed nothing would let
-`hx.scan._mark_unobserved` retire a finding on the strength of a question
-this check never got to ask, which is the exact mistake the module doc on
-`base.Verdict.considered` exists to prevent. Since N3 of the scoped
-re-review, `probed_any` being false also decides the VERDICT and not only
-`considered`: it answers `inconclusive` with `_nothing_probeable()`, because
-`clean` with nothing considered told `report._coverage` this check examined
+still tracked explicitly, defensively, rather than assumed: naming the issue
+type as `examined` on a call that genuinely probed nothing would claim
+coverage for a question this check never got to ask. Since N3 of the scoped
+re-review, `probed_any` being false decides the VERDICT and not only what is
+claimed: it answers `inconclusive` with `_nothing_probeable()`, because
+`clean` with nothing examined told `report._coverage` this check examined
 a surface it never sent a request to. `_probe_util.verdict` refuses that
 combination outright now, so the honest answer is structural rather than
 remembered here. A POINT THAT REFLECTED NOTHING
@@ -138,9 +136,10 @@ from hx.checks import base
 from hx.checks.active import _probe_util
 from hx.checks.passive import _http
 
-# Minted once so a candidate's `issue_type_id` and the verdict's `considered`
-# cannot spell it two different ways (the same reasoning `cors.py` and
-# `open_redirect.py` give their own `_ISSUE_TYPE`/`_CONSIDERED`). One issue
+# Minted once so a candidate's `issue_type_id` and what `_probe_util.verdict`
+# is told this check examined cannot spell it two different ways (the same
+# reasoning `cors.py` and `open_redirect.py` give their own
+# `_EXAMINED`/`_ISSUE_TYPE`). One issue
 # type, not one per insertion kind: this check asks the same question --
 # "did this come back?" -- everywhere it probes.
 _ISSUE_TYPE = "reflected-input"
@@ -325,8 +324,8 @@ class ReflectedInput:
             # costs the CONTEXT answer and nothing else, so `unescaped` goes
             # to `None` -- neither "survived" nor "did not survive" -- and
             # `_describe` says which of the three happened. The gap it
-            # records still withholds `considered` (see `_probe_util.
-            # verdict`), so the finding is reported and nothing is retired.
+            # records reaches `_probe_util.verdict`, where a candidate wins
+            # over a gap, so the finding is reported rather than swallowed.
             esc_resp = _probe_util.send_or_gap(sender, esc_path, insertion,
                                                gaps, headers=esc_headers)
             unescaped = (None if esc_resp is None
@@ -365,13 +364,13 @@ class ReflectedInput:
             # covers the production case; what reaches here is a point of a
             # kind this check does not probe, which `scan.run` filters out
             # and this check does not assume it did. `_probe_util.verdict`
-            # refuses `clean` with an empty `considered` outright, so this
-            # is where the honest sentence gets written rather than a place
-            # a caller may forget.
+            # refuses `clean` with nothing examined outright, so this is
+            # where the honest sentence gets written rather than a place a
+            # caller may forget.
             return _probe_util.verdict(candidates, gaps,
                                        unprobed=self._nothing_probeable())
         return _probe_util.verdict(candidates, gaps,
-                                   considered=(_ISSUE_TYPE,))
+                                   examined=(_ISSUE_TYPE,))
 
     def _nothing_probeable(self) -> str:
         """What a coverage row says for a surface nothing was sent to.

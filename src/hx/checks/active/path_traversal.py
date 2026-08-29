@@ -74,16 +74,16 @@ the single response is matched against every table entry, and the loop
 stops at the first hit -- a table with more entries never costs more
 requests, exactly the rule `sql_error.py` and this task's brief both state.
 
-CONSIDERED, THE SAME SHAPE AS EVERY ACTIVE CHECK IN THIS CORPUS. One issue
+EXAMINED, THE SAME SHAPE AS EVERY ACTIVE CHECK IN THIS CORPUS. One issue
 type -- the finding is always "this input let a file outside the intended
 directory be read", regardless of which line of `/etc/passwd` proved it --
-named in `considered` only when at least one file-shaped parameter was
-actually probed, never on a surface with no insertion point this check's
-name filter accepted. Such a surface answers `inconclusive` and not `clean`
-(N3 of the scoped re-review): an empty `considered` retires nothing, but a
-`clean` row still tells `report._coverage` this check examined a surface it
-never sent a request to. `_NOTHING_PROBEABLE` is the sentence it says
-instead.
+passed to `_probe_util.verdict` as `examined` only when at least one
+file-shaped parameter was actually probed, never on a surface with no
+insertion point this check's name filter accepted. Such a surface answers
+`inconclusive` and not `clean` (N3 of the scoped re-review): nothing an
+active check says retires anything since fix round 6, but a `clean` row
+still tells `report._coverage` this check examined a surface it never sent
+a request to. `_NOTHING_PROBEABLE` is the sentence it says instead.
 
 EACH CANDIDATE CARRIES ITS `Insertion`, for the same reason
 `open_redirect.py`, `reflected_input.py` and `sql_error.py` all give:
@@ -251,8 +251,8 @@ class PathTraversal:
     # segment to `{id}`, `{uuid}`, `{hex}` or `{slug}`, and not one of those
     # contains a `_FILE_NAME_HINTS` substring, so in production this check
     # tests query parameters and nothing else. Pre-existing and harmless in
-    # direction (a false negative: `considered` stays empty for a point that
-    # was never probed, so nothing retires), and a report that implied
+    # direction (a false negative: this check simply never sends to such a
+    # point, so nothing is claimed about it), and a report that implied
     # otherwise would be claiming coverage it does not have --
     # `hx.report._limits` reads this attribute and discloses it. Fixing it is
     # a check-design question: either the filter widens or the normaliser
@@ -330,4 +330,4 @@ class PathTraversal:
             return _probe_util.verdict(candidates, gaps,
                                        unprobed=_NOTHING_PROBEABLE)
         return _probe_util.verdict(candidates, gaps,
-                                   considered=(_ISSUE_TYPE,))
+                                   examined=(_ISSUE_TYPE,))

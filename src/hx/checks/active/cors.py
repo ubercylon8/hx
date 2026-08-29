@@ -56,14 +56,19 @@ A RESPONSE THAT REFUSED IS NOT A RESPONSE THAT ANSWERED. A 403 from a WAF, a
 500, a 429 or a 404 carries no CORS headers for the same reason a correctly
 configured target carries none, and the two must not record the same verdict:
 `_probe_util.unanswered` names the first, and `_probe_util.verdict` turns it
-into `inconclusive` -- which carries no `considered` and therefore retires
-nothing. See `_probe_util.py`'s own docstring for why that doctrine is shared
-across all five checks rather than spelt here.
+into `inconclusive`, which is what stops a refusal being written up as a
+tested surface. See `_probe_util.py`'s own docstring for why that doctrine is
+shared across all five checks rather than spelt here.
 
-`considered` NAMES ALL THREE, on every clean or finding answer, because
-`hx.scan._mark_unobserved` retires a finding whose issue type is in
-`considered` and was not re-emitted this run: naming fewer than all three
-means a client who fixes their CORS header can never see the finding close.
+`_EXAMINED` NAMES ALL THREE, on every clean or finding answer, and since fix
+round 6 that is a statement about COVERAGE alone. It used to be the verdict's
+`considered` and therefore what `hx.scan._mark_unobserved` retired on, which
+made naming fewer than all three a client who fixes their CORS header never
+seeing the finding close; an active check retires nothing now
+(`hx.scan._retirable`), so what naming all three buys is that
+`_probe_util.verdict` will let this check say `clean` when it looked for all
+three and found none -- and that the check states its own coverage in one
+place rather than three.
 
 THE EVIDENCE THIS CHECK CITES IS THE SURFACE'S EXEMPLAR EXCHANGE, not a
 fresh one from this probe's own request/response. Nothing in this build
@@ -99,9 +104,9 @@ _REFLECTS_NO_CREDENTIALS = "cors-reflects-arbitrary-origin"
 _WILDCARD_WITH_CREDENTIALS = "cors-wildcard-with-credentials"
 
 # Every issue type this check can conclude about, minted once here so a
-# candidate's `issue_type_id` and the verdict's `considered` cannot spell
-# the set two different ways.
-_CONSIDERED = (
+# candidate's `issue_type_id` and what `_probe_util.verdict` is told this
+# check examined cannot spell the set two different ways.
+_EXAMINED = (
     _REFLECTS_WITH_CREDENTIALS,
     _REFLECTS_NO_CREDENTIALS,
     _WILDCARD_WITH_CREDENTIALS,
@@ -231,4 +236,4 @@ class Cors:
             refusal = _probe_util.unanswered(resp)
             if refusal is not None:
                 gaps.append(refusal)
-        return _probe_util.verdict(candidates, gaps, considered=_CONSIDERED)
+        return _probe_util.verdict(candidates, gaps, examined=_EXAMINED)

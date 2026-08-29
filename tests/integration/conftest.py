@@ -376,8 +376,11 @@ class Rig:
         a browser, session and all, while everything hx itself issues is
         refused a credential header it did not inject. Traffic captured
         through this method is therefore the only way an AUTHENTICATED surface
-        reaches the store, which is what `hx.scan._unauthenticated_view` reads
-        and what `test_active_checks.py`'s section 5 is built on.
+        -- and so the only way a `cookie` insertion point -- reaches the
+        store, which is what `test_active_checks.py`'s section 5 is built on.
+        (Fix round 5 read the same fact at the runner, to decide whether a row
+        could retire; fix round 6 removed that rule, and the derivation and
+        the send path's refusal of it are what is left.)
         """
         dest = to or self.target
         return browse_through(port or self.proxy_port, method,

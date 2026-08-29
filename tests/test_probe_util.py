@@ -218,19 +218,15 @@ def test_a_response_with_no_status_at_all_is_a_gap():
 # that the passive half has no use for -- see the N3 section at the end.
 
 
-def test_nothing_found_and_nothing_refused_is_clean_and_considers():
-    v = _probe_util.verdict([], [], considered=("probed",))
+def test_nothing_found_and_nothing_refused_is_clean():
+    v = _probe_util.verdict([], [], examined=("probed",))
     assert v.state == "clean"
-    assert v.considered == ("probed",)
 
 
-def test_nothing_found_with_a_gap_is_inconclusive_and_considers_nothing():
-    v = _probe_util.verdict([], ["q: status 403"], considered=("probed",))
+def test_nothing_found_with_a_gap_is_inconclusive():
+    v = _probe_util.verdict([], ["q: status 403"], examined=("probed",))
     assert v.state == "inconclusive"
     assert "403" in v.reason
-    assert v.considered == (), (
-        "`Verdict.inconclusive` takes no `considered` at all, which is the "
-        "property that stops a refused probe retiring a live finding")
 
 
 def test_a_candidate_wins_over_a_gap():
@@ -238,20 +234,31 @@ def test_a_candidate_wins_over_a_gap():
     500, so a doctrine that downgraded a finding to `inconclusive` because
     of the status it came back on would delete `sql_error`'s whole point."""
     v = _probe_util.verdict([_candidate()], ["q: status 500"],
-                            considered=("probed",))
+                            examined=("probed",))
     assert v.state == "finding"
     assert len(v.candidates) == 1
 
 
-def test_a_gap_withholds_considered_from_a_finding_too():
-    """The active half of F5. `considered` is what retires, and a surface
-    where one point answered and another was refused has not examined the
-    refused one -- so the finding is reported and its neighbours are not
-    closed on the strength of a probe that never got an answer."""
-    v = _probe_util.verdict([_candidate()], ["q: status 403"],
-                            considered=("probed",))
-    assert v.state == "finding"
-    assert v.considered == ()
+def test_no_verdict_this_funnel_builds_carries_considered():
+    """FIX ROUND 6, AND THIS IS THE HALF THAT LIVES IN THE CHECKS. An active
+    check retires nothing, so `examined` feeds the `clean` guard below and
+    stops there -- it deliberately never reaches `Verdict.considered`, which
+    `hx.scan._retirable` would refuse from a probing check anyway. Both ends
+    are asserted so neither can quietly move on its own: this pins the
+    check's end, `tests/test_scan_probes.py::test_an_active_check_that_
+    populates_considered_is_an_error_row` pins the runner's.
+
+    Every branch, because `clean` is not the only one that used to carry it:
+    a finding used to carry `considered` too (and lose it to a gap), which
+    is what let one check's finding on a surface retire that check's OTHER
+    issue types there."""
+    for v in (_probe_util.verdict([], [], examined=("probed",)),
+              _probe_util.verdict([_candidate()], [], examined=("probed",)),
+              _probe_util.verdict([_candidate()], ["q: status 403"],
+                                  examined=("probed",)),
+              _probe_util.verdict([], ["q: status 403"], examined=("probed",)),
+              _probe_util.verdict([], [], unprobed="nothing here")):
+        assert v.considered == (), v
 
 
 def test_the_reason_shows_the_gaps_the_way_a_coverage_row_does():
@@ -268,9 +275,9 @@ def test_the_reason_shows_the_gaps_the_way_a_coverage_row_does():
 #
 # N3 of the scoped re-review. `open_redirect` and `path_traversal` each apply
 # a name filter of their own before a point earns a probe, and a surface on
-# which that filter matched nothing reached `verdict([], [], considered=())`
-# -> `clean` with `requests_sent = 0`. Nothing was retired (`considered` was
-# empty, which is why this is not the same severity as N1), but
+# which that filter matched nothing reached `verdict([], [])` -> `clean` with
+# `requests_sent = 0`. Nothing was retired even then (it named nothing it had
+# examined, which is why this is not the same severity as N1), but
 # `report._coverage` groups on (check_id, verdict) and counts SURFACES, so a
 # real engagement rendered `hx.active.open-redirect | clean | <most of the
 # corpus>` for a check that probed a handful. `clean` asserts "tested and
@@ -281,7 +288,6 @@ def test_a_check_that_probed_nothing_says_so_and_is_not_clean():
     v = _probe_util.verdict([], [], unprobed="no point here was probeable")
     assert v.state == "inconclusive"
     assert v.reason == "no point here was probeable"
-    assert v.considered == ()
 
 
 def test_a_gap_outranks_the_unprobed_sentence():
@@ -299,19 +305,25 @@ def test_a_candidate_outranks_the_unprobed_sentence_too():
     """Structurally unreachable -- nothing probed means nothing found -- and
     answered in the same order as every other branch rather than left to be
     reasoned about."""
-    v = _probe_util.verdict([_candidate()], [], considered=("probed",),
+    v = _probe_util.verdict([_candidate()], [], examined=("probed",),
                             unprobed="no point here was probeable")
     assert v.state == "finding"
 
 
-def test_clean_with_nothing_considered_is_refused_outright():
+def test_clean_with_nothing_examined_is_refused_outright():
     """THE STRUCTURAL HALF, and the reason this is not four `if` statements
-    in four checks. `clean` with an empty `considered` is exactly the row
-    N3 is about: a check saying "tested, nothing found" while naming no
-    issue type it tested for. There is no caller for which that is the
-    right answer, so the funnel refuses it rather than each caller
-    remembering not to ask. `hx.scan.run` turns the raise into an `error`
-    row, which retires nothing -- the safe direction."""
+    in four checks. `clean` with nothing examined is exactly the row N3 is
+    about: a check saying "tested, nothing found" while naming no issue type
+    it tested for. There is no caller for which that is the right answer, so
+    the funnel refuses it rather than each caller remembering not to ask.
+    `hx.scan.run` turns the raise into an `error` row, which is loud and
+    retires nothing -- the safe direction.
+
+    STILL LOAD-BEARING AFTER FIX ROUND 6, and more narrowly so: this used to
+    guard the coverage row AND the retirement a populated `considered`
+    licensed. The retirement is gone for every active check, and the
+    coverage row is reason enough on its own -- S12 is about exactly that
+    distinction."""
     with pytest.raises(ValueError) as exc:
         _probe_util.verdict([], [])
-    assert "considered" in str(exc.value)
+    assert "examined" in str(exc.value)

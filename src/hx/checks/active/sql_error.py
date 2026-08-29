@@ -71,17 +71,18 @@ target, almost any parameter -- an id, a filter, a sort key, a search term
 one probe, the same reasoning `reflected_input.py` gives for probing every
 kind it declares.
 
-CONSIDERED, THE SAME SHAPE `reflected_input.py` SETTLED. One issue type
+EXAMINED, THE SAME SHAPE `reflected_input.py` SETTLED. One issue type
 covers every vendor this check can name -- the finding is always "a
 database error was disclosed", regardless of which driver's wording proved
-it -- so `hx.scan._mark_unobserved` retires on `(surface_id, check_id,
-issue_type_id)` and never on which insertion point or which vendor. As with
-both predecessors, `considered` names `_ISSUE_TYPE` only when at least one
-point was actually probed, never on a surface with none of the declared
-kinds -- and, since N3 of the scoped re-review, such a call answers
-`inconclusive` with `_nothing_probeable()` rather than `clean`: an empty
-`considered` retires nothing, but a `clean` row still claimed coverage in
-`report._coverage` of a surface this check never sent a request to.
+it -- so a second vendor's wording on the same parameter is the same
+finding, and `records.dedupe_key` merges the two rather than filing two. As
+with both predecessors, `_ISSUE_TYPE` is passed to `_probe_util.verdict` as
+`examined` only when at least one point was actually probed, never on a
+surface with none of the declared kinds -- and, since N3 of the scoped
+re-review, such a call answers `inconclusive` with `_nothing_probeable()`
+rather than `clean`: nothing an active check says retires anything since fix
+round 6, but a `clean` row still claimed coverage in `report._coverage` of a
+surface this check never sent a request to.
 
 EACH CANDIDATE CARRIES ITS `Insertion`, for the reason `open_redirect.py`
 and `reflected_input.py` both give: `records.dedupe_key` folds
@@ -306,7 +307,7 @@ class SqlError:
             return _probe_util.verdict(candidates, gaps,
                                        unprobed=self._nothing_probeable())
         return _probe_util.verdict(candidates, gaps,
-                                   considered=(_ISSUE_TYPE,))
+                                   examined=(_ISSUE_TYPE,))
 
     def _nothing_probeable(self) -> str:
         """What a coverage row says for a surface nothing was sent to,

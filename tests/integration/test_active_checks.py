@@ -45,16 +45,24 @@ answered `clean` with `considered` populated -- retiring live findings from a
 would have caught it is against the TARGET's own request log, which is the one
 witness this side cannot fake: what arrived, and that it carried no `{`.
 
-WHAT THE PASSIVE CORPUS CANNOT DELIVER, and why the second test below is the
+WHAT ONLY A TARGET THAT CHANGES CAN SHOW, and why the second test below is the
 point of the whole task: `test_scan_and_report.py` proves a finding is re-found
-by a second scan, and its own claim 3 measures that a finding CANNOT be retired
+by a second scan, and its own claim 3 measures that a finding cannot be retired
 by taking the target away -- the exchange that proves it is still on file, so
-every passive check goes on answering `finding` for ever. Only a target that
-CHANGES can prove the other half, and only an active check can see that change:
-`target.fix(check_id)` removes exactly one flaw, the check that owns it answers
-`clean` while still naming what it considered, and `hx.scan._mark_unobserved`
-closes that finding and no other. That is `Verdict.considered` working end to
-end, and it exists nowhere else in this suite.
+every passive check goes on answering `finding` for ever. Only an active check
+can see a target actually change, and `target.fix(check_id)` is how one is made
+to: every route is repaired, every check gets a complete answer and says
+`clean` off a probe that really went, and NOT ONE finding closes.
+
+That test asserted the opposite until fix round 6. It fixed CORS alone and
+required that finding to retire while the four beside it stayed live, which was
+`Verdict.considered` working end to end. Every probe this build sends is
+unauthenticated, so an active `clean` is a statement about the logged-out view
+of the application, and an application answering a logged-out request with a
+200 login PAGE is indistinguishable from the genuine answers that test now
+produces. `hx.scan._retirable` refuses the whole class rather than trying to
+tell them apart; retirement is a passive-corpus property until probes can
+authenticate.
 
 AND TWO SURFACES NO CHECK MAY CLOSE, WHICH ARE THE LAST TWO TESTS. The same
 blind spot as the templated path, twice more. Every route above answers 2xx
@@ -73,16 +81,15 @@ AND ONE SURFACE THE BROWSER WAS LOGGED IN TO, WHICH IS THE LAST TEST AND THE
 FOURTH INSTANCE OF THAT SAME BLIND SPOT. Every surface above was browsed
 anonymously, so no captured surface in this file had ever carried a `cookie`
 insertion point: F2's fix (a point the send path refuses is dropped rather
-than probed), the `no_probeable_insertion_point` skip, and now the rule that
-an unauthenticated probe of an AUTHENTICATED surface retires nothing were all
-covered by fake bridges and by nothing end to end. `Rig.browse` could always
-carry headers -- `test_proxy_capture.py` sends a session cookie through it to
-prove the redaction -- but no active check had ever been run against what that
-produces. The last test logs in through `/login`, browses the reflecting route
-with the cookie that route issues, fixes the flaw, and measures that the
-finding does NOT retire; browsing carries a session because it goes through
-the proxy listener's operator branch, which is scope-only, while every probe
-hx issues is refused a credential header it did not inject. That asymmetry is
+than probed) and the `no_probeable_insertion_point` skip that names WHICH
+point were covered by fake bridges and by nothing end to end. `Rig.browse`
+could always carry headers -- `test_proxy_capture.py` sends a session cookie
+through it to prove the redaction -- but no active check had ever been run
+against what that produces. The last test logs in through `/login`, browses
+the two routes with the cookie `/login` issues, and measures the skip and its
+per-point sentence; browsing carries a session because it goes through the
+proxy listener's operator branch, which is scope-only, while every probe hx
+issues is refused a credential header it did not inject. That asymmetry is
 S4's operator/agent split, and `Rig.browse`'s own docstring carries it.
 """
 from __future__ import annotations
@@ -369,11 +376,11 @@ def test_the_report_names_every_active_finding_and_every_check_that_ran(rig):
 
 
 # ---------------------------------------------------------------------------
-# 2. The retest story: stable across a scan that changes nothing, and one
-#    finding -- exactly one -- retired by a fix.
+# 2. The retest story: stable across a scan that changes nothing, and not one
+#    finding closed by a fix that is real on every route.
 # ---------------------------------------------------------------------------
 
-def test_a_second_scan_is_stable_and_a_fixed_endpoint_retires_only_its_own_finding(rig):
+def test_a_second_scan_is_stable_and_a_wholly_fixed_target_retires_nothing(rig):
     """The property no unit test can reach, in three scans.
 
     SCAN 1 and SCAN 2 change nothing. Five findings must stay five findings --
@@ -384,24 +391,39 @@ def test_a_second_scan_is_stable_and_a_fixed_endpoint_retires_only_its_own_findi
     measures). Neither can be produced by hand-inserted rows, because both are
     about what a REAL second probe of a real target produces.
 
-    SCAN 3 follows `target.fix("hx.active.cors")`, which stops that one route
-    reflecting an origin it never heard of and changes nothing else. What has
-    to happen then is the whole of `Verdict.considered`: `Cors.probes` answers
-    `clean` while still naming all three issue types it examined,
-    `_mark_unobserved` finds its earlier finding's type in that set and NOT in
-    this run's findings, and writes `observed=0` -- for that finding and no
-    other. The four beside it must stay `observed=1`, and they are the
-    separating case: a retirement gate keyed on the CHECK RUN rather than on
-    the issue type, or on the surface rather than on the check, would close
-    some of them too.
+    SCAN 3 FOLLOWS FIVE REAL FIXES, and is the sharpest available statement of
+    what fix round 6 removed. Every vulnerable route is repaired -- each one
+    goes on answering 200 and simply stops being vulnerable, so every check
+    gets an ordinary, complete, application-composed answer and every one of
+    them says `clean` off a probe that really went. Not one finding may close.
 
-    WOULD THIS FAIL IF THE CLAIM WERE FALSE? A `considered` that named nothing
-    would leave the CORS finding `observed=1` for ever -- a client told a
-    vulnerability they fixed is still open. A `considered` that named too much,
-    or a `_mark_unobserved` that ignored `issue_type_id`, would retire the
-    other four as well -- a client told four live vulnerabilities are fixed.
-    The two assertions below separate those two failures from each other and
-    from the intended behaviour.
+    THIS TEST ASSERTED THE OPPOSITE UNTIL FIX ROUND 6. It was
+    `..._and_a_fixed_endpoint_retires_only_its_own_finding`: it fixed CORS
+    alone and required `[1, 1, 0]` for that finding and `[1, 1, 1]` for the
+    four beside it. That was `Verdict.considered` working end to end, and it
+    is the capability the user's decision removed. Every probe this build
+    sends is unauthenticated, so a `clean` here is a statement about the
+    logged-out view of the application -- and the shape that makes that fatal,
+    an application answering a logged-out request with a 200 login PAGE, is
+    indistinguishable from the five genuine answers below.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED on this exact scan,
+    with `_probe_util.verdict` putting `examined` back on the verdict and
+    `scan._retirable` passing a probing check's `considered` through --
+    which together are the behaviour up to fix round 5:
+
+        {'hx.active.cors': [1, 1, 0], 'hx.active.open-redirect': [1, 1, 0],
+         'hx.active.path-traversal': [1, 1, 0], 'hx.active.reflected-input':
+         [1, 1, 0], 'hx.active.sql-error': [1, 1, 0]}
+
+    and the rendered page carried "**not observed the last time its check
+    tested this surface -- appears fixed; verify before closing**" five
+    times, once per finding. Every assertion below reddens on that, and the
+    last of them is the sentence a client would have read.
+
+    NOT VACUOUS: the check rows are asserted to be REAL `clean` answers with
+    requests on the wire, so what is measured is a suppressed retirement and
+    not a scan that skipped everything.
     """
     _configure(rig)
     _browse_the_vulnerable_surfaces(rig)
@@ -419,39 +441,44 @@ def test_a_second_scan_is_stable_and_a_fixed_endpoint_retires_only_its_own_findi
         assert _observations(rig, finding_id) == [1, 1], \
             f"{check_id}: {_observations(rig, finding_id)}"
 
-    # Fix ONE endpoint. Nothing else about the target, the store or the config
-    # changes.
-    rig.target.fix("hx.active.cors")
+    # Fix every endpoint. Nothing else about the target, the store or the
+    # config changes, and every route goes on answering.
+    for check_id in ACTIVE_CHECK_IDS:
+        rig.target.fix(check_id)
 
     _scan(rig)
     third = {f["check_id"]: f["id"] for f in _active_findings(rig)}
     assert third == first, \
         "the third scan invented or lost a finding row; only observations move"
 
-    cors_id = first["hx.active.cors"]
-    assert _observations(rig, cors_id) == [1, 1, 0], (
-        "the CORS finding did not retire when its route was fixed: "
-        f"{_observations(rig, cors_id)}. `Verdict.considered` is what closes "
-        "it, and a client cannot be shown a fixed issue as still open")
+    # EVERY CHECK REALLY LOOKED, AND REALLY FOUND NOTHING. Without this the
+    # assertion below is satisfied by a scan that skipped the corpus, and by
+    # every future change that stops it sending.
+    rows = {(r["path_template"], r["check_id"]): r
+            for r in _check_runs(rig, _last_scan_run(rig))}
+    for check_id, route in VULNERABLE_ROUTES.items():
+        row = rows[(route.split("?")[0], check_id)]
+        assert (row["verdict"], row["requests_sent"] > 0) == ("clean", True), (
+            f"{check_id} did not answer `clean` off a probe that went, so "
+            f"nothing below measures a suppressed retirement: {dict(row)}")
 
+    # TWO OBSERVATIONS, NOT THREE, and the missing row is the whole point.
+    # `record_observation(observed=1)` is written by `_write_finding` when a
+    # finding is RE-FOUND, and none of them was -- every route is repaired. So
+    # the only row scan 3 could have added is the `observed=0` that
+    # `_mark_unobserved` writes, and it writes none. A third entry here can
+    # therefore only be a retirement.
     for check_id, finding_id in first.items():
-        if check_id == "hx.active.cors":
-            continue
-        assert _observations(rig, finding_id) == [1, 1, 1], (
-            f"{check_id} retired too: {_observations(rig, finding_id)}. Its "
-            "route was never touched, and telling a client a live "
-            "vulnerability is fixed is the worse half of this mechanism")
+        assert _observations(rig, finding_id) == [1, 1], (
+            f"{check_id} retired: {_observations(rig, finding_id)}. Every "
+            "probe this build sends is unauthenticated, so no active check "
+            "may tell a client their issue appears fixed")
 
-    # AND THE RETIREMENT CAME FROM AN ANSWER, NOT FROM ABSENCE. `observed=0` is
-    # only allowed to mean "the same check looked again and did not find it";
-    # a CORS row that was `skipped`, `error` or missing this run would be
-    # "nobody looked", which S12 forbids rendering as the first.
-    third_run = _last_scan_run(rig)
-    cors_rows = [r for r in _check_runs(rig, third_run)
-                 if r["check_id"] == "hx.active.cors"
-                 and r["path_template"] == VULNERABLE_ROUTES["hx.active.cors"]]
-    assert [(r["verdict"], r["requests_sent"]) for r in cors_rows] == [("clean", 1)], \
-        cors_rows
+    # WHERE THE CLIENT WOULD HAVE READ IT, and what the page says instead.
+    out = report.render(rig.eng.db, engagement_id=rig.eng.id,
+                        config=rig.eng.config, blobs=rig.eng.blobs)
+    assert "appears fixed" not in out, out
+    assert "An active finding is never automatically marked as fixed" in out
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +567,7 @@ def test_a_templated_surface_is_probed_at_its_own_concrete_path(rig):
 # 4. A response that is not an answer, and a surface no probe can address.
 # ---------------------------------------------------------------------------
 
-def test_a_login_wall_is_not_a_clean_result_and_retires_nothing(rig):
+def test_a_login_wall_is_not_a_clean_result(rig):
     """N1, end to end: the corpus meeting a target that stops answering.
 
     Two scans of one surface. In the first the route reflects `tab` and
@@ -553,13 +580,19 @@ def test_a_login_wall_is_not_a_clean_result_and_retires_nothing(rig):
     WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against this exact route
     with `unanswered` blind to a 3xx, which is its state before fix round 3:
     every check that sent anything -- `cors`, `reflected-input` and
-    `sql-error`, one probe each -- closed `clean` with `considered` populated,
-    `_mark_unobserved` wrote `observed = 0` for the live finding, and the
-    report rendered it as "appears fixed; verify before closing". (The other
-    two sent nothing and answered `inconclusive` either way: their own name
-    filters decline `tab`, which is N3's fix and not this one's.) Three
-    assertions below redden on that, and the last of them is the one a client
-    would have read.
+    `sql-error`, one probe each -- closed `clean`, telling `report._coverage`
+    that three surfaces had been tested by three probes that reached a login
+    page. (The other two sent nothing and answered `inconclusive` either way:
+    their own name filters decline `tab`, which is N3's fix and not this
+    one's.)
+
+    THE NAME LOST ITS SECOND HALF IN FIX ROUND 6. N1's own harm was the
+    RETIREMENT behind that 302 -- `considered` populated, `observed = 0`, and
+    "appears fixed; verify before closing" rendered for a live cross-site
+    scripting vector. No active check retires anything now, so that half is
+    the runner's whatever this doctrine does; the observations are still
+    asserted below as the consequence, and the `inconclusive` verdicts are the
+    claim.
     """
     _configure(rig)
     rig.browse("GET", LOGIN_WALL_ROUTE)
@@ -571,7 +604,7 @@ def test_a_login_wall_is_not_a_clean_result_and_retires_nothing(rig):
     first = {f["check_id"]: f["id"] for f in _active_findings(rig)}
     assert set(first) == {"hx.active.reflected-input"}, (
         "the route has to be FOUND before the wall goes up; a wall in front "
-        f"of a surface nothing was found on retires nothing anyway: {first}")
+        f"of a surface nothing was found on proves nothing: {first}")
     finding_id = first["hx.active.reflected-input"]
     assert _observations(rig, finding_id) == [1]
 
@@ -599,10 +632,9 @@ def test_a_login_wall_is_not_a_clean_result_and_retires_nothing(rig):
         "the rows must name the redirect they got rather than some other "
         f"gap: {[r['reason'] for r in check_runs]}")
 
-    # THE FINDING IS STILL LIVE. `observed = 0` would be retirement, and
-    # `_mark_unobserved` writes one only for an issue type this run examined
-    # -- which an `inconclusive` verdict never contributes, because
-    # `Verdict.inconclusive` does not take `considered` at all.
+    # AND THE FINDING IS STILL LIVE -- guarded twice since fix round 6, by
+    # the `inconclusive` above and by `scan._retirable`, which lets no active
+    # check retire anything whatever it answered.
     assert {f["check_id"]: f["id"] for f in _active_findings(rig)} == first
     assert _observations(rig, finding_id) == [1], (
         "the login wall retired the finding: a client is told a live "
@@ -637,8 +669,11 @@ def test_a_state_changing_surface_is_skipped_rather_than_probed_with_a_get(rig):
     surface with the skip removed: three GETs of `/api/orders` on the wire
     (a bare one, one carrying a canary in `sku`, one carrying a quote),
     `summary.by_reason` empty, `cors`, `reflected-input` and `sql-error` all
-    closing `clean` off them, and the finding above coming back `observed = 0`
-    -- retired by a request to a surface this engagement never captured.
+    closing `clean` off them, and -- in the build of the day -- the finding
+    above coming back `observed = 0`, retired by a request to a surface this
+    engagement never captured. The retirement half is now the runner's
+    (`scan._retirable`); the three `clean` rows are still this skip's, and
+    they are a coverage claim no request to this surface backs.
     """
     _configure(rig)
     rig.browse("POST", STATE_CHANGING_ROUTE, body=b'{"sku": 1}')
@@ -673,9 +708,11 @@ def test_a_state_changing_surface_is_skipped_rather_than_probed_with_a_get(rig):
         "the scan sent requests at a surface it recorded as unprobeable: "
         f"{[(h.method, h.path) for h in rig.target.hits[hits_before:]]}")
 
-    # AND THE FINDING IS UNTOUCHED. A `clean` row here would have named the
-    # issue type in `considered`, and `_mark_unobserved` retires on exactly
-    # that -- on the strength of a request to a different surface.
+    # AND THE FINDING IS UNTOUCHED. Guarded twice since fix round 6: a `clean`
+    # row here would have claimed, in Coverage, to have tested a surface no
+    # request addressed -- and before fix round 6 it would also have retired
+    # this finding on the strength of a request to a DIFFERENT surface, which
+    # is what the measurement in this docstring recorded.
     assert _observations(rig, finding_id) == [1], (
         "a GET of a surface hx never captured retired a finding filed "
         f"against the POST one: {_observations(rig, finding_id)}")
@@ -694,10 +731,11 @@ def _file_a_finding_on(rig, surface) -> str:
     Everything the dedupe key is computed from comes off the surface row, so
     the row this leaves is the one a scan of that surface would have left --
     see the caller's docstring for why a scan cannot leave it any more. The
-    issue type is read off the check rather than spelt here: retirement
-    matches on `(surface_id, check_id, issue_type_id)`, so a literal that
-    drifted from `reflected_input._ISSUE_TYPE` would make the finding
-    unretirable by construction and the assertion vacuous.
+    issue type is read off the check rather than spelt here, for the reason
+    every other dedupe-key value on this row is: a literal that drifted from
+    `reflected_input._ISSUE_TYPE` would file a row no later scan of this
+    surface could ever match, and the caller's "this finding is untouched"
+    would be satisfied by a finding nothing could touch.
     """
     check = next(c for c in registry.CHECKS
                  if c.id == "hx.active.reflected-input")
@@ -761,39 +799,33 @@ def _log_in(rig) -> str:
     raise AssertionError(f"/login set no cookie: {head!r}")
 
 
-def test_a_fix_on_an_authenticated_surface_is_not_reported_as_fixed(rig):
-    """THE SEVENTH SPELLING, end to end: a probe that carried no session may
-    report what it found and may not close anything.
+def test_a_cookie_bearing_surface_names_the_point_the_send_path_refuses(rig):
+    """AN AUTHENTICATED BROWSE, end to end, and the refusal it produces.
 
-    An operator logs in, browses `/api/profile` and `/search`, and
-    `hx.active.cors` and `hx.active.reflected-input` each find their own flaw.
-    The CORS misconfiguration is then genuinely FIXED -- the route goes on
-    answering 200 and simply stops reflecting an origin it never heard of --
-    so the second scan's `clean` comes off a real probe of a real answer. It
-    still may not retire, because hx's probe is not the request the capture
-    was of: it carries no cookie, so what it tested is the logged-out view of
-    an authenticated surface and it can say nothing about the view the
-    client's users are in.
+    An operator logs in through `/login` and browses `/api/profile` and
+    `/search` carrying the cookie that route issued. That is the only way a
+    `cookie` insertion point can reach the store at all, and until fix round 5
+    no active check had ever been run against one: F2's fix (a point the send
+    path refuses is dropped rather than probed), the
+    `no_probeable_insertion_point` skip and fix round 4's per-point refusal
+    detail were all covered by fake bridges and by nothing end to end.
 
-    THAT IS THE SHAPE NO STATUS SET CAN CATCH, closed from the other side. An
-    application answering a logged-out request with a 200 login PAGE is a
-    complete, application-composed response indistinguishable from an answer;
-    what distinguishes it is not the response at all but a fact the store
-    already holds -- the capture carried a session and the probe did not.
+    A BROWSE MAY CARRY A COOKIE THAT A PROBE MAY NOT, and that asymmetry is S4
+    working as designed -- `_log_in`'s own docstring carries the argument. The
+    consequence measured here is the one an operator reads: the check that
+    declares the `cookie` kind is skipped, and the row NAMES the point rather
+    than saying only that something was refused.
 
-    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED on these exact surfaces
-    with `scan._unauthenticated_view` returning "" and nothing else changed:
-    `hx.active.cors` closed `clean` with `considered` populated,
-    `_mark_unobserved` wrote `observed = 0` for the live finding, and the
-    rendered page carried "**not observed the last time its check tested this
-    surface -- appears fixed; verify before closing**" for a CORS
-    misconfiguration nobody has verified. Four assertions below redden on
-    that, and the last of them is the sentence a client would have read.
-
-    `/login` IS THE CONTROL, IN THE SAME SCAN. It is browsed WITHOUT a cookie,
-    so its capture and hx's probe are the same view and nothing is withheld
-    there. A suppression that fired on every row, or on none, fails one half
-    or the other.
+    WHAT THIS TEST NO LONGER MEASURES. It was
+    `test_a_fix_on_an_authenticated_surface_is_not_reported_as_fixed`, and it
+    fixed the CORS route and asserted that the finding did not retire because
+    the CAPTURE had carried a credential header. Fix round 6 removed that
+    discriminator: retirement is gone from the whole active corpus, so the
+    surviving claim is measured on plain anonymous surfaces by
+    `test_a_second_scan_is_stable_and_a_wholly_fixed_target_retires_nothing`,
+    where the fix is real on all five routes. What is left here is the cookie
+    point and the skip that names it, which nothing else in this suite
+    reaches.
     """
     _configure(rig)
     cookie = _log_in(rig)
@@ -804,17 +836,19 @@ def test_a_fix_on_an_authenticated_surface_is_not_reported_as_fixed(rig):
 
     # GUARD 1: THE COOKIE REALLY TRAVELLED, in both browses. Without this,
     # everything below is satisfied by a request that carried no session at
-    # all -- and "nothing was retired" is also what a broken scan produces.
+    # all -- and "no cookie point was derived" is also what a broken browse
+    # produces.
     served = rig.target.hits_for(CORS_SURFACE) \
         + rig.target.hits_for(REFLECTING_SURFACE)
     assert [hit.headers.get("Cookie") for hit in served] == [cookie, cookie], \
         served
 
-    # GUARD 2: AND THE STORE HOLDS THEM AS AUTHENTICATED SURFACES. The runner
-    # decides off the exemplar REQUEST, so these are the bytes the rule reads.
-    # The value is redacted before they are hashed (S7) and the NAME is what
-    # survives -- which is exactly what `credentials_carried` asks about, so
-    # this asserts the two halves together.
+    # GUARD 2: AND WHAT REACHED THE STORE IS THE HEADER NAME WITHOUT ITS
+    # VALUE. `Redactor.redactObservedRequest` replaces the value before the
+    # bytes are hashed (S7), so the blob reads `Cookie: {{observed:cookie}}` --
+    # which is the only reason an insertion point of that kind can be derived
+    # from it at all, and the reason no rule on this side can ever tell a
+    # session cookie from an analytics one.
     surfaces = {r["path_template"]: r for r in rows(
         rig, "SELECT id, path_template, exemplar_exchange_id FROM surface")}
     captured = {}
@@ -822,20 +856,14 @@ def test_a_fix_on_an_authenticated_surface_is_not_reported_as_fixed(rig):
         blob = rows(rig, "SELECT req_blob FROM exchange WHERE id=?",
                     (surfaces[template]["exemplar_exchange_id"],))[0]["req_blob"]
         captured[template] = rig.eng.blobs.get(blob)
-    assert probe.credentials_carried(captured[CORS_SURFACE]) == ("cookie",)
-    assert probe.credentials_carried(captured[REFLECTING_SURFACE]) == ("cookie",)
-    assert probe.credentials_carried(captured["/login"]) == (), (
-        "the control surface is not anonymous, so it controls for nothing")
+    assert b"Cookie:" in captured[CORS_SURFACE], captured[CORS_SURFACE]
     for template, blob in captured.items():
         assert SESSION_COOKIE_VALUE.encode() not in blob, (
             f"{template}'s blob holds the live session value; redaction runs "
             "before the digest, so this is not recoverable afterwards")
 
-    # GUARD 3: A POINT THE SEND PATH REFUSES IS NOW ON A REAL SURFACE, which
-    # is the other half of the gap this test closes. F2 of the whole-branch
-    # review and the refusal detail fix round 4 appended to its skip had never
-    # been measured end to end, because no captured surface in this suite had
-    # ever carried a cookie.
+    # GUARD 3: THE POINT IS DERIVED AND IS ONE THE SEND PATH REFUSES, asserted
+    # off the real blob rather than constructed.
     points = insertion.derive(captured[CORS_SURFACE], CORS_SURFACE)
     assert [(p.kind, probe.unprobeable(p) is not None) for p in points] == \
         [("cookie", True)], points
@@ -843,10 +871,8 @@ def test_a_fix_on_an_authenticated_surface_is_not_reported_as_fixed(rig):
     summary = _scan(rig)
     found = {f["check_id"]: f["id"] for f in _active_findings(rig)}
     assert set(found) == {"hx.active.cors", "hx.active.reflected-input"}, (
-        "both routes have to be FOUND before one of them is fixed; a fix on a "
-        f"surface nothing was found on retires nothing anyway: {found}")
-    cors_finding = found["hx.active.cors"]
-    assert _observations(rig, cors_finding) == [1]
+        "both routes have to be found, or the scan below never ran the "
+        f"checks whose rows are asserted: {found}")
 
     # THE CHECK THAT COULD NOT BE HANDED A POINT SAYS WHICH POINT, on the row
     # an operator reads. `hx.active.reflected-input` is the one check that
@@ -864,46 +890,3 @@ def test_a_fix_on_an_authenticated_surface_is_not_reported_as_fixed(rig):
     assert refused_row["verdict"] == "skipped", refused_row
     assert "a cookie is probed by sending a Cookie header" in \
         refused_row["reason"], refused_row
-
-    # THE FLAW IS GENUINELY GONE. Not a wall and not a dead target: the route
-    # answers the same 200 and stops reflecting an origin it never heard of,
-    # which is the one thing that makes `Cors.probes` say `clean`.
-    rig.target.fix("hx.active.cors")
-    hits_before = len(rig.target.hits)
-
-    _scan(rig)
-    here = {(r["path_template"], r["check_id"]): r
-            for r in _check_runs(rig, _last_scan_run(rig))
-            if r["check_id"] in ACTIVE_CHECK_IDS}
-    fixed = here[(CORS_SURFACE, "hx.active.cors")]
-    assert fixed["verdict"] == "clean", fixed
-    assert fixed["requests_sent"] > 0, (
-        "the check answered `clean` without sending anything, so what is "
-        f"measured below is not a suppressed retirement: {fixed}")
-    assert len(rig.target.hits) > hits_before, "no probe reached the target"
-
-    # THE ROW SAYS WHICH VIEW IT TESTED. `report._coverage` renders this cell,
-    # and a `clean` with an empty one reads as "tested, clean" -- which S12
-    # calls worse than no report when that is not what happened.
-    assert "UNAUTHENTICATED view" in (fixed["reason"] or ""), fixed
-    assert "['cookie']" in fixed["reason"], fixed
-
-    # THE CONTROL, in the same scan: `/login` was browsed anonymously, so its
-    # `clean` is a real clean that retires exactly as before.
-    control = here[("/login", "hx.active.cors")]
-    assert control["verdict"] == "clean", control
-    assert "UNAUTHENTICATED view" not in (control["reason"] or ""), control
-
-    # AND THE FINDING IS STILL LIVE. `observed = 0` is the retirement, and
-    # this is the assertion the whole test exists for.
-    assert _observations(rig, cors_finding) == [1], (
-        "a probe carrying no session retired a finding on an authenticated "
-        "surface: a client is told a live vulnerability appears fixed on the "
-        f"strength of the logged-out view. {_observations(rig, cors_finding)}")
-
-    # WHERE THEY WOULD HAVE READ IT, and what the page says instead.
-    out = report.render(rig.eng.db, engagement_id=rig.eng.id,
-                        config=rig.eng.config, blobs=rig.eng.blobs)
-    assert "appears fixed" not in out, out
-    assert ("On an authenticated surface, an active check reports but "
-            "retires nothing") in out

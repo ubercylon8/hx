@@ -728,24 +728,27 @@ def test_the_limits_section_says_a_fix_cannot_be_shown_by_re_browsing(
     observed.
 
     Task 8 registered `hx.active.cors`, so the corpus is now mixed and the
-    bullet's wording moved from an unqualified "cannot" to a "may not" that
-    names which checks it covers -- see `report._limits`'s `elif passive`
-    arm. The active side of that same bullet (the checks a retest through
-    THIS engagement's re-browsing DOES catch) is pinned separately below."""
+    bullet names which checks each half of it covers -- see
+    `report._limits`'s `elif passive` arm. It said "may not be shown as
+    fixed by re-browsing" between task 8 and fix round 6, while an active
+    finding could still retire; with active retirement gone the two halves
+    reach the same conclusion by different routes and the heading says so
+    outright."""
     out = report.render(**report_env_with_findings)
     assert "Limits" in out
-    assert "may not be shown as fixed by re-browsing" in out
-    # QUALIFIED SINCE FIX ROUND 5, and the absence half is why both
-    # lines are here: the active clause of this bullet used to read
-    # "are not limited this way", which is a claim about every active
-    # finding. `scan._unauthenticated_view` made it true only of a
-    # surface whose capture carried no credential header, and a client
-    # reading the unqualified sentence would re-run a scan expecting
-    # findings to retire that now cannot.
+    assert ("No finding in this report can be shown as fixed by re-running "
+            "this assessment") in out
+    # WRONG TWICE, AND THE ABSENCE HALVES ARE WHY ALL THREE LINES ARE
+    # HERE. The active clause of this bullet read "are not limited this
+    # way" (a claim about every active finding), then fix round 5's
+    # qualification by the credential header the capture carried, and
+    # fix round 6 removed active retirement outright. Both earlier
+    # wordings sent a client to re-run a scan expecting findings to
+    # retire that will not.
     assert "are not limited this way" not in out
-    assert ("re-issue requests, so a rescan can show one of theirs as "
-            "fixed — but only on a surface whose captured request "
-            "carried no credential header") in out
+    assert "carried no credential header" not in out
+    assert ("do re-issue requests, but hx never marks one of their "
+            "findings as no longer observed") in out
 
 
 def test_urls_are_redacted_on_export(report_env_with_credential_url):
@@ -1163,17 +1166,17 @@ def test_the_shipped_corpus_now_ships_an_active_check_and_the_prose_says_so(
     assert out.count("`hx.active.cors`") >= 3
     assert "active check(s) ship in this build" in out
     assert "none of them can reach a request body" in out
-    # QUALIFIED SINCE FIX ROUND 5, and the absence half is why both
-    # lines are here: the active clause of this bullet used to read
-    # "are not limited this way", which is a claim about every active
-    # finding. `scan._unauthenticated_view` made it true only of a
-    # surface whose capture carried no credential header, and a client
-    # reading the unqualified sentence would re-run a scan expecting
-    # findings to retire that now cannot.
+    # WRONG TWICE, AND THE ABSENCE HALVES ARE WHY ALL THREE LINES ARE
+    # HERE. The active clause of this bullet read "are not limited this
+    # way" (a claim about every active finding), then fix round 5's
+    # qualification by the credential header the capture carried, and
+    # fix round 6 removed active retirement outright. Both earlier
+    # wordings sent a client to re-run a scan expecting findings to
+    # retire that will not.
     assert "are not limited this way" not in out
-    assert ("re-issue requests, so a rescan can show one of theirs as "
-            "fixed — but only on a surface whose captured request "
-            "carried no credential header") in out
+    assert "carried no credential header" not in out
+    assert ("do re-issue requests, but hx never marks one of their "
+            "findings as no longer observed") in out
 
 
 def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
@@ -1199,7 +1202,7 @@ def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
     assert "Every check in this build is passive" not in out
 
     # And it must say what IS true instead, naming the check by id in each
-    # of the five places -- Insertion points, and the four Limits bullets
+    # of the six places -- Insertion points, and the five Limits bullets
     # that are conditional on an active corpus. The fourth arrived in fix
     # round A: an active finding's evidence is a captured proxy request to
     # the affected surface, never the probe that proved it, and that
@@ -1207,20 +1210,22 @@ def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
     # corpus, and this store's own `exchange.via`). The fifth is fix round 2,
     # F3: a probe carries none of the exemplar's credentials, so on an
     # authenticated target the whole active corpus tested a logged-out view.
-    assert out.count("`hx.active_safe.reflected-input`") == 5
+    # The sixth is fix round 6: no finding of an active check is ever marked
+    # as no longer observed, whatever a later scan sees.
+    assert out.count("`hx.active_safe.reflected-input`") == 6
     assert "active check(s) ship in this build" in out
     assert "none of them can reach a request body" in out
-    # QUALIFIED SINCE FIX ROUND 5, and the absence half is why both
-    # lines are here: the active clause of this bullet used to read
-    # "are not limited this way", which is a claim about every active
-    # finding. `scan._unauthenticated_view` made it true only of a
-    # surface whose capture carried no credential header, and a client
-    # reading the unqualified sentence would re-run a scan expecting
-    # findings to retire that now cannot.
+    # WRONG TWICE, AND THE ABSENCE HALVES ARE WHY ALL THREE LINES ARE
+    # HERE. The active clause of this bullet read "are not limited this
+    # way" (a claim about every active finding), then fix round 5's
+    # qualification by the credential header the capture carried, and
+    # fix round 6 removed active retirement outright. Both earlier
+    # wordings sent a client to re-run a scan expecting findings to
+    # retire that will not.
     assert "are not limited this way" not in out
-    assert ("re-issue requests, so a rescan can show one of theirs as "
-            "fixed — but only on a surface whose captured request "
-            "carried no credential header") in out
+    assert "carried no credential header" not in out
+    assert ("do re-issue requests, but hx never marks one of their "
+            "findings as no longer observed") in out
     assert "not the probe that proved it" in out
     assert "Every probe was sent unauthenticated" in out
 
@@ -2488,57 +2493,64 @@ def test_the_unauthenticated_bullets_safety_claim_is_one_the_code_honours(
                 f"status {status} is read as a conclusive negative")
 
 
-def test_the_unauthenticated_bullet_says_retirement_is_suppressed_and_it_is(
+def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honours(
         report_env_with_blobs):
-    """THE SEVENTH SPELLING, AND THE ONLY HALF OF IT A DELIVERABLE CAN CARRY.
-    F3 -- probes carry no session -- was decided as DISCLOSE, NOT FIX. The
-    bullet above disclosed it and a client still got `appears fixed` for a
-    live finding, because a disclosure does not stop a retirement: an
-    application answering a logged-out request with a 200 LOGIN PAGE is
-    indistinguishable from one that answered, at every level a status set
-    operates.
+    """THE SEVENTH SPELLING, AND WHAT A DELIVERABLE CAN HONESTLY SAY ABOUT
+    IT. F3 -- probes carry no session -- was decided as DISCLOSE, NOT FIX,
+    and a client still got `appears fixed` for a live finding, because a
+    disclosure does not stop a retirement: an application answering a
+    logged-out request with a 200 LOGIN PAGE is indistinguishable from one
+    that answered at every level a status set operates. Fix round 5
+    suppressed retirement where the CAPTURE carried a credential header; fix
+    round 6 removed it from the active corpus outright, because that
+    predicate keyed on the first sighting and could see only a header name.
 
-    So the page now claims a BEHAVIOUR of the runner rather than a property
-    of the checks, and this is the assertion that ties the two together: the
-    sentence, and then `scan._unauthenticated_view` asked about a request
-    carrying each of the names the sentence lists. Empty its answer and this
-    fails, naming the paragraph that has to go with it."""
+    The page claims a BEHAVIOUR of the runner, and this ties the two
+    together: the sentence, and then `scan._retirable` asked the two
+    questions the sentence rests on. Make it return a probing check's
+    `considered` and this fails, naming the bullet that has to go with it."""
     limits = report.render(**report_env_with_blobs)
     limits = limits[limits.index("## Limits"):]
-    assert ("On an authenticated surface, an active check reports but "
-            "retires nothing") in limits
-    assert "stays live until it is retested by hand" in limits
+    assert "An active finding is never automatically marked as fixed" in limits
+    assert ("Verify an active finding against the fixed application yourself "
+            "before closing it") in limits
 
-    for name in sorted(probe_mod.CREDENTIAL_HEADERS):
-        assert f"`{name}`" in limits, name
-        captured = f"GET / HTTP/1.1\r\nHost: a\r\n{name}: v\r\n\r\n".encode()
-        assert scan._unauthenticated_view(
-            probe_mod.credentials_carried(captured)), (
-                f"the Limits page tells a client that a capture carrying "
-                f"{name} retires nothing, and the runner retires on it")
+    considered = ("some-issue-type",)
+    assert scan._retirable(scan._PROBE_HOOK,
+                           base.Verdict.clean()) == (), (
+        "the Limits page tells a client no active finding is ever closed, "
+        "and the runner enters one for retirement")
+    with pytest.raises(ValueError):
+        scan._retirable(scan._PROBE_HOOK,
+                        base.Verdict.clean(considered=considered))
 
     # AND THE OTHER DIRECTION, which is what keeps the bullet honest rather
-    # than merely safe: an anonymous capture is NOT suppressed, so the page
-    # is not promising a blanket that would make every active retest
-    # impossible.
-    assert scan._unauthenticated_view(probe_mod.credentials_carried(
-        b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")) == ""
+    # than merely safe: the page says this of the ACTIVE checks, and the
+    # passive half of the same section says something different. A rule that
+    # emptied both would make the whole document's retest story a lie in the
+    # other direction.
+    assert scan._retirable("on_surface",
+                           base.Verdict.clean(considered=considered)) == \
+        considered
 
 
-def test_the_unauthenticated_bullet_does_not_claim_the_login_page_is_handled(
+def test_the_unauthenticated_bullet_says_the_login_page_costs_coverage_only(
         report_env_with_blobs):
-    """WHAT THE FIX DOES NOT DO. The suppression keys on the CAPTURE, so a
-    surface whose captured request carried no credential header is not
-    covered by it -- and a 200 login page there is still indistinguishable
-    from an answer. The page has to say the residual is narrowed rather than
-    closed; a sentence claiming otherwise would be this branch's ninth false
-    comment, in the one place a client reads."""
+    """WHAT IS AND IS NOT LEFT OF THE RESIDUAL. The 200 login page is still
+    indistinguishable from an answer, so the row it produces still reads
+    `clean` and still counts as a tested surface in Coverage -- that is a
+    coverage overstatement and the page must keep saying so. What it can no
+    longer do is close a finding, and the bullet says which of the two it
+    is. Fix round 5's version said the residual applied only to surfaces
+    whose capture carried no credential header; that qualification went with
+    the predicate, and asserting its ABSENCE is what stops it being left
+    behind."""
     limits = report.render(**report_env_with_blobs)
     limits = limits[limits.index("## Limits"):]
     assert "200 login PAGE cannot be told apart here from one that answered" \
         in limits
-    assert ("on those the 200 login PAGE above is still indistinguishable "
-            "from an answer") in limits
+    assert "That costs coverage and nothing more" in limits
+    assert "carried no credential header" not in limits
 
 
 def test_limits_disclose_that_credential_insertion_points_are_not_probed(

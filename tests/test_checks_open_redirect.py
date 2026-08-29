@@ -126,15 +126,12 @@ def test_a_location_that_keeps_the_targets_host_is_not_a_finding():
     it is not `clean` either: the endpoint redirected somewhere this check
     did not ask for, and the response carries nothing that separates "the
     parameter was validated" from "the parameter was never read, this is
-    just where unauthenticated requests go". Only the first of those may
-    retire a finding, so the honest answer is `inconclusive`."""
+    just where unauthenticated requests go". Only the first of those is a
+    tested surface, so the honest answer is `inconclusive`."""
     v = oredir.OpenRedirect().probes(
         ctx, surface, (_REDIRECT_INSERTION,),
         _sender_returning(302, {"Location": "https://app.test/dashboard"}))
     assert v.state == "inconclusive"
-    assert v.considered == (), (
-        "`Verdict.inconclusive` takes no `considered`, which is what stops a "
-        "redirect the check cannot interpret from retiring a live finding")
 
 
 def test_a_relative_location_is_not_an_open_redirect():
@@ -168,22 +165,17 @@ def test_a_parameter_that_cannot_redirect_is_not_probed():
     request.
 
     N3 OF THE SCOPED RE-REVIEW CHANGED THE VERDICT THIS ANSWERS WITH. It was
-    `clean` with an empty `considered`, which retired nothing -- but
-    `report._coverage` groups on (check_id, verdict) and counts surfaces, so
-    a real engagement rendered `hx.active.open-redirect | clean | <most of
-    the corpus>` for a check that probed a handful. `clean` asserts "tested
-    and nothing found"; nothing was tested here, and the row has to say
-    which."""
+    `clean` naming an issue type it had not looked for, which retired nothing
+    -- but `report._coverage` groups on (check_id, verdict) and counts
+    surfaces, so a real engagement rendered `hx.active.open-redirect | clean
+    | <most of the corpus>` for a check that probed a handful. `clean`
+    asserts "tested and nothing found"; nothing was tested here, and the row
+    has to say which."""
     sender = _sender_returning(200, {})
     v = oredir.OpenRedirect().probes(ctx, surface, (_UNRELATED_INSERTION,),
                                      sender)
     assert sender.sent == 0
     assert v.state == "inconclusive"
-    assert v.considered == (), (
-        "nothing was actually examined on this surface, so nothing may be "
-        "considered -- naming the issue type here would let a real, "
-        "never-tested finding be silently retired"
-    )
     # The sentence names the filter, so an operator reading the coverage row
     # can tell "this check looked and found nothing" from "this check does
     # not probe parameters called `id`".
@@ -211,9 +203,6 @@ def test_a_refusal_ends_one_point_and_never_the_whole_check():
     assert sender.sent == 2, "the refusal took the second point down with it"
     assert v.state == "finding"
     assert v.candidates[0].insertion == _SECOND_REDIRECT_INSERTION
-    assert v.considered == (), (
-        "one point was never answered, so this surface's issue type was not "
-        "examined and a prior finding of it must not be retired")
 
 
 def test_a_refusal_with_nothing_found_is_inconclusive_never_clean():
@@ -301,7 +290,6 @@ def test_only_query_insertions_are_considered_others_are_ignored():
     v = oredir.OpenRedirect().probes(ctx, surface, (header_insertion,), sender)
     assert sender.sent == 0
     assert v.state == "inconclusive"
-    assert v.considered == ()
 
 
 def test_the_probe_carries_the_marker_url_in_the_parameter():
@@ -327,16 +315,17 @@ def test_the_finding_cites_the_surfaces_exemplar_exchange():
     assert v.candidates[0].exchange_ids == ("x-1",)
 
 
-def test_a_findings_issue_type_is_one_it_considered():
+def test_a_findings_issue_type_is_the_one_it_examines_for():
     """The drift-catching test this whole suite of checks carries: a
-    candidate whose issue type is not in `considered` can never be
-    retired."""
+    candidate minting an issue type the check does not name as `examined`
+    is two spellings of one question, and a coverage row would claim to
+    have looked for something no finding is ever filed under."""
     v = oredir.OpenRedirect().probes(
         ctx, surface, (_REDIRECT_INSERTION,),
         _sender_returning(302, {"Location": _MARKER_LOCATION}))
     assert v.state == "finding"
     for candidate in v.candidates:
-        assert candidate.issue_type_id in v.considered
+        assert candidate.issue_type_id == oredir._ISSUE_TYPE
 
 
 def test_two_canary_shaped_parameters_that_both_redirect_are_two_findings():
@@ -365,13 +354,12 @@ def test_two_canary_shaped_parameters_that_both_redirect_are_two_findings():
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 429, 500, 503])
 def test_a_status_that_refused_is_inconclusive_not_clean(status):
     """A response with no `Location` because a WAF answered instead is not a
-    target that validated the parameter, and only one of those may retire a
-    finding."""
+    target that validated the parameter, and only one of those is a tested
+    surface."""
     v = oredir.OpenRedirect().probes(
         ctx, surface, (_REDIRECT_INSERTION,), _sender_returning(status, {}))
     assert v.state == "inconclusive"
     assert str(status) in v.reason
-    assert v.considered == ()
 
 
 def test_a_redirect_status_is_this_checks_finding_and_never_a_gap():
@@ -391,4 +379,3 @@ def test_a_two_hundred_with_no_location_is_still_clean():
     v = oredir.OpenRedirect().probes(
         ctx, surface, (_REDIRECT_INSERTION,), _sender_returning(200, {}))
     assert v.state == "clean"
-    assert v.considered == (oredir._ISSUE_TYPE,)

@@ -142,31 +142,25 @@ def test_a_response_with_no_signature_anywhere_is_clean():
     v = sqle.SqlError().probes(ctx, surface, (_QUERY,),
                                _sender_returning(200, _CLEAN_BODY))
     assert v.state == "clean"
-    assert v.considered == (sqle._ISSUE_TYPE,), (
-        "the point WAS probed, so the issue type must be considered or a "
-        "later fix can never be seen as retiring anything")
 
 
-def test_a_clean_answer_names_only_what_was_actually_probed():
+def test_a_clean_answer_probes_every_point_it_was_handed():
     sender = _sender_returning(200, _CLEAN_BODY)
     v = sqle.SqlError().probes(ctx, surface, (_QUERY, _PATH_SEGMENT), sender)
     assert sender.sent == 2, "every declared insertion point was examined"
-    assert v.considered == (sqle._ISSUE_TYPE,)
+    assert v.state == "clean"
 
 
-def test_no_insertions_probed_means_nothing_considered():
+def test_no_insertions_probed_is_inconclusive_and_never_clean():
     """N3 of the scoped re-review turned the verdict here from `clean` to
-    `inconclusive`. `considered` was already empty, so nothing was ever
-    retired on this path -- what was false was the coverage row: `clean`
-    asserts "tested and nothing found", and this surface was not tested."""
+    `inconclusive`. Nothing was ever retired on this path -- the check named
+    nothing it had examined -- so what was false was the coverage row:
+    `clean` asserts "tested and nothing found", and this surface was not
+    tested."""
     sender = _sender_returning(200, _CLEAN_BODY)
     v = sqle.SqlError().probes(ctx, surface, (), sender)
     assert sender.sent == 0
     assert v.state == "inconclusive"
-    assert v.considered == (), (
-        "nothing was examined on this surface, so nothing may be "
-        "considered -- naming the issue type here would let a real, "
-        "never-tested finding be silently retired")
 
 
 def test_one_request_per_point_even_with_a_dozen_table_entries():
@@ -242,9 +236,6 @@ def test_a_refusal_ends_one_point_and_never_the_whole_check():
     assert sender.sent == 2, "the refusal took the second point down with it"
     assert v.state == "finding"
     assert v.candidates[0].insertion == _PATH_SEGMENT
-    assert v.considered == (), (
-        "one point was never answered, so nothing on this surface may be "
-        "retired on the strength of the other")
 
 
 def test_a_refusal_with_nothing_found_is_inconclusive_never_clean():
@@ -288,7 +279,6 @@ def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
     v = sqle.SqlError().probes(ctx, surface, (header_insertion,), sender)
     assert sender.sent == 0
     assert v.state == "inconclusive"
-    assert v.considered == ()
     for kind in sqle.SqlError.insertion_kinds:
         assert kind in v.reason, kind
 
@@ -305,12 +295,12 @@ def test_the_finding_cites_the_surfaces_exemplar_exchange():
     assert v.candidates[0].exchange_ids == ("x-1",)
 
 
-def test_a_findings_issue_type_is_one_it_considered():
+def test_a_findings_issue_type_is_the_one_it_examines_for():
     v = sqle.SqlError().probes(ctx, surface, (_QUERY,),
                                _sender_returning(500, _MYSQL_BODY))
     assert v.state == "finding"
     for candidate in v.candidates:
-        assert candidate.issue_type_id in v.considered
+        assert candidate.issue_type_id == sqle._ISSUE_TYPE
 
 
 def test_two_points_that_both_disclose_errors_are_two_findings():
@@ -359,7 +349,6 @@ def test_a_status_that_refused_with_no_signature_is_inconclusive(status):
                                _sender_returning(status, _CLEAN_BODY))
     assert v.state == "inconclusive"
     assert str(status) in v.reason
-    assert v.considered == ()
 
 
 def test_a_driver_error_on_a_five_hundred_is_still_a_finding():
@@ -369,4 +358,3 @@ def test_a_driver_error_on_a_five_hundred_is_still_a_finding():
     v = sqle.SqlError().probes(ctx, surface, (_QUERY,),
                                _sender_returning(500, _MYSQL_BODY))
     assert v.state == "finding"
-    assert v.considered == (sqle._ISSUE_TYPE,)
