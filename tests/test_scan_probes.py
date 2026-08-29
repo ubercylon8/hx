@@ -29,6 +29,7 @@ import pytest
 from hx import config as config_mod
 from hx import insertion as insertion_mod
 from hx import scan
+from hx import surface as surface_mod
 from hx.checks import base, probe, registry
 from hx.checks.active import cors
 from hx.store import blobs as blobs_mod
@@ -678,11 +679,22 @@ def test_insertion_points_are_derived_once_per_surface(tmp_path, monkeypatch):
 def test_a_passive_only_scan_derives_nothing(tmp_path, monkeypatch):
     """The cost a passive scan must not pay. `hx scan` with no active class
     enabled is the common case and stays entirely offline -- no session, and
-    no blob read for points nothing will probe."""
+    no blob read for a request nothing will probe.
+
+    BOTH SEAMS ARE GUARDED, and the second is why this test is not merely
+    about `derive` any more: the blob read moved out to `_exemplar_request`
+    when the probe path started coming off the same bytes, so a passive scan
+    could have begun paying for the read without ever calling `derive` -- and
+    the version of this test that watched only `derive` would not have
+    noticed.
+    """
     env = _env(tmp_path)
     monkeypatch.setattr(
         scan.insertion_mod, "derive",
         lambda *a, **k: pytest.fail("a passive scan derived insertion points"))
+    monkeypatch.setattr(
+        scan, "_exemplar_request",
+        lambda *a, **k: pytest.fail("a passive scan read the exemplar blob"))
 
     class Passive:
         id, version, klass = "hx.test.passive", "1", "passive"
@@ -703,6 +715,9 @@ def test_a_bridgeless_active_scan_derives_nothing_either(tmp_path, monkeypatch):
     monkeypatch.setattr(
         scan.insertion_mod, "derive",
         lambda *a, **k: pytest.fail("derived points with no bridge to use them"))
+    monkeypatch.setattr(
+        scan, "_exemplar_request",
+        lambda *a, **k: pytest.fail("read the exemplar blob with no bridge"))
     scan.run(**env, checks=(_Probe(),), bridge=None)
     assert _row(env["conn"])[0] == "skipped"
 
@@ -751,7 +766,8 @@ def test_the_shipped_cors_check_cannot_file_a_finding_it_could_not_evidence(
 # this defect confuses were the same string.
 
 # The exemplar of a templated surface: a concrete request line, whose path
-# `hx.surface` would normalise to `TEMPLATED_SURFACE` below.
+# `hx.surface` normalises to `TEMPLATED` below -- asserted rather than
+# claimed, by the first test in this section.
 REQ_TEMPLATED = (
     b"GET /user/12345/profile?q=1 HTTP/1.1\r\n"
     b"Host: app.test\r\n"
@@ -768,6 +784,18 @@ def _templated_env(tmp_path):
 def _paths_on_the_wire(fb):
     """The request-line target of every request the bridge was handed."""
     return [body.split(b" ")[1].decode("latin-1") for body in fb.bodies]
+
+
+def test_this_sections_surface_is_one_the_real_normaliser_would_produce():
+    """The fixture is not a fiction. A hand-written `path_template` that
+    `hx.surface` would never mint would make every test below it measure a
+    shape no scan can reach, which is the same blindness as measuring only
+    static routes."""
+    cfg = config_mod.Config(name="T", client="T", scope_include=["*.test"])
+    assert surface_mod.path_template(
+        ADDRESS, preserve=frozenset(cfg.preserve_segments),
+        slug_threshold=cfg.slug_threshold) == TEMPLATED
+    assert TEMPLATED != ADDRESS
 
 
 def test_the_sender_is_bound_to_the_exemplars_path_not_the_template(tmp_path):

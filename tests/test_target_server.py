@@ -589,7 +589,8 @@ def test_the_templated_routes_reflection_survives_the_escalation_wrapper(target)
     `test_the_search_route_reflects_its_input_unescaped` asks it of `/search`
     -- except that here the value rides a PATH SEGMENT, so the route has to
     percent-decode it the way a vulnerable application would."""
-    wrapped = f"{reflected_input._META_CHARS}Zq7pLx3nV0aB{reflected_input._META_CHARS}"
+    meta = reflected_input._META_CHARS
+    wrapped = f"{meta}Zq7pLx3nV0aB{meta}"
     status, _headers, body = _get(
         target, f"/user/{quote(wrapped, safe='')}/profile")
     assert status == 200

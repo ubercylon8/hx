@@ -228,9 +228,9 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             # foreign key off. MEASURED, both shapes, with a
                             # check declaring no insertion kinds (which is
                             # `hx.active.cors`, the one that reaches this at
-                            # all -- a check WITH declared kinds already skips,
-                            # because `_exemplar_request` reads nothing from
-                            # an exemplar that is not there):
+                            # all -- a check WITH declared kinds already
+                            # skipped, deriving nothing from an exemplar that
+                            # was not there):
                             #
                             #   * NULL: `Candidate(exchange_ids=(None,))`
                             #     constructed, `evidence` took a row with a
@@ -411,14 +411,13 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # complete scan is not itself misreported as "truncated for a reason".
     #
     # `by_reason` CARRIES MORE THAN `budget` NOW. The probe pass adds
-    # `no_bridge`, `no_exemplar` and `no_insertion_point`, and all belong in
-    # this sentence
-    # for the reason the budget one does: a pass that left rows `skipped` did
-    # not do everything it set out to do, and the run row is where a report
-    # decides whether to trust it. The word stays `truncated` and the KEY is
-    # what distinguishes them -- `truncated: no_bridge=4` says which four
-    # rows to go and read, which is more than a differently-worded prefix
-    # would have said.
+    # `no_bridge`, `no_exemplar`, `no_probe_path` and `no_insertion_point`,
+    # and all belong in this sentence for the reason the budget one does: a
+    # pass that left rows `skipped` did not do everything it set out to do,
+    # and the run row is where a report decides whether to trust it. The word
+    # stays `truncated` and the KEY is what distinguishes them --
+    # `truncated: no_bridge=4` says which four rows to go and read, which is
+    # more than a differently-worded prefix would have said.
     stop_reason = None
     if summary.by_reason:
         parts = ", ".join(f"{k}={v}" for k, v in sorted(summary.by_reason.items()))

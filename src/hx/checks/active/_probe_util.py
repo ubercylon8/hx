@@ -211,8 +211,9 @@ def verdict(candidates, gaps, *,
     per probe that came back without answering; `considered` is what the
     check examined.
 
-    A CANDIDATE STILL WINS OVER A GAP: what was found was found, and a probe
-    that answered nowhere else does not un-find it. What the gap takes away
+    A CANDIDATE STILL WINS OVER A GAP: what was found was found, and another
+    probe on this surface coming back without an answer does not un-find it.
+    What the gap takes away
     is `considered` -- so the finding is reported and `hx.scan.
     _mark_unobserved` does NOT retire this surface's other findings of the
     same check on the strength of probes that were refused.
