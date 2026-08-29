@@ -1196,8 +1196,14 @@ every cookie-bearing engagement. `unprobeable()` below names those points and
 names are spelt HERE, once, in the module that already models what the send
 path will and will not carry, rather than in each check that declares a
 `header` or `cookie` kind. What the CLIENT is told about them is
-`hx.report._limits`' business: they are counted under "Insertion points" and
-disclosed there as not probed.
+`hx.report._limits`' business: a Limits bullet says they were not probed and
+renders the three names off `CREDENTIAL_HEADERS` below. It deliberately does
+NOT cross-reference the report's "Insertion points" table -- N4 of the scoped
+re-review, because an earlier version of this paragraph said the opposite.
+That table counts points by kind and states in as many words that this build
+records no per-insertion probe attribution, so it cannot say which points
+were probed; it also renders only where a blob store was supplied, so a
+bullet pointing at it could point at a section that is not on the page.
 """
 from __future__ import annotations
 
@@ -1267,8 +1273,15 @@ def unprobeable(insertion) -> str | None:
     is matched here anyway: this function answers for the send path's rule,
     not for one derivation's current output.
 
-    The sentence is short because it is what a coverage row shows an operator
-    (`_http._detail` formats it, the same as a gap from `_probe_util`).
+    NOTHING RENDERS THE SENTENCE, and saying so is the point: an earlier
+    version of this docstring justified its shape by claiming a coverage row
+    showed it, formatted by `_http._detail` the same as a gap from
+    `_probe_util`. That was never true (N4 of the scoped re-review).
+    `hx.scan.run` is the only caller, it tests this result for `None`, and it
+    discards the string -- the `no_probeable_insertion_point` row carries its
+    own sentence, naming the count, the kinds and `CREDENTIAL_HEADERS`. So
+    the reason exists for a reader of THIS function rather than for a page:
+    it says which of the two rules refused a point, which `True` would not.
     """
     if insertion.kind == "cookie":
         return (f"cookie {insertion.name!r}: a cookie is probed by sending a "

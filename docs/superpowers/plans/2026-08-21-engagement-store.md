@@ -929,14 +929,20 @@ CREATE TABLE IF NOT EXISTS finding (
   scope_level        TEXT NOT NULL
                      CHECK (scope_level IN ('engagement','host','surface','insertion')),
   payload            TEXT,
-  -- Still DEFAULT 1, deliberately and temporarily. The same argument as
-  -- surface.normaliser_version applies -- a column answering "which ruleset
-  -- produced this row" should not answer it with a guess -- but nothing
-  -- produces a finding until Plan 6, so the default is not yet WRONG here,
-  -- only premature. Removing it now costs 11 fixture rewrites in a merged
-  -- plan's test file, in a commit whose job is unblocking Task 3. Take it in
-  -- the plan that first writes a finding, and take it BEFORE that plan writes
-  -- one.
+  -- Still DEFAULT 1, and it is WRONG now rather than premature. The same
+  -- argument as surface.normaliser_version applies -- a column answering
+  -- "which ruleset produced this row" should not answer it with a guess --
+  -- and the deadline the previous version of this comment set for itself
+  -- ("nothing produces a finding until Plan 6, so the default is not yet
+  -- WRONG here, only premature") has passed. Plan 5, checks-and-reporting,
+  -- was the plan that first wrote a finding, and it is merged: every finding
+  -- row now carries 1 while hx.surface.NORMALISER_VERSION is 2.
+  --
+  -- Deferred rather than urgent because it is wrong in a column no reader
+  -- consults: nothing in Python writes it (records.upsert_finding's column
+  -- list omits it) and nothing reads it -- no report section, no retest
+  -- path, no query. Removing the default costs 11 fixture rewrites in a
+  -- merged plan's test file. Whoever takes it takes this comment with it.
   normaliser_version INTEGER NOT NULL DEFAULT 1,
   first_seen_run     TEXT REFERENCES run(id),
   last_seen_run      TEXT REFERENCES run(id),
