@@ -54,7 +54,7 @@ _ALL_HOOKS = ("on_surface", "probes", "on_corpus")
 #
 # `probes` WAS IN `on_corpus`'S POSITION AND IS NOT ANY MORE, and the reason
 # it was refused is the reason it is now listed rather than a reason that
-# stopped applying: `hx.scan.run` grew the probe pass (Plan 6, Task 7), so
+# stopped applying: `hx.scan.run` grew the probe pass (this plan, Task 7), so
 # something does now invoke it, and the refusal below lifts for active checks
 # by that fact alone. Nothing about the RULE changed. `on_corpus` is still
 # here-but-uncalled for every class in `_HOOKS`, still refused as the only

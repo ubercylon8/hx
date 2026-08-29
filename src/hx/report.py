@@ -219,7 +219,7 @@ def _by_class() -> tuple[tuple, tuple]:
     sentences -- "None were probed", "this build ships no active checks",
     "Every check in this build is passive" -- in a module that ALREADY
     derives its unshipped-class note from `registry.CHECKS` two functions
-    away. The first entry of Plan 6's active corpus makes all three false in
+    away. The first entry of this build's active corpus makes all three false in
     a client deliverable, with no test to redden: the Limits section would
     tell a client no request carrying a payload was ever issued while
     `check_run.requests_sent` said otherwise, and the passive-retest
@@ -1180,7 +1180,7 @@ def _insertion_coverage(conn, engagement_id, blobs) -> list[str]:
         return []
     _passive, active = _by_class()
     if active:
-        # F5: the moment Plan 6 registers its first active check, "None were
+        # F5: the moment the corpus registers its first active check, "None were
         # probed" is a sentence this module cannot support. It does not
         # become "all were probed" either -- `check_run.insertion_name`
         # exists but this build's coverage query does not read it, and

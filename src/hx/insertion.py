@@ -42,9 +42,9 @@ than an oversight:
     exclusion no test names is indistinguishable from one that was never
     there.
 
-The body kinds ARE derived and are NOT probeable in this plan or Plan 6: S4's
-production method allowlist is GET/HEAD/OPTIONS, so an active_safe check can
-only re-issue a GET. They are recorded so the coverage section can say
+The body kinds ARE derived and are NOT probeable in this plan or the active-
+checks plan that followed it: S4's production method allowlist is
+GET/HEAD/OPTIONS, so an active_safe check can only re-issue a GET. They are recorded so the coverage section can say
 `exists, not probed`, which is worth more than omitting them.
 """
 from __future__ import annotations

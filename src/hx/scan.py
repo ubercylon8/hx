@@ -15,8 +15,8 @@ and the crash case is the one where no other mechanism would say anything.
 5's draft of this module had the import and never called it: with a purely
 passive corpus there was nothing here to insert a payload into, and the one
 consumer of a derivation was the report, which derives at render time from
-the exemplar exchange already on each surface row. Plan 6's probe pass is the
-first caller that has a use for one -- an active check is handed the points
+the exemplar exchange already on each surface row. This plan's probe pass is
+the first caller that has a use for one -- an active check is handed the points
 it declared it can reach -- so the import is here because something calls it,
 which is the same test it failed before. The report still derives its own at
 render time: S5 says there is no `insertion` table in v1, so a derivation is
@@ -293,9 +293,9 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                         # for having no points: it shapes its own request --
                         # a header it adds, a method it re-issues -- rather
                         # than filling in a parameter it found. That is the
-                        # shape the next task's CORS check takes (Plan 6 Task
-                        # 8, `src/hx/checks/active/cors.py`, not written
-                        # yet): its `insertion_kinds` is empty on purpose,
+                        # shape `hx.active.cors` takes
+                        # (`src/hx/checks/active/cors.py`, registered on this
+                        # branch): its `insertion_kinds` is empty on purpose,
                         # and skipping a check for having none of what it
                         # never asked for would silence the first check in
                         # this build that sends.
