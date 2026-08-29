@@ -1377,9 +1377,10 @@ def _limits(conn, engagement_id) -> list[str]:
         # request carried one of `probe.CREDENTIAL_HEADERS`, so nothing there
         # is closed. This paragraph and that function have to move together:
         # the sentence below claims a behaviour of the runner, not a property
-        # of the checks, and `test_the_unauthenticated_bullet_says_active_
-        # checks_retire_nothing_on_an_authenticated_surface` holds it against
-        # the code.
+        # of the checks, and `tests/test_report.py::test_the_unauthenticated_
+        # bullet_says_retirement_is_suppressed_and_it_is` holds it against the
+        # code -- it asks `scan._unauthenticated_view` about a capture
+        # carrying each name the bullet lists, and about one carrying none.
         #
         # THE RESIDUAL IS NARROWED, NOT CLOSED, AND THE SENTENCE SAYS WHICH.
         # On a surface whose capture carried NO credential header the probe
@@ -1484,10 +1485,10 @@ def _limits(conn, engagement_id) -> list[str]:
         # limited this way", which was a claim about EVERY active finding;
         # `hx.scan._unauthenticated_view` now means it holds only where the
         # captured request carried no credential header. Left unqualified it
-        # would be this section contradicting the bullet four above it, which
-        # is the exact reading a client would act on -- "the active findings
-        # will retire, so re-run the scan" -- for a corpus that will now
-        # rarely retire anything on a real engagement.
+        # would be this section contradicting the unauthenticated-probe
+        # bullets above it, in the exact direction a client would act on --
+        # "the active findings will retire, so re-run the scan" -- for a
+        # corpus that will now rarely retire anything on a real engagement.
         out.append("- **A fixed issue may not be shown as fixed by "
                    "re-browsing.** The passive checks in this build "
                    f"({_names(passive)}) read this engagement's whole "

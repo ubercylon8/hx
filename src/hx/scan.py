@@ -709,23 +709,34 @@ def _unauthenticated_view(carried: tuple[str, ...]) -> str:
     All this needs is the knowledge that the two requests are not the same
     view, and the exemplar's own headers are already on file.
 
-    THE SEVENTH SPELLING IS WHY IT IS NOT A STATUS RULE. Six ways an active
-    check could answer `clean` from a probe that tested nothing were closed
-    by `_probe_util._NOT_AN_ANSWER` and by the skips above; the seventh is an
-    application that answers a logged-out request with a 200 LOGIN PAGE,
-    which is a complete, well-formed, application-composed response and is
+    THE SEVENTH SPELLING IS WHY IT IS NOT A STATUS RULE. The six earlier ways
+    an active check could answer `clean` from a probe that tested nothing were
+    closed by the status doctrine (`_probe_util._NOT_AN_ANSWER`), by the
+    runner's skips above it, and by `_probe_util.verdict`'s `unprobed` branch.
+    The seventh is an application that answers a logged-out request with a 200
+    LOGIN PAGE -- a complete, well-formed, application-composed response,
     indistinguishable from an answer at every level a status set operates.
-    MEASURED (fix round 3): all five checks `clean`, `considered` populated, a
-    live finding retired. No set of statuses closes it. What DOES close it is
-    a fact the store already holds -- that the capture carried a session and
-    the probe did not -- and it closes the login page, the silent partial
-    render, and every future shape of the same thing at once.
+    MEASURED, fix round 3, real registry against a target answering one to
+    everything: all five checks `clean` with `considered` populated. That a
+    populated `considered` then retires a live finding is measured here, in
+    `tests/integration/test_active_checks.py::test_a_fix_on_an_authenticated_
+    surface_is_not_reported_as_fixed` with this function returning "":
+    `observed = 0`, rendered as "appears fixed; verify before closing".
 
-    THE ACCEPTED COST, stated because it is large: most surfaces on a real
-    engagement are authenticated, so active checks will rarely retire, and
-    the active corpus's retest story shrinks to anonymous surfaces. The
-    passive corpus is untouched -- it reads the captured traffic itself, so
-    it was never looking at a different view.
+    WHAT IT DOES AND DOES NOT COVER, because the difference is the whole
+    honesty of the rule. It does not look at the response at all, so on a
+    surface the capture was AUTHENTICATED for it covers every shape of this
+    -- a login page, a silently emptied list, a partial render, and whatever
+    the next one turns out to be. It covers NOTHING on a surface whose
+    capture carried no credential header: there the probe and the capture are
+    the same view, and a 200 login page is still indistinguishable from an
+    answer. `report._limits` tells the client both halves.
+
+    THE ACCEPTED COST, and the ground the decision was taken on: most surfaces
+    on a real engagement are authenticated, so active checks will rarely
+    retire and the active corpus's retest story shrinks to anonymous surfaces.
+    The passive corpus is untouched -- it reads the captured traffic itself,
+    so it was never looking at a different view.
 
     `carried` COMES FROM `probe.credentials_carried`, so the three names are
     the send path's own; see it for why the values are unreadable here and

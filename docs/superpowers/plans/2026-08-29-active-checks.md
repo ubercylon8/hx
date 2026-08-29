@@ -1366,13 +1366,13 @@ def credentials_carried(request_bytes: bytes) -> tuple[str, ...]:
     RIGHT ONE. `Redactor.redactObservedRequest` replaces each of these
     headers' VALUES with `{{observed:<name>}}` before the bytes are hashed and
     stored (S7), so a captured request on disk reads `Cookie:
-    {{observed:cookie}}` -- the name survives and the credential does not.
-    Nothing here can see a credential value, which is also why nothing here
-    can tell a live session from an expired one, an empty `Cookie:` header
-    from a full one, or a first-party cookie from an analytics one. All of
-    them answer "carried", which is the safe direction: the cost is a
-    retirement withheld, and the alternative is a live finding reported to a
-    client as fixed.
+    {{observed:cookie}}` -- the name survives and the credential does not, and
+    a caller reading this function's answer never had a value available to it
+    in the first place. Which is also why nothing here can tell a live session
+    from an expired one, an empty `Cookie:` header from a full one, or a
+    first-party cookie from an analytics one. All of them answer "carried",
+    which is the safe direction: the cost is a retirement withheld, and the
+    alternative is a live finding reported to a client as fixed.
 
     A REQUEST WITH NO HEAD TERMINATOR IS READ WHOLE, for the same reason.
     `_http._split_head_body` returns the entire input as the head when it can
