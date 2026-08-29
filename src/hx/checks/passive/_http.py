@@ -78,11 +78,45 @@ def _fetch(ctx, exchanges) -> Evidence:
     return Evidence(tuple(entries), tuple(gaps))
 
 
+def _split_head_body(raw: bytes) -> tuple[bytes, bytes]:
+    """Head and body, accepting either line terminator.
+
+    RFC 9112 s2.2 requires a recipient to accept a bare LF as a line
+    terminator. `partition(b"\\r\\n\\r\\n")` on a bare-LF response matches
+    nothing and returns `(raw, b"", b"")`, which hands every body-searching
+    check an EMPTY body and every header-reading check the whole response as
+    one unsplit head. The tool then answers `clean` because it failed to
+    read, which is the one direction an assessment must never be wrong in.
+
+    Whichever terminator appears FIRST is the real one, so a body that
+    happens to contain `\\r\\n\\r\\n` cannot pull the boundary backwards past
+    a head that actually ended with a bare `\\n\\n`.
+    """
+    crlf = raw.find(b"\r\n\r\n")
+    lf = raw.find(b"\n\n")
+    if crlf == -1 and lf == -1:
+        return raw, b""
+    if crlf != -1 and (lf == -1 or crlf <= lf):
+        return raw[:crlf], raw[crlf + 4:]
+    return raw[:lf], raw[lf + 2:]
+
+
+def _header_lines(head: bytes) -> list[bytes]:
+    """Header lines, minus the status line, for either terminator.
+
+    Splits on LF and strips at most one trailing CR per line, rather than
+    also splitting on a bare CR: a lone CR inside a header value is data, and
+    splitting on it would invent a header boundary the wire did not carry.
+    """
+    return [line[:-1] if line.endswith(b"\r") else line
+            for line in head.split(b"\n")[1:]]
+
+
 def bodies(ctx, exchanges) -> Evidence:
     """`(row, body_bytes)` per readable exchange, plus what could not be read."""
     got = _fetch(ctx, exchanges)
     return Evidence(
-        tuple((row, raw.partition(b"\r\n\r\n")[2]) for row, raw in got.entries),
+        tuple((row, _split_head_body(raw)[1]) for row, raw in got.entries),
         got.gaps)
 
 
@@ -90,7 +124,7 @@ def responses(ctx, exchanges) -> Evidence:
     """`(row, head_bytes)` per readable exchange, plus what could not be read."""
     got = _fetch(ctx, exchanges)
     return Evidence(
-        tuple((row, raw.partition(b"\r\n\r\n")[0]) for row, raw in got.entries),
+        tuple((row, _split_head_body(raw)[0]) for row, raw in got.entries),
         got.gaps)
 
 
@@ -141,7 +175,7 @@ def _detail(evidence: Evidence) -> str:
 
 def header_names(head: bytes) -> list[str]:
     return [line.partition(b":")[0].decode("latin-1").strip()
-            for line in head.split(b"\r\n")[1:] if b":" in line]
+            for line in _header_lines(head) if b":" in line]
 
 
 def header_values(head: bytes, name: str) -> list[str]:
@@ -153,7 +187,7 @@ def header_values(head: bytes, name: str) -> list[str]:
     """
     want = name.lower()
     out = []
-    for line in head.split(b"\r\n")[1:]:
+    for line in _header_lines(head):
         key, sep, value = line.partition(b":")
         if sep and key.decode("latin-1").strip().lower() == want:
             out.append(value.decode("latin-1").strip())
