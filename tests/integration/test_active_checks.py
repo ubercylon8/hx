@@ -62,8 +62,9 @@ and every surface above is a GET, so until now no integration test had put
 either a response the doctrine reads as a REFUSAL or a surface a probe cannot
 address in front of a check -- and N1 and N2 of the scoped re-review lived in
 exactly that gap, each caught by a human reading rather than by a suite. A
-`302 Found / Location: /login` was read by all five checks as a conclusive
-negative and retired a live finding; a `POST` surface was probed with a GET,
+`302 Found / Location: /login` was read as a conclusive negative by every
+check that had a point to probe, and retired a live finding; a `POST` surface
+was probed with a GET,
 which is a request to a different surface, and closed `clean` on the strength
 of it. Both were fixed with coverage at `scan.run` against fake bridges. Here
 they are measured through Burp, a socket and a server that answers.

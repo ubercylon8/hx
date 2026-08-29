@@ -184,9 +184,13 @@ TEMPLATED_SURFACE = "/user/{id}/profile"
 # check. N1 of the scoped re-review lived exactly there: a `302 Found /
 # Location: /login` -- what a browser-facing application answers an
 # unauthenticated request with, and every probe this build sends is
-# unauthenticated -- was read by all five checks as a conclusive negative, and
-# a live `reflected-input` finding came back `observed = 0`, which
-# `hx.report` renders to a client as "appears fixed; verify before closing".
+# unauthenticated -- was read as a conclusive negative by every check that had
+# a point to probe, and a live `reflected-input` finding came back
+# `observed = 0`, which `hx.report` renders to a client as "appears fixed;
+# verify before closing". That was five checks on the re-review's own fixture,
+# whose surface carried a parameter each of them accepts, and three on this
+# route: `open-redirect` and `path-traversal` decline `tab` by their own name
+# filters and send nothing here whatever the wall does.
 #
 # TWO STATES, AND THE MEASUREMENT NEEDS BOTH. While it is answering, this
 # route REFLECTS `tab` into an HTML document exactly as `/search` reflects
