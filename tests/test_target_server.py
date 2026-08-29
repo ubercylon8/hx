@@ -606,3 +606,74 @@ def test_nothing_else_reaches_the_templated_route(target, path):
     answer for paths other routes own -- or for a 404 this suite relies on."""
     assert _get(target, path)[0] == 404
 
+
+# ---------------------------------------------------------------------------
+# The two routes that are not vulnerabilities: a response no check may read as
+# an answer, and a surface no probe can address.
+#
+# Every route above answers 2xx to a GET, which is what kept N1 and N2 of the
+# scoped re-review invisible to a green integration suite for the same reason
+# a static path kept F1 invisible. These two are the instrument for the
+# integration tests that close that, pinned here for milliseconds rather than
+# there for a JVM.
+# ---------------------------------------------------------------------------
+
+def test_the_wall_route_reflects_its_input_until_the_wall_goes_up(target):
+    """Both states of `LOGIN_WALL_ROUTE`, and the integration test needs both.
+
+    Answering, it has to REFLECT -- that is the only way a finding gets on
+    file against this surface before the wall goes up, and a retirement is
+    what the test measures. Walled, it has to answer `302` with the `Location`
+    the constant names and to reflect NOTHING: a canary echoed inside the
+    redirect body would be a candidate, and a candidate beats a gap in
+    `_probe_util.verdict`, so the finding would survive because it was
+    re-found rather than because the redirect was read as a refusal.
+    """
+    assert _get(target, ts.LOGIN_WALL_ROUTE)[0] == 200, (
+        "the browsed route must exist; a 404 here would leave the integration "
+        "test measuring a missing route rather than a login wall")
+    path = ts.LOGIN_WALL_ROUTE.partition("?")[0]
+
+    status, headers, body = _get(target, f"{path}?tab=Zq7pLx3nV0aB")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert b"Zq7pLx3nV0aB" in body
+
+    target.require_login()
+
+    status, headers, body = _get(target, f"{path}?tab=Zq7pLx3nV0aB")
+    assert status == 302
+    assert headers["Location"] == ts.LOGIN_WALL_LOCATION
+    assert b"Zq7pLx3nV0aB" not in body, (
+        "the walled response reflected the value it was given, so a probe "
+        "would file a finding off a redirect it never got past")
+
+    # THE WALL IS ONE ROUTE'S, not the server's. Every other route goes on
+    # answering, which is what makes the surface under test the only thing
+    # that changed between two scans.
+    assert _get(target, ts.VULNERABLE_ROUTES["hx.active.reflected-input"])[0] == 200
+
+
+def test_the_state_changing_route_answers_both_the_post_and_the_get(target):
+    """`STATE_CHANGING_ROUTE`'s two halves, and neither is decoration.
+
+    The POST is what makes the captured surface `state_changing` -- asserted
+    against `hx.surface`'s own function rather than by eye, because that is
+    the derivation the schema's `kind` column carries. The GET is what a build
+    without the method skip sends at that surface, and it has to be an
+    ORDINARY ANSWER: a route that 404ed a GET would make the integration
+    test's counterfactual a refusal (`inconclusive`, which retires nothing)
+    instead of the false `clean` N2 is about.
+    """
+    assert surface.kind_for("POST") == "state_changing"
+    path = ts.STATE_CHANGING_ROUTE.partition("?")[0]
+
+    raw = _request(target, "POST", ts.STATE_CHANGING_ROUTE)
+    assert b" 201 " in raw, raw
+
+    status, _headers, body = _get(target, ts.STATE_CHANGING_ROUTE)
+    assert status == 200
+    assert json.loads(body) == {"orders": [{"id": 1, "total": "12.00"}]}
+
+    assert [(h.method, h.path) for h in target.hits] == [
+        ("POST", path), ("GET", path)]

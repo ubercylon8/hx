@@ -26981,6 +26981,78 @@ def test_nothing_else_reaches_the_templated_route(target, path):
     """The handler matches a shape, and a shape that matched too much would
     answer for paths other routes own -- or for a 404 this suite relies on."""
     assert _get(target, path)[0] == 404
+
+
+# ---------------------------------------------------------------------------
+# The two routes that are not vulnerabilities: a response no check may read as
+# an answer, and a surface no probe can address.
+#
+# Every route above answers 2xx to a GET, which is what kept N1 and N2 of the
+# scoped re-review invisible to a green integration suite for the same reason
+# a static path kept F1 invisible. These two are the instrument for the
+# integration tests that close that, pinned here for milliseconds rather than
+# there for a JVM.
+# ---------------------------------------------------------------------------
+
+def test_the_wall_route_reflects_its_input_until_the_wall_goes_up(target):
+    """Both states of `LOGIN_WALL_ROUTE`, and the integration test needs both.
+
+    Answering, it has to REFLECT -- that is the only way a finding gets on
+    file against this surface before the wall goes up, and a retirement is
+    what the test measures. Walled, it has to answer `302` with the `Location`
+    the constant names and to reflect NOTHING: a canary echoed inside the
+    redirect body would be a candidate, and a candidate beats a gap in
+    `_probe_util.verdict`, so the finding would survive because it was
+    re-found rather than because the redirect was read as a refusal.
+    """
+    assert _get(target, ts.LOGIN_WALL_ROUTE)[0] == 200, (
+        "the browsed route must exist; a 404 here would leave the integration "
+        "test measuring a missing route rather than a login wall")
+    path = ts.LOGIN_WALL_ROUTE.partition("?")[0]
+
+    status, headers, body = _get(target, f"{path}?tab=Zq7pLx3nV0aB")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert b"Zq7pLx3nV0aB" in body
+
+    target.require_login()
+
+    status, headers, body = _get(target, f"{path}?tab=Zq7pLx3nV0aB")
+    assert status == 302
+    assert headers["Location"] == ts.LOGIN_WALL_LOCATION
+    assert b"Zq7pLx3nV0aB" not in body, (
+        "the walled response reflected the value it was given, so a probe "
+        "would file a finding off a redirect it never got past")
+
+    # THE WALL IS ONE ROUTE'S, not the server's. Every other route goes on
+    # answering, which is what makes the surface under test the only thing
+    # that changed between two scans.
+    assert _get(target, ts.VULNERABLE_ROUTES["hx.active.reflected-input"])[0] == 200
+
+
+def test_the_state_changing_route_answers_both_the_post_and_the_get(target):
+    """`STATE_CHANGING_ROUTE`'s two halves, and neither is decoration.
+
+    The POST is what makes the captured surface `state_changing` -- asserted
+    against `hx.surface`'s own function rather than by eye, because that is
+    the derivation the schema's `kind` column carries. The GET is what a build
+    without the method skip sends at that surface, and it has to be an
+    ORDINARY ANSWER: a route that 404ed a GET would make the integration
+    test's counterfactual a refusal (`inconclusive`, which retires nothing)
+    instead of the false `clean` N2 is about.
+    """
+    assert surface.kind_for("POST") == "state_changing"
+    path = ts.STATE_CHANGING_ROUTE.partition("?")[0]
+
+    raw = _request(target, "POST", ts.STATE_CHANGING_ROUTE)
+    assert b" 201 " in raw, raw
+
+    status, _headers, body = _get(target, ts.STATE_CHANGING_ROUTE)
+    assert status == 200
+    assert json.loads(body) == {"orders": [{"id": 1, "total": "12.00"}]}
+
+    assert [(h.method, h.path) for h in target.hits] == [
+        ("POST", path), ("GET", path)]
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -27177,6 +27249,60 @@ TEMPLATED_ROUTE = "/user/12345/profile"
 # The surface `TEMPLATED_ROUTE` normalises to, spelt once so a test asserting
 # on it and the route it browses cannot drift apart.
 TEMPLATED_SURFACE = "/user/{id}/profile"
+
+# ONE ROUTE THAT CAN STOP ANSWERING, and it is TEMPLATED_ROUTE's blind spot in
+# a second spelling. Every route in `VULNERABLE_ROUTES` and `TEMPLATED_ROUTE`
+# answers 2xx, so no integration test had ever put a response that
+# `hx.checks.active._probe_util.unanswered` reads as a REFUSAL in front of a
+# check. N1 of the scoped re-review lived exactly there: a `302 Found /
+# Location: /login` -- what a browser-facing application answers an
+# unauthenticated request with, and every probe this build sends is
+# unauthenticated -- was read by all five checks as a conclusive negative, and
+# a live `reflected-input` finding came back `observed = 0`, which
+# `hx.report` renders to a client as "appears fixed; verify before closing".
+#
+# TWO STATES, AND THE MEASUREMENT NEEDS BOTH. While it is answering, this
+# route REFLECTS `tab` into an HTML document exactly as `/search` reflects
+# `q`, so `hx.active.reflected-input` files a finding against this surface.
+# `TargetServer.require_login()` then puts the wall up for the rest of the run
+# and the next probe of that same surface meets the 302. A wall in front of a
+# surface nothing was ever found on could show that no check answers `clean`;
+# it could not show a retirement, and the retirement is the harm.
+#
+# NOT in `VULNERABLE_ROUTES`, for `TEMPLATED_ROUTE`'s reason: that map holds
+# one route per check and `hx.active.reflected-input` already has `/search`.
+# This route is browsed by the one test that names it.
+LOGIN_WALL_ROUTE = "/account/summary?tab=orders"
+
+# Where the wall sends a request it will not answer. `/login` is a route this
+# server already has, so the destination is a page that exists rather than a
+# dangling one, and it is RELATIVE -- what an application redirecting to its
+# own login page emits, and deliberately not the absolute, off-host `Location`
+# that is `hx.active.open-redirect`'s finding. Nothing in hx follows it; what
+# is under test is that the status and the header are the ones a browser would
+# have obeyed.
+LOGIN_WALL_LOCATION = "/login"
+
+# ONE SURFACE CAPTURED WITH A METHOD NO PROBE CAN BUILD -- the same blind spot
+# a third time. Every surface the active corpus had ever been measured against
+# was a GET, so no integration test had put a `state_changing` surface in
+# front of a check: N2 of the scoped re-review. `hx.checks.probe.ProbeSender.
+# _request_bytes` builds a GET and only a GET, and a surface's method is part
+# of its identity (`hx.surface.normalise`), so `POST /api/orders` probed with
+# `GET /api/orders` is a request that tested a DIFFERENT surface -- and the
+# `clean` row it produced stood ready to retire this surface's findings.
+# `hx.scan.run` skips it now, `not_a_get_surface`.
+#
+# `/api/orders` RATHER THAN A NEW ROUTE, because that route is already this
+# shape and has been since the send path: it answers a POST 201 and a GET 200.
+# The GET is what makes the counterfactual sharp rather than incidental -- a
+# probe of this surface gets an ordinary, complete answer, so nothing but the
+# method could tell hx it had addressed a different row. The query string is
+# here for the reason `VULNERABLE_ROUTES` carries one: without it the four
+# checks that declare insertion kinds have nowhere to put a payload and are
+# skipped `no_insertion_point` whatever the method rule does, which would
+# leave `hx.active.cors` as the only check the measurement could move.
+STATE_CHANGING_ROUTE = "/api/orders?sku=1"
 
 
 # MySQL's own wording for a query that did not parse, matching
@@ -27464,6 +27590,29 @@ class _Handler(BaseHTTPRequestHandler):
                 # Deliberately does not echo `name`: see the one-route-one-check
                 # paragraph beside VULNERABLE_ROUTES.
                 self._reply(200, {"served": True})
+        elif parts.path == "/account/summary":
+            # THE LOGIN WALL -- see LOGIN_WALL_ROUTE. Two states, and the
+            # switch between them is one way (`TargetServer.require_login`).
+            #
+            # Answering, it is `/search` with a different parameter name: `tab`
+            # comes back into an HTML document with no encoding, which is what
+            # gives `hx.active.reflected-input` a finding to file here before
+            # the wall goes up. NOT `_reply`, for the reason `/search` gives.
+            #
+            # Walled, it reflects NOTHING. A 302 whose body carried the canary
+            # back would be a candidate, and a candidate wins over a gap in
+            # `_probe_util.verdict` -- so the finding would stay live because
+            # it was re-found rather than because the redirect was read as a
+            # refusal, and the test would pass while measuring the wrong
+            # sentence.
+            if self.server.target.login_required():
+                self._reply(302, {"login_required": True},
+                            extra=(("Location", LOGIN_WALL_LOCATION),))
+            else:
+                tab = params.get("tab", [""])[0]
+                self._reply_text(
+                    200, "<html><body><h1>Account</h1>"
+                         f"<p>Showing {tab}</p></body></html>")
         elif self._templated_id(parts.path) is not None:
             # For `hx.active.reflected-input`, through a PATH SEGMENT rather
             # than a query parameter -- see TEMPLATED_ROUTE's own comment for
@@ -27563,6 +27712,7 @@ class TargetServer:
         self.max_delay_s = max_delay_s
         self._hits: list[Hit] = []
         self._fixed: set[str] = set()
+        self._login_required = False
         self._lock = threading.Lock()
         self._httpd = _Server((host, 0), _Handler)
         # Read by every handler through self.server. Set before any thread is
@@ -27648,6 +27798,31 @@ class TargetServer:
         """Read by a handler thread on every request; see `fix`."""
         with self._lock:
             return check_id in self._fixed
+
+    def require_login(self) -> None:
+        """Put `LOGIN_WALL_ROUTE` behind its login wall for the rest of this
+        run.
+
+        NOT A SECOND `fix()`, and the difference is the whole point. `fix()`
+        removes a flaw and the route goes on ANSWERING, which is what lets a
+        check say `clean` and retire the finding. This removes the ANSWER: the
+        flaw is untouched and may well still be there, and a probe that meets
+        the 302 has tested nothing. A build that reads the two as the same
+        thing tells a client a live vulnerability is fixed, which is N1 of the
+        scoped re-review and the reason this method exists.
+
+        ONE DIRECTION ONLY, for `fix()`'s reason, and the asymmetry bites
+        harder here: a knob that could take the wall back down would let a
+        test assert that a finding survived a login wall and then quietly log
+        back in before the scan that had to prove it.
+        """
+        with self._lock:
+            self._login_required = True
+
+    def login_required(self) -> bool:
+        """Read by a handler thread on every request; see `require_login`."""
+        with self._lock:
+            return self._login_required
 
     def hits_for(self, path: str) -> list[Hit]:
         """Every hit on `path`, ignoring the query string.
