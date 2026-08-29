@@ -772,8 +772,7 @@ git commit -m "fix(checks): a bare-LF response is parsed, not read as empty"
 # tests/test_probe.py -- Task 6: the sender's whole contract
 def test_a_probe_returns_the_response_and_counts_the_request():
     fb = FakeBridge()
-    fb.reply({"status": 200, "outcome": "ok"},
-             b"HTTP/1.1 200 OK\r\nX-A: b\r\n\r\nhi")
+    _ok(fb)
     s = _sender(fb)
     r = s.get("/a?q=1")
     assert r.status == 200 and r.body == b"hi"
@@ -795,12 +794,48 @@ def test_every_refusal_raises_and_names_itself(cls):
     assert exc.value.reason == cls
 
 
-def test_a_refused_attempt_is_still_counted():
-    # The budget was spent whether or not an answer came back, and a
-    # requests_sent that undercounts refusals understates the traffic this
-    # tool put on a client's system.
+# --- what `requests_sent` counts -------------------------------------------
+#
+# ISSUANCES, NOT ATTEMPTS. This pair replaces `test_a_refused_attempt_is_
+# still_counted`, which encoded the opposite rule ("the budget was spent
+# whether or not an answer came back") and was wrong for every gate class:
+# `hx.policy.Limiter.check` increments `issued` on the ALLOW path only and
+# says so in its own words -- "Refusals are not issuances and do not appear
+# here" -- so a request the gate refused never left the JVM and the target
+# never saw it. `check_run.requests_sent` reaches a client's report as the
+# traffic hx generated, and it is also what a bounded retry would otherwise
+# double-count.
+
+
+@pytest.mark.parametrize("cls", [
+    "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
+    "budget_exhausted", "halted", "not_configured",
+])
+def test_a_refusal_the_gate_decided_before_issuing_counts_nothing(cls):
+    """Each of the seven is decided before a request is issued -- the first
+    five by `Limiter`/`Policy` inside the JVM, the last two by
+    `BridgeServer.send` before a frame is even written -- so none of them is
+    traffic, and a report that counted them would overstate what hx put on a
+    client's system."""
     fb = FakeBridge()
-    fb.refuse("rate_limited")
+    fb.refuse(cls)
+    s = _sender(fb)
+    with pytest.raises(probe.ProbeRefused):
+        s.get("/a")
+    assert s.sent == 0
+
+
+@pytest.mark.parametrize("cls", [
+    "transport_error", "timeout", "bridge_lost", "a_class_from_a_later_build",
+])
+def test_a_refusal_that_may_already_have_left_counts_as_a_request(cls):
+    """The default direction, and it is deliberately the counting one. These
+    three classes describe a request that reached the wire and then failed,
+    and the fourth is a class this build has never seen: a rule written as an
+    enumeration of what COUNTS would file every future class as free traffic,
+    which is the one direction this number must not lean."""
+    fb = FakeBridge()
+    fb.refuse(cls)
     s = _sender(fb)
     with pytest.raises(probe.ProbeRefused):
         s.get("/a")
@@ -812,13 +847,160 @@ def test_a_response_that_did_not_come_back_whole_is_also_refused():
     # outcome="status_unreadable" when the peer's status line could not be
     # read, and _http.py treats that the same way -- a gap, not proof of
     # absence. get() applies the same rule at the wire rather than handing a
-    # check a response it could misread as clean.
+    # check a response it could misread as clean. It is still a request that
+    # was issued -- the peer answered it -- so it is still counted.
     fb = FakeBridge()
     fb.reply({"status": 599, "outcome": "status_unreadable"}, b"")
     s = _sender(fb)
     with pytest.raises(probe.ProbeRefused) as exc:
         s.get("/a")
     assert exc.value.reason == "status_unreadable"
+    assert s.sent == 1
+
+
+# --- pacing: the one refusal class that is a request to wait ---------------
+
+
+def test_a_rate_limited_probe_waits_the_hint_out_and_then_succeeds():
+    """The half of the `retry_after_us` contract that was never written.
+
+    `Limiter` refuses an over-rate request and says exactly when the window
+    frees; `tests/integration/test_send_path.py::test_the_rate_limit_trips_
+    and_its_retry_hint_is_true` states the contract as "the agent obeys
+    `retry_after_us`". Nothing obeyed it until the probe pass became the
+    first thing in the product to issue requests in a loop, and an unpaced
+    loop at a production rate reports `inconclusive` for every probe after
+    the `rate_rps`'th.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? A sender that raised on the
+    first refusal never makes the second call, so `fb.calls` is 1 and the
+    `get` raises instead of returning.
+    """
+    fb = FakeBridge()
+    _ok(fb)
+    fb.refuse("rate_limited", "rate limit 3/s", retry_after_us=1000, times=1)
+    s = _sender(fb)
+
+    started = time.monotonic()
+    r = s.get("/a")
+
+    assert r.status == 200
+    assert fb.calls == 2
+    assert time.monotonic() - started >= 1000 / 1_000_000
+    # ONE issuance, not two. The refused attempt never left the JVM, so a
+    # sender that counted attempts would report this probe as twice the
+    # traffic it actually was -- which is why the counting rule above and
+    # this retry are one change and not two.
+    assert s.sent == 1
+
+
+def test_the_wait_is_bounded_and_ends_in_a_refusal(monkeypatch):
+    """A limiter that never frees must not spin. Three attempts, two waits,
+    and then the refusal the check would have got anyway -- with the
+    requests still counted at zero, because none of them was issued."""
+    waits: list[float] = []
+    monkeypatch.setattr(probe.time, "sleep", waits.append)
+    fb = FakeBridge()
+    fb.refuse("rate_limited", "rate limit 3/s", retry_after_us=1000)
+    s = _sender(fb)
+
+    with pytest.raises(probe.ProbeRefused) as exc:
+        s.get("/a")
+
+    assert exc.value.reason == "rate_limited"
+    assert probe._RATE_LIMIT_ATTEMPTS == 3
+    assert fb.calls == probe._RATE_LIMIT_ATTEMPTS
+    assert len(waits) == probe._RATE_LIMIT_ATTEMPTS - 1
+    assert s.sent == 0
+
+
+def test_an_over_large_hint_is_clamped_rather_than_obeyed(monkeypatch):
+    """The hint crosses a trust boundary. `Limiter` computes it as
+    `WINDOW_US - elapsed` with `0 < elapsed < WINDOW_US`, so it can never
+    legitimately exceed one second -- and a peer that answered with ten
+    minutes would otherwise stall a scan for ten minutes per probe. The
+    clamp costs nothing a real limiter would ever ask for."""
+    waits: list[float] = []
+    monkeypatch.setattr(probe.time, "sleep", waits.append)
+    fb = FakeBridge()
+    fb.refuse("rate_limited", "", retry_after_us=600_000_000)  # ten minutes
+    s = _sender(fb)
+
+    with pytest.raises(probe.ProbeRefused):
+        s.get("/a")
+
+    ceiling = probe._RETRY_CEILING_S + probe._RETRY_SLACK_S
+    assert waits == [ceiling, ceiling]
+
+
+@pytest.mark.parametrize("hint", [None, 0, -1, "soon"])
+def test_a_rate_limit_with_no_usable_hint_is_terminal(hint):
+    """The direction that spins. `Limiter` always sends a positive hint when
+    it refuses for rate, so a missing, zero, negative or non-numeric one
+    means something else answered -- and inventing a wait for a refusal that
+    did not ask for one is how a scan loops against a peer that will never
+    let it through."""
+    fb = FakeBridge()
+    fb.refuse("rate_limited", "", retry_after_us=hint)
+    s = _sender(fb)
+    with pytest.raises(probe.ProbeRefused):
+        s.get("/a")
+    assert fb.calls == 1
+
+
+@pytest.mark.parametrize("cls", [
+    "budget_exhausted", "scope_denied", "method_denied", "dangerous_denied",
+    "halted", "not_configured", "transport_error", "timeout", "bridge_lost",
+    "a_class_from_a_later_build",
+])
+def test_no_other_class_is_retried_even_when_it_carries_a_hint(cls):
+    """`rate_limited` is an ALLOWLIST of one, not a denylist. A budget that
+    is spent stays spent, scope and method are deterministic policy, `halted`
+    and `not_configured` are session state, and a transport failure may
+    already have reached the target -- replaying that one blindly is the
+    thing S6 forbids. A class this build has never seen is terminal too,
+    which is what an allowlist buys."""
+    fb = FakeBridge()
+    fb.refuse(cls, "", retry_after_us=1000)
+    s = _sender(fb)
+    with pytest.raises(probe.ProbeRefused):
+        s.get("/a")
+    assert fb.calls == 1
+
+
+# --- the client-facing string ----------------------------------------------
+
+
+def test_the_refusal_names_its_class_once():
+    """OBSERVED, against a real Burp: `probe refused: rate_limited:
+    rate_limited: rate limit 3/s: ...`. `BridgeError`'s message already opens
+    with the class, `ProbeRefused` put the reason in front of it again, and
+    `hx.scan.run` prefixes the whole thing a third time on its way into
+    `check_run.reason` -- which is what a client reads in the report's
+    coverage rows."""
+    fb = FakeBridge()
+    fb.refuse("rate_limited", "rate limit 3/s: 3 requests issued in the last second")
+    s = _sender(fb)
+    with pytest.raises(probe.ProbeRefused) as exc:
+        s.get("/a")
+    assert str(exc.value) == (
+        "rate_limited: rate limit 3/s: 3 requests issued in the last second")
+    assert str(exc.value).count("rate_limited") == 1
+    assert exc.value.detail == "rate limit 3/s: 3 requests issued in the last second"
+
+
+def test_a_refusal_carrying_no_detail_is_just_its_class():
+    """`BridgeServer.send` raises a bare `BridgeError("halted",
+    error_class="halted")` for a local halt, so stripping the class prefix
+    leaves the class itself -- which must become an empty detail rather than
+    `halted: halted`."""
+    fb = FakeBridge()
+    fb.refuse("halted")
+    s = _sender(fb)
+    with pytest.raises(probe.ProbeRefused) as exc:
+        s.get("/a")
+    assert str(exc.value) == "halted"
+    assert exc.value.detail == ""
 
 
 def test_the_sender_only_ever_issues_GET():
@@ -893,13 +1075,99 @@ gap rather than proof of absence. `get()` applies the identical rule at the
 wire: only `outcome == "ok"` is handed back as a `ProbeResponse`, and
 anything else raises `ProbeRefused` too, for the same reason -- a check must
 not be able to read an incomplete response as a clean one.
+
+ONE REFUSAL CLASS IS A REQUEST TO WAIT, AND THIS IS THE SEAM THAT OBEYS IT.
+`hx.policy.Limiter` REFUSES an over-rate request rather than queueing it, and
+puts the exact moment the window frees on the refusal --
+`Decision.rateLimited(WINDOW_US - elapsed, ...)`, which `BridgeServer.send`
+carries out to Python on `BridgeError.retry_after_us`. That hint is computed
+exactly, plumbed through four layers and pinned end to end
+(`tests/integration/test_send_path.py::test_the_rate_limit_trips_and_its_
+retry_hint_is_true`, whose own docstring states the contract: "the agent
+obeys `retry_after_us`"). Nothing on this side consumed it until the probe
+pass became the first thing in the product to issue requests in a loop, and
+an unpaced probe pass at a production rate is not a slow scan, it is a scan
+that reports `inconclusive` for every probe after the `rate_rps`'th and finds
+almost nothing. MEASURED against a real Burp at the integration rig's 3/s: of
+the sixteen probes one scan of five surfaces issues, three were answered and
+thirteen were refused.
+
+`rate_limited` ONLY, AS AN ALLOWLIST AND NEVER AS A DENYLIST. Every other
+class is terminal, and a new class arriving from a future extension is
+terminal by default rather than accidentally retried: `scope_denied`,
+`method_denied` and `dangerous_denied` are deterministic policy and answer
+the same way for ever; `budget_exhausted` is monotonic by construction
+(`Limiter`: "a budget that is spent stays spent", with no way to refill it);
+`halted` and `not_configured` are session state that a wait does not change;
+and `transport_error`, `timeout` and `bridge_lost` may have already reached
+the target, so replaying them blindly is the one thing a safe sender may not
+do.
+
+THE WAIT IS HERE AND NOT IN `BridgeServer`. That module's "NOTHING IN THIS
+FILE RETRIES" stays literally true, and it should: S6's objection is that a
+replayed STATE-CHANGING request is worse than a failed one, and only a caller
+knows whether its request was one. This sender is a caller that does know.
+`_request_bytes` can build nothing but a GET, and `Limiter.check` increments
+`issued` on the ALLOW path only -- "Refusals are not issuances and do not
+appear here" -- so a request refused for rate never left the JVM and a
+bounded retry cannot double-spend `limit.max_requests`. The published
+decision order is `not_configured, halted, scope, method, dangerous, rate,
+budget`, so a `rate_limited` answer also means scope, method and dangerous
+ALREADY PASSED: waiting cannot turn a denial into an allow.
+
+THE HINT CROSSES A TRUST BOUNDARY, SO IT IS BOUNDED IN BOTH DIRECTIONS. A
+missing or non-positive hint is terminal -- inventing a wait for a refusal
+that did not ask for one is how a scan spins -- and an over-large one is
+CLAMPED to `_RETRY_CEILING_S` rather than obeyed, so a peer cannot stall a
+scan by answering with a huge number. The clamp costs nothing real:
+`retryAfterUs` is `WINDOW_US - elapsed` with `0 < elapsed < WINDOW_US`, so a
+`Limiter` cannot legitimately ask for more than one second. Attempts are
+bounded at `_RATE_LIMIT_ATTEMPTS`, which puts a ceiling of roughly two
+seconds on what any one probe can add; the run as a whole is bounded by
+`hx.scan.run`'s `max_seconds`, so no deadline is threaded through here.
+
+THE COUNT IS OF ISSUANCES, NOT ATTEMPTS. `check_run.requests_sent` reaches a
+client's report as the traffic hx generated, so it has to be true of the
+requests that were actually made. `Limiter` decides `scope_denied`,
+`method_denied`, `dangerous_denied`, `rate_limited` and `budget_exhausted`
+BEFORE issuing and never increments `issued` for them, and `halted` /
+`not_configured` are refused on this side before a frame is written at all --
+so none of the seven is a request the target saw, and counting them would
+overstate the traffic AND make every retry above double-count. Everything
+else counts, by default and including a class this build has never seen:
+`transport_error`, `timeout` and `bridge_lost` may already have reached the
+target, and a `status_unreadable` outcome certainly did. Overstating traffic
+is the safe direction; understating what hx put on a client's system is not.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from hx.bridge.server import BridgeError, BridgeServer
 from hx.checks.passive import _http
+
+# ATTEMPTS, not retries: 3 is one issue and at most two waits, so the worst
+# case a single probe can add to a scan is two clamped waits (~2 s).
+_RATE_LIMIT_ATTEMPTS = 3
+
+# The most a `Limiter` can legitimately ask for is one window, and the window
+# is one second (`Limiter.WINDOW_US`). A larger hint is a peer that is wrong
+# or hostile, and either way it does not get to decide how long hx waits.
+_RETRY_CEILING_S = 1.0
+
+# The same slack `tests/integration/test_send_path.py` already waits with:
+# the hint is exact about when the window frees, and two clocks that are
+# exactly equal are two clocks that race.
+_RETRY_SLACK_S = 0.02
+
+# The refusal classes the gate decides BEFORE issuing, so none of them is a
+# request the target saw. Named as an EXCLUSION set on purpose -- see the
+# module docstring's last paragraph: anything not listed here counts.
+_NOT_ISSUED = frozenset({
+    "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
+    "budget_exhausted", "halted", "not_configured",
+})
 
 
 class ProbeRefused(Exception):
@@ -917,6 +1185,21 @@ class ProbeResponse:
     head: bytes
     body: bytes
     outcome: str
+
+
+def _rate_limit_wait(exc: BridgeError) -> float | None:
+    """Seconds to wait out a `rate_limited` refusal, or None if it is terminal.
+
+    None for a hint that is absent, non-numeric or non-positive: `Limiter`
+    always sends a positive one when it refuses for rate, so its absence means
+    something other than that limiter answered and there is nothing to wait
+    for. Waiting anyway -- a default, a backoff -- is what makes a scan spin
+    against a peer that will never let it through.
+    """
+    hint = exc.retry_after_us
+    if not isinstance(hint, (int, float)) or isinstance(hint, bool) or hint <= 0:
+        return None
+    return min(hint / 1_000_000, _RETRY_CEILING_S) + _RETRY_SLACK_S
 
 
 class ProbeSender:
@@ -943,30 +1226,50 @@ class ProbeSender:
                 "a sender is bound to one surface and cannot be pointed "
                 "somewhere else")
         raw = self._request_bytes(path, headers or {})
-        self._sent += 1          # BEFORE the call: a refused attempt still
-                                 # spent the budget and still touched the
-                                 # target, and a count that omitted refusals
-                                 # would understate the traffic hx generated.
-        try:
-            result = self._bridge.send(
-                {"target_host": self._host, "target_port": self._port,
-                 "tls": self._scheme == "https"},
-                raw, timeout=timeout)
-        except BridgeError as exc:
-            # BridgeServer.send() never returns a refusal -- it raises this,
-            # with the wire's class on .error_class (None only for a
-            # malformed call, which a correctly bound sender never makes).
-            # Translating it here is what makes rule one hold in practice.
-            raise ProbeRefused(exc.error_class or "transport_error",
-                               str(exc)) from exc
-        outcome = result.get("outcome", "ok")
-        if outcome != "ok":
-            raise ProbeRefused(
-                outcome, "the response did not come back whole, so nothing "
-                         "found in it separates tested from unreachable")
-        head, body = _http._split_head_body(
-            result.get(BridgeServer.BODY_KEY, b""))
-        return ProbeResponse(result.get("status"), head, body, outcome)
+        attempts_left = _RATE_LIMIT_ATTEMPTS
+        while True:
+            attempts_left -= 1
+            try:
+                result = self._bridge.send(
+                    {"target_host": self._host, "target_port": self._port,
+                     "tls": self._scheme == "https"},
+                    raw, timeout=timeout)
+            except BridgeError as exc:
+                # BridgeServer.send() never returns a refusal -- it raises
+                # this, with the wire's class on .error_class (None only for a
+                # malformed call or a peer answering a send with the wrong
+                # frame, the second of which HAS already put bytes on the
+                # wire). Translating it here is what makes rule one hold in
+                # practice.
+                cls = exc.error_class or "transport_error"
+                if cls not in _NOT_ISSUED:
+                    # Counted before the raise and before the retry decision:
+                    # this attempt may have reached the target, and a class
+                    # this build has never seen counts too.
+                    self._sent += 1
+                wait = _rate_limit_wait(exc) if cls == "rate_limited" else None
+                if wait is not None and attempts_left > 0:
+                    time.sleep(wait)
+                    continue
+                # `BridgeError`'s own message already opens with the class
+                # ("rate_limited: rate limit 3/s: ..."), and `ProbeRefused`
+                # puts the reason in front of the detail again -- which
+                # `hx.scan.run` then prefixes a third time on its way into
+                # `check_run.reason` and the report's coverage rows.
+                detail = str(exc).removeprefix(f"{cls}: ")
+                raise ProbeRefused(cls, "" if detail == cls else detail) from exc
+            # The send returned a `result` frame, so a request was issued --
+            # whatever the frame then says about how much of the answer came
+            # back.
+            self._sent += 1
+            outcome = result.get("outcome", "ok")
+            if outcome != "ok":
+                raise ProbeRefused(
+                    outcome, "the response did not come back whole, so nothing "
+                             "found in it separates tested from unreachable")
+            head, body = _http._split_head_body(
+                result.get(BridgeServer.BODY_KEY, b""))
+            return ProbeResponse(result.get("status"), head, body, outcome)
 
     def _request_bytes(self, path: str, headers: dict[str, str]) -> bytes:
         lines = [f"GET {path} HTTP/1.1", f"Host: {self._host}"]
