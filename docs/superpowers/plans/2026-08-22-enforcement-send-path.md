@@ -26399,6 +26399,7 @@ from urllib.parse import quote
 
 import pytest
 
+from hx import config, surface
 from hx.checks import registry
 from hx.checks.active import cors, open_redirect, path_traversal
 from hx.checks.active import reflected_input, sql_error
@@ -26909,6 +26910,67 @@ def test_the_fixtures_passwd_is_not_the_machines(target):
     real = pathlib.Path("/etc/passwd")
     if real.exists():
         assert real.read_text(errors="replace") != ts.FAKE_PASSWD
+
+
+# ---------------------------------------------------------------------------
+# The one route whose path the normaliser TEMPLATES.
+#
+# Every route in VULNERABLE_ROUTES is static, so `path_template == path` for
+# every surface this suite builds and `hx.surface`'s normaliser never ran on
+# the active corpus's own data. F1 of the whole-branch review lived in that
+# blind spot. These tests are the instrument for the integration test that
+# closes it, in the fast suite for the same reason the rest of this file is.
+# ---------------------------------------------------------------------------
+
+def test_the_templated_route_is_a_path_hx_surface_actually_templates():
+    """The claim the whole route rests on, made against the real normaliser
+    and its real defaults rather than by eye. A route whose path came back
+    unchanged would leave the integration test measuring a static surface
+    again -- passing, and proving nothing."""
+    cfg = config.Config(name="t", client="t", scope_include=["*"])
+    templated = surface.path_template(
+        ts.TEMPLATED_ROUTE, preserve=frozenset(cfg.preserve_segments),
+        slug_threshold=cfg.slug_threshold)
+    assert templated == ts.TEMPLATED_SURFACE
+    assert templated != ts.TEMPLATED_ROUTE
+
+
+def test_the_templated_route_reflects_the_id_segment(target):
+    status, headers, body = _get(target, ts.TEMPLATED_ROUTE)
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert b"12345" in body
+
+
+def test_the_templated_route_answers_any_id_not_only_the_browsed_one(target):
+    """Matched by shape, because every probe REPLACES that segment: a handler
+    keyed on the browsed path would 404 every probe and the integration test
+    would measure a refusal instead of a reflection."""
+    status, _headers, body = _get(target, "/user/Zq7pLx3nV0aB/profile")
+    assert status == 200
+    assert b"Zq7pLx3nV0aB" in body
+
+
+def test_the_templated_routes_reflection_survives_the_escalation_wrapper(target):
+    """The second half of what `reflected_input` asks, exactly as
+    `test_the_search_route_reflects_its_input_unescaped` asks it of `/search`
+    -- except that here the value rides a PATH SEGMENT, so the route has to
+    percent-decode it the way a vulnerable application would."""
+    wrapped = f"{reflected_input._META_CHARS}Zq7pLx3nV0aB{reflected_input._META_CHARS}"
+    status, _headers, body = _get(
+        target, f"/user/{quote(wrapped, safe='')}/profile")
+    assert status == 200
+    assert wrapped.encode() in body
+
+
+@pytest.mark.parametrize("path", [
+    "/user/12345", "/user//profile", "/user/12345/profile/extra",
+    "/users/12345/profile", "/user/12345/settings",
+])
+def test_nothing_else_reaches_the_templated_route(target, path):
+    """The handler matches a shape, and a shape that matched too much would
+    answer for paths other routes own -- or for a 404 this suite relies on."""
+    assert _get(target, path)[0] == 404
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -26965,7 +27027,7 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 # The value that must never be found on disk. It stands in for a live
 # production session cookie, and it is distinctive enough that a byte search
@@ -27076,6 +27138,36 @@ VULNERABLE_ROUTES: dict[str, str] = {
     "hx.active.reflected-input": "/search?q=hello",
     "hx.active.sql-error": "/db/lookup?id=42",
 }
+
+# ONE ROUTE WHOSE PATH `hx.surface` WILL TEMPLATE, and the reason it is not in
+# the map above. Every route in `VULNERABLE_ROUTES` is static -- not one
+# carries a numeric, uuid, hex or slug segment -- so `path_template == path`
+# for every surface this suite has ever built, and the normaliser never ran on
+# any data the active corpus was measured against. F1 of the whole-branch
+# review lived in exactly that blind spot: all five checks probed
+# `surface.path_template` literally, which on a templated surface is an
+# address that cannot exist, and 35 integration tests and 1262 unit tests
+# stayed green.
+#
+# `12345` is what `hx.surface._template_segment` replaces with `{id}`, so the
+# surface this produces is `/user/{id}/profile` and the exemplar request that
+# proved it exists is this concrete path. The route REFLECTS the id segment,
+# which makes `hx.active.reflected-input` the check that finds it -- the one
+# active check that probes a `path_segment` and therefore the one whose probe
+# has to substitute INTO the concrete address rather than into the template.
+#
+# NOT in `VULNERABLE_ROUTES` because that map is keyed by check id: it holds
+# exactly one route per check and `hx.active.reflected-input` already has
+# `/search`. A second entry cannot be added, and the arithmetic of the tests
+# that read it -- one finding per check, 16 probes per scan -- is about that
+# map rather than about this file. This route is browsed by the one test that
+# names it.
+TEMPLATED_ROUTE = "/user/12345/profile"
+
+# The surface `TEMPLATED_ROUTE` normalises to, spelt once so a test asserting
+# on it and the route it browses cannot drift apart.
+TEMPLATED_SURFACE = "/user/{id}/profile"
+
 
 # MySQL's own wording for a query that did not parse, matching
 # `hx.checks.active.sql_error._SIGNATURES`' first entry. It deliberately does
@@ -27362,8 +27454,42 @@ class _Handler(BaseHTTPRequestHandler):
                 # Deliberately does not echo `name`: see the one-route-one-check
                 # paragraph beside VULNERABLE_ROUTES.
                 self._reply(200, {"served": True})
+        elif self._templated_id(parts.path) is not None:
+            # For `hx.active.reflected-input`, through a PATH SEGMENT rather
+            # than a query parameter -- see TEMPLATED_ROUTE's own comment for
+            # why this route is not in VULNERABLE_ROUTES.
+            #
+            # `unquote` is the decode a vulnerable application does itself,
+            # exactly as `parse_qs` does it for `/files` and `/search`:
+            # `reflected_input` percent-encodes every value that rides the
+            # request line, so without it the escalation's `<>"'` wrapper
+            # would come back as `%3C%3E%22%27` and answer a question about
+            # encoding rather than about this application. NOT `_reply`, for
+            # the reason `/search` gives: `json.dumps` would escape the `"`.
+            ident = unquote(self._templated_id(parts.path))
+            self._reply_text(
+                200, "<html><body><h1>Profile</h1>"
+                     f"<p>User {ident}</p></body></html>")
         else:
             self._reply(404, {"error": "no such route"})
+
+    @staticmethod
+    def _templated_id(path: str) -> str | None:
+        """The middle segment of `/user/<id>/profile`, or None for any other
+        path.
+
+        Matched by SHAPE rather than by equality with `TEMPLATED_ROUTE`,
+        because the whole point of the route is that a probe replaces that
+        segment with something else: a handler keyed on the literal browsed
+        path would 404 every probe and the test would measure a refusal.
+        """
+        segments = path.split("/")
+        if len(segments) != 4:
+            return None
+        blank, user, ident, profile = segments
+        if (blank, user, profile) != ("", "user", "profile") or not ident:
+            return None
+        return ident
 
     def _reply(self, status: int, payload: dict,
                extra: tuple[tuple[str, str], ...] = ()) -> None:

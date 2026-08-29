@@ -34,6 +34,17 @@ received == `PROBES_PER_SCAN`) has to hold THROUGH the refusals and the waits:
 every probe eventually issued exactly once, counted exactly once, and seen by
 the target exactly once.
 
+AND ONE SURFACE WHOSE PATH THE NORMALISER TEMPLATES, WHICH IS THE THIRD TEST
+BELOW. Every route in `VULNERABLE_ROUTES` is static, so `path_template ==
+path` for all five surfaces above and `hx.surface`'s normaliser never ran on
+any data this corpus was measured against. F1 of the whole-branch review lived
+exactly there: all five checks probed `surface.path_template` literally, which
+on a templated surface is an address that cannot exist, and every one of them
+answered `clean` with `considered` populated -- retiring live findings from a
+404. 35 integration tests and 1262 unit tests stayed green. The assertion that
+would have caught it is against the TARGET's own request log, which is the one
+witness this side cannot fake: what arrived, and that it carried no `{`.
+
 WHAT THE PASSIVE CORPUS CANNOT DELIVER, and why the second test below is the
 point of the whole task: `test_scan_and_report.py` proves a finding is re-found
 by a second scan, and its own claim 3 measures that a finding CANNOT be retired
@@ -54,8 +65,9 @@ import pytest
 
 from hx import report, scan
 from hx.checks import registry
-from hx.checks.active import cors
-from tests.integration.target_server import VULNERABLE_ROUTES
+from hx.checks.active import cors, reflected_input
+from tests.integration.target_server import (
+    TEMPLATED_ROUTE, TEMPLATED_SURFACE, VULNERABLE_ROUTES)
 
 pytestmark = pytest.mark.integration
 
@@ -387,3 +399,86 @@ def test_a_second_scan_is_stable_and_a_fixed_endpoint_retires_only_its_own_findi
                  and r["path_template"] == VULNERABLE_ROUTES["hx.active.cors"]]
     assert [(r["verdict"], r["requests_sent"]) for r in cors_rows] == [("clean", 1)], \
         cors_rows
+
+
+# ---------------------------------------------------------------------------
+# 3. A templated surface: the probe goes to the address, not to the identity.
+# ---------------------------------------------------------------------------
+
+def test_a_templated_surface_is_probed_at_its_own_concrete_path(rig):
+    """F1, end to end, against the one witness this side cannot fake.
+
+    `/user/12345/profile` normalises to the surface `/user/{id}/profile`, and
+    the id segment is REFLECTED -- so `hx.active.reflected-input` finds it
+    only if its probe reaches a URL that exists and carries its canary in the
+    place the template merely names.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? Measured against this exact
+    route with the pre-fix corpus: every probe went to `/user/{id}/profile`,
+    the target answered 404 from its own catch-all, nothing reflected, and
+    all five checks recorded `clean` -- the finding assertion below reddens,
+    and so does the hit-log assertion, which is the one that says WHY.
+    """
+    _configure(rig)
+    rig.browse("GET", TEMPLATED_ROUTE)
+    rig.settle(
+        lambda: len(rows(rig, "SELECT id FROM surface")) == 1,
+        "one surface for the templated route")
+    hits_before = len(rig.target.hits)
+
+    # THE SURFACE REALLY IS TEMPLATED. Without this the rest measures a
+    # static route, passes, and proves nothing -- which is precisely how the
+    # five surfaces above kept this defect invisible.
+    surfaces = rows(rig, "SELECT path_template FROM surface")
+    assert [s["path_template"] for s in surfaces] == [TEMPLATED_SURFACE]
+
+    _scan(rig)
+
+    findings = [f for f in _active_findings(rig)
+                if f["check_id"] == "hx.active.reflected-input"]
+    assert len(findings) == 1, (
+        "the reflected id segment was not found; a probe that went to the "
+        f"template reaches a 404 and reflects nothing. {findings}")
+    assert findings[0]["path_template"] == TEMPLATED_SURFACE
+    assert findings[0]["insertion_name"] == "{id}", (
+        "the finding must name the insertion point the template calls it, "
+        "which is the surface's identity and what a retest matches on")
+
+    # THE ASSERTION THAT WOULD HAVE CAUGHT F1. `hits` is what the target
+    # actually received; every path in it must be a real address, and no
+    # request may carry a placeholder. `hx` cannot fake this: the log is
+    # written by the server before it answers.
+    arrived = rig.target.hits[hits_before:]
+    assert arrived, "the scan sent nothing at all"
+    for hit in arrived:
+        assert "{" not in hit.path and "}" not in hit.path, hit
+        segments = hit.path.split("/")
+        assert len(segments) == 4 and segments[1] == "user" \
+            and segments[3] == "profile", hit
+
+    # AND THE PAYLOAD LANDED IN THE SEGMENT THE TEMPLATE NAMES, rather than
+    # beside the exemplar's own id. A `str.replace` of `{id}` against the
+    # concrete path substitutes nothing and re-sends `12345` -- a probe that
+    # tests nothing and reads as clean.
+    probed_ids = {hit.path.split("/")[2] for hit in arrived}
+    assert probed_ids - {"12345"}, (
+        "every probe re-sent the exemplar's own id, so none of them carried "
+        f"a payload at all: {probed_ids}")
+
+    # NOTHING WENT WRONG QUIETLY, the same guard the first test makes. A
+    # `ValueError` from `ProbeSender`'s placeholder refusal lands `error`
+    # here rather than `clean`, which is the safe direction and still a
+    # failure of this test.
+    run_id = _last_scan_run(rig)
+    bad = [r for r in _check_runs(rig, run_id)
+           if r["check_id"] in ACTIVE_CHECK_IDS and r["verdict"] == "error"]
+    assert bad == [], bad
+
+    # The escalation is what makes it the Medium finding rather than the Low
+    # one: the `<>"\'` wrapper survived the round trip through Burp, a real
+    # socket, and a route that percent-decodes its own path segment.
+    assert findings[0]["severity"] == "Medium", (
+        f"the escalation's {reflected_input._META_CHARS!r} wrapper did not "
+        "come back intact; it rides a PATH SEGMENT here rather than a query "
+        "string, through Burp and a real socket")
+

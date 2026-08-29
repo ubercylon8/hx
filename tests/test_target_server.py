@@ -32,6 +32,7 @@ from urllib.parse import quote
 
 import pytest
 
+from hx import config, surface
 from hx.checks import registry
 from hx.checks.active import cors, open_redirect, path_traversal
 from hx.checks.active import reflected_input, sql_error
@@ -542,3 +543,65 @@ def test_the_fixtures_passwd_is_not_the_machines(target):
     real = pathlib.Path("/etc/passwd")
     if real.exists():
         assert real.read_text(errors="replace") != ts.FAKE_PASSWD
+
+
+# ---------------------------------------------------------------------------
+# The one route whose path the normaliser TEMPLATES.
+#
+# Every route in VULNERABLE_ROUTES is static, so `path_template == path` for
+# every surface this suite builds and `hx.surface`'s normaliser never ran on
+# the active corpus's own data. F1 of the whole-branch review lived in that
+# blind spot. These tests are the instrument for the integration test that
+# closes it, in the fast suite for the same reason the rest of this file is.
+# ---------------------------------------------------------------------------
+
+def test_the_templated_route_is_a_path_hx_surface_actually_templates():
+    """The claim the whole route rests on, made against the real normaliser
+    and its real defaults rather than by eye. A route whose path came back
+    unchanged would leave the integration test measuring a static surface
+    again -- passing, and proving nothing."""
+    cfg = config.Config(name="t", client="t", scope_include=["*"])
+    templated = surface.path_template(
+        ts.TEMPLATED_ROUTE, preserve=frozenset(cfg.preserve_segments),
+        slug_threshold=cfg.slug_threshold)
+    assert templated == ts.TEMPLATED_SURFACE
+    assert templated != ts.TEMPLATED_ROUTE
+
+
+def test_the_templated_route_reflects_the_id_segment(target):
+    status, headers, body = _get(target, ts.TEMPLATED_ROUTE)
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert b"12345" in body
+
+
+def test_the_templated_route_answers_any_id_not_only_the_browsed_one(target):
+    """Matched by shape, because every probe REPLACES that segment: a handler
+    keyed on the browsed path would 404 every probe and the integration test
+    would measure a refusal instead of a reflection."""
+    status, _headers, body = _get(target, "/user/Zq7pLx3nV0aB/profile")
+    assert status == 200
+    assert b"Zq7pLx3nV0aB" in body
+
+
+def test_the_templated_routes_reflection_survives_the_escalation_wrapper(target):
+    """The second half of what `reflected_input` asks, exactly as
+    `test_the_search_route_reflects_its_input_unescaped` asks it of `/search`
+    -- except that here the value rides a PATH SEGMENT, so the route has to
+    percent-decode it the way a vulnerable application would."""
+    wrapped = f"{reflected_input._META_CHARS}Zq7pLx3nV0aB{reflected_input._META_CHARS}"
+    status, _headers, body = _get(
+        target, f"/user/{quote(wrapped, safe='')}/profile")
+    assert status == 200
+    assert wrapped.encode() in body
+
+
+@pytest.mark.parametrize("path", [
+    "/user/12345", "/user//profile", "/user/12345/profile/extra",
+    "/users/12345/profile", "/user/12345/settings",
+])
+def test_nothing_else_reaches_the_templated_route(target, path):
+    """The handler matches a shape, and a shape that matched too much would
+    answer for paths other routes own -- or for a 404 this suite relies on."""
+    assert _get(target, path)[0] == 404
+
