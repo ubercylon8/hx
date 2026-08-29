@@ -49,10 +49,15 @@ redirect response, `urlsplit(location).hostname` -- which also resolves a
 protocol-relative `//host/path` `Location`, a real redirect shape some
 servers emit -- decides the case: a host equal (ASCII case-insensitively)
 to the marker's is the finding, because nothing the target could have
-learned about this engagement could make it redirect there on its own. A
-`Location` that is empty, relative (no host at all), or names some other
-host is not: the parameter was not used to build the response's target, or
-the target validated it, and that is what "clean" says here.
+learned about this engagement could make it redirect there on its own.
+
+A `Location` that is empty, relative (no host at all), or names some other
+host is NOT a finding -- and it is not `clean` either, it is `inconclusive`.
+The two readings of such a response ("the target validated the parameter"
+and "the target never looked at the parameter, it just bounced us to a login
+page") are not separable from the outside, and only the first of them may
+retire anything. `clean` here means a 2xx that did not redirect at all; see
+the 3xx paragraph below.
 
 THE PROBE GOES TO THE EXEMPLAR'S OWN PATH (`sender.path`), NOT TO THE SURFACE
 ROW'S `path_template`. F1 of the whole-branch review: `_probe_path` used to
@@ -63,13 +68,24 @@ URL that cannot exist, the 404 carried no `Location`, and this check answered
 `hx.checks.probe.ProbeSender` now refuses a path still carrying a placeholder
 and is bound to the exemplar's concrete path instead.
 
-A RESPONSE THAT REFUSED IS NOT A CLEAN ONE, EITHER. A 403, a 429, a 5xx or a
-404 has no `Location` for the same reason a properly validating target has
-none. `_probe_util.unanswered` names those, `_probe_util.verdict` turns them
-into `inconclusive`, and the doctrine is shared by all five active checks
-rather than spelt here -- see `_probe_util.py`. Note what is NOT in that set:
-3xx, which is this check's own finding condition, and 2xx, which is the
-ordinary answer from a target that validated the parameter.
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE, EITHER. A 400, a 403, a 429, a
+5xx or a 404 has no `Location` for the same reason a properly validating
+target has none. `_probe_util.unanswered` names those, `_probe_util.verdict`
+turns them into `inconclusive`, and the doctrine is shared by all five active
+checks rather than spelt here -- see `_probe_util.py`.
+
+A 3xx IS IN THAT SET TOO, AND THIS CHECK STILL KEEPS ITS FINDING -- because
+of the ORDER the two questions are asked in below, not because of an
+exemption. A `Location` naming `_MARKER_HOST` is a candidate, and
+`unanswered` is consulted only on the branch where that match FAILED, so the
+finding never meets the doctrine. What the 3xx rule changes here is the other
+direction, and N1 of the scoped re-review is why it had to: a redirect to
+somewhere this check did not ask for -- a login page, the target's own
+dashboard, a relative path -- is `inconclusive` now, where it used to be
+`clean`. The endpoint sent the browser away, and nothing in that response
+says whether it looked at this parameter at all. So this check answers
+`clean` only on a NON-REDIRECTING 2xx, which is the one response that is a
+genuine test: the endpoint took the marker and chose not to redirect to it.
 
 CONSIDERED, NAMED HONESTLY. `_ISSUE_TYPE` is only added to `considered`
 when this check actually issued at least one probe on this surface. A
@@ -155,7 +171,10 @@ def _redirect_host(status: int | None, head: bytes) -> str | None:
     `None` for a non-redirect status, an absent header, or a `Location`
     with no host at all (relative, or unparseable) -- every one of those is
     "this response did not send the browser anywhere the marker could be
-    read off", which is exactly the clean case.
+    read off". That is the answer to THIS function's question and not a
+    verdict: the caller then asks `_probe_util.unanswered`, which separates
+    the 2xx that genuinely declined to redirect (clean) from the 3xx that
+    went somewhere else entirely (a gap).
     """
     if status not in _REDIRECT_STATUSES:
         return None

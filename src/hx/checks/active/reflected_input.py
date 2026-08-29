@@ -90,10 +90,13 @@ that tests nothing. `_probe_util.substitute_segment` aligns the two paths by
 segment index instead, and returns `None` -- a gap, never a silent
 substitution-that-did-not-happen -- when it cannot.
 
-A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 403, a 429, a 5xx or a 404
-reflects nothing for the same reason a properly encoding target reflects
-nothing, and the two must not record the same verdict. See `_probe_util.py`
-for the doctrine, which all five active checks share.
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 400, a 403, a 429, a 5xx, a
+404 -- or a 302 to a login page, which is the commonest of them all against
+the browser-facing applications hx captures -- reflects nothing for the same
+reason a properly encoding target reflects nothing, and the two must not
+record the same verdict. See `_probe_util.py` for the doctrine, which all
+five active checks share, and for the measurement (N1) that put 3xx in it:
+this check's own live finding was the one that came back retired.
 
 A REFUSAL BY THE SEND PATH ENDS ONE POINT, NOT THE SURFACE, AND `cookie` IS
 STILL DECLARED ON PURPOSE. F2 of the whole-branch review, measured on this

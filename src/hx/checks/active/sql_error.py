@@ -99,13 +99,13 @@ the exemplar's own value back; `_probe_util.substitute_segment` aligns the
 two paths by segment index instead and returns `None` rather than a probe
 that tests nothing.
 
-A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 403, a 429 or a 404 carries no
-driver wording for the same reason a parameterised query carries none. 5xx is
-in that set too and the ordering below is what keeps that honest: `_match` is
-consulted FIRST, so a driver error disclosed ON a 500 -- which is exactly
-where one usually arrives -- is a finding, and only a 5xx that disclosed
-nothing becomes a gap. See `_probe_util.py` for the doctrine all five active
-checks share.
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 400, a 403, a 429, a 404 or a
+3xx to a login page carries no driver wording for the same reason a
+parameterised query carries none. 5xx is in that set too and the ordering
+below is what keeps that honest: `_match` is consulted FIRST, so a driver
+error disclosed ON a 500 -- which is exactly where one usually arrives -- is
+a finding, and only a 5xx that disclosed nothing becomes a gap. See
+`_probe_util.py` for the doctrine all five active checks share.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
 same reason every active check in this corpus gives: nothing in this build
@@ -272,9 +272,9 @@ class SqlError:
             if found is None:
                 # ASKED ONLY WHERE NOTHING MATCHED, and that ordering is what
                 # keeps a 500 usable: driver wording disclosed on one IS the
-                # finding, and only a 5xx (or 403, 404, 429) that disclosed
-                # nothing is a gap. `_probe_util.verdict`'s "a candidate wins
-                # over a gap", one step earlier.
+                # finding, and only a status in `_probe_util._NOT_AN_ANSWER`
+                # that disclosed nothing is a gap. `_probe_util.verdict`'s "a
+                # candidate wins over a gap", one step earlier.
                 refusal = _probe_util.unanswered(resp)
                 if refusal is not None:
                     gaps.append(f"{insertion.name}: {refusal}")

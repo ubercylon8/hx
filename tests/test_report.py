@@ -11,6 +11,7 @@ the `surface` row it belongs to and sets `surface_id` on it -- `scan.py`'s
 a surface), and a fixture that skipped that no longer matches what production
 ever writes.
 """
+import dataclasses
 import hashlib
 import sqlite3
 from pathlib import Path
@@ -21,6 +22,7 @@ from hx import config as config_mod
 from hx import report
 from hx import surface as surface_mod
 from hx.checks import probe as probe_mod
+from hx.checks.active import _probe_util
 from hx.checks.active import path_traversal
 from hx.checks import base
 from hx.store import blobs as blobs_mod
@@ -2421,6 +2423,38 @@ def test_limits_disclose_that_every_probe_was_unauthenticated(
     assert "Every probe was sent unauthenticated" in limits
     assert "no cookie, no `Authorization`" in limits
     assert "`hx.active.cors`" in limits
+
+
+def test_the_unauthenticated_bullets_safety_claim_is_one_the_code_honours(
+        report_env_with_blobs):
+    """N1 OF THE SCOPED RE-REVIEW, AND THE WORST THING IT FOUND. The bullet
+    above tells a client that a login redirect or an authorisation refusal
+    is recorded as `inconclusive` rather than as a clean result. It said
+    that while `_probe_util._NOT_AN_ANSWER` held 401/403/404/429 and 5xx and
+    deliberately EXCLUDED 3xx -- so the sentence was false for the login
+    redirect, which is the commonest shape of the case it describes, and a
+    live finding was measured retiring behind one.
+
+    A false claim in a client deliverable is the most serious kind this
+    project has, so the claim is tied to the code that has to honour it:
+    every status the sentence names is asked of the doctrine itself. Narrow
+    the set and this fails, naming the sentence that has to go with it."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "A login redirect, an authorisation refusal, or a rejection of " \
+        "the request itself is recorded as `inconclusive`" in limits
+
+    resp = probe_mod.ProbeResponse(status=None, head=b"", body=b"",
+                                   outcome="ok")
+    for status, what in [(302, "a login redirect"), (301, "a login redirect"),
+                         (401, "an authorisation refusal"),
+                         (403, "an authorisation refusal"),
+                         (400, "a rejection of the request itself"),
+                         (405, "a rejection of the request itself")]:
+        assert _probe_util.unanswered(
+            dataclasses.replace(resp, status=status)) is not None, (
+                f"the Limits page claims {what} is `inconclusive`, and "
+                f"status {status} is read as a conclusive negative")
 
 
 def test_limits_disclose_that_credential_insertion_points_are_not_probed(

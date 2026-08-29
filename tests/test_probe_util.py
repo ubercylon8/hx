@@ -153,22 +153,53 @@ def test_a_substitution_that_cannot_be_made_is_None_not_the_address(
 # ---- unanswered() ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 502, 503, 599])
+@pytest.mark.parametrize("status", [
+    400, 401, 403, 404, 405, 429,
+    300, 301, 302, 303, 304, 307, 308,
+    500, 502, 503, 599,
+])
 def test_a_refusing_status_is_named_as_one(status):
     reason = _probe_util.unanswered(_response(status=status))
     assert reason is not None
     assert str(status) in reason
 
 
-@pytest.mark.parametrize("status", [200, 201, 204, 301, 302, 304, 307, 400,
-                                    405, 418])
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_a_redirect_is_not_an_answer_for_any_check_that_shares_this_doctrine(
+        status):
+    """N1 of the scoped re-review, and the case that cost the most. A 3xx
+    used to sit outside the set on the ground that it is `open_redirect`'s
+    own FINDING. It is -- and that is a fact about one check, not about the
+    doctrine: every probe this build sends is unauthenticated, and the
+    ordinary answer a browser-facing application gives an unauthenticated
+    request is a 302 to a login page. Read as a conclusive negative, that
+    retired live findings on all five checks.
+
+    `open_redirect` is unharmed because of WHERE it asks: its marker in a
+    `Location` is a candidate, and `unanswered` is consulted only where its
+    own match failed. Any OTHER 3xx is a gap for it too -- the endpoint sent
+    us somewhere we did not ask for, and nothing here can tell whether it
+    looked at the parameter at all."""
+    assert _probe_util.unanswered(_response(status=status)) is not None
+
+
+@pytest.mark.parametrize("status", [400, 405])
+def test_a_rejected_request_is_not_a_conclusive_negative_either(status):
+    """The second-order members of the same family. Every probe drops the
+    endpoint's OTHER query parameters, so a 400 from a multi-parameter
+    endpoint is the EXPECTED answer rather than an unusual one, and a 405 is
+    the endpoint declining the only method this build can send. Neither is
+    evidence the payload was safe: the earlier justification -- "a fact about
+    the endpoint the check may reason about" -- named no check that reasons
+    about it, and none does."""
+    assert _probe_util.unanswered(_response(status=status)) is not None
+
+
+@pytest.mark.parametrize("status", [200, 201, 204, 206, 418])
 def test_an_answering_status_is_not_a_gap(status):
-    """2xx and 3xx are the application answering -- and a 3xx is
-    `open_redirect`'s own FINDING, so a doctrine that swallowed it would
-    delete a check. The 4xx values here are the ones deliberately left out
-    of `_NOT_AN_ANSWER`: a 400 or a 405 is the application rejecting this
-    REQUEST, which is a fact about the endpoint the check may reason about,
-    not a wall in front of it."""
+    """What is left: a response the application itself composed. 418 is here
+    as the separating case -- an odd 4xx is not automatically a refusal, and
+    the set is enumerated rather than spelt "anything that is not 2xx"."""
     assert _probe_util.unanswered(_response(status=status)) is None
 
 

@@ -1131,6 +1131,85 @@ def test_a_point_that_answered_and_found_nothing_still_retires(tmp_path):
                                           ("r", 1)]
 
 
+# --- a login wall is not a clean result ------------------------------------
+#
+# N1 of the scoped re-review. Every probe this build sends is unauthenticated
+# (disclosed in `report._limits`), and the ordinary answer a BROWSER-FACING
+# application gives an unauthenticated request is not a 401 -- it is a 302 to
+# a login page, which is exactly the traffic hx captures through a proxy. A
+# 3xx used to sit outside `_probe_util._NOT_AN_ANSWER` on the ground that it
+# is `open_redirect`'s own finding; it is, and that is a fact about ONE check
+# rather than about the doctrine.
+
+
+class _LoginWallBridge(FakeBridge):
+    """A target that has stopped answering: every request is bounced to a
+    login page. Nothing here refuses -- the bridge, the gate and the budget
+    are all happy, and a complete HTTP response comes back. What did not
+    happen is the application answering."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reply({"status": 302, "outcome": "ok"},
+                   b"HTTP/1.1 302 Found\r\nLocation: /login\r\n\r\n")
+
+
+def _latest_row(conn):
+    return conn.execute(
+        "SELECT verdict, reason, requests_sent FROM check_run"
+        " ORDER BY ended_us DESC, started_us DESC LIMIT 1").fetchone()
+
+
+def test_a_login_redirect_does_not_retire_a_live_finding(tmp_path):
+    """MEASURED END TO END, the way the re-review measured it. Run 1 the
+    target reflects and two findings are filed; run 2 the same target sits
+    behind a login wall and answers 302 to everything. Nothing was tested,
+    so nothing may be retired -- `observed = 0` is what `report._findings`
+    renders as "appears fixed; verify before closing", and a client reading
+    that about a live cross-site scripting vector on the strength of a probe
+    that reached a login page is the whole of S12's harm."""
+    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
+    scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
+    assert _observations(env["conn"]) == [("q", 1), ("r", 1)], (
+        "the first scan did not find both reflections; nothing below "
+        "would prove anything")
+
+    scan.run(**env, checks=(_reflected_input(),), bridge=_LoginWallBridge())
+
+    verdict, reason, sent = _latest_row(env["conn"])
+    assert verdict == "inconclusive", f"{verdict}: {reason}"
+    assert sent > 0, "the second scan probed nothing, so it proves nothing"
+    assert _observations(env["conn"]) == [("q", 1), ("r", 1)], (
+        "a live finding was retired on the strength of a probe that reached "
+        "a login page")
+
+
+# One request carrying a point every probing check's own name filter accepts,
+# so that a corpus-wide assertion is about the doctrine and not about which
+# checks happened to find something to probe.
+REQ_EVERY_SHAPE = (
+    b"GET /search?q=hello&redirect_uri=/home&file=notes.txt HTTP/1.1\r\n"
+    b"Host: app.test\r\n"
+    b"\r\n"
+)
+
+
+def test_every_probing_check_reads_a_login_wall_as_a_gap(tmp_path):
+    """The whole active corpus, not one check. The registry's own checks are
+    driven against a target that 302s everything; not one of them may close
+    `clean`, because `clean` with `considered` populated is what retires."""
+    env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE,
+               path_template="/search")
+    active = tuple(c for c in registry.CHECKS if c.klass != "passive")
+    assert len(active) == 5, "the corpus changed shape; re-read this test"
+    scan.run(**env, checks=active, bridge=_LoginWallBridge())
+
+    rows = dict(env["conn"].execute(
+        "SELECT check_id, verdict FROM check_run").fetchall())
+    clean = sorted(cid for cid, v in rows.items() if v == "clean")
+    assert clean == [], f"a login wall was read as a clean result: {clean}"
+
+
 # --- a truncated run may not close as a completed one ---------------------
 #
 # F11 of the whole-branch review. `stop_reason` was built from `by_reason`,

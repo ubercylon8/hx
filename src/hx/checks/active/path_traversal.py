@@ -100,11 +100,12 @@ exemplar's own value back; `_probe_util.substitute_segment` aligns the two
 paths by segment index instead and returns `None` rather than a probe that
 tests nothing.
 
-A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 403, a 429, a 5xx or a 404
-carries no `/etc/passwd` line for the same reason a target that canonicalises
-its paths carries none, and the two must not record the same verdict. `_match`
-is consulted first, so a signature disclosed on any status is still the
-finding. See `_probe_util.py` for the doctrine all five active checks share.
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 400, a 403, a 429, a 5xx, a
+404 or a redirect to a login page carries no `/etc/passwd` line for the same
+reason a target that canonicalises its paths carries none, and the two must
+not record the same verdict. `_match` is consulted first, so a signature
+disclosed on any status is still the finding. See `_probe_util.py` for the
+doctrine all five active checks share.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
 same reason every active check in this corpus gives: nothing in this build

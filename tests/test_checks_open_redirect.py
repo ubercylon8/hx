@@ -120,21 +120,31 @@ def test_a_location_pointing_at_the_marker_host_is_a_finding():
     assert v.candidates[0].payload == oredir._MARKER_URL
 
 
-def test_a_location_that_keeps_the_targets_host_is_clean():
+def test_a_location_that_keeps_the_targets_host_is_not_a_finding():
+    """N1 OF THE SCOPED RE-REVIEW CHANGED THE OTHER HALF OF THIS. It is not
+    the finding -- the marker is not where the browser is being sent -- and
+    it is not `clean` either: the endpoint redirected somewhere this check
+    did not ask for, and the response carries nothing that separates "the
+    parameter was validated" from "the parameter was never read, this is
+    just where unauthenticated requests go". Only the first of those may
+    retire a finding, so the honest answer is `inconclusive`."""
     v = oredir.OpenRedirect().probes(
         ctx, surface, (_REDIRECT_INSERTION,),
         _sender_returning(302, {"Location": "https://app.test/dashboard"}))
-    assert v.state == "clean"
-    assert v.considered == (oredir._ISSUE_TYPE,), (
-        "the parameter WAS probed, so the issue type must be considered or "
-        "a later fix can never be seen as retiring anything")
+    assert v.state == "inconclusive"
+    assert v.considered == (), (
+        "`Verdict.inconclusive` takes no `considered`, which is what stops a "
+        "redirect the check cannot interpret from retiring a live finding")
 
 
 def test_a_relative_location_is_not_an_open_redirect():
+    """Not a finding, and -- same reasoning -- not a clean result: `/login`
+    is the commonest relative `Location` a browser-facing application gives
+    an unauthenticated probe, and this check sends nothing else."""
     v = oredir.OpenRedirect().probes(
         ctx, surface, (_REDIRECT_INSERTION,),
         _sender_returning(302, {"Location": "/dashboard"}))
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
 
 
 def test_the_check_never_requests_the_location_it_was_given():
@@ -228,10 +238,12 @@ def test_a_200_with_a_location_header_is_not_a_redirect():
     assert v.state == "clean"
 
 
-def test_a_redirect_with_no_location_at_all_is_clean():
+def test_a_redirect_with_no_location_at_all_is_not_clean():
+    """A 3xx that names nowhere is a response this check cannot read at all,
+    which is the plainest case of "not an answer"."""
     v = oredir.OpenRedirect().probes(
         ctx, surface, (_REDIRECT_INSERTION,), _sender_returning(302, {}))
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
 
 
 def test_a_protocol_relative_location_at_the_marker_host_is_a_finding():
@@ -324,7 +336,7 @@ def test_two_canary_shaped_parameters_that_both_redirect_are_two_findings():
 # chosen rather than "every status that is not 2xx".
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 429, 500, 503])
 def test_a_status_that_refused_is_inconclusive_not_clean(status):
     """A response with no `Location` because a WAF answered instead is not a
     target that validated the parameter, and only one of those may retire a
@@ -337,9 +349,12 @@ def test_a_status_that_refused_is_inconclusive_not_clean(status):
 
 
 def test_a_redirect_status_is_this_checks_finding_and_never_a_gap():
-    """The separating case, and the reason 3xx is deliberately outside
-    `_probe_util._NOT_AN_ANSWER`: a doctrine that read every non-2xx as a
-    refusal would delete this check."""
+    """THE SEPARATING CASE, and why putting 3xx INTO `_probe_util.
+    _NOT_AN_ANSWER` did not delete this check. `unanswered` is consulted only
+    on the branch where the marker did not match, so a `Location` naming the
+    marker becomes a candidate before the doctrine is ever asked, and a
+    candidate wins over a gap. No exemption, no per-check status set -- the
+    ordering does it."""
     v = oredir.OpenRedirect().probes(
         ctx, surface, (_REDIRECT_INSERTION,),
         _sender_returning(302, {"Location": oredir._MARKER_URL}))

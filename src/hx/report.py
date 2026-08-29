@@ -1352,11 +1352,22 @@ def _limits(conn, engagement_id) -> list[str]:
         # _request_bytes` emits a request line, a `Host`, and at most the one
         # header the check is probing -- nothing carries the exemplar's
         # cookies, its `Authorization`, or the endpoint's OTHER parameters.
-        # Fix round 1 closed the safety half of this (a login redirect or a
-        # 403 is `inconclusive` now, never a false `clean`), so what is left
-        # is a coverage fact with nothing on the page saying it. Wiring
-        # identities into the sender reaches the identity model this build
-        # deliberately excludes; the client is told instead.
+        # Wiring identities into the sender reaches the identity model this
+        # build deliberately excludes; the client is told instead.
+        #
+        # THE SAFETY SENTENCE BELOW IS LOAD-BEARING AND WAS ONCE FALSE. It
+        # used to credit fix round 1 with covering a login redirect; fix
+        # round 1 covered 401/403/404/429/5xx and left 3xx OUT, so the
+        # commonest shape of the very case this bullet describes -- a
+        # browser-facing application answering an unauthenticated probe with
+        # `302 /login` -- was read as a conclusive negative and retired live
+        # findings (N1 of the scoped re-review, measured end to end). The
+        # sentence is true now because `_probe_util._NOT_AN_ANSWER` holds
+        # 3xx, 400 and 405 as well; if that set is ever narrowed, this
+        # sentence has to go with it. What no status can catch is named in
+        # the same breath rather than left for the client to discover: an
+        # application that answers a logged-out request with a 200 login PAGE
+        # is not distinguishable here from one that answered.
         out.append("- **Every probe was sent unauthenticated.** The "
                    f"{len(active)} active check(s) in this build "
                    f"({_names(active)}) build each probe from the affected "
@@ -1364,11 +1375,15 @@ def _limits(conn, engagement_id) -> list[str]:
                    "with it: no cookie, no `Authorization`, and none of the "
                    "endpoint's other parameters. Against an application that "
                    "requires a session, a probe therefore tests the "
-                   "logged-out view of it. A login redirect or an "
-                   "authorisation refusal is recorded as `inconclusive` "
-                   "rather than as a clean result, so nothing is claimed for "
-                   "those surfaces -- but nothing was covered on them "
-                   "either.")
+                   "logged-out view of it. A login redirect, an authorisation "
+                   "refusal, or a rejection of the request itself is recorded "
+                   "as `inconclusive` rather than as a clean result, so no "
+                   "surface is reported as tested on the strength of one -- "
+                   "but nothing was covered on those surfaces either. One "
+                   "shape escapes that: an application that answers a "
+                   "logged-out request with a 200 login PAGE cannot be told "
+                   "apart from one that answered, and a check reading such a "
+                   "response finds nothing and says so.")
         # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
         # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
         # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.
