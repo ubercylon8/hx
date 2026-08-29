@@ -675,41 +675,50 @@ def test_a_complete_scan_has_no_stop_reason(scan_env):
 
 
 def test_mark_unobserved_reads_check_id_not_issue_type_id(scan_env):
-    """Separates 'reads finding.check_id' from 'reads finding.issue_type_id'
-    -- a later edit accidentally swapping the column name back (they are the
-    same type, so nothing at the schema level or the type checker would
-    catch it) must redden this, not pass silently.
+    """Separates 'matches finding.check_id against the check-id slot and
+    finding.issue_type_id against the issue-type slot' from any swap of the
+    two -- they are different axes (schema.sql: `check_id` answers "which of
+    hx's checks found this", `issue_type_id` answers "what kind of issue is
+    this"), the same Python type, so nothing at the schema level or the type
+    checker would catch a swapped read, and Task 2 made `_mark_unobserved`
+    compare BOTH columns where it used to compare only `check_id`.
 
-    Setup deliberately DISAGREES the two columns: run 1 writes the finding
-    with `check_id='hx.test.finds'` and `issue_type_id='t-issue'` -- the
-    candidate's OWN issue type, which since F1 of the whole-branch review is
-    written rather than left NULL, and which is nothing like a check id.
-    The row is then corrupted directly to the SHAPE a swap-back bug would
-    produce -- `check_id=NULL`, `issue_type_id='hx.test.finds'`. If
-    `_mark_unobserved` ever reads `issue_type_id` instead of `check_id`, run
-    2's clean re-run of the SAME check on the SAME surface would match
-    against the wrongly-populated column and mark the finding `observed=0`.
-    Reading the real `check_id` column (`NULL` here) cannot match, so the
-    finding stays alone.
+    `check_id='hx.test.finds'` (the check's own dotted id) and
+    `issue_type_id='t-issue'` (a short slug) are unrelated strings chosen so
+    a swapped read cannot land on the right answer by coincidence -- neither
+    is a substring or reformatting of the other. Run 2's verdict names
+    `considered=("t-issue",)`: it examined the ISSUE TYPE and did not find
+    it. `scan.run` combines that with the check's own id into
+    `('s-1', 'hx.test.finds', 't-issue')` -- `check_id` in the middle slot,
+    `issue_type_id` last, matching the SELECT's own column order.
+
+    A `_mark_unobserved` that swapped which column fills which slot would
+    instead compare `('s-1', 't-issue', 'hx.test.finds')` against that same
+    set -- no match, since neither `t-issue` sits in the check-id slot nor
+    `hx.test.finds` in the issue-type slot of what `considered` actually
+    holds. That swap turns a finding that SHOULD retire into one that stays
+    live forever: the wrong outcome in the direction a client would notice
+    (a fixed issue kept open), which is why `rows == [1, 0]` below -- the
+    correct read -- is the assertion, not `[1]`.
     """
     _run1_finds(scan_env)
     conn = scan_env["conn"]
     assert conn.execute(
         "SELECT check_id, issue_type_id FROM finding").fetchone() == (
         "hx.test.finds", "t-issue")
-    conn.execute(
-        "UPDATE finding SET check_id=NULL, issue_type_id='hx.test.finds'")
 
     class FindsThenClean:
         id, version, klass = "hx.test.finds", "1", "passive"
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
-            return base.Verdict.clean()
+            return base.Verdict.clean(considered=("t-issue",))
 
     scan.run(**scan_env, checks=(FindsThenClean(),))
     rows = [r[0] for r in conn.execute(
         "SELECT observed FROM finding_observation ORDER BY ts_us")]
-    assert rows == [1]
+    assert rows == [1, 0], (
+        "the finding's check_id and issue_type_id were not matched against "
+        "the considered set in the correct positions")
 
 
 # --- Whole-branch review F1 (HIGH): every candidate one passive check yields
