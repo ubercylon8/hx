@@ -1355,19 +1355,38 @@ def _limits(conn, engagement_id) -> list[str]:
         # Wiring identities into the sender reaches the identity model this
         # build deliberately excludes; the client is told instead.
         #
-        # THE SAFETY SENTENCE BELOW IS LOAD-BEARING AND WAS ONCE FALSE. It
-        # used to credit fix round 1 with covering a login redirect; fix
-        # round 1 covered 401/403/404/429/5xx and left 3xx OUT, so the
-        # commonest shape of the very case this bullet describes -- a
-        # browser-facing application answering an unauthenticated probe with
-        # `302 /login` -- was read as a conclusive negative and retired live
-        # findings (N1 of the scoped re-review, measured end to end). The
-        # sentence is true now because `_probe_util._NOT_AN_ANSWER` holds
-        # 3xx, 400 and 405 as well; if that set is ever narrowed, this
-        # sentence has to go with it. What no status can catch is named in
-        # the same breath rather than left for the client to discover: an
-        # application that answers a logged-out request with a 200 login PAGE
-        # is not distinguishable here from one that answered.
+        # THE SAFETY SENTENCE BELOW IS LOAD-BEARING AND HAS BEEN FALSE
+        # TWICE, WHICH IS WHY IT NO LONGER RESTS ON A LIST. It first credited
+        # fix round 1 with covering a login redirect; fix round 1 covered
+        # 401/403/404/429/5xx and left 3xx OUT, so the commonest shape of the
+        # very case this bullet describes -- a browser-facing application
+        # answering an unauthenticated probe with `302 /login` -- was read as
+        # a conclusive negative and retired live findings (N1 of the scoped
+        # re-review, measured end to end). Fix round 3 added 3xx, 400 and 405
+        # and this comment then declared the sentence true: it checked the
+        # three ADDITIONS and never asked what the set still OMITTED. 422,
+        # 410, 407, 406, 414 and their neighbours went on reading as answers,
+        # and a target refusing every probe with one of them rendered five
+        # `clean` Coverage rows -- under this very denial, measured end to
+        # end at the final review.
+        #
+        # So `_probe_util.unanswered` is a rule and not a set: it reads a 2xx
+        # and nothing else as an answer a check may reason about. The
+        # sentence below is true of every status there is rather than of the
+        # ones somebody remembered, and it cannot go stale as the web adds
+        # more. If that rule is ever loosened this sentence has to go with
+        # it, which is what `tests/test_report.py::test_the_unauthenticated_
+        # bullets_safety_claim_is_one_the_code_honours` holds -- it asks the
+        # doctrine itself for every status the sentence names.
+        #
+        # WHAT NO RULE OVER STATUSES CAN CATCH is named in the same breath
+        # rather than left for the client to discover, and it is a CLASS
+        # rather than one shape: a refusal delivered UNDER a 2xx. The 200
+        # login page is the member that cost the most; an API reporting a
+        # rejected parameter in a 200 error envelope is another, and it is
+        # the same family as the 422 above. The bullet no longer claims to
+        # enumerate them -- "one shape escapes that" was itself a
+        # completeness claim, and the last one printed here was false.
         #
         # AND SINCE FIX ROUND 6 THE BULLET BELOW IT DISCLOSES A BEHAVIOUR AS
         # WELL AS A GAP. F3 was decided as DISCLOSE, NOT FIX -- and a
@@ -1392,15 +1411,19 @@ def _limits(conn, engagement_id) -> list[str]:
                    "requires a session, a probe therefore tests the "
                    "logged-out view of it. A login redirect, an authorisation "
                    "refusal, or a rejection of the request itself is recorded "
-                   "as `inconclusive` rather than as a clean result, so no "
-                   "surface is reported as tested on the strength of one -- "
-                   "but nothing was covered on those surfaces either. One "
-                   "shape escapes that: an application that answers a "
-                   "logged-out request with a 200 login PAGE cannot be told "
-                   "apart here from one that answered, so a probe against it "
-                   "is recorded as a clean result. That costs coverage and "
-                   "nothing more — the bullet below is why no clean result "
-                   "from an active check can close anything.")
+                   "as `inconclusive` rather than as a clean result — hx "
+                   "reads only a 2xx response as an answer it may reason "
+                   "about — so no surface is reported as tested on the "
+                   "strength of one, but nothing was covered on those "
+                   "surfaces either. What that cannot catch is a refusal "
+                   "delivered UNDER a 2xx: an application that answers a "
+                   "logged-out request with a 200 login PAGE, or an API that "
+                   "reports a rejected parameter in a 200 error envelope, "
+                   "cannot be told apart here from one that answered, so a "
+                   "probe against it is recorded as a clean result. That "
+                   "costs coverage and nothing more — the bullet below is "
+                   "why no clean result from an active check can close "
+                   "anything.")
         out.append("- **An active finding is never automatically marked as "
                    f"fixed.** The {len(active)} active check(s) in this build "
                    f"({_names(active)}) re-issue requests, so a later scan "

@@ -2463,18 +2463,30 @@ def test_limits_disclose_that_every_probe_was_unauthenticated(
 
 def test_the_unauthenticated_bullets_safety_claim_is_one_the_code_honours(
         report_env_with_blobs):
-    """N1 OF THE SCOPED RE-REVIEW, AND THE WORST THING IT FOUND. The bullet
-    above tells a client that a login redirect or an authorisation refusal
-    is recorded as `inconclusive` rather than as a clean result. It said
-    that while `_probe_util._NOT_AN_ANSWER` held 401/403/404/429 and 5xx and
-    deliberately EXCLUDED 3xx -- so the sentence was false for the login
-    redirect, which is the commonest shape of the case it describes, and a
-    live finding was measured retiring behind one.
+    """THE SENTENCE THIS BRANCH HAS PRINTED FALSE TWICE. It tells a client
+    that a login redirect, an authorisation refusal or a rejection of the
+    request itself is recorded as `inconclusive` rather than as a clean
+    result.
+
+    It said that first while the doctrine held 401/403/404/429 and 5xx and
+    deliberately EXCLUDED 3xx -- so it was false for the login redirect,
+    which is the commonest shape of the case it describes, and a live finding
+    was measured retiring behind one (N1 of the scoped re-review). It said it
+    again after 3xx, 400 and 405 were added, and was false for 422, 410, 407,
+    406, 414 and their neighbours: the final review measured a target
+    refusing every probe with one of those recording `clean` for all five
+    active checks and rendering as tested Coverage, under this very denial.
+    422 is what FastAPI/pydantic, Rails and a great many Node validation
+    layers answer a probe that dropped the endpoint's other parameters, which
+    is every probe this build sends.
 
     A false claim in a client deliverable is the most serious kind this
-    project has, so the claim is tied to the code that has to honour it:
-    every status the sentence names is asked of the doctrine itself. Narrow
-    the set and this fails, naming the sentence that has to go with it."""
+    project has, so the claim is tied to the code that has to honour it. The
+    statuses below are the two rounds' worth of counterexamples plus the
+    shapes the sentence names; the doctrine is an ALLOWLIST now, so a
+    sixteenth status nobody listed here is covered by construction rather
+    than by this list being complete. Loosen `_probe_util.unanswered` and
+    this fails, naming the sentence that has to go with it."""
     limits = report.render(**report_env_with_blobs)
     limits = limits[limits.index("## Limits"):]
     assert "A login redirect, an authorisation refusal, or a rejection of " \
@@ -2485,12 +2497,27 @@ def test_the_unauthenticated_bullets_safety_claim_is_one_the_code_honours(
     for status, what in [(302, "a login redirect"), (301, "a login redirect"),
                          (401, "an authorisation refusal"),
                          (403, "an authorisation refusal"),
+                         (407, "an authorisation refusal"),
                          (400, "a rejection of the request itself"),
-                         (405, "a rejection of the request itself")]:
+                         (405, "a rejection of the request itself"),
+                         (406, "a rejection of the request itself"),
+                         (410, "a rejection of the request itself"),
+                         (414, "a rejection of the request itself"),
+                         (422, "a rejection of the request itself"),
+                         (431, "a rejection of the request itself")]:
         assert _probe_util.unanswered(
             dataclasses.replace(resp, status=status)) is not None, (
                 f"the Limits page claims {what} is `inconclusive`, and "
                 f"status {status} is read as a conclusive negative")
+
+    # ANTI-VACUITY, because a doctrine that called everything a gap would
+    # satisfy every assertion above while testing nothing at all -- and the
+    # bullet's other half (a probe against a 200 login page IS recorded as
+    # clean) would then be the false sentence instead.
+    assert _probe_util.unanswered(
+        dataclasses.replace(resp, status=200)) is None, (
+            "no status is read as an answer, so the assertions above hold "
+            "vacuously and this build tests nothing")
 
 
 def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honours(
@@ -2500,7 +2527,7 @@ def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honou
     and a client still got `appears fixed` for a live finding, because a
     disclosure does not stop a retirement: an application answering a
     logged-out request with a 200 LOGIN PAGE is indistinguishable from one
-    that answered at every level a status set operates. Fix round 5
+    that answered at every level a status rule operates. Fix round 5
     suppressed retirement where the CAPTURE carried a credential header; fix
     round 6 removed it from the active corpus outright, because that
     predicate keyed on the first sighting and could see only a header name.
@@ -2536,21 +2563,34 @@ def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honou
 
 def test_the_unauthenticated_bullet_says_the_login_page_costs_coverage_only(
         report_env_with_blobs):
-    """WHAT IS AND IS NOT LEFT OF THE RESIDUAL. The 200 login page is still
-    indistinguishable from an answer, so the row it produces still reads
-    `clean` and still counts as a tested surface in Coverage -- that is a
-    coverage overstatement and the page must keep saying so. What it can no
-    longer do is close a finding, and the bullet says which of the two it
-    is. Fix round 5's version said the residual applied only to surfaces
-    whose capture carried no credential header; that qualification went with
-    the predicate, and asserting its ABSENCE is what stops it being left
+    """WHAT IS AND IS NOT LEFT OF THE RESIDUAL. A refusal delivered UNDER a
+    2xx is still indistinguishable from an answer, so the row it produces
+    still reads `clean` and still counts as a tested surface in Coverage --
+    that is a coverage overstatement and the page must keep saying so. What
+    it can no longer do is close a finding, and the bullet says which of the
+    two it is.
+
+    THE RESIDUAL IS NAMED AS A CLASS AND NOT COUNTED, which is the final
+    review's finding 1 one layer down. "One shape escapes that" was a
+    completeness claim over a set the author had not enumerated, and it was
+    printed in a client deliverable; the 200 login page is one member and a
+    200 error envelope over a rejected parameter is another. Asserting the
+    absence of the count is what stops it coming back.
+
+    Fix round 5's version said the residual applied only to surfaces whose
+    capture carried no credential header; that qualification went with the
+    predicate, and asserting its ABSENCE is what stops IT being left
     behind."""
     limits = report.render(**report_env_with_blobs)
     limits = limits[limits.index("## Limits"):]
-    assert "200 login PAGE cannot be told apart here from one that answered" \
-        in limits
+    assert "What that cannot catch is a refusal delivered UNDER a 2xx" in limits
+    assert "200 login PAGE" in limits
+    assert "200 error envelope" in limits
     assert "That costs coverage and nothing more" in limits
     assert "carried no credential header" not in limits
+    assert "One shape escapes" not in limits, (
+        "the page counts the shapes that escape the status rule again; the "
+        "last time it did that the count was measured wrong by fourteen")
 
 
 def test_limits_disclose_that_credential_insertion_points_are_not_probed(
