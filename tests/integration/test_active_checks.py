@@ -533,12 +533,16 @@ def test_a_login_wall_is_not_a_clean_result_and_retires_nothing(rig):
     application meeting an unauthenticated request, which is every request
     this build sends -- and the second scan probes it again.
 
-    WOULD THIS FAIL IF THE CLAIM WERE FALSE? Measured against this exact route
-    with `unanswered` blind to a 3xx (its state before fix round 3): all five
-    checks closed `clean` with `considered` populated, `_mark_unobserved` wrote
-    `observed = 0` for the live finding, and `report` rendered it as "appears
-    fixed; verify before closing". Three assertions below redden on that, and
-    the last of them is the one a client would have read.
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against this exact route
+    with `unanswered` blind to a 3xx, which is its state before fix round 3:
+    every check that sent anything -- `cors`, `reflected-input` and
+    `sql-error`, one probe each -- closed `clean` with `considered` populated,
+    `_mark_unobserved` wrote `observed = 0` for the live finding, and the
+    report rendered it as "appears fixed; verify before closing". (The other
+    two sent nothing and answered `inconclusive` either way: their own name
+    filters decline `tab`, which is N3's fix and not this one's.) Three
+    assertions below redden on that, and the last of them is the one a client
+    would have read.
     """
     _configure(rig)
     rig.browse("GET", LOGIN_WALL_ROUTE)
@@ -612,11 +616,12 @@ def test_a_state_changing_surface_is_skipped_rather_than_probed_with_a_get(rig):
     than a hand-shaped one, and what is under test is not how it got there but
     what a GET of a different surface is allowed to do to it.
 
-    WOULD THIS FAIL IF THE CLAIM WERE FALSE? Measured against this exact
-    surface with the skip removed: three GETs of `/api/orders` on the wire,
-    `hx.active.reflected-input` and `hx.active.sql-error` closing `clean` with
-    `considered` populated off them, and the finding above coming back
-    `observed = 0`.
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED against this exact
+    surface with the skip removed: three GETs of `/api/orders` on the wire
+    (a bare one, one carrying a canary in `sku`, one carrying a quote),
+    `summary.by_reason` empty, `cors`, `reflected-input` and `sql-error` all
+    closing `clean` off them, and the finding above coming back `observed = 0`
+    -- retired by a request to a surface this engagement never captured.
     """
     _configure(rig)
     rig.browse("POST", STATE_CHANGING_ROUTE, body=b'{"sku": 1}')
