@@ -233,8 +233,10 @@ def test_every_active_check_finds_its_own_endpoint(rig):
     # finding filed by a check that sent nothing would mean the verdict came
     # from somewhere other than the wire. Only the active rows: a passive
     # finding on one of these surfaces (`hx.passive.security-headers` files
-    # three against `/search`, which answers `text/html` and carries none of
-    # them) is a real finding that correctly spent no requests at all.
+    # two against `/search` -- missing-content-type-options and
+    # missing-frame-protection. The third spec, missing-hsts, is gated
+    # `applies=https` and this rig's origin is `http://`, so it never fires
+    # here) is a real finding that correctly spent no requests at all.
     for row in check_runs:
         if row["check_id"] not in ACTIVE_CHECK_IDS:
             assert row["requests_sent"] == 0, \
@@ -251,13 +253,14 @@ def test_every_active_check_finds_its_own_endpoint(rig):
     # AND BOUNDED, AGAINST THE ONE WITNESS THIS SIDE CANNOT FAKE. The target
     # server's own log is what actually arrived; `requests_sent` is what hx
     # believes it spent. At the raised rate this held only because nothing was
-    # ever refused. At 3/s it has to hold THROUGH thirteen refusals and the
-    # waits that answered them, which makes it the proof of both halves of fix
-    # round A at once: every probe was eventually issued exactly once (the
-    # retry works), counted exactly once (a refusal the gate decided before
-    # issuing adds nothing, so the retry does not double-count), and seen by
-    # the target exactly once (no wait replayed a request that had already
-    # left).
+    # ever refused. At 3/s it has to hold THROUGH the refusals and the waits
+    # that answered them -- measured against a real Burp: 16 probes issued,
+    # 5 `rate_limited` refusals, one apiece across 5 of those probes -- which
+    # makes it the proof of both halves of fix round A at once: every probe
+    # was eventually issued exactly once (the retry works), counted exactly
+    # once (a refusal the gate decided before issuing adds nothing, so the
+    # retry does not double-count), and seen by the target exactly once (no
+    # wait replayed a request that had already left).
     spent = sum(r["requests_sent"] for r in check_runs)
     arrived = len(rig.target.hits) - hits_before
     assert spent == arrived == PROBES_PER_SCAN, (
