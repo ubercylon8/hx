@@ -141,6 +141,19 @@ def test_a_finding_verdict_can_name_what_it_considered(a_candidate):
     assert v.considered == ("missing-hsts",)
 
 
+def test_a_finding_verdict_that_names_nothing_considered_retires_nothing(a_candidate):
+    # The safe default for `finding()` is the same as for `clean()`: an empty
+    # `considered`. Two failure directions are possible for this default, and
+    # only one of them is acceptable -- an empty default leaves a finding
+    # live (safe: nothing is retired that wasn't examined), while a default
+    # DERIVED from the emitted candidates' own issue types would retire
+    # every OTHER issue type the check never looked at (unsafe: a check
+    # emitting one of three candidates would silently close the other two,
+    # telling a client a still-open issue is fixed because the check merely
+    # stopped finding it, not because it looked and confirmed it gone).
+    assert base.Verdict.finding(a_candidate).considered == ()
+
+
 def test_considered_defaults_to_empty_so_an_unaware_check_retires_nothing():
     # The failure mode of a check that never populates `considered` must be a
     # finding staying live, never a finding falsely closed.
