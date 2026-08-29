@@ -30,6 +30,15 @@ from dataclasses import dataclass, field
 from hx import insertion as insertion_mod
 from hx import run as run_mod
 from hx.checks import base, probe, registry
+# `_http._detail` FORMATS A PER-POINT LIST THE WAY A COVERAGE ROW SHOWS IT,
+# read across the module boundary rather than copied, for the reason
+# `hx.checks.active._probe_util.verdict` reads it: an operator reading that
+# row must see the same shape -- at most three, then a count -- whether the
+# list came from a passive check's unreadable exchanges, an active check's
+# gaps, or the skip below. It lives under `checks.passive` because that is
+# where the first caller was; its own docstring says it takes the list and
+# not an `Evidence` precisely so the rest of the corpus can use it.
+from hx.checks.passive import _http
 from hx.engagement import now_us
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
@@ -388,7 +397,24 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                                   f"{sorted(probe.CREDENTIAL_HEADERS)} the "
                                   "extension did not inject -- so there was "
                                   "nowhere for this check to put a payload it "
-                                  "could send; it was not run, not run clean")
+                                  "could send; it was not run, not run clean"
+                                  # WHICH POINTS, not merely that there were
+                                  # some. Concern 5 of fix round 3:
+                                  # `unprobeable` builds a sentence per point
+                                  # naming which of its two rules refused it,
+                                  # and this was the only caller -- it tested
+                                  # each for `None` and threw the strings
+                                  # away, so no row an operator could read
+                                  # ever said whether a cookie or a credential
+                                  # header was what stopped the check.
+                                  #
+                                  # `refusals` GOES IN WHOLE. Every entry on
+                                  # this branch is a sentence: it is reached
+                                  # only when `usable` is empty, which is
+                                  # exactly when no `unprobeable` answered
+                                  # `None`. A filter here would be a guard no
+                                  # input can exercise.
+                                  + _http._detail(refusals))
                             continue
                         if wanted and not usable:
                             _skip(conn, row_id, summary, "no_insertion_point",

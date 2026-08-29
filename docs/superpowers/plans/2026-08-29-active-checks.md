@@ -1197,7 +1197,11 @@ names are spelt HERE, once, in the module that already models what the send
 path will and will not carry, rather than in each check that declares a
 `header` or `cookie` kind. What the CLIENT is told about them is
 `hx.report._limits`' business: a Limits bullet says they were not probed and
-renders the three names off `CREDENTIAL_HEADERS` below. It deliberately does
+renders the three names off `CREDENTIAL_HEADERS` below. The Coverage table
+carries the per-point sentences too since fix round 4 (see `unprobeable`), but
+only where a whole check was skipped for want of a probeable point; the bullet
+is what makes the disclosure for the ordinary case, where other points on the
+same surface were probed and the check ran. It deliberately does
 NOT cross-reference the report's "Insertion points" table -- N4 of the scoped
 re-review, because an earlier version of this paragraph said the opposite.
 That table counts points by kind and states in as many words that this build
@@ -1275,15 +1279,22 @@ def unprobeable(insertion) -> str | None:
     is matched here anyway: this function answers for the send path's rule,
     not for one derivation's current output.
 
-    NOTHING RENDERS THE SENTENCE, and saying so is the point: an earlier
-    version of this docstring justified its shape by claiming a coverage row
-    showed it, formatted by `_http._detail` the same as a gap from
-    `_probe_util`. That was never true (N4 of the scoped re-review).
-    `hx.scan.run` is the only caller, it tests this result for `None`, and it
-    discards the string -- the `no_probeable_insertion_point` row carries its
-    own sentence, naming the count, the kinds and `CREDENTIAL_HEADERS`. So
-    the reason exists for a reader of THIS function rather than for a page:
-    it says which of the two rules refused a point, which `True` would not.
+    A COVERAGE ROW SHOWS THE SENTENCE, which is why it is short. `hx.scan.run`
+    is the only caller: it drops every point this answers for, and where that
+    leaves a check nothing at all it appends these sentences -- through
+    `_http._detail`, the formatter a gap from `_probe_util` goes through, so
+    the list is capped and counted the same way -- to the
+    `no_probeable_insertion_point` skip reason, which `hx.report._coverage`
+    renders. An operator reading that row sees WHICH points were refused and
+    under which of the two rules, rather than only that some were.
+
+    THIS DOCSTRING HAS BEEN WRONG IN BOTH DIRECTIONS, which is worth the two
+    lines. It claimed exactly the paragraph above while `scan.run` tested the
+    result for `None` and threw the string away (N4 of the scoped re-review),
+    was corrected to say nothing rendered it, and then the code caught up with
+    the original claim (Concern 5 of fix round 3). What never changed is why
+    this is a `str` and not a `True`: two rules refuse a point, and a reader
+    of a skip cannot tell them apart from a bool.
     """
     if insertion.kind == "cookie":
         return (f"cookie {insertion.name!r}: a cookie is probed by sending a "

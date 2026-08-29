@@ -33,6 +33,7 @@ from hx import scan
 from hx import surface as surface_mod
 from hx.checks import base, probe, registry
 from hx.checks.active import cors
+from hx.checks.passive import _http
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
 from tests.test_probe import FakeBridge
@@ -1078,6 +1079,54 @@ def test_a_surface_whose_only_points_are_refused_ones_says_so(tmp_path):
     assert "refuses" in reason
     assert check.calls == 0
     assert fb.calls == 0, "a probe was spent on a guaranteed refusal"
+
+
+REQ_ONLY_REFUSED_POINTS = (
+    b"GET /dashboard HTTP/1.1\r\n"
+    b"Host: app.test\r\n"
+    b"Cookie: session=abc; csrf=def\r\n"
+    b"Authorization: Bearer t\r\n"
+    b"\r\n"
+)
+
+
+def test_the_skip_says_which_points_the_send_path_refused(tmp_path):
+    """Concern 5 of fix round 3, and the difference between "some" and
+    "which".
+
+    `probe.unprobeable` builds a sentence per point saying which of its TWO
+    rules refused it -- a cookie of any name, or a header the extension did
+    not inject -- and `scan.run` was its only caller: it tested each answer
+    for `None` and discarded the string. The row therefore named the rule set
+    (`CREDENTIAL_HEADERS`) and never the points, so an operator reading
+    `hx.report._coverage` could not tell a surface stopped by one session
+    cookie from one stopped by a bearer token, and had no name to go and look
+    at.
+
+    THREE POINTS, TWO RULES, and that is what makes this more than a spelling
+    test: `insertion.derive` sorts by `(kind, name)`, all three fit under
+    `_http._GAPS_SHOWN`, and the two rules have to read differently in the one
+    row. A `True`/`False` refusal could not produce any of it.
+    """
+    env = _env(tmp_path, request_bytes=REQ_ONLY_REFUSED_POINTS,
+               path_template="/dashboard")
+    summary = scan.run(**env, checks=(_AllKinds(),), bridge=_replying_bridge())
+
+    verdict, reason, sent = _row(env["conn"])
+    assert (verdict, sent) == ("skipped", 0)
+    assert summary.by_reason == {"no_probeable_insertion_point": 1}
+    for point in ("cookie 'csrf'", "cookie 'session'", "header 'Authorization'"):
+        assert point in reason, (point, reason)
+    assert "a cookie is probed by sending a Cookie header" in reason
+    assert "credential header it did not inject" in reason
+    # AND IT IS THE SHAPE A COVERAGE ROW EXPECTS. `_http._detail` is what
+    # bounds this list at three and counts the rest; a reason built by hand
+    # here would be a second spelling free to grow without bound, in the one
+    # column `report._coverage` deliberately does not group on.
+    assert reason.endswith(_http._detail(tuple(
+        probe.unprobeable(i)
+        for i in insertion_mod.derive(REQ_ONLY_REFUSED_POINTS, "/dashboard")))), \
+        reason
 
 
 def test_the_shipped_reflected_input_check_probes_a_cookie_bearing_surface(
