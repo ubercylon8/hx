@@ -1202,8 +1202,10 @@ NOT cross-reference the report's "Insertion points" table -- N4 of the scoped
 re-review, because an earlier version of this paragraph said the opposite.
 That table counts points by kind and states in as many words that this build
 records no per-insertion probe attribution, so it cannot say which points
-were probed; it also renders only where a blob store was supplied, so a
-bullet pointing at it could point at a section that is not on the page.
+were probed; and it renders only where a point could be derived at all
+(`report._insertion_coverage` returns nothing when no exemplar request blob
+could be read), so a bullet naming it could name a section that is not on
+the page.
 """
 from __future__ import annotations
 
