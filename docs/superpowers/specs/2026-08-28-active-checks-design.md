@@ -119,6 +119,40 @@ Design notes that bind the implementation:
   exchange stays in the store forever. Plan 5 had to disclose that gap in Limits; this plan
   does not close it for passive, and that disclosure stays.
 
+**Amended 2026-08-29: retirement is a passive-corpus property. The bullet directly
+above is withdrawn.** The rule stated at the top of this section — retire a finding whose
+issue type was considered and not re-emitted — is unchanged and still describes
+`_mark_unobserved`'s gate. What changed is what may reach that gate: `hx.scan._retirable`
+returns nothing for a check the runner drives through the `probes` hook, and raises if such
+a check populated `Verdict.considered` at all. An active check is reported and closes
+nothing.
+
+Every probe this build sends is UNAUTHENTICATED — `ProbeSender._request_bytes` emits a
+request line, a `Host` and at most the one header the check is probing — so an active
+check's `clean` is a statement about the application's logged-out view, not about the view
+the client's own users are in, and retirement is exactly the second claim (`report._findings`
+renders it as "appears fixed; verify before closing"). The shape that makes this fatal
+rather than theoretical is an application answering a logged-out request with a **200 login
+page**: a complete, well-formed, application-composed response indistinguishable from an
+answer at every level a status set operates. Measured against the real registry, all five
+checks closed `clean` on one.
+
+Two narrower rules were built and withdrawn before this one. The status doctrine
+(`_probe_util._NOT_AN_ANSWER`, widened to hold 3xx, 400 and 405) catches a login *redirect*
+and cannot catch a login *page*. A predicate that suppressed retirement only where the
+surface's captured request carried a credential header could not work either: it keyed on
+the exemplar, which is the FIRST sighting, so a surface browsed logged-out and then
+logged-in stayed "anonymous" and went on retiring — the unsafe direction — and S7 redacts a
+credential header's value before the bytes are hashed, so only the NAME survives and an
+analytics or consent cookie is indistinguishable from a session.
+
+The passive corpus is untouched and the bullets above still hold for it: a passive check
+reads the captured traffic itself, session and all, so it was never looking at a different
+view of the application. The active corpus therefore has no automatic retest story, which
+`report._limits` discloses in as many words ("An active finding is never automatically
+marked as fixed"). Reinstating one needs probes that can authenticate, which reaches the
+identity model this build deliberately excludes.
+
 ## 6. The five `active_safe` checks
 
 `active_safe` is §10's "idempotent GET/HEAD payloads, bounded". All five stay inside
@@ -235,7 +269,10 @@ home built per run, never the real `$HOME`.
 Beyond per-check tests, two properties need their own:
 
 1. **Retirement, both directions.** A fixed issue retires and renders with the marker; an
-   issue the check never examined does not retire.
+   issue the check never examined does not retire. **Amended 2026-08-29:** for the PASSIVE
+   corpus only — see §5's amendment. The active half of this property is now the opposite
+   claim and is tested as such: five genuinely repaired routes, five `clean` answers off
+   probes that really went, and not one finding closed.
 2. **The seam refuses correctly.** Each refusal class produces `inconclusive` with that
    reason and never `clean`, and `requests_sent` counts attempts including refused ones.
 
@@ -246,4 +283,4 @@ Beyond per-check tests, two properties need their own:
 | Scope | Foundation + five `active_safe` checks; `active_timing` and boolean-differential to Plan 7 | Splits on an infrastructure boundary — timing needs concurrency and wall-clock budget, differential needs variation analysis — not an arbitrary count |
 | Body parameters | Stay GET-only, disclose | §10 defines `active_safe` as idempotent; `active_mutate` already exists for the non-idempotent case; adds no blast radius on client systems |
 | Payload depth | Canary-first, escalate on evidence | Volume scales with application behaviour rather than surface count |
-| Verdict contract | `Verdict.considered`, retire what was considered and not re-emitted | Only option that expresses dynamically-minted issue types; fails safe; makes retest genuinely work for the active corpus |
+| Verdict contract | `Verdict.considered`, retire what was considered and not re-emitted | Only option that expresses dynamically-minted issue types; fails safe; makes retest genuinely work for the active corpus. **Amended 2026-08-29:** the last clause is withdrawn — active checks retire nothing, see §5's amendment. The contract itself is unchanged and serves the passive corpus |
