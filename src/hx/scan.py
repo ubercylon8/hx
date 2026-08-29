@@ -271,14 +271,29 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             # FROM, and it is the narrower test -- `kind`
                             # calls OPTIONS an idempotent read, and `GET /x`
                             # is still not the surface `OPTIONS /x` names.
+                            #
+                            # AND A `HEAD` SURFACE LEAVES BY THE SAME DOOR,
+                            # which is finding 9 of the final review and the
+                            # second reason `kind` is the wrong test: `kind`
+                            # calls HEAD an idempotent read too. It was
+                            # probed for a round because a GET sees
+                            # everything a HEAD could have shown -- safe for
+                            # a `clean` row, and not safe for a FINDING,
+                            # since three of the five checks match on a
+                            # response BODY and a HEAD response has none. The
+                            # skip is spelt with this same vocabulary rather
+                            # than a new word: the fact an operator needs is
+                            # identical, that hx could not address the
+                            # surface the row names.
                             _skip(conn, row_id, summary, "not_a_get_surface",
                                   "this surface was captured as a "
                                   f"{surface[1]} request and this build can "
-                                  "send nothing but a GET, which would be a "
-                                  "request to a different surface; body and "
-                                  "mutating probes are outside this build by "
-                                  "design, so the check was not run, not run "
-                                  "clean")
+                                  "send nothing but a GET (body and mutating "
+                                  "probes are outside this build by design), "
+                                  "so a probe here would be a request to a "
+                                  "different surface -- a method is part of "
+                                  "a surface's identity -- and the check was "
+                                  "not run, not run clean")
                             continue
                         if _citable_exemplar(surface, exchanges) is None:
                             # THE EVIDENCE AN ACTIVE CHECK WILL CITE HAS TO
@@ -753,17 +768,28 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
 # there".
 _UNREAD = object()
 
-# The surface methods a probe can honestly address. `ProbeSender.
-# _request_bytes` builds a GET and only a GET, and a surface's method is part
-# of its identity -- so a GET probe answers for a `GET` surface, and for a
-# `HEAD` one (RFC 9110 s9.3.2: HEAD is GET without the body, so the probe
-# sees everything the captured request could have shown and more). It answers
-# for nothing else, `OPTIONS` included: S4's method allowlist permits OPTIONS
-# and `surface.kind_for` calls it an idempotent read, but `OPTIONS /x` and
-# `GET /x` are two surface rows and a check may not close one by testing the
-# other. Case-sensitive, for the reason `surface.kind_for` gives: `get` is
-# not GET, and a lowercase verb must not inherit a safe method's permissions.
-_PROBEABLE_METHODS = frozenset({"GET", "HEAD"})
+# The surface methods a probe can honestly address, and there is exactly one.
+# `ProbeSender._request_bytes` builds a GET and only a GET, and a surface's
+# method is part of its identity -- so a GET probe answers for a `GET`
+# surface and for nothing else.
+#
+# `OPTIONS` AND `HEAD` ARE BOTH OUT, ON THE SAME ARGUMENT. S4's method
+# allowlist permits both and `surface.kind_for` calls both idempotent reads,
+# but `OPTIONS /x`, `HEAD /x` and `GET /x` are three surface rows and a check
+# may not close one by testing another. `HEAD` was admitted for a round on an
+# RFC 9110 s9.3.2 reading -- HEAD is GET without the body, so a GET probe
+# sees everything the captured request could have shown and more -- which is
+# sound for a `clean` row and NOT sound for a finding: `reflected_input`,
+# `sql_error` and `path_traversal` all match on a response BODY, and a HEAD
+# response has none, so a body-reflection finding filed against a `HEAD`
+# surface describes something that surface never does, in a description that
+# does not say the method was changed. Finding 9 of the final review, ruled
+# the way the OPTIONS line four rows up was already ruled: the consistency is
+# worth more than the coverage, and browsers rarely issue HEAD anyway.
+#
+# Case-sensitive, for the reason `surface.kind_for` gives: `get` is not GET,
+# and a lowercase verb must not inherit a safe method's permissions.
+_PROBEABLE_METHODS = frozenset({"GET"})
 
 
 def _exemplar_request(blobs, surface, exchanges) -> bytes | None:

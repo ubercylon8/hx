@@ -330,23 +330,66 @@ def test_no_active_check_answers_clean_for_a_state_changing_surface(tmp_path):
     assert fb.bodies == [], fb.bodies
 
 
-@pytest.mark.parametrize("method", ["GET", "HEAD"])
-def test_a_read_surface_is_still_probed(method):
-    """The separating case. HEAD is in because a GET is a HEAD plus a body
-    (RFC 9110 s9.3.2): the probe sees everything the captured request could
-    have shown and more, so it tests the surface the row names."""
-    assert method in scan._PROBEABLE_METHODS
+REQ_HEAD = (
+    b"HEAD /report?q=1&redirect_uri=/home&file=notes.txt HTTP/1.1\r\n"
+    b"Host: app.test\r\n"
+    b"\r\n"
+)
+
+
+def test_no_active_check_answers_for_a_head_surface_either(tmp_path):
+    """FINDING 9 OF THE FINAL REVIEW, measured at the runner rather than at
+    the constant. `HEAD` was probeable for a round, so this surface's five
+    rows came off five GETs: safe in the `clean` direction (a GET sees
+    everything a HEAD could have shown) and not safe in the other, because
+    three of the five checks match on a response BODY that a HEAD surface
+    never returns. The request carries a point each check's own name filter
+    accepts, so before the fix every one of them probed and answered.
+
+    The skip reuses `not_a_get_surface` rather than minting a word: the fact
+    an operator needs is the same one the POST case carries, and the reason
+    string names the method it read."""
+    env = _env(tmp_path, request_bytes=REQ_HEAD, path_template="/report",
+               method="HEAD")
+    fb = _replying_bridge()
+    active = tuple(c for c in registry.CHECKS if c.klass != "passive")
+    summary = scan.run(**env, checks=active, bridge=fb)
+
+    rows = env["conn"].execute(
+        "SELECT verdict, reason FROM check_run").fetchall()
+    assert {v for v, _r in rows} == {"skipped"}, rows
+    assert all("HEAD" in r and "GET" in r for _v, r in rows), rows
+    assert fb.calls == 0, "a GET went on the wire for a HEAD surface"
+    assert summary.by_reason == {"not_a_get_surface": len(active)}
+
+
+def test_a_get_surface_is_the_only_one_this_build_probes():
+    """There is exactly one, and the set is asserted whole rather than
+    member by member so that ADDING one has to come here and argue for it."""
+    assert scan._PROBEABLE_METHODS == {"GET"}
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE",
-                                    "OPTIONS", "get"])
+                                    "OPTIONS", "HEAD", "get"])
 def test_no_other_method_is(method):
     """`OPTIONS` is out even though `hx.surface.kind_for` calls it an
     idempotent read and S4's allowlist permits it: `GET /x` and `OPTIONS /x`
     are two surfaces, and a GET tests the first one whichever row it is
-    filed under. `get` is out because `kind_for` is case-sensitive per RFC
-    9110 s9.1 and a lowercase verb must not inherit a safe method's
-    permissions."""
+    filed under.
+
+    `HEAD` IS OUT ON THAT SAME ARGUMENT and was not, for a round. It was
+    admitted on RFC 9110 s9.3.2 -- HEAD is GET without the body, so a GET
+    probe sees everything the captured request could have shown and more --
+    which is sound for a `clean` row and unsound for a FINDING:
+    `reflected_input`, `sql_error` and `path_traversal` all match on a
+    response BODY, and a HEAD response has none, so a body-reflection finding
+    filed against `HEAD /x` describes something that surface never does.
+    Finding 9 of the final review; the identity argument used to exclude
+    OPTIONS is equally true here, and waiving it for coverage is what was
+    wrong with it.
+
+    `get` is out because `kind_for` is case-sensitive per RFC 9110 s9.1 and a
+    lowercase verb must not inherit a safe method's permissions."""
     assert method not in scan._PROBEABLE_METHODS
 
 
