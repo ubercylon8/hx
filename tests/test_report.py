@@ -20,6 +20,7 @@ import pytest
 
 from hx import config as config_mod
 from hx import report
+from hx import scan
 from hx import surface as surface_mod
 from hx.checks import probe as probe_mod
 from hx.checks.active import _probe_util
@@ -734,7 +735,17 @@ def test_the_limits_section_says_a_fix_cannot_be_shown_by_re_browsing(
     out = report.render(**report_env_with_findings)
     assert "Limits" in out
     assert "may not be shown as fixed by re-browsing" in out
-    assert "are not limited this way" in out
+    # QUALIFIED SINCE FIX ROUND 5, and the absence half is why both
+    # lines are here: the active clause of this bullet used to read
+    # "are not limited this way", which is a claim about every active
+    # finding. `scan._unauthenticated_view` made it true only of a
+    # surface whose capture carried no credential header, and a client
+    # reading the unqualified sentence would re-run a scan expecting
+    # findings to retire that now cannot.
+    assert "are not limited this way" not in out
+    assert ("re-issue requests, so a rescan can show one of theirs as "
+            "fixed — but only on a surface whose captured request "
+            "carried no credential header") in out
 
 
 def test_urls_are_redacted_on_export(report_env_with_credential_url):
@@ -1152,7 +1163,17 @@ def test_the_shipped_corpus_now_ships_an_active_check_and_the_prose_says_so(
     assert out.count("`hx.active.cors`") >= 3
     assert "active check(s) ship in this build" in out
     assert "none of them can reach a request body" in out
-    assert "are not limited this way" in out
+    # QUALIFIED SINCE FIX ROUND 5, and the absence half is why both
+    # lines are here: the active clause of this bullet used to read
+    # "are not limited this way", which is a claim about every active
+    # finding. `scan._unauthenticated_view` made it true only of a
+    # surface whose capture carried no credential header, and a client
+    # reading the unqualified sentence would re-run a scan expecting
+    # findings to retire that now cannot.
+    assert "are not limited this way" not in out
+    assert ("re-issue requests, so a rescan can show one of theirs as "
+            "fixed — but only on a surface whose captured request "
+            "carried no credential header") in out
 
 
 def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
@@ -1189,7 +1210,17 @@ def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
     assert out.count("`hx.active_safe.reflected-input`") == 5
     assert "active check(s) ship in this build" in out
     assert "none of them can reach a request body" in out
-    assert "are not limited this way" in out
+    # QUALIFIED SINCE FIX ROUND 5, and the absence half is why both
+    # lines are here: the active clause of this bullet used to read
+    # "are not limited this way", which is a claim about every active
+    # finding. `scan._unauthenticated_view` made it true only of a
+    # surface whose capture carried no credential header, and a client
+    # reading the unqualified sentence would re-run a scan expecting
+    # findings to retire that now cannot.
+    assert "are not limited this way" not in out
+    assert ("re-issue requests, so a rescan can show one of theirs as "
+            "fixed — but only on a surface whose captured request "
+            "carried no credential header") in out
     assert "not the probe that proved it" in out
     assert "Every probe was sent unauthenticated" in out
 
@@ -2455,6 +2486,59 @@ def test_the_unauthenticated_bullets_safety_claim_is_one_the_code_honours(
             dataclasses.replace(resp, status=status)) is not None, (
                 f"the Limits page claims {what} is `inconclusive`, and "
                 f"status {status} is read as a conclusive negative")
+
+
+def test_the_unauthenticated_bullet_says_retirement_is_suppressed_and_it_is(
+        report_env_with_blobs):
+    """THE SEVENTH SPELLING, AND THE ONLY HALF OF IT A DELIVERABLE CAN CARRY.
+    F3 -- probes carry no session -- was decided as DISCLOSE, NOT FIX. The
+    bullet above disclosed it and a client still got `appears fixed` for a
+    live finding, because a disclosure does not stop a retirement: an
+    application answering a logged-out request with a 200 LOGIN PAGE is
+    indistinguishable from one that answered, at every level a status set
+    operates.
+
+    So the page now claims a BEHAVIOUR of the runner rather than a property
+    of the checks, and this is the assertion that ties the two together: the
+    sentence, and then `scan._unauthenticated_view` asked about a request
+    carrying each of the names the sentence lists. Empty its answer and this
+    fails, naming the paragraph that has to go with it."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert ("On an authenticated surface, an active check reports but "
+            "retires nothing") in limits
+    assert "stays live until it is retested by hand" in limits
+
+    for name in sorted(probe_mod.CREDENTIAL_HEADERS):
+        assert f"`{name}`" in limits, name
+        captured = f"GET / HTTP/1.1\r\nHost: a\r\n{name}: v\r\n\r\n".encode()
+        assert scan._unauthenticated_view(
+            probe_mod.credentials_carried(captured)), (
+                f"the Limits page tells a client that a capture carrying "
+                f"{name} retires nothing, and the runner retires on it")
+
+    # AND THE OTHER DIRECTION, which is what keeps the bullet honest rather
+    # than merely safe: an anonymous capture is NOT suppressed, so the page
+    # is not promising a blanket that would make every active retest
+    # impossible.
+    assert scan._unauthenticated_view(probe_mod.credentials_carried(
+        b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")) == ""
+
+
+def test_the_unauthenticated_bullet_does_not_claim_the_login_page_is_handled(
+        report_env_with_blobs):
+    """WHAT THE FIX DOES NOT DO. The suppression keys on the CAPTURE, so a
+    surface whose captured request carried no credential header is not
+    covered by it -- and a 200 login page there is still indistinguishable
+    from an answer. The page has to say the residual is narrowed rather than
+    closed; a sentence claiming otherwise would be this branch's ninth false
+    comment, in the one place a client reads."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "200 login PAGE cannot be told apart here from one that answered" \
+        in limits
+    assert ("on those the 200 login PAGE above is still indistinguishable "
+            "from an answer") in limits
 
 
 def test_limits_disclose_that_credential_insertion_points_are_not_probed(

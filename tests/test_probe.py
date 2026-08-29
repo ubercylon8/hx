@@ -466,6 +466,86 @@ def test_the_three_names_are_the_extensions_own():
         {"authorization", "cookie", "proxy-authorization"})
 
 
+# --- whether the CAPTURE was of a different view --------------------------
+#
+# The same three names, one question further out. `unprobeable` above answers
+# for one insertion POINT (may a probe put a payload here); this answers for
+# the whole captured REQUEST (did the browser that produced this surface carry
+# an identity that a probe does not). `hx.scan.run` withholds `considered` on
+# a surface where it does, so an active check reports what it finds in the
+# logged-out view and closes nothing about the client's own.
+
+
+@pytest.mark.parametrize("line, expected", [
+    (b"Cookie: session=abc", ("cookie",)),
+    (b"cookie: session=abc", ("cookie",)),
+    (b"Authorization: Bearer x", ("authorization",)),
+    (b"PROXY-AUTHORIZATION: Basic x", ("proxy-authorization",)),
+    # The shape a captured request ACTUALLY has on disk: `Redactor.
+    # redactObservedRequest` replaces the value and keeps the name (S7), so
+    # the name is the only thing this can be asked about -- and the only
+    # thing it should be.
+    (b"Cookie: {{observed:cookie}}", ("cookie",)),
+    # An empty one counts. Nothing here can see a value, so "carried a
+    # session" and "carried an empty header" are the same observation; the
+    # safe direction is to withhold a retirement rather than to guess.
+    (b"Cookie:", ("cookie",)),
+    (b"Accept: text/html", ()),
+    (b"X-Authorization-Mode: strict", ()),
+])
+def test_which_credential_headers_a_captured_request_carried(line, expected):
+    assert probe.credentials_carried(
+        b"GET /x?q=1 HTTP/1.1\r\nHost: app.test\r\n" + line
+        + b"\r\n\r\nbody") == expected
+
+
+def test_the_names_are_deduplicated_and_sorted():
+    """Sorted so a coverage row's sentence is stable across two scans of one
+    surface, deduplicated so a request repeating a header does not say
+    `['cookie', 'cookie']` at an operator."""
+    assert probe.credentials_carried(
+        b"GET / HTTP/1.1\r\nProxy-Authorization: a\r\nCookie: b\r\n"
+        b"cookie: c\r\nAuthorization: d\r\n\r\n") == (
+            "authorization", "cookie", "proxy-authorization")
+
+
+def test_the_request_LINE_is_not_read_as_a_header():
+    """`_http._header_lines` drops line 0, which matters here: a request whose
+    TARGET contains the word `cookie` has not carried one."""
+    assert probe.credentials_carried(
+        b"GET /set?cookie=1 HTTP/1.1\r\nHost: app.test\r\n\r\n") == ()
+
+
+def test_a_credential_shaped_line_in_the_BODY_is_not_a_header():
+    """The head is split off first. A form post whose body reads
+    `Cookie: x` is data, and treating it as a header would withhold a
+    retirement from an anonymous surface -- the wrong direction, and the one
+    that quietly costs coverage with nothing to redden."""
+    assert probe.credentials_carried(
+        b"POST /f HTTP/1.1\r\nHost: app.test\r\nContent-Length: 13\r\n"
+        b"\r\nCookie: x=1\r\n") == ()
+
+
+def test_a_request_with_no_head_terminator_is_read_whole():
+    """A truncated capture. `_http._split_head_body` hands the whole input
+    back as the head when it can find neither terminator, so a `Cookie:`
+    anywhere in it counts -- a false positive whose only cost is a retirement
+    withheld, on a blob that is malformed to begin with. Named because it is
+    a deliberate direction and not an accident of the helper."""
+    assert probe.credentials_carried(
+        b"GET / HTTP/1.1\r\nHost: app.test\r\nCookie: s=1") == ("cookie",)
+
+
+def test_the_two_questions_read_the_same_list():
+    """One source, asked from both sides. A fourth name reaching
+    `CREDENTIAL_HEADERS` must change both answers, because two modules
+    disagreeing about what a credential header is would be F2 over again."""
+    for name in sorted(probe.CREDENTIAL_HEADERS):
+        head = f"GET / HTTP/1.1\r\nHost: a\r\n{name}: v\r\n\r\n".encode()
+        assert probe.credentials_carried(head) == (name,)
+        assert probe.unprobeable(base.Insertion("header", name)) is not None
+
+
 def test_unmanaged_credential_is_not_counted_as_a_request():
     """F8 of the whole-branch review. `Sender.decide()` decides this class
     BEFORE the Gate and before `http.send` -- deliberately, so a request

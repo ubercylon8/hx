@@ -156,10 +156,14 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
             " ORDER BY host, path_template, method", (engagement_id,)).fetchall()
 
         seen_findings: set[str] = set()
-        # (surface_id, check_id, issue_type_id) this run actually examined and
-        # concluded about. Retirement reads this, NOT `check_run.verdict ==
-        # 'clean'`: a check filing one of three findings answers `finding`,
-        # and the other two still need retiring.
+        # (surface_id, check_id, issue_type_id) this run examined, concluded
+        # about, AND may speak for the client's own view of. Retirement reads
+        # this, NOT `check_run.verdict == 'clean'`: a check filing one of
+        # three findings answers `finding`, and the other two still need
+        # retiring. The third clause is `_unauthenticated_view`'s -- an
+        # active check on a surface whose capture carried credentials
+        # examined a view that is not the client's, so its conclusions are
+        # reported and are not entered here.
         considered: set[tuple[str, str, str]] = set()
 
         for surface in surfaces:
@@ -216,6 +220,15 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                 # fails at import.
                 hook = _runner_hook(check)
                 sender = None
+                # WHY THIS ROW MAY NOT RETIRE ANYTHING, or "" when it may.
+                # Set in the probe branch only, and empty here so that the
+                # passive branch keeps retiring exactly as before: a passive
+                # check reads the captured traffic ITSELF -- the very
+                # exchanges the browser's session produced -- so it is
+                # already looking at the view the client's users see, and
+                # this whole question is one only a re-issued request can
+                # have. See `_unauthenticated_view` for the rule.
+                withheld = ""
                 # F2 of the task-6 review: this try used to wrap ONLY
                 # `check.on_surface`, so anything raised while HANDLING the
                 # result -- `verdict.state` on a non-Verdict, `_write_finding`
@@ -344,6 +357,24 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                                   "rather than an address; the check was not "
                                   "run, not run clean")
                             continue
+                        # THE PROBE AND THE CAPTURE MAY BE TWO DIFFERENT
+                        # VIEWS, AND ONLY ONE OF THEM IS THE CLIENT'S.
+                        # Decided HERE rather than in the five checks, for
+                        # the reason the point-refusal above it is: a rule a
+                        # check has to remember is a rule the sixth check
+                        # forgets. `withheld` is what the answer costs; see
+                        # `_unauthenticated_view` for what it is and why the
+                        # verdict itself is left alone.
+                        #
+                        # RE-READ PER CHECK, DELIBERATELY. `exemplar_request`
+                        # is already in memory (one blob read per surface),
+                        # so this is a scan of one head per active check --
+                        # against a probe that crosses a socket, it is not a
+                        # cost worth a fourth piece of per-surface lazy state
+                        # whose "not computed yet" spelling would default to
+                        # the unsafe answer if any path ever read it early.
+                        withheld = _unauthenticated_view(
+                            probe.credentials_carried(exemplar_request))
                         wanted = frozenset(getattr(
                             check, "insertion_kinds", frozenset()) or ())
                         if wanted and insertions is None:
@@ -452,11 +483,26 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             f"({type(verdict).__name__}), not a "
                             "hx.checks.base.Verdict; a check may not "
                             "construct the runner's own vocabulary by hand")
+                    reason = verdict.reason
                     # An `inconclusive` verdict carries no `considered` -- the
                     # classmethod does not offer it -- so this loop is empty
                     # for exactly the state that must retire nothing.
-                    for issue_type in verdict.considered:
-                        considered.add((surface[0], check.id, issue_type))
+                    #
+                    # AND `withheld` IS THE SECOND WAY IT STAYS EMPTY. The
+                    # verdict is not touched: a `finding` is still written and
+                    # still reported, a `clean` is still `clean`. What is
+                    # dropped is the row's contribution to `considered`, which
+                    # is the only thing `_mark_unobserved` retires on -- so an
+                    # unauthenticated probe of an authenticated surface reports
+                    # what it found and closes nothing. The sentence goes onto
+                    # the row instead, because a `clean` whose Reason cell is
+                    # empty reads as "tested, clean" and this one is "tested,
+                    # clean, in a view that is not the client's".
+                    if withheld and verdict.considered:
+                        reason = f"{reason}; {withheld}" if reason else withheld
+                    else:
+                        for issue_type in verdict.considered:
+                            considered.add((surface[0], check.id, issue_type))
                     if verdict.state == "finding":
                         for candidate in verdict.candidates:
                             fid = _write_finding(conn, engagement_id, run_id,
@@ -503,7 +549,7 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                                f"{type(exc).__name__}: {exc}",
                                requests_sent=_spent(summary, sender))
                     continue
-                _close_row(conn, row_id, verdict.state, verdict.reason,
+                _close_row(conn, row_id, verdict.state, reason,
                            requests_sent=_spent(summary, sender))
 
         _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
@@ -641,6 +687,56 @@ def _citable_exemplar(surface, exchanges) -> str | None:
     if not exemplar_id:
         return None
     return exemplar_id if any(x.id == exemplar_id for x in exchanges) else None
+
+
+def _unauthenticated_view(carried: tuple[str, ...]) -> str:
+    """Why an active check may report but not retire here, or "" when it may.
+
+    THE RULE. If the captured request carried a credential header and the
+    probe does not, the two are requests to the same URL in two DIFFERENT
+    VIEWS of the application. An active check may report what it finds in the
+    logged-out view -- a reflection is a reflection, and suppressing evidence
+    of a real issue would be strictly worse than reporting it from the wrong
+    view -- but it may not say anything about the view the client's users are
+    in, and RETIREMENT is exactly that claim: `_mark_unobserved` renders as
+    "appears fixed; verify before closing".
+
+    THIS NEEDS NO IDENTITY MODEL, WHICH IS THE POINT. F3 of the whole-branch
+    review -- probes carry no session -- was decided as DISCLOSE, NOT FIX:
+    wiring identities into `ProbeSender` reaches the identity model this build
+    deliberately excludes, and `report._limits` tells the client instead. But
+    a disclosure does not stop the retirement, and the retirement is the harm.
+    All this needs is the knowledge that the two requests are not the same
+    view, and the exemplar's own headers are already on file.
+
+    THE SEVENTH SPELLING IS WHY IT IS NOT A STATUS RULE. Six ways an active
+    check could answer `clean` from a probe that tested nothing were closed
+    by `_probe_util._NOT_AN_ANSWER` and by the skips above; the seventh is an
+    application that answers a logged-out request with a 200 LOGIN PAGE,
+    which is a complete, well-formed, application-composed response and is
+    indistinguishable from an answer at every level a status set operates.
+    MEASURED (fix round 3): all five checks `clean`, `considered` populated, a
+    live finding retired. No set of statuses closes it. What DOES close it is
+    a fact the store already holds -- that the capture carried a session and
+    the probe did not -- and it closes the login page, the silent partial
+    render, and every future shape of the same thing at once.
+
+    THE ACCEPTED COST, stated because it is large: most surfaces on a real
+    engagement are authenticated, so active checks will rarely retire, and
+    the active corpus's retest story shrinks to anonymous surfaces. The
+    passive corpus is untouched -- it reads the captured traffic itself, so
+    it was never looking at a different view.
+
+    `carried` COMES FROM `probe.credentials_carried`, so the three names are
+    the send path's own; see it for why the values are unreadable here and
+    why that is the right shape anyway.
+    """
+    if not carried:
+        return ""
+    return (f"this surface's captured request carried {list(carried)} and a "
+            "probe from this build carries none, so this result is from the "
+            "application's UNAUTHENTICATED view of an authenticated surface: "
+            "it is reported, and it retires nothing here")
 
 
 # "Not read yet", and it cannot be `None` -- see the surface loop. Both facts
@@ -842,6 +938,15 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
     inconclusive, was skipped by the budget, or was simply absent from this
     run's `checks` retires none of its prior findings: none of those states
     ever added an entry for them.
+
+    AND ONE MORE STATE SINCE FIX ROUND 5, which is a `clean` or a `finding`
+    that DID name what it considered: `scan.run` drops the contribution of an
+    active check whose surface's captured request carried a credential header
+    (`_unauthenticated_view`), because that probe and that capture are two
+    different views of the application. The row still says what it found; it
+    just cannot say the client's own view is clean of it. So "in `considered`"
+    now means "examined, in the view the capture was of", and that is the only
+    reading under which retirement is sound.
 
     Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
     the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses

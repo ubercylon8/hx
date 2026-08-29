@@ -318,10 +318,14 @@ In `scan.run`, beside `seen_findings: set[str] = set()`, add:
 
 ```python
 # src/hx/scan.py -- Task 2: the considered set the runner collects
-        # (surface_id, check_id, issue_type_id) this run actually examined and
-        # concluded about. Retirement reads this, NOT `check_run.verdict ==
-        # 'clean'`: a check filing one of three findings answers `finding`,
-        # and the other two still need retiring.
+        # (surface_id, check_id, issue_type_id) this run examined, concluded
+        # about, AND may speak for the client's own view of. Retirement reads
+        # this, NOT `check_run.verdict == 'clean'`: a check filing one of
+        # three findings answers `finding`, and the other two still need
+        # retiring. The third clause is `_unauthenticated_view`'s -- an
+        # active check on a surface whose capture carried credentials
+        # examined a view that is not the client's, so its conclusions are
+        # reported and are not entered here.
         considered: set[tuple[str, str, str]] = set()
 ```
 
@@ -330,11 +334,26 @@ After the `isinstance(verdict, base.Verdict)` guard and before the
 
 ```python
 # src/hx/scan.py -- Task 2: every accepted verdict contributes to it
+                    reason = verdict.reason
                     # An `inconclusive` verdict carries no `considered` -- the
                     # classmethod does not offer it -- so this loop is empty
                     # for exactly the state that must retire nothing.
-                    for issue_type in verdict.considered:
-                        considered.add((surface[0], check.id, issue_type))
+                    #
+                    # AND `withheld` IS THE SECOND WAY IT STAYS EMPTY. The
+                    # verdict is not touched: a `finding` is still written and
+                    # still reported, a `clean` is still `clean`. What is
+                    # dropped is the row's contribution to `considered`, which
+                    # is the only thing `_mark_unobserved` retires on -- so an
+                    # unauthenticated probe of an authenticated surface reports
+                    # what it found and closes nothing. The sentence goes onto
+                    # the row instead, because a `clean` whose Reason cell is
+                    # empty reads as "tested, clean" and this one is "tested,
+                    # clean, in a view that is not the client's".
+                    if withheld and verdict.considered:
+                        reason = f"{reason}; {withheld}" if reason else withheld
+                    else:
+                        for issue_type in verdict.considered:
+                            considered.add((surface[0], check.id, issue_type))
 ```
 
 Change the call at the end of the run from `_mark_unobserved(conn, engagement_id, run_id, seen_findings)` to:
@@ -376,6 +395,15 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
     inconclusive, was skipped by the budget, or was simply absent from this
     run's `checks` retires none of its prior findings: none of those states
     ever added an entry for them.
+
+    AND ONE MORE STATE SINCE FIX ROUND 5, which is a `clean` or a `finding`
+    that DID name what it considered: `scan.run` drops the contribution of an
+    active check whose surface's captured request carried a credential header
+    (`_unauthenticated_view`), because that probe and that capture are two
+    different views of the application. The row still says what it found; it
+    just cannot say the client's own view is clean of it. So "in `considered`"
+    now means "examined, in the view the capture was of", and that is the only
+    reading under which retirement is sound.
 
     Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
     the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses
@@ -1303,6 +1331,49 @@ def unprobeable(insertion) -> str | None:
         return (f"header {insertion.name!r}: the send path refuses a "
                 "credential header it did not inject")
     return None
+
+
+def credentials_carried(request_bytes: bytes) -> tuple[str, ...]:
+    """Which of `CREDENTIAL_HEADERS` this CAPTURED request carried, sorted.
+
+    THE QUESTION IS "WAS THIS THE SAME VIEW?", NOT "CAN WE PROBE IT?".
+    `unprobeable` above answers for one insertion POINT -- may a probe put a
+    payload here -- and `hx.scan.run` uses it to drop points. This answers for
+    the whole captured REQUEST: did the browser that produced this surface
+    carry an identity that a probe from this build does not? `ProbeSender.
+    _request_bytes` emits a request line, a `Host` and at most the one header
+    the check is probing, so the answer being non-empty means the probe and
+    the capture are two different views of the application, and whatever the
+    probe did or did not find says nothing about the one the client's users
+    see. `hx.scan.run` withholds `considered` on such a surface, so nothing
+    there is retired; F3 of the whole-branch review is the disclosure of the
+    underlying gap, and `hx.report._limits` carries it.
+
+    THE SAME THREE NAMES, READ FROM `CREDENTIAL_HEADERS` RATHER THAN SPELT
+    AGAIN. Two modules disagreeing about what a credential header is would be
+    the F2 family of defect over again, from the other side.
+
+    NAMES ONLY, AND THE STORE IS WHY THAT IS THE ONLY OPTION AS WELL AS THE
+    RIGHT ONE. `Redactor.redactObservedRequest` replaces each of these
+    headers' VALUES with `{{observed:<name>}}` before the bytes are hashed and
+    stored (S7), so a captured request on disk reads `Cookie:
+    {{observed:cookie}}` -- the name survives and the credential does not.
+    Nothing here can see a credential value, which is also why nothing here
+    can tell a live session from an expired one, an empty `Cookie:` header
+    from a full one, or a first-party cookie from an analytics one. All of
+    them answer "carried", which is the safe direction: the cost is a
+    retirement withheld, and the alternative is a live finding reported to a
+    client as fixed.
+
+    A REQUEST WITH NO HEAD TERMINATOR IS READ WHOLE, for the same reason.
+    `_http._split_head_body` returns the entire input as the head when it can
+    find neither terminator (a truncated capture), so a `Cookie:` anywhere in
+    it counts. That is a false positive whose only cost is the retirement, on
+    a blob that is malformed to begin with.
+    """
+    head = _http._split_head_body(request_bytes)[0]
+    return tuple(sorted({name.lower() for name in _http.header_names(head)
+                         if name.lower() in CREDENTIAL_HEADERS}))
 
 
 def _placeholder_in(path: str) -> str | None:
