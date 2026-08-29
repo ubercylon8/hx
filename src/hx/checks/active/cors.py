@@ -146,6 +146,15 @@ class Cors:
 
     def probes(self, ctx, surface, insertions, sender) -> base.Verdict:
         exemplar_exchange_id = surface[6]
+        # THE ONE CHECK THAT DOES NOT USE `_probe_util.send_or_gap`, and the
+        # reason is that it has nothing to continue TO. That helper exists so
+        # a refusal on one insertion point does not discard the points after
+        # it (F2 of the whole-branch review); this check declares none and
+        # sends exactly one request, so a refusal here IS the whole surface's
+        # answer. Letting it propagate puts the wire's own class in the
+        # `check_run` row via `hx.scan.run`'s `except ProbeRefused` -- `probe
+        # refused: budget_exhausted: ...` -- which says more than a gap
+        # sentence would, and lands `inconclusive` either way.
         resp = sender.get(sender.path, headers={"Origin": _PROBE_ORIGIN})
 
         allow_origin = _http.header_values(resp.head,
