@@ -1225,6 +1225,7 @@ git commit -m "feat(checks): reflected input, canary-first"
 - Test: `tests/test_checks_sql_error.py`, `tests/test_checks_path_traversal.py`
 
 **Interfaces:**
+- Consumes: `probe.ProbeSender.get(path, *, headers=None, timeout=30.0) -> ProbeResponse`; `base.Verdict.clean(*, considered=())` / `finding(*candidates, considered=())`; and **`_probe_util.canary()` / `_probe_util.reflected(response, marker)`, created in Task 10** — both checks here send a value and match the response, which is the shape that helper exists for. Do not reimplement it.
 - Produces: `sql_error.SqlError` (`id = "hx.active.sql-error"`) and `path_traversal.PathTraversal` (`id = "hx.active.path-traversal"`), both `klass = "active_safe"`, both `insertion_kinds = frozenset({"query", "path_segment"})`.
 
 **Two checks in one task because they are the same shape**: send a value at an insertion point, then match the response against a signature table. They differ only in the value and the table, and a reviewer can reject one while approving the other by file.
