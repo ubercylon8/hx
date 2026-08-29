@@ -230,6 +230,7 @@ class OpenRedirect:
                     severity="Medium", confidence="Certain",
                     insertion=insertion,
                     exchange_ids=(exemplar_exchange_id,), cwe="CWE-601",
+                    payload=_MARKER_URL,
                     description=(
                         f"Requesting {path} with {insertion.name}="
                         f"{_MARKER_URL} (a host this target cannot have "

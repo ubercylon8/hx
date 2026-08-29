@@ -126,6 +126,13 @@ def test_a_canary_that_comes_back_is_a_finding_naming_the_insertion_point():
     assert v.state == "finding"
     assert v.candidates[0].insertion == _QUERY_A
     assert v.candidates[0].issue_type_id == ri._ISSUE_TYPE
+    # F10, and this check is the one where the payload is not a constant: the
+    # value is minted per point per run, so the column is the only record of
+    # WHICH string was sent. An unescaped finding rests on the escalation, so
+    # the wrapped value is the one named.
+    payload = v.candidates[0].payload
+    assert payload.startswith(ri._META_CHARS) and payload.endswith(
+        ri._META_CHARS), payload
 
 
 def test_a_canary_that_does_not_come_back_is_clean():

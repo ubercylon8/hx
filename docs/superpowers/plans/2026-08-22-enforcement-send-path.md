@@ -23988,6 +23988,14 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
     `(surface_id, check.id)` match against THIS run's own `check_run` rows
     with `verdict='clean'`, not surface membership alone.
 
+    `payload` MOVES WITH `description`, and that pairing is the reason it is
+    in the update list at all. Two of the active checks mint a fresh random
+    payload per run (`reflected_input`'s canary, `sql_error`'s prefix), so a
+    column left alone on re-find would hold run 1's value beside a
+    description, severity and confidence that are all run 7's -- one row
+    describing two different demonstrations. It is not part of `dedupe_key`,
+    so moving it re-files nothing.
+
     The fix is here rather than in the runner because `dedupe_key` is already
     built from surface AND check identity in exactly one place (this module's
     `dedupe_key`) and a second place deciding either would be the same class
@@ -24012,6 +24020,7 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
         "   confidence=excluded.confidence,"
         "   surface_id=excluded.surface_id,"
         "   host=excluded.host,"
+        "   payload=excluded.payload,"
         "   check_id=excluded.check_id",
         (fid, engagement_id, dedupe_key, candidate.issue_type_id,
          candidate.title, candidate.description,

@@ -127,6 +127,10 @@ def test_the_root_account_line_in_the_body_is_a_finding():
     assert v.state == "finding"
     assert v.candidates[0].issue_type_id == ptrav._ISSUE_TYPE
     assert v.candidates[0].insertion == _FILE_PARAM
+    # F10: the payload as this check MEANT it, not as the request line spells
+    # it -- `../../..` and not `..%2F..%2F..`, which is what a reader would
+    # have to reproduce.
+    assert v.candidates[0].payload == ptrav._TRAVERSAL_PAYLOAD
 
 
 def test_a_response_with_no_signature_anywhere_is_clean():

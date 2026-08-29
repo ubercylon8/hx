@@ -115,6 +115,9 @@ def test_a_location_pointing_at_the_marker_host_is_a_finding():
     assert v.state == "finding"
     assert v.candidates[0].issue_type_id == oredir._ISSUE_TYPE
     assert v.candidates[0].insertion == _REDIRECT_INSERTION
+    # F10: `finding.payload` exists and `upsert_finding` writes it; every
+    # active check left it NULL until this fix.
+    assert v.candidates[0].payload == oredir._MARKER_URL
 
 
 def test_a_location_that_keeps_the_targets_host_is_clean():

@@ -162,6 +162,7 @@ class Cors:
                 issue_type_id=_REFLECTS_WITH_CREDENTIALS,
                 severity="High", confidence="Certain", insertion=None,
                 exchange_ids=(exemplar_exchange_id,), cwe="CWE-942",
+                payload=_PROBE_ORIGIN,
                 description=(
                     f"Requesting with Origin: {_PROBE_ORIGIN} (a value this "
                     "target cannot have expected) drew back "
@@ -181,6 +182,7 @@ class Cors:
                 issue_type_id=_REFLECTS_NO_CREDENTIALS,
                 severity="Medium", confidence="Certain", insertion=None,
                 exchange_ids=(exemplar_exchange_id,), cwe="CWE-942",
+                payload=_PROBE_ORIGIN,
                 description=(
                     f"Requesting with Origin: {_PROBE_ORIGIN} (a value this "
                     "target cannot have expected) drew back "
@@ -198,6 +200,7 @@ class Cors:
                 issue_type_id=_WILDCARD_WITH_CREDENTIALS,
                 severity="Low", confidence="Firm", insertion=None,
                 exchange_ids=(exemplar_exchange_id,), cwe="CWE-942",
+                payload=_PROBE_ORIGIN,
                 description=(
                     "The response carried Access-Control-Allow-Origin: * "
                     "together with Access-Control-Allow-Credentials: "

@@ -15,6 +15,8 @@ real Burp path is Task 13's (`tests/integration/`).
 """
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import pytest
 
 from hx.checks import base, probe
@@ -121,11 +123,19 @@ _CLEAN_BODY = b"<html>ordinary response, nothing wrong here</html>"
 
 
 def test_a_vendor_signature_in_the_body_is_a_finding():
-    v = sqle.SqlError().probes(ctx, surface, (_QUERY,),
-                               _sender_returning(500, _MYSQL_BODY))
+    sender = _sender_returning(500, _MYSQL_BODY)
+    v = sqle.SqlError().probes(ctx, surface, (_QUERY,), sender)
     assert v.state == "finding"
     assert v.candidates[0].issue_type_id == sqle._ISSUE_TYPE
     assert v.candidates[0].insertion == _QUERY
+    # F10: the payload as this check MEANT it -- before the percent-encoding
+    # that carries it on the request line, and ending in the unmatched quote
+    # that is the whole probe. Checked against what actually went out, not
+    # only for shape: the value is random per point per run, so this column
+    # is the only record of WHICH string was sent.
+    payload = v.candidates[0].payload
+    assert payload.endswith("'"), payload
+    assert quote(payload, safe="") in sender.paths[0]
 
 
 def test_a_response_with_no_signature_anywhere_is_clean():

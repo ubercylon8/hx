@@ -279,6 +279,7 @@ class PathTraversal:
                 severity="High", confidence="Certain",
                 insertion=insertion,
                 exchange_ids=(exemplar_exchange_id,), cwe="CWE-22",
+                payload=_TRAVERSAL_PAYLOAD,
                 description=_describe(insertion, resp, signature, what),
                 remediation=(
                     "Resolve this input against an allowlist of permitted "

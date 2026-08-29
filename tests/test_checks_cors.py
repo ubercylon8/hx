@@ -101,6 +101,10 @@ def test_an_arbitrary_origin_reflected_with_credentials_is_a_finding():
          "Access-Control-Allow-Credentials": "true"}))
     assert v.state == "finding"
     assert cors._PROBE_ORIGIN in v.candidates[0].description
+    # F10: `finding.payload` exists and `upsert_finding` writes it. The value
+    # this was demonstrated with is the Origin the probe carried; leaving the
+    # column NULL made the first corpus with real payloads populate none.
+    assert v.candidates[0].payload == cors._PROBE_ORIGIN
 
 
 def test_a_target_that_ignores_the_origin_is_clean_and_says_what_it_considered():

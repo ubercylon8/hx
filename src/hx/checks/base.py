@@ -108,6 +108,15 @@ class Candidate:
     remediation: str | None = None
     cwe: str | None = None
     scope_level: str = "surface"
+    # THE VALUE THIS FINDING WAS DEMONSTRATED WITH, as the check meant it and
+    # BEFORE any transport encoding: `../../../../../../etc/passwd`, not
+    # `..%2F..%2F...`. F10 of the whole-branch review -- the first corpus in
+    # this project's history that actually has payloads left this NULL on
+    # every candidate, in a column `records.upsert_finding` has always
+    # written and the schema has always had. Nothing renders it (that is a
+    # separate decision about what belongs in a client deliverable), so what
+    # it buys today is a store that holds the answer rather than one that
+    # would have to re-derive it from a description.
     payload: str | None = None
 
     def __post_init__(self) -> None:

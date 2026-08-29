@@ -287,6 +287,7 @@ class SqlError:
                 severity="Medium", confidence="Certain",
                 insertion=insertion,
                 exchange_ids=(exemplar_exchange_id,), cwe="CWE-209",
+                payload=value,
                 description=_describe(insertion, resp, signature, vendor),
                 remediation=(
                     "Use parameterised queries or prepared statements for "

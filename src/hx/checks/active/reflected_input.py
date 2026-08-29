@@ -331,6 +331,14 @@ class ReflectedInput:
                 confidence="Certain",
                 insertion=insertion,
                 exchange_ids=(exemplar_exchange_id,), cwe="CWE-79",
+                # THE ONE THE TITLE IS ABOUT. An unescaped finding is the
+                # ESCALATION's result, so its payload is the wrapped value
+                # that came back intact; a plain one -- including the case
+                # where the escalation was refused and never sent -- rests on
+                # the bare canary, and naming a string this check did not
+                # learn anything from would be the same overstatement one
+                # column along.
+                payload=wrapped if unescaped else marker,
                 description=_describe(insertion, marker, resp,
                                       unescaped=unescaped),
                 remediation=(
