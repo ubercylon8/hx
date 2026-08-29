@@ -94,7 +94,8 @@ def responses(ctx, exchanges) -> Evidence:
         got.gaps)
 
 
-def verdict(evidence: Evidence, candidates) -> base.Verdict:
+def verdict(evidence: Evidence, candidates, *,
+            considered: tuple[str, ...] = ()) -> base.Verdict:
     """The corpus's one rule for when `clean` may be said.
 
     A check may answer `clean` only when EVERY exchange the surface holds was
@@ -109,9 +110,15 @@ def verdict(evidence: Evidence, candidates) -> base.Verdict:
     surface that DID find something records no trace of the gap. Closing that
     means a reason on a finding verdict, which is a schema-visible change to
     `check_run` semantics and not this fix's.)
+
+    `considered` NAMES WHAT THE CHECK EXAMINED, and only the two conclusive
+    returns carry it. An `inconclusive` verdict deliberately does not: the
+    surface's evidence was incomplete, so the check concluded nothing, and
+    `hx.scan._mark_unobserved` must not retire a finding on the strength of a
+    response it could not read.
     """
     if candidates:
-        return base.Verdict.finding(*candidates)
+        return base.Verdict.finding(*candidates, considered=considered)
     if not evidence.entries:
         return base.Verdict.inconclusive(
             "no response could be read for this surface" + _detail(evidence))
@@ -119,7 +126,7 @@ def verdict(evidence: Evidence, candidates) -> base.Verdict:
         return base.Verdict.inconclusive(
             "this surface's evidence is incomplete, so nothing found here "
             "separates `tested, clean` from `never reached`" + _detail(evidence))
-    return base.Verdict.clean()
+    return base.Verdict.clean(considered=considered)
 
 
 def _detail(evidence: Evidence) -> str:

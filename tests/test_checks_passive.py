@@ -88,6 +88,32 @@ def test_a_second_set_cookie_header_is_still_checked():
     assert "b" in v.candidates[0].title
 
 
+def test_cookie_flags_considers_every_cookie_the_surface_set():
+    """Per-cookie issue types: exactly why `considered` is run-time and not a
+    class-level declaration. Both cookies are considered even though only
+    one of them is missing anything -- a check that examined a cookie and
+    found it fine still examined it."""
+    c = cookie_flags.CookieFlags()
+    blob = resp(b"Set-Cookie: a=1; Path=/; Secure; HttpOnly; SameSite=Lax",
+                b"Set-Cookie: b=2; Path=/")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
+    assert len(v.considered) == 2
+    assert set(v.considered) == {cookie_flags._issue_type("a"),
+                                 cookie_flags._issue_type("b")}
+
+
+def test_a_cookie_flag_candidates_issue_type_is_one_it_considered():
+    """The silent-drift hazard: a candidate whose issue type is not in
+    `considered` can never be retired, and nothing else in the suite would
+    notice."""
+    c = cookie_flags.CookieFlags()
+    blob = resp(b"Set-Cookie: session=abc; Path=/")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
+    assert v.state == "finding"
+    for candidate in v.candidates:
+        assert candidate.issue_type_id in v.considered
+
+
 def test_the_issue_type_carries_the_cookie_but_not_the_missing_flags():
     """D1 and D4 at the unit the dedupe key is built from.
 
@@ -154,6 +180,32 @@ def test_a_fully_headed_https_response_is_clean():
                 b"X-Content-Type-Options: nosniff",
                 b"X-Frame-Options: DENY")
     assert c.on_surface(ctx_for(d1=blob), None, rows()).state == "clean"
+
+
+def test_security_headers_reports_every_header_it_examined():
+    c = security_headers.SecurityHeaders()
+    blob = resp(b"Content-Type: text/html",
+                b"Strict-Transport-Security: max-age=31536000",
+                b"X-Content-Type-Options: nosniff",
+                b"X-Frame-Options: DENY")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
+    assert v.state == "clean"
+    assert set(v.considered) == {
+        "missing-content-type-options",
+        "missing-frame-protection",
+        "missing-hsts",
+    }, "a clean answer that names nothing retires nothing, so a fixed header stays live forever"
+
+
+def test_an_inconclusive_verdict_considers_nothing():
+    """S10: never `clean` when the check could not run, and never with
+    `considered` populated either -- a check that could not read the
+    evidence has concluded nothing, and retiring on that basis would close a
+    finding on missing data."""
+    c = security_headers.SecurityHeaders()
+    v = c.on_surface(ctx_for(), None, rows())      # d1 absent from the store
+    assert v.state == "inconclusive"
+    assert v.considered == ()
 
 
 def test_csp_frame_ancestors_satisfies_the_frame_check():

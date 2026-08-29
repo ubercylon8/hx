@@ -38,6 +38,11 @@ _PATTERNS = (
      "a Slack token", "High", "CWE-312", "slack-token-in-response"),
 )
 
+# The issue type this check examines every readable body for, regardless of
+# whether any pattern matched. Read off `_PATTERNS` so it cannot drift from
+# the identity a matching candidate carries.
+_ISSUE_TYPES = tuple(issue_type_id for *_, issue_type_id in _PATTERNS)
+
 
 class SecretInResponse:
     id = "hx.passive.secret-in-response"
@@ -65,4 +70,4 @@ class SecretInResponse:
                     remediation="Remove the credential from the response and "
                                 "rotate it, in that order.",
                 ))
-        return _http.verdict(seen, candidates)
+        return _http.verdict(seen, candidates, considered=_ISSUE_TYPES)

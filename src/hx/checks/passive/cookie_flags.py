@@ -136,10 +136,17 @@ class CookieFlags:
     def on_surface(self, ctx, surface, exchanges) -> base.Verdict:
         seen = _http.responses(ctx, exchanges)
         candidates = []
+        considered = []
         for row, head in seen.entries:
             https = row.url.lower().startswith("https://")
             for cookie in _http.header_values(head, "set-cookie"):
                 name = cookie.split("=", 1)[0].strip()
+                # Minted once per cookie occurrence and reused for both the
+                # candidate and `considered`, so the two cannot drift: a
+                # candidate whose issue type is not in `considered` is never
+                # retired, and nothing else would notice.
+                issue_type = _issue_type(name)
+                considered.append(issue_type)
                 attrs = {a.strip().split("=", 1)[0].lower()
                          for a in cookie.split(";")[1:]}
                 missing = [f for f, want in (("HttpOnly", "httponly"),
@@ -151,7 +158,7 @@ class CookieFlags:
                     continue
                 candidates.append(base.Candidate(
                     title=f"Cookie {name} set without {', '.join(missing)}",
-                    issue_type_id=_issue_type(name),
+                    issue_type_id=issue_type,
                     severity="Medium" if "HttpOnly" in missing else "Low",
                     confidence="Certain",
                     insertion=None,
@@ -167,4 +174,4 @@ class CookieFlags:
                         "cross-site submission; Secure prevents it being sent "
                         "over plaintext."),
                 ))
-        return _http.verdict(seen, candidates)
+        return _http.verdict(seen, candidates, considered=tuple(considered))

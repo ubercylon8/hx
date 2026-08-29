@@ -34,6 +34,11 @@ _PATTERNS = (
      "nodejs-stack-trace-disclosed"),
 )
 
+# The issue type this check examines every readable body for, regardless of
+# whether any pattern matched. Read off `_PATTERNS` so it cannot drift from
+# the identity a matching candidate carries.
+_ISSUE_TYPES = tuple(issue_type_id for *_, issue_type_id in _PATTERNS)
+
 
 class StackTrace:
     id = "hx.passive.stack-trace"
@@ -62,4 +67,4 @@ class StackTrace:
                                 "detail server-side.",
                 ))
                 break     # one trace per exchange is the finding
-        return _http.verdict(seen, candidates)
+        return _http.verdict(seen, candidates, considered=_ISSUE_TYPES)
