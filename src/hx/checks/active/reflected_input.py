@@ -76,10 +76,12 @@ one request means its three issue types were all looked at and none applied
 -- "examined" never meant "found something", here or in either predecessor.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
-same reason `cors.py` and `open_redirect.py` give: nothing in this build's
-probe path writes an exchange row for a probe's own traffic yet (Task 13's),
-so `surface[6]` is the only exchange id any of these three checks can
-truthfully name today.
+same reason `cors.py` and `open_redirect.py` give: nothing in this build
+records a probe's own request and response anywhere, so `surface[6]` is the
+only exchange id any of these three checks can truthfully name today.
+`report._limits` discloses the gap to the client; closing it for real needs
+a new bridge frame type and writer -- Java work beyond this plan, and open
+debt owned by no current task.
 """
 from __future__ import annotations
 

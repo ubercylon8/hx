@@ -62,9 +62,12 @@ redirect, and `hx.scan._mark_unobserved` must not retire a finding on the
 strength of a question this check never asked.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
-same reason `cors.py` gives: nothing in this build's probe path writes an
-exchange row for a probe's own traffic yet (Task 13's), so
-`surface[6]` is the only exchange id this check can truthfully name.
+same reason `cors.py` gives: nothing in this build records a probe's own
+request and response anywhere -- the extension captures proxy traffic only
+-- so `surface[6]` is the only exchange id this check can truthfully name.
+`report._limits` discloses that gap to the client; closing it needs a new
+bridge frame type and writer, Java work this plan does not do, and it is
+open debt no current task owns.
 
 EACH CANDIDATE CARRIES ITS `Insertion`, unlike `cors.py`'s `insertion=None`.
 Two parameters on one surface can each independently redirect, and

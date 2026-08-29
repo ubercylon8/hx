@@ -46,12 +46,18 @@ WHAT THE PAIR OF HEADERS MEANS, AND WHY THE SEVERITIES DIFFER:
 means a client who fixes their CORS header can never see the finding close.
 
 THE EVIDENCE THIS CHECK CITES IS THE SURFACE'S EXEMPLAR EXCHANGE, not a
-fresh one from this probe's own request/response. Nothing in this build's
-probe path writes an exchange row for a probe's own traffic yet -- the wire
-answers `ProbeSender.get()` directly, and no `hx.capture`-shaped sink is
-wired to it -- so `surface[6]` (`exemplar_exchange_id`, the exchange that
-already proved this surface exists) is the only exchange row this check can
-truthfully cite. Recording the probe's own exchange is Task 13's.
+fresh one from this probe's own request/response. Nothing in this build
+records a probe's own request and response anywhere: the extension
+captures proxy traffic only (`Capture.deliverExchange` hard-codes
+`via: proxy`), and the wire here answers `ProbeSender.get()` directly with
+no `hx.capture`-shaped sink wired to it -- so `surface[6]`
+(`exemplar_exchange_id`, the exchange that already proved this surface
+exists) is the only exchange row this check can truthfully cite: a captured
+request TO the affected surface, not the probe that demonstrated the flaw.
+That gap is disclosed to the client -- `report._limits` says so (added in
+commit 7aa7f63). Closing it for real needs a new bridge frame type and a
+new writer, which is Java work outside this plan; it is open debt owned by
+no current task.
 """
 from __future__ import annotations
 

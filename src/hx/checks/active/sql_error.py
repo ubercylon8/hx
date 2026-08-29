@@ -87,10 +87,12 @@ parameters that each independently disclose a database error must stay two
 rows, not collapse into one.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
-same reason every active check in this corpus gives: nothing in this
-build's probe path writes an exchange row for a probe's own traffic yet
-(Task 13's), so `surface[6]` is the only exchange id this check can
-truthfully name.
+same reason every active check in this corpus gives: nothing in this build
+records a probe's own request and response anywhere, so `surface[6]` is the
+only exchange id this check can truthfully name. The gap is disclosed to
+the client via `report._limits`; closing it needs a new bridge frame type
+and writer, which is Java work outside this plan and open debt no current
+task owns.
 """
 from __future__ import annotations
 

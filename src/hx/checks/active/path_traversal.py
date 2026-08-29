@@ -88,10 +88,11 @@ finding's identity, and two parameters that each independently disclose
 file content must stay two rows.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
-same reason every active check in this corpus gives: nothing in this
-build's probe path writes an exchange row for a probe's own traffic yet
-(Task 13's), so `surface[6]` is the only exchange id this check can
-truthfully name.
+same reason every active check in this corpus gives: nothing in this build
+records a probe's own request and response anywhere -- the extension
+captures proxy traffic only. `report._limits` already tells the client so;
+a real fix needs a new bridge frame type and a new writer, Java work this
+plan does not touch, and until then the gap is debt no current task owns.
 """
 from __future__ import annotations
 
