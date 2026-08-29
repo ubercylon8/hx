@@ -3023,6 +3023,7 @@ git commit -m "feat(engagement): isolated engagement directories with append-onl
 ```python
 # tests/test_cli.py
 import contextlib
+import dataclasses
 import os
 import shutil
 from pathlib import Path
@@ -3775,11 +3776,10 @@ def test_deleting_the_sentinel_by_hand_leaves_the_two_sides_disagreeing(engageme
 @pytest.fixture
 def engagement_with_surface(engagement: Path) -> Path:
     """One `surface` row and one `exchange` against it, so a passive check --
-    `active_safe`, `active_mutate` and `active_dos` all default to `probes`,
-    not `on_surface`, and this plan ships none of those -- has something to
-    read. Built on `engagement` the way `engagement_with_drops` and
+    or, since Task 8, `hx.active.cors` on its `probes` hook -- has something
+    to read. Built on `engagement` the way `engagement_with_drops` and
     `engagement_with_stale_run` are, per P2: this fixture did not exist
-    before this task."""
+    before Task 7."""
     eng = eng_mod.open_(engagement)
     try:
         eng.db.execute(
@@ -3798,7 +3798,46 @@ def engagement_with_surface(engagement: Path) -> Path:
     return engagement
 
 
-def test_scan_reports_what_it_ran(engagement_with_surface):
+def _disable_checks(engagement_path: Path, **overrides: bool) -> None:
+    """Overlay `overrides` onto an engagement's `checks` config, on disk.
+
+    Not a raw rewrite of `config.yaml`: `eng_mod.open_`'s I2 guard refuses a
+    file that has drifted from the latest `scope_version` row, so
+    `record_scope_version` -- the sanctioned writer, which updates both -- is
+    what a test needing a non-default `checks` map has to go through instead.
+    """
+    eng = eng_mod.open_(engagement_path)
+    try:
+        eng.config = dataclasses.replace(
+            eng.config, checks={**eng.config.checks, **overrides})
+        eng_mod.record_scope_version(
+            eng, author="test", reason="test override of checks config")
+    finally:
+        eng.db.close()
+
+
+def _stub_session(monkeypatch, bridge=None) -> None:
+    """Stand in for `hx.session.session` with something that never launches
+    a JVM, for a test whose point has nothing to do with the session itself.
+
+    `hx.active.cors` shipping (Task 8) means `active_safe` -- on by default
+    -- now has a check in it, so `hx scan` opens a session for any engagement
+    with a surface (see `cli.scan`'s `sending` gate). `bridge` defaults to a
+    bare `object()`: `Cors.probes` calling `.send()` on it raises
+    `AttributeError`, which `scan.run`'s per-check `except Exception` turns
+    into an `error` check_run row rather than a crash -- fine for every test
+    below that is not itself asserting something about CORS's own outcome.
+    """
+    def fake(eng, *, instance, jar=None, workdir=None, seed=None):
+        return contextlib.nullcontext(
+            SimpleNamespace(operator_port=1, crawler_port=2, epoch=1,
+                            bridge=bridge if bridge is not None else object(),
+                            workdir=None, proc=None))
+    monkeypatch.setattr(cli.session_mod, "session", fake)
+
+
+def test_scan_reports_what_it_ran(engagement_with_surface, monkeypatch):
+    _stub_session(monkeypatch)
     result = CliRunner().invoke(cli.main,
                                 ["scan", "--root", str(engagement_with_surface)])
     assert result.exit_code == 0, result.output
@@ -3812,7 +3851,8 @@ _FLAGLESS_COOKIE_RESPONSE = (
 )
 
 
-def test_scan_prints_the_number_of_findings_the_store_holds(engagement):
+def test_scan_prints_the_number_of_findings_the_store_holds(engagement,
+                                                             monkeypatch):
     """D3 of the fix-round-A re-review. Forty surfaces of ONE host, all
     setting one flagless cookie: `cookie_flags` is `scope_level='host'`, so
     F3 of the whole-branch review makes the forty candidates land on ONE
@@ -3842,6 +3882,7 @@ def test_scan_prints_the_number_of_findings_the_store_holds(engagement):
     finally:
         eng.db.close()
 
+    _stub_session(monkeypatch)
     result = CliRunner().invoke(cli.main, ["scan", "--root", str(engagement)])
 
     assert result.exit_code == 0, result.output
@@ -3856,11 +3897,14 @@ def test_scan_prints_the_number_of_findings_the_store_holds(engagement):
         "disagreed")
 
 
-def test_scan_names_a_class_that_is_enabled_but_ships_no_checks(engagement_with_surface):
+def test_scan_names_a_class_that_is_enabled_but_ships_no_checks(
+        engagement_with_surface, monkeypatch):
     """config.DEFAULT_CHECKS turns `active_timing` ON by default and this
-    plan ships no checks in it. An operator reading `active_timing: enabled`
-    and seeing no rows would reasonably conclude it ran and found nothing.
-    The scan says so out loud instead."""
+    build ships no checks in it (`active_safe` -- since Task 8 -- and
+    `active_timing` are two different classes). An operator reading
+    `active_timing: enabled` and seeing no rows would reasonably conclude it
+    ran and found nothing. The scan says so out loud instead."""
+    _stub_session(monkeypatch)
     result = CliRunner().invoke(cli.main,
                                 ["scan", "--root", str(engagement_with_surface)])
     assert "active_timing" in result.output
@@ -3891,6 +3935,7 @@ def test_scan_max_seconds_reaches_the_runner(engagement_with_surface, monkeypatc
     `test_budget_exhaustion_writes_skipped_rows_for_the_remaining_surfaces`
     in `tests/test_scan.py` does it: one call to compute the deadline, one
     call for the single surface `engagement_with_surface` seeds."""
+    _stub_session(monkeypatch)
     ticks = iter([0.0, 1.0])
     monkeypatch.setattr(scan_mod.time, "monotonic", lambda: next(ticks))
     result = CliRunner().invoke(cli.main, [
@@ -3926,6 +3971,7 @@ def test_scan_max_requests_flag_overrides_the_configured_budget(
                         bridge=bridge)
 
     monkeypatch.setattr(scan_mod, "run", fake_run)
+    _stub_session(monkeypatch)
     before = eng_mod.open_(engagement_with_surface)
     try:
         before_max_requests = before.config.max_requests
@@ -3999,9 +4045,17 @@ def _fake_session(opened, bridge):
 
 def test_scan_opens_no_session_when_the_corpus_is_passive_only(
         engagement_with_surface, monkeypatch):
-    """A passive scan stays offline. Burp costs ~10 s to start and this build
-    ships only passive checks, so the common `hx scan` must not pay it for an
-    engine nothing will send through."""
+    """A passive scan stays offline. Burp costs ~10 s to start, so an engine
+    nothing will send through must not be paid for.
+
+    `active_safe` is ON by default and, since Task 8, ships a check
+    (`hx.active.cors`) -- so this scenario is no longer the shipped build's
+    ambient state and has to be built by hand: everything active turned off,
+    leaving a corpus that is passive-only BY CONSTRUCTION rather than by
+    accident of what this build happened to ship."""
+    _disable_checks(engagement_with_surface, active_safe=False,
+                    active_timing=False)
+
     def refuse(*a, **k):
         pytest.fail("a passive-only scan launched Burp")
 
@@ -4043,7 +4097,13 @@ def test_scan_does_not_open_a_session_for_an_active_class_that_ships_nothing(
     default and this build ships no check in it, so a CLI that tested
     `config.checks` instead of `registry.enabled` would launch a Burp for
     every scan, send nothing through it, and print the `ships no checks`
-    note underneath."""
+    note underneath.
+
+    `active_safe` turned off here so `hx.active.cors` -- a class this build
+    DOES ship a check in, since Task 8 -- cannot itself be the reason a
+    session opens and mask what this test is actually pinning."""
+    _disable_checks(engagement_with_surface, active_safe=False)
+
     def refuse(*a, **k):
         pytest.fail("a class with no checks in it launched Burp")
 
@@ -4071,7 +4131,12 @@ def test_scan_does_not_open_a_session_for_a_non_passive_class_that_reads(
     THE ASSERTION IS THE AUTOUSE GUARD. `no_unit_test_in_this_file_launches_a_jvm`
     fails this test in teardown if the gate opens a session, which is the
     same mechanism protecting every other test in the file rather than a
-    second one invented here."""
+    second one invented here.
+
+    `active_safe` turned off so `hx.active.cors` -- which DOES send, since
+    Task 8 -- is not itself the reason a session opens here; this test is
+    about `active_timing`'s hook, not about `active_safe`'s content."""
+    _disable_checks(engagement_with_surface, active_safe=False)
     monkeypatch.setitem(registry_mod._HOOKS, "active_timing",
                         ("on_surface", "on_corpus"))
 

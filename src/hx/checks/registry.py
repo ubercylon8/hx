@@ -14,6 +14,7 @@ operator has already billed for.
 from __future__ import annotations
 
 from hx.checks import base
+from hx.checks.active import cors
 from hx.checks.passive import cookie_flags, secret_in_response
 from hx.checks.passive import security_headers, stack_trace
 
@@ -109,6 +110,7 @@ CHECKS: tuple[base.Check, ...] = (
     security_headers.SecurityHeaders(),
     secret_in_response.SecretInResponse(),
     stack_trace.StackTrace(),
+    cors.Cors(),
 )
 
 validate(CHECKS)

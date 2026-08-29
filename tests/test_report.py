@@ -705,17 +705,24 @@ def test_the_limits_section_names_what_this_corpus_cannot_do(report_env):
 
 def test_the_limits_section_says_a_fix_cannot_be_shown_by_re_browsing(
         report_env_with_findings):
-    """Every check this build ships is passive: `scan._exchanges_for` reads
-    an engagement's WHOLE captured history for a surface, not only its
-    newest traffic, so one recorded bad response keeps a finding live no
+    """The PASSIVE checks in this build read an engagement's WHOLE captured
+    history for a surface (`scan._exchanges_for`), not only its newest
+    traffic, so one recorded bad response keeps a finding of theirs live no
     matter how much clean traffic follows it. `report_env_with_findings`
     writes findings but no `finding_observation` row at all, which is the
     point -- this bullet is a build fact, unconditional on any run having
     retested anything, not a consequence of what a particular scan
-    observed."""
+    observed.
+
+    Task 8 registered `hx.active.cors`, so the corpus is now mixed and the
+    bullet's wording moved from an unqualified "cannot" to a "may not" that
+    names which checks it covers -- see `report._limits`'s `elif passive`
+    arm. The active side of that same bullet (the checks a retest through
+    THIS engagement's re-browsing DOES catch) is pinned separately below."""
     out = report.render(**report_env_with_findings)
     assert "Limits" in out
-    assert "cannot be shown as fixed by re-browsing" in out
+    assert "may not be shown as fixed by re-browsing" in out
+    assert "are not limited this way" in out
 
 
 def test_urls_are_redacted_on_export(report_env_with_credential_url):
@@ -735,10 +742,17 @@ def test_a_finding_carries_its_evidence_chain(report_env_with_findings):
 def test_derived_insertion_points_are_reported_as_not_probed(report_env_with_blobs):
     """Pre-flight ruling F1. S4 says body and parameter insertion points are
     derived and recorded so the coverage section can say `exists, not probed`.
-    Without this the derivation has no consumer in this plan at all."""
+    Without this the derivation has no consumer in this plan at all.
+
+    Task 8 registered `hx.active.cors`, the first active check, so "None
+    were probed" (true only while the corpus ships no active check at all --
+    see `report._insertion_coverage`'s `if active` arm) is no longer the
+    sentence the real, un-monkeypatched registry produces; the replacement
+    is asserted instead."""
     out = report.render(**report_env_with_blobs)
     assert "Insertion points" in out
-    assert "None were probed" in out
+    assert "active check(s) ship in this build" in out
+    assert "cannot say which were and which were not" in out
 
 
 def test_insertion_points_are_omitted_when_no_blob_store_is_given(report_env):
@@ -1106,15 +1120,27 @@ class _FakeActiveCheck:
     insertion_kinds = frozenset({"query"})
 
 
-def test_the_shipped_corpus_is_all_passive_and_the_prose_says_so(
+def test_the_shipped_corpus_now_ships_an_active_check_and_the_prose_says_so(
         report_env_with_blobs):
-    """The separating case, and the reason F5 survived nine reviews: every
-    one of these sentences is TRUE of the build as it stands. What was wrong
-    is that none of them was derived from it."""
+    """UPDATED FOR TASK 8. This was the all-passive separating case for F5 --
+    every sentence asserted here was TRUE of the build as it stood, and F5's
+    point was that none of them was DERIVED from it rather than typed.
+    `hx.active.cors` joining `registry.CHECKS` makes the all-passive
+    sentences false of the real build starting today, which is exactly the
+    day this test's assertions have to move: `test_registering_an_active_
+    check_falsifies_none_of_the_limits_prose` above already proved the
+    DERIVATION handles a mixed corpus (via a monkeypatched fake check); this
+    is the anti-vacuity twin that pins the real, un-monkeypatched registry
+    now takes that branch, by name, for `hx.active.cors` specifically."""
     out = report.render(**report_env_with_blobs)
-    assert "**None were probed** — this build ships no active checks." in out
-    assert "no request carrying a payload was ever issued" in out
-    assert "Every check in this build is passive" in out
+    assert "this build ships no active checks" not in out
+    assert "no request carrying a payload was ever issued" not in out
+    assert "Every check in this build is passive" not in out
+
+    assert out.count("`hx.active.cors`") >= 3
+    assert "active check(s) ship in this build" in out
+    assert "none of them can reach a request body" in out
+    assert "are not limited this way" in out
 
 
 def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
