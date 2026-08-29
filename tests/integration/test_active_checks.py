@@ -55,6 +55,18 @@ CHANGES can prove the other half, and only an active check can see that change:
 `clean` while still naming what it considered, and `hx.scan._mark_unobserved`
 closes that finding and no other. That is `Verdict.considered` working end to
 end, and it exists nowhere else in this suite.
+
+AND TWO SURFACES NO CHECK MAY CLOSE, WHICH ARE THE LAST TWO TESTS. The same
+blind spot as the templated path, twice more. Every route above answers 2xx
+and every surface above is a GET, so until now no integration test had put
+either a response the doctrine reads as a REFUSAL or a surface a probe cannot
+address in front of a check -- and N1 and N2 of the scoped re-review lived in
+exactly that gap, each caught by a human reading rather than by a suite. A
+`302 Found / Location: /login` was read by all five checks as a conclusive
+negative and retired a live finding; a `POST` surface was probed with a GET,
+which is a request to a different surface, and closed `clean` on the strength
+of it. Both were fixed with coverage at `scan.run` against fake bridges. Here
+they are measured through Burp, a socket and a server that answers.
 """
 from __future__ import annotations
 
@@ -64,10 +76,11 @@ from collections import Counter
 import pytest
 
 from hx import report, scan
-from hx.checks import registry
+from hx.checks import base, registry
 from hx.checks.active import cors, reflected_input
 from tests.integration.target_server import (
-    TEMPLATED_ROUTE, TEMPLATED_SURFACE, VULNERABLE_ROUTES)
+    LOGIN_WALL_ROUTE, STATE_CHANGING_ROUTE, TEMPLATED_ROUTE, TEMPLATED_SURFACE,
+    VULNERABLE_ROUTES)
 
 pytestmark = pytest.mark.integration
 
@@ -505,3 +518,178 @@ def test_a_templated_surface_is_probed_at_its_own_concrete_path(rig):
         "come back intact; it rides a PATH SEGMENT here rather than a query "
         "string, through Burp and a real socket")
 
+
+# ---------------------------------------------------------------------------
+# 4. A response that is not an answer, and a surface no probe can address.
+# ---------------------------------------------------------------------------
+
+def test_a_login_wall_is_not_a_clean_result_and_retires_nothing(rig):
+    """N1, end to end: the corpus meeting a target that stops answering.
+
+    Two scans of one surface. In the first the route reflects `tab` and
+    `hx.active.reflected-input` files a finding against it. Then
+    `require_login()` puts a `302 Found / Location: /login` in front of the
+    same route -- the ordinary shape of an authenticated, browser-facing
+    application meeting an unauthenticated request, which is every request
+    this build sends -- and the second scan probes it again.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? Measured against this exact route
+    with `unanswered` blind to a 3xx (its state before fix round 3): all five
+    checks closed `clean` with `considered` populated, `_mark_unobserved` wrote
+    `observed = 0` for the live finding, and `report` rendered it as "appears
+    fixed; verify before closing". Three assertions below redden on that, and
+    the last of them is the one a client would have read.
+    """
+    _configure(rig)
+    rig.browse("GET", LOGIN_WALL_ROUTE)
+    rig.settle(
+        lambda: len(rows(rig, "SELECT id FROM surface")) == 1,
+        "one surface for the login-wall route")
+
+    _scan(rig)
+    first = {f["check_id"]: f["id"] for f in _active_findings(rig)}
+    assert set(first) == {"hx.active.reflected-input"}, (
+        "the route has to be FOUND before the wall goes up; a wall in front "
+        f"of a surface nothing was found on retires nothing anyway: {first}")
+    finding_id = first["hx.active.reflected-input"]
+    assert _observations(rig, finding_id) == [1]
+
+    # The wall. Nothing else about the target, the store or the config moves.
+    rig.target.require_login()
+    hits_before = len(rig.target.hits)
+
+    _scan(rig)
+    check_runs = [r for r in _check_runs(rig, _last_scan_run(rig))
+                  if r["check_id"] in ACTIVE_CHECK_IDS]
+    assert {r["verdict"] for r in check_runs} == {"inconclusive"}, (
+        "a probe that got a redirect to a login page tested nothing, and "
+        f"`clean` says the opposite: {check_runs}")
+
+    # AND THE PROBES REALLY WENT, which is what separates this from a skip.
+    # `inconclusive` is also what a surface nobody could address produces, so
+    # without this the assertion above would be satisfied by a scan that sent
+    # nothing at all -- and by every future change that stops it sending.
+    spent = sum(r["requests_sent"] for r in check_runs)
+    arrived = len(rig.target.hits) - hits_before
+    assert spent == arrived >= 3, (
+        f"hx counted {spent} probes and the target received {arrived}; the "
+        "wall has to be measured against requests that actually reached it")
+    assert any("status 302" in (r["reason"] or "") for r in check_runs), (
+        "the rows must name the redirect they got rather than some other "
+        f"gap: {[r['reason'] for r in check_runs]}")
+
+    # THE FINDING IS STILL LIVE. `observed = 0` would be retirement, and
+    # `_mark_unobserved` writes one only for an issue type this run examined
+    # -- which an `inconclusive` verdict never contributes, because
+    # `Verdict.inconclusive` does not take `considered` at all.
+    assert {f["check_id"]: f["id"] for f in _active_findings(rig)} == first
+    assert _observations(rig, finding_id) == [1], (
+        "the login wall retired the finding: a client is told a live "
+        "vulnerability appears fixed on the strength of a probe that never "
+        f"got past /login. {_observations(rig, finding_id)}")
+
+    # AND THE CLIENT-FACING SENTENCE IS NOT ON THE PAGE. The store is where
+    # the retirement happens; this is where it would have been read.
+    out = report.render(rig.eng.db, engagement_id=rig.eng.id,
+                        config=rig.eng.config, blobs=rig.eng.blobs)
+    assert "appears fixed" not in out, out
+
+
+def test_a_state_changing_surface_is_skipped_rather_than_probed_with_a_get(rig):
+    """N2, end to end: a surface captured with a method no probe can build.
+
+    `ProbeSender._request_bytes` builds a GET and only a GET, and a surface's
+    method is part of its identity -- so a GET probe of `POST /api/orders`
+    tests a different surface, and any verdict it produces is about that other
+    surface. `scan.run` skips it, `not_a_get_surface`.
+
+    THE FINDING IS WRITTEN, NOT FOUND, and it has to be: no probe in this
+    build can file one against a POST surface, which is precisely the fix. The
+    row stands in for one filed before that fix existed, or by a build that
+    can send a POST, or imported from a previous engagement -- the store holds
+    findings across all three. It goes in through `scan._write_finding`, the
+    runner's own writer, so it is the row a scan would have produced rather
+    than a hand-shaped one, and what is under test is not how it got there but
+    what a GET of a different surface is allowed to do to it.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? Measured against this exact
+    surface with the skip removed: three GETs of `/api/orders` on the wire,
+    `hx.active.reflected-input` and `hx.active.sql-error` closing `clean` with
+    `considered` populated off them, and the finding above coming back
+    `observed = 0`.
+    """
+    _configure(rig)
+    rig.browse("POST", STATE_CHANGING_ROUTE, body=b'{"sku": 1}')
+    rig.settle(
+        lambda: len(rows(rig, "SELECT id FROM surface")) == 1,
+        "one surface for the state-changing route")
+
+    surface = rows(rig, "SELECT id, method, scheme, host, port, kind,"
+                   " path_template, exemplar_exchange_id FROM surface")[0]
+    assert (surface["method"], surface["kind"]) == ("POST", "state_changing"), (
+        "the rig has to CAPTURE the method, or this measures a GET surface "
+        f"with a longer name: {surface}")
+
+    finding_id = _file_a_finding_on(rig, surface)
+    assert _observations(rig, finding_id) == [1]
+    hits_before = len(rig.target.hits)
+
+    summary = _scan(rig)
+    assert summary.by_reason == {"not_a_get_surface": len(ACTIVE_CHECK_IDS)}, (
+        "every active check must be skipped for the method, and skipped for "
+        f"THAT reason: {summary.by_reason}")
+
+    check_runs = [r for r in _check_runs(rig, _last_scan_run(rig))
+                  if r["check_id"] in ACTIVE_CHECK_IDS]
+    assert {r["verdict"] for r in check_runs} == {"skipped"}, check_runs
+    assert all(r["requests_sent"] == 0 for r in check_runs), check_runs
+
+    # THE ONE WITNESS THIS SIDE CANNOT FAKE. A skip that still sent something
+    # would leave rows saying one thing and a target log saying another, and
+    # the log is what a GET probe of this surface would appear in.
+    assert rig.target.hits[hits_before:] == [], (
+        "the scan sent requests at a surface it recorded as unprobeable: "
+        f"{[(h.method, h.path) for h in rig.target.hits[hits_before:]]}")
+
+    # AND THE FINDING IS UNTOUCHED. A `clean` row here would have named the
+    # issue type in `considered`, and `_mark_unobserved` retires on exactly
+    # that -- on the strength of a request to a different surface.
+    assert _observations(rig, finding_id) == [1], (
+        "a GET of a surface hx never captured retired a finding filed "
+        f"against the POST one: {_observations(rig, finding_id)}")
+
+    # The run row says so too, so an operator reading the summary of the pass
+    # is not told it covered what it skipped.
+    run_row = rows(rig, "SELECT status, stop_reason FROM run WHERE id=?",
+                   (_last_scan_run(rig),))[0]
+    assert "not_a_get_surface" in (run_row["stop_reason"] or ""), run_row
+
+
+def _file_a_finding_on(rig, surface) -> str:
+    """One finding already on file against `surface`, through the runner's own
+    writer.
+
+    Everything the dedupe key is computed from comes off the surface row, so
+    the row this leaves is the one a scan of that surface would have left --
+    see the caller's docstring for why a scan cannot leave it any more. The
+    issue type is read off the check rather than spelt here: retirement
+    matches on `(surface_id, check_id, issue_type_id)`, so a literal that
+    drifted from `reflected_input._ISSUE_TYPE` would make the finding
+    unretirable by construction and the assertion vacuous.
+    """
+    check = next(c for c in registry.CHECKS
+                 if c.id == "hx.active.reflected-input")
+    exemplar = surface["exemplar_exchange_id"]
+    assert exemplar, surface
+    candidate = base.Candidate(
+        title="Reflected input in a query parameter",
+        issue_type_id=reflected_input._ISSUE_TYPE,
+        severity="Medium", confidence="Firm",
+        insertion=base.Insertion("query", "sku"),
+        exchange_ids=(exemplar,),
+        payload="Zq7pLx3nV0aB")
+    return scan._write_finding(
+        rig.eng.db, rig.eng.id, rig.run_id,
+        (surface["id"], surface["method"], surface["scheme"], surface["host"],
+         surface["port"], surface["path_template"], exemplar),
+        check, candidate)
