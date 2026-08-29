@@ -159,6 +159,28 @@ def test_reflection_without_credentials_is_a_weaker_finding():
     assert order[with_creds.candidates[0].severity] > order[v.candidates[0].severity]
 
 
+def test_a_present_but_non_true_credentials_header_is_not_reported_as_absent():
+    """Fix round 1 (LOW). `_credentials_allowed` answers False for
+    `Access-Control-Allow-Credentials: False` -- it is present, just not the
+    exact `true` a browser honours -- and the reflects-no-credentials
+    description used to hardcode "with no Access-Control-Allow-Credentials
+    header" for every case that reached this branch, which misstates what
+    was actually observed when a header WAS sent. A client reading this
+    sentence cannot see the code that produced it and would be told
+    something false about their own target."""
+    v = cors.Cors().probes(ctx, surface, (), _sender_returning(
+        {"Access-Control-Allow-Origin": cors._PROBE_ORIGIN,
+         "Access-Control-Allow-Credentials": "False"}))
+    assert v.state == "finding"
+    assert v.candidates[0].issue_type_id == cors._REFLECTS_NO_CREDENTIALS
+    description = v.candidates[0].description
+    assert "no Access-Control-Allow-Credentials header" not in description, (
+        "the header WAS present (False); the description must not claim "
+        "it was absent")
+    assert "False" in description, (
+        "the description must state what was actually observed")
+
+
 def test_wildcard_with_credentials_is_the_lowest_severity_finding():
     """`*` plus `Access-Control-Allow-Credentials: true` is a response a
     browser refuses to honour (the fetch spec forbids the combination), so

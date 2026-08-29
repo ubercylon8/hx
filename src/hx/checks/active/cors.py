@@ -81,9 +81,34 @@ _CONSIDERED = (
 )
 
 
-def _credentials_allowed(head: bytes) -> bool:
-    values = _http.header_values(head, "access-control-allow-credentials")
+def _credentials_allowed(values: list[str]) -> bool:
     return any(v.strip().lower() == "true" for v in values)
+
+
+def _render_header(values: list[str]) -> str:
+    """The header's OWN value(s), verbatim -- never inferred. Only correct
+    to call where the header is known to be present (every call site below
+    is guarded by a branch that already required one of `values` to satisfy
+    `_credentials_allowed`), so it never has to guess at absence itself."""
+    return ", ".join(values)
+
+
+def _credentials_phrase(values: list[str]) -> str:
+    """What was actually observed for Access-Control-Allow-Credentials, on
+    the branch where `_credentials_allowed(values)` is False.
+
+    Fix round 1 (LOW): the description used to hardcode "with no
+    Access-Control-Allow-Credentials header" for this branch, which is true
+    only when the header is genuinely absent. `_credentials_allowed` also
+    answers False for a header that IS present but reads e.g. `False`, a
+    typo, or unusual casing beyond exactly `true` -- and a client reading a
+    finding that claims "no header" when one was in fact sent is being told
+    something false about their own target, from a sentence they cannot
+    check against the code that produced it. The two cases are now told
+    apart."""
+    if not values:
+        return "was not present"
+    return f"was present but read {', '.join(values)!r}, not the exact `true` a browser honours"
 
 
 class Cors:
@@ -99,7 +124,9 @@ class Cors:
         allow_origin = _http.header_values(resp.head,
                                            "access-control-allow-origin")
         origin_value = allow_origin[0] if allow_origin else None
-        credentials = _credentials_allowed(resp.head)
+        credential_values = _http.header_values(
+            resp.head, "access-control-allow-credentials")
+        credentials = _credentials_allowed(credential_values)
 
         candidate = None
         if origin_value == _PROBE_ORIGIN and credentials:
@@ -112,7 +139,8 @@ class Cors:
                     f"Requesting with Origin: {_PROBE_ORIGIN} (a value this "
                     "target cannot have expected) drew back "
                     f"Access-Control-Allow-Origin: {origin_value} and "
-                    "Access-Control-Allow-Credentials: true. Any site on the "
+                    "Access-Control-Allow-Credentials: "
+                    f"{_render_header(credential_values)}. Any site on the "
                     "internet can read this target's authenticated, "
                     "cookie-bearing responses through a victim's browser."),
                 remediation=(
@@ -129,8 +157,9 @@ class Cors:
                 description=(
                     f"Requesting with Origin: {_PROBE_ORIGIN} (a value this "
                     "target cannot have expected) drew back "
-                    f"Access-Control-Allow-Origin: {origin_value} with no "
-                    "Access-Control-Allow-Credentials header. No session "
+                    f"Access-Control-Allow-Origin: {origin_value}. "
+                    "Access-Control-Allow-Credentials "
+                    f"{_credentials_phrase(credential_values)}. No session "
                     "rides along, but an arbitrary origin is still trusted."),
                 remediation=(
                     "Validate the Origin header against an explicit "
@@ -144,9 +173,10 @@ class Cors:
                 exchange_ids=(exemplar_exchange_id,), cwe="CWE-942",
                 description=(
                     "The response carried Access-Control-Allow-Origin: * "
-                    "together with Access-Control-Allow-Credentials: true. "
-                    "A conforming browser refuses this pairing, so it is not "
-                    "currently exploitable through one, but it is an invalid "
+                    "together with Access-Control-Allow-Credentials: "
+                    f"{_render_header(credential_values)}. A conforming "
+                    "browser refuses this pairing, so it is not currently "
+                    "exploitable through one, but it is an invalid "
                     "combination and likely an accident worth fixing."),
                 remediation=(
                     "Either drop Access-Control-Allow-Credentials or reflect "
