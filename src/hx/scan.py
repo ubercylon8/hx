@@ -98,6 +98,11 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
             " ORDER BY host, path_template, method", (engagement_id,)).fetchall()
 
         seen_findings: set[str] = set()
+        # (surface_id, check_id, issue_type_id) this run actually examined and
+        # concluded about. Retirement reads this, NOT `check_run.verdict ==
+        # 'clean'`: a check filing one of three findings answers `finding`,
+        # and the other two still need retiring.
+        considered: set[tuple[str, str, str]] = set()
 
         for surface in surfaces:
             if surface_filter is not None and not surface_filter(surface):
@@ -165,6 +170,11 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             f"({type(verdict).__name__}), not a "
                             "hx.checks.base.Verdict; a check may not "
                             "construct the runner's own vocabulary by hand")
+                    # An `inconclusive` verdict carries no `considered` -- the
+                    # classmethod does not offer it -- so this loop is empty
+                    # for exactly the state that must retire nothing.
+                    for issue_type in verdict.considered:
+                        considered.add((surface[0], check.id, issue_type))
                     if verdict.state == "finding":
                         for candidate in verdict.candidates:
                             fid = _write_finding(conn, engagement_id, run_id,
@@ -188,7 +198,7 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                     continue
                 _close_row(conn, row_id, verdict.state, verdict.reason)
 
-        _mark_unobserved(conn, engagement_id, run_id, seen_findings)
+        _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
     except BaseException as exc:
         # Left `running` here would mean the NEXT scan.run() call inherits
         # this one's half-finished state via current_run's reuse window --
@@ -276,34 +286,32 @@ def _write_finding(conn, engagement_id, run_id, surface, check, candidate) -> st
     return fid
 
 
-def _mark_unobserved(conn, engagement_id, run_id, seen) -> None:
-    """`observed = 0` for a finding whose OWN CHECK ran, on the finding's OWN
-    surface, THIS run, and came back clean.
+def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
+    """`observed = 0` for a finding whose issue type was EXAMINED this run and
+    not re-emitted.
 
-    PER CHECK, NOT PER SURFACE. F1 of the task-6 review, HIGH, and the
-    plan's own defect rather than an implementation one -- the brief said
-    "whose surface was actually tested", and that granularity is wrong.
-    MEASURED against the surface-only version: one surface, run 1 finds via
-    check A, run 2 has check A RAISE (or go `inconclusive`, or is simply
-    absent from this run's `checks`, or is skipped by the budget) --
-    `finding_observation.observed` came back `[1, 0]` in every one of those
-    four cases. `observed=0` is the exact datum a retest renders as "fixed",
-    so the surface-only version reported a live finding as fixed because the
-    check that would have found it again never got a clean answer out at
-    all. Requiring the SAME check to have run clean on the SAME surface this
-    run is what "looked and it's gone" actually means; `finding.check_id`
-    (SCHEMA_VERSION 7, added fix round 2 -- NOT `issue_type_id`, which is
-    spec S10/S12's "which of Burp's 183 vendored issue definitions" and a
-    different axis entirely; see schema.sql's comment on both columns)
-    carries `check.id` for exactly this comparison, written by
-    `_write_finding` via `records.upsert_finding`.
+    THE GATE THIS REPLACES was `check_run.verdict == 'clean'` for the
+    finding's own (surface, check). That was sound while a check filed at most
+    one finding per surface: "the check ran and found nothing" and "this
+    finding is gone" were the same sentence. `issue_type_id` made
+    N-per-surface the norm, and they stopped being the same sentence -- a
+    check finding one of three issues answers `finding`, so the two fixed ones
+    were never retired and rendered live off stale observations. A client was
+    told a fixed issue was still open.
 
-    A finding whose (surface, check) pair was never clean THIS run --
-    because the surface went untested, the check raised, the check went
-    inconclusive, the check was skipped by the budget, or the check was
-    never in this run's `checks` at all -- gets NO ROW, not a zero. "Not
-    observed" would otherwise silently mean "not looked at" (or "looked and
-    failed to look properly"), which is S12's own failure one layer down.
+    EXAMINATION, NOT ABSENCE. A finding is retired only if its issue type is
+    in `considered` -- the check looked and did not find it. A check that
+    simply stopped looking retires nothing, because "I did not examine this"
+    is not evidence of a fix, and S12 forbids rendering the second as the
+    first.
+
+    `considered` is built by `scan.run` from every accepted `Verdict`'s own
+    `considered` field (Task 1), keyed `(surface_id, check_id, issue_type_id)`.
+    An `inconclusive` verdict contributes nothing to it -- the classmethod
+    does not accept `considered` at all -- so a check that raised, went
+    inconclusive, was skipped by the budget, or was simply absent from this
+    run's `checks` retires none of its prior findings: none of those states
+    ever added an entry for them.
 
     Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
     the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses
@@ -311,29 +319,27 @@ def _mark_unobserved(conn, engagement_id, run_id, seen) -> None:
     `tests/test_scan.py::test_a_surface_deleted_between_capture_and_scan_is_refused_by_the_schema`
     pins that. Reaching this case at all needs `PRAGMA foreign_keys=OFF`
     around the delete, the shape a bulk purge/retention job takes. Once it
-    happens, the `clean` set below is built from THIS run's own `check_run`
-    rows -- a vanished surface has none, so it is simply absent, never
+    happens, `considered` is built from THIS run's own surface loop -- a
+    vanished surface never appears in it, so it is simply absent, never
     looked up, never guessed about.
     """
-    clean = {(r[0], r[1]) for r in conn.execute(
-        "SELECT surface_id, check_id FROM check_run"
-        " WHERE run_id=? AND verdict='clean'", (run_id,))}
-    if not clean:
+    if not considered:
         return
-    # `finding.check_id`, NOT `finding.issue_type_id` -- the two are
-    # different axes (see schema.sql) and this is precisely the read a
-    # future edit swapping them back would get wrong silently, which
+    # `finding.check_id` and `finding.issue_type_id` are different axes (see
+    # schema.sql): `check_id` answers "which of hx's checks found this",
+    # `issue_type_id` answers "what kind of issue is this", and both are read
+    # here because `considered` is keyed on both --
     # `tests/test_scan.py::test_mark_unobserved_reads_check_id_not_issue_type_id`
-    # exists to catch.
+    # pins that a swap of the two columns must not let this match wrongly.
     rows = conn.execute(
-        "SELECT id, surface_id, check_id FROM finding WHERE engagement_id=?",
-        (engagement_id,)).fetchall()
+        "SELECT id, surface_id, check_id, issue_type_id FROM finding"
+        " WHERE engagement_id=?", (engagement_id,)).fetchall()
     at = now_us()
     with db_mod.transaction(conn):
-        for fid, surface_id, check_id in rows:
+        for fid, surface_id, check_id, issue_type_id in rows:
             if fid in seen:
                 continue
-            if (surface_id, check_id) not in clean:
+            if (surface_id, check_id, issue_type_id) not in considered:
                 continue
             records.record_observation(
                 conn, finding_id=fid, run_id=run_id, observed=False,

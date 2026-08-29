@@ -102,7 +102,10 @@ def test_a_finding_not_seen_this_run_is_marked_unobserved_if_its_surface_was_tes
         def __init__(self, on): self.on = on
         def on_surface(self, ctx, surface, exchanges):
             if not self.on:
-                return base.Verdict.clean()
+                # Retirement now follows examination: a clean verdict must
+                # name the issue type it looked for and did not find, or
+                # `_mark_unobserved` has nothing to retire against.
+                return base.Verdict.clean(considered=("t-issue",))
             return base.Verdict.finding(base.Candidate(
                 title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=(exchanges[0].id,)))
@@ -300,6 +303,98 @@ def test_a_finding_whose_surface_vanished_is_left_alone_not_fabricated_against(
     assert rows == [1]
 
 
+# --- Task 2: retire what was considered and not re-emitted ---
+#
+# `_mark_unobserved` used to retire a finding only when the whole
+# `(surface, check)` answered `clean`. That was sound only while a check
+# filed at most one finding per surface; `Candidate.issue_type_id` made
+# N-per-surface the norm, and a check finding one of three issues answers
+# `finding`, so the clean-only gate never fired for the other two -- they
+# rendered live off stale observations. The two tests below pin the
+# replacement: retirement follows EXAMINATION (issue type in `considered`),
+# not the check's overall verdict.
+
+
+def test_a_check_retires_the_one_issue_it_no_longer_finds(scan_env):
+    """The defect this task exists for.
+
+    A check that finds one of three issues answers `finding`, so the
+    clean-only gate never fired and the two fixed issues rendered live off
+    their stale run-1 observations, with no "appears fixed" marker.
+    """
+    def _candidate(ctx, exchanges, issue_type_id):
+        return base.Candidate(
+            title=f"t-{issue_type_id}", issue_type_id=issue_type_id,
+            severity="Low", confidence="Firm", insertion=None,
+            exchange_ids=(exchanges[0].id,))
+
+    class Finds:
+        id, version, klass = "hx.test.three", "1", "passive"
+        insertion_kinds = frozenset()
+
+        def __init__(self):
+            self.emit = ("a", "b", "c")
+
+        def on_surface(self, ctx, surface_row, exchanges):
+            return base.Verdict.finding(
+                *[_candidate(ctx, exchanges, t) for t in self.emit],
+                considered=("a", "b", "c"))
+
+    check = Finds()
+    scan.run(**scan_env, checks=(check,))
+    check.emit = ("a",)                      # b and c are fixed
+    scan.run(**scan_env, checks=(check,))
+
+    conn = scan_env["conn"]
+    observed = dict(conn.execute(
+        "SELECT f.issue_type_id, o.observed FROM finding f"
+        " JOIN finding_observation o ON o.finding_id = f.id"
+        " WHERE o.run_id = (SELECT id FROM run ORDER BY started_us DESC"
+        "                   LIMIT 1)").fetchall())
+    assert observed == {"a": 1, "b": 0, "c": 0}
+
+
+def test_an_issue_type_the_check_never_considered_is_not_retired(scan_env):
+    """The separating case. Retirement must follow examination, not absence.
+
+    A check that stops looking at something has not established it is fixed,
+    and a report that closed a finding on that basis would be inventing a
+    fact the run does not hold.
+    """
+    def _candidate(ctx, exchanges, issue_type_id):
+        return base.Candidate(
+            title=f"t-{issue_type_id}", issue_type_id=issue_type_id,
+            severity="Low", confidence="Firm", insertion=None,
+            exchange_ids=(exchanges[0].id,))
+
+    class Narrows:
+        id, version, klass = "hx.test.narrow", "1", "passive"
+        insertion_kinds = frozenset()
+
+        def __init__(self):
+            self.considered = ("a", "b")
+
+        def on_surface(self, ctx, surface_row, exchanges):
+            emit = [t for t in ("a", "b") if t in self.considered]
+            return base.Verdict.finding(
+                *[_candidate(ctx, exchanges, t) for t in emit],
+                considered=self.considered)
+
+    check = Narrows()
+    scan.run(**scan_env, checks=(check,))
+    check.considered = ("a",)                # b is no longer examined at all
+    scan.run(**scan_env, checks=(check,))
+
+    conn = scan_env["conn"]
+    rows = conn.execute(
+        "SELECT o.observed FROM finding f"
+        " JOIN finding_observation o ON o.finding_id = f.id"
+        " WHERE f.issue_type_id='b' ORDER BY o.ts_us").fetchall()
+    assert [r[0] for r in rows] == [1], (
+        "an unexamined issue type was retired: the report would tell a client "
+        "an issue is fixed on the strength of the check having stopped looking")
+
+
 # --- Fix round 1 ---
 #
 # F1 (HIGH): `_mark_unobserved` must be per-check, not per-surface. Four
@@ -410,14 +505,18 @@ def test_a_check_that_returns_clean_on_retest_does_mark_the_finding_fixed(
     """The positive half of F1's fix, alongside the four negative cases
     above: the SAME check, SAME surface, clean THIS run is still exactly
     what licenses `observed=0` -- the per-check rule narrows what counts,
-    it does not remove the retest mechanism itself."""
+    it does not remove the retest mechanism itself.
+
+    Task 2 layers EXAMINATION on top of that: `observed=0` now also needs
+    the clean verdict to name the issue type it looked for, via
+    `considered`."""
     _run1_finds(scan_env)
 
     class FindsThenClean:
         id, version, klass = "hx.test.finds", "1", "passive"
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
-            return base.Verdict.clean()
+            return base.Verdict.clean(considered=("t-issue",))
 
     scan.run(**scan_env, checks=(FindsThenClean(),))
     rows = [r[0] for r in scan_env["conn"].execute(
