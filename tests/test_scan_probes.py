@@ -415,9 +415,40 @@ def test_a_refusal_becomes_inconclusive_never_clean(tmp_path):
     verdict, reason, sent = _row(env["conn"])
     assert verdict == "inconclusive"
     assert "budget_exhausted" in reason
-    # The attempt spent the budget and touched the target whether or not an
-    # answer came back; a count that omitted refusals would understate the
-    # traffic hx put on a client's system.
+    # AND THE ROW SAYS ZERO REQUESTS. `hx.policy.Limiter` answers
+    # `budget_exhausted` BEFORE it issues anything and increments `issued` on
+    # the allow path only -- "Refusals are not issuances and do not appear
+    # here" -- so nothing reached the target and `requests_sent` is what says
+    # so. This assertion read `== 1` until fix round A, on the strength of a
+    # comment ("the attempt spent the budget and touched the target") that
+    # `Limiter` contradicts in its own words; the number reaches a client's
+    # report as the traffic hx generated.
+    assert sent == 0
+    # And the class is named ONCE. `BridgeError`'s message already opens with
+    # it, so the reason used to read `probe refused: budget_exhausted:
+    # budget_exhausted: the run's request budget is spent`.
+    assert reason == ("probe refused: budget_exhausted: "
+                      "the run's request budget is spent")
+
+
+def test_a_refusal_after_the_request_left_is_counted(tmp_path):
+    """The other direction, and the separating case for the assertion above.
+    A `transport_error` is a request that reached the wire and then failed,
+    so it IS traffic -- understating what hx put on a client's system is the
+    direction this count may not lean, and a rule written as "refusals are
+    free" would zero this row too."""
+    env = _env(tmp_path)
+    fb = FakeBridge()
+    fb.refuse("transport_error", "connection reset")
+
+    class Sends(_Probe):
+        def probes(self, ctx, surface, insertions, send):
+            send.get("/?q=1")
+            return base.Verdict.clean(considered=("probed",))
+
+    scan.run(**env, checks=(Sends(),), bridge=fb)
+    verdict, _reason, sent = _row(env["conn"])
+    assert verdict == "inconclusive"
     assert sent == 1
 
 

@@ -335,9 +335,16 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                     # `error` would be almost as bad -- an operator reading
                     # `error` goes looking for a bug in hx, when what
                     # happened is that the target, the extension or the
-                    # budget said no. `requests_sent` is still written: a
-                    # refused attempt spent the budget and touched the
-                    # target, and the count is what says so.
+                    # budget said no. `requests_sent` is still written, and it
+                    # counts ISSUANCES rather than attempts: `hx.policy.
+                    # Limiter` decides scope, method, dangerous, rate and
+                    # budget before issuing and increments `issued` on the
+                    # allow path only ("Refusals are not issuances and do not
+                    # appear here"), so a probe refused by one of those did
+                    # not reach the target and this row says 0. A refusal that
+                    # may already have left -- `transport_error`, `timeout`,
+                    # `bridge_lost`, a truncated answer -- is counted. See
+                    # `hx.checks.probe`'s `_NOT_ISSUED`.
                     _close_row(conn, row_id, "inconclusive",
                                f"probe refused: {exc}",
                                requests_sent=sender.sent if sender else 0)

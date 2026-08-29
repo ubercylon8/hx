@@ -58,8 +58,15 @@ class _FakeSender:
         self.calls: list[tuple[str, dict[str, str]]] = []
 
     def get(self, path, *, headers=None, timeout=30.0):
-        self.sent += 1          # a refused attempt still spent the budget,
-                                 # matching the real sender's own ordering.
+        self.sent += 1          # ATTEMPTS, and deliberately not the real
+                                 # sender's rule. `hx.checks.probe` counts
+                                 # ISSUANCES -- a refusal the gate decided
+                                 # before issuing is not one -- but this
+                                 # double's `sent` doubles as its own call
+                                 # cursor, and no check ever reads the
+                                 # field, so the difference stays inside
+                                 # these tests. What the stored number
+                                 # means is pinned in tests/test_probe.py.
         headers = dict(headers or {})
         self.calls.append((path, headers))
         if self._exc is not None:

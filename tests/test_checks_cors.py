@@ -37,8 +37,15 @@ class _FakeSender:
         self.last_headers: dict[str, str] | None = None
 
     def get(self, path, *, headers=None, timeout=30.0):
-        self.sent += 1          # a refused attempt still spent the budget,
-                                 # matching the real sender's own ordering.
+        self.sent += 1          # ATTEMPTS, and deliberately not the real
+                                 # sender's rule. `hx.checks.probe` counts
+                                 # ISSUANCES -- a refusal the gate decided
+                                 # before issuing is not one -- but this
+                                 # double's `sent` doubles as its own call
+                                 # cursor, and no check ever reads the
+                                 # field, so the difference stays inside
+                                 # these tests. What the stored number
+                                 # means is pinned in tests/test_probe.py.
         self.last_path = path
         self.last_headers = headers
         if self._exc is not None:
@@ -240,15 +247,22 @@ def test_a_cors_candidates_issue_type_is_one_it_considered():
         assert candidate.issue_type_id in v.considered
 
 
-def test_a_refused_attempt_still_spent_the_budget():
-    """The refused GET still touched the target (or tried to); a sender
-    whose `.sent` undercounted refusals would understate the traffic this
-    check put on a client's system. Mirrors `tests/test_probe.py::
-    test_a_refused_attempt_is_still_counted` at this check's own call site."""
+def test_a_refusal_propagates_rather_than_becoming_a_verdict():
+    """The check does not catch `ProbeRefused`, and must not: S10 says a
+    check that could not run is `inconclusive`, and `hx.scan.run`'s own
+    `except probe.ProbeRefused` is what writes that row. A check that
+    swallowed the refusal would answer `clean` for a probe that never got an
+    answer, which is the confusion S12 calls worse than no report.
+
+    This replaces `test_a_refused_attempt_still_spent_the_budget`, whose
+    claim -- and whose assertion on the DOUBLE's counter -- encoded the rule
+    fix round A corrected: `hx.policy.Limiter` refuses `budget_exhausted`
+    before issuing anything, so nothing was spent and nothing was touched.
+    What `requests_sent` counts is a property of the real sender and is
+    pinned there, in `tests/test_probe.py`, not against a stand-in."""
     sender = _sender_raising(probe.ProbeRefused("budget_exhausted"))
     with pytest.raises(probe.ProbeRefused):
         cors.Cors().probes(ctx, surface, (), sender)
-    assert sender.sent == 1
 
 
 # ---- evidence --------------------------------------------------------
