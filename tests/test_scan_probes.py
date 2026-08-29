@@ -30,6 +30,7 @@ from hx import config as config_mod
 from hx import insertion as insertion_mod
 from hx import scan
 from hx.checks import base, probe
+from hx.checks.active import cors
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
 from tests.test_probe import FakeBridge
@@ -198,6 +199,33 @@ class _Finds(_Probe):
             confidence="Firm", insertion=None, exchange_ids=("x-1",)))
 
 
+class _NoPointsFinds:
+    """`hx.active.cors`'s shape: no declared insertion kinds, and a finding
+    whose evidence is the surface's own exemplar exchange.
+
+    Both halves matter and neither is arbitrary. A check with declared kinds
+    never reaches a missing exemplar -- `_insertions_for` derives nothing from
+    an exemplar it cannot read and the runner skips it -- so the empty
+    `insertion_kinds` is what makes this shape the one that gets there. And
+    `exchange_ids=(surface[6],)` is not this test's invention: it is what every
+    active check in this corpus writes, because nothing in this build records
+    an exchange for a probe's own traffic.
+    """
+    id, version, klass = "hx.test.nopoints-finds", "1", "active_safe"
+    insertion_kinds = frozenset()
+
+    def __init__(self):
+        self.calls = 0
+
+    def probes(self, ctx, surface, insertions, send):
+        self.calls += 1
+        send.get("/")
+        return base.Verdict.finding(base.Candidate(
+            title="t", issue_type_id="probed", severity="Low",
+            confidence="Firm", insertion=None,
+            exchange_ids=(surface[6],)), considered=("probed",))
+
+
 def test_a_no_bridge_skip_retires_nothing(tmp_path):
     """The consequence that makes the `skipped` row worth writing. A check
     that never ran examined nothing, so `considered` gains nothing and
@@ -233,11 +261,109 @@ def test_a_surface_whose_exemplar_is_gone_is_skipped_rather_than_crashing(
     """Row G's shape, one layer down. A surface can lose its exemplar to a
     purge, and `insertion.derive` then has no bytes to read. One unreadable
     row must not end a scan an operator has already billed for -- it must
-    produce the same honest `skipped` any other underivable surface does."""
+    produce the same honest `skipped` any other underivable surface does.
+
+    THE REASON CHANGED IN TASK 13 AND THE OUTCOME DID NOT. It used to be
+    `no_insertion_point`, because a missing exemplar reaches the runner as
+    "nothing could be derived" -- true, and not the whole truth: what is
+    actually gone is the evidence any finding on this surface would have cited,
+    which is a fact about the surface rather than about this check's declared
+    kinds. `no_exemplar` is now decided first, for every active check, and the
+    two tests below are the cases that separates."""
     env = _env(tmp_path, exemplar=False)
     summary = scan.run(**env, checks=(_Probe(),), bridge=_replying_bridge())
     assert _row(env["conn"])[0] == "skipped"
-    assert summary.by_reason == {"no_insertion_point": 1}
+    assert summary.by_reason == {"no_exemplar": 1}
+
+
+def test_a_check_that_declares_no_kinds_is_also_skipped_when_the_exemplar_is_gone(
+        tmp_path):
+    """The case a purged exemplar used to reach, and what it did there.
+
+    A check declaring no insertion kinds is deliberately NOT skipped for having
+    no points (the test below this one), so before Task 13 it was the one shape
+    that ran on a surface whose exemplar was gone -- and every active check in
+    this corpus cites `surface.exemplar_exchange_id` as the evidence for what
+    it finds. MEASURED, with the check below and a NULL exemplar:
+    `Candidate(exchange_ids=(None,))` constructed (a one-tuple is not empty),
+    `record_evidence` wrote a row whose `exchange_id` was NULL -- the column is
+    nullable -- and `hx.report._evidence` rendered the finding with "1 of the 1
+    shown could not be resolved to a request". A claim the operator has no way
+    to check, which is exactly what `Candidate`'s own docstring says a
+    candidate may not be.
+
+    Nothing is sent, either: the skip is decided before the sender exists, so
+    the probe traffic is not spent on a surface whose answer could not have
+    been evidenced.
+    """
+    env = _env(tmp_path, exemplar=False)
+    fb = _replying_bridge()
+    check = _NoPointsFinds()
+    summary = scan.run(**env, checks=(check,), bridge=fb)
+
+    verdict, reason, sent = _row(env["conn"])
+    assert (verdict, sent) == ("skipped", 0)
+    assert "exemplar" in reason
+    assert check.calls == 0
+    assert summary.by_reason == {"no_exemplar": 1}
+    assert env["conn"].execute("SELECT COUNT(*) FROM finding").fetchone()[0] == 0
+    assert env["conn"].execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+def test_an_exemplar_id_whose_row_was_purged_is_skipped_not_an_error(tmp_path):
+    """The other half of the same purge, and the one that LOST a finding.
+
+    `surface.exemplar_exchange_id REFERENCES exchange(id)` with the pragma ON
+    refuses the delete outright, so reaching this needs `PRAGMA
+    foreign_keys=OFF` -- which is the shape a bulk purge or retention job takes
+    (S8's Row G, and `tests/test_scan.py::test_a_surface_deleted_between_
+    capture_and_scan_is_refused_by_the_schema` pins the refusal). The column is
+    then not NULL, it DANGLES.
+
+    MEASURED before the fix: `record_evidence` raised `IntegrityError: FOREIGN
+    KEY constraint failed`, `scan.run`'s blanket `except Exception` closed the
+    row `error`, and the finding was gone -- not silently (an `error` row is
+    visible in coverage, so S12 is not violated) but gone. A real finding
+    reported as a bug in hx.
+    """
+    env = _env(tmp_path)
+    conn = env["conn"]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DELETE FROM exchange WHERE id='x-1'")
+    conn.execute("PRAGMA foreign_keys=ON")
+    assert conn.execute(
+        "SELECT exemplar_exchange_id FROM surface").fetchone()[0] == "x-1"
+
+    summary = scan.run(**env, checks=(_NoPointsFinds(),),
+                       bridge=_replying_bridge())
+    verdict, reason, _sent = _row(conn)
+    assert verdict == "skipped", (
+        f"a dangling exemplar came back {verdict!r}: {reason}")
+    assert summary.by_reason == {"no_exemplar": 1}
+
+
+def test_a_purged_exemplar_does_not_stop_a_passive_check_reading_the_surface(
+        tmp_path):
+    """The separating case, and the reason this skip lives in the probe branch.
+
+    A passive check reads the exchanges, not the exemplar, and a surface can
+    have plenty of those after the one that first proved it exists is gone. It
+    still runs, still answers, and still retires what it considered -- the skip
+    above is about the evidence an ACTIVE finding would cite, not about the
+    surface being unusable."""
+    env = _env(tmp_path, exemplar=False)
+
+    class Passive:
+        id, version, klass = "hx.test.passive", "1", "passive"
+        insertion_kinds = frozenset()
+
+        def on_surface(self, ctx, surface, exchanges):
+            assert exchanges, "the surface's exchanges are still readable"
+            return base.Verdict.clean(considered=("looked",))
+
+    summary = scan.run(**env, checks=(Passive(),), bridge=_replying_bridge())
+    assert _row(env["conn"])[0] == "clean"
+    assert summary.by_reason == {}
 
 
 def test_a_check_declaring_no_insertion_kinds_runs_on_a_bare_surface(tmp_path):
@@ -539,3 +665,34 @@ def test_a_bridgeless_active_scan_derives_nothing_either(tmp_path, monkeypatch):
         lambda *a, **k: pytest.fail("derived points with no bridge to use them"))
     scan.run(**env, checks=(_Probe(),), bridge=None)
     assert _row(env["conn"])[0] == "skipped"
+
+
+def test_the_shipped_cors_check_cannot_file_a_finding_it_could_not_evidence(
+        tmp_path):
+    """The same two cases, against the real check rather than a stand-in.
+
+    `_NoPointsFinds` above is a faithful copy of the shape, and a copy is
+    exactly what stops being faithful. `hx.active.cors` is the only registered
+    check whose `insertion_kinds` is empty, which makes it the only one that
+    can reach a missing exemplar at all, and it cites `surface[6]` verbatim.
+    The vulnerable branch is driven both ways here so the skip cannot be
+    mistaken for the reply simply not being a finding: with the exemplar
+    present, the identical bridge reply files one.
+    """
+    reply = (b"HTTP/1.1 200 OK\r\n"
+             b"Access-Control-Allow-Origin: " + cors._PROBE_ORIGIN.encode() +
+             b"\r\nAccess-Control-Allow-Credentials: true\r\n\r\n{}")
+
+    intact = _env(tmp_path / "intact")
+    scan.run(**intact, checks=(cors.Cors(),),
+             bridge=_replying_bridge(reply))
+    assert _row(intact["conn"])[0] == "finding", \
+        "the reply is not the vulnerable shape; the skip below proves nothing"
+
+    purged = _env(tmp_path / "purged", exemplar=False)
+    summary = scan.run(**purged, checks=(cors.Cors(),),
+                       bridge=_replying_bridge(reply))
+    assert _row(purged["conn"])[0] == "skipped"
+    assert summary.by_reason == {"no_exemplar": 1}
+    assert purged["conn"].execute(
+        "SELECT COUNT(*) FROM finding").fetchone()[0] == 0

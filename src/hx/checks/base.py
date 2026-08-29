@@ -132,6 +132,25 @@ class Candidate:
             # exchange behind it has nothing to chain, and the operator would
             # be asked to believe a claim with no way to check it.
             raise ValueError("a candidate must name at least one exchange")
+        if not all(self.exchange_ids):
+            # THE SAME RULE, AND THE HOLE IT HAD. `(None,)` is a non-empty
+            # tuple, so the guard above admitted it -- and every active check
+            # in this corpus builds its evidence out of
+            # `surface.exemplar_exchange_id`, which is NULL for a surface whose
+            # first sighting was purged. MEASURED, `hx.active.cors` against
+            # such a surface: the candidate constructed, `evidence` took a row
+            # with a NULL `exchange_id` (the column is nullable), and
+            # `hx.report._evidence` rendered "1 of the 1 shown could not be
+            # resolved to a request" -- which is precisely the claim-with-no-
+            # way-to-check the paragraph above forbids, filed as a finding.
+            # `hx.scan.run` now skips an active check on such a surface before
+            # it sends anything; this is the guard for a candidate that got a
+            # blank id from anywhere else.
+            raise ValueError(
+                f"a candidate's exchange_ids are {self.exchange_ids!r}: every "
+                "entry must name a real exchange. A blank one chains to "
+                "nothing, and a finding whose evidence resolves to no request "
+                "asks the operator to believe a claim they cannot check")
 
 
 # Not scanned by tests/test_vocabularies_match_the_schema.py's enumeration

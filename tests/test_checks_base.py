@@ -111,6 +111,23 @@ def test_candidate_requires_evidence():
                        insertion=None, exchange_ids=())
 
 
+def test_candidate_evidence_that_names_nothing_is_refused_too():
+    """The hole the test above had. `(None,)` is not an empty tuple, so
+    `if not self.exchange_ids` admitted it -- and it is the exact value every
+    active check produces on a surface whose exemplar exchange was purged,
+    since each of them writes `exchange_ids=(surface[6],)`. MEASURED before the
+    fix: the candidate constructed, `evidence` took a row with a NULL
+    `exchange_id` (the column is nullable), and the report rendered "1 of the 1
+    shown could not be resolved to a request" -- a finding whose evidence
+    chain resolves to no request at all, which is what this rule exists to
+    prevent rather than a different rule."""
+    for ids in ((None,), ("",), ("x-1", None)):
+        with pytest.raises(ValueError, match="exchange"):
+            base.Candidate(title="t", issue_type_id="t-issue",
+                           severity="Low", confidence="Firm",
+                           insertion=None, exchange_ids=ids)
+
+
 def test_an_insertion_names_a_known_kind_and_a_name():
     """`Insertion.__post_init__` had no test anywhere in the repo before this
     fix round. A legal one just needs a kind the schema-adjacent

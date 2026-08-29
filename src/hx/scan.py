@@ -208,6 +208,48 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                                   "session, so this active check had no "
                                   "route to the target and sent nothing")
                             continue
+                        if _citable_exemplar(surface, exchanges) is None:
+                            # THE EVIDENCE AN ACTIVE CHECK WILL CITE HAS TO
+                            # EXIST BEFORE IT IS WORTH SENDING ANYTHING.
+                            # Nothing in this build records an exchange for a
+                            # probe's own traffic, so every active check in
+                            # this corpus names `surface.exemplar_exchange_id`
+                            # as the evidence for whatever it finds -- and that
+                            # column is NULL for a surface whose first sighting
+                            # was purged, or dangling if the purge ran with the
+                            # foreign key off. MEASURED, both shapes, with a
+                            # check declaring no insertion kinds (which is
+                            # `hx.active.cors`, the one that reaches this at
+                            # all -- a check WITH declared kinds already skips,
+                            # because `_insertions_for` can derive nothing from
+                            # an exemplar it cannot read):
+                            #
+                            #   * NULL: `Candidate(exchange_ids=(None,))`
+                            #     constructed, `evidence` took a row with a
+                            #     NULL `exchange_id`, and the report rendered
+                            #     "1 of the 1 shown could not be resolved to a
+                            #     request" -- a finding with nothing behind it;
+                            #   * dangling: `record_evidence` raised
+                            #     `IntegrityError: FOREIGN KEY constraint
+                            #     failed`, the blanket `except` below turned it
+                            #     into an `error` row, and a real finding was
+                            #     lost.
+                            #
+                            # Both are now this skip, which is the honest
+                            # sentence: the check was not run, it was not run
+                            # clean, and the probe traffic is not spent on a
+                            # surface whose answer could not have been
+                            # evidenced. `Candidate.__post_init__` refuses the
+                            # blank id as well, so a check that gets one from
+                            # somewhere other than this column still cannot
+                            # file an unverifiable finding.
+                            _skip(conn, row_id, summary, "no_exemplar",
+                                  "this surface's exemplar exchange is not on "
+                                  "file, and it is the evidence an active "
+                                  "check cites for anything it finds here; a "
+                                  "finding would have had no exchange to "
+                                  "chain to")
+                            continue
                         wanted = frozenset(getattr(
                             check, "insertion_kinds", frozenset()) or ())
                         if wanted and insertions is None:
@@ -328,7 +370,8 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # complete scan is not itself misreported as "truncated for a reason".
     #
     # `by_reason` CARRIES MORE THAN `budget` NOW. The probe pass adds
-    # `no_bridge` and `no_insertion_point`, and both belong in this sentence
+    # `no_bridge`, `no_exemplar` and `no_insertion_point`, and all belong in
+    # this sentence
     # for the reason the budget one does: a pass that left rows `skipped` did
     # not do everything it set out to do, and the run row is where a report
     # decides whether to trust it. The word stays `truncated` and the KEY is
@@ -405,6 +448,28 @@ def _runner_hook(check) -> str:
     return ""
 
 
+def _citable_exemplar(surface, exchanges) -> str | None:
+    """The exemplar exchange id, if the row it names is still there.
+
+    Two ways it is not, and they are one question rather than two: the column
+    is NULL (a surface whose first sighting was purged, or a schema-level
+    `ON DELETE SET NULL`), or it names an id no `exchange` row has any more (a
+    bulk purge run with `PRAGMA foreign_keys=OFF`, the shape S8's Row G takes
+    -- with the pragma ON the delete is simply refused).
+
+    ANSWERED FROM THE ROWS ALREADY FETCHED, not with a second query.
+    `_exchanges_for` has just read every exchange of this surface, and the
+    exemplar is by definition one of them -- `hx.capture` writes the exchange
+    and then points the surface at it -- so a `SELECT` here would be a second
+    trip to ask something the caller is already holding. `_insertions_for`
+    resolves the same id the same way, a few lines down, for the same reason.
+    """
+    exemplar_id = surface[6]
+    if not exemplar_id:
+        return None
+    return exemplar_id if any(x.id == exemplar_id for x in exchanges) else None
+
+
 def _insertions_for(blobs, surface, exchanges) -> tuple:
     """Insertion points derived from this surface's exemplar request.
 
@@ -415,14 +480,21 @@ def _insertions_for(blobs, surface, exchanges) -> tuple:
     first exchange that proved the surface exists (`hx.capture`), so it is
     one of them.
 
-    EVERY FAILURE IS AN EMPTY TUPLE, not a raise. A surface whose exemplar
-    was purged, whose blob is gone, or whose captured request had no head
-    terminator is a surface with no derivable points -- which the caller
-    already has a word for, `skipped` with a reason -- and taking the whole
-    scan down over one unreadable row is the trade S12 argues against.
-    `CorruptBlob` is caught by name for the reason F8 gives one layer up: a
-    bare `except Exception` here would swallow `blobs=None`, and a caller's
-    own programming error is meant to surface.
+    EVERY FAILURE IS AN EMPTY TUPLE, not a raise. A surface whose blob is
+    gone, or whose captured request had no head terminator, is a surface with
+    no derivable points -- which the caller already has a word for, `skipped`
+    with a reason -- and taking the whole scan down over one unreadable row is
+    the trade S12 argues against. `CorruptBlob` is caught by name for the
+    reason F8 gives one layer up: a bare `except Exception` here would swallow
+    `blobs=None`, and a caller's own programming error is meant to surface.
+
+    THE MISSING-EXEMPLAR CASE NO LONGER ARRIVES HERE, and the two lines that
+    answer it are kept anyway. `run()` skips an active check on a surface whose
+    exemplar is NULL or dangling before this is called (`_citable_exemplar`),
+    because that surface has no evidence for a finding to cite whether or not
+    an insertion point could be derived from it. This function is still pure
+    and still total for the same input, so the guard costs two lines and means
+    a second caller cannot inherit a crash.
     """
     exemplar_id = surface[6]
     if not exemplar_id:
