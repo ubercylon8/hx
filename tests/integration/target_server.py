@@ -17,6 +17,15 @@ looks identical whether the gate worked or the port was simply shut.
 Every request is recorded BEFORE it is answered, so the assertions in
 test_send_path.py can be made against what the server saw rather than against
 what the bridge said.
+
+SOME OF THESE ROUTES ARE GENUINELY VULNERABLE, and that is what they are for:
+`hx.checks.active` is a corpus that SENDS, and a check that has never met a
+target that answers its payload is a check nobody has run. `VULNERABLE_ROUTES`
+below names one route per active check, each with a comment saying which. The
+loopback rule stops being incidental at that point -- it is the only thing
+between a payload and somebody else's server -- so the constructor's refusal of
+any host outside 127.0.0.0/8 is now load-bearing rather than tidy, and no test
+in this directory takes a hostname from anywhere but a TargetServer it built.
 """
 from __future__ import annotations
 
@@ -102,6 +111,66 @@ UPGRADE_HEAD = (b"HTTP/1.1 101 Switching Protocols\r\n"
 # are NOT HTTP and must not be read as a status line: the byte after the head is
 # 0x81, and a scan that keeps looking for a final head after a 101 finds this.
 UPGRADE_FRAME = b"\x81\x05hello"
+
+# ---------------------------------------------------------------------------
+# The deliberately vulnerable routes, one per active check.
+#
+# EVERY ONE OF THEM IS ON THIS LOOPBACK SERVER AND NOWHERE ELSE. The
+# constructor above refuses any host outside 127.0.0.0/8, and these routes are
+# the first thing in this project that answers an ATTACK payload -- a canary, a
+# quote, a traversal sequence, an arbitrary Origin. `hx.checks.active` sends
+# those at whatever host the surface names, so the surface must never name
+# anything but this server: the integration test browses only `origin + path`
+# for the origin this fixture bound, and takes a hostname from nowhere else.
+#
+# ONE ROUTE ANSWERS FOR EXACTLY ONE CHECK, and the routes that are not that
+# check's are deliberately mute: `/files` does not echo the name it was given,
+# `/db/lookup` does not quote the value in its error, `/go` answers 200 to
+# anything that is not already an absolute URL. Every active check probes every
+# insertion point it declares on every surface, so a route that echoed its input
+# as well as redirecting off it would file two findings and the retirement
+# assertion below ("that finding retires, the others stay live") would have to
+# disentangle which check moved. The exception is `hx.passive.security-headers`,
+# which fires on `/search` because that route answers `text/html` and carries
+# none of the headers a document should: that is real, it is stable across
+# scans, and it is left alone.
+#
+# `VULNERABLE_ROUTES` is the browse path INCLUDING the query string, because the
+# query string is load-bearing: `hx.insertion.derive` reads insertion points off
+# the exemplar request, so a surface browsed without `?q=` offers a check
+# nowhere to put a payload and is skipped `no_insertion_point`. The path
+# template a finding is filed against is this path up to the `?`.
+VULNERABLE_ROUTES: dict[str, str] = {
+    "hx.active.cors": "/api/profile",
+    "hx.active.open-redirect": "/go?next=/account",
+    "hx.active.path-traversal": "/files?file=readme.txt",
+    "hx.active.reflected-input": "/search?q=hello",
+    "hx.active.sql-error": "/db/lookup?id=42",
+}
+
+# MySQL's own wording for a query that did not parse, matching
+# `hx.checks.active.sql_error._SIGNATURES`' first entry. It deliberately does
+# NOT quote the value it was given, unlike the real driver message: see the
+# one-route-one-check paragraph above.
+MYSQL_SYNTAX_ERROR = (
+    "Fatal error: Uncaught mysqli_sql_exception: You have an error in your "
+    "SQL syntax; check the manual that corresponds to your MySQL server "
+    "version for the right syntax to use near ''' at line 1 in "
+    "/var/www/app/lookup.php:41"
+)
+
+# SYNTHETIC. Not this machine's `/etc/passwd`, not any machine's: five invented
+# lines shaped like the file `hx.checks.active.path_traversal` looks for, so the
+# traversal it proves is proved against a fixture's own bytes and nothing is
+# ever read off the host running the suite. `root:x:0:0:` is the signature that
+# check matches first.
+FAKE_PASSWD = (
+    "root:x:0:0:root:/root:/bin/sh\n"
+    "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+    "bin:x:2:2:bin:/bin:/usr/sbin/nologin\n"
+    "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n"
+    "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+)
 
 
 @dataclass(frozen=True)
@@ -293,6 +362,77 @@ class _Handler(BaseHTTPRequestHandler):
             time.sleep(min(_int_param(params, "ms", 250) / 1000.0,
                            self.server.target.max_delay_s))
             self._reply(_int_param(params, "status", 200), {"slow": True})
+        elif parts.path == "/api/profile":
+            # For `hx.active.cors`. Reflects whatever `Origin` it was sent and
+            # allows credentials with it -- the High-severity shape that check
+            # names, and the one a browser will actually honour.
+            #
+            # THE HEADER IS ONLY ABSENT WHEN THE ORIGIN IS ALLOWLISTED, which
+            # is what `fix("hx.active.cors")` switches on: a fixed CORS
+            # configuration does not stop answering, it stops reflecting an
+            # origin it never heard of. The probe's Origin is
+            # `https://hx-cors-probe.test` and is on nobody's allowlist, so the
+            # fixed route answers the same 200 with no CORS header at all --
+            # which is exactly what `Cors.probes` reads as clean.
+            origin = self.headers.get("Origin")
+            extra = []
+            if origin and not self.server.target.is_fixed("hx.active.cors"):
+                extra = [("Access-Control-Allow-Origin", origin),
+                         ("Access-Control-Allow-Credentials", "true")]
+            self._reply(200, {"user": "alice"}, extra=tuple(extra))
+        elif parts.path == "/go":
+            # For `hx.active.open-redirect`. `next` is one of the parameter
+            # names that check's canary-first filter accepts, and an absolute
+            # (or protocol-relative) value goes straight into `Location` with
+            # nothing validated. A value that is not already a URL -- every
+            # other check's canary and quote -- gets a plain 200 and is not
+            # echoed anywhere, so only the redirect check has anything to find
+            # here.
+            dest = params.get("next", [""])[0]
+            if dest.startswith(("http://", "https://", "//")):
+                self._reply(302, {"redirecting": True},
+                            extra=(("Location", dest),))
+            else:
+                self._reply(200, {"redirecting": False})
+        elif parts.path == "/search":
+            # For `hx.active.reflected-input`. `q` comes back into an HTML
+            # document with no encoding whatsoever, so the escalation request's
+            # `<>"'`-wrapped canary survives intact and the finding is the
+            # Medium `unescaped` one. NOT `_reply`: `json.dumps` escapes the
+            # `"` in that wrapper, which would answer the check's second
+            # question with a fact about JSON encoding rather than about this
+            # application.
+            term = params.get("q", [""])[0]
+            self._reply_text(
+                200, "<html><body><h1>Search</h1>"
+                     f"<p>No results for {term}</p></body></html>")
+        elif parts.path == "/db/lookup":
+            # For `hx.active.sql-error`. A value carrying an unmatched single
+            # quote -- which is the whole of that check's payload -- reaches a
+            # query and the driver's own wording comes back. Any other value
+            # gets a 200 that says nothing about what was asked for.
+            ident = params.get("id", [""])[0]
+            if "'" in ident:
+                self._reply_text(500, MYSQL_SYNTAX_ERROR,
+                                 content_type="text/plain; charset=utf-8")
+            else:
+                self._reply(200, {"found": False})
+        elif parts.path == "/files":
+            # For `hx.active.path-traversal`. `file` is one of the file-shaped
+            # parameter names that check probes, and a value that climbs out of
+            # the intended directory and names `etc/passwd` is served -- from
+            # FAKE_PASSWD, never from this machine. `parse_qs` has already
+            # percent-decoded the value, which is the decode a vulnerable
+            # application would do itself and the reason the check never has to
+            # put a raw `../` on hx's own request line.
+            name = params.get("file", [""])[0]
+            if "../" in name and name.endswith("etc/passwd"):
+                self._reply_text(200, FAKE_PASSWD,
+                                 content_type="text/plain; charset=utf-8")
+            else:
+                # Deliberately does not echo `name`: see the one-route-one-check
+                # paragraph beside VULNERABLE_ROUTES.
+                self._reply(200, {"served": True})
         else:
             self._reply(404, {"error": "no such route"})
 
@@ -301,6 +441,28 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in extra:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _reply_text(self, status: int, text: str, *,
+                    content_type: str = "text/html; charset=utf-8",
+                    extra: tuple[tuple[str, str], ...] = ()) -> None:
+        """`_reply`, for a body that is not JSON and must not be escaped.
+
+        Every route above this one answers `json.dumps(payload)`, which is
+        right for them and wrong for the three vulnerable routes that have to
+        put bytes on the wire EXACTLY as they were given them: a reflected
+        `<>"'` wrapper, a driver's error string, a file's own content. JSON
+        encoding any of those would make the response answer a question about
+        encoding rather than about the application.
+        """
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         for name, value in extra:
             self.send_header(name, value)
@@ -335,6 +497,7 @@ class TargetServer:
             )
         self.max_delay_s = max_delay_s
         self._hits: list[Hit] = []
+        self._fixed: set[str] = set()
         self._lock = threading.Lock()
         self._httpd = _Server((host, 0), _Handler)
         # Read by every handler through self.server. Set before any thread is
@@ -383,6 +546,43 @@ class TargetServer:
         only ever appears on someone else's machine."""
         with self._lock:
             return list(self._hits)
+
+    def fix(self, check_id: str) -> None:
+        """Stop being vulnerable to `check_id`, for the rest of this run.
+
+        THE RETEST HALF OF S12 CANNOT BE MEASURED WITHOUT THIS. A scan run
+        twice against an unchanged target proves a finding is stable; only a
+        target that CHANGES can prove the other half -- that the finding
+        retires when the flaw is gone and that the findings beside it do not.
+        Nothing else in this suite can produce that fact: `hx` has no fixture
+        for "the client deployed a patch", and stopping the server outright
+        proves something different and weaker (see
+        `test_stopping_the_target_does_not_clear_a_finding_...` in
+        test_scan_and_report.py, which measures that a dead target retires
+        nothing at all).
+
+        ONE DIRECTION ONLY, and there is deliberately no `unfix`. Every route
+        starts vulnerable and each of these calls removes one flaw; a knob that
+        could put a flaw BACK would let a test assert a retirement and then
+        quietly re-arm the thing it just proved gone, which is the shape of
+        every vacuous retest. A run wanting the vulnerable route back gets a
+        fresh server, which every test already does.
+
+        THE NAME IS CHECKED. A typo would silently fix nothing, and the test
+        that follows it -- "this finding retired" -- would fail somewhere else
+        entirely, naming the retirement machinery for a mistyped string.
+        """
+        if check_id not in VULNERABLE_ROUTES:
+            raise ValueError(
+                f"{check_id!r} has no vulnerable route here; this fixture "
+                f"knows {sorted(VULNERABLE_ROUTES)}")
+        with self._lock:
+            self._fixed.add(check_id)
+
+    def is_fixed(self, check_id: str) -> bool:
+        """Read by a handler thread on every request; see `fix`."""
+        with self._lock:
+            return check_id in self._fixed
 
     def hits_for(self, path: str) -> list[Hit]:
         """Every hit on `path`, ignoring the query string.

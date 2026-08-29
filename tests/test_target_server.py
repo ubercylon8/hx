@@ -25,11 +25,16 @@ from __future__ import annotations
 
 import http.client
 import json
+import pathlib
 import socket
 import time
+from urllib.parse import quote
 
 import pytest
 
+from hx.checks import registry
+from hx.checks.active import cors, open_redirect, path_traversal
+from hx.checks.active import reflected_input, sql_error
 from tests.integration import target_server as ts
 
 
@@ -406,3 +411,134 @@ def test_stop_is_safe_on_a_server_that_never_started():
     rig registers stop() BEFORE start(), so this path is real."""
     server = ts.TargetServer("127.0.0.1")
     server.stop()
+
+
+# ---------------------------------------------------------------------------
+# The vulnerable routes: the instrument the active corpus is measured with.
+#
+# Every assertion below is written against the CHECK'S OWN constants -- its
+# probe origin, its marker host, its signature table, its traversal payload --
+# rather than against a literal pasted from them. A route that stops answering
+# what its check actually sends is the one failure that makes the integration
+# suite's "each check found its finding" vacuous, and it costs milliseconds to
+# catch here instead of a JVM to catch there.
+# ---------------------------------------------------------------------------
+
+def test_every_active_check_has_exactly_one_vulnerable_route(target):
+    """The map is the contract the integration suite reads. A check added to
+    the registry without a route here would be scanned against nothing and
+    would answer `clean` -- indistinguishable, in a report, from a check that
+    was run against something and found it sound."""
+    active = {c.id for c in registry.CHECKS if c.klass != "passive"}
+    assert set(ts.VULNERABLE_ROUTES) == active, (
+        "every active check needs a route it can find something on, and every "
+        "route here needs a check that probes it")
+    for check_id, path in ts.VULNERABLE_ROUTES.items():
+        status, _headers, _body = _get(target, path)
+        assert status in (200, 302), (check_id, path, status)
+
+
+def test_the_cors_route_reflects_an_arbitrary_origin_with_credentials(target):
+    status, headers, _body = _get(
+        target, ts.VULNERABLE_ROUTES["hx.active.cors"],
+        headers={"Origin": cors._PROBE_ORIGIN})
+    assert status == 200
+    assert headers["Access-Control-Allow-Origin"] == cors._PROBE_ORIGIN
+    assert headers["Access-Control-Allow-Credentials"] == "true"
+
+
+def test_a_fixed_cors_route_stops_reflecting_and_nothing_else_changes(target):
+    """What `fix()` has to mean for the retirement half of the retest story: a
+    fixed configuration still answers, it just stops trusting an origin it
+    never heard of. A route that started 404ing or erroring instead would
+    retire the finding for the wrong reason."""
+    target.fix("hx.active.cors")
+    status, headers, body = _get(
+        target, ts.VULNERABLE_ROUTES["hx.active.cors"],
+        headers={"Origin": cors._PROBE_ORIGIN})
+    assert status == 200
+    assert json.loads(body) == {"user": "alice"}
+    assert "Access-Control-Allow-Origin" not in headers
+    assert "Access-Control-Allow-Credentials" not in headers
+
+
+def test_fix_refuses_a_name_no_route_here_answers_for(target):
+    """A typo would fix nothing and the retirement assertion that followed it
+    would fail somewhere else, naming the retirement machinery."""
+    with pytest.raises(ValueError, match="no vulnerable route"):
+        target.fix("hx.active.corse")
+
+
+def test_the_redirect_route_puts_the_markers_url_in_location_unvalidated(target):
+    status, headers, _body = _get(target, f"/go?next={open_redirect._MARKER_URL}")
+    assert status == 302
+    assert headers["Location"] == open_redirect._MARKER_URL
+
+
+def test_the_redirect_route_does_not_echo_a_value_that_is_not_a_url(target):
+    """Every other active check probes `next` too. If this route echoed their
+    canaries, `hx.active.reflected-input` would file a second finding on the
+    same surface and the one-route-one-check attribution would be gone."""
+    status, headers, body = _get(target, "/go?next=Zq7pLx3nV0aB")
+    assert status == 200
+    assert "Location" not in headers
+    assert b"Zq7pLx3nV0aB" not in body
+
+
+def test_the_search_route_reflects_its_input_unescaped(target):
+    """Both halves of what `reflected_input` asks: the bare canary comes back,
+    and so does one wrapped in the four metacharacters that decide whether the
+    finding is Medium or Low."""
+    wrapped = f'{reflected_input._META_CHARS}Zq7pLx3nV0aB{reflected_input._META_CHARS}'
+    status, headers, body = _get(target, f"/search?q={quote(wrapped, safe='')}")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert wrapped.encode() in body, (
+        "the wrapper came back escaped or not at all, so the escalation "
+        "request can only ever produce the weaker Low finding")
+
+
+def test_the_lookup_route_discloses_a_driver_error_only_for_a_broken_query(target):
+    signature = sql_error._SIGNATURES[0][0]
+    status, _headers, body = _get(target, "/db/lookup?id=42%27")
+    assert status == 500
+    assert signature.encode() in body
+
+    status, _headers, body = _get(target, "/db/lookup?id=42")
+    assert status == 200
+    assert signature.encode() not in body
+
+
+def test_the_lookup_route_does_not_quote_the_value_it_was_given(target):
+    """A real driver message quotes the offending value, and this one must not:
+    `sql_error`'s probe is a canary plus a quote, and echoing it would make
+    `reflected-input` file a finding here as well."""
+    _status, _headers, body = _get(target, "/db/lookup?id=Zq7pLx3nV0aB%27")
+    assert b"Zq7pLx3nV0aB" not in body
+
+
+def test_the_files_route_serves_the_fixtures_own_passwd_for_a_traversal(target):
+    payload = quote(path_traversal._TRAVERSAL_PAYLOAD, safe="")
+    status, _headers, body = _get(target, f"/files?file={payload}")
+    assert status == 200
+    signature = path_traversal._SIGNATURES[0][0]
+    assert signature.encode() in body
+    assert body.decode() == ts.FAKE_PASSWD, (
+        "the traversal must be answered from FAKE_PASSWD and never from a "
+        "file on the machine running this suite")
+
+
+def test_the_files_route_answers_an_ordinary_name_without_echoing_it(target):
+    status, _headers, body = _get(target, "/files?file=Zq7pLx3nV0aB.txt")
+    assert status == 200
+    assert b"Zq7pLx3nV0aB" not in body
+    assert path_traversal._SIGNATURES[0][0].encode() not in body
+
+
+def test_the_fixtures_passwd_is_not_the_machines(target):
+    """FAKE_PASSWD is invented, and the only thing that keeps it invented is
+    that nothing reads the real file. If these two are ever equal, something
+    started serving the host's own account list to a payload."""
+    real = pathlib.Path("/etc/passwd")
+    if real.exists():
+        assert real.read_text(errors="replace") != ts.FAKE_PASSWD
