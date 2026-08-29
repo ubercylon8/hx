@@ -810,15 +810,24 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # text: `cookie_flags.py:153` builds it as "Cookie {name} set
             # without ...", and `name` is the cookie name off a `Set-Cookie`
             # RESPONSE header. The re-review judged a newline unreachable
-            # there on HTTP framing; it is not. `_http.header_values` splits
-            # the head on `\r\n` and `.strip()`s the value, so a BARE `\n`
-            # inside a header line survives both -- `Set-Cookie: se\nssion=1`
-            # yields the name `se\nssion` -- and this heading then ends at
-            # the newline with the remainder starting a line of its own.
-            # `_flat` is the whole fix: the heading is not a code span, so
-            # `_code` does not apply, and a backtick or a `**` in a heading
-            # is mangling that `_flat` deliberately does not touch (this
-            # module escapes, it does not drop).
+            # there on HTTP framing; that was wrong AT THE TIME. `_http.
+            # header_values` used to split the head on `\r\n` and `.strip()`
+            # the value, so a BARE `\n` inside a header line survived both --
+            # `Set-Cookie: se\nssion=1` yielded the name `se\nssion` -- and
+            # this heading would then end at the newline with the remainder
+            # starting a line of its own.
+            #
+            # That path is CLOSED as of `_http._header_lines` splitting on
+            # LF first (active-checks plan, bare-LF header parsing): a bare
+            # `\n` now terminates the header line before `header_values` ever
+            # sees it, so a cookie name can no longer carry one. `_flat` is
+            # kept anyway, and is still the whole fix here -- `title` is free
+            # text from ANY check, this build's and a future one's alike, and
+            # a guard that holds only because today's one producer of it
+            # happens to be safe is not a guard. The heading is not a code
+            # span, so `_code` does not apply, and a backtick or a `**` in a
+            # heading is mangling that `_flat` deliberately does not touch
+            # (this module escapes, it does not drop).
             out.append(f"#### {_flat(_redact(title))}\n")
             marker = ""
             observed = _latest_observed(conn, fid)

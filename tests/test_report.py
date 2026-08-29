@@ -2047,13 +2047,23 @@ def test_an_ordinary_engagement_name_keeps_its_plain_single_backtick_span(
 
 
 def test_a_newline_in_a_finding_title_cannot_add_a_section():
-    """C-5, and the re-review's own judgement on it was wrong. It read the
-    `####` framing as making a newline unreachable "because of HTTP header
-    framing"; `_http.header_values` splits the head on `\\r\\n` and `.strip()`s
-    the value, so a BARE `\\n` inside a header line survives both. Verified
-    directly: a head carrying `Set-Cookie: se\\nssion=1` yields the cookie
-    name `se\\nssion`, and `cookie_flags.py:153` interpolates that straight
-    into the title. This is injection, not mangling."""
+    """C-5, and the re-review's own judgement on it was wrong AT THE TIME. It
+    read the `####` framing as making a newline unreachable "because of HTTP
+    header framing"; `_http.header_values` used to split the head on `\\r\\n`
+    and `.strip()` the value, so a BARE `\\n` inside a header line survived
+    both, and a head carrying `Set-Cookie: se\\nssion=1` yielded the cookie
+    name `se\\nssion` for `cookie_flags.py:153` to interpolate straight into
+    the title.
+
+    The active-checks plan's bare-LF header fix (`_http._header_lines` now
+    splits on LF first) CLOSED that path: a bare `\\n` inside a header line
+    now terminates the line before `header_values` sees it, so a cookie name
+    can no longer carry one, and this test's `_INJECT` title is built by hand
+    rather than through `_http` -- it never routed through the parser this
+    path used to exploit. It stays, and stays passing, because `_flat` on
+    `title` is a general guard against ANY free-text title carrying a raw
+    newline, not a patch for one now-closed injection route; a hostile title
+    reaching this render by some other means must still be handled."""
     conn = _conn()
     _run(conn, "r-1")
     _exchange(conn, "x-1", "r-1", "https://app.acme.test/login")
