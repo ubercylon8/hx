@@ -237,6 +237,20 @@ def test_headers_are_not_demanded_of_a_non_document_response():
     assert c.on_surface(ctx_for(d1=blob), None, rows()).state == "clean"
 
 
+def test_a_security_headers_candidate_issue_type_is_one_it_considered():
+    """The `cookie_flags` analog of the drift-catching test: both sides read
+    `_HeaderSpec.issue_type_id` off the same table today, but nothing pinned
+    that, and `security_headers` has no per-name identity like the cookie
+    check's `_issue_type` to fall back on if the two reads are ever pulled
+    apart. A candidate whose issue type is not in `considered` can never be
+    retired, and nothing else in the suite would notice."""
+    c = security_headers.SecurityHeaders()
+    v = c.on_surface(ctx_for(d1=resp(b"Content-Type: text/html")), None, rows())
+    assert v.state == "finding"
+    for candidate in v.candidates:
+        assert candidate.issue_type_id in v.considered
+
+
 # ---- secret in response -----------------------------------------------
 
 def test_a_private_key_block_in_a_body_is_a_finding():
@@ -290,6 +304,26 @@ def test_prose_mentioning_an_exception_is_clean():
     c = stack_trace.StackTrace()
     body = b"<p>If you see a NullPointerException, contact support.</p>"
     assert c.on_surface(ctx_for(d1=resp(body=body)), None, rows()).state == "clean"
+
+
+def test_stack_trace_does_not_claim_a_pattern_the_break_skipped():
+    """The per-exchange `break` stops at the FIRST matching pattern, so a
+    body that would also match a LATER pattern never has that later
+    pattern's `.search()` called. A `considered` that named it anyway would
+    let `scan._mark_unobserved` retire a still-live finding of a kind this
+    body was never actually checked against -- the false-close direction,
+    and the more dangerous one.
+
+    This body matches `php-error-disclosed` (3rd pattern) and would also
+    match `nodejs-stack-trace-disclosed` (5th pattern, "at foo.bar
+    (baz.js:12:5)") if the check ever got there. It must not.
+    """
+    c = stack_trace.StackTrace()
+    body = b"PHP Fatal error: Uncaught Error\n    at foo.bar (baz.js:12:5)\n"
+    v = c.on_surface(ctx_for(d1=resp(body=body)), None, rows(status=500))
+    assert v.state == "finding"
+    assert [x.issue_type_id for x in v.candidates] == ["php-error-disclosed"]
+    assert "nodejs-stack-trace-disclosed" not in v.considered
 
 
 # ---- unreadable evidence ----------------------------------------------

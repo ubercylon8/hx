@@ -34,11 +34,6 @@ _PATTERNS = (
      "nodejs-stack-trace-disclosed"),
 )
 
-# The issue type this check examines every readable body for, regardless of
-# whether any pattern matched. Read off `_PATTERNS` so it cannot drift from
-# the identity a matching candidate carries.
-_ISSUE_TYPES = tuple(issue_type_id for *_, issue_type_id in _PATTERNS)
-
 
 class StackTrace:
     id = "hx.passive.stack-trace"
@@ -49,8 +44,20 @@ class StackTrace:
     def on_surface(self, ctx, surface, exchanges) -> base.Verdict:
         seen = _http.bodies(ctx, exchanges)
         candidates = []
+        considered = []
         for row, body in seen.entries:
             for pattern, what, issue_type_id in _PATTERNS:
+                # `considered` gets this pattern's issue type the moment its
+                # `.search()` actually runs -- BEFORE the match is known --
+                # so a pattern the `break` below skips for this body is never
+                # claimed as examined. A static, `_PATTERNS`-derived
+                # `considered` would be wrong here precisely because of that
+                # `break`: a body matching the third pattern never reaches
+                # the fourth or fifth, so claiming their issue types were
+                # considered would let `scan._mark_unobserved` retire a
+                # still-live finding of a pattern this body was never
+                # checked against.
+                considered.append(issue_type_id)
                 if not pattern.search(body):
                     continue
                 candidates.append(base.Candidate(
@@ -67,4 +74,4 @@ class StackTrace:
                                 "detail server-side.",
                 ))
                 break     # one trace per exchange is the finding
-        return _http.verdict(seen, candidates, considered=_ISSUE_TYPES)
+        return _http.verdict(seen, candidates, considered=tuple(considered))
