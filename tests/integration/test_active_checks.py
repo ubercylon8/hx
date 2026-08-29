@@ -22,10 +22,17 @@ second copy of that coverage and nothing about the checks. So the scan is
 `scan.run(..., bridge=rig.srv)`: the same call `hx scan` makes, handed the same
 kind of bridge, against the Burp the rig already has.
 
-THE RATE LIMIT IS RAISED IN `_configure`, DELIBERATELY AND WITH A MEASUREMENT
-BEHIND IT -- see that function's docstring. It is the one fixture knob here that
-hides a real product limitation, and it says so out loud rather than passing
-quietly.
+AND IT RUNS AT THE RIG'S OWN 3/s, WHICH IS THE POINT OF THE FILE AS MUCH AS THE
+CHECKS ARE. `hx.policy.Limiter` REFUSES an over-rate request rather than
+queueing it, so sixteen probes at three a second are only reachable if the
+sender obeys the `retry_after_us` the refusal carries. This file first ran with
+the rate raised to 200 -- a fixture knob that hid the missing half of that
+contract, documented at the call site so no green run could be read as evidence
+that an unpaced scan works. The half is written now (`hx.checks.probe`), the
+knob is gone, and the invariant below (`sum(requests_sent)` == what the target
+received == `PROBES_PER_SCAN`) has to hold THROUGH the refusals and the waits:
+every probe eventually issued exactly once, counted exactly once, and seen by
+the target exactly once.
 
 WHAT THE PASSIVE CORPUS CANNOT DELIVER, and why the second test below is the
 point of the whole task: `test_scan_and_report.py` proves a finding is re-found
@@ -40,6 +47,7 @@ end, and it exists nowhere else in this suite.
 """
 from __future__ import annotations
 
+import time
 from collections import Counter
 
 import pytest
@@ -71,33 +79,31 @@ def rows(rig, sql: str, args=()) -> list[dict]:
 
 
 def _configure(rig) -> None:
-    """Authorise the extension, with a rate this scan can actually finish at.
+    """Authorise the extension AT THE ENGAGEMENT'S OWN RATE -- no knob.
 
-    THE RIG'S OWN 3/s DOES NOT WORK HERE, AND THE REASON IS A REAL GAP IN THE
-    PRODUCT rather than a property of this fixture. `hx.policy.Limiter` REFUSES
-    over-rate requests -- `Decision.rateLimited(retryAfterUs, ...)`, carrying a
-    hint -- it does not block and it does not queue. Nothing on the Python side
-    consumes that hint: `BridgeServer.send`'s own docstring says "NOTHING IN
-    THIS FILE RETRIES", `ProbeSender.get` turns the refusal into `ProbeRefused`,
-    and `hx.scan.run` turns that into an `inconclusive` row. The probe pass
-    issues its requests as fast as the send path answers them -- 0.57 ms p50
-    through this whole rig, measured in `target_server.py`'s own header -- so at
-    any single-digit `rate_limit_rps` a scan of more than `rate_rps` probes goes
-    `inconclusive` from the fourth request onward. MEASURED here first, at the
-    rig's own 3/s: of the sixteen probes one scan issues, three were answered
-    and every attempt after them came back `rate_limited` -- twelve
-    `inconclusive` rows, one finding of the five, and four of the five checks
-    never given an answer on any surface they were meant to find one on.
+    `rig.configure()` with no `rate_rps` sends the rate the engagement config
+    carries, which this rig sets to 3/s (`conftest`, deliberately not
+    `hx.config`'s default of 5 so that a configured rate and an ignored
+    configure body are distinguishable). That is a production rate: S4 puts the
+    profile in the single digits.
 
-    That is a defect in the corpus's pacing, not in this test, and it is
-    reported as one. What this file can honestly do is not pretend otherwise:
-    the rate is raised to a number that lets the checks be measured against a
-    real Burp, and the number is written down here with the reason, so nobody
-    reads a green run as evidence that an unpaced scan works at a production
-    rate. `limit.rate_rps` is armed on the FIRST configure of a run (see
+    IT USED TO SAY `rate_rps=200`, AND THE REASON IT NO LONGER DOES IS THE
+    SUBJECT OF THIS FILE. `hx.policy.Limiter` refuses an over-rate request --
+    `Decision.rateLimited(retryAfterUs, ...)` -- it does not block and it does
+    not queue, and until fix round A nothing on the Python side consumed the
+    hint. MEASURED here at 3/s before that: of the sixteen probes one scan
+    issues, three were answered and every attempt after them came back
+    `rate_limited` -- twelve `inconclusive` rows, one finding of the five, and
+    four of the five checks never given an answer on any surface they were
+    meant to find one on. Raising the rate made the checks measurable and hid
+    that; `ProbeSender.get` waiting the hint out is what makes the raise
+    unnecessary, and running here at 3/s is the only thing that proves it
+    against a real limiter rather than a double.
+
+    `limit.rate_rps` is armed on the FIRST configure of a run (see
     `conftest.build_config_body`), which is what this is.
     """
-    assert rig.configure(rate_rps=200) == 1
+    assert rig.configure() == 1
 
 
 def _browse_the_vulnerable_surfaces(rig) -> None:
@@ -171,7 +177,9 @@ def test_every_active_check_finds_its_own_endpoint(rig):
     _browse_the_vulnerable_surfaces(rig)
     hits_before = len(rig.target.hits)
 
+    started = time.monotonic()
     summary = _scan(rig)
+    elapsed = time.monotonic() - started
     assert summary.surfaces == len(VULNERABLE_ROUTES)
 
     run_id = _last_scan_run(rig)
@@ -180,11 +188,33 @@ def test_every_active_check_finds_its_own_endpoint(rig):
     # NOTHING WENT WRONG QUIETLY. `inconclusive` is what a refusal becomes
     # (`rate_limited`, `scope_denied`, a truncated response); `error` is a bug
     # in hx. Either would leave a check looking like it ran while it found
-    # nothing, which is the confusion S12 exists to remove -- and one of them
-    # is exactly how this test failed the first time it was run (see
-    # `_configure`).
+    # nothing, which is the confusion S12 exists to remove -- and
+    # `rate_limited` is exactly how this test failed the first time it was
+    # run, at this same 3/s (see `_configure`). It passes here because the
+    # sender waits the refusal's own `retry_after_us` out, not because the
+    # fixture raised the rate.
     bad = [r for r in check_runs if r["verdict"] in ("error", "inconclusive")]
     assert bad == [], f"a check neither ran nor was skipped: {bad}"
+
+    # AND IT WAS PACED RATHER THAN LUCKY. `Limiter`'s window is a sliding log
+    # of the last `rate_rps` issuances, so issuance k cannot happen until one
+    # second after issuance k-rate_rps: sixteen probes at 3/s cannot be
+    # delivered in less than (16-1)//3 = 5 seconds, whatever else is true. A
+    # scan that finished faster than that did not send sixteen requests
+    # through this limiter, and the equality below would then be measuring
+    # something other than what it says.
+    #
+    # The ceiling is the other failure: a sender that ignored the hint and
+    # waited its own full clamp on every probe, twice, would take ~33 s and
+    # still be green on everything above. It is deliberately loose -- the
+    # margin over the expected ~5.1 s is for a loaded machine, not for a
+    # second pacing strategy.
+    rps = rig.eng.config.rate_limit_rps
+    floor_s = (PROBES_PER_SCAN - 1) // rps
+    assert floor_s <= elapsed <= floor_s + PROBES_PER_SCAN, (
+        f"{PROBES_PER_SCAN} probes at {rps}/s took {elapsed:.2f}s; the "
+        f"limiter's own arithmetic puts the floor at {floor_s}s and anything "
+        "far above it is a sender waiting more than it was asked to")
 
     findings = _active_findings(rig)
     assert Counter(f["check_id"] for f in findings) == \
@@ -220,9 +250,14 @@ def test_every_active_check_finds_its_own_endpoint(rig):
 
     # AND BOUNDED, AGAINST THE ONE WITNESS THIS SIDE CANNOT FAKE. The target
     # server's own log is what actually arrived; `requests_sent` is what hx
-    # believes it spent. They are equal only if every probe left, none was
-    # refused before it did, and nothing issued traffic the count does not know
-    # about.
+    # believes it spent. At the raised rate this held only because nothing was
+    # ever refused. At 3/s it has to hold THROUGH thirteen refusals and the
+    # waits that answered them, which makes it the proof of both halves of fix
+    # round A at once: every probe was eventually issued exactly once (the
+    # retry works), counted exactly once (a refusal the gate decided before
+    # issuing adds nothing, so the retry does not double-count), and seen by
+    # the target exactly once (no wait replayed a request that had already
+    # left).
     spent = sum(r["requests_sent"] for r in check_runs)
     arrived = len(rig.target.hits) - hits_before
     assert spent == arrived == PROBES_PER_SCAN, (
