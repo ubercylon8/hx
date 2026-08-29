@@ -51,8 +51,9 @@ servers emit -- decides the case: a host equal (ASCII case-insensitively)
 to the marker's is the finding, because nothing the target could have
 learned about this engagement could make it redirect there on its own.
 
-A `Location` that is empty, relative (no host at all), or names some other
-host is NOT a finding -- and it is not `clean` either, it is `inconclusive`.
+ON THAT SAME REDIRECT RESPONSE, a `Location` that is empty, relative (no
+host at all), or names some other host is NOT a finding -- and it is not
+`clean` either, it is `inconclusive`.
 The two readings of such a response ("the target validated the parameter"
 and "the target never looked at the parameter, it just bounced us to a login
 page") are not separable from the outside, and only the first of them may
@@ -282,9 +283,10 @@ class OpenRedirect:
 
         if not probed_any:
             # NOTHING WAS SENT, SO NOTHING WAS TESTED -- and that is not
-            # `clean`. N3 of the scoped re-review: a surface whose query
-            # parameters are `q` and `page` is one this check's own name
-            # filter never looked at, and a `clean` row for it claimed
+            # `clean`. N3 of the scoped re-review. Reached by either filter
+            # above: a point of the wrong KIND, or a query parameter whose
+            # name is `q` or `page` rather than redirect-shaped. Both are
+            # "this check did not look here", and a `clean` row for it claimed
             # coverage in `report._coverage` (which counts surfaces per
             # check and verdict) that no request backs. `considered` was
             # already empty, so nothing was ever retired on this path; the

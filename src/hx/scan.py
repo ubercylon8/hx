@@ -259,7 +259,7 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             # calls OPTIONS an idempotent read, and `GET /x`
                             # is still not the surface `OPTIONS /x` names.
                             _skip(conn, row_id, summary, "not_a_get_surface",
-                                  f"this surface was captured as a "
+                                  "this surface was captured as a "
                                   f"{surface[1]} request and this build can "
                                   "send nothing but a GET, which would be a "
                                   "request to a different surface; body and "
@@ -505,10 +505,9 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # in this sentence for the reason the budget one does: a pass that left
     # rows `skipped` did not do everything it set out to do, and the run row
     # is where a report decides whether to trust it. The word stays
-    # `truncated` and the KEY is what distinguishes them --
-    # `truncated: skipped no_bridge=4` says which four
-    # rows to go and read, which is more than a differently-worded prefix
-    # would have said.
+    # `truncated` and the KEY is what distinguishes them -- `truncated:
+    # skipped no_bridge=4` says which four rows to go and read, which is more
+    # than a differently-worded prefix would have said.
     #
     # AND A SKIP IS NOT THE ONLY WAY TO STOP SHORT -- F11 of the whole-branch
     # review. `budget_exhausted` never reaches `by_reason`: it arrives as a

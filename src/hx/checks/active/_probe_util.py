@@ -301,12 +301,16 @@ def verdict(candidates, gaps, *,
             unprobed: str | None = None) -> base.Verdict:
     """The active corpus's one rule for when `clean` may be said.
 
-    THE SAME THREE BRANCHES AS `_http.verdict`, in the same order and for the
-    same reasons -- that module's docstring is the long form of this one, and
-    the two halves of one corpus answering this question differently is the
-    architectural drift this function exists to close. `gaps` is one string
-    per probe that came back without answering; `considered` is what the
-    check examined.
+    IT OPENS WITH THE SAME THREE BRANCHES AS `_http.verdict`, in the same
+    order and for the same reasons -- that module's docstring is the long
+    form of those, and the two halves of one corpus answering this question
+    differently is the architectural drift this function exists to close.
+    Two more follow that the passive half has no use for: a passive check is
+    handed this surface's recorded traffic and reads it, so "I examined
+    nothing" is not a state it can be in, while an active check decides for
+    itself whether any of the points it was handed is worth a request. See
+    `unprobed` below. `gaps` is one string per probe that came back without
+    answering; `considered` is what the check examined.
 
     A CANDIDATE STILL WINS OVER A GAP: what was found was found, and another
     probe on this surface coming back without an answer does not un-find it.
@@ -321,12 +325,16 @@ def verdict(candidates, gaps, *,
     remembered.
 
     `unprobed` IS A FOURTH FACT AND IT IS NOT A GAP. A gap is a probe that
-    was SENT and came back without answering; `unprobed` is the check's own
-    filter saying there was nothing here worth sending to at all --
-    `open_redirect` probes only a redirect-shaped parameter name,
-    `path_traversal` only a file-shaped one, and a surface whose parameters
-    are `q` and `page` is one neither of them examined. N3 of the scoped
-    re-review: that surface used to reach the `clean` return with
+    was SENT and came back without answering; `unprobed` is the check saying
+    there was nothing here worth sending to at all -- `open_redirect` probes
+    only a redirect-shaped parameter name, `path_traversal` only a
+    file-shaped one, and a surface whose parameters are `q` and `page` is
+    one neither of them examined. `reflected_input` and `sql_error` have no
+    name filter, so the runner's `no_insertion_point` skip covers their
+    production case; they pass `unprobed` for the KIND guard they apply
+    defensively, which the suite drives directly. All four looping checks
+    therefore pass it. N3 of the scoped re-review: an unprobed surface used
+    to reach the `clean` return with
     `considered=()`, so nothing was retired -- the safety envelope held --
     but the row read `clean` with `requests_sent = 0`, and
     `report._coverage` groups on (check_id, verdict) and counts SURFACES.
@@ -344,12 +352,14 @@ def verdict(candidates, gaps, *,
     structural half of the same fix. A check saying "tested, nothing found"
     while naming no issue type it tested FOR is exactly the row N3 is about,
     and there is no caller for which it is the right answer -- so the funnel
-    refuses it rather than five callers each remembering not to ask it. The
-    two checks with a name filter pass `unprobed`; the two without cannot
-    reach here unprobed (a point they were handed either builds a probe or
-    records a gap), and a name in this signature that no input can exercise
-    is a claim no test separates from its absence. `hx.scan.run` turns the
-    raise into an `error` row, which retires nothing.
+    refuses it rather than five callers each remembering not to ask it. That
+    is not a hypothetical: adding this raise is what FOUND two of the four
+    call sites. `reflected_input` and `sql_error` were expected not to need
+    `unprobed` at all, and their own defensive kind guards -- the branch
+    each carries because `scan.run` filters by kind and neither check
+    assumes it did -- reached this return with nothing considered. The
+    doctrine was in one place; the four exits from it were not.
+    `hx.scan.run` turns the raise into an `error` row, which retires nothing.
 
     `_http._detail` FORMATS THE GAP LIST, read across the module boundary
     rather than copied, for the reason `hx.scan._runner_hook` gives for

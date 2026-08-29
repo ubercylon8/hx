@@ -197,16 +197,39 @@ def test_every_active_check_finds_its_own_endpoint(rig):
     run_id = _last_scan_run(rig)
     check_runs = _check_runs(rig, run_id)
 
-    # NOTHING WENT WRONG QUIETLY. `inconclusive` is what a refusal becomes
-    # (`rate_limited`, `scope_denied`, a truncated response); `error` is a bug
-    # in hx. Either would leave a check looking like it ran while it found
-    # nothing, which is the confusion S12 exists to remove -- and
-    # `rate_limited` is exactly how this test failed the first time it was
-    # run, at this same 3/s (see `_configure`). It passes here because the
-    # sender waits the refusal's own `retry_after_us` out, not because the
-    # fixture raised the rate.
-    bad = [r for r in check_runs if r["verdict"] in ("error", "inconclusive")]
+    # NOTHING WENT WRONG QUIETLY. `error` is a bug in hx; an `inconclusive`
+    # row that SENT something is what a refusal becomes (`rate_limited`,
+    # `scope_denied`, a truncated response) or what a status the doctrine
+    # will not read as an answer becomes. Either would leave a check looking
+    # like it ran while it found nothing, which is the confusion S12 exists
+    # to remove -- and `rate_limited` is exactly how this test failed the
+    # first time it was run, at this same 3/s (see `_configure`). It passes
+    # here because the sender waits the refusal's own `retry_after_us` out,
+    # not because the fixture raised the rate.
+    bad = [r for r in check_runs
+           if r["verdict"] == "error"
+           or (r["verdict"] == "inconclusive" and r["requests_sent"] > 0)]
     assert bad == [], f"a check neither ran nor was skipped: {bad}"
+
+    # AN `inconclusive` ROW THAT SENT NOTHING IS A DIFFERENT FACT, AND THE
+    # RIGHT ONE. N3 of the scoped re-review: `open_redirect` and
+    # `path_traversal` probe a point only when its NAME matches their own
+    # filter, so on somebody else's vulnerable route they decline before a
+    # request exists. That used to read `clean` with `requests_sent = 0`,
+    # which told `report._coverage` -- which counts surfaces per (check,
+    # verdict) -- that the check had examined a surface it never sent
+    # anything to. Asserted rather than waved past: only those two checks may
+    # decline, never on their own route, and the row says why.
+    for row in check_runs:
+        if row["verdict"] != "inconclusive":
+            continue
+        assert row["check_id"] in {"hx.active.open-redirect",
+                                   "hx.active.path-traversal"}, row
+        own = VULNERABLE_ROUTES[row["check_id"]].split("?")[0]
+        assert row["path_template"] != own, (
+            "a check declined the very route the fixture built to be "
+            f"vulnerable to it: {row}")
+        assert "nothing was sent" in row["reason"], row
 
     # AND IT WAS PACED RATHER THAN LUCKY. `Limiter`'s window is a sliding log
     # of the last `rate_rps` issuances, so issuance k cannot happen until one

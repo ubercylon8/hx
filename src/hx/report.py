@@ -1382,8 +1382,8 @@ def _limits(conn, engagement_id) -> list[str]:
                    "but nothing was covered on those surfaces either. One "
                    "shape escapes that: an application that answers a "
                    "logged-out request with a 200 login PAGE cannot be told "
-                   "apart from one that answered, and a check reading such a "
-                   "response finds nothing and says so.")
+                   "apart here from one that answered, so a probe against it "
+                   "is recorded as a clean result.")
         # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
         # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
         # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.
