@@ -3022,9 +3022,11 @@ git commit -m "feat(engagement): isolated engagement directories with append-onl
 
 ```python
 # tests/test_cli.py
+import contextlib
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -3034,6 +3036,9 @@ from hx import engagement as eng_mod
 from hx import halt as halt_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
+from hx import session as session_mod
+from hx.checks import base as checks_base
+from hx.checks import registry as registry_mod
 from hx.store import records as records_mod
 
 
@@ -3886,6 +3891,147 @@ def test_scan_max_requests_below_one_is_a_bad_parameter_not_a_silent_clamp(
     assert "max-requests" in result.output.lower()
 
 
+# --- Plan 6 Task 7: `hx scan` opens the session, and only when it must -----
+#
+# NO REAL BURP IN THIS FILE. `session_mod.session` is replaced throughout;
+# the real launch is `tests/integration/`'s, which is the only place in this
+# repository allowed to cost a JVM.
+
+
+class _CliActive:
+    """A registerable `active_safe` check. `insertion_kinds` is empty for the
+    same reason `hx.checks.active.cors`'s is -- it shapes its own request --
+    which also means it runs against `engagement_with_surface`'s exchange,
+    whose `req_blob` is NULL and yields no points to derive."""
+    id, version, klass = "hx.test.cliactive", "1", "active_safe"
+    insertion_kinds = frozenset()
+
+    def probes(self, ctx, surface, insertions, send):
+        return checks_base.Verdict.clean(considered=("probed",))
+
+
+def _register_active(monkeypatch):
+    """Put one active check in the shipped corpus for the length of a test.
+
+    `registry.CHECKS` rather than a stub of `registry.enabled`: `cli.scan`
+    and `scan.run` both call `enabled`, and patching the tuple they both
+    read keeps the two answers the same. `validate` is called on it first --
+    if this shape were not one the registry accepts, the test would be
+    proving the CLI drives something that can never ship."""
+    check = _CliActive()
+    registry_mod.validate((check,))
+    monkeypatch.setattr(registry_mod, "CHECKS", registry_mod.CHECKS + (check,))
+    return check
+
+
+def _fake_session(opened, bridge):
+    @contextlib.contextmanager
+    def fake(eng, *, instance, jar=None, workdir=None, seed=None):
+        opened.append(instance)
+        yield SimpleNamespace(operator_port=1, crawler_port=2, epoch=1,
+                              bridge=bridge, workdir=None, proc=None)
+    return fake
+
+
+def test_scan_opens_no_session_when_the_corpus_is_passive_only(
+        engagement_with_surface, monkeypatch):
+    """A passive scan stays offline. Burp costs ~10 s to start and this build
+    ships only passive checks, so the common `hx scan` must not pay it for an
+    engine nothing will send through."""
+    def refuse(*a, **k):
+        pytest.fail("a passive-only scan launched Burp")
+
+    monkeypatch.setattr(cli.session_mod, "session", refuse)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+
+
+def test_scan_opens_a_session_when_an_active_check_is_enabled(
+        engagement_with_surface, monkeypatch):
+    """And hands `scan.run` that session's bridge. Opening a Burp and then
+    scanning without its bridge would be the worst of both: the startup cost
+    paid, and every active row still `skipped` for want of a route."""
+    _register_active(monkeypatch)
+    opened, bridge = [], object()
+    monkeypatch.setattr(cli.session_mod, "session",
+                        _fake_session(opened, bridge))
+
+    seen = {}
+    real_run = scan_mod.run
+
+    def spy(conn, **kwargs):
+        seen["bridge"] = kwargs.get("bridge")
+        return real_run(conn, **kwargs)
+
+    monkeypatch.setattr(scan_mod, "run", spy)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["scan"], "the session was not opened once, as `scan`"
+    assert seen["bridge"] is bridge
+
+
+def test_scan_does_not_open_a_session_for_an_active_class_that_ships_nothing(
+        engagement_with_surface, monkeypatch):
+    """THE SEPARATING CASE for the test above. `active_timing` is enabled by
+    default and this build ships no check in it, so a CLI that tested
+    `config.checks` instead of `registry.enabled` would launch a Burp for
+    every scan, send nothing through it, and print the `ships no checks`
+    note underneath."""
+    def refuse(*a, **k):
+        pytest.fail("a class with no checks in it launched Burp")
+
+    monkeypatch.setattr(cli.session_mod, "session", refuse)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    assert "ships no checks" in result.output
+
+
+def test_scan_turns_a_session_error_into_a_click_exception(
+        engagement_with_surface, monkeypatch):
+    """The message intact, as `capture start` does. Every `SessionError`
+    already names the fix -- a stale socket to remove by hand, an extension
+    jar that is unbuilt -- and an operator who gets `Error: SessionError`
+    instead has been handed the exception's type in place of its advice."""
+    _register_active(monkeypatch)
+
+    def die(*a, **k):
+        raise session_mod.SessionError(
+            "the bridge could not start on /x/hx.sock: address in use")
+
+    monkeypatch.setattr(cli.session_mod, "session", die)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code != 0
+    assert "the bridge could not start on /x/hx.sock" in result.output
+
+
+def test_scan_max_requests_still_reaches_an_active_session(
+        engagement_with_surface, monkeypatch):
+    """`--max-requests` predates the session and must survive it. The number
+    goes into `eng.config` before the session is opened, so it is the budget
+    `session.config_body` authorises the extension with -- not just the one
+    `scan.run` is handed."""
+    _register_active(monkeypatch)
+    seen = {}
+
+    @contextlib.contextmanager
+    def fake(eng, *, instance, jar=None, workdir=None, seed=None):
+        seen["max_requests"] = eng.config.max_requests
+        yield SimpleNamespace(operator_port=1, crawler_port=2, epoch=1,
+                              bridge=object(), workdir=None, proc=None)
+
+    monkeypatch.setattr(cli.session_mod, "session", fake)
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface),
+        "--max-requests", "23"])
+    assert result.exit_code == 0, result.output
+    assert seen["max_requests"] == 23
+
+
 # --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---
 # --- what that gap already cost -----------------------------------------
 
@@ -4540,8 +4686,10 @@ def scan(root, max_seconds, max_requests) -> None:
     eng = _open_engagement(path)
     if max_requests is not None:
         # Same override as `capture start`'s -- see its comment. `scan.run`
-        # takes `eng.config` as-is, so this is where a later active-check
-        # session picks up the per-invocation number.
+        # takes `eng.config` as-is, and the active-check session opened
+        # below hands the same object to `session.config_body`, so this
+        # single replacement is what authorises the extension for THIS
+        # invocation. It must stay ahead of both.
         eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
     try:
         surfaces = eng.db.execute(
@@ -4555,9 +4703,40 @@ def scan(root, max_seconds, max_requests) -> None:
                        "through the proxy first, then scan")
             return
 
-        summary = scan_mod.run(
-            eng.db, engagement_id=eng.id, blobs=eng.blobs,
-            config=eng.config, max_seconds=max_seconds)
+        # THE SESSION IS OPENED HERE, AND ONLY WHEN SOMETHING WILL SEND.
+        # `scan.run` takes a bridge and never builds one: it has no
+        # engagement root, no jar and no business owning a JVM whose
+        # lifetime is a local variable's. This command has all three.
+        #
+        # ONLY WHEN AN ACTIVE CLASS IS ENABLED, because a passive scan that
+        # paid Burp's ~10 s startup to send nothing would be a cost with no
+        # answer attached -- and the corpus this build ships is still all
+        # passive, so the common `hx scan` stays entirely offline. The test
+        # is on `registry.enabled`, which is the one place "switched on for
+        # this engagement" is decided, rather than on `config.checks`: a
+        # class enabled with no checks in it (the shipped `active_timing`)
+        # must not start a Burp either, and `enabled` already returns
+        # nothing for it.
+        active = tuple(c for c in registry.enabled(eng.config)
+                       if c.klass != "passive")
+        try:
+            if active:
+                with session_mod.session(eng, instance="scan") as live:
+                    summary = scan_mod.run(
+                        eng.db, engagement_id=eng.id, blobs=eng.blobs,
+                        config=eng.config, max_seconds=max_seconds,
+                        bridge=live.bridge)
+            else:
+                summary = scan_mod.run(
+                    eng.db, engagement_id=eng.id, blobs=eng.blobs,
+                    config=eng.config, max_seconds=max_seconds)
+        except session_mod.SessionError as exc:
+            # The message intact, as `capture start` does: every one of
+            # them already names the fix (a stale socket to remove, an
+            # unbuilt extension jar, a listener that came up off loopback),
+            # and re-wording it here would put this command between the
+            # operator and the sentence that tells them what to do.
+            raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
         click.echo(f"findings  {summary.findings}")

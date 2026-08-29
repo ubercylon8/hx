@@ -38,7 +38,7 @@ _HOOKS = {
 }
 _ALL_HOOKS = ("on_surface", "probes", "on_corpus")
 
-# Which of those hooks `hx.scan.run` ACTUALLY CALLS. Today: one. `_HOOKS`
+# Which of those hooks `hx.scan.run` ACTUALLY CALLS. Today: two. `_HOOKS`
 # above answers "may this class implement this hook"; this answers "will
 # anything ever invoke it", and they are different questions that were being
 # asked as one. F7 of the whole-branch review: a check implementing only
@@ -46,12 +46,19 @@ _ALL_HOOKS = ("on_surface", "probes", "on_corpus")
 # surface (`scan.run` calls `check.on_surface` unconditionally, so the
 # missing attribute raises inside the per-check try) -- verbatim the outcome
 # the "no hook" guard below exists to prevent, arrived at by a different
-# route. `probes` is in the same position and is refused for the same
-# reason; giving the corpus a probe pass, or a corpus pass, is design S5
-# work and belongs in a later plan. WHEN A RUNNER PASS IS ADDED, ADD ITS
-# HOOK HERE -- this tuple is what makes such a check runnable, and forgetting
-# it is a loud import error rather than a silent corpus.
-_RUNNER_CALLS = ("on_surface",)
+# route. WHEN A RUNNER PASS IS ADDED, ADD ITS HOOK HERE -- this tuple is what
+# makes such a check runnable, and forgetting it is a loud import error rather
+# than a silent corpus.
+#
+# `probes` WAS IN `on_corpus`'S POSITION AND IS NOT ANY MORE, and the reason
+# it was refused is the reason it is now listed rather than a reason that
+# stopped applying: `hx.scan.run` grew the probe pass (Plan 6, Task 7), so
+# something does now invoke it, and the refusal below lifts for active checks
+# by that fact alone. Nothing about the RULE changed. `on_corpus` is still
+# here-but-uncalled for every class in `_HOOKS`, still refused as the only
+# hook of a check, and the day a corpus pass is written this tuple is the one
+# line that has to move with it -- which is what this paragraph is kept for.
+_RUNNER_CALLS = ("on_surface", "probes")
 
 
 class RegistryError(Exception):

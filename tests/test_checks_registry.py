@@ -20,7 +20,7 @@ class _Passive:
 class _PassiveThatProbes(_Passive):
     id = "t.passive-that-probes"
 
-    def probes(self, ctx, surface, insertion):
+    def probes(self, ctx, surface, insertions, send):
         return ()
 
 
@@ -104,7 +104,7 @@ class _ActiveThatOnlyProbes:
     id, version, klass = "t.only-probes", "1", "active_safe"
     insertion_kinds = frozenset()
 
-    def probes(self, ctx, surface, insertion):
+    def probes(self, ctx, surface, insertions, send):
         return ()
 
 
@@ -120,13 +120,30 @@ def test_a_check_whose_only_hook_the_runner_never_calls_is_refused():
         registry.validate((_OnlyCorpus(),))
 
 
-def test_an_active_check_that_only_probes_is_refused_for_the_same_reason():
-    """The rule is about the RUNNER, not about one hook name. `probes` is
-    legal for `active_safe` and is equally uncalled today, so an active check
-    with only a `probes` method is refused too -- and the message says the
-    pass is not written rather than implying the check is malformed."""
-    with pytest.raises(registry.RegistryError, match="does not yet call"):
-        registry.validate((_ActiveThatOnlyProbes(),))
+def test_an_active_check_that_only_probes_is_accepted_now_the_pass_exists():
+    """THE REFUSAL LIFTED BY THE RUNNER CHANGING, NOT BY THE RULE CHANGING.
+
+    Until Plan 6's Task 7 this check was refused, and the message said so in
+    the right words: the hook is legal for its class and the pass that would
+    drive it was not written. `hx.scan.run` now has that pass, `probes` is in
+    `_RUNNER_CALLS`, and the same rule applied to the same check therefore
+    accepts it. The test below pins that `on_corpus` -- still uncalled -- is
+    still refused, which is what makes this an outcome of the rule rather
+    than an exemption carved out of it."""
+    registry.validate((_ActiveThatOnlyProbes(),))
+
+
+def test_the_probe_hook_is_listed_as_one_the_runner_calls():
+    """The registry's half of the seam, asserted directly.
+
+    The test above passes if the refusal stops firing, and there is more than
+    one way to stop a refusal firing: deleting the `_RUNNER_CALLS` guard from
+    `validate` would do it for every check at once and leave nothing here
+    red. Naming the tuple's contents -- `probes` in, `on_corpus` still out --
+    is what separates "the pass was added" from "the guard was loosened"."""
+    assert "probes" in registry._RUNNER_CALLS
+    assert "on_surface" in registry._RUNNER_CALLS
+    assert "on_corpus" not in registry._RUNNER_CALLS
 
 
 def test_a_check_carrying_on_corpus_ALONGSIDE_on_surface_is_accepted():

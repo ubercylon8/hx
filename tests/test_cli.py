@@ -1,6 +1,8 @@
+import contextlib
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -10,6 +12,9 @@ from hx import engagement as eng_mod
 from hx import halt as halt_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
+from hx import session as session_mod
+from hx.checks import base as checks_base
+from hx.checks import registry as registry_mod
 from hx.store import records as records_mod
 
 
@@ -860,6 +865,147 @@ def test_scan_max_requests_below_one_is_a_bad_parameter_not_a_silent_clamp(
         "--max-requests", "0"])
     assert result.exit_code != 0
     assert "max-requests" in result.output.lower()
+
+
+# --- Plan 6 Task 7: `hx scan` opens the session, and only when it must -----
+#
+# NO REAL BURP IN THIS FILE. `session_mod.session` is replaced throughout;
+# the real launch is `tests/integration/`'s, which is the only place in this
+# repository allowed to cost a JVM.
+
+
+class _CliActive:
+    """A registerable `active_safe` check. `insertion_kinds` is empty for the
+    same reason `hx.checks.active.cors`'s is -- it shapes its own request --
+    which also means it runs against `engagement_with_surface`'s exchange,
+    whose `req_blob` is NULL and yields no points to derive."""
+    id, version, klass = "hx.test.cliactive", "1", "active_safe"
+    insertion_kinds = frozenset()
+
+    def probes(self, ctx, surface, insertions, send):
+        return checks_base.Verdict.clean(considered=("probed",))
+
+
+def _register_active(monkeypatch):
+    """Put one active check in the shipped corpus for the length of a test.
+
+    `registry.CHECKS` rather than a stub of `registry.enabled`: `cli.scan`
+    and `scan.run` both call `enabled`, and patching the tuple they both
+    read keeps the two answers the same. `validate` is called on it first --
+    if this shape were not one the registry accepts, the test would be
+    proving the CLI drives something that can never ship."""
+    check = _CliActive()
+    registry_mod.validate((check,))
+    monkeypatch.setattr(registry_mod, "CHECKS", registry_mod.CHECKS + (check,))
+    return check
+
+
+def _fake_session(opened, bridge):
+    @contextlib.contextmanager
+    def fake(eng, *, instance, jar=None, workdir=None, seed=None):
+        opened.append(instance)
+        yield SimpleNamespace(operator_port=1, crawler_port=2, epoch=1,
+                              bridge=bridge, workdir=None, proc=None)
+    return fake
+
+
+def test_scan_opens_no_session_when_the_corpus_is_passive_only(
+        engagement_with_surface, monkeypatch):
+    """A passive scan stays offline. Burp costs ~10 s to start and this build
+    ships only passive checks, so the common `hx scan` must not pay it for an
+    engine nothing will send through."""
+    def refuse(*a, **k):
+        pytest.fail("a passive-only scan launched Burp")
+
+    monkeypatch.setattr(cli.session_mod, "session", refuse)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+
+
+def test_scan_opens_a_session_when_an_active_check_is_enabled(
+        engagement_with_surface, monkeypatch):
+    """And hands `scan.run` that session's bridge. Opening a Burp and then
+    scanning without its bridge would be the worst of both: the startup cost
+    paid, and every active row still `skipped` for want of a route."""
+    _register_active(monkeypatch)
+    opened, bridge = [], object()
+    monkeypatch.setattr(cli.session_mod, "session",
+                        _fake_session(opened, bridge))
+
+    seen = {}
+    real_run = scan_mod.run
+
+    def spy(conn, **kwargs):
+        seen["bridge"] = kwargs.get("bridge")
+        return real_run(conn, **kwargs)
+
+    monkeypatch.setattr(scan_mod, "run", spy)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code == 0, result.output
+    assert opened == ["scan"], "the session was not opened once, as `scan`"
+    assert seen["bridge"] is bridge
+
+
+def test_scan_does_not_open_a_session_for_an_active_class_that_ships_nothing(
+        engagement_with_surface, monkeypatch):
+    """THE SEPARATING CASE for the test above. `active_timing` is enabled by
+    default and this build ships no check in it, so a CLI that tested
+    `config.checks` instead of `registry.enabled` would launch a Burp for
+    every scan, send nothing through it, and print the `ships no checks`
+    note underneath."""
+    def refuse(*a, **k):
+        pytest.fail("a class with no checks in it launched Burp")
+
+    monkeypatch.setattr(cli.session_mod, "session", refuse)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
+    assert "ships no checks" in result.output
+
+
+def test_scan_turns_a_session_error_into_a_click_exception(
+        engagement_with_surface, monkeypatch):
+    """The message intact, as `capture start` does. Every `SessionError`
+    already names the fix -- a stale socket to remove by hand, an extension
+    jar that is unbuilt -- and an operator who gets `Error: SessionError`
+    instead has been handed the exception's type in place of its advice."""
+    _register_active(monkeypatch)
+
+    def die(*a, **k):
+        raise session_mod.SessionError(
+            "the bridge could not start on /x/hx.sock: address in use")
+
+    monkeypatch.setattr(cli.session_mod, "session", die)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code != 0
+    assert "the bridge could not start on /x/hx.sock" in result.output
+
+
+def test_scan_max_requests_still_reaches_an_active_session(
+        engagement_with_surface, monkeypatch):
+    """`--max-requests` predates the session and must survive it. The number
+    goes into `eng.config` before the session is opened, so it is the budget
+    `session.config_body` authorises the extension with -- not just the one
+    `scan.run` is handed."""
+    _register_active(monkeypatch)
+    seen = {}
+
+    @contextlib.contextmanager
+    def fake(eng, *, instance, jar=None, workdir=None, seed=None):
+        seen["max_requests"] = eng.config.max_requests
+        yield SimpleNamespace(operator_port=1, crawler_port=2, epoch=1,
+                              bridge=object(), workdir=None, proc=None)
+
+    monkeypatch.setattr(cli.session_mod, "session", fake)
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface),
+        "--max-requests", "23"])
+    assert result.exit_code == 0, result.output
+    assert seen["max_requests"] == 23
 
 
 # --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---

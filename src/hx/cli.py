@@ -556,8 +556,10 @@ def scan(root, max_seconds, max_requests) -> None:
     eng = _open_engagement(path)
     if max_requests is not None:
         # Same override as `capture start`'s -- see its comment. `scan.run`
-        # takes `eng.config` as-is, so this is where a later active-check
-        # session picks up the per-invocation number.
+        # takes `eng.config` as-is, and the active-check session opened
+        # below hands the same object to `session.config_body`, so this
+        # single replacement is what authorises the extension for THIS
+        # invocation. It must stay ahead of both.
         eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
     try:
         surfaces = eng.db.execute(
@@ -571,9 +573,40 @@ def scan(root, max_seconds, max_requests) -> None:
                        "through the proxy first, then scan")
             return
 
-        summary = scan_mod.run(
-            eng.db, engagement_id=eng.id, blobs=eng.blobs,
-            config=eng.config, max_seconds=max_seconds)
+        # THE SESSION IS OPENED HERE, AND ONLY WHEN SOMETHING WILL SEND.
+        # `scan.run` takes a bridge and never builds one: it has no
+        # engagement root, no jar and no business owning a JVM whose
+        # lifetime is a local variable's. This command has all three.
+        #
+        # ONLY WHEN AN ACTIVE CLASS IS ENABLED, because a passive scan that
+        # paid Burp's ~10 s startup to send nothing would be a cost with no
+        # answer attached -- and the corpus this build ships is still all
+        # passive, so the common `hx scan` stays entirely offline. The test
+        # is on `registry.enabled`, which is the one place "switched on for
+        # this engagement" is decided, rather than on `config.checks`: a
+        # class enabled with no checks in it (the shipped `active_timing`)
+        # must not start a Burp either, and `enabled` already returns
+        # nothing for it.
+        active = tuple(c for c in registry.enabled(eng.config)
+                       if c.klass != "passive")
+        try:
+            if active:
+                with session_mod.session(eng, instance="scan") as live:
+                    summary = scan_mod.run(
+                        eng.db, engagement_id=eng.id, blobs=eng.blobs,
+                        config=eng.config, max_seconds=max_seconds,
+                        bridge=live.bridge)
+            else:
+                summary = scan_mod.run(
+                    eng.db, engagement_id=eng.id, blobs=eng.blobs,
+                    config=eng.config, max_seconds=max_seconds)
+        except session_mod.SessionError as exc:
+            # The message intact, as `capture start` does: every one of
+            # them already names the fix (a stale socket to remove, an
+            # unbuilt extension jar, a listener that came up off loopback),
+            # and re-wording it here would put this command between the
+            # operator and the sentence that tells them what to do.
+            raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
         click.echo(f"findings  {summary.findings}")
