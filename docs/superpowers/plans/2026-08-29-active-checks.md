@@ -33,7 +33,8 @@ not pay Burp's startup.
 - **Baselines at the time of writing:** `.venv/bin/pytest` → `1006 passed, 1 skipped, 32 deselected`; `.venv/bin/pytest -m integration` → `32 passed` (~210s, real headless Burp); `./extension/test.sh` → `13 ALL PASS`, 2330 `ok`, 2352 output lines, rc 0.
 - **Never trust a cumulative total written in this plan.** The previous plan's arithmetic was wrong four times, and an implementer who trusts a stale total either "fixes" a passing suite to match it or reports a false regression. **Measure the suite before you start, add your task's tests, and report the delta you actually observed.** The numbers above are the state when this plan was written and nothing more.
 - Some functions are guarded by plan byte-compare tests. If one breaks, sync it with a trailing `chore(plans):` commit — see `13a029e` and `3fc0a41` for the established pattern.
-- **Code blocks meant to be transcribed verbatim carry a `# path` marker on their first line** — `path` for a whole file, `path -- note` for an excerpt — so `tests/test_plan_matches_repo.py` holds them against the repo. The previous plan shipped with **zero** compared blocks, because one block was restructured mid-flight to dodge a marker error and nobody noticed until the whole-branch review counted them. **An unmarked block is silently never compared.** Blocks that are deliberately sketches (test shapes an implementer will adapt to existing fixtures) are left unmarked AND say so in their surrounding prose, so the distinction is stated rather than inferred from an absent comment.
+- **Markers go on at the END, not during execution.** `tests/test_plan_matches_repo.py` compares a marked block against the file it names, so a marker added before the code exists fails on every run — which is what happened when this plan was first committed. During execution the blocks stay unmarked. **The last task adds `# path` markers to every block meant to be transcribed verbatim and syncs them with `scripts/sync_plan_block.py`**, once the code they describe exists.
+- When you do mark them: **code blocks meant to be transcribed verbatim carry a `# path` marker on their first line** — `path` for a whole file, `path -- note` for an excerpt — so `tests/test_plan_matches_repo.py` holds them against the repo. The previous plan shipped with **zero** compared blocks, because one block was restructured mid-flight to dodge a marker error and nobody noticed until the whole-branch review counted them. **An unmarked block is silently never compared.** Blocks that are deliberately sketches (test shapes an implementer will adapt to existing fixtures) are left unmarked AND say so in their surrounding prose, so the distinction is stated rather than inferred from an absent comment.
 - **`tests/test_plan_matches_repo.py` reddens on ANY edit to a file it covers**, correct or not. It is never evidence that a behaviour is pinned. When you mutate something to check a test bites, look at WHICH test failed and disregard that one.
 - **Verifying a restored file with `sha256sum` is not sufficient on this machine.** A mutation that is byte-length-identical to the original can leave a stale `.pyc` that passes CPython's mtime+size check, and the suite will run the mutant after a clean checksum. Clear `__pycache__` after every restore, then re-verify.
 
@@ -898,7 +899,6 @@ Expected: FAIL — `Config` has no attribute `max_requests`.
 - [ ] **Step 4: Emit the key**
 
 ```python
-# src/hx/session.py -- config_body's budget line
         "limit.max_requests": [str(cfg.max_requests)],
 ```
 
@@ -1005,7 +1005,6 @@ Expected: FAIL — `scan.run() got an unexpected keyword argument 'bridge'`.
 - [ ] **Step 3: Add the hook to the registry**
 
 ```python
-# src/hx/checks/registry.py -- _RUNNER_CALLS
 _RUNNER_CALLS = ("on_surface", "probes")
 ```
 
@@ -1359,4 +1358,15 @@ ps -eo pid,args | grep '[j]ava.*StartBurp' || echo none
 ```bash
 git add tests/integration
 git commit -m "test(integration): the active corpus against a real target"
+```
+
+- [ ] **Step 6: Mark this plan's code blocks and sync them**
+
+Now that every file this plan describes exists, give each block meant to be transcribed verbatim a `# path` marker on its first line — `path` for a whole file, `path -- note` for an excerpt — and sync with `scripts/sync_plan_block.py`. Then run `.venv/bin/pytest tests/test_plan_matches_repo.py -q` and confirm the new blocks are **compared and matching**, not merely absent.
+
+This step exists because the previous plan shipped with **zero** compared blocks: one was restructured mid-flight to dodge a marker error and nobody noticed until the whole-branch review counted them. Report how many blocks this plan now contributes.
+
+```bash
+git add docs/superpowers/plans/2026-08-29-active-checks.md
+git commit -m "chore(plans): mark and sync this plan's blocks against the shipped code"
 ```
