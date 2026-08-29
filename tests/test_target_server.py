@@ -463,6 +463,112 @@ def test_a_fixed_cors_route_stops_reflecting_and_nothing_else_changes(target):
     assert "Access-Control-Allow-Credentials" not in headers
 
 
+# ---------------------------------------------------------------------------
+# `fix()` HONOURS EVERY ID IT ACCEPTS, which four of the five did not until fix
+# round 6: only `/api/profile` consulted `is_fixed`, so `fix("hx.active.
+# reflected-input")` was accepted and changed nothing. Nothing called it with
+# another id, so nothing was vacuous yet -- these are what stop the next
+# retest test being the one that finds out.
+#
+# EVERY ONE OF THEM ASSERTS THE ROUTE STILL ANSWERS, and that is the assertion
+# with the teeth. `_probe_util._NOT_AN_ANSWER` holds 3xx, 4xx and 5xx, so a
+# "fix" that answered any of those would make its check say `inconclusive` --
+# a wall, not a repair -- and a test built on it would measure the opposite of
+# what it claimed. The flaw's own signature going away is the easy half.
+# ---------------------------------------------------------------------------
+
+def test_a_fixed_redirect_route_validates_instead_of_redirecting(target):
+    target.fix("hx.active.open-redirect")
+    status, headers, body = _get(
+        target, f"/go?next={open_redirect._MARKER_URL}")
+    assert status == 200, "a fixed route that stops answering is a wall"
+    assert "Location" not in headers
+    assert open_redirect._MARKER_HOST.encode() not in body
+
+
+def test_a_fixed_search_route_stops_reflecting_and_still_answers(target):
+    wrapped = f'{reflected_input._META_CHARS}Zq7pLx3nV0aB{reflected_input._META_CHARS}'
+    target.fix("hx.active.reflected-input")
+    status, headers, body = _get(
+        target, f"/search?q={quote(wrapped, safe='')}")
+    assert status == 200, "a fixed route that stops answering is a wall"
+    assert headers["Content-Type"].startswith("text/html")
+    assert b"Zq7pLx3nV0aB" not in body, (
+        "the canary came back, so `reflected_input` still files a finding "
+        "and the fix reads as no fix at all")
+
+
+def test_a_fixed_lookup_route_stops_disclosing_the_driver_error(target):
+    target.fix("hx.active.sql-error")
+    status, _headers, body = _get(target, "/db/lookup?id=42%27")
+    assert status == 200, (
+        "a fixed route answering 5xx lands in `_NOT_AN_ANSWER`, so the check "
+        "says `inconclusive` and the test measures a wall")
+    assert sql_error._SIGNATURES[0][0].encode() not in body
+
+
+def test_a_fixed_files_route_confines_the_path_and_still_answers(target):
+    target.fix("hx.active.path-traversal")
+    payload = quote(path_traversal._TRAVERSAL_PAYLOAD, safe="")
+    status, _headers, body = _get(target, f"/files?file={payload}")
+    assert status == 200, (
+        "a fixed route answering 403 or 404 lands in `_NOT_AN_ANSWER`, so "
+        "the check says `inconclusive` and the test measures a wall")
+    assert path_traversal._SIGNATURES[0][0].encode() not in body
+    assert ts.FAKE_PASSWD.encode() not in body
+
+
+# What "still vulnerable" MEANS at each route, spelt once. Each entry is the
+# request that demonstrates the flaw and a predicate over `(status, headers,
+# body)` that is true only while it is there -- the same evidence the check
+# itself reads, so a `fix` that half-worked cannot satisfy this.
+_STILL_VULNERABLE = {
+    "hx.active.cors": (
+        "/api/profile", {"Origin": cors._PROBE_ORIGIN},
+        lambda s, h, b: h.get("Access-Control-Allow-Origin") == cors._PROBE_ORIGIN),
+    "hx.active.open-redirect": (
+        f"/go?next={open_redirect._MARKER_URL}", None,
+        lambda s, h, b: s == 302 and h.get("Location") == open_redirect._MARKER_URL),
+    "hx.active.path-traversal": (
+        f"/files?file={quote(path_traversal._TRAVERSAL_PAYLOAD, safe='')}", None,
+        lambda s, h, b: b.decode() == ts.FAKE_PASSWD),
+    "hx.active.reflected-input": (
+        "/search?q=Zq7pLx3nV0aB", None,
+        lambda s, h, b: b"Zq7pLx3nV0aB" in b),
+    "hx.active.sql-error": (
+        "/db/lookup?id=42%27", None,
+        lambda s, h, b: sql_error._SIGNATURES[0][0].encode() in b),
+}
+
+
+def test_the_vulnerability_predicates_cover_every_route_in_the_map():
+    """Derived from the map, so a sixth check with a route here cannot be
+    left out of the test below without anything reddening."""
+    assert set(_STILL_VULNERABLE) == set(ts.VULNERABLE_ROUTES)
+
+
+@pytest.mark.parametrize("check_id", sorted(ts.VULNERABLE_ROUTES))
+def test_fixing_one_route_leaves_the_other_four_vulnerable(target, check_id):
+    """THE SEPARATING CASE, over the whole map. A `fix` that switched
+    something global -- or four branches all reading one flag -- would pass
+    every test above while silently repairing the routes a retest test is
+    using as its controls. Each route is checked for its OWN flaw rather than
+    for a status, because four of the five repairs above leave the status
+    exactly where it was."""
+    for other, (path, headers, still) in _STILL_VULNERABLE.items():
+        status, got, body = _get(target, path, headers=headers)
+        assert still(status, got, body), (
+            f"{other} was not vulnerable before anything was fixed, so this "
+            "test measures nothing")
+
+    target.fix(check_id)
+
+    for other, (path, headers, still) in _STILL_VULNERABLE.items():
+        status, got, body = _get(target, path, headers=headers)
+        assert still(status, got, body) == (other != check_id), (
+            f"fixing {check_id} left {other} in the wrong state", status, got)
+
+
 def test_fix_refuses_a_name_no_route_here_answers_for(target):
     """A typo would fix nothing and the retirement assertion that followed it
     would fail somewhere else, naming the retirement machinery."""
