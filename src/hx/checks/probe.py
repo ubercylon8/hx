@@ -87,8 +87,16 @@ scan by answering with a huge number. The clamp costs nothing real:
 `retryAfterUs` is `WINDOW_US - elapsed` with `0 < elapsed < WINDOW_US`, so a
 `Limiter` cannot legitimately ask for more than one second. Attempts are
 bounded at `_RATE_LIMIT_ATTEMPTS`, which puts a ceiling of roughly two
-seconds on what any one probe can add; the run as a whole is bounded by
-`hx.scan.run`'s `max_seconds`, so no deadline is threaded through here.
+seconds on what any one probe can add. `hx.scan.run` does NOT bound the run
+by `max_seconds` -- it consults its deadline only at the top of the surface
+loop (`scan.py:144`), so `max_seconds` bounds when the next surface starts,
+not when the run ends: once a surface is in flight every check on it runs
+to completion, and this retry can add its ceiling to each probe issued
+there. That overshoot is accepted, not fixed: it is bounded (one surface's
+probes, worst case tens of seconds), the safety envelope is
+`limit.max_requests` and the rate limit rather than `max_seconds`, and
+`_skip_rest(..., "budget", ...)` already records a skipped row for every
+check a deadline miss does cut off. No deadline is threaded through here.
 
 THE COUNT IS OF ISSUANCES, NOT ATTEMPTS. `check_run.requests_sent` reaches a
 client's report as the traffic hx generated, so it has to be true of the
