@@ -49,6 +49,19 @@ class ScanSummary:
     CLI printed `findings  40` while the store and the report held 1 -- the
     exact forty tickets F3 removed, reappearing at the terminal. A number an
     operator reads must be the number the report will show.
+
+    `checks_run` IS `check_run` ROWS WRITTEN, and that is the same rule as
+    the paragraph above: a number an operator reads must be one they can go
+    and verify. Fix round 1 (LOW) found the two skip paths disagreeing about
+    it -- a probe skip incremented this (the counter sits right after
+    `_open_row`) and `_skip_rest`'s budget skip did not, so the SAME
+    situation, "four rows opened, four skipped, nothing executed", printed
+    `checks 4 / skipped 4` down one path and `checks 0 / skipped 4` down the
+    other. Rows-written is the meaning that survives: it equals
+    `SELECT COUNT(*) FROM check_run WHERE run_id=?` exactly, for every way a
+    row can end, which is a claim a test can make and an operator can check.
+    "Checks that actually executed" is NOT this number and is not lost --
+    it is `checks_run` minus `skipped`, and the CLI prints both lines.
     """
     surfaces: int = 0
     checks_run: int = 0
@@ -185,7 +198,7 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                 # was never conditional on WHERE in handling the check went
                 # wrong.
                 try:
-                    if hook == "probes":
+                    if hook == _PROBE_HOOK:
                         if bridge is None:
                             # Never silence. The one thing an active check
                             # cannot do without is a route to the wire, and
@@ -342,6 +355,32 @@ def _exchanges_for(conn, surface_id):
         " FROM exchange WHERE surface_id=? ORDER BY rowid", (surface_id,)))
 
 
+# The one hook `run()` drives through the wire. Named once because two
+# questions read it: which branch of the per-check dispatch a check takes,
+# and -- through `needs_a_bridge` below -- whether `hx scan` has to start a
+# Burp at all. Those must be the same answer or the CLI pays for a session
+# the runner never sends through.
+_PROBE_HOOK = "probes"
+
+
+def needs_a_bridge(check) -> bool:
+    """Whether `run()` will drive this check through a pass that SENDS.
+
+    `hx scan` (cli.py) asks this to decide whether to open a session, and it
+    has to be the SAME question `run()` answers when it dispatches. Fix round
+    1 (LOW): the CLI used to ask `check.klass != "passive"` instead -- a
+    class-string restatement of a rule the registry owns, and precisely what
+    `_runner_hook` refuses to do one function below. The two agree today and
+    could stop agreeing tomorrow without a word: `_HOOKS` decides per class
+    which hooks are legal, so a future non-passive class given
+    `("on_surface", "on_corpus")` rather than `("probes", ...)` would read as
+    active to a class-string test while the runner called `on_surface` and
+    sent nothing -- a 10-second JVM started, per scan, to be handed no
+    traffic. Asking the hook cannot drift, because it is the dispatch.
+    """
+    return _runner_hook(check) == _PROBE_HOOK
+
+
 def _runner_hook(check) -> str:
     """Which of the hooks this runner calls the check implements.
 
@@ -443,8 +482,18 @@ def _close_row(conn, row_id, verdict, reason, requests_sent=0) -> None:
 
 
 def _skip_rest(conn, run_id, surface, checks, reason, summary) -> int:
+    """Every remaining check of one surface, opened and closed `skipped`.
+
+    `checks_run` is advanced here, which it was not before fix round 1
+    (LOW). These rows ARE `check_run` rows -- `_open_row` writes each one --
+    and `ScanSummary.checks_run` is defined as rows written, so a path that
+    wrote four and counted none made the same scan print `checks 0 /
+    skipped 4` where the probe pass prints `checks 4 / skipped 4`. The
+    counter now moves wherever a row is opened, down both paths.
+    """
     for check in checks:
         row_id = _open_row(conn, run_id, surface, check)
+        summary.checks_run += 1
         _close_row(conn, row_id, "skipped", reason)
         summary.by_reason[reason] = summary.by_reason.get(reason, 0) + 1
     return len(checks)

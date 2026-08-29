@@ -397,6 +397,23 @@ def test_a_passive_row_records_no_requests(tmp_path):
     assert _row(env["conn"]) == ("clean", None, 0)
 
 
+def test_checks_run_counts_the_rows_a_probe_skip_wrote(tmp_path):
+    """The other half of the fix-round-1 (LOW) agreement. `checks_run` is
+    `check_run` rows written, down every path -- an operator reading
+    `checks 2 / skipped 2` can go and find two rows, and the same scan
+    truncated by the budget instead of by a missing bridge reports the same
+    two numbers."""
+    env = _env(tmp_path)
+
+    class Second(_Probe):
+        id = "hx.test.probe2"
+
+    summary = scan.run(**env, checks=(_Probe(), Second()), bridge=None)
+    rows = env["conn"].execute("SELECT COUNT(*) FROM check_run").fetchone()[0]
+    assert summary.checks_run == rows == 2
+    assert summary.skipped == 2
+
+
 # --- dispatch is on the hook, not on the class string ---------------------
 
 

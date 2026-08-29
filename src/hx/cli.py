@@ -578,19 +578,29 @@ def scan(root, max_seconds, max_requests) -> None:
         # engagement root, no jar and no business owning a JVM whose
         # lifetime is a local variable's. This command has all three.
         #
-        # ONLY WHEN AN ACTIVE CLASS IS ENABLED, because a passive scan that
-        # paid Burp's ~10 s startup to send nothing would be a cost with no
-        # answer attached -- and the corpus this build ships is still all
-        # passive, so the common `hx scan` stays entirely offline. The test
-        # is on `registry.enabled`, which is the one place "switched on for
-        # this engagement" is decided, rather than on `config.checks`: a
-        # class enabled with no checks in it (the shipped `active_timing`)
-        # must not start a Burp either, and `enabled` already returns
-        # nothing for it.
-        active = tuple(c for c in registry.enabled(eng.config)
-                       if c.klass != "passive")
+        # ONLY WHEN SOMETHING WILL SEND, because a passive scan that paid
+        # Burp's ~10 s startup to send nothing would be a cost with no answer
+        # attached -- and the corpus this build ships is still all passive,
+        # so the common `hx scan` stays entirely offline.
+        #
+        # TWO FILTERS, TWO DIFFERENT QUESTIONS, AND NEITHER IS RESTATED HERE.
+        # `registry.enabled` is the one place "switched on for this
+        # engagement" is decided, which also settles a class enabled with no
+        # checks in it (the shipped `active_timing`) -- `enabled` returns
+        # nothing for it, so it starts no Burp. `scan.needs_a_bridge` is the
+        # one place "will the runner send for this check" is decided, and it
+        # answers by asking which hook the runner would dispatch to.
+        #
+        # This second one was `c.klass != "passive"` until fix round 1 (LOW):
+        # a class-string restatement of a rule the registry owns, of exactly
+        # the kind `scan._runner_hook` refuses to make. A future non-passive
+        # class whose `_HOOKS` entry never gets `probes` would have launched
+        # a JVM here while `scan.run` called `on_surface` and sent nothing,
+        # with no test anywhere pinning the disagreement.
+        sending = tuple(c for c in registry.enabled(eng.config)
+                        if scan_mod.needs_a_bridge(c))
         try:
-            if active:
+            if sending:
                 with session_mod.session(eng, instance="scan") as live:
                     summary = scan_mod.run(
                         eng.db, engagement_id=eng.id, blobs=eng.blobs,

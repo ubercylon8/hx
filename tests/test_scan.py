@@ -659,6 +659,37 @@ def test_a_budget_truncated_scan_records_a_stop_reason(scan_env, monkeypatch):
     assert "budget" in row[1]
 
 
+def test_checks_run_counts_the_rows_a_budget_skip_wrote(scan_env, monkeypatch):
+    """FIX ROUND 1 (LOW): `_skip_rest` wrote a `check_run` row per remaining
+    check and advanced `checks_run` for none of them, so a budget-truncated
+    scan printed `checks 0 / skipped 2` while the store held two rows. The
+    probe pass counts its own skips (the counter sits right after
+    `_open_row`), so the SAME situation printed two different numbers
+    depending on which skip got there first. `checks_run` is defined as rows
+    written; this asserts it against the store rather than against a
+    literal, which is the only comparison that cannot drift."""
+    conn = scan_env["conn"]
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, discovered_by, normaliser_version)"
+        " VALUES('s-2','e-1','GET','https','app.test',443,'/other','proxy',1)")
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url) VALUES('x-2', NULL, 's-2', 'proxy', 'ok', 1, 'GET',"
+        " 'https://app.test/other')")
+    ticks = iter([0.0, 0.5, 2.0])
+    monkeypatch.setattr(scan.time, "monotonic", lambda: next(ticks))
+
+    summary = scan.run(**scan_env, checks=(Quiet(), Boom()), max_seconds=1)
+
+    rows = conn.execute("SELECT COUNT(*) FROM check_run").fetchone()[0]
+    assert summary.checks_run == rows
+    # Two surfaces x two checks: the first surface ran both, the second was
+    # skipped for budget. Four rows, and `checks_run` says four.
+    assert rows == 4
+    assert summary.skipped == 2
+
+
 def test_a_complete_scan_has_no_stop_reason(scan_env):
     """The other half of F7: a scan that was NOT truncated must not gain a
     stop_reason either -- an always-set reason would be just as useless as

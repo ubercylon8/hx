@@ -3042,6 +3042,59 @@ from hx.checks import registry as registry_mod
 from hx.store import records as records_mod
 
 
+@pytest.fixture(autouse=True)
+def no_unit_test_in_this_file_launches_a_jvm(monkeypatch):
+    """NO TEST IN THIS FILE MAY REACH THE REAL `hx.session.session`.
+
+    THE HAZARD THIS FILE ALREADY DOCUMENTS IN PROSE, NOW ENFORCED. The
+    comment above `test_info_reports_drops_loudly_when_there_are_any` records
+    why the `capture start` tests were moved out to `tests/test_cli_capture.py`
+    -- unstubbed, they reached `session.session`, and this machine has exactly
+    one jar under the default `$HX_BURP_LAB` (a 714 MB
+    `burpsuite_desktop_v2026.7.3.jar`, which `find_burp_jar`'s glob matches
+    exactly once), so a plain `pytest` run would have launched real Burps.
+    A comment cannot stop that happening again, and it did not: Plan 6 Task 7
+    gave `hx scan` a session too, and five `scan`/`report` tests here (the
+    ones invoking `scan` and `report` through `CliRunner` with nothing
+    stubbed) sat one registered active check away from launching five JVMs on
+    every default run. Reviewer-measured, and nothing was red -- the trap
+    arms itself the day `hx.active.cors` joins `registry.CHECKS`, not today.
+
+    OPTING IN IS REPLACING IT. A test that legitimately drives the session
+    path monkeypatches `cli.session_mod.session` with its own double in the
+    test body, which runs after this fixture and therefore wins; `refuse`
+    below is then never called and this fixture passes silently. There is no
+    marker to remember, because the thing a safe test must do -- stub the
+    session -- IS the opt-in.
+
+    IT RAISES `SessionError` AND FAILS IN TEARDOWN, which is two mechanisms
+    for one job and both are needed. `pytest.fail` inside the call would be
+    swallowed: `CliRunner.invoke` catches every exception by default and
+    files it under `result.exception`, so the guard would surface as a
+    puzzling non-zero exit rather than as itself. Raising `SessionError`
+    keeps the command's own error path intact (the CLI turns it into a
+    `ClickException`, as it would for any session failure), and the
+    post-yield `pytest.fail` then reports the real cause somewhere
+    `CliRunner` cannot reach.
+    """
+    reached: list[str] = []
+
+    def refuse(eng, *, instance, **kwargs):
+        reached.append(instance)
+        raise session_mod.SessionError(
+            "tests/test_cli.py's no-JVM guard refused to launch Burp")
+
+    monkeypatch.setattr(cli.session_mod, "session", refuse)
+    yield
+    if reached:
+        pytest.fail(
+            "this test reached the real hx.session.session (instance="
+            f"{reached[0]!r}), which launches a real Burp: ~10 s and a 900 MB "
+            "JVM inside the default `pytest` run. Stub "
+            "`cli.session_mod.session` in the test, or move the test to "
+            "tests/test_cli_capture.py, which stubs it throughout.")
+
+
 def test_new_creates_engagement(tmp_path: Path):
     runner = CliRunner()
     result = runner.invoke(
@@ -3392,6 +3445,12 @@ def engagement_with_stale_run(engagement: Path) -> Path:
 # tests/test_cli_capture.py, which stubs `session.session` throughout; the
 # fixtures below (`engagement` and its variants) stay because the `info` and
 # `scan`/`report` tests further down still use them.
+#
+# THAT MOVE IS NO LONGER THE ONLY THING HOLDING THE LINE. Task 7 of Plan 6
+# gave `hx scan` a session as well, and this comment did not stop five tests
+# below from re-arming the same trap. `no_unit_test_in_this_file_launches_a_jvm`
+# at the top of the file is the autouse guard that now enforces the rule for
+# every test here, whatever command it invokes.
 
 
 def test_info_reports_drops_loudly_when_there_are_any(engagement_with_drops):
@@ -3855,11 +3914,16 @@ def test_scan_max_requests_flag_overrides_the_configured_budget(
     seen: list = []
 
     def fake_run(conn, *, engagement_id, blobs, config, checks=None,
-                surface_filter=None, max_seconds=None):
+                surface_filter=None, max_seconds=None, bridge=None):
+        # `bridge=None` is not decoration: `hx scan` passes it the moment an
+        # active check ships, and a double whose signature lags the function
+        # it doubles fails with `unexpected keyword argument` rather than
+        # with anything about budgets.
         seen.append(config.max_requests)
         return real_run(conn, engagement_id=engagement_id, blobs=blobs,
                         config=config, checks=checks,
-                        surface_filter=surface_filter, max_seconds=max_seconds)
+                        surface_filter=surface_filter, max_seconds=max_seconds,
+                        bridge=bridge)
 
     monkeypatch.setattr(scan_mod, "run", fake_run)
     before = eng_mod.open_(engagement_with_surface)
@@ -3988,6 +4052,43 @@ def test_scan_does_not_open_a_session_for_an_active_class_that_ships_nothing(
         cli.main, ["scan", "--root", str(engagement_with_surface)])
     assert result.exit_code == 0, result.output
     assert "ships no checks" in result.output
+
+
+def test_scan_does_not_open_a_session_for_a_non_passive_class_that_reads(
+        engagement_with_surface, monkeypatch):
+    """FIX ROUND 1 (LOW): the gate used to be `c.klass != "passive"`, and
+    this is the disagreement nothing pinned.
+
+    `_HOOKS` decides PER CLASS which hooks are legal, and nothing says a
+    non-passive class must get `probes`. Simulated here by giving
+    `active_timing` the passive pairing -- a decision a later plan could
+    genuinely make for a class that reads timing off captured exchanges
+    rather than issuing its own -- and registering a check that implements
+    `on_surface`. `registry.validate` accepts it, `scan.run` dispatches it to
+    `on_surface` and sends nothing, and the old class-string gate would have
+    started a 10-second JVM per scan to hand it no traffic.
+
+    THE ASSERTION IS THE AUTOUSE GUARD. `no_unit_test_in_this_file_launches_a_jvm`
+    fails this test in teardown if the gate opens a session, which is the
+    same mechanism protecting every other test in the file rather than a
+    second one invented here."""
+    monkeypatch.setitem(registry_mod._HOOKS, "active_timing",
+                        ("on_surface", "on_corpus"))
+
+    class ReadsOnly:
+        id, version, klass = "hx.test.reads", "1", "active_timing"
+        insertion_kinds = frozenset()
+
+        def on_surface(self, ctx, surface, exchanges):
+            return checks_base.Verdict.clean(considered=("read",))
+
+    check = ReadsOnly()
+    registry_mod.validate((check,))
+    monkeypatch.setattr(registry_mod, "CHECKS", registry_mod.CHECKS + (check,))
+
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+    assert result.exit_code == 0, result.output
 
 
 def test_scan_turns_a_session_error_into_a_click_exception(
@@ -4708,19 +4809,29 @@ def scan(root, max_seconds, max_requests) -> None:
         # engagement root, no jar and no business owning a JVM whose
         # lifetime is a local variable's. This command has all three.
         #
-        # ONLY WHEN AN ACTIVE CLASS IS ENABLED, because a passive scan that
-        # paid Burp's ~10 s startup to send nothing would be a cost with no
-        # answer attached -- and the corpus this build ships is still all
-        # passive, so the common `hx scan` stays entirely offline. The test
-        # is on `registry.enabled`, which is the one place "switched on for
-        # this engagement" is decided, rather than on `config.checks`: a
-        # class enabled with no checks in it (the shipped `active_timing`)
-        # must not start a Burp either, and `enabled` already returns
-        # nothing for it.
-        active = tuple(c for c in registry.enabled(eng.config)
-                       if c.klass != "passive")
+        # ONLY WHEN SOMETHING WILL SEND, because a passive scan that paid
+        # Burp's ~10 s startup to send nothing would be a cost with no answer
+        # attached -- and the corpus this build ships is still all passive,
+        # so the common `hx scan` stays entirely offline.
+        #
+        # TWO FILTERS, TWO DIFFERENT QUESTIONS, AND NEITHER IS RESTATED HERE.
+        # `registry.enabled` is the one place "switched on for this
+        # engagement" is decided, which also settles a class enabled with no
+        # checks in it (the shipped `active_timing`) -- `enabled` returns
+        # nothing for it, so it starts no Burp. `scan.needs_a_bridge` is the
+        # one place "will the runner send for this check" is decided, and it
+        # answers by asking which hook the runner would dispatch to.
+        #
+        # This second one was `c.klass != "passive"` until fix round 1 (LOW):
+        # a class-string restatement of a rule the registry owns, of exactly
+        # the kind `scan._runner_hook` refuses to make. A future non-passive
+        # class whose `_HOOKS` entry never gets `probes` would have launched
+        # a JVM here while `scan.run` called `on_surface` and sent nothing,
+        # with no test anywhere pinning the disagreement.
+        sending = tuple(c for c in registry.enabled(eng.config)
+                        if scan_mod.needs_a_bridge(c))
         try:
-            if active:
+            if sending:
                 with session_mod.session(eng, instance="scan") as live:
                     summary = scan_mod.run(
                         eng.db, engagement_id=eng.id, blobs=eng.blobs,
