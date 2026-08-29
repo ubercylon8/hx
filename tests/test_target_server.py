@@ -471,8 +471,8 @@ def test_a_fixed_cors_route_stops_reflecting_and_nothing_else_changes(target):
 # retest test being the one that finds out.
 #
 # EVERY ONE OF THEM ASSERTS THE ROUTE STILL ANSWERS, and that is the assertion
-# with the teeth. `_probe_util._NOT_AN_ANSWER` holds 3xx, 4xx and 5xx, so a
-# "fix" that answered any of those would make its check say `inconclusive` --
+# with the teeth. `_probe_util.unanswered` reads a 2xx and nothing else as an
+# answer, so a "fix" that replied 3xx, 4xx or 5xx would say `inconclusive` --
 # a wall, not a repair -- and a test built on it would measure the opposite of
 # what it claimed. The flaw's own signature going away is the easy half.
 # ---------------------------------------------------------------------------
@@ -502,7 +502,7 @@ def test_a_fixed_lookup_route_stops_disclosing_the_driver_error(target):
     target.fix("hx.active.sql-error")
     status, _headers, body = _get(target, "/db/lookup?id=42%27")
     assert status == 200, (
-        "a fixed route answering 5xx lands in `_NOT_AN_ANSWER`, so the check "
+        "a fixed route answering 5xx is no answer to `unanswered`, so the check "
         "says `inconclusive` and the test measures a wall")
     assert sql_error._SIGNATURES[0][0].encode() not in body
 
@@ -512,7 +512,7 @@ def test_a_fixed_files_route_confines_the_path_and_still_answers(target):
     payload = quote(path_traversal._TRAVERSAL_PAYLOAD, safe="")
     status, _headers, body = _get(target, f"/files?file={payload}")
     assert status == 200, (
-        "a fixed route answering 403 or 404 lands in `_NOT_AN_ANSWER`, so "
+        "a fixed route answering 403 or 404 is no answer to `unanswered`, so "
         "the check says `inconclusive` and the test measures a wall")
     assert path_traversal._SIGNATURES[0][0].encode() not in body
     assert ts.FAKE_PASSWD.encode() not in body

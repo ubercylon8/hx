@@ -686,17 +686,20 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
 
     WHY THE SEVENTH SPELLING FORCED THIS. Six ways an active check could
     answer `clean` off a probe that tested nothing were closed by the status
-    doctrine (`_probe_util._NOT_AN_ANSWER`), by the skips in `run` above,
-    and by `_probe_util.verdict`'s `unprobed` branch. The seventh is an
-    application that answers a logged-out request with a 200 LOGIN PAGE: a
-    complete, well-formed, application-composed response, indistinguishable
-    from an answer at every level a status set operates. That one is an
-    ARGUMENT AND NOT A MEASUREMENT, and saying otherwise is a mistake this
-    branch has already made once: fix round 3 measured five `clean` rows and
-    a retired finding behind a `302 /login` (see `_NOT_AN_ANSWER`), which is
-    the shape a status CAN catch and is now caught. A fixture whose anonymous
-    view differs from its anonymous view does not exist, so the 200 login
-    page has never been put in front of this corpus and cannot be.
+    doctrine (`_probe_util.unanswered`), by the skips in `run` above, and by
+    `_probe_util.verdict`'s `unprobed` branch -- and the EIGHTH was closed by
+    that same doctrine a round later, when it stopped being an enumeration of
+    refusing statuses and became the rule that only a 2xx is an answer. The
+    seventh is an application that answers a logged-out request with a 200
+    LOGIN PAGE: a complete, well-formed, application-composed response,
+    indistinguishable from an answer at every level a status rule operates.
+    That one is an ARGUMENT AND NOT A MEASUREMENT, and saying otherwise is a
+    mistake this branch has already made once: fix round 3 measured five
+    `clean` rows and a retired finding behind a `302 /login` (see
+    `_probe_util.unanswered`), which is the shape a status CAN catch and is
+    now caught. A fixture whose anonymous view differs from its anonymous
+    view does not exist, so the 200 login page has never been put in front of
+    this corpus and cannot be.
 
     WHAT IS MEASURED is the same `clean` arriving off a genuine answer:
     `tests/integration/test_active_checks.py::test_a_second_scan_is_stable_

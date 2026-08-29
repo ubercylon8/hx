@@ -29,6 +29,7 @@ import pytest
 
 from hx import config as config_mod
 from hx import insertion as insertion_mod
+from hx import report as report_mod
 from hx import scan
 from hx import surface as surface_mod
 from hx.checks import base, probe, registry
@@ -1505,9 +1506,9 @@ class _PassiveOnce:
 # (disclosed in `report._limits`), and the ordinary answer a BROWSER-FACING
 # application gives an unauthenticated request is not a 401 -- it is a 302 to
 # a login page, which is exactly the traffic hx captures through a proxy. A
-# 3xx used to sit outside `_probe_util._NOT_AN_ANSWER` on the ground that it
-# is `open_redirect`'s own finding; it is, and that is a fact about ONE check
-# rather than about the doctrine.
+# 3xx used to sit outside `_probe_util`'s status doctrine on the ground that
+# it is `open_redirect`'s own finding; it is, and that is a fact about ONE
+# check rather than about the doctrine.
 
 
 class _LoginWallBridge(FakeBridge):
@@ -1586,6 +1587,82 @@ def test_every_probing_check_reads_a_login_wall_as_a_gap(tmp_path):
         "SELECT check_id, verdict FROM check_run").fetchall())
     clean = sorted(cid for cid, v in rows.items() if v == "clean")
     assert clean == [], f"a login wall was read as a clean result: {clean}"
+
+
+# --- a target that refuses every probe is not a tested target -------------
+#
+# THE EIGHTH SPELLING, and the first one that reached the client deliverable
+# as a printed denial. `_probe_util`'s status doctrine was an ENUMERATION of
+# six refusing statuses (400, 401, 403, 404, 405, 429) plus 3xx and 5xx, so
+# every other 4xx read as the application answering -- and `report._limits`
+# told the client that "a rejection of the request itself is recorded as
+# `inconclusive` ... so no surface is reported as tested on the strength of
+# one", with exactly one named shape escaping. Measured, five did.
+#
+# 422 IS THE ORDINARY CASE, NOT AN EXOTIC ONE, and the enumeration's own
+# reason for holding 400 is why: every probe this build sends drops the
+# endpoint's OTHER query parameters, so a validation rejection is the
+# EXPECTED answer from a multi-parameter endpoint -- and FastAPI/pydantic,
+# Rails and a great many Node validation layers spell that rejection 422
+# rather than 400. `410` is `404`'s sibling, `407` is `401`'s, and `406` and
+# `414` are the same family. The doctrine is an allowlist now (2xx and
+# nothing else), so this test is about a RULE rather than about five numbers:
+# it fails for any status the rule would newly read as an answer.
+
+
+class _RefusingBridge(FakeBridge):
+    """A target that refuses every request rather than answering one.
+
+    The same shape as `_LoginWallBridge` and for the same reason: nothing
+    here refuses at the bridge, the gate or the budget, so a complete HTTP
+    response comes back and `ProbeSender.get` hands it over as `outcome=ok`.
+    What did not happen is the application looking at the payload."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__()
+        self.reply(
+            {"status": status, "outcome": "ok"},
+            b"HTTP/1.1 %d Refused\r\nContent-Length: 0\r\n\r\n" % status)
+
+
+@pytest.mark.parametrize("status", [422, 410, 407, 406, 414])
+def test_every_probing_check_reads_a_refused_request_as_a_gap(tmp_path,
+                                                              status):
+    """MEASURED THE WAY THE REVIEW MEASURED IT, both halves. The registry's
+    own five checks are driven against a target that answers the same refusal
+    to every request, on a surface carrying a point each check's own name
+    filter accepts -- so every check probes, and not one of them is answered.
+
+    The second half is the one that makes this blocking rather than academic:
+    the rows are RENDERED, and a `clean` row in the Coverage table is the
+    client reading that this surface was tested. Before the fix each of these
+    five statuses produced five `clean` rows and five tested Coverage rows off
+    five requests none of which was answered."""
+    env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE,
+               path_template="/search")
+    active = tuple(c for c in registry.CHECKS if c.klass != "passive")
+    assert len(active) == 5, "the corpus changed shape; re-read this test"
+    bridge = _RefusingBridge(status)
+    scan.run(**env, checks=active, bridge=bridge)
+
+    rows = dict(env["conn"].execute(
+        "SELECT check_id, verdict FROM check_run").fetchall())
+    assert len(rows) == 5, rows
+    clean = sorted(cid for cid, v in rows.items() if v == "clean")
+    assert clean == [], (
+        f"a target that refused every probe with {status} was read as a "
+        f"clean result by {clean}")
+    assert bridge.calls > 0, (
+        "nothing went on the wire, so this run proves nothing about what a "
+        "refused probe is read as")
+
+    coverage = report_mod.render(**env)
+    coverage = coverage[coverage.index("## Coverage"):]
+    tested = [c.id for c in active
+              if f"| `{c.id}` | clean |" in coverage]
+    assert tested == [], (
+        f"the Coverage table reports {tested} as tested against a target "
+        f"that answered {status} to every request")
 
 
 # --- a check whose own filter matched nothing -----------------------------

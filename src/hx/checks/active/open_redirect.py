@@ -69,13 +69,14 @@ URL that cannot exist, the 404 carried no `Location`, and this check answered
 `hx.checks.probe.ProbeSender` now refuses a path still carrying a placeholder
 and is bound to the exemplar's concrete path instead.
 
-A RESPONSE THAT REFUSED IS NOT A CLEAN ONE, EITHER. A 400, a 403, a 429, a
-5xx or a 404 has no `Location` for the same reason a properly validating
-target has none. `_probe_util.unanswered` names those, `_probe_util.verdict`
-turns them into `inconclusive`, and the doctrine is shared by all five active
-checks rather than spelt here -- see `_probe_util.py`.
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE, EITHER. A 400, a 403, a 422, a
+429, a 5xx or a 404 has no `Location` for the same reason a properly
+validating target has none. `_probe_util.unanswered` reads a 2xx and nothing
+else as an answer, `_probe_util.verdict` turns the rest into `inconclusive`,
+and the doctrine is shared by all five active checks rather than spelt here
+-- see `_probe_util.py`.
 
-A 3xx IS IN THAT SET TOO, AND THIS CHECK STILL KEEPS ITS FINDING -- because
+A 3xx IS NOT AN ANSWER EITHER, AND THIS CHECK STILL KEEPS ITS FINDING -- because
 of the ORDER the two questions are asked in below, not because of an
 exemption. A `Location` naming `_MARKER_HOST` is a candidate, and
 `unanswered` is consulted only on the branch where that match FAILED, so the

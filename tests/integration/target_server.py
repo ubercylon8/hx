@@ -482,7 +482,7 @@ class _Handler(BaseHTTPRequestHandler):
             # FIXED, it validates instead of redirecting: the same
             # non-redirecting 200 an unrecognised value already gets, which is
             # the ONE response `open_redirect.probes` reads as clean (a 3xx to
-            # anywhere is `inconclusive` -- see `_probe_util._NOT_AN_ANSWER`),
+            # anywhere is `inconclusive` -- see `_probe_util.unanswered`),
             # so a fixed route here answers the check rather than walling it.
             dest = params.get("next", [""])[0]
             if (dest.startswith(("http://", "https://", "//"))
@@ -545,8 +545,8 @@ class _Handler(BaseHTTPRequestHandler):
             #
             # FIXED, the path is confined: the traversal resolves inside the
             # intended directory and the ordinary 200 comes back with no file
-            # content in it. NOT a 403 or a 404 -- both are in
-            # `_probe_util._NOT_AN_ANSWER`, so `path_traversal` would answer
+            # content in it. NOT a 403 or a 404 -- neither is an answer under
+            # `_probe_util.unanswered`, so `path_traversal` would answer
             # `inconclusive` and the fix would be indistinguishable from a
             # wall, which is the very confusion `require_login` exists to
             # keep separate.
@@ -745,8 +745,9 @@ class TargetServer:
 
         WHAT A FIX HAS TO LOOK LIKE, and it is the same rule at all five
         routes: the route goes on ANSWERING and stops being vulnerable. A fix
-        that started answering 403, 404 or 5xx would land in
-        `_probe_util._NOT_AN_ANSWER`, the check would say `inconclusive`, and
+        that started answering anything but a 2xx -- a 403, a 404, a 5xx --
+        is not an answer to `_probe_util.unanswered`, the check would say
+        `inconclusive`, and
         the test would be measuring a wall while claiming to measure a repair
         -- which is exactly the distinction `require_login` exists to keep
         separate. Each branch below says which shape it chose and why.

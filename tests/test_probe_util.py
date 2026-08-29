@@ -164,6 +164,33 @@ def test_a_refusing_status_is_named_as_one(status):
     assert str(status) in reason
 
 
+@pytest.mark.parametrize("status", [402, 406, 407, 408, 409, 410, 413, 414,
+                                    415, 418, 422, 423, 428, 431, 451])
+def test_a_status_the_old_enumeration_omitted_is_a_gap_too(status):
+    """THE EIGHTH SPELLING, and the reason this doctrine is an allowlist
+    rather than a list of six numbers. Each of these read as the application
+    ANSWERING while the set was enumerated; measured end to end in
+    `tests/test_scan_probes.py::test_every_probing_check_reads_a_refused_
+    request_as_a_gap`, a target answering 422, 410, 407, 406 or 414 to every
+    request produced five `clean` rows and five tested Coverage rows off five
+    requests none of which was answered -- under a Limits bullet denying that
+    could happen.
+
+    422 IS THE ORDINARY CASE. The enumeration's own justification for holding
+    400 was that every probe this build sends drops the endpoint's other query
+    parameters, so a validation rejection is the EXPECTED answer from a
+    multi-parameter endpoint. That argument is about the situation and not
+    about the number: FastAPI/pydantic, Rails and a great many Node validation
+    layers spell the same rejection 422. `410` is `404`'s sibling and `407` is
+    `401`'s -- and a 407 is not composed by the application at all. `418` is
+    here as the case that CHANGED SIDES: it used to be the separating example
+    for "an odd 4xx is not automatically a refusal", which is exactly the
+    reasoning that left the other fourteen out."""
+    reason = _probe_util.unanswered(_response(status=status))
+    assert reason is not None
+    assert str(status) in reason
+
+
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
 def test_a_redirect_is_not_an_answer_for_any_check_that_shares_this_doctrine(
         status):
@@ -195,12 +222,23 @@ def test_a_rejected_request_is_not_a_conclusive_negative_either(status):
     assert _probe_util.unanswered(_response(status=status)) is not None
 
 
-@pytest.mark.parametrize("status", [200, 201, 204, 206, 418])
-def test_an_answering_status_is_not_a_gap(status):
-    """What is left: a response the application itself composed. 418 is here
-    as the separating case -- an odd 4xx is not automatically a refusal, and
-    the set is enumerated rather than spelt "anything that is not 2xx"."""
+@pytest.mark.parametrize("status", [200, 201, 202, 204, 206, 226, 299])
+def test_an_answering_status_is_a_2xx_and_only_a_2xx(status):
+    """The whole of what is left, and it is a rule rather than a list: the
+    application processed the payload and composed a reply. 299 is here as
+    the edge of the range and 226 as a real, rarely-seen member of it -- both
+    are answers by the same rule, and neither needs anybody to have thought
+    of it in advance, which is the property an enumeration could not have."""
     assert _probe_util.unanswered(_response(status=status)) is None
+
+
+@pytest.mark.parametrize("status", [100, 101, 102, 199])
+def test_an_informational_status_is_not_an_answer_either(status):
+    """Unreachable through `ProbeSender` (the Java side reads one complete
+    response and a 1xx is not it), and answered anyway in the direction the
+    allowlist makes free: a status this build has never seen is a gap without
+    anyone having to add it."""
+    assert _probe_util.unanswered(_response(status=status)) is not None
 
 
 def test_a_response_with_no_status_at_all_is_a_gap():

@@ -347,11 +347,13 @@ def test_two_canary_shaped_parameters_that_both_redirect_are_two_findings():
 # ---- a refusal from the target is not a clean answer ---------------------
 #
 # F4 of the whole-branch review. The doctrine lives in `_probe_util`; these
-# are this check's end of it, and the 3xx case is why the set had to be
-# chosen rather than "every status that is not 2xx".
+# are this check's end of it. The doctrine IS "every status that is not 2xx"
+# since the eighth spelling, and the 3xx case is why the ORDERING below had to
+# be got right rather than the rule narrowed to spare this check.
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 429, 500, 503])
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 407, 410, 422,
+                                    429, 500, 503])
 def test_a_status_that_refused_is_inconclusive_not_clean(status):
     """A response with no `Location` because a WAF answered instead is not a
     target that validated the parameter, and only one of those is a tested
@@ -363,8 +365,8 @@ def test_a_status_that_refused_is_inconclusive_not_clean(status):
 
 
 def test_a_redirect_status_is_this_checks_finding_and_never_a_gap():
-    """THE SEPARATING CASE, and why putting 3xx INTO `_probe_util.
-    _NOT_AN_ANSWER` did not delete this check. `unanswered` is consulted only
+    """THE SEPARATING CASE, and why a doctrine that reads every 3xx as a gap
+    did not delete this check. `unanswered` is consulted only
     on the branch where the marker did not match, so a `Location` naming the
     marker becomes a candidate before the doctrine is ever asked, and a
     candidate wins over a gap. No exemption, no per-check status set -- the

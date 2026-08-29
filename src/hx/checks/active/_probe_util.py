@@ -142,71 +142,94 @@ def reflected(response, marker: str) -> bool:
     return needle in response.head or needle in response.body
 
 
-# The statuses that refuse a request rather than answering it. A check
-# receiving one has not tested anything, whatever its payload was:
+# THE ONLY RESPONSE A CHECK MAY REASON ABOUT IS A 2xx. Everything else --
+# 1xx, 3xx, 4xx, 5xx, and a status that could not be read at all -- is not a
+# conclusive negative, and `unanswered` below turns it into a gap.
 #
-#   * 400 -- the request was malformed AS FAR AS THIS ENDPOINT IS CONCERNED,
-#     and every probe this build sends drops the endpoint's OTHER query
-#     parameters (`ProbeSender._request_bytes` emits a request line, a `Host`
-#     and at most the one header the check is probing). A multi-parameter
-#     endpoint answering 400 to a one-parameter probe is the EXPECTED
-#     outcome, not an unusual one, and "you sent me nonsense" is not "your
-#     payload was safe".
-#   * 401/403 -- a WAF, an expired session, an authorisation layer in front
-#     of the application. The probe never reached the code under test, and
-#     every probe this build sends is unauthenticated, so this is the
-#     ordinary answer from an authenticated application rather than an
-#     exotic one.
-#   * 404 -- the resource is gone. Reachable even now that probes go to the
-#     exemplar's concrete path: a capture from an hour ago can name a row
+# AN ALLOWLIST, AND THE EIGHTH SPELLING IS WHY IT HAD TO BECOME ONE. This was
+# an ENUMERATION of the statuses that refuse -- 400, 401, 403, 404, 405, 429,
+# grown one round at a time, then 3xx and 5xx -- so every status nobody had
+# thought of read as the application answering. MEASURED at the end of this
+# branch, real registry, `scan.run` against a target answering the same
+# status to every request on a surface carrying `q`, `redirect_uri` and
+# `file`: 422, 410, 407, 406 and 414 each produced five `clean` rows off five
+# requests none of which was answered, and `report._coverage` rendered all
+# five as tested -- under a Limits bullet telling the client that a rejection
+# of the request itself is recorded as `inconclusive`.
+#
+# 422 IS THE ORDINARY CASE, and the enumeration's own reason for holding 400
+# is what makes it one. Every probe this build sends drops the endpoint's
+# OTHER query parameters (`ProbeSender._request_bytes` emits a request line,
+# a `Host` and at most the one header the check is probing), so a
+# multi-parameter endpoint answering a one-parameter probe with a validation
+# rejection is the EXPECTED outcome rather than an unusual one -- and
+# FastAPI/pydantic spells that rejection 422, as do a great many Rails and
+# Node validation layers. That argument was always about the SITUATION and
+# never about the number. hx captures browser and XHR traffic, so an
+# API-heavy engagement is the ordinary one.
+#
+# SO THE RULE IS INVERTED RATHER THAN THE LIST WIDENED. An enumeration of
+# "bad" statuses has to be MAINTAINED against a web that keeps adding them,
+# and every round of that maintenance so far has been a coverage
+# overstatement found by a reviewer rather than by the code. "The application
+# processed my payload and composed a reply" is a rule instead: it cannot go
+# stale, and a status nobody here has considered gets the SAFE treatment by
+# construction. It is the shape `hx.checks.probe` already uses twice for this
+# same reason -- `_NOT_ISSUED` is an exclusion set so that an unrecognised
+# refusal class counts as traffic, and the rate-limit retry allowlists the
+# one class worth waiting on so that a new one stays terminal.
+#
+# WHAT THE EXCLUDED CLASSES MEAN, since a coverage row shows only the number:
+#
+#   * any 3xx -- the endpoint sent the browser away, and nothing in that
+#     response says whether it looked at the probe's parameter at all. N1 of
+#     the scoped re-review, and the case that cost the most: every probe this
+#     build sends is unauthenticated and the traffic hx captures is browser
+#     traffic, so `302 /login` is the COMMONEST shape of the situation this
+#     doctrine exists for rather than an edge of it. Read as a conclusive
+#     negative it closed all five checks `clean` and -- before fix round 6
+#     stopped an active check retiring anything -- brought a live
+#     `reflected-input` finding back as `observed = 0`, which
+#     `report._findings` renders as "appears fixed; verify before closing".
+#   * 400, 413, 414, 415, 422, 431 and their neighbours -- the request was
+#     refused before the payload was reached. "You sent me nonsense" is not
+#     "your payload was safe".
+#   * 401, 403, 407 -- a WAF, an expired session, an authorisation layer or a
+#     proxy in front of the application. The probe never reached the code
+#     under test, and every probe this build sends is unauthenticated, so
+#     this is the ordinary answer from an authenticated application rather
+#     than an exotic one. A 407 is not composed by the application at all.
+#   * 404, 410 -- the resource is gone. Reachable even now that probes go to
+#     the exemplar's concrete path: a capture from an hour ago can name a row
 #     that has since been deleted.
 #   * 405 -- the endpoint declines the only method this build can send. The
-#     runner now skips a surface whose own method is not GET/HEAD before a
-#     sender exists, so this is the case that survives that: a surface
-#     captured as a GET whose server answers 405 to the probe hx built.
+#     runner skips a surface this build cannot address before a sender exists
+#     (`hx.scan._PROBEABLE_METHODS`), so this is the case that survives that:
+#     a surface hx could address whose server answers 405 to the probe built
+#     for it.
 #   * 429 -- the TARGET's own rate limit, which is a different thing from
 #     `hx.policy.Limiter`'s (that one never reaches a check at all; it is a
 #     `ProbeRefused`). It means "ask again later", not "there is nothing
 #     here".
-#   * any 3xx -- see below.
 #   * any 5xx -- the application failed to answer. A maintenance page and a
 #     stack trace both carry none of what a check is looking for.
 #
-# A 3xx IS IN THE SET, AND N1 OF THE SCOPED RE-REVIEW IS WHY IT HAD TO BE.
-# It was deliberately left out at first, on the ground that a 3xx is
-# `open_redirect`'s own FINDING and a doctrine that swallowed it would delete
-# a check. That ground is true of `open_redirect` and of no other check --
-# and it is not even true of `open_redirect` in the direction it was used
-# for. MEASURED, real registry, a target answering `302 Found / Location:
-# /login` to everything: all five checks closed `clean` with `considered`
-# populated, and a live `reflected-input` finding from the previous run came
-# back `observed = 0`, which `report._findings` renders to a client as
-# "appears fixed; verify before closing". Every probe this build sends is
-# unauthenticated and the traffic hx captures is browser traffic, so a 302 to
-# a login page is the COMMONEST shape of the situation this doctrine exists
-# for, not an edge of it.
+# WHAT THE INVERSION COSTS IS COVERAGE AND NEVER A FINDING. All five checks
+# ask `unanswered` ONLY where their own match failed, which is the ordering
+# F4 put there, so a candidate is decided before this is ever consulted: a
+# `Location` naming `open_redirect`'s marker on a 302 and `sql_error`'s
+# driver wording on a 500 are findings exactly as they were. What moves is
+# the other direction -- a genuine answer delivered on a non-2xx (a 418, an
+# API that reports its results under a 4xx) is `inconclusive` where it used
+# to be `clean`. That is a surface hx says it could not speak for instead of
+# one it wrongly says it tested, which is the direction S12 requires.
 #
-# `open_redirect` LOSES NOTHING, and it does not opt out. All five checks ask
-# `unanswered` ONLY where their own match failed, which is the ordering F4
-# put there so that `sql_error`'s finding on a 500 survives -- so a `Location`
-# naming `open_redirect`'s marker is a candidate before this set is ever
-# consulted, and a candidate wins over a gap in `verdict` below. What the 3xx
-# rule changes for that check is the OTHER direction: a redirect somewhere we
-# did not ask for is now `inconclusive` rather than `clean`, because the
-# endpoint sent the browser away and nothing in the response tells us whether
-# it looked at our parameter at all. The consequence is deliberate and it is
-# the whole of the check's clean branch: `open_redirect` says `clean` only on
-# a non-redirecting 2xx, which is a genuine test -- the endpoint took the
-# parameter and chose not to redirect. A per-check exemption would have been
-# machinery for a difference that lives in each check's own control flow.
-#
-# 2xx is what is left, and a 4xx not named above (418 and its neighbours) --
-# a response the application itself composed. THE STATUS CANNOT CATCH EVERY
-# WALL: an application that answers a logged-out request with a 200 login
-# page is indistinguishable here from one that answered, and no set of
-# statuses closes that. `report._limits` discloses it to the client rather
-# than this module pretending otherwise.
-_NOT_AN_ANSWER = frozenset({400, 401, 403, 404, 405, 429})
+# NO RULE OVER STATUSES CATCHES A REFUSAL WEARING A 2xx. An application that
+# answers a logged-out request with a 200 login PAGE, and an API that reports
+# a rejected parameter in a 200 error envelope, are not distinguishable here
+# from one that answered. `report._limits` discloses that to the client
+# rather than this module pretending otherwise.
+_AN_ANSWER = range(200, 300)
 
 
 def substitute_segment(path: str, path_template: str, placeholder: str,
@@ -295,8 +318,7 @@ def unanswered(response) -> str | None:
     status = response.status
     if status is None:
         return "no status could be read"
-    if (status in _NOT_AN_ANSWER or 300 <= status <= 399
-            or 500 <= status <= 599):
+    if status not in _AN_ANSWER:
         return f"status {status}"
     return None
 
