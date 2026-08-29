@@ -1296,6 +1296,55 @@ def _limits(conn, engagement_id) -> list[str]:
                    "config has no `method.allow` key, so the extension's "
                    "default method allowlist (GET, HEAD, OPTIONS) applies "
                    "unconditionally.")
+    if active:
+        # S12's own rule, applied to the EVIDENCE an active finding carries.
+        # Every active check in this build cites
+        # `surface.exemplar_exchange_id` -- the request the PROXY captured on
+        # the surface it found the flaw on -- because nothing in this build
+        # records a probe's own exchange: `HxExtension` registers proxy
+        # handlers only and `Capture.deliverExchange` hard-codes
+        # `h.put("via", "proxy")`, so no writer can produce an `exchange` row
+        # with any other `via`. A client reading an active finding is
+        # therefore looking at a citation that is NOT the request that proved
+        # it, and "a report that cannot distinguish tested-clean from
+        # never-reached is worse than no report" is the same rule one step
+        # down: a citation that cannot be distinguished from the proof is a
+        # citation a reader will replay and find nothing wrong with.
+        #
+        # BOTH HALVES ARE DERIVED, like the two bullets above and the crawl
+        # bullet: the checks come from the corpus, and whether this
+        # engagement holds any exchange hx itself issued comes from the
+        # store. `exchange.via` is CHECK-constrained to proxy|send|crawl, so
+        # the question is one this store answers -- and the day a send-path
+        # recorder lands, the engagement that used it stops being told its
+        # probe traffic was never recorded. LEFT JOINs on both sides because
+        # an `exchange` row reaches its engagement through EITHER column:
+        # `hx.capture` sets `surface_id` after the fact and the report
+        # fixtures set only `run_id`.
+        off_proxy = conn.execute(
+            "SELECT COUNT(*) FROM exchange x"
+            " LEFT JOIN surface s ON s.id = x.surface_id"
+            " LEFT JOIN run r ON r.id = x.run_id"
+            " WHERE x.via <> 'proxy'"
+            " AND (s.engagement_id = ? OR r.engagement_id = ?)",
+            (engagement_id, engagement_id)).fetchone()[0]
+        if off_proxy:
+            recorded = (f"{off_proxy} exchange(s) recorded here were issued "
+                        "by hx rather than captured through the proxy, and "
+                        "nothing records which of those a check's probe made")
+        else:
+            recorded = ("no exchange recorded for this engagement was issued "
+                        "by hx at all — every one of them was captured "
+                        "through the proxy")
+        out.append("- **An active finding cites captured traffic, not the "
+                   f"probe that proved it.** The {len(active)} active "
+                   f"check(s) in this build ({_names(active)}) cite the "
+                   "affected surface's captured exemplar request as their "
+                   f"evidence: {recorded}. The request shown under an active "
+                   "finding is therefore a request TO the affected surface, "
+                   "not the request that demonstrated the flaw; reproduce one "
+                   "from the finding's description and insertion point rather "
+                   "than by replaying its evidence bullet.")
     if passive and not active:
         out.append("- **A fixed issue cannot be shown as fixed by "
                    "re-browsing.** "

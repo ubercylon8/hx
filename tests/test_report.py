@@ -128,17 +128,24 @@ def _check_run(conn, check_run_id, *, run_id, surface_id, check_id,
 
 
 def _exchange(conn, exchange_id, run_id, url, *, req_blob=None,
-             status=200, method="GET") -> None:
+             status=200, method="GET", via="proxy") -> None:
     """`method` and `status` are parameters (fix round D) because both are as
     captured as `url` is: `exchange.method` carries no CHECK constraint, and
     `status` reaches `record_exchange` as `header.get("status")` off a bridge
     frame that `codec._check_header` admits as a `str`, which SQLite's INTEGER
     affinity then stores as TEXT. A fixture that could only write `'GET'` and
-    an int could not measure either."""
+    an int could not measure either.
+
+    `via` is a parameter (fix round A) for the same reason one step further
+    on. The schema's CHECK admits `proxy | send | crawl`; this build's
+    extension can only ever deliver `proxy` (`Capture.deliverExchange`
+    hard-codes it), and `_limits` derives a disclosure from that. A fixture
+    that could only write `'proxy'` could assert the sentence but not that it
+    is DERIVED."""
     conn.execute(
         "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method,"
-        " url, req_blob, status) VALUES(?,?,'proxy','ok',1,?,?,?,?)",
-        (exchange_id, run_id, method, url, req_blob, status))
+        " url, req_blob, status) VALUES(?,?,?,'ok',1,?,?,?,?)",
+        (exchange_id, run_id, via, method, url, req_blob, status))
 
 
 def _finding(conn, *, run_id, title, severity, exchange_ids,
@@ -1166,11 +1173,17 @@ def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
     assert "Every check in this build is passive" not in out
 
     # And it must say what IS true instead, naming the check by id in each
-    # of the three places -- Insertion points, and both Limits bullets.
-    assert out.count("`hx.active_safe.reflected-input`") == 3
+    # of the four places -- Insertion points, and the three Limits bullets
+    # that are conditional on an active corpus. The fourth arrived in fix
+    # round A: an active finding's evidence is a captured proxy request to
+    # the affected surface, never the probe that proved it, and that
+    # disclosure is derived from the same two sources as its neighbours (the
+    # corpus, and this store's own `exchange.via`).
+    assert out.count("`hx.active_safe.reflected-input`") == 4
     assert "active check(s) ship in this build" in out
     assert "none of them can reach a request body" in out
     assert "are not limited this way" in out
+    assert "not the probe that proved it" in out
 
 
 # --- F1: redaction reaches every field that can carry a URL -----------------
@@ -2313,3 +2326,70 @@ def test_the_partial_findings_note_is_scoped_to_the_unfinished_runs():
     # longer to the list as a whole.
     assert "anything below drawn from them is what they had reached" in findings
     assert "what follows is what they had reached" not in findings
+
+
+# --- fix round A: what an active finding's evidence actually is -------------
+#
+# Nothing in this build records a probe's own exchange. `HxExtension`
+# registers proxy handlers only and `Capture.deliverExchange` hard-codes
+# `h.put("via", "proxy")`, so every active check cites
+# `surface.exemplar_exchange_id` -- a request the PROXY captured on the
+# affected surface -- as the evidence for what its probe found. Fixing that
+# needs a new frame type and a new writer on the Java side, which this plan
+# forbids; S12's rule ("a report that cannot distinguish tested-clean from
+# never-reached is worse than no report") makes the limit something the page
+# has to carry in the meantime.
+
+def test_an_active_findings_evidence_is_disclosed_as_captured_not_probed(
+        report_env_with_blobs):
+    """The real, un-monkeypatched registry: five active checks ship, so the
+    bullet renders and names them."""
+    out = report.render(**report_env_with_blobs)
+    limits = out[out.index("## Limits"):]
+    assert "An active finding cites captured traffic, not the probe that " \
+        "proved it." in limits
+    assert "`hx.active.cors`" in limits
+    assert "no exchange recorded for this engagement was issued by hx at " \
+        "all" in limits
+
+
+def test_that_disclosure_is_derived_from_the_store_not_typed(
+        report_env_with_blobs):
+    """THE ANTI-VACUITY HALF. The sentence above is true of this build, and
+    the failure mode fix round B named for its neighbours applies to it
+    exactly: a claim that is TRUE and not DERIVED goes on being printed after
+    it stops being true, with nothing to redden.
+
+    `exchange.via` is CHECK-constrained to `proxy | send | crawl`, so
+    "hx recorded none of its own traffic here" is a question this store
+    answers. One `via='send'` row -- the shape a probe-recording writer would
+    produce -- must move the sentence."""
+    conn = report_env_with_blobs["conn"]
+    _exchange(conn, "x-2", "r-1", "https://app.acme.test/api/orders/1?ref=x",
+              via="send")
+    out = report.render(**report_env_with_blobs)
+    limits = out[out.index("## Limits"):]
+
+    assert "no exchange recorded for this engagement was issued by hx" \
+        not in limits
+    assert "1 exchange(s) recorded here were issued by hx rather than " \
+        "captured through the proxy" in limits
+    # The disclosure does not vanish: the citation is still the surface's
+    # captured exemplar, and what changed is only what can be said about why.
+    assert "not the request that demonstrated the flaw" in limits
+
+
+def test_an_all_passive_build_makes_no_claim_about_probe_evidence(
+        report_env_with_blobs, monkeypatch):
+    """The separating case. A build with no active checks files no active
+    findings, so a bullet about what one of them cites would be a caveat
+    about nothing -- and a caveat that is always present is not a caveat
+    (`test_a_report_with_no_dropped_records_makes_no_floor_claim`, the same
+    rule one section up)."""
+    monkeypatch.setattr(
+        report.registry, "CHECKS",
+        tuple(c for c in report.registry.CHECKS if c.klass == "passive"))
+    out = report.render(**report_env_with_blobs)
+    assert "not the probe that proved it" not in out
+    # And the all-passive prose it makes room for is back.
+    assert "Every check in this build is passive" in out
