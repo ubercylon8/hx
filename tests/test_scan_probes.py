@@ -1415,9 +1415,22 @@ def test_no_probing_check_in_the_corpus_retires_anything(tmp_path):
         "`_mark_unobserved` retires on; every probe this build sends is "
         f"unauthenticated: {sorted(considered)}")
 
-    # NOT VACUOUS: the same store, the same helper, one passive check, and it
-    # contributes. A `_considered_by` that saw nothing whatever it was handed
-    # would satisfy the assertion above for the wrong reason.
+    # NOT VACUOUS, TWICE OVER, and the first half is the one that matters.
+    # EVERY check reached a conclusion off a probe that went, so each of them
+    # would have contributed under the old rule -- without this, five checks
+    # that quietly stopped examining anything satisfy the assertion above.
+    # Fix round 5 got this control by re-running the corpus on an ANONYMOUS
+    # capture, which is no longer a case that contributes anything.
+    rows = env["conn"].execute(
+        "SELECT check_id, verdict, requests_sent FROM check_run").fetchall()
+    assert {c.id for c in active} == {r[0] for r in rows}, rows
+    for check_id, verdict, sent in rows:
+        assert (verdict in ("clean", "finding")) and sent > 0, (
+            f"{check_id} examined nothing on this surface, so its empty "
+            f"contribution above says nothing: {(verdict, sent)}")
+
+    # And the spy itself sees what it is meant to see: same store shape, one
+    # passive check, and it contributes.
     passive = _env(tmp_path / "passive", request_bytes=REQ_EVERY_SHAPE,
                    path_template="/search")
     assert _considered_by(passive, (_PassiveOnce(),), None), (

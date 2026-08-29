@@ -64,11 +64,12 @@ shared across all five checks rather than spelt here.
 round 6 that is a statement about COVERAGE alone. It used to be the verdict's
 `considered` and therefore what `hx.scan._mark_unobserved` retired on, which
 made naming fewer than all three a client who fixes their CORS header never
-seeing the finding close; an active check retires nothing now
-(`hx.scan._retirable`), so what naming all three buys is that
-`_probe_util.verdict` will let this check say `clean` when it looked for all
-three and found none -- and that the check states its own coverage in one
-place rather than three.
+seeing the finding close. An active check retires nothing now
+(`hx.scan._retirable`), so what the tuple is for is that this check states in
+ONE place what it looked for -- `_probe_util.verdict` refuses a `clean` that
+names nothing, every candidate's `issue_type_id` comes out of the same three
+constants, and a fourth issue type added to `probes()` without being added
+here would be a finding of a kind the check does not claim to examine.
 
 THE EVIDENCE THIS CHECK CITES IS THE SURFACE'S EXEMPLAR EXCHANGE, not a
 fresh one from this probe's own request/response. Nothing in this build

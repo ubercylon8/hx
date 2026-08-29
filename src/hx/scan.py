@@ -690,13 +690,26 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     and by `_probe_util.verdict`'s `unprobed` branch. The seventh is an
     application that answers a logged-out request with a 200 LOGIN PAGE: a
     complete, well-formed, application-composed response, indistinguishable
-    from an answer at every level a status set operates. MEASURED, fix round
-    3, real registry against a target answering one to everything: all five
-    checks `clean` with their issue types entered for retirement.
+    from an answer at every level a status set operates. That one is an
+    ARGUMENT AND NOT A MEASUREMENT, and saying otherwise is a mistake this
+    branch has already made once: fix round 3 measured five `clean` rows and
+    a retired finding behind a `302 /login` (see `_NOT_AN_ANSWER`), which is
+    the shape a status CAN catch and is now caught. A fixture whose anonymous
+    view differs from its anonymous view does not exist, so the 200 login
+    page has never been put in front of this corpus and cannot be.
 
-    Fix round 5 tried to contain that by suppressing retirement only where
-    the surface's captured request carried a credential header. Its own
-    report retired the idea: the predicate keyed on the exemplar, which is
+    WHAT IS MEASURED is the same `clean` arriving off a genuine answer:
+    `tests/integration/test_active_checks.py::test_a_second_scan_is_stable_
+    and_a_wholly_fixed_target_retires_nothing` repairs all five vulnerable
+    routes and, with this function passing `considered` through, closes all
+    five findings -- `[1, 1, 0]` each, rendered five times as "appears fixed;
+    verify before closing". Nothing in those rows distinguishes them from
+    what a login page would have produced, which is the whole argument.
+
+    Fix round 5 tried to contain the login page by suppressing retirement
+    only where the surface's captured request carried a credential header.
+    Its own report established why that could not hold: the predicate keyed
+    on the exemplar, which is
     the FIRST sighting, so a surface browsed logged-out and then logged-in
     stayed "anonymous" and went on retiring -- the unsafe direction -- and
     more fundamentally `Redactor.redactObservedRequest` replaces a

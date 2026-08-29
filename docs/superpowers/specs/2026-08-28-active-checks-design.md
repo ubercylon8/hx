@@ -134,8 +134,11 @@ the client's own users are in, and retirement is exactly the second claim (`repo
 renders it as "appears fixed; verify before closing"). The shape that makes this fatal
 rather than theoretical is an application answering a logged-out request with a **200 login
 page**: a complete, well-formed, application-composed response indistinguishable from an
-answer at every level a status set operates. Measured against the real registry, all five
-checks closed `clean` on one.
+answer at every level a status set operates. That is an argument, not a measurement — a
+fixture whose anonymous view differs from its anonymous view cannot be built. What was
+measured is the same `clean` arriving off a genuine answer: five repaired routes, five
+`clean` verdicts off probes that really went, and, with the rule disabled, five findings
+closed and rendered as "appears fixed; verify before closing".
 
 Two narrower rules were built and withdrawn before this one. The status doctrine
 (`_probe_util._NOT_AN_ANSWER`, widened to hold 3xx, 400 and 405) catches a login *redirect*
