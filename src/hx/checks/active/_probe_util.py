@@ -28,10 +28,10 @@ own escalation step -- because that decision (which characters, and when to
 spend the extra request) is specific to what that check is trying to learn,
 not something this module can decide on every caller's behalf.
 
-THE OTHER THREE FUNCTIONS ARE HERE FOR A DIFFERENT REASON: not that they
+THE OTHER FOUR FUNCTIONS ARE HERE FOR A DIFFERENT REASON: not that they
 would otherwise be copied, but that five copies would be free to DISAGREE,
-and the two questions they answer are the ones where a disagreement is a
-false `clean`.
+and every question they answer is one where a disagreement is a false
+`clean`.
 
   * `substitute_segment` puts a payload in a templated path segment. The
     surface row's `path_template` is `/user/{id}/profile`; the sender is
@@ -41,6 +41,16 @@ false `clean`.
     and it is not obvious -- a check doing `path.replace("{id}", value)`
     against the concrete path silently replaces nothing, sends the
     exemplar's own value back, and calls the result clean.
+
+  * `send_or_gap` is the OTHER refusal doctrine, and it is about the ones
+    that never reached the target at all. `ProbeSender` raises on every
+    refusal so that no check can read `budget_exhausted` as a response; a
+    check that let that propagate out of a per-point loop then discarded
+    every point after it, which is F2 of the whole-branch review -- one
+    refused cookie took `reflected_input`'s query and path-segment probes
+    with it on every cookie-bearing engagement. A refusal ends the POINT
+    here, not the check, and lands as a gap, which is what stops the
+    surviving points' answers from retiring anything.
 
   * `unanswered` and `verdict` are the refusal doctrine. `ProbeSender`
     guarantees only that a complete HTTP response came back; it does not
@@ -72,6 +82,7 @@ import secrets
 import string
 
 from hx.checks import base
+from hx.checks import probe as probe_mod
 from hx.checks.passive import _http
 
 # Alphanumeric only -- see the module docstring's inertness paragraph. Base62
@@ -183,6 +194,43 @@ def substitute_segment(path: str, path_template: str, placeholder: str,
         else:
             out.append(segment)
     return "/".join(out) if substituted else None
+
+
+def send_or_gap(sender, path, insertion, gaps, *, headers=None):
+    """One probe: its response, or `None` with a gap recorded.
+
+    A REFUSAL ENDS THIS POINT AND NOT THE CHECK. `ProbeSender.get` RAISES on
+    every refusal (`hx/checks/probe.py`, rule one) precisely so that no check
+    can read `budget_exhausted` as a response and carry on to `clean`. What
+    no check may do with that is let it propagate out of a loop over
+    insertion points: the points after the refused one are then never probed,
+    and `hx.scan.run` closes the row `inconclusive` for the whole surface.
+    MEASURED, F2 of the whole-branch review: on a captured request carrying
+    `Cookie: session=...`, `hx.active.reflected-input` probed nothing at all
+    -- `insertion.derive` sorts by `(kind, name)`, so the refused cookie went
+    first and the query and path-segment points that would have worked were
+    never reached.
+
+    CAUGHT HERE AND NOT IN FIVE CHECKS, for the reason the two functions
+    below are shared: five copies of this `except` would be five chances to
+    spell the gap differently, and one of them to swallow the refusal without
+    recording anything -- which is the same false `clean` by another route.
+
+    `exc.reason` IS THE WIRE'S OWN CLASS, not a re-wording. An operator
+    reading `budget_exhausted` in a coverage row goes and looks at the run's
+    budget; `scope_denied` sends them somewhere else entirely, and a single
+    tidy phrase covering both would send them nowhere.
+
+    The honesty is `verdict`'s: a gap withholds `considered` from a finding
+    and turns "found nothing" into `inconclusive`, so a surface where one
+    point was refused retires none of its neighbours and `considered` names
+    an issue type only where every point of it was actually answered.
+    """
+    try:
+        return sender.get(path, headers=headers or {})
+    except probe_mod.ProbeRefused as exc:
+        gaps.append(f"{insertion.name}: probe refused ({exc.reason})")
+        return None
 
 
 def unanswered(response) -> str | None:

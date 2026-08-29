@@ -249,13 +249,16 @@ class PathTraversal:
                 gaps.append(f"{insertion.name}: no probe could be built for "
                             "this insertion point")
                 continue
+            # A REFUSAL ENDS THIS POINT, NOT THE CHECK -- the same rule the
+            # other three probing checks follow, and for the reason
+            # `_probe_util.send_or_gap` gives: `ProbeSender.get()` RAISES on
+            # every refusal and never returns one, and letting that propagate
+            # out of this loop discards every insertion point after the
+            # refused one.
+            resp = _probe_util.send_or_gap(sender, path, insertion, gaps)
+            if resp is None:
+                continue
             probed_any = True
-            # No `try`/`except`: `ProbeSender.get()` RAISES `ProbeRefused`
-            # on every refusal and never returns one (see
-            # `hx/checks/probe.py`), and letting it propagate is what turns
-            # this into `inconclusive` in `hx.scan.run` rather than a
-            # `clean` this check mistook a refusal for.
-            resp = sender.get(path)
 
             found = _match(resp)
             if found is None:

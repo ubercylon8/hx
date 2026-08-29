@@ -63,7 +63,14 @@ class _FakeSender:
         if self._exc is not None:
             raise self._exc
         idx = min(self.sent - 1, len(self._responses) - 1)
-        status, hdrs = self._responses[idx]
+        entry = self._responses[idx]
+        if isinstance(entry, Exception):
+            # AN ENTRY MAY BE A REFUSAL. `exc` above refuses every call,
+            # which cannot express "the first point is refused and the
+            # second answers" -- the only shape that separates a check that
+            # continues past a refusal from one that stops at it.
+            raise entry
+        status, hdrs = entry
         return probe.ProbeResponse(status=status, head=_head(hdrs), body=b"",
                                    outcome="ok")
 
@@ -91,6 +98,9 @@ surface = ("s-1", "GET", "https", "app.test", 443, "/go", "x-1")
 
 _REDIRECT_INSERTION = base.Insertion("query", "redirect_uri")
 _UNRELATED_INSERTION = base.Insertion("query", "id")
+# A SECOND redirect-shaped name, so a test can refuse one point and still
+# have one this check would probe. `next` is in `_REDIRECT_NAME_HINTS`.
+_SECOND_REDIRECT_INSERTION = base.Insertion("query", "next")
 
 _MARKER_LOCATION = f"https://{oredir._MARKER_HOST}/steal"
 
@@ -158,25 +168,37 @@ def test_a_parameter_that_cannot_redirect_is_not_probed():
 # ---- refusal and budget ---------------------------------------------------
 
 
-def test_a_refusal_propagates_rather_than_becoming_a_verdict():
-    """`ProbeSender.get()` RAISES `ProbeRefused` on every refusal and never
-    returns one (see `hx/checks/probe.py`); catching it here and answering
-    `inconclusive` (or worse, `clean`) would be this check doing the
-    runner's job. `hx.scan.run`'s `except ProbeRefused` is what turns this
-    into `inconclusive`, exercised end to end by
-    `tests/test_scan_probes.py::test_a_refusal_becomes_inconclusive_never_clean`."""
-    sender = _sender_raising(probe.ProbeRefused("rate_limited"))
-    with pytest.raises(probe.ProbeRefused) as exc:
-        oredir.OpenRedirect().probes(ctx, surface, (_REDIRECT_INSERTION,),
-                                     sender)
-    assert exc.value.reason == "rate_limited"
+def test_a_refusal_ends_one_point_and_never_the_whole_check():
+    """F2 of the whole-branch review. `ProbeSender.get()` RAISES on every
+    refusal so no check can read one as a response -- but a check that let
+    that propagate out of its own loop threw away every insertion point
+    after the refused one. The first parameter here is refused and the
+    second is probed and found vulnerable; before the fix the exception left
+    this method before the second was reached."""
+    sender = _FakeSender(responses=[
+        probe.ProbeRefused("rate_limited"),
+        (302, {"Location": _MARKER_LOCATION}),
+    ])
+    v = oredir.OpenRedirect().probes(
+        ctx, surface, (_REDIRECT_INSERTION, _SECOND_REDIRECT_INSERTION),
+        sender)
+    assert sender.sent == 2, "the refusal took the second point down with it"
+    assert v.state == "finding"
+    assert v.candidates[0].insertion == _SECOND_REDIRECT_INSERTION
+    assert v.considered == (), (
+        "one point was never answered, so this surface's issue type was not "
+        "examined and a prior finding of it must not be retired")
 
 
-def test_a_refused_attempt_still_spent_the_budget():
-    sender = _sender_raising(probe.ProbeRefused("budget_exhausted"))
-    with pytest.raises(probe.ProbeRefused):
-        oredir.OpenRedirect().probes(ctx, surface, (_REDIRECT_INSERTION,),
+def test_a_refusal_with_nothing_found_is_inconclusive_never_clean():
+    """The other branch. Nothing was found and one point never answered, so
+    `clean` -- which is what a swallowed refusal would produce -- is exactly
+    the "tested, clean" S12 forbids for a surface that was never reached."""
+    sender = _FakeSender(responses=[probe.ProbeRefused("budget_exhausted")])
+    v = oredir.OpenRedirect().probes(ctx, surface, (_REDIRECT_INSERTION,),
                                      sender)
+    assert v.state == "inconclusive"
+    assert "budget_exhausted" in v.reason
     assert sender.sent == 1
 
 

@@ -62,9 +62,11 @@ kind this check probes -- unlike `security_headers.py`'s per-header table or
 asked at every point, not a family of questions. `hx.scan.run` never calls
 `probes()` with an empty `insertions` tuple for a check whose
 `insertion_kinds` is non-empty (a surface with none of the declared kinds is
-`skipped` with reason `no_insertion_point` before this check is ever
-reached -- see the `usable`/`wanted` guard in `scan.py`), so in practice
-every call this check receives probes at least one point. `probed_any` is
+`skipped` with reason `no_insertion_point`, and one whose declared points are
+all ones the send path refuses with `no_probeable_insertion_point`, before
+this check is ever reached -- see the `usable`/`wanted` guard in `scan.py`),
+so in practice every call this check receives is handed at least one point it
+could send to. `probed_any` is
 still tracked explicitly, defensively, rather than assumed: a `considered`
 that named the issue type on a call that genuinely probed nothing would let
 `hx.scan._mark_unobserved` retire a finding on the strength of a question
@@ -92,6 +94,24 @@ A RESPONSE THAT REFUSED IS NOT A CLEAN ONE. A 403, a 429, a 5xx or a 404
 reflects nothing for the same reason a properly encoding target reflects
 nothing, and the two must not record the same verdict. See `_probe_util.py`
 for the doctrine, which all five active checks share.
+
+A REFUSAL BY THE SEND PATH ENDS ONE POINT, NOT THE SURFACE, AND `cookie` IS
+STILL DECLARED ON PURPOSE. F2 of the whole-branch review, measured on this
+check: `Sender.decide()` refuses any request carrying a `Cookie`,
+`Authorization` or `Proxy-Authorization` header the extension did not inject,
+`insertion.derive` returns points sorted by `(kind, name)` so `cookie` went
+first, and the resulting `ProbeRefused` propagated out of the loop -- so on
+any authenticated engagement this check probed NOTHING. Two things changed
+and both were needed. `hx.scan.run` no longer hands over a point
+`hx.checks.probe.unprobeable` names, so a guaranteed refusal is not attempted
+at all; and every send here goes through `_probe_util.send_or_gap`, so a
+refusal that DOES arrive -- a rate limit, a spent budget, a halt mid-surface
+-- costs its own point and no other. `insertion_kinds` still declares
+`cookie` and `header`, and that is not a claim about what gets probed: it is
+what makes the runner report `no_probeable_insertion_point` for a surface
+whose only points are refused ones, instead of the `no_insertion_point` that
+would say this surface had nowhere to put a payload when in truth it had
+several. `report._limits` tells the client the same thing.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
 same reason `cors.py` and `open_redirect.py` give: nothing in this build
@@ -190,7 +210,16 @@ def _where(resp, marker: str) -> str:
 
 
 def _describe(insertion: base.Insertion, marker: str, resp, *,
-             unescaped: bool) -> str:
+             unescaped: bool | None) -> str:
+    """The finding's own sentences. `unescaped` is THREE-STATE.
+
+    `True` and `False` are the escalation's two answers. `None` is a third
+    fact and not a spelling of `False`: the escalation request was REFUSED
+    before it was issued (a rate limit, a spent budget, a halt), so nothing
+    was learnt about context at all. Saying "they did not come back intact"
+    there would be this check reporting a result it never received, which is
+    S12's rule applied to one sentence of one finding.
+    """
     base_sentence = (
         f"Sending {insertion.kind} {insertion.name!r} with a random, inert "
         f"alphanumeric marker drew back status {resp.status} with that "
@@ -202,6 +231,13 @@ def _describe(insertion: base.Insertion, marker: str, resp, *,
             f"wrapped in {_META_CHARS!r} (the characters that matter for "
             "breaking out of a tag, an attribute, or a quoted string), and "
             "that wrapping came back unescaped and intact.")
+    elif unescaped is None:
+        tail = (
+            " A second request would have replaced the marker with a fresh "
+            f"one wrapped in {_META_CHARS!r} to see whether those characters "
+            "survive, and it was refused before it was sent, so this check "
+            "cannot say whether the surrounding context would let a "
+            "character-bearing value through.")
     else:
         tail = (
             " A second request replaced the marker with a fresh one "
@@ -244,14 +280,20 @@ class ReflectedInput:
                 gaps.append(f"{insertion.name}: no probe could be built for "
                             "this insertion point")
                 continue
-            probed_any = True
             path, headers = built
-            # No `try`/`except`: `ProbeSender.get()` RAISES `ProbeRefused` on
-            # every refusal and never returns one (see `hx/checks/probe.py`),
-            # and letting it propagate is what turns this into
-            # `inconclusive` in `hx.scan.run` rather than a `clean` this
-            # check mistook a refusal for.
-            resp = sender.get(path, headers=headers)
+            # A REFUSAL ENDS THIS POINT, NOT THE CHECK, and this check is the
+            # one F2 of the whole-branch review was measured on: with `cookie`
+            # sorting first out of `insertion.derive`, one refusal here used
+            # to discard the query and path-segment points that would have
+            # worked, on every cookie-bearing engagement. `ProbeSender.get()`
+            # still RAISES on every refusal so nothing can read one as a
+            # response; `_probe_util.send_or_gap` turns it into a gap for THIS
+            # point and lets the loop go on.
+            resp = _probe_util.send_or_gap(sender, path, insertion, gaps,
+                                           headers=headers)
+            if resp is None:
+                continue
+            probed_any = True
             if not _probe_util.reflected(resp, marker):
                 # ASKED ONLY WHERE NOTHING CAME BACK: a canary that reflected
                 # proves the response carried this input, whatever its status
@@ -269,8 +311,17 @@ class ReflectedInput:
             # arguments.
             esc_path, esc_headers = _for_insertion(
                 sender.path, path_template, insertion, wrapped)
-            esc_resp = sender.get(esc_path, headers=esc_headers)
-            unescaped = _probe_util.reflected(esc_resp, wrapped)
+            # THE FINDING SURVIVES A REFUSED ESCALATION. The first request
+            # already proved this input comes back; a refusal on the second
+            # costs the CONTEXT answer and nothing else, so `unescaped` goes
+            # to `None` -- neither "survived" nor "did not survive" -- and
+            # `_describe` says which of the three happened. The gap it
+            # records still withholds `considered` (see `_probe_util.
+            # verdict`), so the finding is reported and nothing is retired.
+            esc_resp = _probe_util.send_or_gap(sender, esc_path, insertion,
+                                               gaps, headers=esc_headers)
+            unescaped = (None if esc_resp is None
+                         else _probe_util.reflected(esc_resp, wrapped))
 
             title_fmt = _UNESCAPED_TITLE if unescaped else _PLAIN_TITLE
             candidates.append(base.Candidate(

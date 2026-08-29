@@ -299,8 +299,46 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                         # and skipping a check for having none of what it
                         # never asked for would silence the first check in
                         # this build that sends.
-                        usable = tuple(i for i in (insertions or ())
-                                       if i.kind in wanted)
+                        declared = tuple(i for i in (insertions or ())
+                                         if i.kind in wanted)
+                        # A POINT THE SEND PATH WILL REFUSE IS NOT HANDED OVER.
+                        # F2 of the whole-branch review: `insertion.derive`
+                        # sorts by `(kind, name)`, so `cookie` came first, and
+                        # `hx.active.reflected-input` spent its first probe of
+                        # every cookie-bearing surface on a request
+                        # `Sender.decide()` refuses by design
+                        # (`unmanaged_credential`) -- taking the whole check
+                        # down with it and never reaching the query and
+                        # path-segment points that would have worked. The
+                        # refusal is a property of the POINT rather than of
+                        # the payload, so it is decidable here, before a
+                        # sender exists and before any budget is spent.
+                        # DECIDED IN ONE PLACE, `probe.unprobeable`, rather
+                        # than in each check that declares a `header` or
+                        # `cookie` kind. What a client is told about the
+                        # coverage this costs is `report._limits`'.
+                        refusals = tuple(probe.unprobeable(i) for i in declared)
+                        usable = tuple(i for i, why in zip(declared, refusals)
+                                       if why is None)
+                        if wanted and not usable and declared:
+                            # A DIFFERENT FACT FROM `no_insertion_point`, and
+                            # it gets its own key because the two send an
+                            # operator to different places: one says this
+                            # surface has nothing of the kind this check
+                            # wants, the other says it has them and none can
+                            # be reached.
+                            _skip(conn, row_id, summary,
+                                  "no_probeable_insertion_point",
+                                  f"the {len(declared)} insertion point(s) of "
+                                  f"kind {sorted(wanted)} on this surface are "
+                                  "all ones the send path refuses to carry a "
+                                  "probe to -- a cookie, or one of the "
+                                  "credential headers "
+                                  f"{sorted(probe.CREDENTIAL_HEADERS)} the "
+                                  "extension did not inject -- so there was "
+                                  "nowhere for this check to put a payload it "
+                                  "could send; it was not run, not run clean")
+                            continue
                         if wanted and not usable:
                             _skip(conn, row_id, summary, "no_insertion_point",
                                   "no insertion point of kind "
@@ -411,7 +449,8 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # complete scan is not itself misreported as "truncated for a reason".
     #
     # `by_reason` CARRIES MORE THAN `budget` NOW. The probe pass adds
-    # `no_bridge`, `no_exemplar`, `no_probe_path` and `no_insertion_point`,
+    # `no_bridge`, `no_exemplar`, `no_probe_path`, `no_insertion_point` and
+    # `no_probeable_insertion_point`,
     # and all belong in this sentence for the reason the budget one does: a
     # pass that left rows `skipped` did not do everything it set out to do,
     # and the run row is where a report decides whether to trust it. The word

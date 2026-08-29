@@ -256,13 +256,17 @@ class SqlError:
                 gaps.append(f"{insertion.name}: no probe could be built for "
                             "this insertion point")
                 continue
+            # A REFUSAL ENDS THIS POINT, NOT THE CHECK. `ProbeSender.get()`
+            # RAISES `ProbeRefused` on every refusal and never returns one
+            # (see `hx/checks/probe.py`); `_probe_util.send_or_gap` catches it
+            # HERE, one point at a time, so a rate limit or a budget on the
+            # first parameter does not discard every parameter after it. The
+            # gap it records is what keeps that honest -- see
+            # `_probe_util.verdict`.
+            resp = _probe_util.send_or_gap(sender, path, insertion, gaps)
+            if resp is None:
+                continue
             probed_any = True
-            # No `try`/`except`: `ProbeSender.get()` RAISES `ProbeRefused`
-            # on every refusal and never returns one (see
-            # `hx/checks/probe.py`), and letting it propagate is what turns
-            # this into `inconclusive` in `hx.scan.run` rather than a
-            # `clean` this check mistook a refusal for.
-            resp = sender.get(path)
 
             found = _match(resp)
             if found is None:

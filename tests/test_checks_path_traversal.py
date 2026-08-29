@@ -59,7 +59,14 @@ class _FakeSender:
         if self._exc is not None:
             raise self._exc
         idx = min(self.sent - 1, len(self._responses) - 1)
-        status, hdrs, body = self._responses[idx]
+        entry = self._responses[idx]
+        if isinstance(entry, Exception):
+            # AN ENTRY MAY BE A REFUSAL -- see
+            # `test_checks_open_redirect.py`'s own note: `exc` refuses every
+            # call, which cannot express "the first point is refused and the
+            # second answers".
+            raise entry
+        status, hdrs, body = entry
         return probe.ProbeResponse(status=status, head=_head(hdrs), body=body,
                                    outcome="ok")
 
@@ -100,6 +107,9 @@ surface = ("s-1", "GET", "https", "app.test", 443,
 
 _FILE_PARAM = base.Insertion("query", "file")
 _UNRELATED_PARAM = base.Insertion("query", "id")
+# A SECOND file-shaped name, so a test can refuse one point and still have
+# one this check would probe. `template` is in `_FILE_NAME_HINTS`.
+_SECOND_FILE_PARAM = base.Insertion("query", "template")
 _PATH_SEGMENT = base.Insertion("path_segment", "{filename}")
 
 _PASSWD_BODY = (
@@ -213,17 +223,27 @@ def test_the_description_does_not_claim_arbitrary_file_access():
 # ---- refusal and budget ---------------------------------------------------
 
 
-def test_a_refusal_propagates_rather_than_becoming_a_verdict():
-    sender = _sender_raising(probe.ProbeRefused("rate_limited"))
-    with pytest.raises(probe.ProbeRefused) as exc:
-        ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,), sender)
-    assert exc.value.reason == "rate_limited"
+def test_a_refusal_ends_one_point_and_never_the_whole_check():
+    """F2 of the whole-branch review, in this check's spelling. Two
+    file-shaped parameters: the first is refused, the second is probed and
+    /etc/passwd comes back."""
+    sender = _FakeSender(responses=[
+        probe.ProbeRefused("rate_limited"),
+        (200, {}, _PASSWD_BODY),
+    ])
+    v = ptrav.PathTraversal().probes(
+        ctx, surface, (_FILE_PARAM, _SECOND_FILE_PARAM), sender)
+    assert sender.sent == 2, "the refusal took the second point down with it"
+    assert v.state == "finding"
+    assert v.candidates[0].insertion == _SECOND_FILE_PARAM
+    assert v.considered == ()
 
 
-def test_a_refused_attempt_still_spent_the_budget():
-    sender = _sender_raising(probe.ProbeRefused("budget_exhausted"))
-    with pytest.raises(probe.ProbeRefused):
-        ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,), sender)
+def test_a_refusal_with_nothing_found_is_inconclusive_never_clean():
+    sender = _FakeSender(responses=[probe.ProbeRefused("budget_exhausted")])
+    v = ptrav.PathTraversal().probes(ctx, surface, (_FILE_PARAM,), sender)
+    assert v.state == "inconclusive"
+    assert "budget_exhausted" in v.reason
     assert sender.sent == 1
 
 

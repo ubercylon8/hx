@@ -195,15 +195,17 @@ class OpenRedirect:
                 continue
             if not _looks_like_redirect_target(insertion.name):
                 continue
-            probed_any = True
             path = _probe_path(sender.path, insertion.name, _MARKER_URL)
-            # No `try`/`except` here: `ProbeSender.get()` RAISES
-            # `ProbeRefused` on every refusal and never returns one (see
-            # `hx/checks/probe.py`), and that is deliberate -- it must
-            # propagate out of this method so `hx.scan.run` turns it into
-            # `inconclusive`, never something this check mistakes for an
-            # answer.
-            resp = sender.get(path)
+            # A REFUSAL ENDS THIS POINT, NOT THE CHECK. `ProbeSender.get()`
+            # RAISES `ProbeRefused` on every refusal and never returns one
+            # (see `hx/checks/probe.py`), so this check can never mistake one
+            # for an answer; `_probe_util.send_or_gap` catches it per point
+            # rather than per surface, so a refusal on the first
+            # redirect-shaped parameter does not discard the second.
+            resp = _probe_util.send_or_gap(sender, path, insertion, gaps)
+            if resp is None:
+                continue
+            probed_any = True
 
             # THE SAFETY RULE, ENFORCED BY WHAT THIS FUNCTION DOES NOT DO:
             # `_redirect_host` only ever READS `resp.head`. Nothing below

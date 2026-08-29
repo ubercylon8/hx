@@ -34,7 +34,7 @@ import time
 import pytest
 
 from hx.bridge import server
-from hx.checks import probe
+from hx.checks import base, probe
 
 
 class FakeBridge:
@@ -409,3 +409,81 @@ def test_a_concrete_path_that_merely_contains_braces_is_sent():
     s.get("/report/build{2026}x/view")
     assert fb.calls == 1
     assert fb.last_body.startswith(b"GET /report/build{2026}x/view ")
+
+
+# --- the points the send path will never carry ----------------------------
+#
+# F2 of the whole-branch review. `Sender.decide()` refuses any request
+# carrying a `Cookie`, `Authorization` or `Proxy-Authorization` header the
+# extension did not itself inject, BEFORE the Gate and before `http.send`.
+# `unprobeable` is where this side states that rule once, so a check does not
+# spend a probe on an attempt whose only possible answer is
+# `unmanaged_credential` and `hx.report._limits` can name the same three
+# headers at the client without a second list.
+
+
+def test_a_cookie_point_of_any_name_is_unprobeable():
+    """The kind, not the name: the ONLY way to fill a cookie point in is to
+    send a `Cookie` header, whatever the cookie is called."""
+    for name in ("session", "csrf", "anything-at-all"):
+        why = probe.unprobeable(base.Insertion("cookie", name))
+        assert why is not None and name in why
+
+
+@pytest.mark.parametrize("name", [
+    "Authorization", "authorization", "PROXY-AUTHORIZATION", "Cookie",
+])
+def test_a_credential_header_point_is_unprobeable_whatever_its_case(name):
+    """ASCII-insensitive, matching `Redactor.asciiEqualsIgnoreCase` -- the
+    extension refuses `authorization` and `AUTHORIZATION` alike, so a check
+    that probed the second spelling would be refused just the same."""
+    assert probe.unprobeable(base.Insertion("header", name)) is not None
+
+
+@pytest.mark.parametrize("insertion", [
+    base.Insertion("header", "Accept"),
+    base.Insertion("header", "User-Agent"),
+    base.Insertion("header", "X-Authorization-Mode"),
+    base.Insertion("query", "cookie"),
+    base.Insertion("path_segment", "{id}"),
+    base.Insertion("query", "authorization"),
+])
+def test_every_other_point_is_probeable(insertion):
+    """THE SEPARATING CASE. An over-broad rule here silently stops probing
+    ordinary headers and parameters, which is a coverage loss with nothing to
+    redden -- the check would simply answer `clean` on fewer points. The
+    match is on the header's whole NAME, not a substring, and on the header
+    kind only: a query parameter called `authorization` is a parameter."""
+    assert probe.unprobeable(insertion) is None
+
+
+def test_the_three_names_are_the_extensions_own():
+    """One list, not two. `Redactor.CREDENTIAL_HEADERS` is the enforcement
+    point; this set exists so the runner can decline to attempt what that
+    list refuses, and a fourth name added there without one here would put
+    hx back to spending a probe on a guaranteed refusal."""
+    assert probe.CREDENTIAL_HEADERS == frozenset(
+        {"authorization", "cookie", "proxy-authorization"})
+
+
+def test_unmanaged_credential_is_not_counted_as_a_request():
+    """F8 of the whole-branch review. `Sender.decide()` decides this class
+    BEFORE the Gate and before `http.send` -- deliberately, so a request
+    about to be refused does not spend a rate token and a budget slot -- so
+    nothing reached the target and `requests_sent` must say 0. It was counted
+    until this fix, which overstated the traffic hx put on a client's system
+    in a number their report shows them.
+
+    Reachable in practice, not theoretical: it is what every cookie and
+    credential-header probe drew before `unprobeable` stopped them being
+    attempted, and it is still what a check reaching one another way gets.
+    """
+    fb = FakeBridge()
+    fb.refuse("unmanaged_credential",
+              "request carries a Cookie header this extension did not inject")
+    s = _sender(fb)
+    with pytest.raises(probe.ProbeRefused) as exc:
+        s.get("/a", headers={"Cookie": "session=x"})
+    assert exc.value.reason == "unmanaged_credential"
+    assert s.sent == 0
+    assert "unmanaged_credential" in probe._NOT_ISSUED

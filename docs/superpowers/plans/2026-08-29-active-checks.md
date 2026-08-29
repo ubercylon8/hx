@@ -1168,14 +1168,36 @@ THE COUNT IS OF ISSUANCES, NOT ATTEMPTS. `check_run.requests_sent` reaches a
 client's report as the traffic hx generated, so it has to be true of the
 requests that were actually made. `Limiter` decides `scope_denied`,
 `method_denied`, `dangerous_denied`, `rate_limited` and `budget_exhausted`
-BEFORE issuing and never increments `issued` for them, and `halted` /
-`not_configured` are refused on this side before a frame is written at all --
-so none of the seven is a request the target saw, and counting them would
-overstate the traffic AND make every retry above double-count. Everything
-else counts, by default and including a class this build has never seen:
-`transport_error`, `timeout` and `bridge_lost` may already have reached the
-target, and a `status_unreadable` outcome certainly did. Overstating traffic
-is the safe direction; understating what hx put on a client's system is not.
+BEFORE issuing and never increments `issued` for them; `halted` /
+`not_configured` are refused on this side before a frame is written at all;
+and `unmanaged_credential` is decided by `Sender.decide()` ahead of both the
+Gate and `http.send`, placed there in that method's own words so that
+`Limits.check()` does not "spend a rate token and a budget slot on a request
+that is about to be refused". So none of the eight is a request the target
+saw, and counting them would overstate the traffic AND make every retry above
+double-count. Everything else counts, by default and including a class this
+build has never seen: `transport_error`, `timeout` and `bridge_lost` may
+already have reached the target, and a `status_unreadable` outcome certainly
+did. Overstating traffic is the safe direction; understating what hx put on a
+client's system is not.
+
+A POINT THE SEND PATH STRUCTURALLY REFUSES IS NOT PROBED AT ALL. That same
+`unmanaged_credential` refusal covers any request carrying a `Cookie`,
+`Authorization` or `Proxy-Authorization` header the extension did not itself
+inject (`Redactor.CREDENTIAL_HEADERS`; S7's "refused AND NEVER PERSISTED" is
+why the rule exists). A `cookie` insertion point can only be filled in by
+sending a `Cookie` header, and a `header` point named after one of the three
+by sending that name -- so a probe there is refused before the Gate, every
+time, whatever it carries. F2 of the whole-branch review: `insertion.derive`
+returns points sorted by `(kind, name)`, so `cookie` sorted FIRST, and
+`hx.active.reflected-input` spent its first probe on a guaranteed refusal on
+every cookie-bearing engagement. `unprobeable()` below names those points and
+`hx.scan.run` drops them before a check is handed its own; the three header
+names are spelt HERE, once, in the module that already models what the send
+path will and will not carry, rather than in each check that declares a
+`header` or `cookie` kind. What the CLIENT is told about them is
+`hx.report._limits`' business: they are counted under "Insertion points" and
+disclosed there as not probed.
 """
 from __future__ import annotations
 
@@ -1206,7 +1228,55 @@ _RETRY_SLACK_S = 0.02
 _NOT_ISSUED = frozenset({
     "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
     "budget_exhausted", "halted", "not_configured",
+    # F8 of the whole-branch review. `Sender.decide()` refuses this one BEFORE
+    # the Gate and before `http.send` -- deliberately, so that a request about
+    # to be refused does not spend a rate token and a budget slot -- so it is
+    # in exactly the position of the seven above it and belongs in the same
+    # set. `bad_frame` and the pre-send `timeout` at `Sender.java:220` are
+    # there too and are NOT listed: nothing reachable from this sender can
+    # produce them, and a name here that no input can exercise is a claim no
+    # test separates from its absence.
+    "unmanaged_credential",
 })
+
+# The header names `Sender.decide()` will not carry from a check, matching
+# `Redactor.CREDENTIAL_HEADERS` byte for byte and lower-cased for the same
+# ASCII-insensitive comparison `Redactor.asciiEqualsIgnoreCase` makes. Kept as
+# data rather than spelt into `unprobeable`'s body so that the one place this
+# build states the rule is greppable from both sides of the seam --
+# `hx.report._limits` renders these names at the client.
+CREDENTIAL_HEADERS = frozenset({
+    "authorization", "cookie", "proxy-authorization",
+})
+
+
+def unprobeable(insertion) -> str | None:
+    """Why the send path refuses every probe at this point, or None.
+
+    See the module docstring's last paragraph. The answer is a property of
+    the POINT, not of the payload or of the check, which is what makes it
+    decidable before anything is sent: `hx.scan.run` drops these points from
+    what a check is handed, so no budget and no bridge round trip is spent on
+    an attempt whose only possible outcome is `unmanaged_credential`.
+
+    A `cookie` point of ANY name is refused, because the only way to fill one
+    in is a `Cookie` header. A `header` point is refused only when its own
+    name is one of the three -- an ordinary `Accept` or `User-Agent` header is
+    probed as before. `hx.insertion.derive` cannot currently mint a `header`
+    point called `Cookie` (its cookie branch `continue`s first), and the name
+    is matched here anyway: this function answers for the send path's rule,
+    not for one derivation's current output.
+
+    The sentence is short because it is what a coverage row shows an operator
+    (`_http._detail` formats it, the same as a gap from `_probe_util`).
+    """
+    if insertion.kind == "cookie":
+        return (f"cookie {insertion.name!r}: a cookie is probed by sending a "
+                "Cookie header, which the send path refuses")
+    if insertion.kind == "header" and insertion.name.lower() in CREDENTIAL_HEADERS:
+        return (f"header {insertion.name!r}: the send path refuses a "
+                "credential header it did not inject")
+    return None
 
 
 def _placeholder_in(path: str) -> str | None:

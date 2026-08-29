@@ -253,47 +253,87 @@ def test_the_escalation_wrapper_never_reaches_the_meta_chars_helper_alone():
 # ---- refusal and budget ---------------------------------------------------
 
 
-def test_a_refusal_propagates_rather_than_becoming_a_verdict():
-    """`ProbeSender.get()` RAISES `ProbeRefused` on every refusal and never
-    returns one; catching it here and answering `inconclusive` (or worse,
-    `clean`) would be this check doing the runner's job."""
-    sender = _sender_raising(probe.ProbeRefused("rate_limited"))
-    with pytest.raises(probe.ProbeRefused) as exc:
-        ri.ReflectedInput().probes(ctx, surface, (_QUERY_A,), sender)
-    assert exc.value.reason == "rate_limited"
+class _RefusesThenReflects:
+    """A sender that refuses its FIRST call and echoes every one after it.
+
+    THE ONLY SHAPE THAT SEPARATES the two doctrines. `_sender_raising`
+    refuses every call, and against it a check that stops at the first
+    refusal and a check that carries on to the next point look identical --
+    both end with nothing found. One refusal followed by an answer does not.
+    """
+
+    path = "/search"
+
+    def __init__(self, refuse_on=1, reason="rate_limited"):
+        self._refuse_on = refuse_on
+        self._reason = reason
+        self.sent = 0
+        self.calls: list[tuple[str, dict]] = []
+
+    def get(self, path, *, headers=None, timeout=30.0):
+        self.sent += 1
+        self.calls.append((path, dict(headers or {})))
+        if self.sent == self._refuse_on:
+            raise probe.ProbeRefused(self._reason)
+        text = unquote(path) + "".join(
+            f"{k}: {v}" for k, v in (headers or {}).items())
+        return probe.ProbeResponse(status=200, head=_head(),
+                                   body=text.encode(), outcome="ok")
 
 
-def test_a_refused_attempt_still_spent_the_budget():
+def test_a_refusal_ends_one_point_and_never_the_whole_check():
+    """F2 OF THE WHOLE-BRANCH REVIEW, on the check it was measured on.
+
+    `insertion.derive` returns points sorted by `(kind, name)`, so `cookie`
+    came first on every authenticated engagement, `Sender.decide()` refuses a
+    `Cookie` header it did not inject, and the `ProbeRefused` walked straight
+    out of this method -- taking the query point that would have found the
+    reflection with it. The runner no longer hands a cookie point over at all
+    (`tests/test_scan_probes.py`), and this is the other half: a refusal that
+    DOES arrive costs its own point and no other.
+    """
+    sender = _RefusesThenReflects()
+    v = ri.ReflectedInput().probes(ctx, surface, (_QUERY_A, _QUERY_B), sender)
+
+    assert sender.sent == 3, (
+        "the first point was refused and the second was never probed: "
+        f"{sender.calls}")
+    assert v.state == "finding"
+    assert [c.insertion for c in v.candidates] == [_QUERY_B]
+    assert v.considered == (), (
+        "one point was refused, so this surface's issue type was NOT fully "
+        "examined and `_mark_unobserved` must retire nothing from it")
+
+
+def test_a_refusal_with_nothing_found_is_inconclusive_never_clean():
+    """The branch with no candidate to carry. `clean` here is exactly the
+    "tested, clean" S12 forbids for a point that was never reached."""
     sender = _sender_raising(probe.ProbeRefused("budget_exhausted"))
-    with pytest.raises(probe.ProbeRefused):
-        ri.ReflectedInput().probes(ctx, surface, (_QUERY_A,), sender)
+    v = ri.ReflectedInput().probes(ctx, surface, (_QUERY_A,), sender)
+    assert v.state == "inconclusive"
+    assert "budget_exhausted" in v.reason
+    assert v.considered == ()
     assert sender.sent == 1
 
 
-def test_a_refusal_on_the_escalation_request_also_propagates():
+def test_a_refused_escalation_still_files_the_finding_it_already_proved():
     """The refusal can land on the SECOND request just as easily as the
-    first -- the baseline canary reflects, and then the escalation itself is
-    refused. Still a raise, still never a verdict."""
-    class _ReflectsThenRefuses:
-        path = "/search"
+    first, and by then the finding is already proved: the baseline canary
+    came back, which is the whole of what this check claims. What the refusal
+    costs is the CONTEXT answer -- so the title stays the plain one, the
+    description says the escalation was refused rather than that the
+    metacharacters did not survive, and `considered` is still withheld."""
+    sender = _RefusesThenReflects(refuse_on=2)
+    v = ri.ReflectedInput().probes(ctx, surface, (_QUERY_A,), sender)
 
-        def __init__(self):
-            self.sent = 0
-            self.calls = []
-
-        def get(self, path, *, headers=None, timeout=30.0):
-            self.sent += 1
-            self.calls.append((path, headers))
-            if self.sent == 1:
-                text = unquote(path)
-                return probe.ProbeResponse(status=200, head=_head(),
-                                           body=text.encode(), outcome="ok")
-            raise probe.ProbeRefused("rate_limited")
-
-    sender = _ReflectsThenRefuses()
-    with pytest.raises(probe.ProbeRefused):
-        ri.ReflectedInput().probes(ctx, surface, (_QUERY_A,), sender)
     assert sender.sent == 2
+    assert v.state == "finding"
+    c = v.candidates[0]
+    assert c.title == ri._PLAIN_TITLE.format(name="q")
+    assert c.severity == "Low"
+    assert "refused before it was sent" in c.description
+    assert "did not come back intact" not in c.description
+    assert v.considered == ()
 
 
 # ---- insertion kinds --------------------------------------------------

@@ -23,6 +23,7 @@ a digest the runner never actually stored.
 from __future__ import annotations
 
 import sqlite3
+from urllib.parse import unquote_to_bytes
 
 import pytest
 
@@ -910,3 +911,221 @@ def test_a_surface_whose_exemplar_request_was_never_stored_is_skipped(tmp_path):
     assert _row(env["conn"])[0] == "skipped"
     assert summary.by_reason == {"no_probe_path": 1}
 
+
+
+# --- points the send path structurally refuses ----------------------------
+#
+# F2 of the whole-branch review. `Sender.decide()` refuses any request
+# carrying a `Cookie`, `Authorization` or `Proxy-Authorization` header the
+# extension did not itself inject; `insertion.derive` returns points sorted
+# by `(kind, name)`, so `cookie` sorted FIRST and `hx.active.reflected-input`
+# spent its first probe of every cookie-bearing surface -- that is, every
+# authenticated engagement -- on a guaranteed refusal, which then propagated
+# out of the check and took its query and path-segment points with it.
+#
+# Every request below is a `FakeBridge` call. Nothing here binds a socket.
+
+REQ_AUTHENTICATED = (
+    b"GET /search?q=hello HTTP/1.1\r\n"
+    b"Host: app.test\r\n"
+    b"Cookie: session=abc; csrf=def\r\n"
+    b"Authorization: Bearer token-value\r\n"
+    b"Accept: text/html\r\n"
+    b"\r\n"
+)
+REQ_COOKIE_ONLY = (
+    b"GET /dashboard HTTP/1.1\r\n"
+    b"Host: app.test\r\n"
+    b"Cookie: session=abc\r\n"
+    b"\r\n"
+)
+
+
+def _headers_on_the_wire(fb):
+    """Every header name every request the bridge was handed carried."""
+    out = []
+    for body in fb.bodies:
+        for line in body.split(b"\r\n")[1:]:
+            if b":" in line:
+                out.append(line.split(b":", 1)[0].decode("latin-1"))
+    return out
+
+
+class _AllKinds(_Probe):
+    """A check declaring every kind `insertion.derive` can produce for a
+    GET, so what it is HANDED is the runner's decision and not its own."""
+    id = "hx.test.allkinds"
+    insertion_kinds = frozenset({"query", "path_segment", "header", "cookie"})
+
+
+def test_a_point_the_send_path_refuses_is_never_handed_to_a_check(tmp_path):
+    """POINT ONE OF F2. The refusal is a property of the point, decidable
+    before anything is sent, so the attempt is not made at all: it would
+    spend a bridge round trip and could only ever answer
+    `unmanaged_credential`. The query and header points on the same surface
+    still arrive."""
+    env = _env(tmp_path, request_bytes=REQ_AUTHENTICATED)
+    check = _AllKinds()
+    scan.run(**env, checks=(check,), bridge=_replying_bridge())
+
+    handed = {(i.kind, i.name) for i in check.seen["insertions"]}
+    assert ("query", "q") in handed
+    assert ("header", "Accept") in handed
+    assert ("cookie", "session") not in handed
+    assert ("cookie", "csrf") not in handed
+    assert ("header", "Authorization") not in handed
+    # ANTI-VACUITY: the points really are on this surface, so their absence
+    # above is the runner declining them rather than the derivation never
+    # having found them.
+    derived = {(i.kind, i.name) for i in insertion_mod.derive(
+        REQ_AUTHENTICATED, "/search")}
+    assert {("cookie", "session"), ("cookie", "csrf"),
+            ("header", "Authorization")} <= derived
+
+
+def test_a_surface_whose_only_points_are_refused_ones_says_so(tmp_path):
+    """A DIFFERENT SKIP FROM `no_insertion_point`, and the difference is the
+    whole of S12: this surface HAS points of a kind the check wants, and
+    none of them can be reached. Saying "no insertion point of kind
+    ['cookie', ...] on this surface" would be false about the surface."""
+    env = _env(tmp_path, request_bytes=REQ_COOKIE_ONLY, path_template="/dashboard")
+    fb = _replying_bridge()
+    check = _AllKinds()
+    summary = scan.run(**env, checks=(check,), bridge=fb)
+
+    verdict, reason, sent = _row(env["conn"])
+    assert (verdict, sent) == ("skipped", 0)
+    assert summary.by_reason == {"no_probeable_insertion_point": 1}
+    assert "refuses" in reason
+    assert check.calls == 0
+    assert fb.calls == 0, "a probe was spent on a guaranteed refusal"
+
+
+def test_the_shipped_reflected_input_check_probes_a_cookie_bearing_surface(
+        tmp_path):
+    """THE DEFECT, AGAINST THE REAL CHECK. `hx.active.reflected-input` is the
+    corpus's flagship and F2's measured victim: on this exemplar it used to
+    send `Cookie: csrf=<canary>` first, be refused `unmanaged_credential`,
+    and close the whole surface `inconclusive` having tested nothing.
+
+    Driven through `scan.run` and the real registry entry rather than the
+    check alone, because the fix is split across the two: the runner declines
+    the cookie and credential-header points, and the check no longer lets a
+    refusal end its loop.
+    """
+    env = _env(tmp_path, request_bytes=REQ_AUTHENTICATED,
+               path_template="/search")
+    fb = _replying_bridge()
+    check = next(c for c in registry.CHECKS
+                 if c.id == "hx.active.reflected-input")
+    scan.run(**env, checks=(check,), bridge=fb)
+
+    verdict, reason, sent = _row(env["conn"])
+    assert verdict == "clean", f"{verdict}: {reason}"
+    assert sent >= 1, "the check probed nothing at all"
+    assert "Cookie" not in _headers_on_the_wire(fb)
+    assert "Authorization" not in _headers_on_the_wire(fb)
+    # The points it DID reach: the query parameter on the request line, and
+    # the one ordinary header.
+    assert any(b"GET /search?q=" in body for body in fb.bodies), fb.bodies
+    assert "Accept" in _headers_on_the_wire(fb)
+
+
+# --- `considered` names only what was actually tested ---------------------
+#
+# POINT TWO OF F2, and the one that matters: a refusal on one insertion point
+# must not abort the check, AND the check must not then claim to have
+# examined the surface. `considered` is what `_mark_unobserved` retires from,
+# so a partial pass that populated it would tell a client an issue is fixed
+# on the strength of a probe that was never issued.
+
+REQ_TWO_PARAMS = (
+    b"GET /search?q=hello&r=world HTTP/1.1\r\n"
+    b"Host: app.test\r\n"
+    b"Cookie: session=abc\r\n"
+    b"\r\n"
+)
+
+
+class _EchoBridge(FakeBridge):
+    """A reflecting target: the request line's target comes back in the body,
+    percent-decoded the way an application's own framework hands it to a
+    template. `hx.active.reflected-input` finds a reflection on every query
+    parameter against this, which is what gives the retirement tests below
+    something real to retire.
+
+    `blind_to` names a query parameter this target does NOT echo -- one of
+    two reflections fixed. It is the separating case: without it, "nothing
+    was retired" cannot be told apart from "this corpus can never retire
+    anything".
+    """
+
+    def __init__(self, blind_to: str | None = None) -> None:
+        super().__init__()
+        self._blind_to = blind_to
+
+    def send(self, req, body=b"", timeout=30.0, *, enforce_locally=True):
+        target = body.split(b"\r\n", 1)[0].split(b" ")[1]
+        if self._blind_to and f"{self._blind_to}=".encode() in target:
+            target = target.split(b"?")[0]
+        self.reply({"status": 200, "outcome": "ok"},
+                   b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+                   + unquote_to_bytes(target))
+        return super().send(req, body, timeout,
+                            enforce_locally=enforce_locally)
+
+
+def _observations(conn):
+    return conn.execute(
+        "SELECT f.insertion_name, o.observed FROM finding_observation o"
+        " JOIN finding f ON f.id = o.finding_id"
+        " ORDER BY f.insertion_name, o.ts_us").fetchall()
+
+
+def _reflected_input():
+    return next(c for c in registry.CHECKS
+                if c.id == "hx.active.reflected-input")
+
+
+def test_a_refused_point_withholds_considered_from_the_points_that_answered(
+        tmp_path):
+    """Two reflecting parameters, then a rescan in which the first is
+    refused and the second answers and is re-found. The refused parameter's
+    finding must NOT be retired: nothing looked at it this run.
+
+    `budget_exhausted` rather than `rate_limited` because the sender retries
+    the second -- three attempts and two waits -- so a `times=1` rate limit
+    would be paced out and answered rather than refused.
+    """
+    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
+    scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
+    assert _observations(env["conn"]) == [("q", 1), ("r", 1)], (
+        "the first scan did not find both reflections; nothing below "
+        "would prove anything")
+
+    refusing = _EchoBridge()
+    refusing.refuse("budget_exhausted", "the run's request budget is spent",
+                    times=1)
+    scan.run(**env, checks=(_reflected_input(),), bridge=refusing)
+
+    verdict, reason, _sent = _row(env["conn"])
+    assert verdict == "finding", f"{verdict}: {reason}"
+    assert _observations(env["conn"]) == [("q", 1), ("r", 1), ("r", 1)], (
+        "a point that was refused had its finding retired, or the point "
+        "that answered was never reached")
+
+
+def test_a_point_that_answered_and_found_nothing_still_retires(tmp_path):
+    """THE SEPARATING CASE. Withholding `considered` unconditionally would
+    be just as wrong in the other direction: a fixed issue could then never
+    be shown as fixed, whatever the rescan saw. Same two parameters, no
+    refusal, and the target has stopped reflecting `q` -- so `q`'s finding
+    IS retired and `r`'s is not."""
+    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
+    scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
+    assert _observations(env["conn"]) == [("q", 1), ("r", 1)]
+
+    scan.run(**env, checks=(_reflected_input(),),
+             bridge=_EchoBridge(blind_to="q"))
+    assert _observations(env["conn"]) == [("q", 1), ("q", 0), ("r", 1),
+                                          ("r", 1)]

@@ -66,7 +66,14 @@ class _FakeSender:
         if self._exc is not None:
             raise self._exc
         idx = min(self.sent - 1, len(self._responses) - 1)
-        status, hdrs, body = self._responses[idx]
+        entry = self._responses[idx]
+        if isinstance(entry, Exception):
+            # AN ENTRY MAY BE A REFUSAL -- see
+            # `test_checks_open_redirect.py`'s own note: `exc` refuses every
+            # call, which cannot express "the first point is refused and the
+            # second answers".
+            raise entry
+        status, hdrs, body = entry
         return probe.ProbeResponse(status=status, head=_head(hdrs), body=body,
                                    outcome="ok")
 
@@ -208,17 +215,29 @@ def test_the_description_does_not_claim_the_query_can_be_manipulated():
 # ---- refusal and budget ---------------------------------------------------
 
 
-def test_a_refusal_propagates_rather_than_becoming_a_verdict():
-    sender = _sender_raising(probe.ProbeRefused("rate_limited"))
-    with pytest.raises(probe.ProbeRefused) as exc:
-        sqle.SqlError().probes(ctx, surface, (_QUERY,), sender)
-    assert exc.value.reason == "rate_limited"
+def test_a_refusal_ends_one_point_and_never_the_whole_check():
+    """F2 of the whole-branch review, in this check's spelling: a refusal on
+    one insertion point must not discard the points after it. The query
+    parameter is refused; the path segment is still probed and its driver
+    error still found."""
+    sender = _FakeSender(responses=[
+        probe.ProbeRefused("rate_limited"),
+        (200, {}, _MYSQL_BODY),
+    ])
+    v = sqle.SqlError().probes(ctx, surface, (_QUERY, _PATH_SEGMENT), sender)
+    assert sender.sent == 2, "the refusal took the second point down with it"
+    assert v.state == "finding"
+    assert v.candidates[0].insertion == _PATH_SEGMENT
+    assert v.considered == (), (
+        "one point was never answered, so nothing on this surface may be "
+        "retired on the strength of the other")
 
 
-def test_a_refused_attempt_still_spent_the_budget():
-    sender = _sender_raising(probe.ProbeRefused("budget_exhausted"))
-    with pytest.raises(probe.ProbeRefused):
-        sqle.SqlError().probes(ctx, surface, (_QUERY,), sender)
+def test_a_refusal_with_nothing_found_is_inconclusive_never_clean():
+    sender = _FakeSender(responses=[probe.ProbeRefused("budget_exhausted")])
+    v = sqle.SqlError().probes(ctx, surface, (_QUERY,), sender)
+    assert v.state == "inconclusive"
+    assert "budget_exhausted" in v.reason
     assert sender.sent == 1
 
 
