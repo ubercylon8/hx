@@ -1079,14 +1079,19 @@ def test_every_config_field_reaches_its_key(a_config):
     assert body["render.allow"] == a_config.render_allow
     assert body["limit.rate_rps"] == [str(a_config.rate_limit_rps)]
     assert body["limit.concurrency"] == [str(a_config.max_concurrency)]
+    assert body["limit.max_requests"] == [str(a_config.max_requests)]
     assert body["method.allow"] == ["GET", "HEAD", "OPTIONS"]
 
 
-def test_the_budget_key_is_absent(a_config):
-    # Java's Limits.arm() falls back to its documented default of 2000, and
-    # S4 says the budget never binds the operator's browser. The plan that
-    # spends it is the plan that bounds it.
-    assert "limit.max_requests" not in session.config_body(a_config)
+def test_the_budget_reaches_the_authorisation(a_config):
+    # Task 6: `hx.checks.probe.ProbeSender` is the send seam that spends the
+    # budget, so the plan that starts spending it is the plan that bounds it
+    # -- the key is no longer absent, and its value is `Config.max_requests`.
+    assert session.config_body(a_config)["limit.max_requests"] == [str(a_config.max_requests)]
+
+
+def test_the_budget_key_is_one_the_codec_permits(a_config):
+    assert set(session.config_body(a_config)) <= codec.CONFIG_KEYS
 
 
 # --- stored_scope_sha256 --------------------------------------------------
@@ -1230,12 +1235,16 @@ idempotent by S10's own definition, and GET is what idempotent means.
 def config_body(cfg) -> dict[str, list[str]]:
     """The authorisation, built from the engagement's config.
 
-    `limit.max_requests` IS DELIBERATELY ABSENT. `Limits.arm()` falls back to
-    a documented default of 2000 per run, and S4 is explicit that the method
-    allowlist, dangerous-path denylist, rate limit and budget "apply to the
-    send path in full, and to crawler traffic in full. They do NOT apply to
-    traffic from the operator's own browser." Nothing this plan starts spends
-    the budget, so bounding it here would be a number with no referent.
+    `limit.max_requests` IS NOW EMITTED. It was deliberately absent until
+    this task: `hx.checks.probe.ProbeSender` is the send seam an active check
+    spends it through, and before that module existed nothing here sent a
+    request, so a number in this dict would have had no referent. The value
+    comes straight from `Config.max_requests`, whose default (2000) matches
+    `Limits.arm()`'s own fallback for an absent key -- so an operator who sets
+    nothing in `config.yaml` gets exactly the documented behaviour rather
+    than a silent change: the budget was always 2000, it is now merely said
+    out loud, here, where the extension can be told it explicitly rather than
+    asked to assume it.
     """
     return {
         "scope.include": list(cfg.scope_include),
@@ -1245,6 +1254,7 @@ def config_body(cfg) -> dict[str, list[str]]:
         "method.allow": list(METHOD_ALLOW),
         "limit.rate_rps": [str(cfg.rate_limit_rps)],
         "limit.concurrency": [str(cfg.max_concurrency)],
+        "limit.max_requests": [str(cfg.max_requests)],
     }
 
 

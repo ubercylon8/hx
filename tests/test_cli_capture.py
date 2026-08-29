@@ -243,6 +243,43 @@ def test_burp_jar_flag_reaches_session(monkeypatch, an_engagement, tmp_path):
     assert calls[0]["jar"] == jar
 
 
+# --- Task 6: --max-requests -------------------------------------------------
+
+
+def test_max_requests_flag_overrides_the_configured_budget(monkeypatch, an_engagement):
+    """`--max-requests` overrides `eng.config.max_requests` for this
+    invocation only -- what `session.config_body` reads, not what
+    `config.yaml` says. Mutating `capture_start` to drop the override (or to
+    write it back to disk) reddens only this test: it reads the value
+    `session.session` was actually called with, not the file on disk."""
+    seen: list = []
+
+    @contextlib.contextmanager
+    def factory(eng, *, instance, jar=None, workdir=None):
+        seen.append(eng.config.max_requests)
+        yield _FakeLiveSession()
+
+    monkeypatch.setattr(cli.session_mod, "session", factory)
+    monkeypatch.setattr(cli, "_block_until_interrupt", lambda live: None)
+    before = an_engagement.config.max_requests
+    result = CliRunner().invoke(cli.main, [
+        "capture", "start", "--root", str(an_engagement.root),
+        "--max-requests", "42"])
+    assert result.exit_code == 0, result.output
+    assert seen == [42]
+    on_disk = config_mod.load(an_engagement.root / "config.yaml")
+    assert on_disk.max_requests == before, (
+        "the flag rewrote config.yaml; it must override this run only")
+
+
+def test_max_requests_below_one_is_a_bad_parameter_not_a_silent_clamp(an_engagement):
+    result = CliRunner().invoke(cli.main, [
+        "capture", "start", "--root", str(an_engagement.root),
+        "--max-requests", "0"])
+    assert result.exit_code != 0
+    assert "max-requests" in result.output.lower()
+
+
 # --- S8: Burp dies mid-session, and SIGTERM -------------------------------
 
 

@@ -639,12 +639,16 @@ idempotent by S10's own definition, and GET is what idempotent means.
 def config_body(cfg) -> dict[str, list[str]]:
     """The authorisation, built from the engagement's config.
 
-    `limit.max_requests` IS DELIBERATELY ABSENT. `Limits.arm()` falls back to
-    a documented default of 2000 per run, and S4 is explicit that the method
-    allowlist, dangerous-path denylist, rate limit and budget "apply to the
-    send path in full, and to crawler traffic in full. They do NOT apply to
-    traffic from the operator's own browser." Nothing this plan starts spends
-    the budget, so bounding it here would be a number with no referent.
+    `limit.max_requests` IS NOW EMITTED. It was deliberately absent until
+    this task: `hx.checks.probe.ProbeSender` is the send seam an active check
+    spends it through, and before that module existed nothing here sent a
+    request, so a number in this dict would have had no referent. The value
+    comes straight from `Config.max_requests`, whose default (2000) matches
+    `Limits.arm()`'s own fallback for an absent key -- so an operator who sets
+    nothing in `config.yaml` gets exactly the documented behaviour rather
+    than a silent change: the budget was always 2000, it is now merely said
+    out loud, here, where the extension can be told it explicitly rather than
+    asked to assume it.
     """
     return {
         "scope.include": list(cfg.scope_include),
@@ -654,6 +658,7 @@ def config_body(cfg) -> dict[str, list[str]]:
         "method.allow": list(METHOD_ALLOW),
         "limit.rate_rps": [str(cfg.rate_limit_rps)],
         "limit.concurrency": [str(cfg.max_concurrency)],
+        "limit.max_requests": [str(cfg.max_requests)],
     }
 
 

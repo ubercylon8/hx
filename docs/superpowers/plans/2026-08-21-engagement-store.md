@@ -1979,6 +1979,31 @@ def test_a_blank_entry_in_a_string_list_is_refused(tmp_path: Path):
             config.load(p)
 
 
+# --- Task 6: the request budget -------------------------------------------
+
+
+def test_max_requests_defaults_to_javas_documented_default():
+    """`Distress.java`/`HxExtension.DEFAULT_MAX_REQUESTS` documents 2000 as
+    `Limits.arm()`'s fallback. Matching it means adding the key changes no
+    behaviour for an operator who sets nothing -- the number was always
+    2000, it was just never said."""
+    cfg = config.Config(
+        name="acme-2026-09", client="Acme Corp",
+        scope_include=["https://app.acme.com/*"])
+    assert cfg.max_requests == 2000
+
+
+def test_max_requests_must_be_a_positive_integer(tmp_path: Path):
+    for bad in ("0", "-1", "true", "many"):
+        p = _write(
+            tmp_path,
+            "name: a\nclient: b\nscope:\n  include: ['https://a/*']\n"
+            f"max_requests: {bad}\n",
+        )
+        with pytest.raises(config.ConfigError, match="max_requests.*integer >= 1"):
+            config.load(p)
+
+
 def test_a_deliberately_empty_list_is_still_allowed(tmp_path: Path):
     """The blank-ENTRY guard must not become a no-empty-LISTS guard.
 
@@ -2052,6 +2077,12 @@ class Config:
     dangerous_paths: list[str] = field(default_factory=lambda: list(DEFAULT_DANGEROUS_PATHS))
     checks: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_CHECKS))
     rate_limit_rps: int = 5
+    # `Limits.arm()` (extension/src/hx/send/Limits.java) falls back to this
+    # same number -- documented in HxExtension.DEFAULT_MAX_REQUESTS -- when a
+    # configure body omits `limit.max_requests`. Matching it means adding the
+    # field to this dataclass changes no behaviour for an operator who set
+    # nothing: the budget was always 2000, it was just never written down.
+    max_requests: int = 2000
     max_concurrency: int = 2
     identities: dict[str, dict] = field(default_factory=dict)
     # `preserve_segments` names path segments the normaliser must NOT template.
@@ -2192,6 +2223,7 @@ def load(path: Path) -> Config:
         dangerous_paths=_string_list(raw, "dangerous_paths", DEFAULT_DANGEROUS_PATHS),
         checks=checks,
         rate_limit_rps=_positive_int(raw, "rate_limit_rps", 5),
+        max_requests=_positive_int(raw, "max_requests", 2000),
         max_concurrency=_positive_int(raw, "max_concurrency", 2),
         identities=_mapping(raw, "identities"),
         preserve_segments=_string_list(raw, "preserve_segments", ["api", "v1", "v2", "v3"]),
@@ -2210,6 +2242,7 @@ def dumps(cfg: Config) -> str:
             "dangerous_paths": cfg.dangerous_paths,
             "checks": cfg.checks,
             "rate_limit_rps": cfg.rate_limit_rps,
+            "max_requests": cfg.max_requests,
             "max_concurrency": cfg.max_concurrency,
             "identities": cfg.identities,
             "preserve_segments": cfg.preserve_segments,
@@ -3804,6 +3837,55 @@ def test_scan_max_seconds_reaches_the_runner(engagement_with_surface, monkeypatc
     assert "skipped" in result.output.lower()
 
 
+# --- Task 6: --max-requests -------------------------------------------------
+
+
+def test_scan_max_requests_flag_overrides_the_configured_budget(
+        engagement_with_surface, monkeypatch):
+    """`--max-requests` overrides `eng.config.max_requests` for this
+    invocation only -- the number `scan.run` is actually called with, not
+    what `config.yaml` says on disk. A CLI that silently dropped the flag
+    (or wrote it back to the file) would leave this test red."""
+    real_run = scan_mod.run
+    seen: list = []
+
+    def fake_run(conn, *, engagement_id, blobs, config, checks=None,
+                surface_filter=None, max_seconds=None):
+        seen.append(config.max_requests)
+        return real_run(conn, engagement_id=engagement_id, blobs=blobs,
+                        config=config, checks=checks,
+                        surface_filter=surface_filter, max_seconds=max_seconds)
+
+    monkeypatch.setattr(scan_mod, "run", fake_run)
+    before = eng_mod.open_(engagement_with_surface)
+    try:
+        before_max_requests = before.config.max_requests
+    finally:
+        before.db.close()
+
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface),
+        "--max-requests", "17"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == [17]
+    after = eng_mod.open_(engagement_with_surface)
+    try:
+        assert after.config.max_requests == before_max_requests, (
+            "the flag rewrote config.yaml; it must override this run only")
+    finally:
+        after.db.close()
+
+
+def test_scan_max_requests_below_one_is_a_bad_parameter_not_a_silent_clamp(
+        engagement_with_surface):
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface),
+        "--max-requests", "0"])
+    assert result.exit_code != 0
+    assert "max-requests" in result.output.lower()
+
+
 # --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---
 # --- what that gap already cost -----------------------------------------
 
@@ -3908,6 +3990,7 @@ rather than in the agent-facing tool layer.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import re
 import signal
@@ -4196,7 +4279,16 @@ def _sigterm_ends_the_session():
          "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
          "a guess, because the report records the version under test.",
 )
-def capture_start(kind, root, burp_jar) -> None:
+@click.option(
+    "--max-requests",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Per-run request budget, authorised on the extension's first "
+         "configure. Default: the engagement's own config.yaml (2000 if "
+         "unset) -- this flag overrides that number for this run only, it "
+         "does not rewrite config.yaml.",
+)
+def capture_start(kind, root, burp_jar, max_requests) -> None:
     """Launch Burp, open the live run of KIND, and hold the session open
     until interrupted.
 
@@ -4209,6 +4301,12 @@ def capture_start(kind, root, burp_jar) -> None:
     """
     path = root or default_root()
     eng = _open_engagement(path)
+    if max_requests is not None:
+        # A per-invocation OVERRIDE, not a rewrite: `eng.config` is replaced
+        # in memory so `session.config_body` picks it up, and `config.yaml`
+        # on disk is untouched -- the flag says what THIS run authorises,
+        # the file stays the record of what the operator wrote down.
+        eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
     try:
         with _sigterm_ends_the_session(), \
                 session_mod.session(eng, instance="capture", jar=burp_jar) as live:
@@ -4427,10 +4525,24 @@ def resume(root) -> None:
 @click.option("--max-seconds", type=int, default=None,
               help="Stop after this long. Remaining checks are recorded as "
                    "skipped, never left absent.")
-def scan(root, max_seconds) -> None:
+@click.option(
+    "--max-requests",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Per-run request budget an active check's session is authorised "
+         "against. Default: the engagement's own config.yaml (2000 if "
+         "unset) -- this flag overrides that number for this run only, it "
+         "does not rewrite config.yaml.",
+)
+def scan(root, max_seconds, max_requests) -> None:
     """Run the enabled check corpus over everything captured so far."""
     path = root or default_root()
     eng = _open_engagement(path)
+    if max_requests is not None:
+        # Same override as `capture start`'s -- see its comment. `scan.run`
+        # takes `eng.config` as-is, so this is where a later active-check
+        # session picks up the per-invocation number.
+        eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
     try:
         surfaces = eng.db.execute(
             "SELECT COUNT(*) FROM surface WHERE engagement_id=?",

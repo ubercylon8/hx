@@ -6,6 +6,7 @@ rather than in the agent-facing tool layer.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import re
 import signal
@@ -294,7 +295,16 @@ def _sigterm_ends_the_session():
          "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
          "a guess, because the report records the version under test.",
 )
-def capture_start(kind, root, burp_jar) -> None:
+@click.option(
+    "--max-requests",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Per-run request budget, authorised on the extension's first "
+         "configure. Default: the engagement's own config.yaml (2000 if "
+         "unset) -- this flag overrides that number for this run only, it "
+         "does not rewrite config.yaml.",
+)
+def capture_start(kind, root, burp_jar, max_requests) -> None:
     """Launch Burp, open the live run of KIND, and hold the session open
     until interrupted.
 
@@ -307,6 +317,12 @@ def capture_start(kind, root, burp_jar) -> None:
     """
     path = root or default_root()
     eng = _open_engagement(path)
+    if max_requests is not None:
+        # A per-invocation OVERRIDE, not a rewrite: `eng.config` is replaced
+        # in memory so `session.config_body` picks it up, and `config.yaml`
+        # on disk is untouched -- the flag says what THIS run authorises,
+        # the file stays the record of what the operator wrote down.
+        eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
     try:
         with _sigterm_ends_the_session(), \
                 session_mod.session(eng, instance="capture", jar=burp_jar) as live:
@@ -525,10 +541,24 @@ def resume(root) -> None:
 @click.option("--max-seconds", type=int, default=None,
               help="Stop after this long. Remaining checks are recorded as "
                    "skipped, never left absent.")
-def scan(root, max_seconds) -> None:
+@click.option(
+    "--max-requests",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Per-run request budget an active check's session is authorised "
+         "against. Default: the engagement's own config.yaml (2000 if "
+         "unset) -- this flag overrides that number for this run only, it "
+         "does not rewrite config.yaml.",
+)
+def scan(root, max_seconds, max_requests) -> None:
     """Run the enabled check corpus over everything captured so far."""
     path = root or default_root()
     eng = _open_engagement(path)
+    if max_requests is not None:
+        # Same override as `capture start`'s -- see its comment. `scan.run`
+        # takes `eng.config` as-is, so this is where a later active-check
+        # session picks up the per-invocation number.
+        eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
     try:
         surfaces = eng.db.execute(
             "SELECT COUNT(*) FROM surface WHERE engagement_id=?",

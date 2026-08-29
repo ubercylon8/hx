@@ -813,6 +813,55 @@ def test_scan_max_seconds_reaches_the_runner(engagement_with_surface, monkeypatc
     assert "skipped" in result.output.lower()
 
 
+# --- Task 6: --max-requests -------------------------------------------------
+
+
+def test_scan_max_requests_flag_overrides_the_configured_budget(
+        engagement_with_surface, monkeypatch):
+    """`--max-requests` overrides `eng.config.max_requests` for this
+    invocation only -- the number `scan.run` is actually called with, not
+    what `config.yaml` says on disk. A CLI that silently dropped the flag
+    (or wrote it back to the file) would leave this test red."""
+    real_run = scan_mod.run
+    seen: list = []
+
+    def fake_run(conn, *, engagement_id, blobs, config, checks=None,
+                surface_filter=None, max_seconds=None):
+        seen.append(config.max_requests)
+        return real_run(conn, engagement_id=engagement_id, blobs=blobs,
+                        config=config, checks=checks,
+                        surface_filter=surface_filter, max_seconds=max_seconds)
+
+    monkeypatch.setattr(scan_mod, "run", fake_run)
+    before = eng_mod.open_(engagement_with_surface)
+    try:
+        before_max_requests = before.config.max_requests
+    finally:
+        before.db.close()
+
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface),
+        "--max-requests", "17"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == [17]
+    after = eng_mod.open_(engagement_with_surface)
+    try:
+        assert after.config.max_requests == before_max_requests, (
+            "the flag rewrote config.yaml; it must override this run only")
+    finally:
+        after.db.close()
+
+
+def test_scan_max_requests_below_one_is_a_bad_parameter_not_a_silent_clamp(
+        engagement_with_surface):
+    result = CliRunner().invoke(cli.main, [
+        "scan", "--root", str(engagement_with_surface),
+        "--max-requests", "0"])
+    assert result.exit_code != 0
+    assert "max-requests" in result.output.lower()
+
+
 # --- Task 8 fix round 1, F12/F2: `hx report` had no test at all, and F2 is ---
 # --- what that gap already cost -----------------------------------------
 
