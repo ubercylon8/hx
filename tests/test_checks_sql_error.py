@@ -155,10 +155,14 @@ def test_a_clean_answer_names_only_what_was_actually_probed():
 
 
 def test_no_insertions_probed_means_nothing_considered():
+    """N3 of the scoped re-review turned the verdict here from `clean` to
+    `inconclusive`. `considered` was already empty, so nothing was ever
+    retired on this path -- what was false was the coverage row: `clean`
+    asserts "tested and nothing found", and this surface was not tested."""
     sender = _sender_returning(200, _CLEAN_BODY)
     v = sqle.SqlError().probes(ctx, surface, (), sender)
     assert sender.sent == 0
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
     assert v.considered == (), (
         "nothing was examined on this surface, so nothing may be "
         "considered -- naming the issue type here would let a real, "
@@ -283,8 +287,10 @@ def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
     sender = _sender_returning(200, _CLEAN_BODY)
     v = sqle.SqlError().probes(ctx, surface, (header_insertion,), sender)
     assert sender.sent == 0
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
     assert v.considered == ()
+    for kind in sqle.SqlError.insertion_kinds:
+        assert kind in v.reason, kind
 
 
 def test_a_finding_names_the_insertion_it_came_from():

@@ -1289,6 +1289,36 @@ def test_every_probing_check_reads_a_login_wall_as_a_gap(tmp_path):
     assert clean == [], f"a login wall was read as a clean result: {clean}"
 
 
+# --- a check whose own filter matched nothing -----------------------------
+#
+# N3 of the scoped re-review. `open_redirect` and `path_traversal` each apply
+# a name filter of their own AFTER the runner has handed them their points,
+# so a surface with query parameters but no matching NAME reached their
+# verdict with nothing probed. `considered` was empty, so nothing retired --
+# but the row read `clean` with `requests_sent = 0`, and `report._coverage`
+# counts surfaces per (check, verdict). A real engagement rendered most of
+# the corpus as `open-redirect | clean` for a check that probed a handful.
+
+
+def test_a_check_whose_filter_matched_nothing_does_not_answer_clean(tmp_path):
+    """Measured at the runner, where the coverage row is actually written:
+    `q` is a real, probeable query point -- so the runner does NOT skip this
+    surface -- and neither of the two name-filtering checks probes it."""
+    env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
+    filtering = tuple(c for c in registry.CHECKS if c.id in {
+        "hx.active.open-redirect", "hx.active.path-traversal"})
+    assert len(filtering) == 2
+    fb = _replying_bridge()
+    scan.run(**env, checks=filtering, bridge=fb)
+
+    rows = env["conn"].execute(
+        "SELECT check_id, verdict, requests_sent FROM check_run"
+        " ORDER BY check_id").fetchall()
+    assert [(v, n) for _c, v, n in rows] == [("inconclusive", 0),
+                                             ("inconclusive", 0)], rows
+    assert fb.calls == 0, "a check that answered for this surface sent nothing"
+
+
 # --- a truncated run may not close as a completed one ---------------------
 #
 # F11 of the whole-branch review. `stop_reason` was built from `by_reason`,

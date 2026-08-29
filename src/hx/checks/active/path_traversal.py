@@ -79,7 +79,11 @@ type -- the finding is always "this input let a file outside the intended
 directory be read", regardless of which line of `/etc/passwd` proved it --
 named in `considered` only when at least one file-shaped parameter was
 actually probed, never on a surface with no insertion point this check's
-name filter accepted.
+name filter accepted. Such a surface answers `inconclusive` and not `clean`
+(N3 of the scoped re-review): an empty `considered` retires nothing, but a
+`clean` row still tells `report._coverage` this check examined a surface it
+never sent a request to. `_NOTHING_PROBEABLE` is the sentence it says
+instead.
 
 EACH CANDIDATE CARRIES ITS `Insertion`, for the same reason
 `open_redirect.py`, `reflected_input.py` and `sql_error.py` all give:
@@ -154,6 +158,16 @@ _SIGNATURES = (
     ("bin:x:2:2:", "the bin account's line"),
     ("nobody:x:65534:", "the nobody account's line"),
 )
+
+
+# What a coverage row says for a surface this check never sent anything to --
+# the same shape as `open_redirect._NOTHING_PROBEABLE`, and naming the filter
+# for the same reason.
+_NOTHING_PROBEABLE = (
+    "no insertion point on this surface is one this check probes -- it "
+    "probes a query or path_segment point whose name contains one of "
+    f"{', '.join(_FILE_NAME_HINTS)} -- so nothing was sent and this surface "
+    "was not examined for path traversal")
 
 
 def _looks_like_file_target(name: str) -> bool:
@@ -306,5 +320,14 @@ class PathTraversal:
                     "intended directory, rather than concatenating this "
                     "input directly into a filesystem path.")))
 
-        considered = (_ISSUE_TYPE,) if probed_any else ()
-        return _probe_util.verdict(candidates, gaps, considered=considered)
+        if not probed_any:
+            # NOTHING WAS SENT, SO NOTHING WAS TESTED -- see
+            # `open_redirect.py`'s identical branch and N3 of the scoped
+            # re-review. Reached by either filter: a point of the wrong
+            # KIND, or one whose name does not look like a file's. Both are
+            # "this check did not look here", and the coverage row has to
+            # say so rather than say `clean`.
+            return _probe_util.verdict(candidates, gaps,
+                                       unprobed=_NOTHING_PROBEABLE)
+        return _probe_util.verdict(candidates, gaps,
+                                   considered=(_ISSUE_TYPE,))

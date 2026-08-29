@@ -71,7 +71,13 @@ still tracked explicitly, defensively, rather than assumed: a `considered`
 that named the issue type on a call that genuinely probed nothing would let
 `hx.scan._mark_unobserved` retire a finding on the strength of a question
 this check never got to ask, which is the exact mistake the module doc on
-`base.Verdict.considered` exists to prevent. A POINT THAT REFLECTED NOTHING
+`base.Verdict.considered` exists to prevent. Since N3 of the scoped
+re-review, `probed_any` being false also decides the VERDICT and not only
+`considered`: it answers `inconclusive` with `_nothing_probeable()`, because
+`clean` with nothing considered told `report._coverage` this check examined
+a surface it never sent a request to. `_probe_util.verdict` refuses that
+combination outright now, so the honest answer is structural rather than
+remembered here. A POINT THAT REFLECTED NOTHING
 WAS STILL EXAMINED: the one request that carries its canary and reads it
 back absent IS the examination, the same way a clean answer from `cors.py`'s
 one request means its three issue types were all looked at and none applied
@@ -351,5 +357,31 @@ class ReflectedInput:
                     "from the response altogether if it need not be "
                     "echoed at all.")))
 
-        considered = (_ISSUE_TYPE,) if probed_any else ()
-        return _probe_util.verdict(candidates, gaps, considered=considered)
+        if not probed_any:
+            # NOTHING WAS SENT, SO NOTHING WAS TESTED, AND THAT IS NOT
+            # `clean` -- N3 of the scoped re-review, and the same branch
+            # `open_redirect.py` and `path_traversal.py` carry. This check
+            # has no name filter, so the runner's `no_insertion_point` skip
+            # covers the production case; what reaches here is a point of a
+            # kind this check does not probe, which `scan.run` filters out
+            # and this check does not assume it did. `_probe_util.verdict`
+            # refuses `clean` with an empty `considered` outright, so this
+            # is where the honest sentence gets written rather than a place
+            # a caller may forget.
+            return _probe_util.verdict(candidates, gaps,
+                                       unprobed=self._nothing_probeable())
+        return _probe_util.verdict(candidates, gaps,
+                                   considered=(_ISSUE_TYPE,))
+
+    def _nothing_probeable(self) -> str:
+        """What a coverage row says for a surface nothing was sent to.
+
+        DERIVED FROM `insertion_kinds`, not typed beside it: the declaration
+        and the sentence describing it are one fact, and a check that learnt
+        a fifth kind would otherwise keep telling an operator it probes four.
+        """
+        return ("no insertion point on this surface is one this check "
+                "probes -- it probes "
+                f"{', '.join(sorted(self.insertion_kinds))} points -- so "
+                "nothing was sent and this surface was not examined for "
+                "reflected input")

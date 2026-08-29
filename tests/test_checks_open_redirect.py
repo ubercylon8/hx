@@ -165,17 +165,30 @@ def test_the_check_never_requests_the_location_it_was_given():
 
 def test_a_parameter_that_cannot_redirect_is_not_probed():
     """Budget: canary-first means not every query parameter earns a
-    request."""
+    request.
+
+    N3 OF THE SCOPED RE-REVIEW CHANGED THE VERDICT THIS ANSWERS WITH. It was
+    `clean` with an empty `considered`, which retired nothing -- but
+    `report._coverage` groups on (check_id, verdict) and counts surfaces, so
+    a real engagement rendered `hx.active.open-redirect | clean | <most of
+    the corpus>` for a check that probed a handful. `clean` asserts "tested
+    and nothing found"; nothing was tested here, and the row has to say
+    which."""
     sender = _sender_returning(200, {})
     v = oredir.OpenRedirect().probes(ctx, surface, (_UNRELATED_INSERTION,),
                                      sender)
     assert sender.sent == 0
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
     assert v.considered == (), (
         "nothing was actually examined on this surface, so nothing may be "
         "considered -- naming the issue type here would let a real, "
         "never-tested finding be silently retired"
     )
+    # The sentence names the filter, so an operator reading the coverage row
+    # can tell "this check looked and found nothing" from "this check does
+    # not probe parameters called `id`".
+    assert "redirect" in v.reason
+    assert _UNRELATED_INSERTION.name not in sender.paths
 
 
 # ---- refusal and budget ---------------------------------------------------
@@ -266,15 +279,28 @@ def test_the_check_is_wired_for_the_registry():
     assert c.insertion_kinds == frozenset({"query"})
 
 
+def test_the_unprobeable_sentence_names_every_kind_and_hint_it_claims():
+    """The sentence is typed rather than derived (the name filter is the
+    binding constraint and it reads better spelt out), so the drift it
+    could develop is caught here instead: every declared kind and every
+    hint the filter actually uses must appear in what an operator reads."""
+    for kind in oredir.OpenRedirect.insertion_kinds:
+        assert kind in oredir._NOTHING_PROBEABLE, kind
+    for hint in oredir._REDIRECT_NAME_HINTS:
+        assert hint in oredir._NOTHING_PROBEABLE, hint
+
+
 def test_only_query_insertions_are_considered_others_are_ignored():
     """`insertion_kinds` is `{"query"}`; a non-query insertion reaching
     `probes()` (which should not happen given `scan.run`'s own filter, but
-    this check must not assume it) is simply skipped, not probed."""
+    this check must not assume it) is simply skipped, not probed. The KIND
+    filter, not the name one -- this point's name would pass -- and it lands
+    where the name filter does: nothing sent, so nothing tested."""
     header_insertion = base.Insertion("header", "redirect")
     sender = _sender_returning(200, {})
     v = oredir.OpenRedirect().probes(ctx, surface, (header_insertion,), sender)
     assert sender.sent == 0
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
     assert v.considered == ()
 
 

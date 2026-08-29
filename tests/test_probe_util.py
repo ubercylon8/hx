@@ -214,7 +214,8 @@ def test_a_response_with_no_status_at_all_is_a_gap():
 #
 # The same three branches as `_http.verdict`, which is the point: the two
 # halves of one corpus answering "when may I say clean" differently is the
-# drift F4 found.
+# drift F4 found. The active half then adds a fourth branch and a refusal
+# that the passive half has no use for -- see the N3 section at the end.
 
 
 def test_nothing_found_and_nothing_refused_is_clean_and_considers():
@@ -261,3 +262,56 @@ def test_the_reason_shows_the_gaps_the_way_a_coverage_row_does():
     assert "p0: status 403" in v.reason
     assert "and 2 more" in v.reason
 
+
+
+# ---- a check that probed nothing may not answer clean ---------------------
+#
+# N3 of the scoped re-review. `open_redirect` and `path_traversal` each apply
+# a name filter of their own before a point earns a probe, and a surface on
+# which that filter matched nothing reached `verdict([], [], considered=())`
+# -> `clean` with `requests_sent = 0`. Nothing was retired (`considered` was
+# empty, which is why this is not the same severity as N1), but
+# `report._coverage` groups on (check_id, verdict) and counts SURFACES, so a
+# real engagement rendered `hx.active.open-redirect | clean | <most of the
+# corpus>` for a check that probed a handful. `clean` asserts "tested and
+# nothing found"; on those rows nothing was tested. S12 on the coverage axis.
+
+
+def test_a_check_that_probed_nothing_says_so_and_is_not_clean():
+    v = _probe_util.verdict([], [], unprobed="no point here was probeable")
+    assert v.state == "inconclusive"
+    assert v.reason == "no point here was probeable"
+    assert v.considered == ()
+
+
+def test_a_gap_outranks_the_unprobed_sentence():
+    """Ordering, and it matters: a surface where one point was refused and
+    another never matched the filter has a gap to report, and the gap names
+    the wire's own class -- which sends an operator somewhere the filter
+    sentence would not."""
+    v = _probe_util.verdict([], ["q: probe refused (budget_exhausted)"],
+                            unprobed="no point here was probeable")
+    assert v.state == "inconclusive"
+    assert "budget_exhausted" in v.reason
+
+
+def test_a_candidate_outranks_the_unprobed_sentence_too():
+    """Structurally unreachable -- nothing probed means nothing found -- and
+    answered in the same order as every other branch rather than left to be
+    reasoned about."""
+    v = _probe_util.verdict([_candidate()], [], considered=("probed",),
+                            unprobed="no point here was probeable")
+    assert v.state == "finding"
+
+
+def test_clean_with_nothing_considered_is_refused_outright():
+    """THE STRUCTURAL HALF, and the reason this is not four `if` statements
+    in four checks. `clean` with an empty `considered` is exactly the row
+    N3 is about: a check saying "tested, nothing found" while naming no
+    issue type it tested for. There is no caller for which that is the
+    right answer, so the funnel refuses it rather than each caller
+    remembering not to ask. `hx.scan.run` turns the raise into an `error`
+    row, which retires nothing -- the safe direction."""
+    with pytest.raises(ValueError) as exc:
+        _probe_util.verdict([], [])
+    assert "considered" in str(exc.value)

@@ -349,13 +349,20 @@ def test_a_refused_escalation_still_files_the_finding_it_already_proved():
 def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
     """`insertion_kinds` is the four given in the interface; a kind outside
     it reaching `probes()` (which should not happen given `scan.run`'s own
-    filter, but this check must not assume it) is simply skipped."""
+    filter, but this check must not assume it) is simply skipped -- and,
+    N3 of the scoped re-review, the verdict says so. Nothing was sent, so
+    the surface was not tested, and `clean` would have claimed coverage of
+    it in `report._coverage`."""
     body_form = base.Insertion("body_form", "q")
     sender = _FakeSender(mode="off")
     v = ri.ReflectedInput().probes(ctx, surface, (body_form,), sender)
     assert sender.sent == 0
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
     assert v.considered == ()
+    # DERIVED, not typed: the sentence names the kinds off the declaration
+    # itself, so a check that learns a fifth cannot keep claiming four.
+    for kind in ri.ReflectedInput.insertion_kinds:
+        assert kind in v.reason, kind
 
 
 # A TEMPLATED SURFACE AND THE CONCRETE ADDRESS IT WAS NORMALISED FROM. These

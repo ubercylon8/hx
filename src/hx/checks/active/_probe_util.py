@@ -60,12 +60,16 @@ and every question they answer is one where a disagreement is a false
     treating them as ones populates `considered` and lets
     `hx.scan._mark_unobserved` retire a live finding. The passive corpus has
     had this doctrine since `_http.verdict` -- "a gap with nothing found is
-    `inconclusive`, never `clean`" -- and `verdict` below is deliberately
-    the same three branches in the same order, including the one that costs
-    the most to get right: a CANDIDATE STILL WINS OVER A GAP (a database
-    error legitimately arrives on a 500), and what a gap withholds from a
-    finding is `considered`, so the finding is still reported and the
-    surface's OTHER issue types are not retired on partial evidence.
+    `inconclusive`, never `clean`" -- and `verdict` below opens with
+    deliberately the same three branches in the same order, including the
+    one that costs the most to get right: a CANDIDATE STILL WINS OVER A GAP
+    (a database error legitimately arrives on a 500), and what a gap
+    withholds from a finding is `considered`, so the finding is still
+    reported and the surface's OTHER issue types are not retired on partial
+    evidence. It then adds one the passive half has no use for: a check
+    whose own filter matched nothing SENT nothing, which is neither a gap
+    nor a clean result (N3), and a `clean` naming nothing considered is
+    refused outright rather than left to five callers to avoid asking for.
 
 RANDOM, PER CALL, AND WHY THAT MATTERS MORE HERE THAN IN EITHER PREDECESSOR.
 `records.dedupe_key` folds `insertion_kind`/`insertion_name` into a finding's
@@ -293,7 +297,8 @@ def unanswered(response) -> str | None:
 
 
 def verdict(candidates, gaps, *,
-            considered: tuple[str, ...] = ()) -> base.Verdict:
+            considered: tuple[str, ...] = (),
+            unprobed: str | None = None) -> base.Verdict:
     """The active corpus's one rule for when `clean` may be said.
 
     THE SAME THREE BRANCHES AS `_http.verdict`, in the same order and for the
@@ -315,6 +320,37 @@ def verdict(candidates, gaps, *,
     property doing the safety work here, and it is structural rather than
     remembered.
 
+    `unprobed` IS A FOURTH FACT AND IT IS NOT A GAP. A gap is a probe that
+    was SENT and came back without answering; `unprobed` is the check's own
+    filter saying there was nothing here worth sending to at all --
+    `open_redirect` probes only a redirect-shaped parameter name,
+    `path_traversal` only a file-shaped one, and a surface whose parameters
+    are `q` and `page` is one neither of them examined. N3 of the scoped
+    re-review: that surface used to reach the `clean` return with
+    `considered=()`, so nothing was retired -- the safety envelope held --
+    but the row read `clean` with `requests_sent = 0`, and
+    `report._coverage` groups on (check_id, verdict) and counts SURFACES.
+    A real engagement rendered `hx.active.open-redirect | clean | <most of
+    the corpus>` for a check that probed a handful. `clean` asserts "tested
+    and nothing found"; on those rows nothing was tested. S12, on the axis
+    the coverage table is for.
+
+    It is ranked BELOW both other branches, and both orderings are real: a
+    gap names the wire's own refusal class, which sends an operator
+    somewhere the filter sentence would not, and a candidate is a finding
+    whatever else did or did not get probed.
+
+    `clean` WITH NOTHING CONSIDERED IS REFUSED OUTRIGHT, and that is the
+    structural half of the same fix. A check saying "tested, nothing found"
+    while naming no issue type it tested FOR is exactly the row N3 is about,
+    and there is no caller for which it is the right answer -- so the funnel
+    refuses it rather than five callers each remembering not to ask it. The
+    two checks with a name filter pass `unprobed`; the two without cannot
+    reach here unprobed (a point they were handed either builds a probe or
+    records a gap), and a name in this signature that no input can exercise
+    is a claim no test separates from its absence. `hx.scan.run` turns the
+    raise into an `error` row, which retires nothing.
+
     `_http._detail` FORMATS THE GAP LIST, read across the module boundary
     rather than copied, for the reason `hx.scan._runner_hook` gives for
     reading `registry._RUNNER_CALLS`: the coupling is real -- an operator
@@ -330,5 +366,13 @@ def verdict(candidates, gaps, *,
             "this surface's probes did not all come back as answers, so "
             "nothing found here separates `tested, clean` from `never "
             "reached`" + _http._detail(tuple(gaps)))
+    if unprobed is not None:
+        return base.Verdict.inconclusive(unprobed)
+    if not considered:
+        raise ValueError(
+            "a clean verdict must name what it considered: nothing was "
+            "found, nothing was refused, and no issue type was examined, "
+            "which is a check reporting `tested, clean` for a surface it "
+            "never tested. Pass `unprobed=<why>` instead")
     return base.Verdict.clean(considered=considered)
 

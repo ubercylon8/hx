@@ -148,16 +148,20 @@ def test_a_response_with_no_signature_anywhere_is_clean():
 
 
 def test_a_parameter_that_does_not_look_like_a_file_is_not_probed():
-    """Budget: name-based canary-first, like `open_redirect.py`."""
+    """Budget: name-based canary-first, like `open_redirect.py` -- and, N3
+    of the scoped re-review, a verdict that says so. `clean` here claimed
+    coverage of a surface this check never sent a request to; the coverage
+    table counts those rows."""
     sender = _sender_returning(200, _CLEAN_BODY)
     v = ptrav.PathTraversal().probes(ctx, surface, (_UNRELATED_PARAM,),
                                      sender)
     assert sender.sent == 0
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
     assert v.considered == (), (
         "nothing was actually examined on this surface, so nothing may be "
         "considered -- naming the issue type here would let a real, "
         "never-tested finding be silently retired")
+    assert "file" in v.reason
 
 
 def test_only_file_shaped_parameters_are_probed_among_a_mix():
@@ -282,13 +286,26 @@ def test_the_check_is_wired_for_the_registry():
     assert c.insertion_kinds == frozenset({"query", "path_segment"})
 
 
+def test_the_unprobeable_sentence_names_every_kind_and_hint_it_claims():
+    """Same drift net as `open_redirect`'s: the sentence is typed, so what
+    it claims is checked against the declaration and the filter it
+    describes."""
+    for kind in ptrav.PathTraversal.insertion_kinds:
+        assert kind in ptrav._NOTHING_PROBEABLE, kind
+    for hint in ptrav._FILE_NAME_HINTS:
+        assert hint in ptrav._NOTHING_PROBEABLE, hint
+
+
 def test_only_declared_insertion_kinds_are_probed_others_are_skipped():
+    """The KIND filter, not the name one -- this point's name would pass
+    `_looks_like_file_target` -- and it lands in the same place: nothing was
+    sent, so the surface was not tested and the row may not say it was."""
     header_insertion = base.Insertion("header", "file")
     sender = _sender_returning(200, _CLEAN_BODY)
     v = ptrav.PathTraversal().probes(ctx, surface, (header_insertion,),
                                      sender)
     assert sender.sent == 0
-    assert v.state == "clean"
+    assert v.state == "inconclusive"
     assert v.considered == ()
 
 

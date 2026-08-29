@@ -78,7 +78,10 @@ it -- so `hx.scan._mark_unobserved` retires on `(surface_id, check_id,
 issue_type_id)` and never on which insertion point or which vendor. As with
 both predecessors, `considered` names `_ISSUE_TYPE` only when at least one
 point was actually probed, never on a surface with none of the declared
-kinds.
+kinds -- and, since N3 of the scoped re-review, such a call answers
+`inconclusive` with `_nothing_probeable()` rather than `clean`: an empty
+`considered` retires nothing, but a `clean` row still claimed coverage in
+`report._coverage` of a surface this check never sent a request to.
 
 EACH CANDIDATE CARRIES ITS `Insertion`, for the reason `open_redirect.py`
 and `reflected_input.py` both give: `records.dedupe_key` folds
@@ -295,5 +298,22 @@ class SqlError:
                     "verbose database error output in production (log it "
                     "server-side instead of returning it to the client).")))
 
-        considered = (_ISSUE_TYPE,) if probed_any else ()
-        return _probe_util.verdict(candidates, gaps, considered=considered)
+        if not probed_any:
+            # NOTHING WAS SENT, SO NOTHING WAS TESTED, AND THAT IS NOT
+            # `clean` -- N3 of the scoped re-review; see
+            # `reflected_input.py`'s identical branch for why this check
+            # carries one despite having no name filter of its own.
+            return _probe_util.verdict(candidates, gaps,
+                                       unprobed=self._nothing_probeable())
+        return _probe_util.verdict(candidates, gaps,
+                                   considered=(_ISSUE_TYPE,))
+
+    def _nothing_probeable(self) -> str:
+        """What a coverage row says for a surface nothing was sent to,
+        derived from `insertion_kinds` for the reason `reflected_input.
+        ReflectedInput._nothing_probeable` gives."""
+        return ("no insertion point on this surface is one this check "
+                "probes -- it probes "
+                f"{', '.join(sorted(self.insertion_kinds))} points -- so "
+                "nothing was sent and this surface was not examined for "
+                "database error disclosure")

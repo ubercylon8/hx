@@ -87,12 +87,17 @@ says whether it looked at this parameter at all. So this check answers
 `clean` only on a NON-REDIRECTING 2xx, which is the one response that is a
 genuine test: the endpoint took the marker and chose not to redirect to it.
 
-CONSIDERED, NAMED HONESTLY. `_ISSUE_TYPE` is only added to `considered`
-when this check actually issued at least one probe on this surface. A
-surface with query parameters but none of them canary-shaped, or with no
-query insertions at all, is a surface this check never examined for open
-redirect, and `hx.scan._mark_unobserved` must not retire a finding on the
-strength of a question this check never asked.
+CONSIDERED, NAMED HONESTLY -- AND THE VERDICT SAYS SO TOO. `_ISSUE_TYPE` is
+only added to `considered` when this check actually issued at least one probe
+on this surface, so `hx.scan._mark_unobserved` cannot retire a finding on the
+strength of a question this check never asked. N3 of the scoped re-review
+added the other half: a surface with query parameters but none of them
+canary-shaped used to answer `clean` with an empty `considered` and
+`requests_sent = 0`. Nothing retired -- but `report._coverage` groups on
+(check_id, verdict) and counts SURFACES, so a real engagement rendered most
+of the corpus as `open-redirect | clean` for a check that probed a handful.
+That surface answers `inconclusive` now, with `_NOTHING_PROBEABLE` naming the
+filter that declined it.
 
 THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
 same reason `cors.py` gives: nothing in this build records a probe's own
@@ -144,6 +149,17 @@ _REDIRECT_STATUSES = range(300, 400)
 # `considered` cannot spell the set two different ways (see `cors.py`'s
 # identical reasoning for `_CONSIDERED`).
 _ISSUE_TYPE = "open-redirect"
+
+
+# What a coverage row says for a surface this check never sent anything to.
+# It names the FILTER rather than the surface, because that is the thing an
+# operator can act on: widen the hints, or accept that a parameter called
+# `id` is not one this check reads.
+_NOTHING_PROBEABLE = (
+    "no insertion point on this surface is one this check probes -- it "
+    "probes a query parameter whose name contains one of "
+    f"{', '.join(_REDIRECT_NAME_HINTS)} -- so nothing was sent and this "
+    "surface was not examined for open redirect")
 
 
 def _looks_like_redirect_target(name: str) -> bool:
@@ -264,5 +280,16 @@ class OpenRedirect:
                         "allowlist of destinations (or require same-origin) "
                         "before using it to build a redirect target.")))
 
-        considered = (_ISSUE_TYPE,) if probed_any else ()
-        return _probe_util.verdict(candidates, gaps, considered=considered)
+        if not probed_any:
+            # NOTHING WAS SENT, SO NOTHING WAS TESTED -- and that is not
+            # `clean`. N3 of the scoped re-review: a surface whose query
+            # parameters are `q` and `page` is one this check's own name
+            # filter never looked at, and a `clean` row for it claimed
+            # coverage in `report._coverage` (which counts surfaces per
+            # check and verdict) that no request backs. `considered` was
+            # already empty, so nothing was ever retired on this path; the
+            # coverage sentence is what was false.
+            return _probe_util.verdict(candidates, gaps,
+                                       unprobed=_NOTHING_PROBEABLE)
+        return _probe_util.verdict(candidates, gaps,
+                                   considered=(_ISSUE_TYPE,))
