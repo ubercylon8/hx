@@ -68,6 +68,22 @@ was probed with a GET,
 which is a request to a different surface, and closed `clean` on the strength
 of it. Both were fixed with coverage at `scan.run` against fake bridges. Here
 they are measured through Burp, a socket and a server that answers.
+
+AND ONE SURFACE THE BROWSER WAS LOGGED IN TO, WHICH IS THE LAST TEST AND THE
+FOURTH INSTANCE OF THAT SAME BLIND SPOT. Every surface above was browsed
+anonymously, so no captured surface in this file had ever carried a `cookie`
+insertion point: F2's fix (a point the send path refuses is dropped rather
+than probed), the `no_probeable_insertion_point` skip, and now the rule that
+an unauthenticated probe of an AUTHENTICATED surface retires nothing were all
+covered by fake bridges and by nothing end to end. `Rig.browse` could always
+carry headers -- `test_proxy_capture.py` sends a session cookie through it to
+prove the redaction -- but no active check had ever been run against what that
+produces. The last test logs in through `/login`, browses the reflecting route
+with the cookie that route issues, fixes the flaw, and measures that the
+finding does NOT retire; browsing carries a session because it goes through
+the proxy listener's operator branch, which is scope-only, while every probe
+hx issues is refused a credential header it did not inject. That asymmetry is
+S4's operator/agent split, and `Rig.browse`'s own docstring carries it.
 """
 from __future__ import annotations
 
@@ -76,12 +92,12 @@ from collections import Counter
 
 import pytest
 
-from hx import report, scan
-from hx.checks import base, registry
+from hx import insertion, report, scan
+from hx.checks import base, probe, registry
 from hx.checks.active import cors, reflected_input
 from tests.integration.target_server import (
-    LOGIN_WALL_ROUTE, STATE_CHANGING_ROUTE, TEMPLATED_ROUTE, TEMPLATED_SURFACE,
-    VULNERABLE_ROUTES)
+    LOGIN_WALL_ROUTE, SESSION_COOKIE_VALUE, STATE_CHANGING_ROUTE,
+    TEMPLATED_ROUTE, TEMPLATED_SURFACE, VULNERABLE_ROUTES)
 
 pytestmark = pytest.mark.integration
 
@@ -699,3 +715,195 @@ def _file_a_finding_on(rig, surface) -> str:
         (surface["id"], surface["method"], surface["scheme"], surface["host"],
          surface["port"], surface["path_template"], exemplar),
         check, candidate)
+
+
+# ---------------------------------------------------------------------------
+# 5. A surface the browser was logged in to.
+# ---------------------------------------------------------------------------
+
+CORS_ROUTE = VULNERABLE_ROUTES["hx.active.cors"]
+CORS_SURFACE = CORS_ROUTE.split("?")[0]
+REFLECTING_ROUTE = VULNERABLE_ROUTES["hx.active.reflected-input"]
+REFLECTING_SURFACE = REFLECTING_ROUTE.split("?")[0]
+
+
+def _log_in(rig) -> str:
+    """Browse `/login` and come back with the `Cookie` header a browser would
+    send next.
+
+    THE VALUE IS THE SERVER'S OWN, not a literal typed here. `/login` answers
+    `Set-Cookie: session=<SESSION_COOKIE_VALUE>; Path=/; HttpOnly; SameSite=
+    Lax` and the cookie this returns is parsed off that response, so a test
+    built on it carries a realistic session and cannot drift from the route
+    that issues one.
+
+    A BROWSE MAY CARRY A COOKIE THAT A PROBE MAY NOT, AND THAT ASYMMETRY IS S4
+    WORKING AS DESIGNED. This goes through the PROXY LISTENER, whose operator
+    branch is `Policy.decideScopeOnly` -- scope, and nothing after it
+    (`ProxyGate.decide`: "It does not reach the Gate, so an operator's
+    browsing spends no rate token and no budget slot"), so the method
+    allowlist, the dangerous-path denylist, the rate limit and the budget are
+    all the crawler's branch and none of them is asked here. The
+    `unmanaged_credential` refusal is `Sender.decide()`'s and lives on the
+    SEND path. So the operator's browser carries its session exactly as a
+    browser does, everything hx itself issues carries none, and the gap
+    between those two requests is the whole subject of the test below.
+
+    IT ALSO LEAVES `/login` AS AN ANONYMOUS SURFACE, which the test uses as
+    its control: one scan, two surfaces, one of them authenticated.
+    """
+    raw = rig.browse("GET", "/login")
+    head = raw.split(b"\r\n\r\n", 1)[0]
+    for line in head.split(b"\r\n")[1:]:
+        name, _sep, value = line.partition(b":")
+        if name.strip().lower() == b"set-cookie":
+            return value.decode("latin-1").strip().split(";")[0]
+    raise AssertionError(f"/login set no cookie: {head!r}")
+
+
+def test_a_fix_on_an_authenticated_surface_is_not_reported_as_fixed(rig):
+    """THE SEVENTH SPELLING, end to end: a probe that carried no session may
+    report what it found and may not close anything.
+
+    An operator logs in, browses `/api/profile` and `/search`, and
+    `hx.active.cors` and `hx.active.reflected-input` each find their own flaw.
+    The CORS misconfiguration is then genuinely FIXED -- the route goes on
+    answering 200 and simply stops reflecting an origin it never heard of --
+    so the second scan's `clean` comes off a real probe of a real answer. It
+    still may not retire, because hx's probe is not the request the capture
+    was of: it carries no cookie, so what it tested is the logged-out view of
+    an authenticated surface and it can say nothing about the view the
+    client's users are in.
+
+    THAT IS THE SHAPE NO STATUS SET CAN CATCH, closed from the other side. An
+    application answering a logged-out request with a 200 login PAGE is a
+    complete, application-composed response indistinguishable from an answer;
+    what distinguishes it is not the response at all but a fact the store
+    already holds -- the capture carried a session and the probe did not.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED on these exact surfaces
+    with `scan._unauthenticated_view` returning "" and nothing else changed:
+    `hx.active.cors` closed `clean` with `considered` populated,
+    `_mark_unobserved` wrote `observed = 0` for the live finding, and the
+    rendered page carried "**not observed the last time its check tested this
+    surface -- appears fixed; verify before closing**" for a CORS
+    misconfiguration nobody has verified. Four assertions below redden on
+    that, and the last of them is the sentence a client would have read.
+
+    `/login` IS THE CONTROL, IN THE SAME SCAN. It is browsed WITHOUT a cookie,
+    so its capture and hx's probe are the same view and nothing is withheld
+    there. A suppression that fired on every row, or on none, fails one half
+    or the other.
+    """
+    _configure(rig)
+    cookie = _log_in(rig)
+    rig.browse("GET", CORS_ROUTE, headers=[("Cookie", cookie)])
+    rig.browse("GET", REFLECTING_ROUTE, headers=[("Cookie", cookie)])
+    rig.settle(lambda: len(rows(rig, "SELECT id FROM surface")) == 3,
+               "three surfaces: /login, the CORS route and the reflecting one")
+
+    # GUARD 1: THE COOKIE REALLY TRAVELLED, in both browses. Without this,
+    # everything below is satisfied by a request that carried no session at
+    # all -- and "nothing was retired" is also what a broken scan produces.
+    served = rig.target.hits_for(CORS_SURFACE) \
+        + rig.target.hits_for(REFLECTING_SURFACE)
+    assert [hit.headers.get("Cookie") for hit in served] == [cookie, cookie], \
+        served
+
+    # GUARD 2: AND THE STORE HOLDS THEM AS AUTHENTICATED SURFACES. The runner
+    # decides off the exemplar REQUEST, so these are the bytes the rule reads.
+    # The value is redacted before they are hashed (S7) and the NAME is what
+    # survives -- which is exactly what `credentials_carried` asks about, so
+    # this asserts the two halves together.
+    surfaces = {r["path_template"]: r for r in rows(
+        rig, "SELECT id, path_template, exemplar_exchange_id FROM surface")}
+    captured = {}
+    for template in (CORS_SURFACE, REFLECTING_SURFACE, "/login"):
+        blob = rows(rig, "SELECT req_blob FROM exchange WHERE id=?",
+                    (surfaces[template]["exemplar_exchange_id"],))[0]["req_blob"]
+        captured[template] = rig.eng.blobs.get(blob)
+    assert probe.credentials_carried(captured[CORS_SURFACE]) == ("cookie",)
+    assert probe.credentials_carried(captured[REFLECTING_SURFACE]) == ("cookie",)
+    assert probe.credentials_carried(captured["/login"]) == (), (
+        "the control surface is not anonymous, so it controls for nothing")
+    for template, blob in captured.items():
+        assert SESSION_COOKIE_VALUE.encode() not in blob, (
+            f"{template}'s blob holds the live session value; redaction runs "
+            "before the digest, so this is not recoverable afterwards")
+
+    # GUARD 3: A POINT THE SEND PATH REFUSES IS NOW ON A REAL SURFACE, which
+    # is the other half of the gap this test closes. F2 of the whole-branch
+    # review and the refusal detail fix round 4 appended to its skip had never
+    # been measured end to end, because no captured surface in this suite had
+    # ever carried a cookie.
+    points = insertion.derive(captured[CORS_SURFACE], CORS_SURFACE)
+    assert [(p.kind, probe.unprobeable(p) is not None) for p in points] == \
+        [("cookie", True)], points
+
+    summary = _scan(rig)
+    found = {f["check_id"]: f["id"] for f in _active_findings(rig)}
+    assert set(found) == {"hx.active.cors", "hx.active.reflected-input"}, (
+        "both routes have to be FOUND before one of them is fixed; a fix on a "
+        f"surface nothing was found on retires nothing anyway: {found}")
+    cors_finding = found["hx.active.cors"]
+    assert _observations(rig, cors_finding) == [1]
+
+    # THE CHECK THAT COULD NOT BE HANDED A POINT SAYS WHICH POINT, on the row
+    # an operator reads. `hx.active.reflected-input` is the one check that
+    # declares the `cookie` kind, so it is the one for which `/api/profile`
+    # HAS a point of a kind it wants and every one of them is refused -- the
+    # other three declare `query` and `path_segment` only, find none, and are
+    # skipped `no_insertion_point`, which is a different fact and has its own
+    # key. Measured: {'no_insertion_point': 7, 'no_probeable_insertion_point':
+    # 1} across the three surfaces.
+    assert summary.by_reason.get("no_probeable_insertion_point") == 1, \
+        summary.by_reason
+    refused_row = [r for r in _check_runs(rig, _last_scan_run(rig))
+                   if r["path_template"] == CORS_SURFACE
+                   and r["check_id"] == "hx.active.reflected-input"][0]
+    assert refused_row["verdict"] == "skipped", refused_row
+    assert "a cookie is probed by sending a Cookie header" in \
+        refused_row["reason"], refused_row
+
+    # THE FLAW IS GENUINELY GONE. Not a wall and not a dead target: the route
+    # answers the same 200 and stops reflecting an origin it never heard of,
+    # which is the one thing that makes `Cors.probes` say `clean`.
+    rig.target.fix("hx.active.cors")
+    hits_before = len(rig.target.hits)
+
+    _scan(rig)
+    here = {(r["path_template"], r["check_id"]): r
+            for r in _check_runs(rig, _last_scan_run(rig))
+            if r["check_id"] in ACTIVE_CHECK_IDS}
+    fixed = here[(CORS_SURFACE, "hx.active.cors")]
+    assert fixed["verdict"] == "clean", fixed
+    assert fixed["requests_sent"] > 0, (
+        "the check answered `clean` without sending anything, so what is "
+        f"measured below is not a suppressed retirement: {fixed}")
+    assert len(rig.target.hits) > hits_before, "no probe reached the target"
+
+    # THE ROW SAYS WHICH VIEW IT TESTED. `report._coverage` renders this cell,
+    # and a `clean` with an empty one reads as "tested, clean" -- which S12
+    # calls worse than no report when that is not what happened.
+    assert "UNAUTHENTICATED view" in (fixed["reason"] or ""), fixed
+    assert "['cookie']" in fixed["reason"], fixed
+
+    # THE CONTROL, in the same scan: `/login` was browsed anonymously, so its
+    # `clean` is a real clean that retires exactly as before.
+    control = here[("/login", "hx.active.cors")]
+    assert control["verdict"] == "clean", control
+    assert "UNAUTHENTICATED view" not in (control["reason"] or ""), control
+
+    # AND THE FINDING IS STILL LIVE. `observed = 0` is the retirement, and
+    # this is the assertion the whole test exists for.
+    assert _observations(rig, cors_finding) == [1], (
+        "a probe carrying no session retired a finding on an authenticated "
+        "surface: a client is told a live vulnerability appears fixed on the "
+        f"strength of the logged-out view. {_observations(rig, cors_finding)}")
+
+    # WHERE THEY WOULD HAVE READ IT, and what the page says instead.
+    out = report.render(rig.eng.db, engagement_id=rig.eng.id,
+                        config=rig.eng.config, blobs=rig.eng.blobs)
+    assert "appears fixed" not in out, out
+    assert ("On an authenticated surface, an active check reports but "
+            "retires nothing") in out

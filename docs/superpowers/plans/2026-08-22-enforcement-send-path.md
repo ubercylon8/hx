@@ -28361,6 +28361,19 @@ class Rig:
         The request itself is `browse_through`'s, because a test that has no
         rig needs the identical one -- see it for why the URI is absolute and
         why this is a raw socket.
+
+        `headers` MAY CARRY A COOKIE THAT A PROBE MAY NOT, AND THAT IS S4
+        WORKING AS DESIGNED RATHER THAN A LOOPHOLE. The operator branch of
+        `ProxyGate.decide` is `Policy.decideScopeOnly` -- scope, and nothing
+        after it: no method allowlist, no dangerous-path denylist, and not the
+        Gate, so "an operator's browsing spends no rate token and no budget
+        slot" (that method's own comment). The `unmanaged_credential` refusal
+        is `Sender.decide()`'s and lives on the SEND path. So a browse here is
+        a browser, session and all, while everything hx itself issues is
+        refused a credential header it did not inject. Traffic captured
+        through this method is therefore the only way an AUTHENTICATED surface
+        reaches the store, which is what `hx.scan._unauthenticated_view` reads
+        and what `test_active_checks.py`'s section 5 is built on.
         """
         dest = to or self.target
         return browse_through(port or self.proxy_port, method,
