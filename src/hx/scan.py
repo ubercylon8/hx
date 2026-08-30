@@ -1178,11 +1178,13 @@ class _IdentityBracket:
         `except IdentityDead` yet (Task 8's), they read that sentence as a
         traceback and re-run for ever.
 
-        THE CLASS IS THE WIRE'S OWN WORD, never free text, which is why it is
-        safe to put in a stored `stop_reason` when `_halt_reason` will not
-        store an exception's message. `ProbeSender` keys `refused` on the
-        `error_class` of a refusal frame or on a non-`ok` `outcome`, and both
-        vocabularies are the extension's.
+        THE CLASS IS A CODE-AUTHORED WORD, never free text, which is why it
+        is safe to put in a stored `stop_reason` when `_halt_reason` will not
+        store an exception's message. `ProbeSender` keys `refused` on
+        `BridgeError.error_class` or on a non-`ok` `outcome`, both of which
+        are the extension's own vocabulary, and falls back to the literal
+        `"transport_error"` when a `BridgeError` carries no class. There is
+        no path by which a target's bytes become one of these keys.
 
         "WAS NOT ANSWERED" COVERS BOTH MEMBERS OF THAT VOCABULARY. A
         `identity_origin` or a `budget_exhausted` never reached the target; a
