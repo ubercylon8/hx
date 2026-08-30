@@ -24,9 +24,11 @@ a derivation whenever it runs, and neither side stores one for the other.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 
+from hx import identity as identity_mod
 from hx import insertion as insertion_mod
 from hx import run as run_mod
 from hx.checks import base, probe, registry
@@ -43,6 +45,37 @@ from hx.engagement import now_us
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
 from hx.store import records
+
+
+class IdentityDead(Exception):
+    """The session could not be proved live, so the run stops.
+
+    NOT a verdict and not an `inconclusive` row -- an exception, because
+    there is no honest partial answer here. Master spec section 7 requires
+    the halt in as many words ("on failure the run halts rather than
+    continuing") and the identity design's section 6 gives the reason: the
+    alternative is SILENT. A run that carried on under a dead session would
+    answer `clean` for every surface it touched, and those answers are
+    indistinguishable in the report from an application that genuinely has
+    nothing wrong with it.
+
+    RAISED WHILE THERE IS STILL TRAFFIC TO PREVENT, and only then. The
+    opening canary and every canary that falls due mid-run raise it; the
+    CLOSING canary does not, because at the close there is nothing left to
+    halt -- every request has already been made -- and raising would throw
+    away a completed pass's rows to prevent traffic that no longer exists.
+    Section 11 names the remedy for that case and it is not a halt: "a
+    failing canary downgrades the whole window to `assumed`, so the run
+    under-claims instead of over-claiming, and retires nothing".
+
+    A REFUSED REGISTRATION IS NOT THIS. `BridgeServer.register_identity`
+    raises `BridgeError` (a peer that refused the frame, or one that is
+    gone) and `codec.FrameError` (a credential that cannot be written as
+    itself), and both propagate as themselves: the run stops either way --
+    `run()`'s own `except BaseException` closes the row `error` and re-raises
+    -- and each of those messages says which of the two actually happened,
+    which "could not be proved live" would not.
+    """
 
 
 @dataclass
@@ -92,11 +125,64 @@ class ScanSummary:
     skipped: int = 0
     by_reason: dict = field(default_factory=dict)
     refused: dict = field(default_factory=dict)
+    # `proven` / `assumed` / `dead` for a run that issued under an identity,
+    # None for one that did not -- `hx.identity.IdentityWindow.state_for_run`,
+    # settled by the closing canary.
+    #
+    # THE ONE PLACE THIS BUILD CAN PUT IT. Spec section 6 writes the state on
+    # `exchange`, and that same section's 2026-08-30 amendment records why the
+    # column cannot be written yet: `Capture.java` delivers `via: proxy` and
+    # nothing else, so this build stores no send-path exchange row for a probe
+    # at all. The `run` table has no identity column either. So the run's own
+    # summary object is what carries the fact out to its caller.
+    #
+    # A RUN-LEVEL FACT AND NOT A PER-PROBE ONE, because `IdentityWindow`
+    # collapses to the worst window in the run: one failed canary anywhere
+    # makes the whole run `assumed`, which under-claims rather than
+    # over-claims. The narrower thing section 6's amendment says the
+    # retirement gate actually needs -- "whether every probe a given
+    # `check_run` sent was issued inside a proven window" -- is answered by
+    # this from above rather than from below: a run that is `proven` had every
+    # window in it proven.
+    #
+    # Nothing prints it today: `hx scan` (cli.py) echoes surfaces, checks,
+    # findings, skips and refusals, and this is not one of them.
+    identity_state: str | None = None
+    # The canaries' OWN requests. Section 6: the canary "is counted in
+    # `requests_sent` for the run, because it is a request `hx` put on the
+    # client's system" -- and it belongs to no `check_run` row, because no
+    # check asked for it. Counted beside the probes rather than folded into
+    # them for the reason `refused` is not folded into `by_reason`: a number
+    # an operator reads has to be one they can go and check against a row
+    # that exists.
+    canary_requests: int = 0
 
 
 def run(conn, *, engagement_id, blobs, config, checks=None,
-        surface_filter=None, max_seconds=None, bridge=None) -> ScanSummary:
+        surface_filter=None, max_seconds=None, bridge=None,
+        identity=None) -> ScanSummary:
     """Run the enabled corpus over every surface in the engagement.
+
+    `identity` IS A RESOLVED CREDENTIAL, NEVER A DECLARATION. It is a
+    `hx.identity.Resolved` -- the secret, which spec section 3 keeps off
+    `Config` because `scope_version.yaml` copies a config verbatim into an
+    append-only table. Passing None does NOT mean anonymous: this function
+    then resolves `config.scan_identity` itself (`_resolve_scan_identity`),
+    which is the only thing in the product that reads that field, and
+    anonymous is what it answers when the field is absent.
+
+    WHAT AN IDENTITY BUYS AND WHAT IT COSTS. Every `ProbeSender` this
+    function builds is bound to it, so every probe of the run issues under
+    one session; and the run is BRACKETED by canaries (section 6), so a
+    session that dies mid-run is caught rather than producing hours of
+    unauthenticated traffic every check reads as "not vulnerable". A canary
+    that cannot be satisfied raises `IdentityDead` out of this function
+    rather than letting the pass continue.
+
+    A CHECK STILL KNOWS NOTHING ABOUT ANY OF IT (section 8). It is handed a
+    sender already bound, exactly as it is handed one already bound to a
+    surface, and cannot choose an identity, read one, or ask whether one
+    applied.
 
     `bridge` IS TAKEN, NEVER BUILT. It is a `hx.bridge.server.BridgeServer`
     already connected to a live extension, and this function has no business
@@ -156,6 +242,22 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
             " exemplar_exchange_id FROM surface WHERE engagement_id=?"
             " ORDER BY host, path_template, method", (engagement_id,)).fetchall()
 
+        # INSIDE THE TRY, so that a run halted over a dead session closes its
+        # own row `error` with the halt named in `stop_reason` -- S5's "an
+        # aborted run must never render as a clean one" -- rather than
+        # leaving a `running` row for `reap_stale` to guess about. AFTER the
+        # surfaces are read, because the opening canary is ordinary traffic
+        # and needs an address to go to, and the run's own first surface is
+        # the one host it is certain to be probing.
+        bracket = _identity_bracket(bridge, config, identity, checks,
+                                    surfaces, surface_filter, summary)
+        if bracket is not None:
+            bracket.start()
+        # Read once: a refresh mints a new credential at a new generation but
+        # never a new id, so this is stable for the life of the run even
+        # though `bracket.resolved` is not.
+        identity_id = None if bracket is None else bracket.identity_id
+
         seen_findings: set[str] = set()
         # (surface_id, check_id, issue_type_id) this run examined AND may
         # speak for the client's own view of. Retirement reads this, NOT
@@ -208,6 +310,18 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
             insertions = None
 
             for check in checks:
+                # THE CANARY GOES BETWEEN CHECKS, AND HERE IS WHY IT IS AT
+                # THE TOP OF THIS LOOP RATHER THAN AFTER THE ROW CLOSES: a
+                # probing row closes at three places (a verdict, a refusal, a
+                # crash) and two of them `continue` out of the loop body, so
+                # a call sited after them would be reached by one path in
+                # three. `_spent` -- which all three call, exactly once per
+                # row -- is what counts the probes toward the next canary;
+                # this is what acts on the count. Raises `IdentityDead` for a
+                # session that cannot be proved live again, before the next
+                # check sends anything.
+                if bracket is not None:
+                    bracket.canary_if_due()
                 row_id = _open_row(conn, run_id, surface, check)
                 summary.checks_run += 1
                 # DISPATCH ON THE HOOK, NOT ON `check.klass`. `registry.
@@ -445,7 +559,8 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             continue
                         sender = probe.ProbeSender(
                             bridge, scheme=surface[2], host=surface[3],
-                            port=surface[4], path=probe_path)
+                            port=surface[4], path=probe_path,
+                            identity_id=identity_id)
                         verdict = check.probes(ctx, surface, usable, sender)
                     else:
                         verdict = check.on_surface(ctx, surface, exchanges)
@@ -522,16 +637,23 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                     # `hx.checks.probe`'s `_NOT_ISSUED`.
                     _close_row(conn, row_id, "inconclusive",
                                f"probe refused: {exc}",
-                               requests_sent=_spent(summary, sender))
+                               requests_sent=_spent(summary, sender, bracket))
                     continue
                 except Exception as exc:                    # noqa: BLE001
                     _close_row(conn, row_id, "error",
                                f"{type(exc).__name__}: {exc}",
-                               requests_sent=_spent(summary, sender))
+                               requests_sent=_spent(summary, sender, bracket))
                     continue
                 _close_row(conn, row_id, verdict.state, reason,
-                           requests_sent=_spent(summary, sender))
+                           requests_sent=_spent(summary, sender, bracket))
 
+        if bracket is not None:
+            # BEFORE `_mark_unobserved`, and that ordering is load-bearing.
+            # The closing canary is what settles the run's state -- a window
+            # is only proof if BOTH its canaries passed -- and retirement is
+            # the last thing this function does that a state could change.
+            bracket.finish()
+            summary.identity_state = bracket.state
         _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
     except BaseException as exc:
         # Left `running` here would mean the NEXT scan.run() call inherits
@@ -584,6 +706,294 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     run_mod.close_run(conn, run_id=run_id, status="completed",
                       stop_reason=stop_reason)
     return summary
+
+
+# --- the identity a run issues under --------------------------------------
+
+
+def _identity_bracket(bridge, config, identity, checks, surfaces,
+                      surface_filter, summary):
+    """The identity in force for this run, or None for an anonymous one.
+
+    THREE WAYS TO GET NONE, and each of them means "this run issues nothing
+    under an identity" rather than "the identity was ignored":
+
+      * no bridge. Every probing check is about to be skipped `no_bridge` --
+        `run()` has no route to the wire at all -- so there is no traffic to
+        bracket, and reading a credential out of the environment for a run
+        that cannot send one would be a resolution failure an operator could
+        do nothing about.
+      * no check the runner drives through the wire. `needs_a_bridge` is the
+        same question `hx scan` asks before it pays for a JVM; a canary here
+        would be two requests on a client's system bought for a pass that
+        sends nothing else.
+      * nothing declared. No `identity=` and no `config.scan_identity`.
+
+    A FOURTH IS DELIBERATELY NOT ONE: a run with no surfaces to probe still
+    resolves and registers nothing, because the loop below it never runs --
+    that falls out of the empty `surfaces` list, and the canary would have
+    nowhere to be addressed to anyway.
+    """
+    if bridge is None or not any(needs_a_bridge(c) for c in checks):
+        return None
+    resolved = identity if identity is not None else _resolve_scan_identity(config)
+    if resolved is None:
+        return None
+    target = next((s for s in surfaces
+                   if surface_filter is None or surface_filter(s)), None)
+    if target is None:
+        return None
+    return _IdentityBracket(bridge, resolved, _declaration(config, resolved.id),
+                            target=target, origins=tuple(config.scope_include),
+                            summary=summary)
+
+
+def _resolve_scan_identity(config):
+    """The identity `config.scan_identity` names, resolved, or None.
+
+    THE ONLY READER OF THAT FIELD IN THE PRODUCT. Spec section 4 gives an
+    operator `scan_identity: user` and the loader validates that it names a
+    declared identity; without this, that would be a config key nothing acts
+    on, which is the state section 1 opens by complaining about ("`config.
+    yaml` accepts an `identities` block that nothing reads").
+
+    THE ENVIRONMENT IS READ HERE AND NOWHERE ELSE ON THIS PATH. `resolve`
+    takes the mapping as an argument precisely so that the read is at a call
+    site rather than buried in the resolver, and the value it returns is a
+    `Resolved` -- which never touches `Config` and never reaches
+    `scope_version.yaml`.
+
+    A PROGRAMMATIC IDENTITY IS MINTED, NOT READ. It has no `value_from_env`
+    to resolve (`resolve` refuses one by name), so its first credential comes
+    from the same command a refresh would run. Generation 0 is the
+    "nothing registered yet" value: `refresh` returns `generation + 1`
+    unconditionally, so the first mint is generation 1 -- the same number
+    `resolve` gives a static identity, and the lowest `codec.identity_body`
+    will carry.
+    """
+    if config.scan_identity is None:
+        return None
+    declared = _declaration(config, config.scan_identity)
+    if declared.strategy == "static":
+        return identity_mod.resolve(declared, dict(os.environ))
+    return identity_mod.refresh(declared, 0)
+
+
+def _declaration(config, identity_id):
+    """The `Identity` declaration behind an id, which must exist.
+
+    A `Resolved` carries the credential and not the liveness proof, so the
+    canary, the refresh command and `every_n_probes` all come from the
+    config's own declaration. An id with none is a caller's mistake rather
+    than an operator's: `config.load_text` refuses a `scan_identity` naming
+    an undeclared identity, so this is only reachable by passing `identity=`
+    a `Resolved` this config never declared -- and section 4 requires a
+    liveness block for every identity precisely because one without a proof
+    could never be `proven`.
+    """
+    declared = config.identities.get(identity_id)
+    if declared is None:
+        raise ValueError(
+            f"identity {identity_id!r} is not declared in this config, so it "
+            "has no liveness proof and a run cannot be bracketed by one. "
+            f"Declared: {sorted(config.identities) or 'none'}")
+    return declared
+
+
+class _IdentityBracket:
+    """One run's identity, and the canaries that bracket its traffic.
+
+    SPEC SECTION 6 IS THE WHOLE OF THIS CLASS. A canary at the start of a run
+    proves the session was live AT THE START and says nothing about the
+    request issued an hour later, so `proven` is a property of a window
+    bracketed by two passing canaries: one at the start, one every
+    `every_n_probes` probes, one at the end always. `hx.identity.
+    IdentityWindow` holds that bookkeeping; this holds the traffic and the
+    decisions.
+
+    THE WINDOW IS OPENED ONCE PER BRACKET, WITH THE SETTLED RESULT. `open()`
+    latches its FIRST argument for the life of the run -- the run either had
+    a proved starting point or it did not -- so a driver that called it once
+    per raw canary attempt would record `dead` for a run that failed its
+    opening canary, refreshed, passed, and by section 6's table CONTINUES.
+    `_settle` therefore does the refresh-and-re-canary dance first and
+    returns both halves of the answer: what the canary said, and what it said
+    once the one refresh a programmatic identity gets had been tried.
+
+    THE TWO HALVES ARE USED FOR DIFFERENT THINGS, and that is not a
+    duplication. The settled half decides whether the run goes on; the raw
+    half decides what to say about the window that just ENDED, because a
+    canary that failed means the traffic behind it was issued into an unknown
+    state whether or not a refresh then brought the session back. Section 6:
+    "When a canary fails, every exchange back to the last passing canary is
+    downgraded from `proven` to `assumed`."
+    """
+
+    def __init__(self, bridge, resolved, declared, *, target, origins,
+                 summary) -> None:
+        self._bridge = bridge
+        self._declared = declared
+        # (scheme, host, port) from the run's own first surface. The canary is
+        # ordinary traffic and needs an address; `liveness.path` is
+        # origin-form (the config loader refuses anything else), so the origin
+        # comes from a surface this run is actually going to probe rather than
+        # from a scope pattern, which may be a glob with no host in it. A run
+        # spanning several hosts proves its session on this one -- section 6
+        # defines a canary per identity, not per host.
+        self._target = (target[2], target[3], target[4])
+        # Section 5: `origins` bounds where the credential may be applied and
+        # "defaults to the hosts in `scope.include`". The extension reads the
+        # host out of each entry (`Sender.hostOf`: everything after `://` and
+        # before the first `/`, `:` or `?`), so a URL-prefix pattern bounds
+        # the credential to that host and a pattern with no host in it bounds
+        # it to nothing -- fail-closed, and visible as an `identity_origin`
+        # refusal rather than as a credential going somewhere it should not.
+        self._origins = origins
+        self._summary = summary
+        self.resolved = resolved
+        self.window = identity_mod.IdentityWindow(
+            due_every=declared.liveness.every_n_probes)
+        self._due = False
+
+    @property
+    def identity_id(self) -> str:
+        return self.resolved.id
+
+    @property
+    def state(self) -> str:
+        return self.window.state_for_run()
+
+    def start(self) -> None:
+        """Register the credential, prove the session, open the window.
+
+        The registration is NOT wrapped: `register_identity` raises
+        `BridgeError` or `codec.FrameError` and each says what actually
+        happened -- see `IdentityDead`'s own docstring.
+        """
+        self._bridge.register_identity(self.resolved, origins=self._origins)
+        _raw, settled = self._settle()
+        self.window.open(passed=settled)
+        if not settled:
+            raise IdentityDead(
+                f"identity {self.resolved.id!r} could not be proved live "
+                f"before the first probe: {self._declared.liveness.path} did "
+                "not answer with the signature this identity is declared to "
+                "prove itself by. Halting rather than scanning anonymously: "
+                "an unauthenticated run of an authenticated application "
+                "answers `clean` about a view none of its users are in")
+
+    def note(self, probes: int) -> None:
+        """Count probes issued inside the current window.
+
+        Called once per `check_run` row with what that row's sender issued,
+        so the canary falls due AT A CHECK BOUNDARY rather than between two
+        probes of one check: a check that sends 60 probes with
+        `every_n_probes` at 25 draws one canary after it, not two during it.
+        `note_probe` resets its own counter each time it comes due, so the
+        remainder carries into the next window and the schedule does not
+        drift.
+        """
+        for _ in range(probes):
+            if self.window.note_probe():
+                self._due = True
+
+    def canary_if_due(self) -> None:
+        """The mid-run canary, if `every_n_probes` have gone by.
+
+        A failure closes the window that just ended as unproven WHETHER OR
+        NOT the refresh below rescues the run -- section 6's downgrade -- and
+        a session that cannot be brought back halts the run here, with probes
+        still to come.
+        """
+        if not self._due:
+            return
+        self._due = False
+        raw, settled = self._settle()
+        self.window.close(passed=raw)
+        if not settled:
+            raise IdentityDead(
+                f"identity {self.resolved.id!r} stopped being live during the "
+                f"run: {self._declared.liveness.path} no longer answers with "
+                "the signature it is declared to prove itself by. Halting "
+                "rather than issuing the rest of this run's probes "
+                "unauthenticated, which would answer `clean` for every "
+                "surface still to come")
+        self.window.open(passed=True)
+
+    def finish(self) -> None:
+        """The closing canary, which always runs and never halts.
+
+        Section 6 requires one at the end of the run "always, even if no
+        probe was sent since the last one", because a window is only proof if
+        BOTH its canaries passed. It does not raise: see `IdentityDead`.
+
+        No refresh either, and for the same reason -- a refresh exists to
+        keep the run's remaining traffic authenticated, and there is none.
+        Renewing the session here would be a request on a client's system
+        that buys nothing, and it would also hide the failure this canary
+        exists to report.
+        """
+        self.window.close(passed=self._canary())
+
+    def _settle(self) -> tuple[bool, bool]:
+        """`(what the canary said, what it said after the one refresh)`.
+
+        Section 6's outcome table, implemented literally. A passing canary
+        settles as itself. A failing one on a `static` identity settles as
+        itself too -- there is no command to run -- and the caller halts. A
+        failing one on a `programmatic` identity gets exactly one refresh,
+        re-registered AT THE NEW GENERATION, and the canary is asked again.
+
+        THE NEW GENERATION IS WHAT MAKES THE RE-REGISTRATION MEAN ANYTHING.
+        `IdentityRegistry.register` keeps the entry it already holds for an
+        EQUAL generation ("a second frame at the SAME generation carrying a
+        DIFFERENT credential swapped it silently: a content change that never
+        advanced the counter whose whole job is to gate content changes") and
+        refuses a lower one. So a refresh that did not advance would be
+        accepted, change nothing, and leave the run issuing under the dead
+        credential -- which is why `hx.identity.refresh` returns
+        `generation + 1` unconditionally.
+        """
+        raw = self._canary()
+        if raw or self._declared.strategy != "programmatic":
+            return raw, raw
+        try:
+            self.resolved = identity_mod.refresh(self._declared,
+                                                 self.resolved.generation)
+        except identity_mod.IdentityError as exc:
+            # The session is dead and cannot be renewed, which is this
+            # exception's own subject -- the cause is chained, so the
+            # command's exit code or its empty output is still in the
+            # traceback an operator reads.
+            raise IdentityDead(
+                f"identity {self.resolved.id!r} failed its canary and could "
+                f"not be refreshed: {exc}") from exc
+        self._bridge.register_identity(self.resolved, origins=self._origins)
+        return raw, self._canary()
+
+    def _canary(self) -> bool:
+        """One liveness request, through the ordinary send path.
+
+        Section 6: "The canary is ordinary traffic. It goes through the send
+        path like any other request, carries the identity, and is subject to
+        scope, the method allowlist, the rate limit and the budget." So it is
+        a `ProbeSender` like a check's -- which also means a refusal is a
+        FAILURE and not an exception (`hx.identity.canary` catches
+        `ProbeRefused`): a canary that could not be sent has proved nothing.
+
+        A FRESH SENDER PER CANARY, so `sent` and `refused` are this canary's
+        own. `_spent` folds the refusals into the run's tally -- a canary
+        that drew `budget_exhausted` is a truncated pass and the run row says
+        so -- and is passed no bracket, because a canary is not a probe.
+        """
+        scheme, host, port = self._target
+        sender = probe.ProbeSender(
+            self._bridge, scheme=scheme, host=host, port=port,
+            path=self._declared.liveness.path, identity_id=self.resolved.id)
+        try:
+            return identity_mod.canary(self._declared.liveness, sender)
+        finally:
+            self._summary.canary_requests += _spent(self._summary, sender)
 
 
 def _exchanges_for(conn, surface_id):
@@ -855,15 +1265,21 @@ def _skip(conn, row_id, summary, key, reason) -> None:
     summary.by_reason[key] = summary.by_reason.get(key, 0) + 1
 
 
-def _spent(summary, sender) -> int:
+def _spent(summary, sender, bracket=None) -> int:
     """What this check's sender issued, folding what it was refused into the
-    run's tally on the way past.
+    run's tally -- and its issuances into the identity window -- on the way
+    past.
 
     ONE CALL PER ROW, at each of the three places a probing row can close.
     `requests_sent` and `summary.refused` are two halves of the same fact --
     what this check spent, and what it did not get to spend -- and reading
     them at one point is what keeps the second from being counted twice or
-    missed on the `error` path.
+    missed on the `error` path. THE WINDOW IS COUNTED HERE FOR THAT SAME
+    REASON: spec section 6 puts a canary every `every_n_probes` PROBES, and
+    this is the one place that sees every probe a row issued however the row
+    ended. `bracket` is None for an anonymous run and for the canary's own
+    sender -- a canary is not a probe, and counting it toward the schedule
+    it is itself running would be a canary counting itself down.
 
     THE RUNNER CANNOT SEE THESE REFUSALS ANY MORE, which is why they are read
     off the sender rather than counted where `except ProbeRefused` sits.
@@ -875,6 +1291,8 @@ def _spent(summary, sender) -> int:
         return 0
     for cls, n in sender.refused.items():
         summary.refused[cls] = summary.refused.get(cls, 0) + n
+    if bracket is not None:
+        bracket.note(sender.sent)
     return sender.sent
 
 

@@ -54,6 +54,10 @@ class FakeBridge:
         # a claim about all of them -- `last_body` alone would let four
         # requests out of five go unlooked at.
         self.bodies: list[bytes] = []
+        # And every send HEADER, for the same reason: "every probe of this
+        # run issued under the identity" is a claim about all of them, and
+        # `last_req` alone cannot tell one bound probe from ten.
+        self.requests: list[dict] = []
 
     def reply(self, header: dict, body: bytes = b"") -> None:
         self._header = header
@@ -72,6 +76,7 @@ class FakeBridge:
         self.last_req = req
         self.last_body = body
         self.bodies.append(body)
+        self.requests.append(dict(req))
         if self._refusal is not None and self._refusals_left != 0:
             if self._refusals_left is not None:
                 self._refusals_left -= 1
@@ -501,3 +506,86 @@ def test_unmanaged_credential_is_not_counted_as_a_request():
     assert exc.value.reason == "unmanaged_credential"
     assert s.sent == 0
     assert "unmanaged_credential" in probe._NOT_ISSUED
+
+
+# --- the identity a probe issues under ------------------------------------
+#
+# The sender carries the identity's ID and nothing else: the credential lives
+# in the extension's registry (`IdentityRegistry`, registered by
+# `BridgeServer.register_identity`) and is written into the request there,
+# after every gate. So what these tests can see at this seam is the ID in the
+# send frame -- which is the whole of what this side decides.
+
+
+def test_a_bound_identity_rides_in_the_send_frame():
+    fb = FakeBridge()
+    _ok(fb)
+    s = probe.ProbeSender(fb, scheme="https", host="app.test", port=443,
+                          path="/a", identity_id="user")
+    s.get("/a")
+    assert fb.last_req["identity_id"] == "user"
+
+
+def test_an_unbound_sender_sends_no_identity_id_at_all():
+    """Not `None`: ABSENT. `Sender.decideAndIssue` reads the field as
+    `header.get("identity_id") instanceof String`, so a null is anonymous
+    there today -- but that is the extension's reading of a value this side
+    had no business sending. Anonymous is the SHAPE of the frame, not a value
+    in it, and a key that is only ever present when it means something cannot
+    acquire a second meaning later."""
+    fb = FakeBridge()
+    _ok(fb)
+    s = _sender(fb)
+    s.get("/a")
+    assert "identity_id" not in fb.last_req
+    assert fb.last_req == {"target_host": "app.test", "target_port": 443,
+                           "tls": True}
+
+
+def test_every_probe_of_a_bound_sender_carries_the_identity_not_just_the_first():
+    """`requests` is every frame, for the reason `bodies` is: a check probes
+    once per insertion point, and an identity that reached the first request
+    and not the rest would leave every probe after it answering about the
+    logged-out view."""
+    fb = FakeBridge()
+    _ok(fb)
+    s = probe.ProbeSender(fb, scheme="https", host="app.test", port=443,
+                          path="/a", identity_id="user")
+    s.get("/a?q=1")
+    s.get("/a?q=2")
+    s.get("/a?q=3")
+    assert [r.get("identity_id") for r in fb.requests] == ["user"] * 3
+
+
+@pytest.mark.parametrize("cls", ["unknown_identity", "identity_origin"])
+def test_an_identity_refusal_is_a_refusal_like_any_other(cls):
+    """Both are `error` frames from `Sender.decideAndIssue` like any other
+    class, so `get()` raises rather than returning -- a check that could read
+    one as a response would carry on to `clean` about a request that never
+    left."""
+    fb = FakeBridge()
+    fb.refuse(cls)
+    s = probe.ProbeSender(fb, scheme="https", host="app.test", port=443,
+                          path="/a", identity_id="user")
+    with pytest.raises(probe.ProbeRefused) as exc:
+        s.get("/a")
+    assert exc.value.reason == cls
+
+
+@pytest.mark.parametrize("cls", ["unknown_identity", "identity_origin"])
+def test_neither_identity_refusal_counts_as_a_request(cls):
+    """READ OFF `Sender.decideAndIssue`, which decides both AFTER
+    `policy.checkGate` -- so unlike `unmanaged_credential` they do spend a
+    rate token and a budget slot inside the JVM (`Limiter.check` increments
+    `issued` on the allow path, and the gate allowed). What they do not do is
+    reach the target: `compose()` and `http.send` are below the two
+    `return error(...)` lines. `requests_sent` is this build's record of what
+    hx put on a CLIENT'S system, so neither belongs in it."""
+    fb = FakeBridge()
+    fb.refuse(cls)
+    s = probe.ProbeSender(fb, scheme="https", host="app.test", port=443,
+                          path="/a", identity_id="user")
+    with pytest.raises(probe.ProbeRefused):
+        s.get("/a")
+    assert s.sent == 0
+    assert cls in probe._NOT_ISSUED
