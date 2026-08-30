@@ -13,13 +13,22 @@ the secret, and the two never meet in a serialiser.
 `Resolved.__repr__` is overridden for the same reason at a smaller scale: a
 dataclass repr would put a live session cookie into every traceback that
 happens to hold one.
+
+This module also holds the liveness canary (`canary`) and the bracketed-window
+bookkeeping (`IdentityWindow`) that decides whether a run's traffic was issued
+while the session was proved live -- not because either shares a type with the
+credential machinery above, but because both are downstream of one `Identity`
+declaration and Task 6 was scoped to append to this file rather than open a
+third module for one function and one class. Nothing above this line is
+implied to be all this file will ever hold.
 """
 from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
 
-from hx.config import Identity
+from hx.checks import probe
+from hx.config import Identity, Liveness
 
 
 class IdentityError(Exception):
@@ -96,3 +105,110 @@ def refresh(ident: Identity, generation: int) -> Resolved:
             "credential is not a credential")
     return Resolved(id=ident.id, header=ident.inject.header, value=value,
                     generation=generation + 1)
+
+
+def canary(liveness: Liveness, sender) -> bool:
+    """Is this session still logged in?
+
+    STATUS IS NECESSARY AND NOWHERE NEAR SUFFICIENT. An application that
+    answers a logged-out request with a 200 login PAGE is the shape no
+    response-status rule can catch. `hx.scan._retirable`'s own docstring
+    calls it out by number: six ways an active check could call a probe
+    `clean` off nothing were closed by the status doctrine, an eighth was
+    closed the same way a round later, and the SEVENTH -- this one -- was not,
+    because "a fixture whose anonymous view differs from its anonymous view
+    does not exist" and so could never be measured against the corpus. That
+    is the open hazard `_retirable` refuses all active-check retirement over
+    today, and the reason `expect_body` is required by the config loader and
+    checked here rather than left to a status code: re-enabling retirement on
+    a proof a login page satisfies would hand the hazard back wearing a
+    stamp.
+
+    A refusal (`probe.ProbeRefused`) is a FAILURE, not an exception to
+    propagate: a canary that could not be sent has proved nothing, and the
+    caller's next move -- treat the session as unproven -- is the same as if
+    it had come back and failed. Any other exception (a malformed
+    `liveness.path`, for instance) is a programming error in the caller and
+    is left to propagate; swallowing it here would read as "session dead"
+    when the actual fault is a config that was never sendable.
+    """
+    try:
+        resp = sender.get(liveness.path)
+    except probe.ProbeRefused:
+        return False
+    if resp.status is None or not (200 <= resp.status < 300):
+        return False
+    body = resp.body or b""
+    if liveness.expect_body.encode("utf-8", "replace") not in body:
+        return False
+    if (liveness.expect_absent is not None
+            and liveness.expect_absent.encode("utf-8", "replace") in body):
+        return False
+    return True
+
+
+class IdentityWindow:
+    """Whether this run's traffic was issued while the session was proved live.
+
+    A canary at the start of a run proves the session was live AT THE START.
+    It says nothing about the request issued an hour later, and spec section
+    6's own motivating case is exactly that: an SSO session dying at 01:50
+    produces six hours of unauthenticated traffic that every check reads as
+    not vulnerable. Stamping those six hours `proven` on the strength of an
+    01:00 canary would be worse than having no proof, because the proof is
+    what Task 8's retirement gate reads.
+
+    So a window is BRACKETED: it opens on a canary result and closes on the
+    next one, and only a window closed by a PASS is proof of anything. Three
+    states, and only three:
+
+      - the window never opened, or the run's first canary failed -> `dead`
+        (the run could not even start proved)
+      - it opened cleanly, and some later canary failed -> `assumed`
+      - it opened cleanly, and nothing ever failed -> `proven`
+
+    A run's state collapses to the WORST window in it, not the last one: any
+    failure anywhere downgrades the whole run to `assumed`, because the
+    retirement gate in Task 8 is decided per run (a `check_run`'s probes may
+    span more than one window) and a finding retired on this run's evidence
+    could sit on a surface probed inside the one window that came back
+    unproven. The run under-claims rather than over-claims.
+    """
+
+    def __init__(self, *, due_every: int) -> None:
+        self.due_every = due_every
+        self._since = 0
+        # None: never opened. False: the run's first canary failed outright,
+        # which is `dead` and stays `dead` no matter what a later open/close
+        # does -- the run never had a proved starting point to stand on.
+        self._first_open_passed: bool | None = None
+        self._any_failure = False
+
+    def open(self, *, passed: bool) -> None:
+        if self._first_open_passed is None:
+            self._first_open_passed = passed
+        if not passed:
+            self._any_failure = True
+        self._since = 0
+
+    def note_probe(self) -> bool:
+        """Count one probe issued inside the current window.
+
+        True when `due_every` probes have been counted since the window last
+        opened or last came due, meaning a canary is now due before another
+        probe goes out.
+        """
+        self._since += 1
+        if self._since >= self.due_every:
+            self._since = 0
+            return True
+        return False
+
+    def close(self, *, passed: bool) -> None:
+        if not passed:
+            self._any_failure = True
+
+    def state_for_run(self) -> str:
+        if not self._first_open_passed:        # None or False
+            return "dead"
+        return "assumed" if self._any_failure else "proven"
