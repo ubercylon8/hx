@@ -715,33 +715,35 @@ def _identity_bracket(bridge, config, identity, checks, surfaces,
                       surface_filter, summary):
     """The identity in force for this run, or None for an anonymous one.
 
-    THREE WAYS TO GET NONE, and each of them means "this run issues nothing
-    under an identity" rather than "the identity was ignored":
+    FOUR WAYS TO GET NONE, and every one of them means "this run issues
+    nothing under an identity" rather than "the identity was ignored":
 
-      * no bridge. Every probing check is about to be skipped `no_bridge` --
-        `run()` has no route to the wire at all -- so there is no traffic to
-        bracket, and reading a credential out of the environment for a run
-        that cannot send one would be a resolution failure an operator could
-        do nothing about.
+      * no bridge. `run()` has no route to the wire at all and every probing
+        check is about to be skipped `no_bridge`, so there is no traffic to
+        bracket.
       * no check the runner drives through the wire. `needs_a_bridge` is the
-        same question `hx scan` asks before it pays for a JVM; a canary here
-        would be two requests on a client's system bought for a pass that
+        same question `hx scan` asks before it pays for a JVM; a bracket here
+        would put two canary requests on a client's system for a pass that
         sends nothing else.
+      * no surface this run will probe. The canary is ordinary traffic and
+        needs an address, and there is no honest one to invent for a run with
+        nowhere to send anything.
       * nothing declared. No `identity=` and no `config.scan_identity`.
 
-    A FOURTH IS DELIBERATELY NOT ONE: a run with no surfaces to probe still
-    resolves and registers nothing, because the loop below it never runs --
-    that falls out of the empty `surfaces` list, and the canary would have
-    nowhere to be addressed to anyway.
+    ASKED IN THAT ORDER, CHEAPEST AND MOST INERT FIRST. Resolution is last
+    because it is the only step with a side effect outside this process: a
+    static identity reads the environment and RAISES when the variable is
+    missing, and a programmatic one runs the operator's refresh command. A
+    run that was never going to send should do neither.
     """
     if bridge is None or not any(needs_a_bridge(c) for c in checks):
-        return None
-    resolved = identity if identity is not None else _resolve_scan_identity(config)
-    if resolved is None:
         return None
     target = next((s for s in surfaces
                    if surface_filter is None or surface_filter(s)), None)
     if target is None:
+        return None
+    resolved = identity if identity is not None else _resolve_scan_identity(config)
+    if resolved is None:
         return None
     return _IdentityBracket(bridge, resolved, _declaration(config, resolved.id),
                             target=target, origins=tuple(config.scope_include),
@@ -838,8 +840,9 @@ class _IdentityBracket:
         # origin-form (the config loader refuses anything else), so the origin
         # comes from a surface this run is actually going to probe rather than
         # from a scope pattern, which may be a glob with no host in it. A run
-        # spanning several hosts proves its session on this one -- section 6
-        # defines a canary per identity, not per host.
+        # spanning several hosts proves its session on this one: an identity
+        # declares ONE `liveness` block (section 4), so its proof is per
+        # identity and not per host.
         self._target = (target[2], target[3], target[4])
         # Section 5: `origins` bounds where the credential may be applied and
         # "defaults to the hosts in `scope.include`". The extension reads the
@@ -889,9 +892,12 @@ class _IdentityBracket:
         so the canary falls due AT A CHECK BOUNDARY rather than between two
         probes of one check: a check that sends 60 probes with
         `every_n_probes` at 25 draws one canary after it, not two during it.
-        `note_probe` resets its own counter each time it comes due, so the
-        remainder carries into the next window and the schedule does not
-        drift.
+        The count then restarts FROM that canary rather than carrying a
+        remainder: `note_probe` zeroes its own counter each time it comes
+        due, and `IdentityWindow.open` zeroes it again when the next window
+        opens. So `every_n_probes` bounds how much traffic one undetected
+        death can contaminate -- which is what section 6 asks of it -- rather
+        than fixing the exact request a canary lands on.
         """
         for _ in range(probes):
             if self.window.note_probe():
@@ -982,9 +988,9 @@ class _IdentityBracket:
         `ProbeRefused`): a canary that could not be sent has proved nothing.
 
         A FRESH SENDER PER CANARY, so `sent` and `refused` are this canary's
-        own. `_spent` folds the refusals into the run's tally -- a canary
-        that drew `budget_exhausted` is a truncated pass and the run row says
-        so -- and is passed no bracket, because a canary is not a probe.
+        own. `_spent` folds those refusals in where the probes' are counted,
+        rather than letting them vanish because no `check_run` row owns them,
+        and is passed no bracket, because a canary is not a probe.
         """
         scheme, host, port = self._target
         sender = probe.ProbeSender(
