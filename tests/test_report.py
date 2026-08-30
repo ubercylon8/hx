@@ -2532,10 +2532,19 @@ def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honou
     round 6 removed it from the active corpus outright, because that
     predicate keyed on the first sighting and could see only a header name.
 
+    AND SINCE TASK 8 THE PAGE SAYS IT OF THIS ENGAGEMENT, NOT OF THE BUILD.
+    `_limits` reads `run.identity_state`, and no run in this fixture carries
+    one -- every scan of it issued anonymously -- so the unconditional
+    sentence above is what renders. The engagement whose scans DID prove a
+    session live gets the other pair of bullets, and
+    `test_the_limits_bullet_is_conditional_on_a_proven_identity` is that
+    render.
+
     The page claims a BEHAVIOUR of the runner, and this ties the two
     together: the sentence, and then `scan._retirable` asked the two
-    questions the sentence rests on. Make it return a probing check's
-    `considered` and this fails, naming the bullet that has to go with it."""
+    questions the sentence rests on, in the state this fixture is in. Make it
+    return a probing check's `considered` for an anonymous run and this
+    fails, naming the bullet that has to go with it."""
     limits = report.render(**report_env_with_blobs)
     limits = limits[limits.index("## Limits"):]
     assert "An active finding is never automatically marked as fixed" in limits
@@ -2543,13 +2552,13 @@ def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honou
             "before closing it") in limits
 
     considered = ("some-issue-type",)
-    assert scan._retirable(scan._PROBE_HOOK,
-                           base.Verdict.clean()) == (), (
+    assert scan._retirable(scan._PROBE_HOOK, base.Verdict.clean(),
+                           identity_state=None) == (), (
         "the Limits page tells a client no active finding is ever closed, "
         "and the runner enters one for retirement")
-    with pytest.raises(ValueError):
-        scan._retirable(scan._PROBE_HOOK,
-                        base.Verdict.clean(considered=considered))
+    assert scan._retirable(scan._PROBE_HOOK,
+                           base.Verdict.clean(considered=considered),
+                           identity_state=None) == ()
 
     # AND THE OTHER DIRECTION, which is what keeps the bullet honest rather
     # than merely safe: the page says this of the ACTIVE checks, and the
@@ -2557,8 +2566,8 @@ def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honou
     # emptied both would make the whole document's retest story a lie in the
     # other direction.
     assert scan._retirable("on_surface",
-                           base.Verdict.clean(considered=considered)) == \
-        considered
+                           base.Verdict.clean(considered=considered),
+                           identity_state=None) == considered
 
 
 def test_the_unauthenticated_bullet_says_the_login_page_costs_coverage_only(

@@ -117,6 +117,18 @@ def _last_verdict(conn):
         "SELECT verdict FROM check_run ORDER BY rowid DESC LIMIT 1").fetchone()[0]
 
 
+def _latest_row(conn):
+    """The most recently written `check_run` row, whole.
+
+    `_row` takes the FIRST row for a check id, which is the right answer for
+    a one-scan test and the wrong one for the two-scan tests below that
+    assert what the SECOND pass wrote -- `_last_verdict` exists for the same
+    reason and returns only the verdict."""
+    return conn.execute(
+        "SELECT verdict, reason, requests_sent FROM check_run"
+        " ORDER BY rowid DESC LIMIT 1").fetchone()
+
+
 def _row(conn, check_id=None):
     if check_id is None:
         return conn.execute(
@@ -1406,18 +1418,26 @@ def test_the_verdict_and_the_row_are_exactly_what_the_check_said(tmp_path):
     assert reason is None, reason
 
 
-def test_an_active_check_that_populates_considered_is_an_error_row(tmp_path):
-    """THE RUNNER REFUSES IT RATHER THAN DROPPING IT, and this is the half a
-    future active check meets. The five shipped checks name what they
-    examined to `_probe_util.verdict` as `examined`, which never reaches
-    `Verdict.considered` -- so a probing check arriving here with a populated
-    one is an author who believed it would retire something, and silently
-    discarding it would leave that belief in the tree unfalsified. It lands
-    as an `error` row through `run`'s per-check `except Exception`: loud,
-    scoped to the one check, and retiring nothing.
+def test_an_active_checks_considered_is_dropped_and_not_an_error_row(tmp_path):
+    """WHAT REPLACED THE RAISE, and why it had to go.
 
-    The message names both ends, because an author reading it has to know
-    where to put the value instead."""
+    Until Task 8 a probing check arriving at `_retirable` with a non-empty
+    `considered` was a `ValueError` -- `run`'s per-check `except Exception`
+    made it an `error` row -- on the ground that the five shipped checks
+    named what they examined as `examined`, which deliberately never reached
+    `Verdict.considered`, so a populated one was an author believing in a
+    retirement that could never happen.
+
+    Section 9 made that belief the ordinary case: `_probe_util.verdict` puts
+    `examined` back on a `clean` verdict, and `_retirable` honours it for a
+    run whose canary proved the session. This run is ANONYMOUS, so nothing is
+    honoured -- and the row must still be the check's own verdict. Keeping
+    the raise would have made every active row of every anonymous scan an
+    `error`.
+
+    NOT VACUOUS: the finding-free `clean` is asserted alongside the empty
+    retirement set, so a build that stopped running the check entirely would
+    fail the first assertion rather than satisfy the second."""
     env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
 
     class Retires(_Probe):
@@ -1428,12 +1448,15 @@ def test_an_active_check_that_populates_considered_is_an_error_row(tmp_path):
             return base.Verdict.clean(considered=("probed",))
 
     check = Retires()
-    scan.run(**env, checks=(check,), bridge=_replying_bridge())
+    considered = _considered_by(env, (check,), _replying_bridge())
 
-    assert check.calls == 1, "the check never ran, so nothing was refused"
+    assert check.calls == 1, "the check never ran, so nothing was decided"
     verdict, reason, _sent = _row(env["conn"], "hx.test.retires")
-    assert verdict == "error", (verdict, reason)
-    assert "considered" in reason and "examined" in reason, reason
+    assert (verdict, reason) == ("clean", None), (verdict, reason)
+    assert considered == set(), (
+        "an anonymous run honoured an active check's `considered`: a client "
+        "is told a live vulnerability appears fixed on the strength of a "
+        "probe that saw only the logged-out view")
 
 
 def test_no_probing_check_in_the_corpus_retires_anything(tmp_path):
@@ -2502,3 +2525,233 @@ def test_the_first_mint_of_a_credential_leaks_nothing_either(tmp_path):
         "the report rendered no stop reason at all, so the absence below "
         "proves nothing -- fix this test before trusting it")
     assert "SUPERSECRET" not in rendered
+
+
+# --- section 9: retirement under a proven identity -------------------------
+#
+# The gate itself, driven directly, then the same rule through a whole
+# `scan.run` against a target that can tell a live session from a dead one.
+# Both, because `_retirable`'s answer is only as good as the state the runner
+# hands it, and the state is settled by a canary the direct tests do not run.
+
+
+def _cors_hook():
+    """The dispatched hook `_retirable` is asked about, for the one active
+    check whose `probes()` needs no insertion point.
+
+    `_runner_hook` rather than the literal `"probes"`: that function IS the
+    dispatch `scan.run` performs, so a check whose hook moved would move this
+    with it. The brief's sketch passed `check.probes` -- the bound METHOD --
+    which is never equal to `scan._PROBE_HOOK` and would have sent every
+    assertion below down the passive branch.
+    """
+    check = next(c for c in registry.CHECKS if c.id == "hx.active.cors")
+    return scan._runner_hook(check)
+
+
+def test_an_active_check_still_retires_nothing_without_an_identity():
+    """The unchanged OUTCOME, pinned so this task cannot widen it by
+    accident: an anonymous run retires nothing an active check said.
+
+    Not byte-for-byte the old behaviour, and the brief's sketch called it
+    that. Until Task 8 this call RAISED `ValueError` and `scan.run` turned it
+    into an `error` row; it now returns empty, because `_probe_util.verdict`
+    puts `examined` on a `clean` verdict again and a raise would make every
+    active row of every anonymous scan an error. What is unchanged is the
+    only thing a client can see -- nothing is retired."""
+    v = base.Verdict.clean(considered=("cors-reflects-origin",))
+    assert scan._retirable(_cors_hook(), v, identity_state=None) == ()
+
+
+def test_an_active_check_retires_under_a_proven_identity():
+    v = base.Verdict.clean(considered=("cors-reflects-origin",))
+    assert scan._retirable(_cors_hook(), v,
+                           identity_state="proven") == ("cors-reflects-origin",)
+
+
+def test_an_assumed_window_retires_nothing_even_though_an_identity_applied():
+    # The canary failed somewhere in the run, so this probe may have been
+    # issued logged-out. Retiring here tells a client a live vulnerability is
+    # fixed -- the exact outcome the whole active-check branch was spent
+    # closing, and `assumed` is the state that says we cannot rule it out.
+    v = base.Verdict.clean(considered=("cors-reflects-origin",))
+    assert scan._retirable(_cors_hook(), v, identity_state="assumed") == ()
+
+
+def test_a_dead_identity_retires_nothing():
+    v = base.Verdict.clean(considered=("cors-reflects-origin",))
+    assert scan._retirable(_cors_hook(), v, identity_state="dead") == ()
+
+
+def test_a_passive_check_is_unaffected_by_any_identity_state():
+    # Passive retirement reads CAPTURED traffic and never depended on a
+    # session, so none of the four states may change it.
+    check = next(c for c in registry.CHECKS if c.klass == "passive")
+    v = base.Verdict.clean(considered=("missing-hsts",))
+    for state in (None, "proven", "assumed", "dead"):
+        assert scan._retirable(scan._runner_hook(check), v,
+                               identity_state=state) == ("missing-hsts",)
+
+
+def test_a_proven_run_retires_a_reflection_that_is_genuinely_gone(tmp_path):
+    """THE CAPABILITY SECTION 9 GIVES BACK, on the case fix round 6 removed.
+
+    `_EchoBridge`'s reflection is real and the second scan's target has
+    stopped reflecting `q`, so the check sends, gets an ordinary 200 and
+    finds nothing -- and this time the run PROVED its session, so `q`'s
+    finding closes. `("q", 0)` is the retirement, and it is what
+    `report._findings` renders as "appears fixed; verify before closing".
+
+    `_SessionEchoBridge` is the two rigs joined: it answers the canary with
+    the account page while the session is live and reflects the request line
+    for everything else. Without the first half the run would halt; without
+    the second there would be no finding to retire.
+
+    BOTH REFLECTIONS GO, and that is forced rather than tidy. MEASURED with
+    only `q` repaired: `reflected_input` returns ONE verdict for the whole
+    surface, `r` was still reflecting, so the verdict was a `finding` -- and
+    `_probe_util.verdict` puts `examined` on the `clean` branch only, so
+    nothing was offered and `q` stayed live (`[("q", 1), ("r", 1),
+    ("r", 1)]`). That is the conservative half of section 9 working as
+    written: a partially fixed surface waits for the scan on which its check
+    comes back clean.
+    """
+    env = _declaring(_env(tmp_path, request_bytes=REQ_TWO_PARAMS,
+                          path_template="/search"), USER)
+    scan.run(**env, checks=(_reflected_input(),),
+             bridge=_SessionEchoBridge(), identity=_resolved())
+    assert _observations(env["conn"]) == [("q", 1), ("r", 1)]
+
+    summary = scan.run(**env, checks=(_reflected_input(),),
+                       bridge=_SessionEchoBridge(reflects=False),
+                       identity=_resolved())
+
+    assert summary.identity_state == "proven"
+    verdict, reason, sent = _latest_row(env["conn"])
+    assert (verdict, sent > 0) == ("clean", True), (verdict, reason, sent)
+    assert _observations(env["conn"]) == [("q", 1), ("q", 0), ("r", 1),
+                                          ("r", 0)], (
+        "a run that proved its session live did not retire the reflections "
+        "that are genuinely gone")
+
+
+def test_the_same_run_retires_nothing_once_its_closing_canary_fails(tmp_path):
+    """THE SEPARATING CASE, AND THE ONE THAT SETTLES WHERE THE GATE RUNS.
+
+    Byte for byte the run above, except that the session dies on the last
+    request of it -- the CLOSING canary. Every probe went out while the
+    window still read `proven`, so a gate asked inside the surface loop would
+    have collected `q`'s retirement and `_mark_unobserved` would have written
+    it. `bracket.finish()` is what turns the run `assumed`, and it runs after
+    the loop and before the gate, which is why the gate is not in the loop.
+
+    `dies_after` counts sends before this one: the opening canary and one
+    probe per point (nothing is reflected, so `reflected_input` spends no
+    escalation), which is three -- and the fourth send is the closing canary,
+    which finds the session gone.
+    """
+    env = _declaring(_env(tmp_path, request_bytes=REQ_TWO_PARAMS,
+                          path_template="/search"), USER)
+    scan.run(**env, checks=(_reflected_input(),),
+             bridge=_SessionEchoBridge(), identity=_resolved())
+    assert _observations(env["conn"]) == [("q", 1), ("r", 1)]
+
+    summary = scan.run(**env, checks=(_reflected_input(),),
+                       bridge=_SessionEchoBridge(reflects=False, dies_after=3),
+                       identity=_resolved())
+
+    assert summary.identity_state == "assumed", (
+        "the closing canary did not catch the death, so nothing below "
+        "measures a downgrade")
+    assert _latest_row(env["conn"])[0] == "clean", \
+        "the check's own row was lost, so nothing below measures a downgrade"
+    assert _observations(env["conn"]) == [("q", 1), ("r", 1)], (
+        "a run downgraded to `assumed` retired a finding: every probe in it "
+        "may have been issued logged-out")
+
+
+def test_a_run_records_the_identity_state_it_ended_in(tmp_path):
+    """THE FACT `report._limits` READS, and the reason it could not be
+    derived before this task. `ScanSummary.identity_state` is a return value:
+    it reaches the operator's terminal and dies there. The report is handed a
+    connection and an engagement id, so the run row is the only place it can
+    learn what a run's traffic was issued under -- and until Task 8 the `run`
+    table had no identity column at all, which is why the Limits page went on
+    telling every client that every probe was sent unauthenticated."""
+    env = _declaring(_env(tmp_path), USER)
+    scan.run(**env, checks=(_Probes(),), bridge=_SessionBridge(),
+             identity=_resolved(generation=3))
+
+    assert env["conn"].execute(
+        "SELECT identity, identity_generation, identity_state FROM run"
+        " WHERE kind='scan'").fetchone() == ("user", 3, "proven")
+
+
+def test_an_anonymous_run_leaves_the_identity_columns_null(tmp_path):
+    """The separating case: NULL is how a report tells "issued anonymously"
+    from "issued under a session that proved live", and a run that wrote a
+    state it did not have would make the Limits page claim a retest story
+    this build did not perform."""
+    env = _env(tmp_path)
+    scan.run(**env, checks=(_Probes(),), bridge=_replying_bridge())
+
+    assert env["conn"].execute(
+        "SELECT identity, identity_generation, identity_state FROM run"
+        " WHERE kind='scan'").fetchone() == (None, None, None)
+
+
+def test_a_halted_run_records_dead_rather_than_the_state_it_had(tmp_path):
+    """A HALTED RUN NEVER RAN ITS CLOSING CANARY, so `proven` would be an
+    over-claim whatever the window last said. `IdentityDead` is the session
+    being dead by name, and the run row says so -- which is what lets the
+    report tell "we tested this and found nothing" from "our session died at
+    01:50" without parsing a stop reason."""
+    env = _declaring(_env(tmp_path, request_bytes=REQ_EVERY_SHAPE,
+                          path_template="/search"), USER, every_n_probes=1)
+
+    class _Second(_Probes):
+        id = "hx.test.probe-second"
+
+    # Three sends: the opening canary, one probe, then the canary that falls
+    # due at the check boundary -- and `dies_after=2` kills the session on
+    # exactly that third one. USER is static, so section 6's table gives it
+    # no refresh and the run halts with a check still to come.
+    bridge = _SessionBridge(dies_after=2)
+    with pytest.raises(scan.IdentityDead):
+        scan.run(**env, checks=(_Probes(), _Second()), bridge=bridge,
+                 identity=_resolved())
+
+    status, _reason = _run_row(env["conn"])
+    assert status == "error"
+    assert env["conn"].execute(
+        "SELECT identity, identity_state FROM run"
+        " WHERE kind='scan'").fetchone() == ("user", "dead")
+
+
+class _SessionEchoBridge(_SessionBridge):
+    """`_SessionBridge`'s canary and `_EchoBridge`'s reflection, in one rig.
+
+    A retirement test needs both: something for the check to find and lose,
+    and something for the canary to prove itself against. The two are told
+    apart by the request target -- `liveness.path` is `/account` and every
+    probe here goes to `/search` -- which is the same discriminator
+    `_probe_frames` uses.
+    """
+
+    def __init__(self, *, reflects: bool = True,
+                 dies_after: int | None = None) -> None:
+        super().__init__(dies_after=dies_after)
+        self._reflects = reflects
+
+    def send(self, req, body=b"", timeout=30.0, *, enforce_locally=True):
+        target = body.split(b"\r\n", 1)[0].split(b" ")[1]
+        if target.split(b"?")[0] == b"/account":
+            return super().send(req, body, timeout,
+                                enforce_locally=enforce_locally)
+        if not self._reflects:
+            target = target.split(b"?")[0]
+        self.reply({"status": 200, "outcome": "ok"},
+                   b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+                   + unquote_to_bytes(target))
+        return FakeBridge.send(self, req, body, timeout,
+                               enforce_locally=enforce_locally)

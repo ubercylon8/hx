@@ -344,24 +344,35 @@ def verdict(candidates, gaps, *,
     `unprobed` below. `gaps` is one string per probe that came back without
     answering; `examined` is what the check looked for.
 
-    `examined` IS NOT `Verdict.considered`, AND FIX ROUND 6 IS WHY IT IS
-    SPELT DIFFERENTLY. It was that field until this round, and it reached it
-    through this function: the four looping checks and `cors` each named
-    their issue types here and `hx.scan._mark_unobserved` retired on them.
-    An active check now retires nothing at all -- the runner cannot
-    establish that a probe saw the view the client's users are in, and the
-    argument is `hx.scan._retirable`'s (its ground changed in fix round A,
-    the rule did not) -- so this feeds exactly ONE question: may it say `clean`
-    at all. A check passes the same fact it always did, under a name that no
-    longer promises a retirement, and `_retirable` refuses a probing check's
-    `considered` outright so the two cannot quietly join up again.
+    `examined` KEEPS ITS OWN NAME AND REACHES `Verdict.considered` AGAIN.
+    It was that field until fix round 6, which severed the two because
+    `hx.scan._retirable` had stopped honouring a probing check's `considered`
+    at all: an active check retired nothing, so a field promising a
+    retirement was a promise nothing could keep. Task 8 re-opened that gate
+    narrowly -- section 9 honours an active check's `considered` for a run
+    whose liveness canary proved the session, and for no other run -- so the
+    fact this parameter carries is exactly the fact the gate needs, and
+    severing them now would leave the gate with nothing to decide.
+
+    THE TWO NAMES STAY DIFFERENT BECAUSE THEY ANSWER DIFFERENT QUESTIONS,
+    and only one of them is this module's. `examined` decides whether this
+    check may say `clean` AT ALL (the raise at the end of this function), and
+    that is a rule about the check. `considered` is the runner's word for
+    what a retirement may key on, and whether any of it is honoured is
+    decided by `_retirable` from the run's settled identity state -- which
+    nothing in a check can see, choose or ask about (section 8). A check
+    passes what it looked for; the runner decides what that is worth.
 
     A CANDIDATE STILL WINS OVER A GAP: what was found was found, and another
     probe on this surface coming back without an answer does not un-find it.
-    The gap used to take `considered` off that finding as well, so the
-    surface's other issue types were not retired on partial evidence; the
-    runner's blanket rule subsumes that, and a finding here is reported with
-    nothing withheld from it.
+    AND A FINDING STILL CARRIES NO `considered`, which is the conservative
+    half and is deliberate: a check that found one of three issue types does
+    not retire the other two here, so a fix confirmed on this surface waits
+    for the scan on which the check comes back clean. That under-claims. The
+    over-claiming version -- putting `examined` on the finding branch -- is
+    the shape that let one check's finding retire that check's OTHER issue
+    types on the same surface, and nothing about a proven session makes it
+    sound.
 
     `unprobed` IS A FOURTH FACT AND IT IS NOT A GAP. A gap is a probe that
     was SENT and came back without answering; `unprobed` is the check saying
@@ -423,4 +434,4 @@ def verdict(candidates, gaps, *,
             "found, nothing was refused, and no issue type was examined, "
             "which is a check reporting `tested, clean` for a surface it "
             "never tested. Pass `unprobed=<why>` instead")
-    return base.Verdict.clean()
+    return base.Verdict.clean(considered=examined)

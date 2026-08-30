@@ -280,21 +280,29 @@ def test_a_candidate_wins_over_a_gap():
     assert len(v.candidates) == 1
 
 
-def test_no_verdict_this_funnel_builds_carries_considered():
-    """FIX ROUND 6, AND THIS IS THE HALF THAT LIVES IN THE CHECKS. An active
-    check retires nothing, so `examined` feeds the `clean` guard below and
-    stops there -- it deliberately never reaches `Verdict.considered`, which
-    `hx.scan._retirable` would refuse from a probing check anyway. Both ends
-    are asserted so neither can quietly move on its own: this pins the
-    check's end, `tests/test_scan_probes.py::test_an_active_check_that_
-    populates_considered_is_an_error_row` pins the runner's.
+def test_only_a_clean_verdict_this_funnel_builds_carries_considered():
+    """TASK 8, AND THIS IS THE HALF THAT LIVES IN THE CHECKS. Section 9
+    honours an active check's `considered` for a run whose canary proved the
+    session live, so `examined` reaches `Verdict.considered` again -- it was
+    severed in fix round 6, when `hx.scan._retirable` honoured it for no run
+    at all and a field promising a retirement was a promise nothing kept.
 
-    Every branch, because `clean` is not the only one that used to carry it:
-    a finding used to carry `considered` too (and lose it to a gap), which
-    is what let one check's finding on a surface retire that check's OTHER
-    issue types there."""
-    for v in (_probe_util.verdict([], [], examined=("probed",)),
-              _probe_util.verdict([_candidate()], [], examined=("probed",)),
+    ONLY ON THE `clean` BRANCH, and the other four are the point of the
+    loop below. A `finding` carried it before fix round 6 (and lost it to a
+    gap), which is what let one check's finding on a surface retire that
+    check's OTHER issue types there; `inconclusive` cannot carry it at all
+    (the classmethod does not accept it), which is what keeps a gap and an
+    unprobed surface from retiring anything. Both ends are asserted so
+    neither can quietly move on its own: this pins the check's end,
+    `tests/test_scan_probes.py`'s `_retirable` block pins the runner's.
+    """
+    assert _probe_util.verdict([], [], examined=("probed",)).considered == \
+        ("probed",), (
+            "an active check no longer offers what it examined, so section "
+            "9's gate has nothing to honour and no active finding can ever "
+            "be shown as fixed")
+
+    for v in (_probe_util.verdict([_candidate()], [], examined=("probed",)),
               _probe_util.verdict([_candidate()], ["q: status 403"],
                                   examined=("probed",)),
               _probe_util.verdict([], ["q: status 403"], examined=("probed",)),

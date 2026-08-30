@@ -333,16 +333,28 @@ In `scan.run`, beside `seen_findings: set[str] = set()`, add:
 
 ```python
 # src/hx/scan.py -- Task 2: the considered set the runner collects
-        # (surface_id, check_id, issue_type_id) this run examined AND may
-        # speak for the client's own view of. Retirement reads this, NOT
-        # `check_run.verdict == 'clean'`: a check filing one of three
-        # findings answers `finding`, and the other two still need retiring.
-        # The second clause is `_retirable`'s and it is why nothing an
-        # ACTIVE check said can be in here: that function cannot tell
-        # whether this run issued under an identity at all, and for one that
-        # did, whether the traffic was inside a PROVEN window is not settled
-        # until `bracket.finish()` -- which runs after every call it makes.
-        considered: set[tuple[str, str, str]] = set()
+        # What each accepted verdict OFFERS for retirement -- its own
+        # `considered`, with the hook that produced it and the row it belongs
+        # to. Retirement reads this, NOT `check_run.verdict == 'clean'`: a
+        # check filing one of three findings answers `finding`, and the other
+        # two still need retiring.
+        #
+        # OFFERED HERE AND DECIDED AFTER THE LOOP, which is Task 8's ordering
+        # and is load-bearing. `_retirable` gates an active check's offer on
+        # the run's settled window state, and `bracket.finish()` -- the
+        # closing canary -- is the last thing that can turn `proven` into
+        # `assumed`. Calling the gate in this loop would read `proven` for a
+        # run whose closing canary was about to fail and retire on traffic
+        # section 6 downgrades, which is the hole the bracket exists to
+        # close. So the decision happens once, below, between `finish()` and
+        # `_mark_unobserved` (the only writer of `observed = 0`).
+        #
+        # A VERDICT WITH NOTHING TO OFFER IS NOT KEPT. An `inconclusive`
+        # verdict carries no `considered` -- the classmethod does not offer
+        # it -- so exactly the state that must retire nothing contributes no
+        # entry at all, and the list holds one tuple per row that named an
+        # issue type rather than one per row.
+        offered: list[tuple[str, str, str, base.Verdict]] = []
 ```
 
 After the `isinstance(verdict, base.Verdict)` guard and before the
@@ -351,16 +363,14 @@ After the `isinstance(verdict, base.Verdict)` guard and before the
 ```python
 # src/hx/scan.py -- Task 2: every accepted verdict contributes to it
                     reason = verdict.reason
-                    # An `inconclusive` verdict carries no `considered` -- the
-                    # classmethod does not offer it -- so this loop is empty
-                    # for exactly the state that must retire nothing, and
-                    # `_retirable` empties it for every check the runner
-                    # drove through the wire. The verdict itself is not
-                    # touched either way: a `finding` is still written and
-                    # still reported, a `clean` is still `clean`, and what
-                    # `report._coverage` renders for the row is unchanged.
-                    for issue_type in _retirable(hook, verdict):
-                        considered.add((surface[0], check.id, issue_type))
+                    # KEPT, NOT DECIDED -- see `offered`'s own comment above
+                    # for why the gate cannot run here. The verdict itself is
+                    # not touched either way: a `finding` is still written
+                    # and still reported, a `clean` is still `clean`, and
+                    # what `report._coverage` renders for the row is
+                    # unchanged.
+                    if verdict.considered:
+                        offered.append((hook, surface[0], check.id, verdict))
 ```
 
 Change the call at the end of the run from `_mark_unobserved(conn, engagement_id, run_id, seen_findings)` to:
@@ -403,16 +413,18 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
     run's `checks` retires none of its prior findings: none of those states
     ever added an entry for them.
 
-    AND SINCE FIX ROUND 6, ONLY A PASSIVE CHECK EVER GETS INTO IT.
-    `scan.run` reads `_retirable`, which returns nothing for a check driven
-    through the wire: an active `clean` is a statement about a view this
-    build cannot yet prove is the one the client's users are in -- a run may
-    be anonymous, and one that issued under an identity is proof only once
-    its closing canary has settled the window, which happens after every
-    `_retirable` call. That function carries the argument and the two
-    spellings the branch tried before it. So "in `considered`"
-    means "examined, by a check that read the captured traffic itself", and
-    that is the only reading under which retirement is sound today.
+    WHICH CHECKS GET INTO IT IS `_retirable`'S DECISION AND NOT THIS
+    FUNCTION'S, and the split is deliberate: a rule written here, or keyed on
+    the finding or on the surface, would have taken the passive corpus's
+    whole retest story with it. `scan.run` builds `considered` by asking that
+    function once per accepted verdict, with the run's SETTLED identity
+    state. A passive check's offer is honoured whatever the session did -- it
+    read the captured traffic itself, session and all. An active check's is
+    honoured only for a run whose liveness canary proved the session live at
+    both ends of the window its probes were issued in (section 9); an
+    anonymous run, and one downgraded to `assumed` by a canary that failed
+    anywhere, both offer nothing. So "in `considered`" means "examined, by a
+    check whose view of the application this run can vouch for".
 
     Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
     the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses

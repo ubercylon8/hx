@@ -249,6 +249,13 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     ctx = base.CheckContext(config=config, blobs=blobs, run_id=run_id,
                             log=lambda s: None)
     deadline = None if max_seconds is None else time.monotonic() + max_seconds
+    # BOUND BEFORE THE `try`, because the `except BaseException` below reads
+    # it and the statement that assigns it is INSIDE that try. Resolving a
+    # `scan_identity` raises `IdentityError` for a variable the operator did
+    # not export (`hx.identity.resolve`), and a handler that then referenced
+    # an unbound local would replace that diagnosis with a `NameError` from
+    # this module.
+    bracket = None
 
     # THE RUNNER OWNS CLOSING WHAT IT OPENED. `run.current_run`'s reuse
     # window exists for a continuous browsing session ("avoid one specific
@@ -298,16 +305,28 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
         identity_id = None if bracket is None else bracket.identity_id
 
         seen_findings: set[str] = set()
-        # (surface_id, check_id, issue_type_id) this run examined AND may
-        # speak for the client's own view of. Retirement reads this, NOT
-        # `check_run.verdict == 'clean'`: a check filing one of three
-        # findings answers `finding`, and the other two still need retiring.
-        # The second clause is `_retirable`'s and it is why nothing an
-        # ACTIVE check said can be in here: that function cannot tell
-        # whether this run issued under an identity at all, and for one that
-        # did, whether the traffic was inside a PROVEN window is not settled
-        # until `bracket.finish()` -- which runs after every call it makes.
-        considered: set[tuple[str, str, str]] = set()
+        # What each accepted verdict OFFERS for retirement -- its own
+        # `considered`, with the hook that produced it and the row it belongs
+        # to. Retirement reads this, NOT `check_run.verdict == 'clean'`: a
+        # check filing one of three findings answers `finding`, and the other
+        # two still need retiring.
+        #
+        # OFFERED HERE AND DECIDED AFTER THE LOOP, which is Task 8's ordering
+        # and is load-bearing. `_retirable` gates an active check's offer on
+        # the run's settled window state, and `bracket.finish()` -- the
+        # closing canary -- is the last thing that can turn `proven` into
+        # `assumed`. Calling the gate in this loop would read `proven` for a
+        # run whose closing canary was about to fail and retire on traffic
+        # section 6 downgrades, which is the hole the bracket exists to
+        # close. So the decision happens once, below, between `finish()` and
+        # `_mark_unobserved` (the only writer of `observed = 0`).
+        #
+        # A VERDICT WITH NOTHING TO OFFER IS NOT KEPT. An `inconclusive`
+        # verdict carries no `considered` -- the classmethod does not offer
+        # it -- so exactly the state that must retire nothing contributes no
+        # entry at all, and the list holds one tuple per row that named an
+        # issue type rather than one per row.
+        offered: list[tuple[str, str, str, base.Verdict]] = []
 
         for surface in surfaces:
             if surface_filter is not None and not surface_filter(surface):
@@ -628,16 +647,14 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             "hx.checks.base.Verdict; a check may not "
                             "construct the runner's own vocabulary by hand")
                     reason = verdict.reason
-                    # An `inconclusive` verdict carries no `considered` -- the
-                    # classmethod does not offer it -- so this loop is empty
-                    # for exactly the state that must retire nothing, and
-                    # `_retirable` empties it for every check the runner
-                    # drove through the wire. The verdict itself is not
-                    # touched either way: a `finding` is still written and
-                    # still reported, a `clean` is still `clean`, and what
-                    # `report._coverage` renders for the row is unchanged.
-                    for issue_type in _retirable(hook, verdict):
-                        considered.add((surface[0], check.id, issue_type))
+                    # KEPT, NOT DECIDED -- see `offered`'s own comment above
+                    # for why the gate cannot run here. The verdict itself is
+                    # not touched either way: a `finding` is still written
+                    # and still reported, a `clean` is still `clean`, and
+                    # what `report._coverage` renders for the row is
+                    # unchanged.
+                    if verdict.considered:
+                        offered.append((hook, surface[0], check.id, verdict))
                     if verdict.state == "finding":
                         for candidate in verdict.candidates:
                             fid = _write_finding(conn, engagement_id, run_id,
@@ -688,14 +705,39 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                            requests_sent=_spent(summary, sender, bracket))
 
         if bracket is not None:
-            # BEFORE `_mark_unobserved`, and that ordering is load-bearing.
-            # The closing canary is what settles the run's state -- a window
-            # is only proof if BOTH its canaries passed -- and retirement is
-            # the last thing this function does that a state could change.
+            # BEFORE the gate below, and that ordering is load-bearing. The
+            # closing canary is what settles the run's state -- a window is
+            # only proof if BOTH its canaries passed -- and retirement is the
+            # last thing this function does that a state could change.
             bracket.finish()
             summary.identity_state = bracket.state
+            _record_identity(conn, run_id, bracket, bracket.state)
+        # SECTION 9'S GATE, ONCE, WITH THE SETTLED STATE. `_retirable` hands
+        # back a passive check's offer whatever the session did and an active
+        # check's only for a `proven` run; the set it builds is
+        # `(surface_id, check_id, issue_type_id)`, which is the key
+        # `_mark_unobserved` matches a finding on.
+        considered = {
+            (surface_id, check_id, issue_type)
+            for said_hook, surface_id, check_id, said in offered
+            for issue_type in _retirable(said_hook, said,
+                                         summary.identity_state)
+        }
         _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
     except BaseException as exc:
+        # THE IDENTITY GOES ON THE ROW EVEN HERE, and never as `proven`. A
+        # run that stopped short never ran its closing canary, and section 6
+        # is explicit that a window is proof only once BOTH its canaries have
+        # passed -- so `bracket.state` may still read `proven` at this point
+        # and would be over-claiming if it were stored. `IdentityDead` IS the
+        # session being dead, by name; anything else that ended the run
+        # leaves the window unclosed, which is `assumed`. `report._limits`
+        # and the identity section both read this column, so a halted run
+        # must not leave it NULL and read as an anonymous one.
+        if bracket is not None:
+            state = "dead" if isinstance(exc, IdentityDead) else "assumed"
+            summary.identity_state = state
+            _record_identity(conn, run_id, bracket, state)
         # Left `running` here would mean the NEXT scan.run() call inherits
         # this one's half-finished state via current_run's reuse window --
         # the same collision this try/except exists to prevent, but for a
@@ -812,6 +854,37 @@ def _halt_reason(exc, summary) -> str:
         return "scan.run raised: IdentityDead: " + "; ".join(
             [exc.stop_reason, *_tallies(summary)])
     return f"scan.run raised: {type(exc).__name__}: {exc}"
+
+
+def _record_identity(conn, run_id, bracket, state) -> None:
+    """Put this run's identity and its settled state on the `run` row.
+
+    THE ONE PLACE A LATER READER CAN LEARN THIS FROM. Until Task 8 the fact
+    lived only on `ScanSummary`, which is a return value: it reached the
+    operator's terminal and died there, so `report._limits` -- handed `conn`
+    and an engagement id -- had nothing to condition its sentences on and
+    went on telling every client that every probe was sent unauthenticated.
+    Section 6's own amendment records why `exchange.identity_state` cannot be
+    the source (this build stores no send-path exchange row at all), so the
+    fact goes where the run that holds it lives.
+
+    NOT DERIVED FROM `config` AT RENDER TIME, and that is the whole reason
+    this function exists rather than a `config.scan_identity` lookup in the
+    report. A config says what was DECLARED; a run row says what a run
+    actually did. They disagree the moment an identity is added after a scan,
+    removed before a report, or resolved and then halted -- and `_limits`
+    has twice been found asserting a build fact it had not derived.
+
+    `generation` is `bracket.resolved`'s, read at the call rather than
+    latched at the start: a programmatic refresh replaces `resolved` with a
+    higher generation mid-run, and the number worth recording is the one the
+    run finished on -- section 10 asks the report for "how many generations
+    each reached".
+    """
+    run_mod.record_identity(conn, run_id=run_id,
+                            identity_id=bracket.identity_id,
+                            generation=bracket.resolved.generation,
+                            state=state)
 
 
 # --- the identity a run issues under --------------------------------------
@@ -1289,50 +1362,55 @@ def _citable_exemplar(surface, exchanges) -> str | None:
     return exemplar_id if any(x.id == exemplar_id for x in exchanges) else None
 
 
-def _retirable(hook, verdict) -> tuple[str, ...]:
+def _retirable(hook, verdict, identity_state) -> tuple[str, ...]:
     """The issue types this verdict may retire a finding on.
 
-    AN ACTIVE CHECK RETIRES NOTHING. Retirement is `_mark_unobserved`
-    writing `observed = 0`, which `report._findings` renders to a client as
-    "appears fixed; verify before closing" -- a claim about the application
-    as the client's own users meet it. This function cannot establish that
-    claim. Its `clean` is reported, because a reflection found in whatever
-    view was probed is still a reflection; it may not close anything.
+    AN ACTIVE CHECK RETIRES ONLY WHAT IT PROBED UNDER A SESSION PROVED LIVE.
+    Retirement is `_mark_unobserved` writing `observed = 0`, which
+    `report._findings` renders to a client as "appears fixed; verify before
+    closing" -- a claim about the application as the client's own users meet
+    it. So the question this function answers is not "did the probe come
+    back clean" but "was the probe issued into the view those users are in",
+    and there is exactly one state in which this build can say yes:
+    `identity_state == "proven"`. Spec section 9, in its own words: an active
+    check's `considered` is honoured "only if every probe it sent ran under
+    an identity whose canary was `proven` at the generation in force for that
+    request".
 
-    THE GROUND FOR THAT CHANGED IN TASK 7, AND THE OLD SENTENCE IS GONE.
-    Until this commit this paragraph read "every probe this build sends is
-    UNAUTHENTICATED (`ProbeSender._request_bytes` emits a request line, a
-    `Host` and at most the one header the check is probing), so an active
-    check's `clean` is a statement about the logged-out view and nothing
-    else". The parenthetical is still true and the conclusion is not: a run
-    whose config names a `scan_identity` registers that credential with the
-    extension and binds every `ProbeSender` to it, and the JVM then puts the
-    declared header on each probe as its FIRST header (`Sender.compose`,
-    which also registers the credential's byte range for redaction). The
-    composition this side does not do
-    happens one layer below what this function can see, which is exactly why
-    the sentence looked checkable from here and was wrong. F3 of fix round A
-    -- and it mattered because Task 8 re-opens this gate by editing this
-    function, on the very fact these words denied.
+    THE THREE STATES THAT RETIRE NOTHING, and none of them is a near miss:
 
-    WHY THE GATE IS STILL SHUT, on two facts rather than the one that
-    stopped being true:
+      * `None` -- THE RUN WAS ANONYMOUS. `scan_identity` is optional,
+        `bridge` may be absent, and `_identity_bracket` has four separate
+        ways to answer None. Every probe of such a run tests the logged-out
+        view, and an application that answers a logged-out request with a
+        200 login PAGE is indistinguishable from one that answered (see the
+        seventh spelling, below). This is the behaviour every build before
+        this task had for every active check, and the first test in
+        `tests/test_scan_probes.py`'s retirement block pins it unchanged.
+      * `assumed` -- A CANARY FAILED SOMEWHERE IN THE RUN. Section 6
+        downgrades every exchange back to the last passing canary, because
+        they were issued into an unknown state; the run collapses to the
+        worst window in it (`IdentityWindow`'s own docstring). Retiring here
+        would tell a client a live vulnerability is fixed on traffic that may
+        have been unauthenticated -- the exact outcome this whole branch was
+        spent closing.
+      * `dead` -- THE SESSION NEVER PROVED, OR STOPPED PROVING AND COULD NOT
+        BE BROUGHT BACK. `run` halts on that (`IdentityDead`), so this
+        function is not normally reached with it; it is written out rather
+        than left to `!= "proven"` because a state that retires nothing must
+        do so by name and not by falling off the end of a condition.
 
-      * A RUN MAY BE ANONYMOUS. `scan_identity` is optional, `bridge` may be
-        absent, and `_identity_bracket` has four separate ways to answer
-        None. This function is handed `(hook, verdict)` and cannot tell
-        which kind of run it is in.
-      * A BRACKETED RUN IS NOT YET PROOF. The fact a sound retirement needs
-        is not "a credential was injected" but "this traffic was issued
-        inside a PROVEN window" -- `hx.identity.IdentityWindow.
-        state_for_run()` -- and that is not settled until `bracket.finish()`
-        runs the closing canary. `run` calls this function per check inside
-        the surface loop and calls `finish()` immediately before
-        `_mark_unobserved`, so every call here happens BEFORE the state
-        exists.
-
-    Opening the gate therefore needs both halves and is Task 8's decision:
-    a state to read, and a place to read it from that has settled.
+    WHY THE ARGUMENT IS PASSED IN RATHER THAN READ HERE. The state is a
+    property of a WINDOW BRACKETED BY TWO PASSING CANARIES, and the closing
+    canary is the last thing that can flip `proven` to `assumed`. `run`
+    therefore does not call this function inside its surface loop at all: it
+    collects each accepted verdict's offer, runs `bracket.finish()`, and only
+    then asks this -- once, with the settled state -- immediately before
+    `_mark_unobserved`, which is the only writer of `observed = 0`. Asking
+    inside the loop would have read `proven` for a run whose closing canary
+    was about to fail, which is precisely the hole section 6 exists to close
+    (`tests/test_scan_probes.py::test_a_run_whose_closing_canary_fails_is_
+    assumed_and_not_a_halt` is that run).
 
     DECIDED OFF `hook`, WHICH IS THE DISPATCH ITSELF. `run` picks the probe
     pass with the same value, `registry._HOOKS` gives `probes` to the four
@@ -1341,41 +1419,33 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     inherits this by being an active check: there is no list of check ids
     here to update, and no rule for its author to remember.
 
-    IT RAISES RATHER THAN DROPPING QUIETLY, and that is the half that keeps
-    the two ends of the rule together. The five active checks pass what they
-    examined to `_probe_util.verdict` as `examined`, which uses it to refuse
-    a `clean` that tested nothing and does NOT put it on the verdict -- so a
-    probing check reaching here with a non-empty `considered` is one whose
-    author believed it would retire something. Silently discarding it would
-    leave that belief in the tree, unfalsified, exactly as fix round 5's
-    suppression would have. `run`'s per-check `except Exception` turns this
-    into an `error` row for that check, which is loud, retires nothing, and
-    ends no scan.
+    IT NO LONGER RAISES, AND THE RAISE IS WHAT TASK 8 REMOVED. Until this
+    commit a probing check arriving with a non-empty `considered` was a
+    `ValueError` -- `run`'s per-check `except Exception` turned it into an
+    `error` row -- on the ground that the five active checks pass what they
+    examined to `_probe_util.verdict` as `examined`, which deliberately did
+    not reach `Verdict.considered`, so a populated one was an author
+    believing in a retirement that could never happen. That belief is now
+    the ordinary case: `_probe_util.verdict` puts `examined` on a `clean`
+    verdict again, and the sentence "may not retire anything" has become
+    "retires when the run proved its session". A refusal here would have
+    made every active row of every anonymous run an `error`.
 
-    WHY THE SEVENTH SPELLING FORCED THIS. Six ways an active check could
-    answer `clean` off a probe that tested nothing were closed by the status
-    doctrine (`_probe_util.unanswered`), by the skips in `run` above, and by
-    `_probe_util.verdict`'s `unprobed` branch -- and the EIGHTH was closed by
-    that same doctrine a round later, when it stopped being an enumeration of
-    refusing statuses and became the rule that only a 2xx is an answer. The
-    seventh is an application that answers a logged-out request with a 200
-    LOGIN PAGE: a complete, well-formed, application-composed response,
-    indistinguishable from an answer at every level a status rule operates.
-    That one is an ARGUMENT AND NOT A MEASUREMENT, and saying otherwise is a
-    mistake this branch has already made once: fix round 3 measured five
-    `clean` rows and a retired finding behind a `302 /login` (see
-    `_probe_util.unanswered`), which is the shape a status CAN catch and is
-    now caught. A fixture whose anonymous view differs from its anonymous
-    view does not exist, so the 200 login page has never been put in front of
-    this corpus and cannot be.
-
-    WHAT IS MEASURED is the same `clean` arriving off a genuine answer:
-    `tests/integration/test_active_checks.py::test_a_second_scan_is_stable_
-    and_a_wholly_fixed_target_retires_nothing` repairs all five vulnerable
-    routes and, with this function passing `considered` through, closes all
-    five findings -- `[1, 1, 0]` each, rendered five times as "appears fixed;
-    verify before closing". Nothing in those rows distinguishes them from
-    what a login page would have produced, which is the whole argument.
+    WHY THE SEVENTH SPELLING FORCED THE GATE TO BE THIS NARROW. Six ways an
+    active check could answer `clean` off a probe that tested nothing were
+    closed by the status doctrine (`_probe_util.unanswered`), by the skips in
+    `run` above, and by `_probe_util.verdict`'s `unprobed` branch -- and the
+    EIGHTH was closed by that same doctrine a round later, when it stopped
+    being an enumeration of refusing statuses and became the rule that only a
+    2xx is an answer. The seventh is an application that answers a logged-out
+    request with a 200 LOGIN PAGE: a complete, well-formed,
+    application-composed response, indistinguishable from an answer at every
+    level a status rule operates. No status rule catches it, which is why the
+    liveness canary is a BODY signature (`hx.identity.canary`, and
+    `config.Liveness.expect_body` is required for this reason) rather than a
+    status check. A canary that accepted a status code would be satisfied by
+    that same page and would stamp `proven` on it -- handing the hazard back
+    with a proof attached, which is section 6's own warning.
 
     Fix round 5 tried to contain the login page by suppressing retirement
     only where the surface's captured request carried a credential header.
@@ -1386,59 +1456,30 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     more fundamentally `Redactor.redactObservedRequest` replaces a
     credential header's VALUE before the bytes are hashed (S7), so only the
     NAME survives and an analytics or consent cookie is indistinguishable
-    from a session. The discriminator could not see what it claimed to.
-    Retirement is a passive-corpus property until a run can PROVE the
-    session its probes were issued under -- which since Task 7 is a
-    different sentence from "until probes can authenticate", because they
-    now can and the proof is a separate question with a separate answer
-    (`IdentityWindow.state_for_run()`).
+    from a session. The discriminator could not see what it claimed to. What
+    replaces it is not a better guess at the capture: it is a request `hx`
+    issued itself, to a path the operator declared, whose body had to carry a
+    signature only an authenticated response carries.
 
     THE PASSIVE CORPUS IS UNTOUCHED, and the asymmetry is not a compromise:
     a passive check reads the captured traffic ITSELF -- the very exchanges
     the operator's own browser produced, session and all -- so it was never
     looking at a different view of the application, and this whole question
-    is one only a re-issued request can have.
+    is one only a re-issued request can have. `identity_state` therefore
+    reaches the passive branch and is not consulted in it.
 
-    THE ACCEPTED COST, stated where the decision was taken: the active
-    corpus has no automatic retest story at all. A client re-running a scan
-    after a fix sees the active finding still listed, and must verify it by
-    hand before closing it. `report._limits` says so in as many words, in
-    its "An active finding is never automatically marked as fixed" bullet,
-    which this function is what makes true.
-
-    ONE NEIGHBOURING BULLET IN THAT SAME FUNCTION IS NOW STALE AND IS NOT
-    FIXED HERE. `report._limits` also renders "**Every probe was sent
-    unauthenticated.**" to the client, which is the sentence above with its
-    old ground, and Task 7 falsified it for a run naming a `scan_identity`
-    exactly as it falsified this one. It is not corrected in fix round A
-    because it cannot be: `_limits` is handed `conn` and `engagement_id`,
-    and NOTHING IN THE STORE records whether a run issued under an identity
-    -- `ScanSummary.identity_state`'s own comment sets out why (`run` has no
-    identity column, and section 6's `exchange.identity_state` is the column
-    that section's amendment says this build cannot write). A derived
-    sentence needs something to derive it from, and TASK 8 IS WHERE THAT
-    ARRIVES: the plan's own Task 8 ("Retirement under a proven identity, the
-    report, and the real Burp") makes the neighbouring bullet conditional on
-    the same state this function will start reading, and adds section 10's
-    identity section "derived from the run rather than hardcoded". Retyping
-    the bullet here, one task early and with no state to condition it on,
-    would be a typed sentence standing in for a derived one -- which is the
-    mistake `_limits`' own F5 and F7 comments record it making twice.
+    WHAT THE CLIENT IS TOLD, and it is derived from the same state rather
+    than typed: `report._limits` reads `run.identity_state` out of the store
+    and renders one pair of bullets for an engagement whose scans issued
+    under a proved session and another for one whose scans did not. Before
+    this task that bullet said flatly that an active finding is never
+    automatically marked as fixed, and its neighbour said every probe was
+    sent unauthenticated; Task 7 falsified the second and this function
+    falsifies the first.
     """
     if hook != _PROBE_HOOK:
         return verdict.considered
-    if verdict.considered:
-        raise ValueError(
-            "an active check returned considered="
-            f"{list(verdict.considered)}; a check the runner drives through "
-            "the wire may not retire anything, because the runner cannot "
-            "establish that what a probe saw is the view the client's own "
-            "users are in: a run may be anonymous, and a run that was not is "
-            "proof only once its closing canary has settled the window. Pass "
-            "what was examined to `_probe_util.verdict` as `examined` -- "
-            "it is what lets a check say `clean` -- and leave `considered` "
-            "to the passive corpus")
-    return ()
+    return verdict.considered if identity_state == "proven" else ()
 
 
 # "Not read yet", and it cannot be `None` -- see the surface loop. Both facts
@@ -1664,16 +1705,18 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
     run's `checks` retires none of its prior findings: none of those states
     ever added an entry for them.
 
-    AND SINCE FIX ROUND 6, ONLY A PASSIVE CHECK EVER GETS INTO IT.
-    `scan.run` reads `_retirable`, which returns nothing for a check driven
-    through the wire: an active `clean` is a statement about a view this
-    build cannot yet prove is the one the client's users are in -- a run may
-    be anonymous, and one that issued under an identity is proof only once
-    its closing canary has settled the window, which happens after every
-    `_retirable` call. That function carries the argument and the two
-    spellings the branch tried before it. So "in `considered`"
-    means "examined, by a check that read the captured traffic itself", and
-    that is the only reading under which retirement is sound today.
+    WHICH CHECKS GET INTO IT IS `_retirable`'S DECISION AND NOT THIS
+    FUNCTION'S, and the split is deliberate: a rule written here, or keyed on
+    the finding or on the surface, would have taken the passive corpus's
+    whole retest story with it. `scan.run` builds `considered` by asking that
+    function once per accepted verdict, with the run's SETTLED identity
+    state. A passive check's offer is honoured whatever the session did -- it
+    read the captured traffic itself, session and all. An active check's is
+    honoured only for a run whose liveness canary proved the session live at
+    both ends of the window its probes were issued in (section 9); an
+    anonymous run, and one downgraded to `assumed` by a canary that failed
+    anywhere, both offer nothing. So "in `considered`" means "examined, by a
+    check whose view of the application this run can vouch for".
 
     Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
     the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses

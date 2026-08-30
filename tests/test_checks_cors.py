@@ -110,10 +110,12 @@ def test_an_arbitrary_origin_reflected_with_credentials_is_a_finding():
 def test_a_target_that_ignores_the_origin_is_clean():
     v = cors.Cors().probes(ctx, surface, (), _sender_returning({}))
     assert v.state == "clean"
-    assert v.considered == (), (
-        "an active check may not retire anything, so no verdict it returns "
-        "may carry `considered` -- `hx.scan._retirable` refuses one that "
-        "does")
+    assert v.considered == cors._EXAMINED, (
+        "the check examined its one issue type and offered nothing for "
+        "retirement, so a run that proved its session live could never show "
+        "this finding as fixed -- `hx.scan._retirable` is what decides "
+        "whether the offer is honoured, and a check that makes none takes "
+        "the decision away from it")
 
 
 def test_a_refusal_propagates_rather_than_becoming_a_verdict():
