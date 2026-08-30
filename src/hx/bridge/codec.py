@@ -313,7 +313,7 @@ def identity_body(identity_id: str, generation: int, header: str, value: str,
         raise FrameError("an identity frame needs a header to inject into")
     if not value:
         raise FrameError("an identity frame with no value registers nothing")
-    if not origins:
+    if not origins or not all(o and o.strip() for o in origins):
         raise FrameError(
             "an identity frame needs at least one origin; an identity with no "
             "origin could be applied to any host the scope allows")
@@ -360,8 +360,12 @@ def parse_identity(body: bytes) -> dict:
         raise FrameError("an identity frame with no value registers nothing")
 
     origins = payload.get("origins")
+    # A BLANK origin is refused alongside a missing list, for the same reason
+    # `identity_id` and `value` refuse emptiness: an entry that matches no host
+    # is not a narrower scope, it is a silently dead rule -- and the caller
+    # believes it registered a bound the extension will never apply.
     if not origins or not isinstance(origins, list) or not all(
-            isinstance(o, str) for o in origins):
+            isinstance(o, str) and o.strip() for o in origins):
         raise FrameError(
             "an identity frame needs at least one origin; an identity with no "
             "origin could be applied to any host the scope allows")

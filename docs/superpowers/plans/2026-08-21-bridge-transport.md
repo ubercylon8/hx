@@ -753,6 +753,24 @@ def test_the_java_side_rejects_the_same_malformed_two_body_payloads():
     # for someone to run the other suite.
     declaration = text.split("TWO_BODY_HEX =", 1)[1].split(";", 1)[0]
     assert "".join(re.findall(r'"([0-9a-f]*)"', declaration)) == TWO_BODY_HEX
+
+
+def test_a_blank_origin_is_refused_on_both_sides():
+    """Finding 2 of the Task 3 review: the asymmetry in re-validation.
+
+    `identity_id` and `value` both refuse emptiness; `origins` refused only a
+    MISSING list, so `[""]` passed. An origin that matches no host is not a
+    narrower bound, it is a dead rule -- and the caller believes it registered
+    a restriction the extension will never apply, which is the wrong direction
+    for a value whose whole job is to stop a credential going to the wrong
+    host.
+    """
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.identity_body("user", 1, "Cookie", "v", ("",))
+    good = codec.identity_body("user", 1, "Cookie", "v", ("https://app.test",))
+    tampered = good.replace(b'"https://app.test"', b'"   "')
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.parse_identity(tampered)
 ```
 
 - [ ] **Step 4: Run tests to verify they fail**
@@ -1079,7 +1097,7 @@ def identity_body(identity_id: str, generation: int, header: str, value: str,
         raise FrameError("an identity frame needs a header to inject into")
     if not value:
         raise FrameError("an identity frame with no value registers nothing")
-    if not origins:
+    if not origins or not all(o and o.strip() for o in origins):
         raise FrameError(
             "an identity frame needs at least one origin; an identity with no "
             "origin could be applied to any host the scope allows")
@@ -1126,8 +1144,12 @@ def parse_identity(body: bytes) -> dict:
         raise FrameError("an identity frame with no value registers nothing")
 
     origins = payload.get("origins")
+    # A BLANK origin is refused alongside a missing list, for the same reason
+    # `identity_id` and `value` refuse emptiness: an entry that matches no host
+    # is not a narrower scope, it is a silently dead rule -- and the caller
+    # believes it registered a bound the extension will never apply.
     if not origins or not isinstance(origins, list) or not all(
-            isinstance(o, str) for o in origins):
+            isinstance(o, str) and o.strip() for o in origins):
         raise FrameError(
             "an identity frame needs at least one origin; an identity with no "
             "origin could be applied to any host the scope allows")
@@ -3488,6 +3510,53 @@ def test_a_refused_identity_frame_raises(srv):
         c.close()
 
 
+def test_an_unexpected_ack_shape_is_a_refusal_not_a_silent_success(srv):
+    """Finding 1 of the Task 3 review, and the direction the gap ran.
+
+    `register_identity` used to test only for `t == "error"` and return on
+    everything else, so a reply of any other shape -- a `result` frame from a
+    confused peer, an ack for a frame type this side does not know -- read as
+    "the credential is now live in the extension". Every probe after it would
+    then issue believing it carried a session it does not have, and answer
+    `clean` about the logged-out view of an authenticated application: the
+    exact confusion this whole feature exists to remove, arrived at by
+    agreeing with a peer instead of by having no identity at all.
+
+    `send()` has always been strict about its reply type. This is the same
+    rule on the one frame whose payload is a live credential.
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie", value="v",
+                                      generation=1),
+                    origins=("https://app.test",))
+                result["returned"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+        header, _ = reader.read()
+        # A well-formed frame of the WRONG type: not an error, not the ack.
+        c.sendall(codec.encode({"v": 1, "t": "result", "id": header["id"],
+                                "status": 200, "outcome": "ok"}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert "returned" not in result, (
+            "a `result` frame was accepted as a successful identity "
+            "registration")
+        assert isinstance(result.get("error"), server.BridgeError), result
+        assert "result" in str(result["error"])
+    finally:
+        c.close()
+
+
 def test_send_serialises_concurrent_writers(srv):
     """_send() wrote the socket with no mutex at all, while its Java
     counterpart is a deliberate `private synchronized void send`. Two threads
@@ -5631,13 +5700,24 @@ class BridgeServer:
                   resolved.id, resolved.generation)
         reply = self._request({"v": codec.PROTOCOL_VERSION, "t": "identity",
                                "engagement_id": self.engagement_id}, body)
-        if reply.get("t") == "error":
+        t = reply.get("t")
+        if t == "identity_registered":
+            return
+        if t == "error":
             raise BridgeError(
                 "peer refused identity: "
                 f"{reply.get('class', 'unspecified')}: "
                 f"{reply.get('detail', '')}".rstrip(": "),
                 error_class=reply.get("class"),
             )
+        # ANYTHING ELSE IS A REFUSAL, and this method is the one that most
+        # needs to say so. It used to test only for `error` and return on
+        # everything else, so a reply of an unexpected shape read as "the
+        # credential is now live in the extension" -- and every probe after it
+        # would issue believing it carried a session it does not have, which
+        # is the confusion this whole feature exists to remove. `send()` above
+        # has always been strict about its reply type; this is the same rule.
+        raise BridgeError(f"peer answered an identity frame with a {t!r} frame")
 
     def send(self, req: dict, body: bytes = b"", timeout: float = 30.0,
              *, enforce_locally: bool = True) -> dict:

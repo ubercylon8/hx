@@ -757,13 +757,24 @@ class BridgeServer:
                   resolved.id, resolved.generation)
         reply = self._request({"v": codec.PROTOCOL_VERSION, "t": "identity",
                                "engagement_id": self.engagement_id}, body)
-        if reply.get("t") == "error":
+        t = reply.get("t")
+        if t == "identity_registered":
+            return
+        if t == "error":
             raise BridgeError(
                 "peer refused identity: "
                 f"{reply.get('class', 'unspecified')}: "
                 f"{reply.get('detail', '')}".rstrip(": "),
                 error_class=reply.get("class"),
             )
+        # ANYTHING ELSE IS A REFUSAL, and this method is the one that most
+        # needs to say so. It used to test only for `error` and return on
+        # everything else, so a reply of an unexpected shape read as "the
+        # credential is now live in the extension" -- and every probe after it
+        # would issue believing it carried a session it does not have, which
+        # is the confusion this whole feature exists to remove. `send()` above
+        # has always been strict about its reply type; this is the same rule.
+        raise BridgeError(f"peer answered an identity frame with a {t!r} frame")
 
     def send(self, req: dict, body: bytes = b"", timeout: float = 30.0,
              *, enforce_locally: bool = True) -> dict:

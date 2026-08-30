@@ -535,3 +535,21 @@ def test_the_java_side_rejects_the_same_malformed_two_body_payloads():
     # for someone to run the other suite.
     declaration = text.split("TWO_BODY_HEX =", 1)[1].split(";", 1)[0]
     assert "".join(re.findall(r'"([0-9a-f]*)"', declaration)) == TWO_BODY_HEX
+
+
+def test_a_blank_origin_is_refused_on_both_sides():
+    """Finding 2 of the Task 3 review: the asymmetry in re-validation.
+
+    `identity_id` and `value` both refuse emptiness; `origins` refused only a
+    MISSING list, so `[""]` passed. An origin that matches no host is not a
+    narrower bound, it is a dead rule -- and the caller believes it registered
+    a restriction the extension will never apply, which is the wrong direction
+    for a value whose whole job is to stop a credential going to the wrong
+    host.
+    """
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.identity_body("user", 1, "Cookie", "v", ("",))
+    good = codec.identity_body("user", 1, "Cookie", "v", ("https://app.test",))
+    tampered = good.replace(b'"https://app.test"', b'"   "')
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.parse_identity(tampered)

@@ -936,6 +936,53 @@ def test_a_refused_identity_frame_raises(srv):
         c.close()
 
 
+def test_an_unexpected_ack_shape_is_a_refusal_not_a_silent_success(srv):
+    """Finding 1 of the Task 3 review, and the direction the gap ran.
+
+    `register_identity` used to test only for `t == "error"` and return on
+    everything else, so a reply of any other shape -- a `result` frame from a
+    confused peer, an ack for a frame type this side does not know -- read as
+    "the credential is now live in the extension". Every probe after it would
+    then issue believing it carried a session it does not have, and answer
+    `clean` about the logged-out view of an authenticated application: the
+    exact confusion this whole feature exists to remove, arrived at by
+    agreeing with a peer instead of by having no identity at all.
+
+    `send()` has always been strict about its reply type. This is the same
+    rule on the one frame whose payload is a live credential.
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie", value="v",
+                                      generation=1),
+                    origins=("https://app.test",))
+                result["returned"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+        header, _ = reader.read()
+        # A well-formed frame of the WRONG type: not an error, not the ack.
+        c.sendall(codec.encode({"v": 1, "t": "result", "id": header["id"],
+                                "status": 200, "outcome": "ok"}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert "returned" not in result, (
+            "a `result` frame was accepted as a successful identity "
+            "registration")
+        assert isinstance(result.get("error"), server.BridgeError), result
+        assert "result" in str(result["error"])
+    finally:
+        c.close()
+
+
 def test_send_serialises_concurrent_writers(srv):
     """_send() wrote the socket with no mutex at all, while its Java
     counterpart is a deliberate `private synchronized void send`. Two threads
