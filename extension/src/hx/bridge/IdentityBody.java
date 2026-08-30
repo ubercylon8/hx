@@ -12,9 +12,12 @@ import java.util.Map;
  * JSON rather than {@link ConfigBody}'s key&lt;TAB&gt;value lines because the
  * payload nests, and because the writer on the Python side is already JSON --
  * this is the reader for what that function emits, not a second opinion about
- * what the frame should look like. {@link Json#parseBody} owns the GRAMMAR;
- * this owns the SCHEMA, exactly the split ConfigBody makes against the line
- * format.
+ * what the frame should look like. It stands beside ConfigBody for the same
+ * reason ConfigBody stands apart from {@link Json}: a frame BODY is a
+ * structured payload with rules of its own, and the class that says what those
+ * rules are is not the class that reads characters. The characters here are
+ * {@link Json#parseBody}'s, because there is one JSON grammar in this tree and
+ * a second reader of it would be free to disagree about a surrogate pair.
  *
  * EVERY FIELD IS RE-VALIDATED, and `hx.bridge.codec.parse_identity` states the
  * principle for both sides: a body is checked on the reading side because the

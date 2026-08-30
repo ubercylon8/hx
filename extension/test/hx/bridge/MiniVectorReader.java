@@ -10,6 +10,15 @@ import java.util.*;
  * placeholder standing in for the header -- through the same flat parser.
  * Widening Json.parse to accept nesting, just to satisfy a test, is the
  * wrong trade.
+ *
+ * {@code Json.parseBody} DOES read nesting now, and that sentence still holds
+ * as written: it was added for the `identity` frame's BODY, which is a
+ * structured payload on the wire, and it is a separate entry point that leaves
+ * {@code Json.parse} -- every frame HEADER -- as flat as it ever was. This
+ * reader is left alone rather than rewritten onto it, because a vector file
+ * that both languages read is not the place to change readers in a commit
+ * about something else. Doing so later would be a simplification and not a
+ * fix.
  */
 final class MiniVectorReader {
 

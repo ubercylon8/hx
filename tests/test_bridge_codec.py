@@ -231,6 +231,38 @@ def test_the_identity_frame_round_trips():
     assert out["origins"] == ["https://app.test"]
 
 
+def test_the_java_fixture_is_what_this_writer_emits():
+    """The `identity` body is a wire contract between two languages.
+
+    `IdentityFrameTest.java` transcribes one body and asserts that the Java
+    reader takes it apart correctly. On its own that pins what THAT side
+    accepts and nothing at all about what THIS side sends: key order,
+    `separators`, `ensure_ascii` -- any of them could move here and both
+    suites would stay green while the extension refused every real frame.
+
+    So the literal is read back out of the Java file and compared. Same shape
+    as `tests/test_credentials_never_reach_the_store.py`, which reads
+    `CREDENTIAL_PARAMS` out of `Redactor.java`: the copy that can drift is the
+    one in the other language, so the comparison lives on this side.
+    """
+    java = (Path(__file__).resolve().parents[1] / "extension" / "test" / "hx"
+            / "bridge" / "IdentityFrameTest.java").read_text(encoding="utf-8")
+    match = re.search(r"static final String PYTHON_WRITES =\n(.*?);\n", java, re.S)
+    assert match, ("IdentityFrameTest.java has no PYTHON_WRITES constant; the "
+                   "fixture it names is what this test compares against")
+    # The Java source of a string built by `+`: take every quoted run and undo
+    # the backslash-escaping of the quotes inside it.
+    pieces = re.findall(r'"((?:[^"\\]|\\.)*)"', match.group(1))
+    assert pieces, match.group(1)
+    transcribed = "".join(pieces).replace('\\"', '"')
+
+    assert transcribed.encode("utf-8") == codec.identity_body(
+        "user", 2, "Cookie", "session=abc", ("https://app.test",)), (
+        "the body IdentityFrameTest.java transcribes is not the one "
+        f"identity_body writes.\n  java:   {transcribed}\n"
+        f"  python: {codec.identity_body('user', 2, 'Cookie', 'session=abc', ('https://app.test',)).decode()}")
+
+
 def test_identity_body_carries_more_than_one_origin_in_order():
     body = codec.identity_body("user", 1, "Cookie", "v",
                                ("https://a.test", "https://b.test"))

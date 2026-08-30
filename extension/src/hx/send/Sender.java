@@ -582,9 +582,11 @@ public final class Sender {
      * WHAT READS `injected` TODAY: nothing in production, and that is worth
      * saying plainly rather than leaving a reader to discover it. The send
      * path's `result` frame carries ONE body -- the redacted RESPONSE -- so no
-     * copy of the request crosses the bridge from here, and the copy the store
-     * holds for a send is the one the harness composed itself, which never had
-     * a credential in it. The registration happens anyway because spec s7
+     * copy of the request crosses the bridge from here at all; and nothing on
+     * the Python side writes an `exchange` row for a send yet either, since
+     * `records.record_exchange` has exactly one caller and it is
+     * `hx.capture.Capture.on_exchange`, which serves the PROXY's `exchange`
+     * frames. The registration happens anyway because spec s7
      * requires it to precede issuance and storage, and because the moment a
      * request half is added to this frame it must be redacted rather than
      * retrofitted: s7 calls the blob store the one item that cannot be
@@ -685,9 +687,10 @@ public final class Sender {
      * the send frame's `target_host` -- and never against the request's own
      * Host line, for the reason {@link #parse} gives: deciding on a Host header
      * would let a request authorised for one service open a connection
-     * somewhere else. An origin written as a URL (`https://app.test`, which is
-     * the shape spec s5's example and `hx.bridge.codec.identity_body` both
-     * use) contributes its authority's host; one written as a bare host
+     * somewhere else. An origin written as a URL -- the shape spec s5's own
+     * example uses, and the shape a `scope.include` pattern has, which is
+     * where s5 says the default comes from --
+     * contributes its authority's host; one written as a bare host
      * contributes itself. A PORT in the origin is ignored: this compares hosts,
      * and the port a send goes to is settled by the frame and by scope.
      *

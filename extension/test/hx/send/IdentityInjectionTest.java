@@ -34,8 +34,9 @@ import java.util.Map;
  *
  * NO BARE `assert` ANYWHERE IN THIS FILE. `extension/test.sh` passes no `-ea`,
  * so a Java assertion is a no-op and a suite written with them prints ALL PASS
- * whether or not the code works -- which is exactly what this task's own plan
- * sketch would have produced. Every claim below goes through {@link #check}.
+ * whether or not the code works -- which is exactly what this plan's Task 4
+ * sketch would have produced, `assert r.get("user").origins().size() == 1;`
+ * and eleven more like it. Every claim below goes through {@link #check}.
  */
 public class IdentityInjectionTest {
 
@@ -80,8 +81,8 @@ public class IdentityInjectionTest {
               () -> unmanagedCredentialStillFiresForAHeaderTheCallerSupplied(sentinel));
             t("theIdentityHeaderReplacesOneTheCallerSentUnderTheSameName",
               () -> theIdentityHeaderReplacesOneTheCallerSentUnderTheSameName(sentinel));
-            t("theBytesIssuedAreTheBytesTheRangeWasMeasuredFrom",
-              () -> theBytesIssuedAreTheBytesTheRangeWasMeasuredFrom(sentinel));
+            t("httpIsHandedThePostInjectionRequestAndItsExactBytes",
+              () -> httpIsHandedThePostInjectionRequestAndItsExactBytes(sentinel));
             t("originsAreMatchedByHostAndNeverBySuffix",
               IdentityInjectionTest::originsAreMatchedByHostAndNeverBySuffix);
             t("aDegenerateIdentityIsRefusedRatherThanIssuedWithABogusRange",
@@ -492,19 +493,27 @@ public class IdentityInjectionTest {
               !text(cased.http.lastWire).contains("KEY_THE_CALLER_CHOSE"));
     }
 
-    static void theBytesIssuedAreTheBytesTheRangeWasMeasuredFrom(Path sentinel) {
+    /**
+     * Http gets the POST-injection request and the POST-injection bytes, and
+     * they describe each other.
+     *
+     * Http takes the composed bytes as a parameter precisely so that the array
+     * the Injected was measured from is the array that goes to Burp;
+     * re-serialising the HxRequest downstream would produce a third array that
+     * no range set names, and Redactor.Injected compares by IDENTITY rather
+     * than by content, so that mistake would not be visible by reading the
+     * bytes. WHAT THIS CHECKS is the half that IS visible from out here: both
+     * arguments have had the identity applied, so an implementation reading
+     * either one sees the same request. The array-identity half is held by
+     * compose() returning both from one local.
+     */
+    static void httpIsHandedThePostInjectionRequestAndItsExactBytes(Path sentinel) {
         Rig rig = new Rig(sentinel);
         rig.registerUser();
         rig.sender.issue(sendHeader("app.example.test", "user"),
                          request("app.example.test"), authorised());
-        // Http takes the composed bytes as a parameter precisely so that the
-        // array the Injected was measured from IS the array that goes to Burp.
-        // Re-serialising the HxRequest downstream would produce a third array
-        // that no range set names -- and Redactor.Injected compares by
-        // IDENTITY, not by content, so that mistake is not visible by reading
-        // the bytes.
-        check("the bytes handed to Http are a serialisation of the request it "
-              + "was given", rig.http.lastWire != null && rig.http.last != null);
+        check("Http was handed both a request and its bytes",
+              rig.http.lastWire != null && rig.http.last != null);
         check("and they are the ones carrying the credential",
               text(rig.http.lastWire).contains(SECRET));
         check("and the HxRequest handed alongside them carries the header too, "
@@ -556,10 +565,15 @@ public class IdentityInjectionTest {
      * whose redaction cannot be trusted.
      *
      * `IdentityRegistry.register` refuses a blank value, so this Entry cannot
-     * come off the wire -- it is built here directly. That is the point: the
-     * guard is defence in depth for the day something else can construct one,
-     * and a RangeError on this path is answered `bad_frame` BEFORE http.send
-     * rather than becoming an exception out of the send arm.
+     * come off the wire -- it is built here directly, which is also why the
+     * case is driven at compose() rather than through issue(): there is no
+     * frame that reaches the send path with one. That is the point of the
+     * guard, which is defence in depth for the day something else can
+     * construct an Entry. Where the RangeError GOES is issue()'s existing
+     * catch, which answers `bad_frame` before anything is issued; that catch is
+     * pinned by SenderTest.aRedactionFailureIsRefusedRatherThanFramed, which
+     * reaches it through the other input -- a response the redactor cannot
+     * read -- and not by this method.
      */
     static void aDegenerateIdentityIsRefusedRatherThanIssuedWithABogusRange(Path sentinel) {
         Rig rig = new Rig(sentinel);

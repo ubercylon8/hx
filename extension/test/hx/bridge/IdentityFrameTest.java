@@ -75,12 +75,24 @@ public class IdentityFrameTest {
     static final String SECRET = "session=IDENTITY_FRAME_SECRET_4f2a";
 
     /**
-     * Byte for byte what `hx.bridge.codec.identity_body` emits -- the same key
-     * order, the same `separators=(",", ":")` with no spaces, the same nesting.
+     * ONE body, exactly as `hx.bridge.codec.identity_body` writes it.
      *
-     * Written out rather than built by a helper, because the thing being
-     * tested is that THIS side reads what THAT side writes, and a helper that
-     * assembled it here would be testing this file against itself.
+     * A TRANSCRIPTION, and it is COMPARED rather than trusted:
+     * `tests/test_bridge_codec.py::test_the_java_fixture_is_what_this_writer_emits`
+     * reads this literal out of this file, unescapes it, and requires it to
+     * equal what the real writer produces for these arguments. Without that,
+     * this suite would pin what this side accepts and nothing would pin that
+     * the other side sends it -- the two could drift on key order, on
+     * `separators`, on anything, and both suites would stay green.
+     */
+    static final String PYTHON_WRITES =
+            "{\"identity_id\":\"user\",\"generation\":2,\"inject\":{\"header\":\"Cookie\","
+            + "\"value\":\"session=abc\"},\"origins\":[\"https://app.test\"]}";
+
+    /**
+     * The same shape, for arbitrary arguments. Built here rather than
+     * transcribed, because the cases below vary one field at a time and
+     * {@link #PYTHON_WRITES} is what holds the shape itself to the writer.
      */
     static byte[] body(String id, int generation, String header, String value,
                        String... origins) {
@@ -124,6 +136,15 @@ public class IdentityFrameTest {
     // ---- the body ------------------------------------------------------
 
     static void theBodyParserReadsWhatThePythonWriterEmits() {
+        // The transcribed body FIRST, because it is the one held against the
+        // real writer from the other side.
+        IdentityBody.Parsed real = IdentityBody.parse(
+                PYTHON_WRITES.getBytes(StandardCharsets.UTF_8));
+        check("the body the Python writer emits is read field for field",
+              "user".equals(real.identityId()) && real.generation() == 2
+              && "Cookie".equals(real.header()) && "session=abc".equals(real.value())
+              && real.origins().equals(List.of("https://app.test")));
+
         IdentityBody.Parsed p = IdentityBody.parse(
                 body("user", 3, "Cookie", SECRET, "https://app.test", "https://api.app.test"));
         check("the identity id survives the round trip", "user".equals(p.identityId()));

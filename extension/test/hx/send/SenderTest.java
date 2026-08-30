@@ -1049,13 +1049,15 @@ public class SenderTest {
     /**
      * A Redactor.RangeError is a DENIAL, never an implicit allow (s4).
      *
-     * Plan 5's identity injection lands on issue(), between the credential
-     * refusal and the issue, and a range that will not fit the bytes in hand
-     * says the frame describes a request other than this one. Nothing
-     * registers a range yet, so the one input that reaches the catch today is
-     * a reply whose bytes the redactor cannot reason about at all -- the same
-     * shape of failure, and the same answer: bytes that were not redacted are
-     * not framed as evidence.
+     * TWO inputs reach the catch now. Identity injection registers a range
+     * between the gate and the issue, and `Sender.compose` raises a RangeError
+     * for one whose bytes are not the credential it was measured for -- a
+     * range that does not describe the request in hand. The one driven here is
+     * the other: a reply whose bytes the redactor cannot reason about at all.
+     * Same shape of failure, same answer -- bytes that were not redacted are
+     * not framed as evidence -- and this input is the one a test can actually
+     * produce, since a bad range needs an Entry the registry would refuse.
+     * hx.send.IdentityInjectionTest drives that one at compose() directly.
      *
      * Without the catch the RangeError leaves issue() as an unhandled
      * RuntimeException, reaches BridgeClient's send arm, and takes the control
