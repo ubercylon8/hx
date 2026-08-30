@@ -1306,8 +1306,10 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     check's `clean` is a statement about the logged-out view and nothing
     else". The parenthetical is still true and the conclusion is not: a run
     whose config names a `scan_identity` registers that credential with the
-    extension and binds every `ProbeSender` to it, and the JVM injects the
-    declared header on each probe. The composition this side does not do
+    extension and binds every `ProbeSender` to it, and the JVM then puts the
+    declared header on each probe as its FIRST header (`Sender.compose`,
+    which also registers the credential's byte range for redaction). The
+    composition this side does not do
     happens one layer below what this function can see, which is exactly why
     the sentence looked checkable from here and was wrong. F3 of fix round A
     -- and it mattered because Task 8 re-opens this gate by editing this
