@@ -2163,6 +2163,25 @@ def test_a_programmatic_identity_needs_no_value_from_env(tmp_path):
     rendered = config.dumps(cfg)
     assert "value_from_env" not in rendered
     assert config.load_text(rendered).identities["user"] == ident
+
+
+def test_a_static_identity_without_value_from_env_is_refused(tmp_path):
+    """The inverse of the programmatic case, and the half that was unpinned.
+
+    A programmatic identity legitimately has no `value_from_env` -- its
+    credential comes from `refresh.command`'s stdout, which is why spec section
+    4's own `admin` example omits it. A STATIC one has no other source, so
+    omitting it there leaves an identity that can never produce a credential:
+    `hx.identity.resolve` would have no variable to read and the run would
+    either halt or, worse, issue anonymously against an application that
+    requires a session -- answering `clean` about a view none of its users are
+    in. The rule was enforced from the start; only this direction of it went
+    untested, which is how it would have regressed silently.
+    """
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(inject={"header": "Cookie"}), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="value_from_env"):
+        config.load(p)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
