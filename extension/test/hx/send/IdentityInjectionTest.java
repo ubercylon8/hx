@@ -457,24 +457,40 @@ public class IdentityInjectionTest {
         check("and the Gate was never asked, so nothing was spent", rig.gate.calls == 0);
     }
 
+    /**
+     * DEFENCE IN DEPTH ON A STATE THE CONFIGURATION FORBIDS, and it is kept
+     * because it is that, not because the state is reachable.
+     *
+     * The collision this pins -- the caller sending a header under the
+     * identity's own name -- cannot happen in production, and the reason has
+     * two independent halves. `hx.config` refuses any `inject.header` outside
+     * `Cookie`, `Authorization` and `Proxy-Authorization` at load
+     * (src/hx/config.py:130-134), so no fourth name can be configured; and
+     * those three, sent by the caller, are refused `unmanaged_credential`
+     * before injection is reached at all. Since the Task 5 fix round
+     * `IdentityRegistry.register` refuses the fourth name too, on the
+     * extension's own account -- which is why this method now builds the Entry
+     * DIRECTLY and drives `compose()`, exactly as
+     * {@link #aDegenerateIdentityIsRefusedRatherThanIssuedWithABogusRange}
+     * does and for the same reason: there is no frame that reaches the send
+     * path with one, and the last arm below is what says so.
+     *
+     * What is still worth pinning is `withHeaderFirst`'s SEMANTICS: two values
+     * for one field name would leave the server to choose which, and a check
+     * could then read an answer given to the caller's own credential and file
+     * it as the identity's.
+     */
     static void theIdentityHeaderReplacesOneTheCallerSentUnderTheSameName(Path sentinel) {
-        Rig rig = new Rig(sentinel);
-        // A header name that is NOT one of Redactor's three credential
-        // headers, so `unmanaged_credential` does not refuse it first -- which
-        // is the only way this collision can actually reach injection.
-        rig.identities.register("api", 1, "X-Api-Key", "KEY_FROM_THE_IDENTITY",
-                                List.of("https://app.example.test"));
-        Map<String, Object> reply = rig.sender.issue(
-                sendHeader("app.example.test", "api"),
-                request("app.example.test", "X-Api-Key", "KEY_THE_CALLER_CHOSE"),
-                authorised());
-        check("the send is issued", "result".equals(reply.get("t")));
-        String wire = text(rig.http.lastWire);
+        IdentityRegistry.Entry ident = new IdentityRegistry.Entry(
+                "api", 1, "X-Api-Key", "KEY_FROM_THE_IDENTITY",
+                List.of("https://app.example.test"));
+        String wire = text(Sender.compose(
+                Sender.parse(sendHeader("app.example.test", "api"),
+                             request("app.example.test", "X-Api-Key",
+                                     "KEY_THE_CALLER_CHOSE")),
+                ident).wire());
         check("the identity's value is what goes out",
               wire.contains("X-Api-Key: KEY_FROM_THE_IDENTITY\r\n"));
-        // TWO values for one field name would leave the server to choose, and
-        // a check could then read an answer given to the caller's credential
-        // and file it as the identity's.
         check("and the caller's value is gone rather than sent alongside it",
               !wire.contains("KEY_THE_CALLER_CHOSE"));
         check("exactly one X-Api-Key header goes out",
@@ -483,14 +499,21 @@ public class IdentityInjectionTest {
         // Field names are case-insensitive (RFC 9110 s5.1), so the collision is
         // matched that way too -- otherwise `x-api-key` from the caller would
         // ride out beside the identity's `X-Api-Key`.
-        Rig cased = new Rig(sentinel);
-        cased.identities.register("api", 1, "X-Api-Key", "KEY_FROM_THE_IDENTITY",
-                                  List.of("https://app.example.test"));
-        cased.sender.issue(sendHeader("app.example.test", "api"),
-                           request("app.example.test", "x-api-key", "KEY_THE_CALLER_CHOSE"),
-                           authorised());
+        String cased = text(Sender.compose(
+                Sender.parse(sendHeader("app.example.test", "api"),
+                             request("app.example.test", "x-api-key",
+                                     "KEY_THE_CALLER_CHOSE")),
+                ident).wire());
         check("a differently-cased duplicate is replaced too",
-              !text(cased.http.lastWire).contains("KEY_THE_CALLER_CHOSE"));
+              !cased.contains("KEY_THE_CALLER_CHOSE"));
+
+        // ...and the Entry above could not have come off the wire. This is the
+        // arm that keeps the javadoc honest: if registration ever stopped
+        // refusing the name, this method would be testing a live path while
+        // claiming to test a foreclosed one.
+        check("and the registry refuses to hold a fourth header name anyway",
+              registerRefused(new Rig(sentinel), "KEY_FROM_THE_IDENTITY",
+                              "X-Api-Key"));
     }
 
     /**

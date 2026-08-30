@@ -46,6 +46,12 @@ public final class IdentityRegistryTest {
         t("aBlankValueIsRefused", IdentityRegistryTest::aBlankValueIsRefused);
         t("noOriginsIsRefused", IdentityRegistryTest::noOriginsIsRefused);
         t("toStringDoesNotCarryTheCredential", IdentityRegistryTest::toStringDoesNotCarryTheCredential);
+        t("aValueCarryingCRLFIsREFUSEDRatherThanEscaped", IdentityRegistryTest::aValueCarryingCRLFIsREFUSEDRatherThanEscaped);
+        t("aValueCarryingNulIsRefused", IdentityRegistryTest::aValueCarryingNulIsRefused);
+        t("aValueOutsideLatin1IsRefusedRatherThanSilentlyMangled", IdentityRegistryTest::aValueOutsideLatin1IsRefusedRatherThanSilentlyMangled);
+        t("aHeaderNameCarryingADelimiterIsRefused", IdentityRegistryTest::aHeaderNameCarryingADelimiterIsRefused);
+        t("onlyTheThreeCredentialHeadersMayBeInjectedInto", IdentityRegistryTest::onlyTheThreeCredentialHeadersMayBeInjectedInto);
+        t("noRefusalMessageQuotesTheCredential", IdentityRegistryTest::noRefusalMessageQuotesTheCredential);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -181,6 +187,145 @@ public final class IdentityRegistryTest {
     static void nullOriginsIsRefusedAsWellAsAnEmptyList() {
         check("null origins is refused", refused(() ->
             new IdentityRegistry().register("user", 1, "Cookie", "v", null)));
+    }
+
+    /**
+     * Finding 1 of the Task 5 review, and the one that is not tidiness.
+     *
+     * `Sender.compose` writes `header + ": " + value` and ends the field with
+     * CRLF, so a value carrying its own CRLF composes into TWO headers -- a
+     * request issued past `Policy.checkGate` carrying a field the gate never
+     * saw. Measured by the reviewer, driving compose() directly:
+     * {@code "sess=1\r\nX-Smuggled: yes"} produced `Cookie: sess=1` followed
+     * by `X-Smuggled: yes`. A value carrying a BLANK line ends the head early
+     * and turns the caller's remaining fields, `Host` included, into a body.
+     *
+     * AND compose()'s OWN SELF-CHECK CANNOT SEE IT. That check verifies that
+     * the bytes at [start,end) equal the credential, and for a CRLF-carrying
+     * value they do -- the bytes at the range ARE the value. So the range is
+     * correct, the redaction is correct, and the request is wrong. That is why
+     * the assertion here is that registration REFUSES, not that composition
+     * escapes: an escaped credential is a different credential, and the
+     * server would answer it logged-out.
+     */
+    static void aValueCarryingCRLFIsREFUSEDRatherThanEscaped() {
+        IdentityRegistry r = new IdentityRegistry();
+        check("a value carrying CRLF is refused", refused(() ->
+            r.register("user", 1, "Cookie", "sess=1\r\nX-Smuggled: yes",
+                       List.of("https://app.test"))));
+        check("a bare LF is refused too -- one is enough to end a field for "
+              + "some parsers", refused(() ->
+            r.register("user", 1, "Cookie", "sess=1\nX-Smuggled: yes",
+                       List.of("https://app.test"))));
+        check("and a bare CR", refused(() ->
+            r.register("user", 1, "Cookie", "sess=1\rX-Smuggled: yes",
+                       List.of("https://app.test"))));
+        check("a blank line, which would turn Host into a body, is refused",
+              refused(() -> r.register("user", 1, "Cookie",
+                                       "sess=1\r\n\r\nGET /evil HTTP/1.1",
+                                       List.of("https://app.test"))));
+        check("...and nothing was held, so no later send can use one",
+              r.get("user") == null);
+    }
+
+    /** NUL cannot split a header. It is refused because a credential that is
+     *  one length in this JVM and another in whatever C code sits between here
+     *  and a socket is a credential whose registered range means nothing. */
+    static void aValueCarryingNulIsRefused() {
+        check("a value carrying NUL is refused", refused(() ->
+            new IdentityRegistry().register("user", 1, "Cookie", "sess=1\0more",
+                                            List.of("https://app.test"))));
+    }
+
+    /**
+     * Finding 6. `Sender.wireBytes` encodes ISO-8859-1 and `String.getBytes`
+     * replaces an unmappable character with '?', so `sess=€123` went out as
+     * `sess=?123` -- offsets correct, redaction correct, credential dead. The
+     * server answers that request logged-out and a check reads the answer as
+     * "not vulnerable", which is the single outcome this feature exists to
+     * prevent. Silence is the whole defect, so the fix is a refusal at the
+     * point an operator can act on it.
+     */
+    static void aValueOutsideLatin1IsRefusedRatherThanSilentlyMangled() {
+        check("a value outside Latin-1 is refused", refused(() ->
+            new IdentityRegistry().register("user", 1, "Cookie", "sess=€123",
+                                            List.of("https://app.test"))));
+        // The high half of Latin-1 IS legal field content (RFC 9110 s5.5
+        // obs-text) and survives the encoding byte for byte, so refusing it
+        // would be refusing a credential that works.
+        IdentityRegistry r = new IdentityRegistry();
+        r.register("user", 1, "Cookie", "sess=café", List.of("https://app.test"));
+        check("but an 8-bit Latin-1 value is kept: it encodes to itself",
+              "sess=café".equals(r.get("user").value()));
+    }
+
+    /**
+     * Finding 5. The name is not a free string: `Sender.withHeaderFirst`
+     * writes whatever is registered as the request's FIRST header, so a name
+     * of {@code "Cookie: a\r\nX-Evil"} composed into two headers -- measured
+     * by the reviewer. The value is not the only half of the field.
+     */
+    static void aHeaderNameCarryingADelimiterIsRefused() {
+        IdentityRegistry r = new IdentityRegistry();
+        check("a header name carrying CRLF is refused", refused(() ->
+            r.register("user", 1, "Cookie: a\r\nX-Evil", "v",
+                       List.of("https://app.test"))));
+        check("and one outside Latin-1", refused(() ->
+            r.register("user", 1, "Cooki€e", "v", List.of("https://app.test"))));
+        check("...and nothing was held", r.get("user") == null);
+    }
+
+    /**
+     * Finding 5's other half: §4 says the extension enforces, and until this
+     * round only `hx.config` restricted the injectable set to §6's three.
+     *
+     * A TRAILING SPACE IS REFUSED, and that is the arm that would go green
+     * under the obvious implementation. `Redactor.asciiEqualsIgnoreCase`
+     * TRIMS -- correctly, because it is a fail-closed gate on a name the
+     * harness sent -- and reusing it here would accept `"Cookie "`, which
+     * `withHeaderFirst` then emits as `Cookie : v`: a field name with a space
+     * before its colon, which RFC 9112 s2.2 requires a server to reject and
+     * which parsers disagree about. `Redactor.isCredentialHeader` exists
+     * because acceptance and refusal want opposite answers here.
+     */
+    static void onlyTheThreeCredentialHeadersMayBeInjectedInto() {
+        for (String name : new String[]{"Cookie", "Authorization",
+                                        "Proxy-Authorization", "cookie",
+                                        "AUTHORIZATION"}) {
+            IdentityRegistry r = new IdentityRegistry();
+            r.register("user", 1, name, "v", List.of("https://app.test"));
+            check("'" + name + "' may be injected into -- field names are "
+                  + "case-insensitive (RFC 9110 s5.1)", r.get("user") != null);
+        }
+        for (String name : new String[]{"X-Api-Key", "X-Auth-Token", "Host",
+                                        "Cookie ", " Cookie", "Cookie2"}) {
+            check("'" + name + "' is refused", refused(() ->
+                new IdentityRegistry().register("user", 1, name, "v",
+                                                List.of("https://app.test"))));
+        }
+    }
+
+    /**
+     * These messages travel: BridgeClient answers an IllegalArgumentException
+     * from here as `bad_identity` with `e.getMessage()` as the detail, and the
+     * harness logs that. Spec s5 says the credential is logged on neither
+     * side, so a refusal that quoted the value -- or the one character that
+     * failed -- would be the leak, arriving through the very door that exists
+     * to stop one.
+     */
+    static void noRefusalMessageQuotesTheCredential() {
+        String secret = "sess=SUPERSECRET\r\nX-Smuggled: yes";
+        String message = "no refusal";
+        try {
+            new IdentityRegistry().register("user", 1, "Cookie", secret,
+                                            List.of("https://app.test"));
+        } catch (IllegalArgumentException e) {
+            message = e.getMessage();
+        }
+        check("the CRLF refusal says nothing of the value (got: " + message + ")",
+              !message.contains("SUPERSECRET") && !message.contains("no refusal"));
+        check("...but does name the identity, so an operator knows which one",
+              message.contains("user"));
     }
 
     /** True when the body throws IllegalArgumentException. */

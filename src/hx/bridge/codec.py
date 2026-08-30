@@ -285,6 +285,62 @@ def build_config_body(pairs: dict[str, list[str]]) -> bytes:
     return bytes(out)
 
 
+def _refuse_unwritable(identity_id: str, what: str, text: str) -> None:
+    """Refuse text the extension could not write into a header as itself.
+
+    THE SAME RULE `build_config_body` TWENTY LINES ABOVE ALREADY APPLIES, and
+    the one body in this protocol that carries a live credential was the one
+    body less strict about it than the config writer. `Sender.compose` writes
+    `header + ": " + value` and ends the field with CRLF, so:
+
+      * CR or LF splits the field. `"sess=1\\r\\nX-Smuggled: yes"` issues a
+        SECOND header that no gate decided about, and `compose`'s own
+        self-check cannot see it -- that check verifies the bytes at the
+        registered range ARE the credential, and for a CRLF-carrying value
+        they are. A blank line ends the head early and turns the caller's
+        remaining fields, `Host` included, into a body.
+      * NUL cannot split a field and is refused anyway: it terminates a string
+        in most of what sits between here and a socket.
+      * anything above U+00FF is SILENTLY MANGLED. `Sender.wireBytes` encodes
+        ISO-8859-1 and Java replaces an unmappable character with `?`, so
+        `sess=€123` goes out as `sess=?123` -- a dead credential, an
+        answer given to nobody, and a check that reads it as "not vulnerable".
+
+    THIS IS THE EARLIER ERROR, NOT THE ENFORCEMENT. `IdentityRegistry.register`
+    refuses all three on the extension side and that is the check the invariant
+    rests on -- spec section 4 is explicit that the JVM may not depend on this
+    process being correct. What this buys is a refusal raised where the
+    operator's own `refresh` command and environment variable are in view,
+    before a frame is written, rather than a `bad_identity` coming back over a
+    socket.
+
+    NOT THE HEADER NAME SET. `hx.config` refuses an `inject.header` outside
+    `Cookie`, `Authorization` and `Proxy-Authorization` at load
+    (`hx.config.CREDENTIAL_HEADERS`), with a better message than this could
+    give, and `IdentityRegistry.register` refuses it again in the JVM. A third
+    copy of those three names here would be a vocabulary in three places.
+    """
+    for ch in text:
+        # The character is never quoted, and neither is the text it came from.
+        # Spec section 5: the credential is logged on neither side, and a
+        # FrameError message is logged by whatever catches it.
+        if ch in "\r\n":
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a carriage return "
+                "or line feed; such values are rejected rather than escaped, "
+                "because injecting one would write a header the extension "
+                "never decided about")
+        if ch == "\0":
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a NUL")
+        if ord(ch) > 0xFF:
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a character "
+                "outside Latin-1; the extension's wire encoding would replace "
+                "it with '?', and a mangled credential answers as an "
+                "unauthenticated one")
+
+
 def identity_body(identity_id: str, generation: int, header: str, value: str,
                   origins: tuple[str, ...]) -> bytes:
     """The `identity` frame's body: `{identity_id, generation,
@@ -304,6 +360,11 @@ def identity_body(identity_id: str, generation: int, header: str, value: str,
     generation than the one it holds as a refusal, so 0 or negative could
     never be above anything it holds, and is a malformed frame here rather
     than a refusal there.
+
+    AND THE HEADER AND VALUE MUST BE WRITABLE AS THEMSELVES -- see
+    `_refuse_unwritable`, which is the same rule `build_config_body` twenty
+    lines above already applies to a config value, arriving late at the one
+    body that carries a credential.
     """
     if not identity_id:
         raise FrameError("an identity frame needs an identity_id")
@@ -313,6 +374,8 @@ def identity_body(identity_id: str, generation: int, header: str, value: str,
         raise FrameError("an identity frame needs a header to inject into")
     if not value:
         raise FrameError("an identity frame with no value registers nothing")
+    _refuse_unwritable(identity_id, "header name", header)
+    _refuse_unwritable(identity_id, "value", value)
     if not origins or not all(o and o.strip() for o in origins):
         raise FrameError(
             "an identity frame needs at least one origin; an identity with no "
