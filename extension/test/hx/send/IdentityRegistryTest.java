@@ -36,6 +36,11 @@ public final class IdentityRegistryTest {
         t("theSameGenerationIsIdempotentRatherThanAnError", IdentityRegistryTest::theSameGenerationIsIdempotentRatherThanAnError);
         t("aHigherGenerationReplacesTheValue", IdentityRegistryTest::aHigherGenerationReplacesTheValue);
         t("aLowerGenerationIsRefused", IdentityRegistryTest::aLowerGenerationIsRefused);
+        t("sameGenerationWithDifferentContentDoesNotSwapTheCredential", IdentityRegistryTest::sameGenerationWithDifferentContentDoesNotSwapTheCredential);
+        t("aBlankIdIsRefused", IdentityRegistryTest::aBlankIdIsRefused);
+        t("aGenerationBelowOneIsRefused", IdentityRegistryTest::aGenerationBelowOneIsRefused);
+        t("aBlankHeaderIsRefused", IdentityRegistryTest::aBlankHeaderIsRefused);
+        t("nullOriginsIsRefusedAsWellAsAnEmptyList", IdentityRegistryTest::nullOriginsIsRefusedAsWellAsAnEmptyList);
         t("anUnknownIdentityIsNullNotAnEmptyEntry", IdentityRegistryTest::anUnknownIdentityIsNullNotAnEmptyEntry);
         t("originsAreCopiedSoACallerCannotWidenThemLater", IdentityRegistryTest::originsAreCopiedSoACallerCannotWidenThemLater);
         t("aBlankValueIsRefused", IdentityRegistryTest::aBlankValueIsRefused);
@@ -131,5 +136,56 @@ public final class IdentityRegistryTest {
               !s.contains("SUPERSECRET"));
         check("...but does carry the id, so it is still useful for debugging",
               s.contains("user"));
+    }
+
+    /** Finding 1 of the Task 4 review. `compute`'s remapper used to build a
+     *  new Entry from whatever the call passed, so a second frame at the SAME
+     *  generation carrying a DIFFERENT credential swapped it silently -- a
+     *  content change that never advanced the counter whose job is to gate
+     *  content changes. The old test only ever resent identical content, so
+     *  it could not see this. */
+    static void sameGenerationWithDifferentContentDoesNotSwapTheCredential() {
+        IdentityRegistry r = new IdentityRegistry();
+        r.register("user", 2, "Cookie", "first", List.of("https://app.test"));
+        r.register("user", 2, "Cookie", "second", List.of("https://evil.test"));
+        check("the held value survives a same-generation re-register",
+              r.get("user").value().equals("first"));
+        check("and so do the held origins",
+              r.get("user").origins().equals(List.of("https://app.test")));
+    }
+
+    /** Findings 2 and 3: branches the code guards and no test reached. The
+     *  Python side validates these too, but the extension is meant to be an
+     *  independent last line of defence, not a second opinion. */
+    static void aBlankIdIsRefused() {
+        check("a blank id is refused", refused(() ->
+            new IdentityRegistry().register("  ", 1, "Cookie", "v",
+                                            List.of("https://app.test"))));
+    }
+
+    static void aGenerationBelowOneIsRefused() {
+        check("generation 0 is refused", refused(() ->
+            new IdentityRegistry().register("user", 0, "Cookie", "v",
+                                            List.of("https://app.test"))));
+        check("a negative generation is refused", refused(() ->
+            new IdentityRegistry().register("user", -1, "Cookie", "v",
+                                            List.of("https://app.test"))));
+    }
+
+    static void aBlankHeaderIsRefused() {
+        check("a blank header is refused", refused(() ->
+            new IdentityRegistry().register("user", 1, "  ", "v",
+                                            List.of("https://app.test"))));
+    }
+
+    static void nullOriginsIsRefusedAsWellAsAnEmptyList() {
+        check("null origins is refused", refused(() ->
+            new IdentityRegistry().register("user", 1, "Cookie", "v", null)));
+    }
+
+    /** True when the body throws IllegalArgumentException. */
+    static boolean refused(Runnable body) {
+        try { body.run(); return false; }
+        catch (IllegalArgumentException expected) { return true; }
     }
 }

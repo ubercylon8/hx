@@ -66,6 +66,18 @@ public final class IdentityRegistry {
                 throw new StaleGeneration(
                     "identity " + id + " is at generation " + held.generation()
                     + "; refusing to go back to " + generation);
+            // EQUAL GENERATION KEEPS THE HELD ENTRY, and that is not a
+            // shortcut for the retry case -- it is the monotonic rule meaning
+            // what it says. This used to build a new Entry from whatever the
+            // call passed, so a second frame at the SAME generation carrying a
+            // DIFFERENT credential swapped it silently: a content change that
+            // never advanced the counter whose whole job is to gate content
+            // changes. Identical content, which is all a bridge retry ever
+            // sends, is unaffected either way. A real rotation advances the
+            // generation -- `hx.identity.refresh` returns `generation + 1`
+            // unconditionally -- so nothing legitimate needs this door.
+            if (held != null && generation == held.generation())
+                return held;
             return new Entry(id, generation, header, value, frozen);
         });
     }
