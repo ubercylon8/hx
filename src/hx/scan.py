@@ -690,7 +690,7 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
         # crash instead of a fast retest. `error`, not `completed`: S5 "an
         # aborted run must never render as a clean one."
         run_mod.close_run(conn, run_id=run_id, status="error",
-                          stop_reason=_halt_reason(exc))
+                          stop_reason=_halt_reason(exc, summary))
         raise
     # F7 of the task-6 review: a budget-truncated scan used to close
     # `('completed', NULL)`, identical at the `run` row to a scan that
@@ -723,6 +723,30 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # `skipped` names rows the runner never ran, `probes refused` names the
     # wire's own classes on rows that did run, and an operator chasing one
     # looks in a different place from an operator chasing the other.
+    parts = _tallies(summary)
+    stop_reason = f"truncated: {'; '.join(parts)}" if parts else None
+    run_mod.close_run(conn, run_id=run_id, status="completed",
+                      stop_reason=stop_reason)
+    return summary
+
+
+def _tallies(summary) -> list[str]:
+    """The two labelled counts a run row carries when it stopped short.
+
+    EXTRACTED SO THE HALT PATH CAN CARRY THEM TOO -- F2 of fix round A. This
+    string was assembled inline on the SUCCESS path only, so a run that
+    halted recorded `summary.refused` nowhere: not in the run row, not in
+    any message, and (until `hx scan` grows an `except IdentityDead`, which
+    is Task 8's) not at the terminal either. On the one path where diagnosis
+    matters most, the wire's own word for what stopped the run existed in no
+    place an operator could read.
+
+    The two are labelled rather than merged, and that is the same decision
+    F11 took: `skipped` names rows the runner never ran, `probes refused`
+    names the wire's own classes on rows that did run, and an operator
+    chasing one looks in a different place from an operator chasing the
+    other.
+    """
     parts = []
     if summary.by_reason:
         parts.append("skipped " + ", ".join(
@@ -730,13 +754,10 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     if summary.refused:
         parts.append("probes refused " + ", ".join(
             f"{k}={v}" for k, v in sorted(summary.refused.items())))
-    stop_reason = f"truncated: {'; '.join(parts)}" if parts else None
-    run_mod.close_run(conn, run_id=run_id, status="completed",
-                      stop_reason=stop_reason)
-    return summary
+    return parts
 
 
-def _halt_reason(exc) -> str:
+def _halt_reason(exc, summary) -> str:
     """What a run that RAISED writes to `run.stop_reason`.
 
     ONE EXCEPTION TYPE DOES NOT GET TO SPEAK FOR ITSELF HERE, and F1 of fix
@@ -760,9 +781,24 @@ def _halt_reason(exc) -> str:
     different is not that its text is untrusted -- all of them are -- but
     that a SUBPROCESS'S STDERR reached it, which no other exception on this
     path can do.
+
+    THE RUN'S TALLIES GO WITH IT, for `IdentityDead` and not for the rest.
+    A halt is the one stop where `summary.refused` reached the store nowhere
+    (`_tallies`' own docstring), and a run that halted after two hundred
+    refused probes has to be able to say so. The other exceptions do not get
+    them because their text already IS the diagnosis and a `sqlite3.Error`
+    with a refusal tally bolted on reads as though the refusals caused it.
+
+    The canary's own refusal therefore appears twice on a halt that had no
+    other traffic -- once as the diagnosis, once as the run's whole tally --
+    and that is not a duplication to engineer away. They are different
+    facts that happen to coincide in the smallest case: the first says what
+    stopped the run, the second says everything the run was refused, and the
+    moment a probe is refused as well they say different things.
     """
     if isinstance(exc, IdentityDead):
-        return f"scan.run raised: IdentityDead: {exc.stop_reason}"
+        return "scan.run raised: IdentityDead: " + "; ".join(
+            [exc.stop_reason, *_tallies(summary)])
     return f"scan.run raised: {type(exc).__name__}: {exc}"
 
 
@@ -932,18 +968,18 @@ class _IdentityBracket:
         happened -- see `IdentityDead`'s own docstring.
         """
         self._bridge.register_identity(self.resolved, origins=self._origins)
-        _raw, settled = self._settle()
+        _raw, settled, refusal = self._settle()
         self.window.open(passed=settled)
         if not settled:
+            told, stored = self._unproved(refusal)
             raise IdentityDead(
                 f"identity {self.resolved.id!r} could not be proved live "
-                f"before the first probe: {self._declared.liveness.path} did "
-                "not answer with the signature this identity is declared to "
-                "prove itself by. Halting rather than scanning anonymously: "
-                "an unauthenticated run of an authenticated application "
-                "answers `clean` about a view none of its users are in",
+                f"before the first probe: {told}. Halting rather than "
+                "scanning anonymously: an unauthenticated run of an "
+                "authenticated application answers `clean` about a view none "
+                "of its users are in",
                 stop_reason=(f"identity {self.resolved.id!r} could not be "
-                             "proved live before the first probe"))
+                             f"proved live before the first probe: {stored}"))
 
     def note(self, probes: int) -> None:
         """Count probes issued inside the current window.
@@ -974,18 +1010,17 @@ class _IdentityBracket:
         if not self._due:
             return
         self._due = False
-        raw, settled = self._settle()
+        raw, settled, refusal = self._settle()
         self.window.close(passed=raw)
         if not settled:
+            told, stored = self._unproved(refusal)
             raise IdentityDead(
                 f"identity {self.resolved.id!r} stopped being live during the "
-                f"run: {self._declared.liveness.path} no longer answers with "
-                "the signature it is declared to prove itself by. Halting "
-                "rather than issuing the rest of this run's probes "
-                "unauthenticated, which would answer `clean` for every "
-                "surface still to come",
+                f"run: {told}. Halting rather than issuing the rest of this "
+                "run's probes unauthenticated, which would answer `clean` "
+                "for every surface still to come",
                 stop_reason=(f"identity {self.resolved.id!r} stopped being "
-                             "live during the run"))
+                             f"live during the run: {stored}"))
         self.window.open(passed=True)
 
     def finish(self) -> None:
@@ -1000,11 +1035,16 @@ class _IdentityBracket:
         Renewing the session here would be a request on a client's system
         that buys nothing, and it would also hide the failure this canary
         exists to report.
-        """
-        self.window.close(passed=self._canary())
 
-    def _settle(self) -> tuple[bool, bool]:
-        """`(what the canary said, what it said after the one refresh)`.
+        The refusal class is dropped here and only here: nothing raises at
+        the close, so there is no message for it to correct, and it has
+        already been folded into `summary.refused` by `_canary` itself.
+        """
+        passed, _refusal = self._canary()
+        self.window.close(passed=passed)
+
+    def _settle(self) -> tuple[bool, bool, str | None]:
+        """`(what the canary said, what it said after the one refresh, why)`.
 
         Section 6's outcome table, implemented literally. A passing canary
         settles as itself. A failing one on a `static` identity settles as
@@ -1021,10 +1061,17 @@ class _IdentityBracket:
         accepted, change nothing, and leave the run issuing under the dead
         credential -- which is why `hx.identity.refresh` returns
         `generation + 1` unconditionally.
+
+        THE THIRD MEMBER IS THE LAST CANARY'S REFUSAL CLASS, or None if a
+        response actually came back. The LAST one, because it is the canary
+        that decided `settled` and therefore the one the halt is about: a
+        run whose first canary was refused `identity_origin` and whose
+        post-refresh canary was refused it too has one story, and this
+        returns the attempt the caller is about to raise over.
         """
-        raw = self._canary()
+        raw, refusal = self._canary()
         if raw or self._declared.strategy != "programmatic":
-            return raw, raw
+            return raw, raw, refusal
         try:
             self.resolved = identity_mod.refresh(self._declared,
                                                  self.resolved.generation)
@@ -1040,14 +1087,16 @@ class _IdentityBracket:
             # an exception a halted run records: `hx.identity.refresh` no
             # longer repeats the command's stderr, and this half keeps the
             # containment even if a future message there does.
+            _told, stored = self._unproved(refusal)
             raise IdentityDead(
                 f"identity {self.resolved.id!r} failed its canary and could "
                 f"not be refreshed: {exc}",
-                stop_reason=(f"identity {self.resolved.id!r} failed its "
-                             "canary and its refresh command failed too")
+                stop_reason=(f"identity {self.resolved.id!r} could not be "
+                             f"refreshed after {stored}")
             ) from exc
         self._bridge.register_identity(self.resolved, origins=self._origins)
-        return raw, self._canary()
+        settled, refusal = self._canary()
+        return raw, settled, refusal
 
     def _canary(self) -> bool:
         """One liveness request, through the ordinary send path.
@@ -1063,15 +1112,84 @@ class _IdentityBracket:
         own. `_spent` folds those refusals in where the probes' are counted,
         rather than letting them vanish because no `check_run` row owns them,
         and is passed no bracket, because a canary is not a probe.
+
+        IT RETURNS THE REFUSAL CLASS AS WELL AS THE VERDICT -- F2 of fix
+        round A (HIGH). `hx.identity.canary` collapses a `ProbeRefused` to
+        `False`, which is right (a canary that could not be sent has proved
+        nothing), and this method USED TO THROW THE CLASS AWAY into
+        `summary.refused` and nowhere else. The caller then said "/account
+        did not answer with the signature this identity is declared to prove
+        itself by" about a request that never left the JVM. See `_unproved`
+        for what that costs an operator.
+
+        AT MOST ONE ENTRY, AND IT IS THIS CANARY'S. `identity.canary` issues
+        exactly one request through this sender, and the sender is built here
+        and discarded here, so `sender.refused` is either empty or a single
+        class with a count of one. `sorted()` is not for the ordering -- there
+        is nothing to order -- it is so that a future canary sending two
+        requests picks a class deterministically rather than at dict-insert
+        order.
         """
         scheme, host, port = self._target
         sender = probe.ProbeSender(
             self._bridge, scheme=scheme, host=host, port=port,
             path=self._declared.liveness.path, identity_id=self.resolved.id)
         try:
-            return identity_mod.canary(self._declared.liveness, sender)
+            passed = identity_mod.canary(self._declared.liveness, sender)
         finally:
             self._summary.canary_requests += _spent(self._summary, sender)
+        # `refused` is a copy, so reading it after `_spent` has folded it in
+        # reads the same dict `_spent` read.
+        classes = sorted(sender.refused)
+        return passed, (classes[0] if classes else None)
+
+    def _unproved(self, refusal: str | None) -> tuple[str, str]:
+        """`(what to tell the operator, what to store)` about a canary that
+        did not prove the session.
+
+        A CANARY THAT WAS REFUSED AND A CANARY THAT WAS ANSWERED WRONGLY ARE
+        DIFFERENT FACTS, and until F2 of fix round A both read as the second.
+        Measured by the review, with a bridge refusing every send
+        `identity_origin` -- the exact fail-closed outcome `__init__`'s own
+        comment predicts for a `scope_include` written as a bare glob, which
+        is the shape `tests/conftest.py` and `_env` actually use -- the halt
+        said
+
+            identity 'user' could not be proved live before the first probe:
+            /account did not answer with the signature this identity is
+            declared to prove itself by.
+
+        and `/account` never left the JVM. That sends an operator to
+        re-authenticate against a message blaming their credential when the
+        fault is the origins their scope produced, and no credential they can
+        mint will ever fix it. Compounded by the fact that `hx scan` has no
+        `except IdentityDead` yet (Task 8's), they read that sentence as a
+        traceback and re-run for ever.
+
+        THE CLASS IS THE WIRE'S OWN WORD, never free text, which is why it is
+        safe to put in a stored `stop_reason` when `_halt_reason` will not
+        store an exception's message. `ProbeSender` keys `refused` on the
+        `error_class` of a refusal frame or on a non-`ok` `outcome`, and both
+        vocabularies are the extension's.
+
+        "WAS NOT ANSWERED" COVERS BOTH MEMBERS OF THAT VOCABULARY. A
+        `identity_origin` or a `budget_exhausted` never reached the target; a
+        `truncated` reached it and did not come back whole. The sentence
+        claims neither -- it says what the send path returned and that
+        nothing came back to compare -- because that is the whole of what
+        this side knows, and it is enough to stop the operator fixing the
+        credential.
+        """
+        path = self._declared.liveness.path
+        if refusal is not None:
+            return (f"the canary to {path} was not answered -- the send path "
+                    f"returned {refusal}, so nothing came back to compare "
+                    "against the signature this identity is declared to "
+                    "prove itself by",
+                    f"its canary was refused {refusal}")
+        return (f"{path} answered, but not with the signature this identity "
+                "is declared to prove itself by",
+                "its canary was answered without the declared signature")
 
 
 def _exchanges_for(conn, surface_id):

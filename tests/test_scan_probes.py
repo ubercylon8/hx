@@ -2310,7 +2310,7 @@ def test_the_store_takes_the_raise_sites_stop_reason_and_not_the_message(
     dead = scan.IdentityDead(
         "anything at all, including SUPERSECRET out of a subprocess",
         stop_reason="identity 'user' could not be proved live")
-    reason = scan._halt_reason(dead)
+    reason = scan._halt_reason(dead, scan.ScanSummary())
 
     assert "SUPERSECRET" not in reason
     assert "could not be proved live" in reason
@@ -2324,6 +2324,143 @@ def test_every_other_exception_still_reaches_the_run_row_intact(tmp_path):
     and nothing else is available to say it; narrowing every halt to a type
     name would take away the only diagnosis a crashed run has. Only
     `IdentityDead` can carry a subprocess's stderr, and only it is cut."""
-    reason = scan._halt_reason(RuntimeError("the disk went away at offset 4"))
+    reason = scan._halt_reason(
+        RuntimeError("the disk went away at offset 4"), scan.ScanSummary())
     assert "the disk went away at offset 4" in reason
     assert "RuntimeError" in reason
+
+
+# --- a refused canary and a wrongly answered one are different facts -------
+#
+# F2 OF FIX ROUND A (HIGH). The halt message asserted a cause the code never
+# established: a canary refused `identity_origin` -- the fail-closed outcome
+# `_IdentityBracket.__init__` predicts for a `scope_include` written as a
+# bare glob -- reported that `/account` "did not answer with the signature
+# this identity is declared to prove itself by", about a request that never
+# left the JVM. The class was sitting in `sender.refused` at that moment and
+# `_canary` discarded it. Compounded twice over: on a halt `summary.refused`
+# reached the store nowhere either (the `truncated:` string was built only on
+# the success path), and `hx scan` still has no `except IdentityDead`, so an
+# operator whose scope is a glob re-authenticates for ever against a message
+# blaming their credentials.
+
+
+def _refusing_bridge(cls="identity_origin"):
+    """A session bridge whose sends are all refused by the extension.
+
+    The canary never reaches the target, so nothing can be concluded about
+    the session -- which is exactly the confusion this pair of tests is
+    about.
+    """
+    bridge = _SessionBridge()
+    bridge.refuse(cls, "the identity is not registered for this origin")
+    return bridge
+
+
+def test_a_canary_that_was_refused_names_the_class_and_not_the_credential(
+        tmp_path):
+    """MEASURED AGAINST THE OLD WORDING. Without the fix this reads "did not
+    answer with the signature this identity is declared to prove itself by",
+    which is a claim about a response nobody received."""
+    env = _declaring(_env(tmp_path), USER)
+    bridge = _refusing_bridge()
+    with pytest.raises(scan.IdentityDead) as raised:
+        scan.run(**env, checks=(_Probes(),), bridge=bridge,
+                 identity=_resolved())
+
+    told = str(raised.value)
+    assert "identity_origin" in told, (
+        "the refusal class the sender actually got is in no message")
+    assert "was not answered" in told
+    assert "did not answer with the signature" not in told, (
+        "the message still asserts a response was received and judged")
+
+
+def test_a_canary_that_was_answered_wrongly_reads_differently(tmp_path):
+    """THE SEPARATING CASE. `_SessionBridge` answers a 200 login PAGE, which
+    is the shape section 6 says the whole canary design turns on: the request
+    DID leave the JVM, a complete application-composed response came back,
+    and it is not the one the identity declares. Nothing was refused, and the
+    message must not claim it was."""
+    env = _declaring(_env(tmp_path), USER)
+    bridge = _SessionBridge(live_at_generation=99)
+    with pytest.raises(scan.IdentityDead) as raised:
+        scan.run(**env, checks=(_Probes(),), bridge=bridge,
+                 identity=_resolved())
+
+    told = str(raised.value)
+    assert "answered, but not with the signature" in told
+    assert "the send path returned" not in told, (
+        "a canary that WAS answered is being reported as a refusal")
+
+
+def test_a_halted_run_records_the_refusal_class_at_the_run_row(tmp_path):
+    """The store half. Before this, a halt overwrote `stop_reason` with the
+    exception text and the `truncated: probes refused ...` string was built
+    only on the success path, so the wire's own word for what stopped the run
+    existed in no row, no message and no report."""
+    env = _declaring(_env(tmp_path), USER)
+    with pytest.raises(scan.IdentityDead):
+        scan.run(**env, checks=(_Probes(),), bridge=_refusing_bridge(),
+                 identity=_resolved())
+
+    status, stop_reason = _run_row(env["conn"])
+    assert status == "error", "a halted run must not read as a completed one"
+    assert "IdentityDead" in stop_reason
+    assert "its canary was refused identity_origin" in stop_reason, (
+        "the run row does not say what the send path returned")
+    assert "probes refused identity_origin=1" in stop_reason, (
+        "summary.refused still reaches the store on the success path only")
+
+
+def test_a_halted_runs_row_says_a_wrongly_answered_canary_was_answered(
+        tmp_path):
+    """The same row, for the other fact. Two halts that look identical at the
+    run row are two halts an operator cannot triage."""
+    env = _declaring(_env(tmp_path), USER)
+    with pytest.raises(scan.IdentityDead):
+        scan.run(**env, checks=(_Probes(),),
+                 bridge=_SessionBridge(live_at_generation=99),
+                 identity=_resolved())
+
+    stop_reason = _run_row(env["conn"])[1]
+    assert "answered without the declared signature" in stop_reason
+    assert "refused" not in stop_reason, (
+        "a canary that was answered is recorded as one that was refused")
+
+
+def test_a_mid_run_halt_names_the_class_too(tmp_path):
+    """NOT ONLY THE OPENING CANARY. A session proved live at the start and a
+    scope that starts refusing mid-run is the same diagnosis at a different
+    moment, and `canary_if_due` raises an `IdentityDead` of its own with its
+    own message and its own stored reason.
+
+    TWO CHECKS, because a due canary is issued at a check BOUNDARY: the one
+    that falls due while the last check of a run is finishing is served by
+    the closing canary, which never raises. The first check turns the
+    refusal on after its own probe has gone out, so the opening canary is
+    answered and the halt is genuinely `canary_if_due`'s.
+    """
+    bridge = _SessionBridge()
+
+    class _First(_Probes):
+        def probes(self, ctx, surface, insertions, send):
+            verdict = super().probes(ctx, surface, insertions, send)
+            bridge.refuse("identity_origin", "out of the declared origins")
+            return verdict
+
+    class _Second(_Probes):
+        id = "hx.test.probe-second"
+
+    env = _declaring(_env(tmp_path), USER, every_n_probes=1)
+    with pytest.raises(scan.IdentityDead) as raised:
+        scan.run(**env, checks=(_First(), _Second()), bridge=bridge,
+                 identity=_resolved())
+
+    told = str(raised.value)
+    assert "stopped being live during the run" in told, (
+        "the opening canary raised, so this proves nothing about the mid-run "
+        "one -- the bridge started refusing too early"
+    )
+    assert "identity_origin" in told
+    assert "identity_origin" in _run_row(env["conn"])[1]
