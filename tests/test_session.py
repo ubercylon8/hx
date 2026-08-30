@@ -159,7 +159,8 @@ def test_the_sink_opens_its_connection_on_the_calling_thread(tmp_path, an_engage
             errors.append(exc)
 
     t = threading.Thread(target=on_other_thread)
-    t.start(); t.join()
+    t.start()
+    t.join()
     assert not errors, f"the sink raised off the main thread: {errors}"
     conn = db_mod.connect(an_engagement.root / "hx.db")
     try:
@@ -225,7 +226,8 @@ def test_one_connection_serves_both_callbacks(monkeypatch, an_engagement):
             errors.append(exc)
 
     t = threading.Thread(target=on_read_thread)
-    t.start(); t.join()
+    t.start()
+    t.join()
 
     assert not errors, f"the sink raised off the main thread: {errors}"
     assert opened == [t.ident], (

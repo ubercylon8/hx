@@ -378,7 +378,7 @@ def probe(tmp_path):
         p = _Probe(out, target, bf.proxy_port(tmp_path),
                    bf.second_proxy_port(tmp_path))
         p.through_proxy("/health")
-        assert bf.wait_for(lambda: any(l.startswith("REQ ") for l in p.lines()), 30), (
+        assert bf.wait_for(lambda: any(line.startswith("REQ ") for line in p.lines()), 30), (
             f"a request to 127.0.0.1:{p.proxy_port} never reached the probe's "
             f"handler. Something answered on that port that is not this Burp -- "
             f"check `ss -tlnp | grep {p.proxy_port}`. burp.log: "
@@ -400,10 +400,10 @@ class _Probe:
         return self.out.read_text().splitlines()
 
     def requests(self) -> list[dict[str, str]]:
-        return [fields(l) for l in self.lines() if l.startswith("REQ ")]
+        return [fields(line) for line in self.lines() if line.startswith("REQ ")]
 
     def responses(self) -> list[dict[str, str]]:
-        return [fields(l) for l in self.lines() if l.startswith("RESP ")]
+        return [fields(line) for line in self.lines() if line.startswith("RESP ")]
 
     def request_for(self, path: str) -> dict[str, str]:
         found = [r for r in self.requests() if r.get("path") == path]
@@ -572,7 +572,7 @@ def test_q3_drop_means_the_target_receives_nothing(probe):
     assert len(probe.target.hits) == before, (
         f"drop() did not prevent egress: the target received "
         f"{probe.target.hits[before:]}")
-    assert any(l.startswith("DROPPED ") for l in probe.lines()), \
+    assert any(line.startswith("DROPPED ") for line in probe.lines()), \
         "the handler never reached its drop branch; the test proved nothing"
 
     head = raw.split(b"\r\n", 1)[0]

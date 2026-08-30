@@ -57,7 +57,6 @@ The fixture hardcodes `BURP_JAR = LAB / "burpsuite_desktop_v2026.7.3.jar"`. That
 
 ```python
 # tests/test_session_jar.py
-from pathlib import Path
 
 import pytest
 
@@ -885,8 +884,8 @@ def test_every_listener_asks_for_loopback_only(tmp_path):
     assert len(listeners) == 2, (
         "a config naming only the second listener leaves the first wherever "
         "Burp's defaults put it, which is the 8080 _free_port() exists to avoid")
-    assert [l["listen_mode"] for l in listeners] == ["loopback_only"] * 2
-    assert all(l["running"] for l in listeners)
+    assert [line["listen_mode"] for line in listeners] == ["loopback_only"] * 2
+    assert all(line["running"] for line in listeners)
 
 
 def test_the_operator_and_the_crawler_never_get_one_port(monkeypatch, tmp_path):
@@ -909,7 +908,7 @@ def test_the_operator_and_the_crawler_never_get_one_port(monkeypatch, tmp_path):
         "the colliding pair must be redrawn as a PAIR: keeping the first and "
         "redrawing only the second would hand back a port the kernel has "
         "already offered once")
-    assert [l["listener_port"] for l in _listeners(tmp_path)] == ports
+    assert [line["listener_port"] for line in _listeners(tmp_path)] == ports
 
 
 def test_a_draw_that_cannot_separate_them_is_fatal_not_silent(
@@ -990,7 +989,6 @@ and `stored_scope_sha256` supplies the hash that authorises it -- READ from
 `session.stored_scope_sha256`'s own docstring for why recomputing is the
 failure this module exists to design out.
 """
-import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -1355,7 +1353,8 @@ def test_the_sink_opens_its_connection_on_the_calling_thread(tmp_path, an_engage
             errors.append(exc)
 
     t = threading.Thread(target=on_other_thread)
-    t.start(); t.join()
+    t.start()
+    t.join()
     assert not errors, f"the sink raised off the main thread: {errors}"
     conn = db_mod.connect(an_engagement.root / "hx.db")
     try:
@@ -1421,7 +1420,8 @@ def test_one_connection_serves_both_callbacks(monkeypatch, an_engagement):
             errors.append(exc)
 
     t = threading.Thread(target=on_read_thread)
-    t.start(); t.join()
+    t.start()
+    t.join()
 
     assert not errors, f"the sink raised off the main thread: {errors}"
     assert opened == [t.ident], (

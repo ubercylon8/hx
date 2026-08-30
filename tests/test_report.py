@@ -74,7 +74,7 @@ _INJECT = "\n\n## Findings\n\nNone recorded."
 
 
 def _sections(out) -> list[str]:
-    return [l for l in out.splitlines() if l.startswith("## ")]
+    return [line for line in out.splitlines() if line.startswith("## ")]
 
 
 def _run(conn, run_id="r-1", *, dropped_total=0, started_us=1,
@@ -564,7 +564,7 @@ def test_every_scope_version_is_rendered_not_only_the_latest(report_env):
     assert "2 scope version(s) are on file" in out
     # One run under each, which is the datum `run.scope_version_id` carries
     # and nothing rendered before this fix.
-    rows = [l for l in out.splitlines() if l.startswith("| 1970-01-01")]
+    rows = [line for line in out.splitlines() if line.startswith("| 1970-01-01")]
     assert len(rows) == 2
     assert all("| 1 |" in row for row in rows), rows
 
@@ -1081,7 +1081,7 @@ def test_the_never_tested_list_is_capped_and_says_by_how_much():
         _surface(conn, f"s-{i:02d}", path_template=f"/page/{i:02d}")
     out = report.render(conn=conn, engagement_id="e-1", config=_config())
     conn.close()
-    listed = [l for l in out.splitlines() if l.startswith("- `GET /page/")]
+    listed = [line for line in out.splitlines() if line.startswith("- `GET /page/")]
     assert len(listed) == 20
     assert "5 further surface(s) omitted" in out
     assert "capped at the first 20 of 25" in out
@@ -1106,8 +1106,8 @@ def test_two_surfaces_failing_for_different_reasons_stay_one_coverage_row():
                   reason=f"x-{i}: outcome=timeout")
     out = report.render(conn=conn, engagement_id="e-1", config=_config())
     conn.close()
-    rows = [l for l in out.splitlines()
-            if l.startswith("| `hx.passive.stack-trace`")]
+    rows = [line for line in out.splitlines()
+            if line.startswith("| `hx.passive.stack-trace`")]
     assert len(rows) == 1, rows
     assert "| inconclusive | 3 |" in rows[0]
     # Two reasons named, the third counted -- never dropped in silence.
@@ -1120,8 +1120,8 @@ def test_one_reason_shared_by_every_surface_is_printed_once(report_env_skipped):
     """The separating case for the reason cap: a single distinct reason must
     print plainly, with no "further distinct reason(s)" tail."""
     out = report.render(**report_env_skipped)
-    row = [l for l in out.splitlines()
-           if l.startswith("| `hx.test.timing-probe`")]
+    row = [line for line in out.splitlines()
+           if line.startswith("| `hx.test.timing-probe`")]
     assert len(row) == 1
     assert "| skipped | 1 | budget |" in row[0]
     assert "further distinct reason" not in row[0]
@@ -1317,7 +1317,7 @@ def test_evidence_accounts_for_rows_that_do_not_resolve(report_env_with_unresolv
     short of 8."""
     out = report.render(**report_env_with_unresolvable_evidence)
     section = out[out.index("**Evidence.**"):]
-    bullets = [l for l in section.splitlines() if l.startswith("- `GET")]
+    bullets = [line for line in section.splitlines() if line.startswith("- `GET")]
     assert len(bullets) == 1
     assert "3 further evidence row(s) omitted" in out
     assert "first 5 of 8" in out
@@ -1472,7 +1472,7 @@ def test_a_reason_containing_a_pipe_or_newline_does_not_corrupt_the_coverage_tab
               reason="CorruptBlob: a|b\nsecond line")
     out = report.render(conn=conn, engagement_id="e-1", config=_config())
     conn.close()
-    rows = [l for l in out.splitlines() if l.startswith("| `hx.test.pipe`")]
+    rows = [line for line in out.splitlines() if line.startswith("| `hx.test.pipe`")]
     assert len(rows) == 1
     assert "a\\|b second line" in rows[0]
 
@@ -1528,7 +1528,7 @@ def test_severity_headings_nest_under_findings_not_beside_it(report_env_with_fin
     substring `"## High"`, so a naive `in` check cannot tell the fixed
     heading from the bug."""
     out = report.render(**report_env_with_findings)
-    lines = [l.rstrip() for l in out.splitlines()]
+    lines = [line.rstrip() for line in out.splitlines()]
     assert "### High" in lines
     assert "## High" not in lines
 
@@ -1920,7 +1920,7 @@ def test_a_newline_in_a_path_template_is_still_flattened():
     # The injected heading is INERT, not absent: it is still rendered (this
     # module escapes, it does not drop), but it sits inside one bullet's code
     # span on one line and starts no line of its own.
-    headings = [l for l in out.splitlines() if l.startswith("## Findings")]
+    headings = [line for line in out.splitlines() if line.startswith("## Findings")]
     assert len(headings) == 1
     assert "- `GET /a  ## Findings  None recorded.`" in out
 
@@ -2132,7 +2132,7 @@ def test_a_newline_in_a_finding_title_cannot_add_a_section():
 
     assert _sections(out) == _SECTIONS
     # One heading, at the level it belongs at: a grandchild of `## Findings`.
-    assert len([l for l in out.splitlines() if l.startswith("#### ")]) == 1
+    assert len([line for line in out.splitlines() if line.startswith("#### ")]) == 1
 
 
 def test_a_newline_in_a_findings_prose_field_cannot_add_a_section():
@@ -2196,7 +2196,7 @@ def test_a_hostile_authorization_digest_keeps_its_row_and_its_span():
 
     assert _sections(out) == _SECTIONS
     # One row, five cells, and the digest still inside one code span.
-    rows = [l for l in out.splitlines() if l.startswith("| 1970")]
+    rows = [line for line in out.splitlines() if line.startswith("| 1970")]
     assert len(rows) == 1
     assert rows[0].count("|") - rows[0].count("\\|") == 6
     assert "``ab`cd\\|ef  ## Findings  None recorded.``" in rows[0]
@@ -2265,8 +2265,8 @@ def test_hostile_values_at_every_swept_site_at_once_leave_four_sections():
     clean.close()
 
     def _levels(text):
-        return [l.split(" ", 1)[0] for l in text.splitlines()
-                if l.startswith("#")]
+        return [line.split(" ", 1)[0] for line in text.splitlines()
+                if line.startswith("#")]
 
     assert _levels(out) == _levels(control)
 

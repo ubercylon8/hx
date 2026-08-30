@@ -62,8 +62,8 @@ def test_every_listener_asks_for_loopback_only(tmp_path):
     assert len(listeners) == 2, (
         "a config naming only the second listener leaves the first wherever "
         "Burp's defaults put it, which is the 8080 _free_port() exists to avoid")
-    assert [l["listen_mode"] for l in listeners] == ["loopback_only"] * 2
-    assert all(l["running"] for l in listeners)
+    assert [line["listen_mode"] for line in listeners] == ["loopback_only"] * 2
+    assert all(line["running"] for line in listeners)
 
 
 def test_the_operator_and_the_crawler_never_get_one_port(monkeypatch, tmp_path):
@@ -86,7 +86,7 @@ def test_the_operator_and_the_crawler_never_get_one_port(monkeypatch, tmp_path):
         "the colliding pair must be redrawn as a PAIR: keeping the first and "
         "redrawing only the second would hand back a port the kernel has "
         "already offered once")
-    assert [l["listener_port"] for l in _listeners(tmp_path)] == ports
+    assert [line["listener_port"] for line in _listeners(tmp_path)] == ports
 
 
 def test_a_draw_that_cannot_separate_them_is_fatal_not_silent(

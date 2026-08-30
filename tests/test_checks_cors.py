@@ -116,7 +116,7 @@ def test_a_target_that_ignores_the_origin_is_clean():
         "does")
 
 
-def test_a_refusal_propagates_rather_than_becoming_a_verdict():
+def test_a_refusal_propagates_with_its_reason_intact():
     """ADAPTED FROM THE BRIEF'S SKETCH, which called `.probes()` directly and
     asserted `v.state == "inconclusive"`. That return shape is one this
     check's `probes()` must never produce on a refusal: `hx/checks/probe.py`

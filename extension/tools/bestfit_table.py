@@ -118,7 +118,7 @@ ENTRY = re.compile(r"^(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s*(?:;(.*))?$")
 
 def wctable(text: str) -> list[tuple[int, int, str]]:
     lines = text.splitlines()
-    starts = [i for i, l in enumerate(lines) if l.startswith("WCTABLE")]
+    starts = [i for i, line in enumerate(lines) if line.startswith("WCTABLE")]
     if len(starts) != 1:
         raise SystemExit(f"expected one WCTABLE section, found {len(starts)}")
     declared = int(lines[starts[0]].split()[1])
