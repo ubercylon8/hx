@@ -643,6 +643,33 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # and re-wording it here would put this command between the
             # operator and the sentence that tells them what to do.
             raise click.ClickException(str(exc)) from exc
+        except scan_mod.IdentityDead as exc:
+            # A DEAD SESSION IS A RESULT, NOT A CRASH -- and until Task 8 it
+            # was a traceback. `scan.run` halts rather than scanning
+            # anonymously (spec s7's instruction, and the identity design's
+            # s6 gives the reason: a dead session produces a run of "not
+            # vulnerable" answers that look exactly like a clean
+            # application), and nothing here caught it, so the one outcome
+            # this whole plan exists to make visible arrived at an operator
+            # as a stack trace with the sentence at the bottom.
+            #
+            # THE MESSAGE INTACT, for the reason above it: it names which of
+            # section 6's four outcomes happened (`_IdentityBracket._outcome`
+            # -- `fails, static` and `fails after refresh` send an operator
+            # to different places), whether the canary was REFUSED or
+            # answered without the declared signature (`_unproved` -- a
+            # refused canary means no credential they can mint will help),
+            # and why halting was the right answer.
+            #
+            # NON-ZERO EXIT, like every other `ClickException`, and that is
+            # the point rather than an accident: the run did not complete,
+            # its `run` row reads `error`, and a shell that treated this as
+            # success would let a scheduled scan report clean coverage for
+            # an application it stopped testing at the first surface. The
+            # run's own tallies are in that row's `stop_reason`
+            # (`scan._halt_reason`) and reach a reader through `hx report`,
+            # not through this line.
+            raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
         click.echo(f"findings  {summary.findings}")

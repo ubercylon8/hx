@@ -789,11 +789,20 @@ def _tallies(summary) -> list[str]:
 
     EXTRACTED SO THE HALT PATH CAN CARRY THEM TOO -- F2 of fix round A. This
     string was assembled inline on the SUCCESS path only, so a run that
-    halted recorded `summary.refused` nowhere: not in the run row, not in
-    any message, and (until `hx scan` grows an `except IdentityDead`, which
-    is Task 8's) not at the terminal either. On the one path where diagnosis
-    matters most, the wire's own word for what stopped the run existed in no
-    place an operator could read.
+    halted recorded `summary.refused` nowhere: not in the run row and not in
+    any message. On the one path where diagnosis matters most, the wire's own
+    word for what stopped the run existed in no place an operator could read.
+
+    THE RUN ROW IS WHERE THEY LAND, AND NOT THE TERMINAL. `hx scan` now has
+    its `except IdentityDead` (Task 8) and it prints the exception's own
+    message: what stopped the run, and which of section 6's outcomes it was.
+    The tallies are not in it, because `summary` is a local of `run()` and
+    the exception is raised two frames below it -- they go to `run.
+    stop_reason` through `_halt_reason`, which is where `report._provenance`
+    reads them and where `hx report` puts them in front of a reader. An
+    earlier version of this paragraph predicted the terminal would get them;
+    it does not, and saying so is cheaper than a field on the exception whose
+    only reader would be one `click.echo`.
 
     The two are labelled rather than merged, and that is the same decision
     F11 took: `skipped` names rows the runner never ran, `probes refused`
@@ -1053,16 +1062,16 @@ class _IdentityBracket:
         happened -- see `IdentityDead`'s own docstring.
         """
         self._bridge.register_identity(self.resolved, origins=self._origins)
-        _raw, settled, refusal = self._settle()
+        _raw, settled, refusal, refreshed = self._settle()
         self.window.open(passed=settled)
         if not settled:
             told, stored = self._unproved(refusal)
             raise IdentityDead(
                 f"identity {self.resolved.id!r} could not be proved live "
-                f"before the first probe: {told}. Halting rather than "
-                "scanning anonymously: an unauthenticated run of an "
-                "authenticated application answers `clean` about a view none "
-                "of its users are in",
+                f"before the first probe: {told}. {self._outcome(refreshed)}. "
+                "Halting rather than scanning anonymously: an "
+                "unauthenticated run of an authenticated application answers "
+                "`clean` about a view none of its users are in",
                 stop_reason=(f"identity {self.resolved.id!r} could not be "
                              f"proved live before the first probe: {stored}"))
 
@@ -1095,15 +1104,15 @@ class _IdentityBracket:
         if not self._due:
             return
         self._due = False
-        raw, settled, refusal = self._settle()
+        raw, settled, refusal, refreshed = self._settle()
         self.window.close(passed=raw)
         if not settled:
             told, stored = self._unproved(refusal)
             raise IdentityDead(
                 f"identity {self.resolved.id!r} stopped being live during the "
-                f"run: {told}. Halting rather than issuing the rest of this "
-                "run's probes unauthenticated, which would answer `clean` "
-                "for every surface still to come",
+                f"run: {told}. {self._outcome(refreshed)}. Halting rather "
+                "than issuing the rest of this run's probes unauthenticated, "
+                "which would answer `clean` for every surface still to come",
                 stop_reason=(f"identity {self.resolved.id!r} stopped being "
                              f"live during the run: {stored}"))
         self.window.open(passed=True)
@@ -1128,8 +1137,9 @@ class _IdentityBracket:
         passed, _refusal = self._canary()
         self.window.close(passed=passed)
 
-    def _settle(self) -> tuple[bool, bool, str | None]:
-        """`(what the canary said, what it said after the one refresh, why)`.
+    def _settle(self) -> tuple[bool, bool, str | None, bool]:
+        """`(what the canary said, what it said after the one refresh, why,
+        whether a refresh was tried)`.
 
         Section 6's outcome table, implemented literally. A passing canary
         settles as itself. A failing one on a `static` identity settles as
@@ -1153,10 +1163,19 @@ class _IdentityBracket:
         run whose first canary was refused `identity_origin` and whose
         post-refresh canary was refused it too has one story, and this
         returns the attempt the caller is about to raise over.
+
+        THE FOURTH IS WHICH OF SECTION 6'S FOUR OUTCOMES A HALT IS, and it
+        cannot be recovered from the other three. Its table gives `fails,
+        static -> dead` and `fails after refresh -> dead` different rows, and
+        both arrive at the caller's raise site looking identical: `settled`
+        is False either way. An operator told only "could not be proved
+        live" does not know whether their refresh command ran, which is the
+        difference between re-minting a credential and reading a script's
+        output. `_outcome` turns this into the sentence they read.
         """
         raw, refusal = self._canary()
         if raw or self._declared.strategy != "programmatic":
-            return raw, raw, refusal
+            return raw, raw, refusal, False
         try:
             self.resolved = identity_mod.refresh(self._declared,
                                                  self.resolved.generation)
@@ -1181,7 +1200,40 @@ class _IdentityBracket:
             ) from exc
         self._bridge.register_identity(self.resolved, origins=self._origins)
         settled, refusal = self._canary()
-        return raw, settled, refusal
+        return raw, settled, refusal, True
+
+    def _outcome(self, refreshed: bool) -> str:
+        """Which row of section 6's outcome table this halt is.
+
+        THE TABLE HAS FOUR ROWS AND TWO OF THEM HALT: `fails, static ->
+        dead` and `fails after refresh -> dead`. Both reach a raise site
+        with `settled` False and produced the same sentence until Task 8,
+        which sent an operator to look for a fault this run may never have
+        touched -- a `static` identity has no refresh command, so "the
+        refresh did not help" is a claim about something that did not
+        happen, and "there was no refresh to try" is a claim about the
+        config they wrote.
+
+        The remaining two rows do not reach here at all: a passing canary is
+        `proven` and the run continues, and a `programmatic` identity whose
+        refresh RESCUES the session continues too (`_settle` returns a
+        settled True and nothing raises). A refresh command that could not
+        run or printed nothing raises from `_settle` itself, with its own
+        message, and never reaches this.
+
+        SAFE IN A STORED `stop_reason` -- it is written here out of a
+        strategy string the config loader constrains to two values and
+        nothing else. It is not put in one today: `stop_reason` carries the
+        canary's own diagnosis, and this is the sentence that tells an
+        OPERATOR what to go and do about their own machine.
+        """
+        if refreshed:
+            return ("Its credential was refreshed once and the canary failed "
+                    "again -- section 6's `fails after refresh`, which is a "
+                    "dead session")
+        return (f"It is a {self._declared.strategy!r} identity, so section 6 "
+                "gives it no refresh command to try -- section 6's `fails, "
+                "static`, which is a dead session")
 
     def _canary(self) -> bool:
         """One liveness request, through the ordinary send path.
@@ -1247,9 +1299,11 @@ class _IdentityBracket:
         and `/account` never left the JVM. That sends an operator to
         re-authenticate against a message blaming their credential when the
         fault is the origins their scope produced, and no credential they can
-        mint will ever fix it. Compounded by the fact that `hx scan` has no
-        `except IdentityDead` yet (Task 8's), they read that sentence as a
-        traceback and re-run for ever.
+        mint will ever fix it. It was compounded, at the time, by `hx scan`
+        having no `except IdentityDead`: they read that sentence at the foot
+        of a traceback and re-ran for ever. Task 8 added the handler, so this
+        string is now the whole of what an operator sees -- which raises
+        rather than lowers what it has to be right about.
 
         THE CLASS IS A CODE-AUTHORED WORD, never free text, which is why it
         is safe to put in a stored `stop_reason` when `_halt_reason` will not

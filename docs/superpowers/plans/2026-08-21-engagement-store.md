@@ -3505,6 +3505,7 @@ from click.testing import CliRunner
 from hx import cli
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import report
 from hx import run as run_mod
 from hx import scan as scan_mod
 from hx import session as session_mod
@@ -4847,6 +4848,95 @@ def test_a_scan_with_no_identity_prints_no_canary_line(
 
     assert result.exit_code == 0, result.output
     assert "canaries" not in result.output, result.output
+
+
+def _declare_identity(root, ident, monkeypatch, *, value="session=abc"):
+    """Give the engagement at `root` one identity and scan under it.
+
+    The scope becomes a URL PREFIX rather than whatever the fixture carries,
+    because that list is what the run registers as the identity's `origins`
+    and a pattern with no host in it bounds the credential to nothing at all.
+    `record_scope_version` is called because `engagement.open_` refuses a
+    store whose config and newest scope version have diverged, and every
+    `hx scan` below opens the store for itself."""
+    monkeypatch.setenv("HX_ID_USER", value)
+    eng = eng_mod.open_(root)
+    try:
+        eng.config = dataclasses.replace(
+            eng.config, identities={ident.id: ident}, scan_identity=ident.id,
+            scope_include=["https://app.acme.com/*"])
+        eng_mod.record_scope_version(
+            eng, author="test", reason="declare an identity for this scan")
+    finally:
+        eng.db.close()
+
+
+def test_a_dead_session_is_reported_as_a_result_and_not_a_traceback(
+        engagement_with_surface, monkeypatch):
+    """HAZARD ONE OF TASK 8. `scan.run` halts on a session it cannot prove --
+    spec s7's instruction, and s6's reason: a dead session produces a run of
+    "not vulnerable" answers indistinguishable from a clean application --
+    and `hx scan` caught only `SessionError`, so the one outcome this plan
+    exists to make visible reached an operator as a stack trace.
+
+    THE MESSAGE NAMES WHICH OF SECTION 6'S FOUR OUTCOMES IT WAS. `user` is
+    static, so the table gives it no refresh: the operator is told that
+    rather than left to wonder whether their (nonexistent) refresh command
+    ran. It also says the canary was ANSWERED rather than refused, which is
+    the difference between re-authenticating and fixing a scope that bounds
+    the credential to no host at all.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch)
+    # A session that never proves, at any generation the run can reach.
+    _stub_session(monkeypatch, bridge=_SessionBridge(live_at_generation=99))
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code != 0, result.output
+    assert result.exception is None or isinstance(result.exception,
+                                                  SystemExit), (
+        "the halt escaped as an exception: an operator reads a traceback "
+        f"instead of a result -- {result.exception!r}")
+    assert "could not be proved live before the first probe" in result.output
+    assert "no refresh command to try" in result.output, (
+        "the message does not say which of section 6's outcomes happened, so "
+        f"an operator cannot tell where to look: {result.output}")
+    assert "`fails, static`" in result.output
+    assert "not with the signature this identity is declared to prove itself "\
+        "by" in result.output, (
+            "a canary that was ANSWERED reads like one that was refused: "
+            + result.output)
+
+
+def test_a_halted_scan_leaves_the_run_row_error_and_dead(
+        engagement_with_surface, monkeypatch):
+    """The halt is a RESULT, so it has to be recorded as one. `report.
+    _provenance` names the run among those that did not finish and
+    `report._identity` says prominently that the session died -- both read
+    the run row, and neither can say anything if the halt left it
+    `running`."""
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch)
+    _stub_session(monkeypatch, bridge=_SessionBridge(live_at_generation=99))
+    CliRunner().invoke(cli.main, ["scan", "--root",
+                                  str(engagement_with_surface)])
+
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        row = eng.db.execute(
+            "SELECT status, identity, identity_state, stop_reason FROM run"
+            " WHERE kind='scan'").fetchone()
+        assert (row[0], row[1], row[2]) == ("error", "user", "dead"), tuple(row)
+        assert "IdentityDead" in row[3]
+        rendered = report.render(eng.db, engagement_id=eng.id,
+                                 config=eng.config, blobs=eng.blobs)
+    finally:
+        eng.db.close()
+    assert ("**1 run(s) stopped because the session being tested under "
+            "stopped being valid.**") in rendered
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -5502,6 +5592,33 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # unbuilt extension jar, a listener that came up off loopback),
             # and re-wording it here would put this command between the
             # operator and the sentence that tells them what to do.
+            raise click.ClickException(str(exc)) from exc
+        except scan_mod.IdentityDead as exc:
+            # A DEAD SESSION IS A RESULT, NOT A CRASH -- and until Task 8 it
+            # was a traceback. `scan.run` halts rather than scanning
+            # anonymously (spec s7's instruction, and the identity design's
+            # s6 gives the reason: a dead session produces a run of "not
+            # vulnerable" answers that look exactly like a clean
+            # application), and nothing here caught it, so the one outcome
+            # this whole plan exists to make visible arrived at an operator
+            # as a stack trace with the sentence at the bottom.
+            #
+            # THE MESSAGE INTACT, for the reason above it: it names which of
+            # section 6's four outcomes happened (`_IdentityBracket._outcome`
+            # -- `fails, static` and `fails after refresh` send an operator
+            # to different places), whether the canary was REFUSED or
+            # answered without the declared signature (`_unproved` -- a
+            # refused canary means no credential they can mint will help),
+            # and why halting was the right answer.
+            #
+            # NON-ZERO EXIT, like every other `ClickException`, and that is
+            # the point rather than an accident: the run did not complete,
+            # its `run` row reads `error`, and a shell that treated this as
+            # success would let a scheduled scan report clean coverage for
+            # an application it stopped testing at the first surface. The
+            # run's own tallies are in that row's `stop_reason`
+            # (`scan._halt_reason`) and reach a reader through `hx report`,
+            # not through this line.
             raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
