@@ -438,6 +438,99 @@ def test_config_body_rejects_a_line_without_a_tab():
         codec.parse_config_body(b"scope.include https://no-tab/*\n")
 
 
+# ---- identity body ------------------------------------------------------
+
+def test_the_identity_frame_round_trips():
+    body = codec.identity_body("user", 2, "Cookie", "session=abc",
+                               ("https://app.test",))
+    out = codec.parse_identity(body)
+    assert out["identity_id"] == "user" and out["generation"] == 2
+    assert out["inject"] == {"header": "Cookie", "value": "session=abc"}
+    assert out["origins"] == ["https://app.test"]
+
+
+def test_identity_body_carries_more_than_one_origin_in_order():
+    body = codec.identity_body("user", 1, "Cookie", "v",
+                               ("https://a.test", "https://b.test"))
+    assert codec.parse_identity(body)["origins"] == \
+        ["https://a.test", "https://b.test"]
+
+
+@pytest.mark.parametrize("generation", [0, -1, -100])
+def test_an_identity_frame_with_a_non_positive_generation_is_refused(generation):
+    # Generation is monotonic on the extension side. A zero or negative one
+    # could never be above what is held, so it is a malformed frame here
+    # rather than a refusal there.
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.identity_body("user", generation, "Cookie", "v",
+                            ("https://app.test",))
+
+
+def test_an_identity_frame_with_a_bool_generation_is_refused():
+    """`isinstance(True, int)` is True in Python; a bool must not sneak past
+    the integer check the way it does not sneak past the header check in
+    `_check_header`."""
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.identity_body("user", True, "Cookie", "v", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_identity_id_is_refused():
+    with pytest.raises(codec.FrameError, match="identity_id"):
+        codec.identity_body("", 1, "Cookie", "v", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_value_is_refused():
+    with pytest.raises(codec.FrameError, match="value"):
+        codec.identity_body("user", 1, "Cookie", "", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_origins_is_refused():
+    """An identity with no origin could be applied to any host the scope
+    allows -- the same rule the extension-side registry enforces."""
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.identity_body("user", 1, "Cookie", "v", ())
+
+
+def test_parse_identity_rejects_a_body_that_is_not_json():
+    with pytest.raises(codec.FrameError):
+        codec.parse_identity(b"not json")
+
+
+def test_parse_identity_rejects_a_missing_generation():
+    body = json.dumps({"identity_id": "user",
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_a_stale_non_positive_generation_too():
+    """Re-validated on the reading side rather than trusted from the writer
+    -- the same discipline `parse_config_body` already follows -- so a body
+    that skipped `identity_body`'s own check is still caught here."""
+    body = json.dumps({"identity_id": "user", "generation": 0,
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_empty_origins():
+    body = json.dumps({"identity_id": "user", "generation": 1,
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": []}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_a_blank_value():
+    body = json.dumps({"identity_id": "user", "generation": 1,
+                       "inject": {"header": "Cookie", "value": ""},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="value"):
+        codec.parse_identity(body)
+
+
 # ---- golden vectors ----------------------------------------------------
 
 def test_every_vector_round_trips():
@@ -956,6 +1049,95 @@ def build_config_body(pairs: dict[str, list[str]]) -> bytes:
                 )
             out += key.encode("utf-8") + b"\t" + value.encode("utf-8") + b"\n"
     return bytes(out)
+
+
+def identity_body(identity_id: str, generation: int, header: str, value: str,
+                  origins: tuple[str, ...]) -> bytes:
+    """The `identity` frame's body: `{identity_id, generation,
+    inject: {header, value}, origins}`, JSON-encoded.
+
+    NOT A CONFIG KEY, and the reason is spec section 5's: a `configure` naming
+    a different rate or budget is REFUSED rather than applied, because a run
+    must not talk its way into a larger allowance mid-flight. A programmatic
+    refresh has to advance a generation WITHOUT re-opening scope, so folding
+    identity into `configure` would either weaken that rule or make refresh
+    impossible. Its own frame keeps both intact -- see `BridgeServer.
+    register_identity`, which sends this body under `t: "identity"` rather
+    than through `configure`.
+
+    GENERATION MUST BE >= 1, validated here rather than left for the
+    extension-side registry alone to catch: the registry treats a lower
+    generation than the one it holds as a refusal, so 0 or negative could
+    never be above anything it holds, and is a malformed frame here rather
+    than a refusal there.
+    """
+    if not identity_id:
+        raise FrameError("an identity frame needs an identity_id")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise FrameError(f"generation must be an integer >= 1, got {generation!r}")
+    if not header:
+        raise FrameError("an identity frame needs a header to inject into")
+    if not value:
+        raise FrameError("an identity frame with no value registers nothing")
+    if not origins:
+        raise FrameError(
+            "an identity frame needs at least one origin; an identity with no "
+            "origin could be applied to any host the scope allows")
+    payload = {
+        "identity_id": identity_id,
+        "generation": generation,
+        "inject": {"header": header, "value": value},
+        "origins": list(origins),
+    }
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def parse_identity(body: bytes) -> dict:
+    """The reverse of `identity_body`.
+
+    Re-validates the same fields rather than trusting the writer, on the
+    principle `parse_config_body` already follows: a body is checked on the
+    reading side because the writing side being in this repo is not a
+    guarantee about what actually arrived on the wire.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except ValueError as exc:  # UnicodeDecodeError is a ValueError
+        raise FrameError(f"identity body is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise FrameError("identity body must be a JSON object")
+
+    identity_id = payload.get("identity_id")
+    if not identity_id or not isinstance(identity_id, str):
+        raise FrameError("an identity frame needs an identity_id")
+
+    generation = payload.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise FrameError(f"generation must be an integer >= 1, got {generation!r}")
+
+    inject = payload.get("inject")
+    if not isinstance(inject, dict):
+        raise FrameError("an identity frame needs an inject object")
+    header = inject.get("header")
+    if not header or not isinstance(header, str):
+        raise FrameError("an identity frame needs a header to inject into")
+    value = inject.get("value")
+    if not value or not isinstance(value, str):
+        raise FrameError("an identity frame with no value registers nothing")
+
+    origins = payload.get("origins")
+    if not origins or not isinstance(origins, list) or not all(
+            isinstance(o, str) for o in origins):
+        raise FrameError(
+            "an identity frame needs at least one origin; an identity with no "
+            "origin could be applied to any host the scope allows")
+
+    return {
+        "identity_id": identity_id,
+        "generation": generation,
+        "inject": {"header": header, "value": value},
+        "origins": origins,
+    }
 
 
 def parse_config_body(body: bytes) -> dict[str, list[str]]:
@@ -2380,6 +2562,7 @@ from pathlib import Path
 import pytest
 
 from hx import halt as halt_mod
+from hx import identity
 from hx.bridge import codec, server
 from hx.store import db as db_mod
 from hx.store import records
@@ -3182,6 +3365,125 @@ def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
             f"must not go on claiming {srv.state!r}"
         )
         assert srv.config_epoch == 0, srv.config_epoch
+    finally:
+        c.close()
+
+
+# ---- register_identity ------------------------------------------------
+
+# `register_identity` blocks waiting for the peer's reply, exactly like
+# `configure()` above. See test_configure_round_trip_returns_an_epoch for the
+# shape this borrows and the race it guards against: calling it inline and
+# then trying to read the frame off the same thread deadlocks, since nothing
+# is left to send the reply. `_connected` already drives past the hello
+# handshake before handing back the socket, which is what keeps these three
+# clear of that race -- `_conn` is set and `state` is "connected" before the
+# thread below ever calls in.
+
+
+def test_registering_an_identity_sends_an_identity_frame(srv):
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie",
+                                      value="session=abc", generation=1),
+                    origins=("https://app.test",))
+                result["ok"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+
+        header, body = reader.read()
+        assert header["t"] == "identity"
+        assert header["engagement_id"] == "e-1"
+        assert isinstance(header["id"], int) and header["id"] > 0
+        parsed = codec.parse_identity(body)
+        assert parsed["identity_id"] == "user" and parsed["generation"] == 1
+        assert parsed["inject"] == {"header": "Cookie", "value": "session=abc"}
+        assert parsed["origins"] == ["https://app.test"]
+
+        c.sendall(codec.encode({"v": 1, "t": "identity_registered",
+                                "id": header["id"]}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert result.get("ok") is True, result
+    finally:
+        c.close()
+
+
+def test_an_identity_frame_is_never_logged(srv, caplog):
+    """The ONLY frame in this protocol whose payload is a secret. The bridge
+    logs frame kinds and correlation ids elsewhere in this class (see
+    test_a_refused_peer_is_counted_and_logged_rather_than_dropped_in_silence);
+    a debug line added to this method that printed `resolved.value` is
+    exactly how a live session cookie reaches a log file that outlives the
+    engagement.
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie",
+                                      value="session=SUPERSECRET",
+                                      generation=1),
+                    origins=("https://app.test",))
+                result["ok"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        with caplog.at_level("DEBUG"):
+            t = threading.Thread(target=do_register)
+            t.start()
+            header, _ = reader.read()
+            c.sendall(codec.encode({"v": 1, "t": "identity_registered",
+                                    "id": header["id"]}))
+            t.join(timeout=5)
+
+        assert not t.is_alive(), "do_register thread never finished"
+        assert result.get("ok") is True, result
+        assert "SUPERSECRET" not in caplog.text
+        assert "identity" in caplog.text, "the frame KIND is still loggable"
+    finally:
+        c.close()
+
+
+def test_a_refused_identity_frame_raises(srv):
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie", value="v",
+                                      generation=1),
+                    origins=("https://app.test",))
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "stale_generation",
+                                "detail": "generation 1 is not above 3"}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert isinstance(result.get("error"), server.BridgeError), result
+        assert result["error"].error_class == "stale_generation"
+        assert "stale_generation" in str(result["error"])
     finally:
         c.close()
 
@@ -5027,7 +5329,7 @@ class BridgeServer:
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error"):
+        if t in ("result", "error", "identity_registered"):
             self._deliver(header, body)
             return True
 
@@ -5288,6 +5590,54 @@ class BridgeServer:
             # exactly what an operator should be able to do.
             self.state = "halted" if self.state == "halted" else "configured"
         return self.config_epoch
+
+    def register_identity(self, resolved, *, origins: tuple[str, ...]) -> None:
+        """Register or refresh one identity in the extension.
+
+        THE BODY IS NEVER LOGGED. Spec section 5 is explicit that `identity`
+        is the one frame in this protocol whose payload is a live credential,
+        and that neither side's diagnostics may print it. Everywhere else in
+        this class logs freely -- `_serve` names the peer's uid, pid and exe
+        at INFO, and a refused peer at WARNING -- because a frame *kind* and a
+        correlation id are not secrets. This method's own log line below is
+        held to the same rule the rest of the class already follows for
+        everything it prints: it names `resolved.id` and `resolved.
+        generation`, and nothing that touches `resolved.value` or
+        `resolved.header`'s injected content ever reaches `_log`.
+
+        `identity` is its own frame type rather than a `configure` key --
+        `configure()` above refuses a later call naming a different rate or
+        budget, because a run must not talk its way into a larger allowance
+        mid-flight, and a programmatic refresh has to advance a generation
+        WITHOUT re-opening scope. Folding identity into `configure` would
+        either weaken that rule or make refresh impossible.
+
+        The success and refusal frame types the peer answers with
+        (`identity_registered`, or `error` carrying a `class` such as
+        `stale_generation` for a generation that does not advance what the
+        extension already holds) are this side's choice: the extension-side
+        registry is a later task in this same plan and has not been built
+        yet, so nothing upstream of this file pins them. `_handle` delivers
+        both alongside `result`/`error` for exactly this method to collect.
+
+        Raises BridgeError: whatever `_request` raises when the peer is gone
+        or never answers, and `error_class` set to the peer's `class` on an
+        `error` reply.
+        """
+        body = codec.identity_body(resolved.id, resolved.generation,
+                                   resolved.header, resolved.value, origins)
+        _log.debug("hx bridge: identity frame for %s generation %d -- kind "
+                  "and generation only, never the injected value",
+                  resolved.id, resolved.generation)
+        reply = self._request({"v": codec.PROTOCOL_VERSION, "t": "identity",
+                               "engagement_id": self.engagement_id}, body)
+        if reply.get("t") == "error":
+            raise BridgeError(
+                "peer refused identity: "
+                f"{reply.get('class', 'unspecified')}: "
+                f"{reply.get('detail', '')}".rstrip(": "),
+                error_class=reply.get("class"),
+            )
 
     def send(self, req: dict, body: bytes = b"", timeout: float = 30.0,
              *, enforce_locally: bool = True) -> dict:

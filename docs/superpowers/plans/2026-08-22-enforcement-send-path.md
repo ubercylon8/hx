@@ -24714,6 +24714,7 @@ First the imports. Replace the import block at the top of
 
 ```python
 # tests/test_bridge_server.py -- the import block, replaced
+import logging
 import os
 import socket
 import stat
@@ -24725,6 +24726,7 @@ from pathlib import Path
 import pytest
 
 from hx import halt as halt_mod
+from hx import identity
 from hx.bridge import codec, server
 from hx.store import db as db_mod
 from hx.store import records
@@ -25892,7 +25894,7 @@ arms with these three:
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error"):
+        if t in ("result", "error", "identity_registered"):
             self._deliver(header, body)
             return True
 ```
