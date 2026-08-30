@@ -749,6 +749,14 @@ class BridgeServer:
         Raises BridgeError: whatever `_request` raises when the peer is gone
         or never answers, and `error_class` set to the peer's `class` on an
         `error` reply.
+
+        Raises codec.FrameError, which is NOT a BridgeError, BEFORE any frame
+        is written: `identity_body` refuses a body it cannot build -- a
+        generation below 1, no origins, and (since the Task 5 fix round) a
+        header or value carrying CR, LF, NUL or a character outside Latin-1,
+        which the extension would refuse as `bad_identity` anyway. Named here
+        because this method has no caller yet and the one that arrives has two
+        exception types to handle, not one.
         """
         body = codec.identity_body(resolved.id, resolved.generation,
                                    resolved.header, resolved.value, origins)
