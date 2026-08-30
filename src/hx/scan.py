@@ -781,10 +781,14 @@ _UNREAD = object()
 # RFC 9110 s9.3.2 reading -- HEAD is GET without the body, so a GET probe
 # sees everything the captured request could have shown and more -- which is
 # sound for a `clean` row and NOT sound for a finding: `reflected_input`,
-# `sql_error` and `path_traversal` all match on a response BODY, and a HEAD
-# response has none, so a body-reflection finding filed against a `HEAD`
+# `sql_error` and `path_traversal` read a response HEAD OR BODY, and a HEAD
+# response has no body, so a body-derived finding filed against a `HEAD`
 # surface describes something that surface never does, in a description that
-# does not say the method was changed. Finding 9 of the final review, ruled
+# does not say the method was changed. The exclusion is therefore wider than
+# the hazard -- a HEAD surface really can reflect into a header, and that
+# finding is given up with the unsound ones -- and it is still the right
+# trade, because the identity argument does not distinguish them: a GET is
+# not the request the client's users make to that surface either way. Finding 9 of the final review, ruled
 # the way the OPTIONS line four rows up was already ruled: the consistency is
 # worth more than the coverage, and browsers rarely issue HEAD anyway.
 #

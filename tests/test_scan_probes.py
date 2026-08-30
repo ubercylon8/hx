@@ -340,10 +340,10 @@ REQ_HEAD = (
 def test_no_active_check_answers_for_a_head_surface_either(tmp_path):
     """FINDING 9 OF THE FINAL REVIEW, measured at the runner rather than at
     the constant. `HEAD` was probeable for a round, so this surface's five
-    rows came off five GETs: safe in the `clean` direction (a GET sees
+    rows came off nine GETs: safe in the `clean` direction (a GET sees
     everything a HEAD could have shown) and not safe in the other, because
-    three of the five checks match on a response BODY that a HEAD surface
-    never returns. The request carries a point each check's own name filter
+    three of the five checks read a response BODY that a HEAD surface never
+    returns. The request carries a point each check's own name filter
     accepts, so before the fix every one of them probed and answered.
 
     The skip reuses `not_a_get_surface` rather than minting a word: the fact
@@ -1681,7 +1681,8 @@ def test_every_probing_check_reads_a_refused_request_as_a_gap(tmp_path,
     the rows are RENDERED, and a `clean` row in the Coverage table is the
     client reading that this surface was tested. Before the fix each of these
     five statuses produced five `clean` rows and five tested Coverage rows off
-    five requests none of which was answered."""
+    nine requests none of which was answered -- five rows off nine, because
+    two of these checks send one probe apiece and three send three."""
     env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE,
                path_template="/search")
     active = tuple(c for c in registry.CHECKS if c.klass != "passive")

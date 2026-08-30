@@ -172,9 +172,12 @@ def test_a_status_the_old_enumeration_omitted_is_a_gap_too(status):
     ANSWERING while the set was enumerated; measured end to end in
     `tests/test_scan_probes.py::test_every_probing_check_reads_a_refused_
     request_as_a_gap`, a target answering 422, 410, 407, 406 or 414 to every
-    request produced five `clean` rows and five tested Coverage rows off five
+    request produced five `clean` rows and five tested Coverage rows off nine
     requests none of which was answered -- under a Limits bullet denying that
-    could happen.
+    could happen. FIVE rows off NINE requests, not five off five: two of these
+    checks send one probe apiece and three send three, and a request count
+    that happened to match the row count would be describing a corpus this
+    build does not ship.
 
     422 IS THE ORDINARY CASE. The enumeration's own justification for holding
     400 was that every probe this build sends drops the endpoint's other query

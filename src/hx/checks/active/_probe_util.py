@@ -153,7 +153,7 @@ def reflected(response, marker: str) -> bool:
 # thought of read as the application answering. MEASURED at the end of this
 # branch, real registry, `scan.run` against a target answering the same
 # status to every request on a surface carrying `q`, `redirect_uri` and
-# `file`: 422, 410, 407, 406 and 414 each produced five `clean` rows off five
+# `file`: 422, 410, 407, 406 and 414 each produced five `clean` rows off nine
 # requests none of which was answered, and `report._coverage` rendered all
 # five as tested -- under a Limits bullet telling the client that a rejection
 # of the request itself is recorded as `inconclusive`.

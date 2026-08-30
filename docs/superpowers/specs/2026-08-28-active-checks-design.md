@@ -251,6 +251,16 @@ talk its way into a larger allowance mid-flight.
 `check_run.requests_sent` is written by the send seam, so per-check attribution exists even
 though the ceiling is per-run.
 
+**Amended 2026-08-29: written by the runner, not the seam.** The sentence above, and the
+"write `check_run.requests_sent` at the seam" instruction earlier in this section, describe
+a design the implementation deliberately did not take. `ProbeSender` holds **no database
+connection** — that is what keeps `CheckContext`'s guarantee ("a check that can write is a
+check that can write the wrong thing") literally true of everything a check can reach — so
+the seam counts in memory and `hx.scan._close_row` writes the column when it closes the
+row. Per-check attribution is unaffected: the count is per `ProbeSender`, and a sender is
+built per check per surface. What changed is only which side of the boundary does the
+INSERT, and it changed in the direction this spec's own §4 argues for.
+
 ## 9. The header-parsing fix
 
 `checks/passive/_http.py` splits response heads on `\r\n` only. A server using bare-LF line
