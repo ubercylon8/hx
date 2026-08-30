@@ -2482,11 +2482,11 @@ def test_the_unauthenticated_bullets_safety_claim_is_one_the_code_honours(
 
     A false claim in a client deliverable is the most serious kind this
     project has, so the claim is tied to the code that has to honour it. The
-    statuses below are the two rounds' worth of counterexamples plus the
-    shapes the sentence names; the doctrine is an ALLOWLIST now, so a
-    sixteenth status nobody listed here is covered by construction rather
-    than by this list being complete. Loosen `_probe_util.unanswered` and
-    this fails, naming the sentence that has to go with it."""
+    statuses below are both rounds' counterexamples plus a member of each
+    shape the sentence names; the doctrine is an ALLOWLIST now, so a status
+    nobody listed here is covered by construction rather than by this list
+    being complete. Loosen `_probe_util.unanswered` and this fails, naming
+    the sentence that has to go with it."""
     limits = report.render(**report_env_with_blobs)
     limits = limits[limits.index("## Limits"):]
     assert "A login redirect, an authorisation refusal, or a rejection of " \

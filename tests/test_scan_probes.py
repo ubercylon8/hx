@@ -1640,7 +1640,8 @@ def test_every_probing_check_reads_a_login_wall_as_a_gap(tmp_path):
 # every other 4xx read as the application answering -- and `report._limits`
 # told the client that "a rejection of the request itself is recorded as
 # `inconclusive` ... so no surface is reported as tested on the strength of
-# one", with exactly one named shape escaping. Measured, five did.
+# one", with exactly one named shape escaping. Measured, five statuses did
+# end to end -- and the enumeration let through every 4xx it had not named.
 #
 # 422 IS THE ORDINARY CASE, NOT AN EXOTIC ONE, and the enumeration's own
 # reason for holding 400 is why: every probe this build sends drops the

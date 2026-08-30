@@ -1380,7 +1380,8 @@ def _limits(conn, engagement_id) -> list[str]:
         # more. If that rule is ever loosened this sentence has to go with
         # it, which is what `tests/test_report.py::test_the_unauthenticated_
         # bullets_safety_claim_is_one_the_code_honours` holds -- it asks the
-        # doctrine itself for every status the sentence names.
+        # doctrine itself for a status of each shape the sentence names, and
+        # for both rounds' counterexamples.
         #
         # WHAT NO RULE OVER STATUSES CAN CATCH is named in the same breath
         # rather than left for the client to discover, and it is a CLASS

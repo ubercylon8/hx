@@ -1207,14 +1207,15 @@ WHAT THAT DOES NOT REST ON, because an earlier version of this sentence did:
 renders it -- `_insertion_coverage` says in as many words that it is deferred
 -- so the ground is the column and not a page, and the two comments said
 opposite things until finding 7 of the final review caught it. What does turn
-on the column: `hx.scan._close_row` writes it for every row, so it is what an
-operator answering "what did hx send against this surface" reads out of the
-database, and a report section that starts rendering it inherits the rule
-that is here rather than getting to choose one. The rule below is right on
-those grounds; it was never right on the one it used to give.
+on the column: `hx.scan._close_row` writes it for every row, so it is where
+an operator asking "what did hx send against this surface" has to look --
+there is nowhere else -- and a report section that starts rendering it
+inherits the rule that is here rather than getting to choose one. The rule
+below is right on those grounds; it was never right on the one it used to
+give.
 
-`Limiter` decides `scope_denied`,
-`method_denied`, `dangerous_denied`, `rate_limited` and `budget_exhausted`
+`Limiter` decides `scope_denied`, `method_denied`, `dangerous_denied`,
+`rate_limited` and `budget_exhausted`
 BEFORE issuing and never increments `issued` for them; `halted` /
 `not_configured` are refused on this side before a frame is written at all;
 and `unmanaged_credential` is decided by `Sender.decide()` ahead of both the

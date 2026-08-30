@@ -142,9 +142,10 @@ def reflected(response, marker: str) -> bool:
     return needle in response.head or needle in response.body
 
 
-# THE ONLY RESPONSE A CHECK MAY REASON ABOUT IS A 2xx. Everything else --
-# 1xx, 3xx, 4xx, 5xx, and a status that could not be read at all -- is not a
-# conclusive negative, and `unanswered` below turns it into a gap.
+# THE ONLY RESPONSE A CHECK MAY REASON ABOUT IS A 2xx. Everything else is
+# not a conclusive negative -- 1xx, 3xx, 4xx, 5xx, a number outside all of
+# those, and a status that could not be read at all -- and `unanswered`
+# below turns every one of them into a gap.
 #
 # AN ALLOWLIST, AND THE EIGHTH SPELLING IS WHY IT HAD TO BECOME ONE. This was
 # an ENUMERATION of the statuses that refuse -- 400, 401, 403, 404, 405, 429,
@@ -192,8 +193,9 @@ def reflected(response, marker: str) -> bool:
 #     `reflected-input` finding back as `observed = 0`, which
 #     `report._findings` renders as "appears fixed; verify before closing".
 #   * 400, 413, 414, 415, 422, 431 and their neighbours -- the request was
-#     refused before the payload was reached. "You sent me nonsense" is not
-#     "your payload was safe".
+#     rejected rather than processed, whether for its shape (400), its size
+#     (413/414/431), its type (415) or its contents (422). "You sent me
+#     nonsense" is not "your payload was safe".
 #   * 401, 403, 407 -- a WAF, an expired session, an authorisation layer or a
 #     proxy in front of the application. The probe never reached the code
 #     under test, and every probe this build sends is unauthenticated, so
