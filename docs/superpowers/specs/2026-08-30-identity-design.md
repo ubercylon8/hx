@@ -209,6 +209,21 @@ issuance*: `proven` if the canary passed for that generation, `assumed` if the i
 applied without a current proof, `dead` if it had failed. The column already exists with
 exactly this CHECK constraint.
 
+**Amended 2026-08-30, while planning: those columns cannot be written yet, and the
+retirement gate does not depend on them.** Checked against the code rather than assumed:
+`Capture.java` delivers `via: proxy` and nothing else, so **this build records no send-path
+exchange rows at all** — the probe's own request and response are not stored, which is the
+same gap that makes an active finding cite a captured request rather than the probe that
+demonstrated it. `exchange.identity`, `.identity_generation` and `.identity_state` are
+therefore written when send-path exchange recording lands, which is its own plan (it needs
+a new bridge frame type and a new writer).
+
+What §9 actually needs is narrower and is available now: **whether every probe a given
+`check_run` sent was issued inside a proven window.** `ProbeSender` already counts
+issuances in memory and the runner already reads that count when it closes the row; the
+identity state travels the same way. So the gate is decided per `check_run`, not per
+exchange, and gains the exchange columns for free when the rows start existing.
+
 ## 7. The extension side
 
 A new `IdentityRegistry` holding `identity_id → {header, value, origins, generation}`,
