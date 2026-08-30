@@ -97,15 +97,28 @@ def refresh(ident: Identity, generation: int) -> Resolved:
     if proc.returncode != 0:
         # THE COMMAND'S OUTPUT DOES NOT TRAVEL WITH THIS MESSAGE, and that
         # sentence is the whole of the guard. F1 of fix round A: this string
-        # is caught by `hx.scan._IdentityBracket._settle`, interpolated into
-        # an `IdentityDead`, and written to `run.stop_reason`, which
-        # `hx.report._provenance` renders on the CLIENT-FACING page through a
-        # `_redact` that strips URL userinfo and nothing else. The command
-        # whose stderr this was is the one that MINTS A CREDENTIAL: a
-        # `curl -v`, a `set -x`, or an auth error quoting the request it just
-        # made prints the token on stderr, and 200 bytes of it went into the
-        # deliverable. Task 7 is what made that path reachable -- before it,
-        # nothing a run could execute called this function at all.
+        # is written to `run.stop_reason`, which `hx.report._provenance`
+        # renders on the CLIENT-FACING page through a `_redact` that strips
+        # URL userinfo and nothing else. The command whose stderr this was is
+        # the one that MINTS A CREDENTIAL: a `curl -v`, a `set -x`, or an auth
+        # error quoting the request it just made prints the token on stderr,
+        # and 200 bytes of it went into the deliverable. Task 7 is what made
+        # that path reachable -- before it, nothing a run could execute called
+        # this function at all.
+        #
+        # TWO ROUTES REACH THE RUN ROW AND ONLY ONE OF THEM IS CUT
+        # DOWNSTREAM. A refresh DURING a run is caught by
+        # `hx.scan._IdentityBracket._settle` and re-raised as an
+        # `IdentityDead`, whose stored `stop_reason` `hx.scan._halt_reason`
+        # composes itself. But the FIRST mint of a programmatic credential
+        # (`hx.scan._resolve_scan_identity` -> `refresh(declared, 0)`) happens
+        # before any bracket exists, and this exception propagates as ITSELF
+        # -- so `_halt_reason` takes its "every other exception keeps its
+        # text" branch and stores this string verbatim. That branch is right
+        # for every other exception on that path, which is why the cut has to
+        # be here as well. `tests/test_scan_probes.py::test_the_first_mint_of_
+        # a_credential_leaks_nothing_either` is that route, and it is red with
+        # only this half reverted.
         #
         # NOT TRUNCATED HARDER, NOT SUMMARISED, NOT HASHED. Each of those is
         # still a function of the secret, and a shorter prefix of a bearer

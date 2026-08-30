@@ -2464,3 +2464,41 @@ def test_a_mid_run_halt_names_the_class_too(tmp_path):
     )
     assert "identity_origin" in told
     assert "identity_origin" in _run_row(env["conn"])[1]
+
+
+def test_the_first_mint_of_a_credential_leaks_nothing_either(tmp_path):
+    """THE PATH THE STORE-POINT CUT DOES NOT COVER, which is why the fix has
+    two halves and not one.
+
+    A programmatic identity's FIRST credential is minted by
+    `_resolve_scan_identity` -> `identity.refresh(declared, 0)`, before any
+    bracket exists. A failure there raises `IdentityError` and NOT
+    `IdentityDead`, so `_halt_reason` takes its "every other exception keeps
+    its text" branch and writes `scan.run raised: IdentityError: {exc}` to the
+    run row verbatim -- correctly, since for every other exception that text
+    is the only diagnosis there is. Nothing but `identity.refresh` declining
+    to repeat the command's output stands between a token echoed on stderr
+    and the client's page here.
+
+    Not passing `identity=` is the whole of the test: it is what makes the
+    runner resolve the config's own `scan_identity` and reach the mint.
+    """
+    leaky = dataclasses.replace(
+        ADMIN, refresh=config_mod.Refresh(command=_LEAKY_REFRESH))
+    env = _declaring(_env(tmp_path), leaky, scan_identity=leaky.id)
+    with pytest.raises(identity_mod.IdentityError) as raised:
+        scan.run(**env, checks=(_Probes(),), bridge=_SessionBridge())
+
+    assert not isinstance(raised.value, scan.IdentityDead), (
+        "this reached the halt path, so it proves nothing about the mint")
+    status, stop_reason = _run_row(env["conn"])
+    assert status == "error"
+    assert "IdentityError" in stop_reason, (
+        "the run row lost which exception stopped the run")
+    assert "SUPERSECRET" not in stop_reason
+
+    rendered = report_mod.render(**env)
+    assert "stop reason:" in rendered, (
+        "the report rendered no stop reason at all, so the absence below "
+        "proves nothing -- fix this test before trusting it")
+    assert "SUPERSECRET" not in rendered
