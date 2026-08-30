@@ -78,12 +78,30 @@ def _sections(out) -> list[str]:
 
 
 def _run(conn, run_id="r-1", *, dropped_total=0, started_us=1,
-        scope_version_id=None, ended_us=None) -> None:
+        scope_version_id=None, ended_us=None, kind="manual",
+        status="completed", identity=None, generation=None,
+        identity_state=None) -> None:
+    """One `run` row.
+
+    The three identity columns are parameters (Task 8) for the reason every
+    other one is: `report._limits` and `report._identity` READ them, so a
+    fixture that could not write them could not reach either branch. They are
+    NULL by default, which is what `hx.scan.run` writes for an anonymous run
+    and what every fixture in this file was implicitly asserting before the
+    columns existed.
+
+    `kind` too, and it is not decoration: `_identity_counts` counts scans,
+    and `manual` -- this file's long-standing default, which predates
+    `hx scan` -- is not one. A fixture that left it would have made every
+    identity assertion below divide by zero scans.
+    """
     conn.execute(
         "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
-        " ended_us, status, dropped_total, scope_version_id)"
-        " VALUES(?,'e-1','manual','staging',?,?,'completed',?,?)",
-        (run_id, started_us, ended_us, dropped_total, scope_version_id))
+        " ended_us, status, dropped_total, scope_version_id, identity,"
+        " identity_generation, identity_state)"
+        " VALUES(?,'e-1',?,'staging',?,?,?,?,?,?,?,?)",
+        (run_id, kind, started_us, ended_us, status, dropped_total,
+         scope_version_id, identity, generation, identity_state))
 
 
 def _scope_version(conn, sv_id, *, sha256, effective_from_us, author="james",
@@ -184,6 +202,44 @@ def _config(**over) -> config_mod.Config:
                scope_include=["https://app.acme.test/*"])
     args.update(over)
     return config_mod.Config(**args)
+
+
+# The environment variable an identity's credential comes from, and a value
+# for it. THE VALUE IS NEVER PUT ON A `Config`: the identity design's s3 is
+# that `scope_version.yaml` copies a config verbatim into an append-only
+# table, so `Inject` holds the variable's NAME and `hx.identity.resolve`
+# reads the environment. Both strings are distinctive enough that a byte
+# search over a rendered report means something.
+_ENV_NAME = "HX_IDENTITY_ACME_USER"
+_ENV_VALUE = "session=s3cr3t-report-cookie-4f1ac902"
+
+# An operator's own refresh argv, with a credential in an argument -- the
+# shape s11 accepts ("it is the operator's own machine and their own
+# command") and the one that would put a token in a client's deliverable if
+# this module ever rendered the field.
+_REFRESH_TOKEN = "bootstrap-4c81de07"
+
+
+def _identity_config(**over) -> config_mod.Config:
+    """A config declaring one static and one programmatic identity."""
+    args = dict(identities={
+        "user": config_mod.Identity(
+            id="user", strategy="static",
+            inject=config_mod.Inject(header="Cookie",
+                                     value_from_env=_ENV_NAME),
+            liveness=config_mod.Liveness(path="/account",
+                                         expect_body="Sign out",
+                                         expect_absent="Sign in")),
+        "admin": config_mod.Identity(
+            id="admin", strategy="programmatic",
+            inject=config_mod.Inject(header="Authorization"),
+            liveness=config_mod.Liveness(path="/admin/whoami",
+                                         expect_body='"role":"admin"'),
+            refresh=config_mod.Refresh(
+                command=("./mint.sh", "--token", _REFRESH_TOKEN))),
+    }, scan_identity="user")
+    args.update(over)
+    return _config(**args)
 
 
 @pytest.fixture
@@ -2660,3 +2716,211 @@ def test_an_all_passive_build_makes_none_of_these_three_claims(
     assert "Every probe was sent unauthenticated" not in out
     assert "credential-header insertion points" not in out
     assert "probed no templated path segment" not in out
+
+
+# --- section 10: what the report says about the session it tested under ----
+
+
+@pytest.fixture
+def report_env_proven(tmp_path):
+    """An engagement whose two scans both proved their session live.
+
+    The blob store and the surface are `report_env_with_blobs`': the two
+    conditional bullets live inside `_limits`' `if active:` branch, so a
+    fixture that reached neither would satisfy every assertion below by
+    rendering nothing at all.
+    """
+    conn = _conn()
+    _run(conn, "r-1", kind="scan", started_us=1, identity="user",
+         generation=1, identity_state="proven")
+    _run(conn, "r-2", kind="scan", started_us=2, identity="user",
+         generation=1, identity_state="proven")
+    raw = (b"GET /api/orders/1?ref=abc123 HTTP/1.1\r\n"
+           b"Host: app.acme.test\r\n"
+           b"\r\n")
+    store = blobs_mod.BlobStore(tmp_path / "blobs")
+    digest, _ = store.put(raw)
+    _exchange(conn, "x-1", "r-1",
+              "https://app.acme.test/api/orders/1?ref=abc123", req_blob=digest)
+    _surface(conn, "s-1", path_template="/api/orders/{id}",
+             exemplar_exchange_id="x-1")
+    yield {"conn": conn, "engagement_id": "e-1", "config": _identity_config(),
+           "blobs": store}
+    conn.close()
+
+
+def test_the_limits_bullet_is_conditional_on_a_proven_identity(
+        report_env_with_blobs, report_env_proven):
+    """THE SENTENCE TASK 7 FALSIFIED AND COULD NOT FIX, and its replacement.
+
+    `report._limits` rendered "**Every probe was sent unauthenticated.**" to
+    every client, and Task 7 made it false for a run naming a
+    `scan_identity`. It could not be corrected then: `_limits` is handed a
+    connection and an engagement id, and nothing in the store recorded
+    whether a run had issued under an identity. `run.identity_state` is that
+    record and this is the pair of renders that separates the two cases.
+
+    BOTH DIRECTIONS, because a bullet that changed unconditionally would be
+    exactly as wrong as one that never changed: the unauthenticated sentence
+    is REQUIRED for an engagement whose scans issued anonymously (section
+    10's own instruction), and it is the first render below.
+    """
+    anonymous = report.render(**report_env_with_blobs)
+    assert "Every probe was sent unauthenticated" in anonymous
+    assert "An active finding is never automatically marked as fixed" in anonymous
+    assert "ran under a session" not in anonymous
+
+    proven = report.render(**report_env_proven)
+    assert "Every probe was sent unauthenticated" not in proven, (
+        "a client whose scans ran under a session is still told every probe "
+        "was sent logged out")
+    assert "2 of the 2 scan(s) recorded here ran under a session" in proven
+    assert "An active finding is never automatically marked as fixed" not in \
+        proven, (
+            "the page still claims a finding can never close, on an "
+            "engagement where `scan._retirable` closes them")
+    assert ("An active finding is marked as no longer observed only where it "
+            "was re-tested under a session proved live") in proven
+    # THE WARNING SURVIVES THE REWRITE. Retirement being possible is not a
+    # reason to stop telling a client to check for themselves, and this is
+    # the sentence a reader acts on.
+    assert ("Verify an active finding against the fixed application yourself "
+            "before closing it") in proven
+
+    # AND THE RETEST BULLET AT THE FOOT OF THE SECTION MOVES WITH THEM. Its
+    # headline is a claim over BOTH corpora -- "No finding in this report can
+    # be shown as fixed by re-running this assessment" -- and an active
+    # finding that can now close contradicts it in the same paragraph that
+    # states it. This fixture has no passive finding rendered, but the bullet
+    # is unconditional on findings: it describes what a re-run could do.
+    assert ("No finding in this report can be shown as fixed by re-running "
+            "this assessment") in anonymous
+    assert ("No finding in this report can be shown as fixed by re-running "
+            "this assessment") not in proven
+    assert ("A passive finding in this report cannot be shown as fixed by "
+            "re-running this assessment") in proven
+    assert "an active finding CAN be shown as fixed" in proven
+
+
+def test_a_run_that_carried_a_session_it_could_not_prove_closes_nothing(
+        report_env_proven):
+    """THE THIRD CASE, which neither bullet's old wording had. A scan can
+    issue under an identity and still end `assumed` -- a canary failed
+    somewhere in the run, so its probes may have been logged out -- and
+    `scan._retirable` retires nothing on it. The page has to say the first
+    without claiming the second."""
+    conn = report_env_proven["conn"]
+    conn.execute("UPDATE run SET identity_state='assumed'")
+    out = report.render(**report_env_proven)
+
+    assert "2 of the 2 scan(s) recorded here ran under a session" in out
+    assert "An active finding is never automatically marked as fixed" in out, (
+        "no scan here proved its session, so nothing retires and the page "
+        "must not offer a retest story it did not perform")
+
+
+def test_a_mixed_engagement_names_both_halves(report_env_proven):
+    """One scan under a session and one without. Saying only the first would
+    tell a client every probe carried a session; saying only the second would
+    tell them none did."""
+    conn = report_env_proven["conn"]
+    conn.execute("UPDATE run SET identity=NULL, identity_generation=NULL,"
+                 " identity_state=NULL WHERE id='r-2'")
+    out = report.render(**report_env_proven)
+
+    assert "1 of the 2 scan(s) recorded here ran under a session" in out
+    assert ("The other 1 scan(s) recorded here sent every probe logged out"
+            in out)
+
+
+def test_the_identity_section_is_derived_from_the_runs(report_env_proven):
+    """Section 10's first requirement: which identities were declared, by
+    which strategy, how many generations each reached, and what the runs
+    using them settled at.
+
+    `admin` is declared and never used, and it is in the table for the same
+    reason the Coverage section lists a check that never ran: a client
+    reading "we tested as these identities" must be able to see which of them
+    actually carried traffic."""
+    conn = report_env_proven["conn"]
+    conn.execute("UPDATE run SET identity_generation=3 WHERE id='r-2'")
+    out = report.render(**report_env_proven)
+
+    assert "### Session identity" in out
+    body = out[out.index("### Session identity"):out.index("## Findings")]
+    assert "| `user` | static | 2 | 3 | proven (2) |" in body, body
+    assert "| `admin` | programmatic | 0 | 0 | never used |" in body, body
+    # The claim the whole design turns on, stated where a client can read it.
+    assert "a status code is never enough" in body
+
+
+def test_an_engagement_with_no_identity_renders_no_identity_section(
+        report_env_with_blobs):
+    """The unchanged page. Every report this build produced before Task 8 had
+    no such section, and an engagement that declared no identity and ran none
+    must still not have one -- there is nothing to say, and a section saying
+    so would be a paragraph of absence in the deliverable's provenance."""
+    out = report.render(**report_env_with_blobs)
+    assert "Session identity" not in out
+    assert _sections(out) == _SECTIONS
+
+
+def test_a_run_that_halted_on_a_dead_session_says_so_prominently(
+        report_env_proven):
+    """Section 10, in its own words: the difference between "we tested this
+    and found nothing" and "our session died at 01:50", which a client cannot
+    tell apart from a coverage table -- every surface after the halt simply
+    has no row.
+
+    `status='error'` and `identity_state='dead'` are what `hx.scan.run`
+    writes on that path, and the run row is read rather than the stop reason
+    parsed: a sentence built by matching text in free-form exception output
+    would be one edit away from silently never matching again."""
+    conn = report_env_proven["conn"]
+    conn.execute("UPDATE run SET identity_state='dead', status='error'"
+                 " WHERE id='r-2'")
+    out = report.render(**report_env_proven)
+
+    body = out[out.index("### Session identity"):out.index("## Findings")]
+    assert ("**1 run(s) stopped because the session being tested under "
+            "stopped being valid.**") in body, body
+    assert "`r-2`" in body
+    assert "read their coverage as partial" in body
+    # And the run is still named among the unfinished ones, which is where a
+    # reader chasing the coverage numbers arrives: the two sections say
+    # different things about the same run and neither replaces the other.
+    assert "of those runs did not finish" in out
+
+
+def test_no_credential_and_no_environment_value_appears_in_a_report(
+        report_env_proven, monkeypatch):
+    """SECTION 10'S LAST RULE, ASSERTED AGAINST THE RENDERED PAGE and not
+    against an intermediate string. The task-7 fix round closed two routes
+    into `run.stop_reason` -- a refresh command's stderr, twice -- by
+    checking the message each raise site composed; this checks the artefact
+    that actually leaves the machine.
+
+    THREE VECTORS, one per field that is one dereference from a secret:
+
+      * the credential itself, which the environment holds and
+        `hx.identity.resolve` reads. It is exported here so the assertion is
+        about what the renderer does and not about a variable nobody set.
+      * the NAME of that variable. Not a secret, and not rendered either:
+        `_identity`'s own docstring says why a field one dereference from a
+        credential is better absent from a deliverable than present.
+      * an argument to the refresh command. s11 accepts that an operator's
+        own argv is theirs, and a token in one is exactly what a client's
+        report must not carry.
+
+    NOT VACUOUS: the identity section is asserted to have rendered, and to
+    name the identity whose credential this is, so a build that stopped
+    rendering the section entirely would fail here rather than pass."""
+    monkeypatch.setenv(_ENV_NAME, _ENV_VALUE)
+    out = report.render(**report_env_proven)
+
+    assert "### Session identity" in out and "`user`" in out, (
+        "nothing about the identity rendered at all, so the absences below "
+        "prove nothing")
+    for secret in (_ENV_VALUE, "s3cr3t-report-cookie", _ENV_NAME,
+                   _REFRESH_TOKEN, "./mint.sh"):
+        assert secret not in out, f"{secret!r} reached the rendered report"
