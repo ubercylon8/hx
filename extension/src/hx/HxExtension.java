@@ -772,8 +772,17 @@ public class HxExtension implements BurpExtension {
                 // request once, after the gate, and registers the byte range
                 // of any injected credential against THAT array -- and
                 // Redactor.Injected holds its array by identity. Re-serialising
-                // here would issue a third array that no range set names, and
-                // would drop the identity header for good measure.
+                // here would issue a third array that no range set names.
+                //
+                // AND THAT IS THE WHOLE OF IT. This used to add "and would
+                // drop the identity header for good measure", which is false:
+                // `req` here is `composed.req()`, the POST-injection request,
+                // so `Sender.wireBytes(req)` would reproduce the identity
+                // header byte for byte. Http.send's javadoc says so correctly
+                // ("req carries any injected header too... an equal-looking
+                // array is not the array the ranges were measured from"); a
+                // second, false reason attached to a true one reads as
+                // corroboration and is worse than no reason at all.
                 HttpRequest request = HttpRequest.httpRequest(
                         service, ByteArray.byteArray(wire));
 
