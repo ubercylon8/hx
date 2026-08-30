@@ -151,10 +151,14 @@ In `src/hx/checks/base.py`, add to `Verdict` after `reason`:
     #
     # PASSIVE CHECKS ONLY, SINCE FIX ROUND 6, AND THE RUNNER ENFORCES IT.
     # `hx.scan._retirable` returns nothing for a check driven through the
-    # `probes` hook and RAISES if such a check populated this at all: every
-    # probe this build sends is unauthenticated, so an active check's
-    # conclusion is about the logged-out view of the application and cannot
-    # close a finding about the view the client's users are in. An active
+    # `probes` hook and RAISES if such a check populated this at all: the
+    # runner cannot establish that an active check's conclusion is about the
+    # view the client's users are in, so it may not close a finding about
+    # that view. (Until fix round A this said "every probe this build sends
+    # is unauthenticated", which Task 7 falsified -- a run naming a
+    # `scan_identity` issues every probe under one. The rule did not change;
+    # its ground did, and `_retirable` now carries both halves of the new
+    # one.) An active
     # check names what it examined to `hx.checks.active._probe_util.verdict`
     # as `examined` instead -- which is what lets it say `clean` -- and that
     # value deliberately never reaches this field. See `_retirable` for the
@@ -334,9 +338,10 @@ In `scan.run`, beside `seen_findings: set[str] = set()`, add:
         # `check_run.verdict == 'clean'`: a check filing one of three
         # findings answers `finding`, and the other two still need retiring.
         # The second clause is `_retirable`'s and it is why nothing an
-        # ACTIVE check said can be in here: every probe this build sends is
-        # unauthenticated, so what it saw is not necessarily the view the
-        # client's users are in.
+        # ACTIVE check said can be in here: that function cannot tell
+        # whether this run issued under an identity at all, and for one that
+        # did, whether the traffic was inside a PROVEN window is not settled
+        # until `bracket.finish()` -- which runs after every call it makes.
         considered: set[tuple[str, str, str]] = set()
 ```
 
@@ -400,10 +405,12 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
 
     AND SINCE FIX ROUND 6, ONLY A PASSIVE CHECK EVER GETS INTO IT.
     `scan.run` reads `_retirable`, which returns nothing for a check driven
-    through the wire: every probe this build sends is unauthenticated, so an
-    active `clean` is a statement about the logged-out view and not about
-    the one the client's users are in. That function carries the argument
-    and the two spellings the branch tried before it. So "in `considered`"
+    through the wire: an active `clean` is a statement about a view this
+    build cannot yet prove is the one the client's users are in -- a run may
+    be anonymous, and one that issued under an identity is proof only once
+    its closing canary has settled the window, which happens after every
+    `_retirable` call. That function carries the argument and the two
+    spellings the branch tried before it. So "in `considered`"
     means "examined, by a check that read the captured traffic itself", and
     that is the only reading under which retirement is sound today.
 

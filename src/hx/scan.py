@@ -292,9 +292,10 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
         # `check_run.verdict == 'clean'`: a check filing one of three
         # findings answers `finding`, and the other two still need retiring.
         # The second clause is `_retirable`'s and it is why nothing an
-        # ACTIVE check said can be in here: every probe this build sends is
-        # unauthenticated, so what it saw is not necessarily the view the
-        # client's users are in.
+        # ACTIVE check said can be in here: that function cannot tell
+        # whether this run issued under an identity at all, and for one that
+        # did, whether the traffic was inside a PROVEN window is not settled
+        # until `bracket.finish()` -- which runs after every call it makes.
         considered: set[tuple[str, str, str]] = set()
 
         for surface in surfaces:
@@ -1281,12 +1282,42 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     AN ACTIVE CHECK RETIRES NOTHING. Retirement is `_mark_unobserved`
     writing `observed = 0`, which `report._findings` renders to a client as
     "appears fixed; verify before closing" -- a claim about the application
-    as the client's own users meet it. Every probe this build sends is
+    as the client's own users meet it. This function cannot establish that
+    claim. Its `clean` is reported, because a reflection found in whatever
+    view was probed is still a reflection; it may not close anything.
+
+    THE GROUND FOR THAT CHANGED IN TASK 7, AND THE OLD SENTENCE IS GONE.
+    Until this commit this paragraph read "every probe this build sends is
     UNAUTHENTICATED (`ProbeSender._request_bytes` emits a request line, a
     `Host` and at most the one header the check is probing), so an active
     check's `clean` is a statement about the logged-out view and nothing
-    else. It is reported, because a reflection found in the logged-out view
-    is still a reflection; it may not close anything.
+    else". The parenthetical is still true and the conclusion is not: a run
+    whose config names a `scan_identity` registers that credential with the
+    extension and binds every `ProbeSender` to it, and the JVM injects the
+    declared header on each probe. The composition this side does not do
+    happens one layer below what this function can see, which is exactly why
+    the sentence looked checkable from here and was wrong. F3 of fix round A
+    -- and it mattered because Task 8 re-opens this gate by editing this
+    function, on the very fact these words denied.
+
+    WHY THE GATE IS STILL SHUT, on two facts rather than the one that
+    stopped being true:
+
+      * A RUN MAY BE ANONYMOUS. `scan_identity` is optional, `bridge` may be
+        absent, and `_identity_bracket` has four separate ways to answer
+        None. This function is handed `(hook, verdict)` and cannot tell
+        which kind of run it is in.
+      * A BRACKETED RUN IS NOT YET PROOF. The fact a sound retirement needs
+        is not "a credential was injected" but "this traffic was issued
+        inside a PROVEN window" -- `hx.identity.IdentityWindow.
+        state_for_run()` -- and that is not settled until `bracket.finish()`
+        runs the closing canary. `run` calls this function per check inside
+        the surface loop and calls `finish()` immediately before
+        `_mark_unobserved`, so every call here happens BEFORE the state
+        exists.
+
+    Opening the gate therefore needs both halves and is Task 8's decision:
+    a state to read, and a place to read it from that has settled.
 
     DECIDED OFF `hook`, WHICH IS THE DISPATCH ITSELF. `run` picks the probe
     pass with the same value, `registry._HOOKS` gives `probes` to the four
@@ -1341,7 +1372,11 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     credential header's VALUE before the bytes are hashed (S7), so only the
     NAME survives and an analytics or consent cookie is indistinguishable
     from a session. The discriminator could not see what it claimed to.
-    Retirement is a passive-corpus property until probes can authenticate.
+    Retirement is a passive-corpus property until a run can PROVE the
+    session its probes were issued under -- which since Task 7 is a
+    different sentence from "until probes can authenticate", because they
+    now can and the proof is a separate question with a separate answer
+    (`IdentityWindow.state_for_run()`).
 
     THE PASSIVE CORPUS IS UNTOUCHED, and the asymmetry is not a compromise:
     a passive check reads the captured traffic ITSELF -- the very exchanges
@@ -1352,7 +1387,28 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     THE ACCEPTED COST, stated where the decision was taken: the active
     corpus has no automatic retest story at all. A client re-running a scan
     after a fix sees the active finding still listed, and must verify it by
-    hand before closing it. `report._limits` says so in as many words.
+    hand before closing it. `report._limits` says so in as many words, in
+    its "An active finding is never automatically marked as fixed" bullet,
+    which this function is what makes true.
+
+    ONE NEIGHBOURING BULLET IN THAT SAME FUNCTION IS NOW STALE AND IS NOT
+    FIXED HERE. `report._limits` also renders "**Every probe was sent
+    unauthenticated.**" to the client, which is the sentence above with its
+    old ground, and Task 7 falsified it for a run naming a `scan_identity`
+    exactly as it falsified this one. It is not corrected in fix round A
+    because it cannot be: `_limits` is handed `conn` and `engagement_id`,
+    and NOTHING IN THE STORE records whether a run issued under an identity
+    -- `ScanSummary.identity_state`'s own comment sets out why (`run` has no
+    identity column, and section 6's `exchange.identity_state` is the column
+    that section's amendment says this build cannot write). A derived
+    sentence needs something to derive it from, and TASK 8 IS WHERE THAT
+    ARRIVES: the plan's own Task 8 ("Retirement under a proven identity, the
+    report, and the real Burp") makes the neighbouring bullet conditional on
+    the same state this function will start reading, and adds section 10's
+    identity section "derived from the run rather than hardcoded". Retyping
+    the bullet here, one task early and with no state to condition it on,
+    would be a typed sentence standing in for a derived one -- which is the
+    mistake `_limits`' own F5 and F7 comments record it making twice.
     """
     if hook != _PROBE_HOOK:
         return verdict.considered
@@ -1360,10 +1416,11 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
         raise ValueError(
             "an active check returned considered="
             f"{list(verdict.considered)}; a check the runner drives through "
-            "the wire may not retire anything, because every probe this "
-            "build sends is unauthenticated and cannot tell the client's "
-            "own view of the application from the logged-out one. Pass what "
-            "was examined to `_probe_util.verdict` as `examined` instead -- "
+            "the wire may not retire anything, because the runner cannot "
+            "establish that what a probe saw is the view the client's own "
+            "users are in: a run may be anonymous, and a run that was not is "
+            "proof only once its closing canary has settled the window. Pass "
+            "what was examined to `_probe_util.verdict` as `examined` -- "
             "it is what lets a check say `clean` -- and leave `considered` "
             "to the passive corpus")
     return ()
@@ -1594,10 +1651,12 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
 
     AND SINCE FIX ROUND 6, ONLY A PASSIVE CHECK EVER GETS INTO IT.
     `scan.run` reads `_retirable`, which returns nothing for a check driven
-    through the wire: every probe this build sends is unauthenticated, so an
-    active `clean` is a statement about the logged-out view and not about
-    the one the client's users are in. That function carries the argument
-    and the two spellings the branch tried before it. So "in `considered`"
+    through the wire: an active `clean` is a statement about a view this
+    build cannot yet prove is the one the client's users are in -- a run may
+    be anonymous, and one that issued under an identity is proof only once
+    its closing canary has settled the window, which happens after every
+    `_retirable` call. That function carries the argument and the two
+    spellings the branch tried before it. So "in `considered`"
     means "examined, by a check that read the captured traffic itself", and
     that is the only reading under which retirement is sound today.
 

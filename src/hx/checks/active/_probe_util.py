@@ -198,9 +198,12 @@ def reflected(response, marker: str) -> bool:
 #     nonsense" is not "your payload was safe".
 #   * 401, 403, 407 -- a WAF, an expired session, an authorisation layer or a
 #     proxy in front of the application. The probe never reached the code
-#     under test, and every probe this build sends is unauthenticated, so
-#     this is the ordinary answer from an authenticated application rather
-#     than an exotic one. A 407 is not composed by the application at all.
+#     under test, and this is the ordinary answer from an authenticated
+#     application rather than an exotic one: an anonymous run carries no
+#     credential at all, and a run issued under an identity (Task 7) can
+#     still be outside what that identity is authorised for, or be holding a
+#     session the application has since dropped. A 407 is not composed by
+#     the application at all.
 #   * 404, 410 -- the resource is gone. Reachable even now that probes go to
 #     the exemplar's concrete path: a capture from an hour ago can name a row
 #     that has since been deleted.
@@ -345,9 +348,10 @@ def verdict(candidates, gaps, *,
     SPELT DIFFERENTLY. It was that field until this round, and it reached it
     through this function: the four looping checks and `cors` each named
     their issue types here and `hx.scan._mark_unobserved` retired on them.
-    An active check now retires nothing at all -- every probe this build
-    sends is unauthenticated, and the argument is `hx.scan._retirable`'s --
-    so this parameter feeds exactly ONE question: may this check say `clean`
+    An active check now retires nothing at all -- the runner cannot
+    establish that a probe saw the view the client's users are in, and the
+    argument is `hx.scan._retirable`'s (its ground changed in fix round A,
+    the rule did not) -- so this feeds exactly ONE question: may it say `clean`
     at all. A check passes the same fact it always did, under a name that no
     longer promises a retirement, and `_retirable` refuses a probing check's
     `considered` outright so the two cannot quietly join up again.
