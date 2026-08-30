@@ -37,6 +37,7 @@ CLASSES=(
     hx.send.RedactorTest
     hx.send.HaltSwitchTest
     hx.send.SenderTest
+    hx.send.IdentityRegistryTest
     hx.proxy.ProxyGateTest
     hx.proxy.CaptureTest
     hx.proxy.PendingTest
