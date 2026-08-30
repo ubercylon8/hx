@@ -455,7 +455,7 @@ class BridgeServer:
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error"):
+        if t in ("result", "error", "identity_registered"):
             self._deliver(header, body)
             return True
 
@@ -716,6 +716,54 @@ class BridgeServer:
             # exactly what an operator should be able to do.
             self.state = "halted" if self.state == "halted" else "configured"
         return self.config_epoch
+
+    def register_identity(self, resolved, *, origins: tuple[str, ...]) -> None:
+        """Register or refresh one identity in the extension.
+
+        THE BODY IS NEVER LOGGED. Spec section 5 is explicit that `identity`
+        is the one frame in this protocol whose payload is a live credential,
+        and that neither side's diagnostics may print it. Everywhere else in
+        this class logs freely -- `_serve` names the peer's uid, pid and exe
+        at INFO, and a refused peer at WARNING -- because a frame *kind* and a
+        correlation id are not secrets. This method's own log line below is
+        held to the same rule the rest of the class already follows for
+        everything it prints: it names `resolved.id` and `resolved.
+        generation`, and nothing that touches `resolved.value` or
+        `resolved.header`'s injected content ever reaches `_log`.
+
+        `identity` is its own frame type rather than a `configure` key --
+        `configure()` above refuses a later call naming a different rate or
+        budget, because a run must not talk its way into a larger allowance
+        mid-flight, and a programmatic refresh has to advance a generation
+        WITHOUT re-opening scope. Folding identity into `configure` would
+        either weaken that rule or make refresh impossible.
+
+        The success and refusal frame types the peer answers with
+        (`identity_registered`, or `error` carrying a `class` such as
+        `stale_generation` for a generation that does not advance what the
+        extension already holds) are this side's choice: the extension-side
+        registry is a later task in this same plan and has not been built
+        yet, so nothing upstream of this file pins them. `_handle` delivers
+        both alongside `result`/`error` for exactly this method to collect.
+
+        Raises BridgeError: whatever `_request` raises when the peer is gone
+        or never answers, and `error_class` set to the peer's `class` on an
+        `error` reply.
+        """
+        body = codec.identity_body(resolved.id, resolved.generation,
+                                   resolved.header, resolved.value, origins)
+        _log.debug("hx bridge: identity frame for %s generation %d -- kind "
+                  "and generation only, never the injected value",
+                  resolved.id, resolved.generation)
+        reply = self._request({"v": codec.PROTOCOL_VERSION, "t": "identity",
+                               "engagement_id": self.engagement_id}, body)
+        if reply.get("t") == "error":
+            raise BridgeError(
+                "peer refused identity: "
+                f"{reply.get('class', 'unspecified')}: "
+                f"{reply.get('detail', '')}".rstrip(": "),
+                error_class=reply.get("class"),
+            )
 
     def send(self, req: dict, body: bytes = b"", timeout: float = 30.0,
              *, enforce_locally: bool = True) -> dict:

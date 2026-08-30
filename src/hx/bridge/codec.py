@@ -285,6 +285,95 @@ def build_config_body(pairs: dict[str, list[str]]) -> bytes:
     return bytes(out)
 
 
+def identity_body(identity_id: str, generation: int, header: str, value: str,
+                  origins: tuple[str, ...]) -> bytes:
+    """The `identity` frame's body: `{identity_id, generation,
+    inject: {header, value}, origins}`, JSON-encoded.
+
+    NOT A CONFIG KEY, and the reason is spec section 5's: a `configure` naming
+    a different rate or budget is REFUSED rather than applied, because a run
+    must not talk its way into a larger allowance mid-flight. A programmatic
+    refresh has to advance a generation WITHOUT re-opening scope, so folding
+    identity into `configure` would either weaken that rule or make refresh
+    impossible. Its own frame keeps both intact -- see `BridgeServer.
+    register_identity`, which sends this body under `t: "identity"` rather
+    than through `configure`.
+
+    GENERATION MUST BE >= 1, validated here rather than left for the
+    extension-side registry alone to catch: the registry treats a lower
+    generation than the one it holds as a refusal, so 0 or negative could
+    never be above anything it holds, and is a malformed frame here rather
+    than a refusal there.
+    """
+    if not identity_id:
+        raise FrameError("an identity frame needs an identity_id")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise FrameError(f"generation must be an integer >= 1, got {generation!r}")
+    if not header:
+        raise FrameError("an identity frame needs a header to inject into")
+    if not value:
+        raise FrameError("an identity frame with no value registers nothing")
+    if not origins:
+        raise FrameError(
+            "an identity frame needs at least one origin; an identity with no "
+            "origin could be applied to any host the scope allows")
+    payload = {
+        "identity_id": identity_id,
+        "generation": generation,
+        "inject": {"header": header, "value": value},
+        "origins": list(origins),
+    }
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def parse_identity(body: bytes) -> dict:
+    """The reverse of `identity_body`.
+
+    Re-validates the same fields rather than trusting the writer, on the
+    principle `parse_config_body` already follows: a body is checked on the
+    reading side because the writing side being in this repo is not a
+    guarantee about what actually arrived on the wire.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except ValueError as exc:  # UnicodeDecodeError is a ValueError
+        raise FrameError(f"identity body is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise FrameError("identity body must be a JSON object")
+
+    identity_id = payload.get("identity_id")
+    if not identity_id or not isinstance(identity_id, str):
+        raise FrameError("an identity frame needs an identity_id")
+
+    generation = payload.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise FrameError(f"generation must be an integer >= 1, got {generation!r}")
+
+    inject = payload.get("inject")
+    if not isinstance(inject, dict):
+        raise FrameError("an identity frame needs an inject object")
+    header = inject.get("header")
+    if not header or not isinstance(header, str):
+        raise FrameError("an identity frame needs a header to inject into")
+    value = inject.get("value")
+    if not value or not isinstance(value, str):
+        raise FrameError("an identity frame with no value registers nothing")
+
+    origins = payload.get("origins")
+    if not origins or not isinstance(origins, list) or not all(
+            isinstance(o, str) for o in origins):
+        raise FrameError(
+            "an identity frame needs at least one origin; an identity with no "
+            "origin could be applied to any host the scope allows")
+
+    return {
+        "identity_id": identity_id,
+        "generation": generation,
+        "inject": {"header": header, "value": value},
+        "origins": origins,
+    }
+
+
 def parse_config_body(body: bytes) -> dict[str, list[str]]:
     pairs: dict[str, list[str]] = {}
     for raw_line in body.decode("utf-8").split("\n"):

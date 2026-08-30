@@ -220,6 +220,99 @@ def test_config_body_rejects_a_line_without_a_tab():
         codec.parse_config_body(b"scope.include https://no-tab/*\n")
 
 
+# ---- identity body ------------------------------------------------------
+
+def test_the_identity_frame_round_trips():
+    body = codec.identity_body("user", 2, "Cookie", "session=abc",
+                               ("https://app.test",))
+    out = codec.parse_identity(body)
+    assert out["identity_id"] == "user" and out["generation"] == 2
+    assert out["inject"] == {"header": "Cookie", "value": "session=abc"}
+    assert out["origins"] == ["https://app.test"]
+
+
+def test_identity_body_carries_more_than_one_origin_in_order():
+    body = codec.identity_body("user", 1, "Cookie", "v",
+                               ("https://a.test", "https://b.test"))
+    assert codec.parse_identity(body)["origins"] == \
+        ["https://a.test", "https://b.test"]
+
+
+@pytest.mark.parametrize("generation", [0, -1, -100])
+def test_an_identity_frame_with_a_non_positive_generation_is_refused(generation):
+    # Generation is monotonic on the extension side. A zero or negative one
+    # could never be above what is held, so it is a malformed frame here
+    # rather than a refusal there.
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.identity_body("user", generation, "Cookie", "v",
+                            ("https://app.test",))
+
+
+def test_an_identity_frame_with_a_bool_generation_is_refused():
+    """`isinstance(True, int)` is True in Python; a bool must not sneak past
+    the integer check the way it does not sneak past the header check in
+    `_check_header`."""
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.identity_body("user", True, "Cookie", "v", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_identity_id_is_refused():
+    with pytest.raises(codec.FrameError, match="identity_id"):
+        codec.identity_body("", 1, "Cookie", "v", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_value_is_refused():
+    with pytest.raises(codec.FrameError, match="value"):
+        codec.identity_body("user", 1, "Cookie", "", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_origins_is_refused():
+    """An identity with no origin could be applied to any host the scope
+    allows -- the same rule the extension-side registry enforces."""
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.identity_body("user", 1, "Cookie", "v", ())
+
+
+def test_parse_identity_rejects_a_body_that_is_not_json():
+    with pytest.raises(codec.FrameError):
+        codec.parse_identity(b"not json")
+
+
+def test_parse_identity_rejects_a_missing_generation():
+    body = json.dumps({"identity_id": "user",
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_a_stale_non_positive_generation_too():
+    """Re-validated on the reading side rather than trusted from the writer
+    -- the same discipline `parse_config_body` already follows -- so a body
+    that skipped `identity_body`'s own check is still caught here."""
+    body = json.dumps({"identity_id": "user", "generation": 0,
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_empty_origins():
+    body = json.dumps({"identity_id": "user", "generation": 1,
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": []}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_a_blank_value():
+    body = json.dumps({"identity_id": "user", "generation": 1,
+                       "inject": {"header": "Cookie", "value": ""},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="value"):
+        codec.parse_identity(body)
+
+
 # ---- golden vectors ----------------------------------------------------
 
 def test_every_vector_round_trips():

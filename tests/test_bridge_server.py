@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from hx import halt as halt_mod
+from hx import identity
 from hx.bridge import codec, server
 from hx.store import db as db_mod
 from hx.store import records
@@ -812,6 +813,125 @@ def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
             f"must not go on claiming {srv.state!r}"
         )
         assert srv.config_epoch == 0, srv.config_epoch
+    finally:
+        c.close()
+
+
+# ---- register_identity ------------------------------------------------
+
+# `register_identity` blocks waiting for the peer's reply, exactly like
+# `configure()` above. See test_configure_round_trip_returns_an_epoch for the
+# shape this borrows and the race it guards against: calling it inline and
+# then trying to read the frame off the same thread deadlocks, since nothing
+# is left to send the reply. `_connected` already drives past the hello
+# handshake before handing back the socket, which is what keeps these three
+# clear of that race -- `_conn` is set and `state` is "connected" before the
+# thread below ever calls in.
+
+
+def test_registering_an_identity_sends_an_identity_frame(srv):
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie",
+                                      value="session=abc", generation=1),
+                    origins=("https://app.test",))
+                result["ok"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+
+        header, body = reader.read()
+        assert header["t"] == "identity"
+        assert header["engagement_id"] == "e-1"
+        assert isinstance(header["id"], int) and header["id"] > 0
+        parsed = codec.parse_identity(body)
+        assert parsed["identity_id"] == "user" and parsed["generation"] == 1
+        assert parsed["inject"] == {"header": "Cookie", "value": "session=abc"}
+        assert parsed["origins"] == ["https://app.test"]
+
+        c.sendall(codec.encode({"v": 1, "t": "identity_registered",
+                                "id": header["id"]}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert result.get("ok") is True, result
+    finally:
+        c.close()
+
+
+def test_an_identity_frame_is_never_logged(srv, caplog):
+    """The ONLY frame in this protocol whose payload is a secret. The bridge
+    logs frame kinds and correlation ids elsewhere in this class (see
+    test_a_refused_peer_is_counted_and_logged_rather_than_dropped_in_silence);
+    a debug line added to this method that printed `resolved.value` is
+    exactly how a live session cookie reaches a log file that outlives the
+    engagement.
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie",
+                                      value="session=SUPERSECRET",
+                                      generation=1),
+                    origins=("https://app.test",))
+                result["ok"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        with caplog.at_level("DEBUG"):
+            t = threading.Thread(target=do_register)
+            t.start()
+            header, _ = reader.read()
+            c.sendall(codec.encode({"v": 1, "t": "identity_registered",
+                                    "id": header["id"]}))
+            t.join(timeout=5)
+
+        assert not t.is_alive(), "do_register thread never finished"
+        assert result.get("ok") is True, result
+        assert "SUPERSECRET" not in caplog.text
+        assert "identity" in caplog.text, "the frame KIND is still loggable"
+    finally:
+        c.close()
+
+
+def test_a_refused_identity_frame_raises(srv):
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie", value="v",
+                                      generation=1),
+                    origins=("https://app.test",))
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "stale_generation",
+                                "detail": "generation 1 is not above 3"}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert isinstance(result.get("error"), server.BridgeError), result
+        assert result["error"].error_class == "stale_generation"
+        assert "stale_generation" in str(result["error"])
     finally:
         c.close()
 
