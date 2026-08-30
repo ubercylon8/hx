@@ -786,9 +786,9 @@ def _halt_reason(exc, summary) -> str:
     EVERY OTHER EXCEPTION KEEPS ITS TEXT, and that is a decision rather than
     an omission. A `sqlite3.Error`, a `BridgeError` or a `codec.FrameError`
     says what happened and there is nothing else available to say it;
-    `report._provenance`'s own comment has named this field
-    attacker-influenceable free text since fix round B and routes it through
-    `_redact` for that reason; and narrowing it to a bare type name would
+    `report._provenance`'s own comment names this field
+    attacker-influenceable free text and routes it through `_redact` for that
+    reason; and narrowing it to a bare type name would
     take away the only diagnosis a crashed run has. What made `IdentityDead`
     different is not that its text is untrusted -- all of them are -- but
     that a SUBPROCESS'S STDERR reached it, which no other exception on this

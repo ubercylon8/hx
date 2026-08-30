@@ -482,9 +482,25 @@ def _provenance(conn, engagement_id, config, *, created_us,
                     f"{_when(started_us)}) ended `{_flat(status)}`")
             if stop_reason:
                 # `stop_reason` is free text and attacker-influenceable:
-                # `hx.scan.run` writes `f"scan.run raised: {type(exc).__name__}:
-                # {exc}"`, an exception message that can quote a request
-                # target. Through `_redact` like every other such field.
+                # `hx.scan._halt_reason` writes `f"scan.run raised:
+                # {type(exc).__name__}: {exc}"`, an exception message that can
+                # quote a request target. Through `_redact` like every other
+                # such field.
+                #
+                # WITH ONE EXCEPTION TYPE HELD BACK AT THE SOURCE, and
+                # `_redact` is why it had to be. F1 of the task-7 fix round A
+                # review: `hx.identity.refresh` put a failing refresh
+                # command's stderr in an `IdentityError`, `scan._settle`
+                # interpolated that into an `IdentityDead`, and this line
+                # rendered it -- `_redact` is `records.redact_url`, which
+                # strips URL userinfo and NOTHING ELSE, so a token echoed by
+                # a `curl -v` or a `set -x` arrived on the page intact. That
+                # is contained where it is created (the message no longer
+                # repeats the output) and again where it is stored
+                # (`_halt_reason` writes an `IdentityDead`'s own composed
+                # `stop_reason`, never `str(exc)`). This line is unchanged:
+                # the containment belongs upstream of a renderer that cannot
+                # know what a string means.
                 line += f" — stop reason: {_flat(_redact(stop_reason))}"
             else:
                 line += " and recorded no stop reason"
