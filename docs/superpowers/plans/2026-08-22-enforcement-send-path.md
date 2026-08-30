@@ -17618,23 +17618,25 @@ public final class Sender {
         Decision d = policy.checkGate(req);
         if (!d.allowed()) return error(id, d);
 
-        // ---- EVERYTHING ABOVE MAY REFUSE. NOTHING BELOW DOES. -------------
+        // ---- EVERY GATE HAS NOW ANSWERED --------------------------------
         //
         // AFTER THE GATE, DELIBERATELY. Injection composes a request carrying
         // a live credential, and doing it before the gate would mean an
         // out-of-scope or dangerous-path send had one composed for it -- with
         // only the refusal returning in time keeping it off the wire. Spec s7
-        // pins this ordering, and IdentityInjectionTest's
-        // aRequestTheGateREFUSEDNeverHasACredentialWrittenIntoIt is what makes
-        // it a fact rather than a comment: it asserts the fake Http was never
-        // called AND that no range was registered for that request.
+        // pins the ordering.
         //
-        // The two refusals below sit here for a different reason: they are the
-        // only two that need an identity in hand, and neither can be decided
-        // before the frame has been read and the boundary checks have passed.
-        // They are the LAST refusals on this path, and they still refuse --
-        // the sentence above is about the gates, which cannot be re-run once
-        // a credential has been written.
+        // The two refusals below are the last things on this path that can
+        // refuse, and they are HERE rather than above because they are the
+        // only two that need an identity in hand: there is no identity to
+        // resolve until the frame has been read, and no reason to resolve one
+        // for a request the boundary checks are about to turn away.
+        //
+        // IdentityInjectionTest's aRequestTheGateREFUSEDNeverHasACredentialWrittenIntoIt
+        // is what holds the order, and it holds it through the REFUSAL CLASS:
+        // an input for which both a gate refusal and an identity refusal are
+        // available can only be answered once, and the class names which step
+        // ran. Moving this block above `policy.checkGate` turns that suite red.
         String identityId = header.get("identity_id") instanceof String s ? s : null;
         IdentityRegistry.Entry ident = null;
         if (identityId != null && !identityId.isBlank()) {
@@ -17654,12 +17656,14 @@ public final class Sender {
                              + req.host());
         }
 
+        // ---- AND NOTHING BELOW THIS LINE REFUSES ------------------------
+        //
         // The bytes that go on the wire, composed ONCE and here rather than in
-        // the adapter: the Injected below holds the array it was measured from
-        // BY IDENTITY, so a second serialisation downstream would issue an
-        // array no range set names. `ident` is null for an anonymous send and
-        // `compose` then registers nothing -- an empty Injected, which is what
-        // every send has carried in spirit since Redactor shipped.
+        // the adapter: the Injected inside holds the array it was measured
+        // from BY IDENTITY, so a second serialisation downstream would issue
+        // an array no range set names. `ident` is null for an anonymous send,
+        // and compose() then registers nothing -- an empty Injected, which
+        // redactRequest answers with a verbatim copy.
         Composed composed = compose(req, ident);
 
         HttpReply reply;
