@@ -16,6 +16,7 @@ constraint sitting there looking like it worked. Collapsing every part into
 one Python string with a literal placeholder for an absent part is what
 keeps that failure mode out of reach in the first place.
 """
+import dataclasses
 import sqlite3
 
 import pytest
@@ -198,6 +199,36 @@ def test_upsert_moves_last_seen_run_and_never_first_seen(engagement_conn):
     row = engagement_conn.execute(
         "SELECT first_seen_run, last_seen_run FROM finding").fetchone()
     assert row == ("r-1", "r-2")
+
+
+def test_upsert_writes_the_payload_and_moves_it_with_the_description(
+        engagement_conn):
+    """F10 of the whole-branch review. `finding.payload` has been in the
+    schema and in this INSERT since the column existed, and every check in
+    the first corpus that HAS payloads left it None -- so the column was
+    NULL on every row.
+
+    The re-upsert half is why it is in the `DO UPDATE SET` list. Two active
+    checks mint a fresh random payload per run, so a column left alone would
+    hold run 1's value beside a `description`, `severity` and `confidence`
+    that all move to run 2's -- one row describing two demonstrations. It is
+    not part of `dedupe_key`, so moving it re-files nothing: the same row is
+    updated, not a second one written.
+    """
+    first = base.Candidate(title="t", issue_type_id="t-issue",
+                           severity="Low", confidence="Firm", insertion=None,
+                           exchange_ids=("x-1",), payload="aaa'")
+    records.upsert_finding(engagement_conn, engagement_id="e-1",
+                           candidate=first, dedupe_key=key(), run_id="r-1")
+    assert engagement_conn.execute(
+        "SELECT payload FROM finding").fetchone()[0] == "aaa'"
+
+    second = dataclasses.replace(first, payload="bbb'", description="later")
+    records.upsert_finding(engagement_conn, engagement_id="e-1",
+                           candidate=second, dedupe_key=key(), run_id="r-2")
+    rows = engagement_conn.execute(
+        "SELECT payload, description FROM finding").fetchall()
+    assert rows == [("bbb'", "later")]
 
 
 def test_a_check_written_finding_is_new_and_created_by_check(engagement_conn):

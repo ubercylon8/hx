@@ -322,7 +322,15 @@ def test_a_stale_excerpt_is_caught_where_a_whole_file_compare_never_looked(tmp_p
 # intended, not collateral. A pending plan is a plan whose blocks are NOT being
 # compared, and how many stopped being compared should be a decision somebody
 # wrote down rather than a number that quietly moved.
-EXPECTED_BLOCKS = 115
+#
+# 139 = 115 from five earlier plans, plus 24 the active-checks plan contributed
+# on 2026-08-29 when its blocks were marked and synced against the shipped
+# code. It had contributed ZERO until then -- every one of its fences went
+# unmarked -- which is precisely the silence this constant exists to price.
+# 2026-08-27-checks-and-reporting.md is still `pending` and still contributes
+# none of its 26, and that is a merged plan: worth fixing, and a bigger job
+# than marking one.
+EXPECTED_BLOCKS = 139
 
 
 def test_the_check_actually_found_some_blocks():

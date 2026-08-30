@@ -23988,6 +23988,14 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
     `(surface_id, check.id)` match against THIS run's own `check_run` rows
     with `verdict='clean'`, not surface membership alone.
 
+    `payload` MOVES WITH `description`, and that pairing is the reason it is
+    in the update list at all. Two of the active checks mint a fresh random
+    payload per run (`reflected_input`'s canary, `sql_error`'s prefix), so a
+    column left alone on re-find would hold run 1's value beside a
+    description, severity and confidence that are all run 7's -- one row
+    describing two different demonstrations. It is not part of `dedupe_key`,
+    so moving it re-files nothing.
+
     The fix is here rather than in the runner because `dedupe_key` is already
     built from surface AND check identity in exactly one place (this module's
     `dedupe_key`) and a second place deciding either would be the same class
@@ -24012,6 +24020,7 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
         "   confidence=excluded.confidence,"
         "   surface_id=excluded.surface_id,"
         "   host=excluded.host,"
+        "   payload=excluded.payload,"
         "   check_id=excluded.check_id",
         (fid, engagement_id, dedupe_key, candidate.issue_type_id,
          candidate.title, candidate.description,
@@ -26392,11 +26401,17 @@ from __future__ import annotations
 
 import http.client
 import json
+import pathlib
 import socket
 import time
+from urllib.parse import quote
 
 import pytest
 
+from hx import config, surface
+from hx.checks import registry
+from hx.checks.active import cors, open_redirect, path_traversal
+from hx.checks.active import reflected_input, sql_error
 from tests.integration import target_server as ts
 
 
@@ -26773,6 +26788,377 @@ def test_stop_is_safe_on_a_server_that_never_started():
     rig registers stop() BEFORE start(), so this path is real."""
     server = ts.TargetServer("127.0.0.1")
     server.stop()
+
+
+# ---------------------------------------------------------------------------
+# The vulnerable routes: the instrument the active corpus is measured with.
+#
+# Every assertion below is written against the CHECK'S OWN constants -- its
+# probe origin, its marker host, its signature table, its traversal payload --
+# rather than against a literal pasted from them. A route that stops answering
+# what its check actually sends is the one failure that makes the integration
+# suite's "each check found its finding" vacuous, and it costs milliseconds to
+# catch here instead of a JVM to catch there.
+# ---------------------------------------------------------------------------
+
+def test_every_active_check_has_exactly_one_vulnerable_route(target):
+    """The map is the contract the integration suite reads. A check added to
+    the registry without a route here would be scanned against nothing and
+    would answer `clean` -- indistinguishable, in a report, from a check that
+    was run against something and found it sound."""
+    active = {c.id for c in registry.CHECKS if c.klass != "passive"}
+    assert set(ts.VULNERABLE_ROUTES) == active, (
+        "every active check needs a route it can find something on, and every "
+        "route here needs a check that probes it")
+    for check_id, path in ts.VULNERABLE_ROUTES.items():
+        status, _headers, _body = _get(target, path)
+        assert status in (200, 302), (check_id, path, status)
+
+
+def test_the_cors_route_reflects_an_arbitrary_origin_with_credentials(target):
+    status, headers, _body = _get(
+        target, ts.VULNERABLE_ROUTES["hx.active.cors"],
+        headers={"Origin": cors._PROBE_ORIGIN})
+    assert status == 200
+    assert headers["Access-Control-Allow-Origin"] == cors._PROBE_ORIGIN
+    assert headers["Access-Control-Allow-Credentials"] == "true"
+
+
+def test_a_fixed_cors_route_stops_reflecting_and_nothing_else_changes(target):
+    """What `fix()` has to mean for the retirement half of the retest story: a
+    fixed configuration still answers, it just stops trusting an origin it
+    never heard of. A route that started 404ing or erroring instead would
+    retire the finding for the wrong reason."""
+    target.fix("hx.active.cors")
+    status, headers, body = _get(
+        target, ts.VULNERABLE_ROUTES["hx.active.cors"],
+        headers={"Origin": cors._PROBE_ORIGIN})
+    assert status == 200
+    assert json.loads(body) == {"user": "alice"}
+    assert "Access-Control-Allow-Origin" not in headers
+    assert "Access-Control-Allow-Credentials" not in headers
+
+
+# ---------------------------------------------------------------------------
+# `fix()` HONOURS EVERY ID IT ACCEPTS, which four of the five did not until fix
+# round 6: only `/api/profile` consulted `is_fixed`, so `fix("hx.active.
+# reflected-input")` was accepted and changed nothing. Nothing called it with
+# another id, so nothing was vacuous yet -- these are what stop the next
+# retest test being the one that finds out.
+#
+# EVERY ONE OF THEM ASSERTS THE ROUTE STILL ANSWERS, and that is the assertion
+# with the teeth. `_probe_util.unanswered` reads a 2xx and nothing else as an
+# answer, so a "fix" that replied 3xx, 4xx or 5xx would say `inconclusive` --
+# a wall, not a repair -- and a test built on it would measure the opposite of
+# what it claimed. The flaw's own signature going away is the easy half.
+# ---------------------------------------------------------------------------
+
+def test_a_fixed_redirect_route_validates_instead_of_redirecting(target):
+    target.fix("hx.active.open-redirect")
+    status, headers, body = _get(
+        target, f"/go?next={open_redirect._MARKER_URL}")
+    assert status == 200, "a fixed route that stops answering is a wall"
+    assert "Location" not in headers
+    assert open_redirect._MARKER_HOST.encode() not in body
+
+
+def test_a_fixed_search_route_stops_reflecting_and_still_answers(target):
+    wrapped = f'{reflected_input._META_CHARS}Zq7pLx3nV0aB{reflected_input._META_CHARS}'
+    target.fix("hx.active.reflected-input")
+    status, headers, body = _get(
+        target, f"/search?q={quote(wrapped, safe='')}")
+    assert status == 200, "a fixed route that stops answering is a wall"
+    assert headers["Content-Type"].startswith("text/html")
+    assert b"Zq7pLx3nV0aB" not in body, (
+        "the canary came back, so `reflected_input` still files a finding "
+        "and the fix reads as no fix at all")
+
+
+def test_a_fixed_lookup_route_stops_disclosing_the_driver_error(target):
+    target.fix("hx.active.sql-error")
+    status, _headers, body = _get(target, "/db/lookup?id=42%27")
+    assert status == 200, (
+        "a fixed route answering 5xx is no answer to `unanswered`, so the check "
+        "says `inconclusive` and the test measures a wall")
+    assert sql_error._SIGNATURES[0][0].encode() not in body
+
+
+def test_a_fixed_files_route_confines_the_path_and_still_answers(target):
+    target.fix("hx.active.path-traversal")
+    payload = quote(path_traversal._TRAVERSAL_PAYLOAD, safe="")
+    status, _headers, body = _get(target, f"/files?file={payload}")
+    assert status == 200, (
+        "a fixed route answering 403 or 404 is no answer to `unanswered`, so "
+        "the check says `inconclusive` and the test measures a wall")
+    assert path_traversal._SIGNATURES[0][0].encode() not in body
+    assert ts.FAKE_PASSWD.encode() not in body
+
+
+# What "still vulnerable" MEANS at each route, spelt once. Each entry is the
+# request that demonstrates the flaw and a predicate over `(status, headers,
+# body)` that is true only while it is there -- the same evidence the check
+# itself reads, so a `fix` that half-worked cannot satisfy this.
+_STILL_VULNERABLE = {
+    "hx.active.cors": (
+        "/api/profile", {"Origin": cors._PROBE_ORIGIN},
+        lambda s, h, b: h.get("Access-Control-Allow-Origin") == cors._PROBE_ORIGIN),
+    "hx.active.open-redirect": (
+        f"/go?next={open_redirect._MARKER_URL}", None,
+        lambda s, h, b: s == 302 and h.get("Location") == open_redirect._MARKER_URL),
+    "hx.active.path-traversal": (
+        f"/files?file={quote(path_traversal._TRAVERSAL_PAYLOAD, safe='')}", None,
+        lambda s, h, b: b.decode() == ts.FAKE_PASSWD),
+    "hx.active.reflected-input": (
+        "/search?q=Zq7pLx3nV0aB", None,
+        lambda s, h, b: b"Zq7pLx3nV0aB" in b),
+    "hx.active.sql-error": (
+        "/db/lookup?id=42%27", None,
+        lambda s, h, b: sql_error._SIGNATURES[0][0].encode() in b),
+}
+
+
+def test_the_vulnerability_predicates_cover_every_route_in_the_map():
+    """Derived from the map, so a sixth check with a route here cannot be
+    left out of the test below without anything reddening."""
+    assert set(_STILL_VULNERABLE) == set(ts.VULNERABLE_ROUTES)
+
+
+@pytest.mark.parametrize("check_id", sorted(ts.VULNERABLE_ROUTES))
+def test_fixing_one_route_leaves_the_other_four_vulnerable(target, check_id):
+    """THE SEPARATING CASE, over the whole map. A `fix` that switched
+    something global -- or four branches all reading one flag -- would pass
+    every test above while silently repairing the routes a retest test is
+    using as its controls. Each route is checked for its OWN flaw rather than
+    for a status, because four of the five repairs above leave the status
+    exactly where it was."""
+    for other, (path, headers, still) in _STILL_VULNERABLE.items():
+        status, got, body = _get(target, path, headers=headers)
+        assert still(status, got, body), (
+            f"{other} was not vulnerable before anything was fixed, so this "
+            "test measures nothing")
+
+    target.fix(check_id)
+
+    for other, (path, headers, still) in _STILL_VULNERABLE.items():
+        status, got, body = _get(target, path, headers=headers)
+        assert still(status, got, body) == (other != check_id), (
+            f"fixing {check_id} left {other} in the wrong state", status, got)
+
+
+def test_fix_refuses_a_name_no_route_here_answers_for(target):
+    """A typo would fix nothing and the retirement assertion that followed it
+    would fail somewhere else, naming the retirement machinery."""
+    with pytest.raises(ValueError, match="no vulnerable route"):
+        target.fix("hx.active.corse")
+
+
+def test_the_redirect_route_puts_the_markers_url_in_location_unvalidated(target):
+    status, headers, _body = _get(target, f"/go?next={open_redirect._MARKER_URL}")
+    assert status == 302
+    assert headers["Location"] == open_redirect._MARKER_URL
+
+
+def test_the_redirect_route_does_not_echo_a_value_that_is_not_a_url(target):
+    """Every other active check probes `next` too. If this route echoed their
+    canaries, `hx.active.reflected-input` would file a second finding on the
+    same surface and the one-route-one-check attribution would be gone."""
+    status, headers, body = _get(target, "/go?next=Zq7pLx3nV0aB")
+    assert status == 200
+    assert "Location" not in headers
+    assert b"Zq7pLx3nV0aB" not in body
+
+
+def test_the_search_route_reflects_its_input_unescaped(target):
+    """Both halves of what `reflected_input` asks: the bare canary comes back,
+    and so does one wrapped in the four metacharacters that decide whether the
+    finding is Medium or Low."""
+    wrapped = f'{reflected_input._META_CHARS}Zq7pLx3nV0aB{reflected_input._META_CHARS}'
+    status, headers, body = _get(target, f"/search?q={quote(wrapped, safe='')}")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert wrapped.encode() in body, (
+        "the wrapper came back escaped or not at all, so the escalation "
+        "request can only ever produce the weaker Low finding")
+
+
+def test_the_lookup_route_discloses_a_driver_error_only_for_a_broken_query(target):
+    signature = sql_error._SIGNATURES[0][0]
+    status, _headers, body = _get(target, "/db/lookup?id=42%27")
+    assert status == 500
+    assert signature.encode() in body
+
+    status, _headers, body = _get(target, "/db/lookup?id=42")
+    assert status == 200
+    assert signature.encode() not in body
+
+
+def test_the_lookup_route_does_not_quote_the_value_it_was_given(target):
+    """A real driver message quotes the offending value, and this one must not:
+    `sql_error`'s probe is a canary plus a quote, and echoing it would make
+    `reflected-input` file a finding here as well."""
+    _status, _headers, body = _get(target, "/db/lookup?id=Zq7pLx3nV0aB%27")
+    assert b"Zq7pLx3nV0aB" not in body
+
+
+def test_the_files_route_serves_the_fixtures_own_passwd_for_a_traversal(target):
+    payload = quote(path_traversal._TRAVERSAL_PAYLOAD, safe="")
+    status, _headers, body = _get(target, f"/files?file={payload}")
+    assert status == 200
+    signature = path_traversal._SIGNATURES[0][0]
+    assert signature.encode() in body
+    assert body.decode() == ts.FAKE_PASSWD, (
+        "the traversal must be answered from FAKE_PASSWD and never from a "
+        "file on the machine running this suite")
+
+
+def test_the_files_route_answers_an_ordinary_name_without_echoing_it(target):
+    status, _headers, body = _get(target, "/files?file=Zq7pLx3nV0aB.txt")
+    assert status == 200
+    assert b"Zq7pLx3nV0aB" not in body
+    assert path_traversal._SIGNATURES[0][0].encode() not in body
+
+
+def test_the_fixtures_passwd_is_not_the_machines(target):
+    """FAKE_PASSWD is invented, and the only thing that keeps it invented is
+    that nothing reads the real file. If these two are ever equal, something
+    started serving the host's own account list to a payload."""
+    real = pathlib.Path("/etc/passwd")
+    if real.exists():
+        assert real.read_text(errors="replace") != ts.FAKE_PASSWD
+
+
+# ---------------------------------------------------------------------------
+# The one route whose path the normaliser TEMPLATES.
+#
+# Every route in VULNERABLE_ROUTES is static, so `path_template == path` for
+# every surface this suite builds and `hx.surface`'s normaliser never ran on
+# the active corpus's own data. F1 of the whole-branch review lived in that
+# blind spot. These tests are the instrument for the integration test that
+# closes it, in the fast suite for the same reason the rest of this file is.
+# ---------------------------------------------------------------------------
+
+def test_the_templated_route_is_a_path_hx_surface_actually_templates():
+    """The claim the whole route rests on, made against the real normaliser
+    and its real defaults rather than by eye. A route whose path came back
+    unchanged would leave the integration test measuring a static surface
+    again -- passing, and proving nothing."""
+    cfg = config.Config(name="t", client="t", scope_include=["*"])
+    templated = surface.path_template(
+        ts.TEMPLATED_ROUTE, preserve=frozenset(cfg.preserve_segments),
+        slug_threshold=cfg.slug_threshold)
+    assert templated == ts.TEMPLATED_SURFACE
+    assert templated != ts.TEMPLATED_ROUTE
+
+
+def test_the_templated_route_reflects_the_id_segment(target):
+    status, headers, body = _get(target, ts.TEMPLATED_ROUTE)
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert b"12345" in body
+
+
+def test_the_templated_route_answers_any_id_not_only_the_browsed_one(target):
+    """Matched by shape, because every probe REPLACES that segment: a handler
+    keyed on the browsed path would 404 every probe and the integration test
+    would measure a refusal instead of a reflection."""
+    status, _headers, body = _get(target, "/user/Zq7pLx3nV0aB/profile")
+    assert status == 200
+    assert b"Zq7pLx3nV0aB" in body
+
+
+def test_the_templated_routes_reflection_survives_the_escalation_wrapper(target):
+    """The second half of what `reflected_input` asks, exactly as
+    `test_the_search_route_reflects_its_input_unescaped` asks it of `/search`
+    -- except that here the value rides a PATH SEGMENT, so the route has to
+    percent-decode it the way a vulnerable application would."""
+    meta = reflected_input._META_CHARS
+    wrapped = f"{meta}Zq7pLx3nV0aB{meta}"
+    status, _headers, body = _get(
+        target, f"/user/{quote(wrapped, safe='')}/profile")
+    assert status == 200
+    assert wrapped.encode() in body
+
+
+@pytest.mark.parametrize("path", [
+    "/user/12345", "/user//profile", "/user/12345/profile/extra",
+    "/users/12345/profile", "/user/12345/settings",
+])
+def test_nothing_else_reaches_the_templated_route(target, path):
+    """The handler matches a shape, and a shape that matched too much would
+    answer for paths other routes own -- or for a 404 this suite relies on."""
+    assert _get(target, path)[0] == 404
+
+
+# ---------------------------------------------------------------------------
+# The two routes that are not vulnerabilities: a response no check may read as
+# an answer, and a surface no probe can address.
+#
+# Every route above answers 2xx to a GET, which is what kept N1 and N2 of the
+# scoped re-review invisible to a green integration suite for the same reason
+# a static path kept F1 invisible. These two are the instrument for the
+# integration tests that close that, pinned here for milliseconds rather than
+# there for a JVM.
+# ---------------------------------------------------------------------------
+
+def test_the_wall_route_reflects_its_input_until_the_wall_goes_up(target):
+    """Both states of `LOGIN_WALL_ROUTE`, and the integration test needs both.
+
+    Answering, it has to REFLECT -- that is the only way a finding gets on
+    file against this surface before the wall goes up, and a retirement is
+    what the test measures. Walled, it has to answer `302` with the `Location`
+    the constant names and to reflect NOTHING: a canary echoed inside the
+    redirect body would be a candidate, and a candidate beats a gap in
+    `_probe_util.verdict`, so the finding would survive because it was
+    re-found rather than because the redirect was read as a refusal.
+    """
+    assert _get(target, ts.LOGIN_WALL_ROUTE)[0] == 200, (
+        "the browsed route must exist; a 404 here would leave the integration "
+        "test measuring a missing route rather than a login wall")
+    path = ts.LOGIN_WALL_ROUTE.partition("?")[0]
+
+    status, headers, body = _get(target, f"{path}?tab=Zq7pLx3nV0aB")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert b"Zq7pLx3nV0aB" in body
+
+    target.require_login()
+
+    status, headers, body = _get(target, f"{path}?tab=Zq7pLx3nV0aB")
+    assert status == 302
+    assert headers["Location"] == ts.LOGIN_WALL_LOCATION
+    assert b"Zq7pLx3nV0aB" not in body, (
+        "the walled response reflected the value it was given, so a probe "
+        "would file a finding off a redirect it never got past")
+
+    # THE WALL IS ONE ROUTE'S, not the server's. Every other route goes on
+    # answering, which is what makes the surface under test the only thing
+    # that changed between two scans.
+    assert _get(target, ts.VULNERABLE_ROUTES["hx.active.reflected-input"])[0] == 200
+
+
+def test_the_state_changing_route_answers_both_the_post_and_the_get(target):
+    """`STATE_CHANGING_ROUTE`'s two halves, and neither is decoration.
+
+    The POST is what makes the captured surface `state_changing` -- asserted
+    against `hx.surface`'s own function rather than by eye, because that is
+    the derivation the schema's `kind` column carries. The GET is what a build
+    without the method skip sends at that surface, and it has to be an
+    ORDINARY ANSWER: a route that 404ed a GET would make the integration
+    test's counterfactual a refusal (`inconclusive`, which retires nothing)
+    instead of the false `clean` N2 is about.
+    """
+    assert surface.kind_for("POST") == "state_changing"
+    path = ts.STATE_CHANGING_ROUTE.partition("?")[0]
+
+    raw = _request(target, "POST", ts.STATE_CHANGING_ROUTE)
+    assert b" 201 " in raw, raw
+
+    status, _headers, body = _get(target, ts.STATE_CHANGING_ROUTE)
+    assert status == 200
+    assert json.loads(body) == {"orders": [{"id": 1, "total": "12.00"}]}
+
+    assert [(h.method, h.path) for h in target.hits] == [
+        ("POST", path), ("GET", path)]
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -26810,6 +27196,15 @@ looks identical whether the gate worked or the port was simply shut.
 Every request is recorded BEFORE it is answered, so the assertions in
 test_send_path.py can be made against what the server saw rather than against
 what the bridge said.
+
+SOME OF THESE ROUTES ARE GENUINELY VULNERABLE, and that is what they are for:
+`hx.checks.active` is a corpus that SENDS, and a check that has never met a
+target that answers its payload is a check nobody has run. `VULNERABLE_ROUTES`
+below names one route per active check, each with a comment saying which. The
+loopback rule stops being incidental at that point -- it is the only thing
+between a payload and somebody else's server -- so the constructor's refusal of
+any host outside 127.0.0.0/8 is now load-bearing rather than tidy, and no test
+in this directory takes a hostname from anywhere but a TargetServer it built.
 """
 from __future__ import annotations
 
@@ -26820,7 +27215,7 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 # The value that must never be found on disk. It stands in for a live
 # production session cookie, and it is distinctive enough that a byte search
@@ -26895,6 +27290,156 @@ UPGRADE_HEAD = (b"HTTP/1.1 101 Switching Protocols\r\n"
 # are NOT HTTP and must not be read as a status line: the byte after the head is
 # 0x81, and a scan that keeps looking for a final head after a 101 finds this.
 UPGRADE_FRAME = b"\x81\x05hello"
+
+# ---------------------------------------------------------------------------
+# The deliberately vulnerable routes, one per active check.
+#
+# EVERY ONE OF THEM IS ON THIS LOOPBACK SERVER AND NOWHERE ELSE. The
+# constructor above refuses any host outside 127.0.0.0/8, and these routes are
+# the first thing in this project that answers an ATTACK payload -- a canary, a
+# quote, a traversal sequence, an arbitrary Origin. `hx.checks.active` sends
+# those at whatever host the surface names, so the surface must never name
+# anything but this server: the integration test browses only `origin + path`
+# for the origin this fixture bound, and takes a hostname from nowhere else.
+#
+# ONE ROUTE ANSWERS FOR EXACTLY ONE CHECK, and the routes that are not that
+# check's are deliberately mute: `/files` does not echo the name it was given,
+# `/db/lookup` does not quote the value in its error, `/go` answers 200 to
+# anything that is not already an absolute URL. Every active check probes every
+# insertion point it declares on every surface, so a route that echoed its input
+# as well as redirecting off it would file two findings and the retest
+# assertions built on this map ("this route was fixed, that one was not") would
+# have to disentangle which check moved. The exception is
+# `hx.passive.security-headers`,
+# which fires on `/search` because that route answers `text/html` and carries
+# none of the headers a document should: that is real, it is stable across
+# scans, and it is left alone.
+#
+# `VULNERABLE_ROUTES` is the browse path INCLUDING the query string, because the
+# query string is load-bearing: `hx.insertion.derive` reads insertion points off
+# the exemplar request, so a surface browsed without `?q=` offers a check
+# nowhere to put a payload and is skipped `no_insertion_point`. The path
+# template a finding is filed against is this path up to the `?`.
+VULNERABLE_ROUTES: dict[str, str] = {
+    "hx.active.cors": "/api/profile",
+    "hx.active.open-redirect": "/go?next=/account",
+    "hx.active.path-traversal": "/files?file=readme.txt",
+    "hx.active.reflected-input": "/search?q=hello",
+    "hx.active.sql-error": "/db/lookup?id=42",
+}
+
+# ONE ROUTE WHOSE PATH `hx.surface` WILL TEMPLATE, and the reason it is not in
+# the map above. Every route in `VULNERABLE_ROUTES` is static -- not one
+# carries a numeric, uuid, hex or slug segment -- so `path_template == path`
+# for every surface this suite has ever built, and the normaliser never ran on
+# any data the active corpus was measured against. F1 of the whole-branch
+# review lived in exactly that blind spot: all five checks probed
+# `surface.path_template` literally, which on a templated surface is an
+# address that cannot exist, and 35 integration tests and 1262 unit tests
+# stayed green.
+#
+# `12345` is what `hx.surface._template_segment` replaces with `{id}`, so the
+# surface this produces is `/user/{id}/profile` and the exemplar request that
+# proved it exists is this concrete path. The route REFLECTS the id segment,
+# which makes `hx.active.reflected-input` the check that finds it -- the one
+# active check that probes a `path_segment` and therefore the one whose probe
+# has to substitute INTO the concrete address rather than into the template.
+#
+# NOT in `VULNERABLE_ROUTES` because that map is keyed by check id: it holds
+# exactly one route per check and `hx.active.reflected-input` already has
+# `/search`. A second entry cannot be added, and the arithmetic of the tests
+# that read it -- one finding per check, 16 probes per scan -- is about that
+# map rather than about this file. This route is browsed by the one test that
+# names it.
+TEMPLATED_ROUTE = "/user/12345/profile"
+
+# The surface `TEMPLATED_ROUTE` normalises to, spelt once so a test asserting
+# on it and the route it browses cannot drift apart.
+TEMPLATED_SURFACE = "/user/{id}/profile"
+
+# ONE ROUTE THAT CAN STOP ANSWERING, and it is TEMPLATED_ROUTE's blind spot in
+# a second spelling. Every route in `VULNERABLE_ROUTES` and `TEMPLATED_ROUTE`
+# answers 2xx, so no integration test had ever put a response that
+# `hx.checks.active._probe_util.unanswered` reads as a REFUSAL in front of a
+# check. N1 of the scoped re-review lived exactly there: a `302 Found /
+# Location: /login` -- what a browser-facing application answers an
+# unauthenticated request with, and every probe this build sends is
+# unauthenticated -- was read as a conclusive negative by every check that had
+# a point to probe, and a live `reflected-input` finding came back
+# `observed = 0`, which `hx.report` renders to a client as "appears fixed;
+# verify before closing". That was five checks on the re-review's own fixture,
+# whose surface carried a parameter each of them accepts, and three on this
+# route: `open-redirect` and `path-traversal` decline `tab` by their own name
+# filters and send nothing here whatever the wall does.
+#
+# TWO STATES, AND THE MEASUREMENT NEEDS BOTH. While it is answering, this
+# route REFLECTS `tab` into an HTML document exactly as `/search` reflects
+# `q`, so `hx.active.reflected-input` files a finding against this surface.
+# `TargetServer.require_login()` then puts the wall up for the rest of the run
+# and the next probe of that same surface meets the 302. A wall in front of a
+# surface nothing was ever found on could show that no check answers `clean`;
+# it could not show what a `clean` there would have COST, which until fix
+# round 6 was the retirement and is now the coverage row.
+#
+# NOT in `VULNERABLE_ROUTES`, for `TEMPLATED_ROUTE`'s reason: that map holds
+# one route per check and `hx.active.reflected-input` already has `/search`.
+# This route is browsed by the one test that names it.
+LOGIN_WALL_ROUTE = "/account/summary?tab=orders"
+
+# Where the wall sends a request it will not answer. `/login` is a route this
+# server already has, so the destination is a page that exists rather than a
+# dangling one, and it is RELATIVE -- what an application redirecting to its
+# own login page emits, and deliberately not the absolute, off-host `Location`
+# that is `hx.active.open-redirect`'s finding. Nothing in hx follows it; what
+# is under test is that the status and the header are the ones a browser would
+# have obeyed.
+LOGIN_WALL_LOCATION = "/login"
+
+# ONE SURFACE CAPTURED WITH A METHOD NO PROBE CAN BUILD -- the same blind spot
+# a third time. Every surface the active corpus had ever been measured against
+# was a GET, so no integration test had put a `state_changing` surface in
+# front of a check: N2 of the scoped re-review. `hx.checks.probe.ProbeSender.
+# _request_bytes` builds a GET and only a GET, and a surface's method is part
+# of its identity (`hx.surface.normalise`), so `POST /api/orders` probed with
+# `GET /api/orders` is a request that tested a DIFFERENT surface -- and the
+# `clean` row it produced stood ready to retire this surface's findings.
+# `hx.scan.run` skips it now, `not_a_get_surface`.
+#
+# `/api/orders` RATHER THAN A NEW ROUTE, because that route is already this
+# shape and has been since the send path: it answers a POST 201 and a GET 200.
+# The GET is what makes the counterfactual sharp rather than incidental -- a
+# probe of this surface gets an ordinary, complete answer, so nothing but the
+# method could tell hx it had addressed a different row. The query string is
+# here for the reason `VULNERABLE_ROUTES` carries one: without it the four
+# checks that declare insertion kinds have nowhere to put a payload and are
+# skipped `no_insertion_point` whatever the method rule does, which would
+# leave `hx.active.cors` as the only check the measurement could move.
+STATE_CHANGING_ROUTE = "/api/orders?sku=1"
+
+
+# MySQL's own wording for a query that did not parse, matching
+# `hx.checks.active.sql_error._SIGNATURES`' first entry. It deliberately does
+# NOT quote the value it was given, unlike the real driver message: see the
+# one-route-one-check paragraph above.
+MYSQL_SYNTAX_ERROR = (
+    "Fatal error: Uncaught mysqli_sql_exception: You have an error in your "
+    "SQL syntax; check the manual that corresponds to your MySQL server "
+    "version for the right syntax to use near ''' at line 1 in "
+    "/var/www/app/lookup.php:41"
+)
+
+# SYNTHETIC. Not this machine's `/etc/passwd`, not any machine's: five invented
+# lines shaped like the file `hx.checks.active.path_traversal` looks for, so the
+# traversal it proves is proved against a fixture's own bytes and nothing is
+# ever read off the host running the suite. `root:x:0:0:` is the signature that
+# check matches first.
+FAKE_PASSWD = (
+    "root:x:0:0:root:/root:/bin/sh\n"
+    "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+    "bin:x:2:2:bin:/bin:/usr/sbin/nologin\n"
+    "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n"
+    "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+)
 
 
 @dataclass(frozen=True)
@@ -27086,14 +27631,201 @@ class _Handler(BaseHTTPRequestHandler):
             time.sleep(min(_int_param(params, "ms", 250) / 1000.0,
                            self.server.target.max_delay_s))
             self._reply(_int_param(params, "status", 200), {"slow": True})
+        elif parts.path == "/api/profile":
+            # For `hx.active.cors`. Reflects whatever `Origin` it was sent and
+            # allows credentials with it -- the High-severity shape that check
+            # names, and the one a browser will actually honour.
+            #
+            # THE HEADER IS ONLY ABSENT WHEN THE ORIGIN IS ALLOWLISTED, which
+            # is what `fix("hx.active.cors")` switches on: a fixed CORS
+            # configuration does not stop answering, it stops reflecting an
+            # origin it never heard of. The probe's Origin is
+            # `https://hx-cors-probe.test` and is on nobody's allowlist, so the
+            # fixed route answers the same 200 with no CORS header at all --
+            # which is exactly what `Cors.probes` reads as clean.
+            origin = self.headers.get("Origin")
+            extra = []
+            if origin and not self.server.target.is_fixed("hx.active.cors"):
+                extra = [("Access-Control-Allow-Origin", origin),
+                         ("Access-Control-Allow-Credentials", "true")]
+            self._reply(200, {"user": "alice"}, extra=tuple(extra))
+        elif parts.path == "/go":
+            # For `hx.active.open-redirect`. `next` is one of the parameter
+            # names that check's canary-first filter accepts, and an absolute
+            # (or protocol-relative) value goes straight into `Location` with
+            # nothing validated. A value that is not already a URL -- every
+            # other check's canary and quote -- gets a plain 200 and is not
+            # echoed anywhere, so only the redirect check has anything to find
+            # here.
+            #
+            # FIXED, it validates instead of redirecting: the same
+            # non-redirecting 200 an unrecognised value already gets, which is
+            # the ONE response `open_redirect.probes` reads as clean (a 3xx to
+            # anywhere is `inconclusive` -- see `_probe_util.unanswered`),
+            # so a fixed route here answers the check rather than walling it.
+            dest = params.get("next", [""])[0]
+            if (dest.startswith(("http://", "https://", "//"))
+                    and not self.server.target.is_fixed(
+                        "hx.active.open-redirect")):
+                self._reply(302, {"redirecting": True},
+                            extra=(("Location", dest),))
+            else:
+                self._reply(200, {"redirecting": False})
+        elif parts.path == "/search":
+            # For `hx.active.reflected-input`. `q` comes back into an HTML
+            # document with no encoding whatsoever, so the escalation request's
+            # `<>"'`-wrapped canary survives intact and the finding is the
+            # Medium `unescaped` one. NOT `_reply`: `json.dumps` escapes the
+            # `"` in that wrapper, which would answer the check's second
+            # question with a fact about JSON encoding rather than about this
+            # application.
+            #
+            # FIXED, it stops putting the term in the document at all rather
+            # than encoding it: this fixture answers the question "did this
+            # input come back?", and an ENCODED reflection is a third state
+            # (`reflected_input` would find the canary -- it is alphanumeric
+            # and survives encoding -- and file the Low `plain` finding, so
+            # the check would not answer `clean` and the fix would not read as
+            # one). Dropping it is the state that makes `clean` the honest
+            # answer. The page still answers 200 with the same shape.
+            term = params.get("q", [""])[0]
+            if self.server.target.is_fixed("hx.active.reflected-input"):
+                term = "your search"
+            self._reply_text(
+                200, "<html><body><h1>Search</h1>"
+                     f"<p>No results for {term}</p></body></html>")
+        elif parts.path == "/db/lookup":
+            # For `hx.active.sql-error`. A value carrying an unmatched single
+            # quote -- which is the whole of that check's payload -- reaches a
+            # query and the driver's own wording comes back. Any other value
+            # gets a 200 that says nothing about what was asked for.
+            #
+            # FIXED, the parameter is bound rather than interpolated: the
+            # quote reaches no query, no driver wording comes back, and the
+            # route answers the ordinary 200 any other value already gets. NOT
+            # a 500 without the wording -- `_probe_util.unanswered` reads a
+            # 5xx as a refusal, so `sql_error` would answer `inconclusive` and
+            # the fix would read as a wall.
+            ident = params.get("id", [""])[0]
+            if "'" in ident and not self.server.target.is_fixed(
+                    "hx.active.sql-error"):
+                self._reply_text(500, MYSQL_SYNTAX_ERROR,
+                                 content_type="text/plain; charset=utf-8")
+            else:
+                self._reply(200, {"found": False})
+        elif parts.path == "/files":
+            # For `hx.active.path-traversal`. `file` is one of the file-shaped
+            # parameter names that check probes, and a value that climbs out of
+            # the intended directory and names `etc/passwd` is served -- from
+            # FAKE_PASSWD, never from this machine. `parse_qs` has already
+            # percent-decoded the value, which is the decode a vulnerable
+            # application would do itself and the reason the check never has to
+            # put a raw `../` on hx's own request line.
+            #
+            # FIXED, the path is confined: the traversal resolves inside the
+            # intended directory and the ordinary 200 comes back with no file
+            # content in it. NOT a 403 or a 404 -- neither is an answer under
+            # `_probe_util.unanswered`, so `path_traversal` would answer
+            # `inconclusive` and the fix would be indistinguishable from a
+            # wall, which is the very confusion `require_login` exists to
+            # keep separate.
+            name = params.get("file", [""])[0]
+            if ("../" in name and name.endswith("etc/passwd")
+                    and not self.server.target.is_fixed(
+                        "hx.active.path-traversal")):
+                self._reply_text(200, FAKE_PASSWD,
+                                 content_type="text/plain; charset=utf-8")
+            else:
+                # Deliberately does not echo `name`: see the one-route-one-check
+                # paragraph beside VULNERABLE_ROUTES.
+                self._reply(200, {"served": True})
+        elif parts.path == "/account/summary":
+            # THE LOGIN WALL -- see LOGIN_WALL_ROUTE. Two states, and the
+            # switch between them is one way (`TargetServer.require_login`).
+            #
+            # Answering, it is `/search` with a different parameter name: `tab`
+            # comes back into an HTML document with no encoding, which is what
+            # gives `hx.active.reflected-input` a finding to file here before
+            # the wall goes up. NOT `_reply`, for the reason `/search` gives.
+            #
+            # Walled, it reflects NOTHING. A 302 whose body carried the canary
+            # back would be a candidate, and a candidate wins over a gap in
+            # `_probe_util.verdict` -- so the finding would stay live because
+            # it was re-found rather than because the redirect was read as a
+            # refusal, and the test would pass while measuring the wrong
+            # sentence.
+            if self.server.target.login_required():
+                self._reply(302, {"login_required": True},
+                            extra=(("Location", LOGIN_WALL_LOCATION),))
+            else:
+                tab = params.get("tab", [""])[0]
+                self._reply_text(
+                    200, "<html><body><h1>Account</h1>"
+                         f"<p>Showing {tab}</p></body></html>")
+        elif self._templated_id(parts.path) is not None:
+            # For `hx.active.reflected-input`, through a PATH SEGMENT rather
+            # than a query parameter -- see TEMPLATED_ROUTE's own comment for
+            # why this route is not in VULNERABLE_ROUTES.
+            #
+            # `unquote` is the decode a vulnerable application does itself,
+            # exactly as `parse_qs` does it for `/files` and `/search`:
+            # `reflected_input` percent-encodes every value that rides the
+            # request line, so without it the escalation's `<>"'` wrapper
+            # would come back as `%3C%3E%22%27` and answer a question about
+            # encoding rather than about this application. NOT `_reply`, for
+            # the reason `/search` gives: `json.dumps` would escape the `"`.
+            ident = unquote(self._templated_id(parts.path))
+            self._reply_text(
+                200, "<html><body><h1>Profile</h1>"
+                     f"<p>User {ident}</p></body></html>")
         else:
             self._reply(404, {"error": "no such route"})
+
+    @staticmethod
+    def _templated_id(path: str) -> str | None:
+        """The middle segment of `/user/<id>/profile`, or None for any other
+        path.
+
+        Matched by SHAPE rather than by equality with `TEMPLATED_ROUTE`,
+        because the whole point of the route is that a probe replaces that
+        segment with something else: a handler keyed on the literal browsed
+        path would 404 every probe and the test would measure a refusal.
+        """
+        segments = path.split("/")
+        if len(segments) != 4:
+            return None
+        blank, user, ident, profile = segments
+        if (blank, user, profile) != ("", "user", "profile") or not ident:
+            return None
+        return ident
 
     def _reply(self, status: int, payload: dict,
                extra: tuple[tuple[str, str], ...] = ()) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in extra:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _reply_text(self, status: int, text: str, *,
+                    content_type: str = "text/html; charset=utf-8",
+                    extra: tuple[tuple[str, str], ...] = ()) -> None:
+        """`_reply`, for a body that is not JSON and must not be escaped.
+
+        Every route above this one answers `json.dumps(payload)`, which is
+        right for them and wrong for the three vulnerable routes that have to
+        put bytes on the wire EXACTLY as they were given them: a reflected
+        `<>"'` wrapper, a driver's error string, a file's own content. JSON
+        encoding any of those would make the response answer a question about
+        encoding rather than about the application.
+        """
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         for name, value in extra:
             self.send_header(name, value)
@@ -27128,6 +27860,8 @@ class TargetServer:
             )
         self.max_delay_s = max_delay_s
         self._hits: list[Hit] = []
+        self._fixed: set[str] = set()
+        self._login_required = False
         self._lock = threading.Lock()
         self._httpd = _Server((host, 0), _Handler)
         # Read by every handler through self.server. Set before any thread is
@@ -27176,6 +27910,86 @@ class TargetServer:
         only ever appears on someone else's machine."""
         with self._lock:
             return list(self._hits)
+
+    def fix(self, check_id: str) -> None:
+        """Repair `VULNERABLE_ROUTES[check_id]`, for the rest of this run.
+
+        ONE ROUTE, THE ONE THIS FIXTURE MAPS TO THIS CHECK -- not every route
+        the check could find something on. `LOGIN_WALL_ROUTE` and
+        `TEMPLATED_ROUTE` also reflect input and `hx.active.reflected-input`
+        finds both; they are deliberately outside the map (see their own
+        comments) and are untouched here, because the tests built on them are
+        about a wall and a normaliser and must not move when a retest test
+        calls this.
+
+        WHAT A FIX HAS TO LOOK LIKE, and it is the same rule at all five
+        routes: the route goes on ANSWERING and stops being vulnerable. A fix
+        that started answering anything but a 2xx -- a 403, a 404, a 5xx --
+        is not an answer to `_probe_util.unanswered`, the check would say
+        `inconclusive`, and
+        the test would be measuring a wall while claiming to measure a repair
+        -- which is exactly the distinction `require_login` exists to keep
+        separate. Each branch below says which shape it chose and why.
+
+        ALL FIVE IDS ARE HONOURED, AND FOUR OF THEM WERE NOT UNTIL FIX ROUND
+        6. Only `/api/profile` consulted `is_fixed`, so `fix("hx.active.
+        reflected-input")` -- a name this method's own `VULNERABLE_ROUTES`
+        check accepts -- changed nothing, `/search` went on reflecting, and
+        the check went on filing a finding while the docstring argued at
+        length that the name was checked precisely so this could not happen.
+        Nothing called it with another id, so no green test was vacuous; the
+        next retest test somebody wrote would have been.
+
+        ONE DIRECTION ONLY, and there is deliberately no `unfix`. Every route
+        starts vulnerable and each of these calls removes one flaw; a knob that
+        could put a flaw BACK would let a test assert something about a fixed
+        route and then quietly re-arm the thing it just proved gone, which is
+        the shape of every vacuous retest. A run wanting the vulnerable route
+        back gets a fresh server, which every test already does.
+
+        THE NAME IS CHECKED, and it is now worth checking. A typo raises here
+        rather than fixing nothing and sending the test that follows it to
+        fail somewhere else entirely.
+        """
+        if check_id not in VULNERABLE_ROUTES:
+            raise ValueError(
+                f"{check_id!r} has no vulnerable route here; this fixture "
+                f"knows {sorted(VULNERABLE_ROUTES)}")
+        with self._lock:
+            self._fixed.add(check_id)
+
+    def is_fixed(self, check_id: str) -> bool:
+        """Read by a handler thread on every request; see `fix`."""
+        with self._lock:
+            return check_id in self._fixed
+
+    def require_login(self) -> None:
+        """Put `LOGIN_WALL_ROUTE` behind its login wall for the rest of this
+        run.
+
+        NOT A SECOND `fix()`, and the difference is the whole point. `fix()`
+        removes a flaw and the route goes on ANSWERING, which is what lets a
+        check say `clean` at all. This removes the ANSWER: the flaw is
+        untouched and may well still be there, and a probe that meets the 302
+        has tested nothing. A build that reads the two as the same thing
+        records `tested, clean` for a surface it never reached, which is N1 of
+        the scoped re-review and the reason this method exists. (N1's own harm
+        was a live finding retired behind that 302; no active check retires
+        anything since fix round 6, and the coverage row is what is left --
+        S12 forbids both.)
+
+        ONE DIRECTION ONLY, for `fix()`'s reason, and the asymmetry bites
+        harder here: a knob that could take the wall back down would let a
+        test assert that a finding survived a login wall and then quietly log
+        back in before the scan that had to prove it.
+        """
+        with self._lock:
+            self._login_required = True
+
+    def login_required(self) -> bool:
+        """Read by a handler thread on every request; see `require_login`."""
+        with self._lock:
+            return self._login_required
 
     def hits_for(self, path: str) -> list[Hit]:
         """Every hit on `path`, ignoring the query string.
@@ -27710,6 +28524,22 @@ class Rig:
         The request itself is `browse_through`'s, because a test that has no
         rig needs the identical one -- see it for why the URI is absolute and
         why this is a raw socket.
+
+        `headers` MAY CARRY A COOKIE THAT A PROBE MAY NOT, AND THAT IS S4
+        WORKING AS DESIGNED RATHER THAN A LOOPHOLE. The operator branch of
+        `ProxyGate.decide` is `Policy.decideScopeOnly` -- scope, and nothing
+        after it: no method allowlist, no dangerous-path denylist, and not the
+        Gate, so "an operator's browsing spends no rate token and no budget
+        slot" (that method's own comment). The `unmanaged_credential` refusal
+        is `Sender.decide()`'s and lives on the SEND path. So a browse here is
+        a browser, session and all, while everything hx itself issues is
+        refused a credential header it did not inject. Traffic captured
+        through this method is therefore the only way an AUTHENTICATED surface
+        -- and so the only way a `cookie` insertion point -- reaches the
+        store, which is what `test_active_checks.py`'s section 5 is built on.
+        (Fix round 5 read the same fact at the runner, to decide whether a row
+        could retire; fix round 6 removed that rule, and the derivation and
+        the send path's refusal of it are what is left.)
         """
         dest = to or self.target
         return browse_through(port or self.proxy_port, method,

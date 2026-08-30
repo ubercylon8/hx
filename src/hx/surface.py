@@ -179,6 +179,18 @@ def _kept_segment(seg: str) -> str:
     return seg.replace("{", "%7B").replace("}", "%7D")
 
 
+# EVERY STRING `_template_segment` CAN MINT, and nothing else in this module
+# may return one that is not here. It is a vocabulary two other modules
+# reason about -- `hx.insertion.is_placeholder` decides the SHAPE, which is
+# a different question, and `hx.checks.active.path_traversal` asks whether
+# its own name filter can ever match one of these (it cannot: none of them
+# looks like a filename, so that check can never probe a templated segment,
+# which `hx.report._limits` discloses). Pinned against the normaliser's real
+# output by `tests/test_surface.py`, in both directions: nothing outside this
+# tuple is minted, and every entry in it is reachable.
+PLACEHOLDERS = ("{id}", "{uuid}", "{hex}", "{slug}")
+
+
 def _template_segment(seg: str, preserve: frozenset[str],
                       slug_threshold: int) -> str:
     decoded = _decode_segment(seg)

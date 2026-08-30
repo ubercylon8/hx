@@ -102,7 +102,10 @@ def test_a_finding_not_seen_this_run_is_marked_unobserved_if_its_surface_was_tes
         def __init__(self, on): self.on = on
         def on_surface(self, ctx, surface, exchanges):
             if not self.on:
-                return base.Verdict.clean()
+                # Retirement now follows examination: a clean verdict must
+                # name the issue type it looked for and did not find, or
+                # `_mark_unobserved` has nothing to retire against.
+                return base.Verdict.clean(considered=("t-issue",))
             return base.Verdict.finding(base.Candidate(
                 title="t", issue_type_id="t-issue", severity="Low", confidence="Firm",
                 insertion=None, exchange_ids=(exchanges[0].id,)))
@@ -300,6 +303,98 @@ def test_a_finding_whose_surface_vanished_is_left_alone_not_fabricated_against(
     assert rows == [1]
 
 
+# --- Task 2: retire what was considered and not re-emitted ---
+#
+# `_mark_unobserved` used to retire a finding only when the whole
+# `(surface, check)` answered `clean`. That was sound only while a check
+# filed at most one finding per surface; `Candidate.issue_type_id` made
+# N-per-surface the norm, and a check finding one of three issues answers
+# `finding`, so the clean-only gate never fired for the other two -- they
+# rendered live off stale observations. The two tests below pin the
+# replacement: retirement follows EXAMINATION (issue type in `considered`),
+# not the check's overall verdict.
+
+
+def test_a_check_retires_the_one_issue_it_no_longer_finds(scan_env):
+    """The defect this task exists for.
+
+    A check that finds one of three issues answers `finding`, so the
+    clean-only gate never fired and the two fixed issues rendered live off
+    their stale run-1 observations, with no "appears fixed" marker.
+    """
+    def _candidate(ctx, exchanges, issue_type_id):
+        return base.Candidate(
+            title=f"t-{issue_type_id}", issue_type_id=issue_type_id,
+            severity="Low", confidence="Firm", insertion=None,
+            exchange_ids=(exchanges[0].id,))
+
+    class Finds:
+        id, version, klass = "hx.test.three", "1", "passive"
+        insertion_kinds = frozenset()
+
+        def __init__(self):
+            self.emit = ("a", "b", "c")
+
+        def on_surface(self, ctx, surface_row, exchanges):
+            return base.Verdict.finding(
+                *[_candidate(ctx, exchanges, t) for t in self.emit],
+                considered=("a", "b", "c"))
+
+    check = Finds()
+    scan.run(**scan_env, checks=(check,))
+    check.emit = ("a",)                      # b and c are fixed
+    scan.run(**scan_env, checks=(check,))
+
+    conn = scan_env["conn"]
+    observed = dict(conn.execute(
+        "SELECT f.issue_type_id, o.observed FROM finding f"
+        " JOIN finding_observation o ON o.finding_id = f.id"
+        " WHERE o.run_id = (SELECT id FROM run ORDER BY started_us DESC"
+        "                   LIMIT 1)").fetchall())
+    assert observed == {"a": 1, "b": 0, "c": 0}
+
+
+def test_an_issue_type_the_check_never_considered_is_not_retired(scan_env):
+    """The separating case. Retirement must follow examination, not absence.
+
+    A check that stops looking at something has not established it is fixed,
+    and a report that closed a finding on that basis would be inventing a
+    fact the run does not hold.
+    """
+    def _candidate(ctx, exchanges, issue_type_id):
+        return base.Candidate(
+            title=f"t-{issue_type_id}", issue_type_id=issue_type_id,
+            severity="Low", confidence="Firm", insertion=None,
+            exchange_ids=(exchanges[0].id,))
+
+    class Narrows:
+        id, version, klass = "hx.test.narrow", "1", "passive"
+        insertion_kinds = frozenset()
+
+        def __init__(self):
+            self.considered = ("a", "b")
+
+        def on_surface(self, ctx, surface_row, exchanges):
+            emit = [t for t in ("a", "b") if t in self.considered]
+            return base.Verdict.finding(
+                *[_candidate(ctx, exchanges, t) for t in emit],
+                considered=self.considered)
+
+    check = Narrows()
+    scan.run(**scan_env, checks=(check,))
+    check.considered = ("a",)                # b is no longer examined at all
+    scan.run(**scan_env, checks=(check,))
+
+    conn = scan_env["conn"]
+    rows = conn.execute(
+        "SELECT o.observed FROM finding f"
+        " JOIN finding_observation o ON o.finding_id = f.id"
+        " WHERE f.issue_type_id='b' ORDER BY o.ts_us").fetchall()
+    assert [r[0] for r in rows] == [1], (
+        "an unexamined issue type was retired: the report would tell a client "
+        "an issue is fixed on the strength of the check having stopped looking")
+
+
 # --- Fix round 1 ---
 #
 # F1 (HIGH): `_mark_unobserved` must be per-check, not per-surface. Four
@@ -410,14 +505,18 @@ def test_a_check_that_returns_clean_on_retest_does_mark_the_finding_fixed(
     """The positive half of F1's fix, alongside the four negative cases
     above: the SAME check, SAME surface, clean THIS run is still exactly
     what licenses `observed=0` -- the per-check rule narrows what counts,
-    it does not remove the retest mechanism itself."""
+    it does not remove the retest mechanism itself.
+
+    Task 2 layers EXAMINATION on top of that: `observed=0` now also needs
+    the clean verdict to name the issue type it looked for, via
+    `considered`."""
     _run1_finds(scan_env)
 
     class FindsThenClean:
         id, version, klass = "hx.test.finds", "1", "passive"
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
-            return base.Verdict.clean()
+            return base.Verdict.clean(considered=("t-issue",))
 
     scan.run(**scan_env, checks=(FindsThenClean(),))
     rows = [r[0] for r in scan_env["conn"].execute(
@@ -560,6 +659,37 @@ def test_a_budget_truncated_scan_records_a_stop_reason(scan_env, monkeypatch):
     assert "budget" in row[1]
 
 
+def test_checks_run_counts_the_rows_a_budget_skip_wrote(scan_env, monkeypatch):
+    """FIX ROUND 1 (LOW): `_skip_rest` wrote a `check_run` row per remaining
+    check and advanced `checks_run` for none of them, so a budget-truncated
+    scan printed `checks 0 / skipped 2` while the store held two rows. The
+    probe pass counts its own skips (the counter sits right after
+    `_open_row`), so the SAME situation printed two different numbers
+    depending on which skip got there first. `checks_run` is defined as rows
+    written; this asserts it against the store rather than against a
+    literal, which is the only comparison that cannot drift."""
+    conn = scan_env["conn"]
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, discovered_by, normaliser_version)"
+        " VALUES('s-2','e-1','GET','https','app.test',443,'/other','proxy',1)")
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url) VALUES('x-2', NULL, 's-2', 'proxy', 'ok', 1, 'GET',"
+        " 'https://app.test/other')")
+    ticks = iter([0.0, 0.5, 2.0])
+    monkeypatch.setattr(scan.time, "monotonic", lambda: next(ticks))
+
+    summary = scan.run(**scan_env, checks=(Quiet(), Boom()), max_seconds=1)
+
+    rows = conn.execute("SELECT COUNT(*) FROM check_run").fetchone()[0]
+    assert summary.checks_run == rows
+    # Two surfaces x two checks: the first surface ran both, the second was
+    # skipped for budget. Four rows, and `checks_run` says four.
+    assert rows == 4
+    assert summary.skipped == 2
+
+
 def test_a_complete_scan_has_no_stop_reason(scan_env):
     """The other half of F7: a scan that was NOT truncated must not gain a
     stop_reason either -- an always-set reason would be just as useless as
@@ -576,41 +706,50 @@ def test_a_complete_scan_has_no_stop_reason(scan_env):
 
 
 def test_mark_unobserved_reads_check_id_not_issue_type_id(scan_env):
-    """Separates 'reads finding.check_id' from 'reads finding.issue_type_id'
-    -- a later edit accidentally swapping the column name back (they are the
-    same type, so nothing at the schema level or the type checker would
-    catch it) must redden this, not pass silently.
+    """Separates 'matches finding.check_id against the check-id slot and
+    finding.issue_type_id against the issue-type slot' from any swap of the
+    two -- they are different axes (schema.sql: `check_id` answers "which of
+    hx's checks found this", `issue_type_id` answers "what kind of issue is
+    this"), the same Python type, so nothing at the schema level or the type
+    checker would catch a swapped read, and Task 2 made `_mark_unobserved`
+    compare BOTH columns where it used to compare only `check_id`.
 
-    Setup deliberately DISAGREES the two columns: run 1 writes the finding
-    with `check_id='hx.test.finds'` and `issue_type_id='t-issue'` -- the
-    candidate's OWN issue type, which since F1 of the whole-branch review is
-    written rather than left NULL, and which is nothing like a check id.
-    The row is then corrupted directly to the SHAPE a swap-back bug would
-    produce -- `check_id=NULL`, `issue_type_id='hx.test.finds'`. If
-    `_mark_unobserved` ever reads `issue_type_id` instead of `check_id`, run
-    2's clean re-run of the SAME check on the SAME surface would match
-    against the wrongly-populated column and mark the finding `observed=0`.
-    Reading the real `check_id` column (`NULL` here) cannot match, so the
-    finding stays alone.
+    `check_id='hx.test.finds'` (the check's own dotted id) and
+    `issue_type_id='t-issue'` (a short slug) are unrelated strings chosen so
+    a swapped read cannot land on the right answer by coincidence -- neither
+    is a substring or reformatting of the other. Run 2's verdict names
+    `considered=("t-issue",)`: it examined the ISSUE TYPE and did not find
+    it. `scan.run` combines that with the check's own id into
+    `('s-1', 'hx.test.finds', 't-issue')` -- `check_id` in the middle slot,
+    `issue_type_id` last, matching the SELECT's own column order.
+
+    A `_mark_unobserved` that swapped which column fills which slot would
+    instead compare `('s-1', 't-issue', 'hx.test.finds')` against that same
+    set -- no match, since neither `t-issue` sits in the check-id slot nor
+    `hx.test.finds` in the issue-type slot of what `considered` actually
+    holds. That swap turns a finding that SHOULD retire into one that stays
+    live forever: the wrong outcome in the direction a client would notice
+    (a fixed issue kept open), which is why `rows == [1, 0]` below -- the
+    correct read -- is the assertion, not `[1]`.
     """
     _run1_finds(scan_env)
     conn = scan_env["conn"]
     assert conn.execute(
         "SELECT check_id, issue_type_id FROM finding").fetchone() == (
         "hx.test.finds", "t-issue")
-    conn.execute(
-        "UPDATE finding SET check_id=NULL, issue_type_id='hx.test.finds'")
 
     class FindsThenClean:
         id, version, klass = "hx.test.finds", "1", "passive"
         insertion_kinds = frozenset()
         def on_surface(self, ctx, surface, exchanges):
-            return base.Verdict.clean()
+            return base.Verdict.clean(considered=("t-issue",))
 
     scan.run(**scan_env, checks=(FindsThenClean(),))
     rows = [r[0] for r in conn.execute(
         "SELECT observed FROM finding_observation ORDER BY ts_us")]
-    assert rows == [1]
+    assert rows == [1, 0], (
+        "the finding's check_id and issue_type_id were not matched against "
+        "the considered set in the correct positions")
 
 
 # --- Whole-branch review F1 (HIGH): every candidate one passive check yields

@@ -1,10 +1,16 @@
 """The types a check speaks in, and the ones it deliberately cannot.
 
-A check is pure. It reads a surface and the exchanges captured against it and
-returns a verdict. It does not build requests, write rows, compute dedupe
-keys, learn its own `check_run` id, or reach the bridge -- each of those
-belongs to the runner, and each is a place where ONE implementation must serve
-every check or the guarantees stop being uniform.
+A PASSIVE check is pure: it reads a surface and the exchanges captured
+against it and returns a verdict. An ACTIVE check additionally builds
+requests -- but it does not own a socket, and cannot construct one. It is
+handed a `hx.checks.probe.ProbeSender` by the runner, which is the only
+route to the wire and which enforces S4 by going through the extension
+like everything else.
+
+What NO check does, active or passive: write rows, compute dedupe keys,
+learn its own `check_run` id, or hold a database connection. Each of those
+belongs to the runner, and each is a place where ONE implementation must
+serve every check or the guarantees stop being uniform.
 
 THE VERDICT VOCABULARY IS NARROWER THAN THE COLUMN, ON PURPOSE.
 `check_run.verdict` carries six values. A check may return three. `pending`,
@@ -102,6 +108,15 @@ class Candidate:
     remediation: str | None = None
     cwe: str | None = None
     scope_level: str = "surface"
+    # THE VALUE THIS FINDING WAS DEMONSTRATED WITH, as the check meant it and
+    # BEFORE any transport encoding: `../../../../../../etc/passwd`, not
+    # `..%2F..%2F...`. F10 of the whole-branch review -- the first corpus in
+    # this project's history that actually has payloads left this NULL on
+    # every candidate, in a column `records.upsert_finding` has always
+    # written and the schema has always had. Nothing renders it (that is a
+    # separate decision about what belongs in a client deliverable), so what
+    # it buys today is a store that holds the answer rather than one that
+    # would have to re-derive it from a description.
     payload: str | None = None
 
     def __post_init__(self) -> None:
@@ -126,6 +141,25 @@ class Candidate:
             # exchange behind it has nothing to chain, and the operator would
             # be asked to believe a claim with no way to check it.
             raise ValueError("a candidate must name at least one exchange")
+        if not all(self.exchange_ids):
+            # THE SAME RULE, AND THE HOLE IT HAD. `(None,)` is a non-empty
+            # tuple, so the guard above admitted it -- and every active check
+            # in this corpus builds its evidence out of
+            # `surface.exemplar_exchange_id`, which is NULL for a surface whose
+            # first sighting was purged. MEASURED, `hx.active.cors` against
+            # such a surface: the candidate constructed, `evidence` took a row
+            # with a NULL `exchange_id` (the column is nullable), and
+            # `hx.report._evidence` rendered "1 of the 1 shown could not be
+            # resolved to a request" -- which is precisely the claim-with-no-
+            # way-to-check the paragraph above forbids, filed as a finding.
+            # `hx.scan.run` now skips an active check on such a surface before
+            # it sends anything; this is the guard for a candidate that got a
+            # blank id from anywhere else.
+            raise ValueError(
+                f"a candidate's exchange_ids are {self.exchange_ids!r}: every "
+                "entry must name a real exchange. A blank one chains to "
+                "nothing, and a finding whose evidence resolves to no request "
+                "asks the operator to believe a claim they cannot check")
 
 
 # Not scanned by tests/test_vocabularies_match_the_schema.py's enumeration
@@ -156,6 +190,36 @@ class Verdict:
     state: str
     candidates: tuple[Candidate, ...] = ()
     reason: str | None = None
+    # What this check EXAMINED on this subject and reached a conclusion about,
+    # as `issue_type_id` strings. `hx.scan._mark_unobserved` retires a finding
+    # whose issue type is in here and was NOT re-emitted this run.
+    #
+    # It exists because the retirement gate it replaces was sound only while a
+    # check filed at most ONE finding per surface. `issue_type_id` (F1 of Plan
+    # 5's whole-branch review) made N-per-surface the norm, and a check that
+    # finds one of three issues answers `finding` -- so under the old
+    # clean-only gate the other two were never retired and rendered live off
+    # stale observations, telling a client a fixed issue was still open.
+    #
+    # RUN-TIME, NOT DECLARED. A class-level list cannot express
+    # `hx.checks.passive.cookie_flags`, which mints an issue type per cookie
+    # NAME; what it considered is whatever cookies this surface actually set.
+    #
+    # DEFAULTS EMPTY, AND THAT IS THE SAFE DIRECTION: a check that populates
+    # nothing retires nothing. The failure mode is a finding staying live,
+    # never one falsely closed.
+    #
+    # PASSIVE CHECKS ONLY, SINCE FIX ROUND 6, AND THE RUNNER ENFORCES IT.
+    # `hx.scan._retirable` returns nothing for a check driven through the
+    # `probes` hook and RAISES if such a check populated this at all: every
+    # probe this build sends is unauthenticated, so an active check's
+    # conclusion is about the logged-out view of the application and cannot
+    # close a finding about the view the client's users are in. An active
+    # check names what it examined to `hx.checks.active._probe_util.verdict`
+    # as `examined` instead -- which is what lets it say `clean` -- and that
+    # value deliberately never reaches this field. See `_retirable` for the
+    # argument and for the two narrower rules that were tried first.
+    considered: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.state not in _VERDICT_STATES:
@@ -172,14 +236,21 @@ class Verdict:
                 "inconclusive requires a reason: S10 says a check that cannot "
                 "run says so, and a reason-less one tells the operator "
                 "nothing they can act on")
+        for issue_type in self.considered:
+            if not isinstance(issue_type, str) or not issue_type:
+                raise ValueError(
+                    f"considered holds {issue_type!r}; it is a tuple of "
+                    "issue_type_id strings, and a blank or non-string entry "
+                    "would retire a finding nothing can be matched against")
 
     @classmethod
-    def clean(cls) -> "Verdict":
-        return cls("clean")
+    def clean(cls, *, considered: tuple[str, ...] = ()) -> "Verdict":
+        return cls("clean", (), None, tuple(considered))
 
     @classmethod
-    def finding(cls, *candidates: Candidate) -> "Verdict":
-        return cls("finding", tuple(candidates))
+    def finding(cls, *candidates: Candidate,
+                considered: tuple[str, ...] = ()) -> "Verdict":
+        return cls("finding", tuple(candidates), None, tuple(considered))
 
     @classmethod
     def inconclusive(cls, reason: str) -> "Verdict":

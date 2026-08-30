@@ -15,10 +15,58 @@ be tidied.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Callable
+
 from hx.checks import base
 from hx.checks.passive import _http
 
 _DOCUMENT_TYPES = ("text/html", "application/xhtml+xml")
+
+
+@dataclass(frozen=True)
+class _HeaderSpec:
+    """One header this check demands of a document response.
+
+    `issue_type_id` is IDENTITY (see the module docstring); it is minted
+    exactly once here and both `on_surface`'s `considered` and its candidates
+    read it off this table, so the two cannot spell it two different ways.
+    `applies` gates by scheme (HSTS means nothing over plain http); `present`
+    reads the response's headers to say whether the requirement is met.
+    """
+    issue_type_id: str
+    title: str
+    cwe: str
+    severity: str
+    applies: Callable[[bool], bool]
+    present: Callable[[frozenset, str], bool]
+
+
+_HEADERS = (
+    _HeaderSpec(
+        issue_type_id="missing-content-type-options",
+        title="X-Content-Type-Options", cwe="CWE-16", severity="Low",
+        applies=lambda https: True,
+        present=lambda names, csp: "x-content-type-options" in names,
+    ),
+    # Two headers answer the framing question. Demanding the older one when
+    # the newer is present reports something already fixed.
+    _HeaderSpec(
+        issue_type_id="missing-frame-protection",
+        title=("frame protection (X-Frame-Options or CSP "
+               "frame-ancestors)"),
+        cwe="CWE-1021", severity="Medium",
+        applies=lambda https: True,
+        present=lambda names, csp: (
+            "x-frame-options" in names or "frame-ancestors" in csp),
+    ),
+    _HeaderSpec(
+        issue_type_id="missing-hsts",
+        title="Strict-Transport-Security", cwe="CWE-319", severity="Low",
+        applies=lambda https: https,
+        present=lambda names, csp: "strict-transport-security" in names,
+    ),
+)
 
 
 class SecurityHeaders:
@@ -30,6 +78,7 @@ class SecurityHeaders:
     def on_surface(self, ctx, surface, exchanges) -> base.Verdict:
         seen = _http.responses(ctx, exchanges)
         candidates = []
+        considered = []
         for row, head in seen.entries:
             ctype = " ".join(_http.header_values(head, "content-type")).lower()
             if not any(t in ctype for t in _DOCUMENT_TYPES):
@@ -38,30 +87,22 @@ class SecurityHeaders:
             names = {n.lower() for n in _http.header_names(head)}
             csp = " ".join(_http.header_values(head, "content-security-policy"))
 
-            missing = []
-            if "x-content-type-options" not in names:
-                missing.append(("X-Content-Type-Options", "CWE-16", "Low",
-                                "missing-content-type-options"))
-            # Two headers answer the framing question. Demanding the older one
-            # when the newer is present reports something already fixed.
-            if "x-frame-options" not in names and "frame-ancestors" not in csp:
-                missing.append(("frame protection (X-Frame-Options or CSP "
-                                "frame-ancestors)", "CWE-1021", "Medium",
-                                "missing-frame-protection"))
-            if https and "strict-transport-security" not in names:
-                missing.append(("Strict-Transport-Security", "CWE-319", "Low",
-                                "missing-hsts"))
+            applicable = [spec for spec in _HEADERS if spec.applies(https)]
+            considered.extend(spec.issue_type_id for spec in applicable)
+            missing = [spec for spec in applicable
+                       if not spec.present(names, csp)]
 
-            for title, cwe, severity, issue_type_id in missing:
+            for spec in missing:
                 candidates.append(base.Candidate(
-                    title=f"Missing {title}",
-                    issue_type_id=issue_type_id,
-                    severity=severity, confidence="Certain",
+                    title=f"Missing {spec.title}",
+                    issue_type_id=spec.issue_type_id,
+                    severity=spec.severity, confidence="Certain",
                     insertion=None, scope_level="surface",
-                    exchange_ids=(row.id,), cwe=cwe,
-                    description=f"This document response did not carry {title}.",
-                    remediation=f"Set {title} on document responses.",
+                    exchange_ids=(row.id,), cwe=spec.cwe,
+                    description=(
+                        f"This document response did not carry {spec.title}."),
+                    remediation=f"Set {spec.title} on document responses.",
                 ))
             if missing:
                 break      # one document per surface is enough to say it
-        return _http.verdict(seen, candidates)
+        return _http.verdict(seen, candidates, considered=tuple(considered))

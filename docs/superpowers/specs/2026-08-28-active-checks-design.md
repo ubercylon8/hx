@@ -82,6 +82,20 @@ A small `ProbeSender`, constructed per `check_run`, wrapping the bridge:
 - counts every attempt into `check_run.requests_sent`;
 - translates the extension's refusals into the verdict the check must return.
 
+**Amended 2026-08-29 (final review, finding 6).** The first bullet is withdrawn as
+written: the seam counts ISSUANCES, not attempts. `probe._NOT_ISSUED` excludes eight
+refusal classes from `check_run.requests_sent` — six of the seven named in the very
+next paragraph (`budget_exhausted`, `halted`, `rate_limited`, `scope_denied`,
+`method_denied`, `dangerous_denied`), plus `not_configured` and, since F8 of the
+whole-branch review, `unmanaged_credential`. Each is decided BEFORE a request is
+issued, so none of them is traffic the target saw, and counting them would also make
+the bounded rate-limit retry double-count. The seventh item of that list, "any
+transport error", still counts, as do `timeout`, `bridge_lost` and
+`status_unreadable`: each may already have reached the target. The set is an
+EXCLUSION list precisely so an unrecognised class counts — overstating traffic is the
+safe direction, understating what hx put on a client's system is not. The code was
+changed under F8 and the spec was not moved with it.
+
 **A refusal is never `clean`.** `budget_exhausted`, `halted`, `rate_limited`,
 `scope_denied`, `method_denied`, `dangerous_denied`, and any transport error mean the check
 did not get its answer, so it returns `inconclusive(reason)`. §10 states this as a rule for
@@ -118,6 +132,55 @@ Design notes that bind the implementation:
   getting no reflection is a genuine re-test, unlike the passive corpus where the original
   exchange stays in the store forever. Plan 5 had to disclose that gap in Limits; this plan
   does not close it for passive, and that disclosure stays.
+
+**Amended 2026-08-29: retirement is a passive-corpus property. The bullet directly
+above is withdrawn.** The rule stated at the top of this section — retire a finding whose
+issue type was considered and not re-emitted — is unchanged and still describes
+`_mark_unobserved`'s gate. What changed is what may reach that gate: `hx.scan._retirable`
+returns nothing for a check the runner drives through the `probes` hook, and raises if such
+a check populated `Verdict.considered` at all. An active check is reported and closes
+nothing.
+
+Every probe this build sends is UNAUTHENTICATED — `ProbeSender._request_bytes` emits a
+request line, a `Host` and at most the one header the check is probing — so an active
+check's `clean` is a statement about the application's logged-out view, not about the view
+the client's own users are in, and retirement is exactly the second claim (`report._findings`
+renders it as "appears fixed; verify before closing"). The shape that makes this fatal
+rather than theoretical is an application answering a logged-out request with a **200 login
+page**: a complete, well-formed, application-composed response indistinguishable from an
+answer at every level a status set operates. That is an argument, not a measurement — a
+fixture whose anonymous view differs from its anonymous view cannot be built. What was
+measured is the same `clean` arriving off a genuine answer: five repaired routes, five
+`clean` verdicts off probes that really went, and, with the rule disabled, five findings
+closed and rendered as "appears fixed; verify before closing".
+
+Two narrower rules were built and withdrawn before this one. The status doctrine
+(`_probe_util._NOT_AN_ANSWER`, widened to hold 3xx, 400 and 405) catches a login *redirect*
+and cannot catch a login *page*. A predicate that suppressed retirement only where the
+surface's captured request carried a credential header could not work either: it keyed on
+the exemplar, which is the FIRST sighting, so a surface browsed logged-out and then
+logged-in stayed "anonymous" and went on retiring — the unsafe direction — and S7 redacts a
+credential header's value before the bytes are hashed, so only the NAME survives and an
+analytics or consent cookie is indistinguishable from a session.
+
+**Amended 2026-08-29 (final review, findings 1 and 2).** `_probe_util._NOT_AN_ANSWER`
+no longer exists, and the sentence above stands only with its name replaced. It was an
+ENUMERATION, so every status outside it read as the application answering — 422 above
+all, which is the ordinary reply to a probe that dropped the endpoint's other
+parameters, and that dropping is what every probe this build sends does. Measured at
+the final review: a target refusing every probe with 422, 410, 407, 406 or 414 recorded
+`clean` for all five active checks and rendered as tested Coverage, under a Limits
+bullet stating that a rejection of the request itself is recorded as `inconclusive`.
+The doctrine is now `_probe_util.unanswered` and it is an ALLOWLIST — only a 2xx is an
+answer a check may reason about — so it still catches a login *redirect*, still cannot
+catch a login *page*, and now also catches every refusal nobody thought to enumerate.
+
+The passive corpus is untouched and the bullets above still hold for it: a passive check
+reads the captured traffic itself, session and all, so it was never looking at a different
+view of the application. The active corpus therefore has no automatic retest story, which
+`report._limits` discloses in as many words ("An active finding is never automatically
+marked as fixed"). Reinstating one needs probes that can authenticate, which reaches the
+identity model this build deliberately excludes.
 
 ## 6. The five `active_safe` checks
 
@@ -188,6 +251,16 @@ talk its way into a larger allowance mid-flight.
 `check_run.requests_sent` is written by the send seam, so per-check attribution exists even
 though the ceiling is per-run.
 
+**Amended 2026-08-29: written by the runner, not the seam.** The sentence above, and the
+"write `check_run.requests_sent` at the seam" instruction earlier in this section, describe
+a design the implementation deliberately did not take. `ProbeSender` holds **no database
+connection** — that is what keeps `CheckContext`'s guarantee ("a check that can write is a
+check that can write the wrong thing") literally true of everything a check can reach — so
+the seam counts in memory and `hx.scan._close_row` writes the column when it closes the
+row. Per-check attribution is unaffected: the count is per `ProbeSender`, and a sender is
+built per check per surface. What changed is only which side of the boundary does the
+INSERT, and it changed in the direction this spec's own §4 argues for.
+
 ## 9. The header-parsing fix
 
 `checks/passive/_http.py` splits response heads on `\r\n` only. A server using bare-LF line
@@ -235,9 +308,16 @@ home built per run, never the real `$HOME`.
 Beyond per-check tests, two properties need their own:
 
 1. **Retirement, both directions.** A fixed issue retires and renders with the marker; an
-   issue the check never examined does not retire.
+   issue the check never examined does not retire. **Amended 2026-08-29:** for the PASSIVE
+   corpus only — see §5's amendment. The active half of this property is now the opposite
+   claim and is tested as such: five genuinely repaired routes, five `clean` answers off
+   probes that really went, and not one finding closed.
 2. **The seam refuses correctly.** Each refusal class produces `inconclusive` with that
    reason and never `clean`, and `requests_sent` counts attempts including refused ones.
+   **Amended 2026-08-29 (final review, finding 6):** the last clause is withdrawn —
+   `requests_sent` counts issuances, and `probe._NOT_ISSUED` excludes the eight classes
+   that are decided before a request is issued. See §4's amendment. The first clause stands
+   unchanged and is what the tests hold.
 
 ## 13. Decisions taken
 
@@ -246,4 +326,4 @@ Beyond per-check tests, two properties need their own:
 | Scope | Foundation + five `active_safe` checks; `active_timing` and boolean-differential to Plan 7 | Splits on an infrastructure boundary — timing needs concurrency and wall-clock budget, differential needs variation analysis — not an arbitrary count |
 | Body parameters | Stay GET-only, disclose | §10 defines `active_safe` as idempotent; `active_mutate` already exists for the non-idempotent case; adds no blast radius on client systems |
 | Payload depth | Canary-first, escalate on evidence | Volume scales with application behaviour rather than surface count |
-| Verdict contract | `Verdict.considered`, retire what was considered and not re-emitted | Only option that expresses dynamically-minted issue types; fails safe; makes retest genuinely work for the active corpus |
+| Verdict contract | `Verdict.considered`, retire what was considered and not re-emitted | Only option that expresses dynamically-minted issue types; fails safe; makes retest genuinely work for the active corpus. **Amended 2026-08-29:** the last clause is withdrawn — active checks retire nothing, see §5's amendment. The contract itself is unchanged and serves the passive corpus |

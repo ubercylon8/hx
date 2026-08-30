@@ -11,6 +11,7 @@ the `surface` row it belongs to and sets `surface_id` on it -- `scan.py`'s
 a surface), and a fixture that skipped that no longer matches what production
 ever writes.
 """
+import dataclasses
 import hashlib
 import sqlite3
 from pathlib import Path
@@ -19,6 +20,11 @@ import pytest
 
 from hx import config as config_mod
 from hx import report
+from hx import scan
+from hx import surface as surface_mod
+from hx.checks import probe as probe_mod
+from hx.checks.active import _probe_util
+from hx.checks.active import path_traversal
 from hx.checks import base
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
@@ -128,17 +134,24 @@ def _check_run(conn, check_run_id, *, run_id, surface_id, check_id,
 
 
 def _exchange(conn, exchange_id, run_id, url, *, req_blob=None,
-             status=200, method="GET") -> None:
+             status=200, method="GET", via="proxy") -> None:
     """`method` and `status` are parameters (fix round D) because both are as
     captured as `url` is: `exchange.method` carries no CHECK constraint, and
     `status` reaches `record_exchange` as `header.get("status")` off a bridge
     frame that `codec._check_header` admits as a `str`, which SQLite's INTEGER
     affinity then stores as TEXT. A fixture that could only write `'GET'` and
-    an int could not measure either."""
+    an int could not measure either.
+
+    `via` is a parameter (fix round A) for the same reason one step further
+    on. The schema's CHECK admits `proxy | send | crawl`; this build's
+    extension can only ever deliver `proxy` (`Capture.deliverExchange`
+    hard-codes it), and `_limits` derives a disclosure from that. A fixture
+    that could only write `'proxy'` could assert the sentence but not that it
+    is DERIVED."""
     conn.execute(
         "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method,"
-        " url, req_blob, status) VALUES(?,?,'proxy','ok',1,?,?,?,?)",
-        (exchange_id, run_id, method, url, req_blob, status))
+        " url, req_blob, status) VALUES(?,?,?,'ok',1,?,?,?,?)",
+        (exchange_id, run_id, via, method, url, req_blob, status))
 
 
 def _finding(conn, *, run_id, title, severity, exchange_ids,
@@ -705,17 +718,37 @@ def test_the_limits_section_names_what_this_corpus_cannot_do(report_env):
 
 def test_the_limits_section_says_a_fix_cannot_be_shown_by_re_browsing(
         report_env_with_findings):
-    """Every check this build ships is passive: `scan._exchanges_for` reads
-    an engagement's WHOLE captured history for a surface, not only its
-    newest traffic, so one recorded bad response keeps a finding live no
+    """The PASSIVE checks in this build read an engagement's WHOLE captured
+    history for a surface (`scan._exchanges_for`), not only its newest
+    traffic, so one recorded bad response keeps a finding of theirs live no
     matter how much clean traffic follows it. `report_env_with_findings`
     writes findings but no `finding_observation` row at all, which is the
     point -- this bullet is a build fact, unconditional on any run having
     retested anything, not a consequence of what a particular scan
-    observed."""
+    observed.
+
+    Task 8 registered `hx.active.cors`, so the corpus is now mixed and the
+    bullet names which checks each half of it covers -- see
+    `report._limits`'s `elif passive` arm. It said "may not be shown as
+    fixed by re-browsing" between task 8 and fix round 6, while an active
+    finding could still retire; with active retirement gone the two halves
+    reach the same conclusion by different routes and the heading says so
+    outright."""
     out = report.render(**report_env_with_findings)
     assert "Limits" in out
-    assert "cannot be shown as fixed by re-browsing" in out
+    assert ("No finding in this report can be shown as fixed by re-running "
+            "this assessment") in out
+    # WRONG TWICE, AND THE ABSENCE HALVES ARE WHY ALL THREE LINES ARE
+    # HERE. The active clause of this bullet read "are not limited this
+    # way" (a claim about every active finding), then fix round 5's
+    # qualification by the credential header the capture carried, and
+    # fix round 6 removed active retirement outright. Both earlier
+    # wordings sent a client to re-run a scan expecting findings to
+    # retire that will not.
+    assert "are not limited this way" not in out
+    assert "carried no credential header" not in out
+    assert ("do re-issue requests, but hx never marks one of their "
+            "findings as no longer observed") in out
 
 
 def test_urls_are_redacted_on_export(report_env_with_credential_url):
@@ -735,10 +768,17 @@ def test_a_finding_carries_its_evidence_chain(report_env_with_findings):
 def test_derived_insertion_points_are_reported_as_not_probed(report_env_with_blobs):
     """Pre-flight ruling F1. S4 says body and parameter insertion points are
     derived and recorded so the coverage section can say `exists, not probed`.
-    Without this the derivation has no consumer in this plan at all."""
+    Without this the derivation has no consumer in this plan at all.
+
+    Task 8 registered `hx.active.cors`, the first active check, so "None
+    were probed" (true only while the corpus ships no active check at all --
+    see `report._insertion_coverage`'s `if active` arm) is no longer the
+    sentence the real, un-monkeypatched registry produces; the replacement
+    is asserted instead."""
     out = report.render(**report_env_with_blobs)
     assert "Insertion points" in out
-    assert "None were probed" in out
+    assert "active check(s) ship in this build" in out
+    assert "cannot say which were and which were not" in out
 
 
 def test_insertion_points_are_omitted_when_no_blob_store_is_given(report_env):
@@ -1106,15 +1146,37 @@ class _FakeActiveCheck:
     insertion_kinds = frozenset({"query"})
 
 
-def test_the_shipped_corpus_is_all_passive_and_the_prose_says_so(
+def test_the_shipped_corpus_now_ships_an_active_check_and_the_prose_says_so(
         report_env_with_blobs):
-    """The separating case, and the reason F5 survived nine reviews: every
-    one of these sentences is TRUE of the build as it stands. What was wrong
-    is that none of them was derived from it."""
+    """UPDATED FOR TASK 8. This was the all-passive separating case for F5 --
+    every sentence asserted here was TRUE of the build as it stood, and F5's
+    point was that none of them was DERIVED from it rather than typed.
+    `hx.active.cors` joining `registry.CHECKS` makes the all-passive
+    sentences false of the real build starting today, which is exactly the
+    day this test's assertions have to move: `test_registering_an_active_
+    check_falsifies_none_of_the_limits_prose` above already proved the
+    DERIVATION handles a mixed corpus (via a monkeypatched fake check); this
+    is the anti-vacuity twin that pins the real, un-monkeypatched registry
+    now takes that branch, by name, for `hx.active.cors` specifically."""
     out = report.render(**report_env_with_blobs)
-    assert "**None were probed** — this build ships no active checks." in out
-    assert "no request carrying a payload was ever issued" in out
-    assert "Every check in this build is passive" in out
+    assert "this build ships no active checks" not in out
+    assert "no request carrying a payload was ever issued" not in out
+    assert "Every check in this build is passive" not in out
+
+    assert out.count("`hx.active.cors`") >= 3
+    assert "active check(s) ship in this build" in out
+    assert "none of them can reach a request body" in out
+    # WRONG TWICE, AND THE ABSENCE HALVES ARE WHY ALL THREE LINES ARE
+    # HERE. The active clause of this bullet read "are not limited this
+    # way" (a claim about every active finding), then fix round 5's
+    # qualification by the credential header the capture carried, and
+    # fix round 6 removed active retirement outright. Both earlier
+    # wordings sent a client to re-run a scan expecting findings to
+    # retire that will not.
+    assert "are not limited this way" not in out
+    assert "carried no credential header" not in out
+    assert ("do re-issue requests, but hx never marks one of their "
+            "findings as no longer observed") in out
 
 
 def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
@@ -1140,11 +1202,32 @@ def test_registering_an_active_check_falsifies_none_of_the_limits_prose(
     assert "Every check in this build is passive" not in out
 
     # And it must say what IS true instead, naming the check by id in each
-    # of the three places -- Insertion points, and both Limits bullets.
-    assert out.count("`hx.active_safe.reflected-input`") == 3
+    # of the six places -- Insertion points, and the five Limits bullets
+    # that are conditional on an active corpus. The fourth arrived in fix
+    # round A: an active finding's evidence is a captured proxy request to
+    # the affected surface, never the probe that proved it, and that
+    # disclosure is derived from the same two sources as its neighbours (the
+    # corpus, and this store's own `exchange.via`). The fifth is fix round 2,
+    # F3: a probe carries none of the exemplar's credentials, so on an
+    # authenticated target the whole active corpus tested a logged-out view.
+    # The sixth is fix round 6: no finding of an active check is ever marked
+    # as no longer observed, whatever a later scan sees.
+    assert out.count("`hx.active_safe.reflected-input`") == 6
     assert "active check(s) ship in this build" in out
     assert "none of them can reach a request body" in out
-    assert "are not limited this way" in out
+    # WRONG TWICE, AND THE ABSENCE HALVES ARE WHY ALL THREE LINES ARE
+    # HERE. The active clause of this bullet read "are not limited this
+    # way" (a claim about every active finding), then fix round 5's
+    # qualification by the credential header the capture carried, and
+    # fix round 6 removed active retirement outright. Both earlier
+    # wordings sent a client to re-run a scan expecting findings to
+    # retire that will not.
+    assert "are not limited this way" not in out
+    assert "carried no credential header" not in out
+    assert ("do re-issue requests, but hx never marks one of their "
+            "findings as no longer observed") in out
+    assert "not the probe that proved it" in out
+    assert "Every probe was sent unauthenticated" in out
 
 
 # --- F1: redaction reaches every field that can carry a URL -----------------
@@ -2021,13 +2104,23 @@ def test_an_ordinary_engagement_name_keeps_its_plain_single_backtick_span(
 
 
 def test_a_newline_in_a_finding_title_cannot_add_a_section():
-    """C-5, and the re-review's own judgement on it was wrong. It read the
-    `####` framing as making a newline unreachable "because of HTTP header
-    framing"; `_http.header_values` splits the head on `\\r\\n` and `.strip()`s
-    the value, so a BARE `\\n` inside a header line survives both. Verified
-    directly: a head carrying `Set-Cookie: se\\nssion=1` yields the cookie
-    name `se\\nssion`, and `cookie_flags.py:153` interpolates that straight
-    into the title. This is injection, not mangling."""
+    """C-5, and the re-review's own judgement on it was wrong AT THE TIME. It
+    read the `####` framing as making a newline unreachable "because of HTTP
+    header framing"; `_http.header_values` used to split the head on `\\r\\n`
+    and `.strip()` the value, so a BARE `\\n` inside a header line survived
+    both, and a head carrying `Set-Cookie: se\\nssion=1` yielded the cookie
+    name `se\\nssion` for `cookie_flags.py:153` to interpolate straight into
+    the title.
+
+    The active-checks plan's bare-LF header fix (`_http._header_lines` now
+    splits on LF first) CLOSED that path: a bare `\\n` inside a header line
+    now terminates the line before `header_values` sees it, so a cookie name
+    can no longer carry one, and this test's `_INJECT` title is built by hand
+    rather than through `_http` -- it never routed through the parser this
+    path used to exploit. It stays, and stays passing, because `_flat` on
+    `title` is a general guard against ANY free-text title carrying a raw
+    newline, not a patch for one now-closed injection route; a hostile title
+    reaching this render by some other means must still be handled."""
     conn = _conn()
     _run(conn, "r-1")
     _exchange(conn, "x-1", "r-1", "https://app.acme.test/login")
@@ -2277,3 +2370,284 @@ def test_the_partial_findings_note_is_scoped_to_the_unfinished_runs():
     # longer to the list as a whole.
     assert "anything below drawn from them is what they had reached" in findings
     assert "what follows is what they had reached" not in findings
+
+
+# --- fix round A: what an active finding's evidence actually is -------------
+#
+# Nothing in this build records a probe's own exchange. `HxExtension`
+# registers proxy handlers only and `Capture.deliverExchange` hard-codes
+# `h.put("via", "proxy")`, so every active check cites
+# `surface.exemplar_exchange_id` -- a request the PROXY captured on the
+# affected surface -- as the evidence for what its probe found. Fixing that
+# needs a new frame type and a new writer on the Java side, which this plan
+# forbids; S12's rule ("a report that cannot distinguish tested-clean from
+# never-reached is worse than no report") makes the limit something the page
+# has to carry in the meantime.
+
+def test_an_active_findings_evidence_is_disclosed_as_captured_not_probed(
+        report_env_with_blobs):
+    """The real, un-monkeypatched registry: five active checks ship, so the
+    bullet renders and names them."""
+    out = report.render(**report_env_with_blobs)
+    limits = out[out.index("## Limits"):]
+    assert "An active finding cites captured traffic, not the probe that " \
+        "proved it." in limits
+    assert "`hx.active.cors`" in limits
+    assert "no exchange recorded for this engagement was issued by hx at " \
+        "all" in limits
+
+
+def test_that_disclosure_is_derived_from_the_store_not_typed(
+        report_env_with_blobs):
+    """THE ANTI-VACUITY HALF. The sentence above is true of this build, and
+    the failure mode fix round B named for its neighbours applies to it
+    exactly: a claim that is TRUE and not DERIVED goes on being printed after
+    it stops being true, with nothing to redden.
+
+    `exchange.via` is CHECK-constrained to `proxy | send | crawl`, so
+    "hx recorded none of its own traffic here" is a question this store
+    answers. One `via='send'` row -- the shape a probe-recording writer would
+    produce -- must move the sentence."""
+    conn = report_env_with_blobs["conn"]
+    _exchange(conn, "x-2", "r-1", "https://app.acme.test/api/orders/1?ref=x",
+              via="send")
+    out = report.render(**report_env_with_blobs)
+    limits = out[out.index("## Limits"):]
+
+    assert "no exchange recorded for this engagement was issued by hx" \
+        not in limits
+    assert "1 exchange(s) recorded here were issued by hx rather than " \
+        "captured through the proxy" in limits
+    # The disclosure does not vanish: the citation is still the surface's
+    # captured exemplar, and what changed is only what can be said about why.
+    assert "not the request that demonstrated the flaw" in limits
+
+
+def test_an_all_passive_build_makes_no_claim_about_probe_evidence(
+        report_env_with_blobs, monkeypatch):
+    """The separating case. A build with no active checks files no active
+    findings, so a bullet about what one of them cites would be a caveat
+    about nothing -- and a caveat that is always present is not a caveat
+    (`test_a_report_with_no_dropped_records_makes_no_floor_claim`, the same
+    rule one section up)."""
+    monkeypatch.setattr(
+        report.registry, "CHECKS",
+        tuple(c for c in report.registry.CHECKS if c.klass == "passive"))
+    out = report.render(**report_env_with_blobs)
+    assert "not the probe that proved it" not in out
+    # And the all-passive prose it makes room for is back.
+    assert "Every check in this build is passive" in out
+
+
+# --- fix round 2, F3: the three coverage gaps the page did not carry --------
+#
+# All three are true of what this build DOES; none of them was on the page.
+# S12's rule is that a report which cannot tell "tested, clean" from "never
+# reached" is worse than no report, and each of these is a way the coverage
+# table's `clean` rows meant less than they looked like.
+
+
+def test_limits_disclose_that_every_probe_was_unauthenticated(
+        report_env_with_blobs):
+    """`ProbeSender._request_bytes` emits a request line, a `Host` and at
+    most the one header the check is probing -- no cookie, no
+    `Authorization`, none of the endpoint's other parameters. Against an
+    authenticated application that is a logged-out view of the app, and
+    nothing on the page said so."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "Every probe was sent unauthenticated" in limits
+    assert "no cookie, no `Authorization`" in limits
+    assert "`hx.active.cors`" in limits
+
+
+def test_the_unauthenticated_bullets_safety_claim_is_one_the_code_honours(
+        report_env_with_blobs):
+    """THE SENTENCE THIS BRANCH HAS PRINTED FALSE TWICE. It tells a client
+    that a login redirect, an authorisation refusal or a rejection of the
+    request itself is recorded as `inconclusive` rather than as a clean
+    result.
+
+    It said that first while the doctrine held 401/403/404/429 and 5xx and
+    deliberately EXCLUDED 3xx -- so it was false for the login redirect,
+    which is the commonest shape of the case it describes, and a live finding
+    was measured retiring behind one (N1 of the scoped re-review). It said it
+    again after 3xx, 400 and 405 were added, and was false for 422, 410, 407,
+    406, 414 and their neighbours: the final review measured a target
+    refusing every probe with one of those recording `clean` for all five
+    active checks and rendering as tested Coverage, under this very denial.
+    422 is what FastAPI/pydantic, Rails and a great many Node validation
+    layers answer a probe that dropped the endpoint's other parameters, which
+    is every probe this build sends.
+
+    A false claim in a client deliverable is the most serious kind this
+    project has, so the claim is tied to the code that has to honour it. The
+    statuses below are both rounds' counterexamples plus a member of each
+    shape the sentence names; the doctrine is an ALLOWLIST now, so a status
+    nobody listed here is covered by construction rather than by this list
+    being complete. Loosen `_probe_util.unanswered` and this fails, naming
+    the sentence that has to go with it."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "A login redirect, an authorisation refusal, or a rejection of " \
+        "the request itself is recorded as `inconclusive`" in limits
+
+    resp = probe_mod.ProbeResponse(status=None, head=b"", body=b"",
+                                   outcome="ok")
+    for status, what in [(302, "a login redirect"), (301, "a login redirect"),
+                         (401, "an authorisation refusal"),
+                         (403, "an authorisation refusal"),
+                         (407, "an authorisation refusal"),
+                         (400, "a rejection of the request itself"),
+                         (405, "a rejection of the request itself"),
+                         (406, "a rejection of the request itself"),
+                         (410, "a rejection of the request itself"),
+                         (414, "a rejection of the request itself"),
+                         (422, "a rejection of the request itself"),
+                         (431, "a rejection of the request itself")]:
+        assert _probe_util.unanswered(
+            dataclasses.replace(resp, status=status)) is not None, (
+                f"the Limits page claims {what} is `inconclusive`, and "
+                f"status {status} is read as a conclusive negative")
+
+    # ANTI-VACUITY, because a doctrine that called everything a gap would
+    # satisfy every assertion above while testing nothing at all -- and the
+    # bullet's other half (a probe against a 200 login page IS recorded as
+    # clean) would then be the false sentence instead.
+    assert _probe_util.unanswered(
+        dataclasses.replace(resp, status=200)) is None, (
+            "no status is read as an answer, so the assertions above hold "
+            "vacuously and this build tests nothing")
+
+
+def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honours(
+        report_env_with_blobs):
+    """THE SEVENTH SPELLING, AND WHAT A DELIVERABLE CAN HONESTLY SAY ABOUT
+    IT. F3 -- probes carry no session -- was decided as DISCLOSE, NOT FIX,
+    and a client still got `appears fixed` for a live finding, because a
+    disclosure does not stop a retirement: an application answering a
+    logged-out request with a 200 LOGIN PAGE is indistinguishable from one
+    that answered at every level a status rule operates. Fix round 5
+    suppressed retirement where the CAPTURE carried a credential header; fix
+    round 6 removed it from the active corpus outright, because that
+    predicate keyed on the first sighting and could see only a header name.
+
+    The page claims a BEHAVIOUR of the runner, and this ties the two
+    together: the sentence, and then `scan._retirable` asked the two
+    questions the sentence rests on. Make it return a probing check's
+    `considered` and this fails, naming the bullet that has to go with it."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "An active finding is never automatically marked as fixed" in limits
+    assert ("Verify an active finding against the fixed application yourself "
+            "before closing it") in limits
+
+    considered = ("some-issue-type",)
+    assert scan._retirable(scan._PROBE_HOOK,
+                           base.Verdict.clean()) == (), (
+        "the Limits page tells a client no active finding is ever closed, "
+        "and the runner enters one for retirement")
+    with pytest.raises(ValueError):
+        scan._retirable(scan._PROBE_HOOK,
+                        base.Verdict.clean(considered=considered))
+
+    # AND THE OTHER DIRECTION, which is what keeps the bullet honest rather
+    # than merely safe: the page says this of the ACTIVE checks, and the
+    # passive half of the same section says something different. A rule that
+    # emptied both would make the whole document's retest story a lie in the
+    # other direction.
+    assert scan._retirable("on_surface",
+                           base.Verdict.clean(considered=considered)) == \
+        considered
+
+
+def test_the_unauthenticated_bullet_says_the_login_page_costs_coverage_only(
+        report_env_with_blobs):
+    """WHAT IS AND IS NOT LEFT OF THE RESIDUAL. A refusal delivered UNDER a
+    2xx is still indistinguishable from an answer, so the row it produces
+    still reads `clean` and still counts as a tested surface in Coverage --
+    that is a coverage overstatement and the page must keep saying so. What
+    it can no longer do is close a finding, and the bullet says which of the
+    two it is.
+
+    THE RESIDUAL IS NAMED AS A CLASS AND NOT COUNTED, which is the final
+    review's finding 1 one layer down. "One shape escapes that" was a
+    completeness claim over a set the author had not enumerated, and it was
+    printed in a client deliverable; the 200 login page is one member and a
+    200 error envelope over a rejected parameter is another. Asserting the
+    absence of the count is what stops it coming back.
+
+    Fix round 5's version said the residual applied only to surfaces whose
+    capture carried no credential header; that qualification went with the
+    predicate, and asserting its ABSENCE is what stops IT being left
+    behind."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "What that cannot catch is a refusal delivered UNDER a 2xx" in limits
+    assert "200 login PAGE" in limits
+    assert "200 error envelope" in limits
+    assert "That costs coverage and nothing more" in limits
+    assert "carried no credential header" not in limits
+    assert "One shape escapes" not in limits, (
+        "the page counts the shapes that escape the status rule again; the "
+        "last time it did that the count was measured wrong by fourteen")
+
+
+def test_limits_disclose_that_credential_insertion_points_are_not_probed(
+        report_env_with_blobs):
+    """The three names come from `probe.CREDENTIAL_HEADERS`, which is this
+    side's copy of `Redactor.CREDENTIAL_HEADERS` -- so a fourth credential
+    header the extension learns to refuse appears here without anyone
+    remembering to type it."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "Cookie and credential-header insertion points were not probed" \
+        in limits
+    for name in probe_mod.CREDENTIAL_HEADERS:
+        assert f"`{name}`" in limits, name
+
+
+def test_limits_disclose_that_path_traversal_reaches_no_templated_segment(
+        report_env_with_blobs):
+    """A pre-existing false negative, found while fixing F1 and disclosed
+    rather than fixed: `path_traversal` declares `path_segment` and probes a
+    point only when its name looks like a filename, while every placeholder
+    `hx.surface` mints is `{id}`, `{uuid}`, `{hex}` or `{slug}`."""
+    limits = report.render(**report_env_with_blobs)
+    limits = limits[limits.index("## Limits"):]
+    assert "`hx.active.path-traversal` probed no templated path segment" \
+        in limits
+    for placeholder in surface_mod.PLACEHOLDERS:
+        assert f"`{placeholder}`" in limits, placeholder
+
+
+def test_that_last_bullet_is_derived_from_the_check_not_typed(
+        report_env_with_blobs, monkeypatch):
+    """THE ANTI-VACUITY HALF, and the one that matters most of the three:
+    this bullet describes a gap somebody will eventually close, and a typed
+    sentence would go on telling clients about it afterwards. Both halves
+    are derived -- the check must declare `path_segment` AND report that its
+    own name filter cannot match a placeholder -- so widening the filter
+    removes the bullet with no prose to remember."""
+    widened = path_traversal.PathTraversal()
+    widened.probes_templated_segments = True
+    monkeypatch.setattr(report.registry, "CHECKS", tuple(
+        widened if c.id == widened.id else c for c in report.registry.CHECKS))
+    out = report.render(**report_env_with_blobs)
+    assert "probed no templated path segment" not in out
+    # The check is still in the corpus, so its OTHER disclosures stand: this
+    # is a bullet disappearing, not a check.
+    assert "`hx.active.path-traversal`" in out
+
+
+def test_an_all_passive_build_makes_none_of_these_three_claims(
+        report_env_with_blobs, monkeypatch):
+    """All three are about what an ACTIVE check does. A build with none must
+    not tell a client its probes were unauthenticated -- it sent none."""
+    monkeypatch.setattr(
+        report.registry, "CHECKS",
+        tuple(c for c in report.registry.CHECKS if c.klass == "passive"))
+    out = report.render(**report_env_with_blobs)
+    assert "Every probe was sent unauthenticated" not in out
+    assert "credential-header insertion points" not in out
+    assert "probed no templated path segment" not in out

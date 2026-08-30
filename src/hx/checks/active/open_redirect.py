@@ -1,0 +1,300 @@
+"""Open redirect -- read `Location`, and never, ever follow it.
+
+THE SAFETY RULE THIS CHECK MUST NOT BREAK: never follow the redirect. The
+send path is configured `RedirectionMode.NEVER` (S4), so nothing in `hx`
+chases a `Location` on its own -- but a check is free to add that behaviour
+back by hand, by issuing a *second* `sender.get()` at whatever host the
+first response named. That would be a request the operator never
+authorised, against a host that may be outside the engagement's scope --
+the exact shape S4 exists to prevent. "Follow it to confirm the redirect
+really lands off-site" is the obvious next thought and it is WRONG here:
+this check reads `Location`, compares its host to the marker it planted,
+and stops. It never issues a request whose target came from a response
+this check received.
+
+CANARY-FIRST, BECAUSE THE BUDGET IS REAL. `insertions` carries only `kind`
+and `name` (`hx.checks.base.Insertion`) -- the surface row `probes()`
+receives (`hx.scan.run`, off `_exemplar_request`) derives them from the
+exemplar request's structure, not its values, so this check has no access
+to what a query parameter currently holds. The canary-first filter is
+therefore NAME-based: a parameter is probed only when its name contains one
+of a small set of tokens (`redirect`, `url`, `uri`, `return`, `next`,
+`dest`, `continue`, `target`, `forward`, `goto`, `link`, `callback`,
+`navigate`) that redirect-carrying parameters conventionally use --
+`redirect_uri`, `returnUrl`, `next`, `continueUrl`, `dest`, and so on. A
+parameter named `id`, `page` or `q` cannot plausibly carry a redirect
+target and is left alone: probing every query parameter on every surface
+would spend the request budget on ones that structurally cannot answer this
+question. This is a heuristic, not a proof -- an unconventionally-named
+redirect parameter is missed -- but a false negative here costs nothing
+worse than the check missing what canary-first was built to accept missing,
+while probing every parameter costs a request against the target for every
+one of them.
+
+THE MARKER MUST BE UNREACHABLE. `_MARKER_URL` uses `.test`, the TLD RFC
+2606 reserves for exactly this purpose: guaranteed never to resolve to a
+real, in-scope production host, so a `Location` this check calls a finding
+can never actually be reached even if this check is wrong about what it
+saw. It intentionally differs from `hx.checks.active.cors._PROBE_ORIGIN`
+(same TLD, different label) so a reader correlating traffic from both
+checks against one target is never left wondering which check sent which
+probe.
+
+WHAT COUNTS AS A FINDING. The probe puts `_MARKER_URL` in the parameter and
+reads back the response's status and `Location` (`_http.header_values`,
+case-insensitive, exactly like every other header read in this corpus). A
+`Location` only means anything on a redirect status (300-399); reading it
+off a 200 would be answering a question the response was not asking. Of a
+redirect response, `urlsplit(location).hostname` -- which also resolves a
+protocol-relative `//host/path` `Location`, a real redirect shape some
+servers emit -- decides the case: a host equal (ASCII case-insensitively)
+to the marker's is the finding, because nothing the target could have
+learned about this engagement could make it redirect there on its own.
+
+ON THAT SAME REDIRECT RESPONSE, a `Location` that is empty, relative (no
+host at all), or names some other host is NOT a finding -- and it is not
+`clean` either, it is `inconclusive`.
+The two readings of such a response ("the target validated the parameter"
+and "the target never looked at the parameter, it just bounced us to a login
+page") are not separable from the outside, and only the first of them may
+retire anything. `clean` here means a 2xx that did not redirect at all; see
+the 3xx paragraph below.
+
+THE PROBE GOES TO THE EXEMPLAR'S OWN PATH (`sender.path`), NOT TO THE SURFACE
+ROW'S `path_template`. F1 of the whole-branch review: `_probe_path` used to
+build its request line out of `surface[5]`, which on any templated surface is
+an identity (`/order/{id}/doc`) rather than an address, so the probe reached a
+URL that cannot exist, the 404 carried no `Location`, and this check answered
+`clean` with `open-redirect` in `considered` -- retiring a live finding.
+`hx.checks.probe.ProbeSender` now refuses a path still carrying a placeholder
+and is bound to the exemplar's concrete path instead.
+
+A RESPONSE THAT REFUSED IS NOT A CLEAN ONE, EITHER. A 400, a 403, a 422, a
+429, a 5xx or a 404 has no `Location` for the same reason a properly
+validating target has none. `_probe_util.unanswered` reads a 2xx and nothing
+else as an answer, `_probe_util.verdict` turns the rest into `inconclusive`,
+and the doctrine is shared by all five active checks rather than spelt here
+-- see `_probe_util.py`.
+
+A 3xx IS NOT AN ANSWER EITHER, AND THIS CHECK STILL KEEPS ITS FINDING -- because
+of the ORDER the two questions are asked in below, not because of an
+exemption. A `Location` naming `_MARKER_HOST` is a candidate, and
+`unanswered` is consulted only on the branch where that match FAILED, so the
+finding never meets the doctrine. What the 3xx rule changes here is the other
+direction, and N1 of the scoped re-review is why it had to: a redirect to
+somewhere this check did not ask for -- a login page, the target's own
+dashboard, a relative path -- is `inconclusive` now, where it used to be
+`clean`. The endpoint sent the browser away, and nothing in that response
+says whether it looked at this parameter at all. So this check answers
+`clean` only on a NON-REDIRECTING 2xx, which is the one response that is a
+genuine test: the endpoint took the marker and chose not to redirect to it.
+
+EXAMINED, NAMED HONESTLY -- AND THE VERDICT SAYS SO TOO. `_ISSUE_TYPE` is
+passed to `_probe_util.verdict` as `examined` only when this check actually
+issued at least one probe on this surface. Until fix round 6 that was the
+verdict's `considered` and the reason mattered most for retirement -- a
+finding could not be closed on the strength of a question this check never
+asked. An active check retires nothing now, and the branch stays because the
+coverage half was always the other reason for it: N3 of the scoped re-review,
+where a surface with query parameters but none of them canary-shaped answered
+`clean` with `requests_sent = 0`. Nothing was retired even then -- but
+`report._coverage` groups on (check_id, verdict) and counts SURFACES, so a
+real engagement rendered most of the corpus as `open-redirect | clean` for a
+check that probed a handful. That surface answers `inconclusive` now, with
+`_NOTHING_PROBEABLE` naming the filter that declined it.
+
+THE EVIDENCE THIS CHECK CITES is the surface's exemplar exchange, for the
+same reason `cors.py` gives: nothing in this build records a probe's own
+request and response anywhere -- the extension captures proxy traffic only
+-- so `surface[6]` is the only exchange id this check can truthfully name.
+`report._limits` discloses that gap to the client; closing it needs a new
+bridge frame type and writer, Java work this plan does not do, and it is
+open debt no current task owns.
+
+EACH CANDIDATE CARRIES ITS `Insertion`, unlike `cors.py`'s `insertion=None`.
+Two parameters on one surface can each independently redirect, and
+`records.dedupe_key` folds `insertion_kind`/`insertion_name` into the
+finding's identity precisely so those stay two rows instead of colliding
+into one -- `_write_finding` in `hx/scan.py` reads `candidate.insertion`
+for exactly that pair.
+"""
+from __future__ import annotations
+
+from urllib.parse import quote, urlsplit
+
+from hx.checks import base
+from hx.checks.active import _probe_util
+from hx.checks.passive import _http
+
+# RFC 2606: `.test` is reserved and guaranteed never to be a real,
+# resolvable domain, so a `Location` naming this host can never actually be
+# reached even if this check has misjudged what it saw. Distinct from
+# `cors._PROBE_ORIGIN` (same TLD) so probes from the two checks are never
+# ambiguous in a traffic capture.
+_MARKER_HOST = "hx-open-redirect-probe.test"
+_MARKER_URL = f"https://{_MARKER_HOST}/"
+
+# Substrings a query parameter's NAME is checked against, case-insensitively,
+# to decide whether it is worth a probe at all -- see the module docstring's
+# "CANARY-FIRST" section for why this is name-only. Matches `redirect_uri`,
+# `returnUrl`, `next`, `continueUrl`, `dest`, `forward_to`, `goto`, `rlink`,
+# `success_callback`, `navigateTo`, and similar; leaves `id`, `page`, `q`,
+# `sort` and the like unprobed.
+_REDIRECT_NAME_HINTS = (
+    "redirect", "url", "uri", "return", "next", "dest", "continue",
+    "target", "forward", "goto", "link", "callback", "navigate",
+)
+
+# A redirect response's status must claim to be one (RFC 9110 s10.2.2) for
+# its `Location` to mean anything at all.
+_REDIRECT_STATUSES = range(300, 400)
+
+# Minted once, so a candidate's `issue_type_id` and what `_probe_util.verdict`
+# is told this check examined cannot spell the set two different ways (see
+# `cors.py`'s identical reasoning for `_EXAMINED`).
+_ISSUE_TYPE = "open-redirect"
+
+
+# What a coverage row says for a surface this check never sent anything to.
+# It names the FILTER rather than the surface, because that is the thing an
+# operator can act on: widen the hints, or accept that a parameter called
+# `id` is not one this check reads.
+_NOTHING_PROBEABLE = (
+    "no insertion point on this surface is one this check probes -- it "
+    "probes a query parameter whose name contains one of "
+    f"{', '.join(_REDIRECT_NAME_HINTS)} -- so nothing was sent and this "
+    "surface was not examined for open redirect")
+
+
+def _looks_like_redirect_target(name: str) -> bool:
+    low = name.lower()
+    return any(hint in low for hint in _REDIRECT_NAME_HINTS)
+
+
+def _probe_path(path: str, name: str, value: str) -> str:
+    """The path, with one query parameter carrying the marker.
+
+    `path` is `sender.path`, the exemplar request's own path, and it never
+    carries a query string of its own (`hx.insertion.request_path` returns
+    `urlsplit(target).path` alone) -- so this always appends the first and
+    only `?`, exactly as it did when the argument was the surface's template.
+    Percent-encoded by hand -- `ProbeSender.get()` sends `path` verbatim onto
+    the request line -- so an unescaped `/` or `:` in `_MARKER_URL` cannot be
+    mistaken for structure the wire did not intend.
+    """
+    return f"{path}?{quote(name, safe='')}={quote(value, safe='')}"
+
+
+def _redirect_host(status: int | None, head: bytes) -> str | None:
+    """The `Location` header's host, only where the status makes it one.
+
+    `None` for a non-redirect status, an absent header, or a `Location`
+    with no host at all (relative, or unparseable) -- every one of those is
+    "this response did not send the browser anywhere the marker could be
+    read off". That is the answer to THIS function's question and not a
+    verdict: the caller then asks `_probe_util.unanswered`, which separates
+    the 2xx that genuinely declined to redirect (clean) from the 3xx that
+    went somewhere else entirely (a gap).
+    """
+    if status not in _REDIRECT_STATUSES:
+        return None
+    values = _http.header_values(head, "location")
+    if not values:
+        return None
+    # `urlsplit` also resolves a protocol-relative `//host/path` Location,
+    # a real redirect shape some servers emit and not merely a relative one.
+    return urlsplit(values[0]).hostname
+
+
+def _location_value(head: bytes) -> str:
+    """The `Location` header's own value, verbatim -- never inferred.
+
+    Only correct to call where `_redirect_host` has already established a
+    `Location` is present (the one call site below is guarded by exactly
+    that), so it never has to guess at absence itself -- the same contract
+    `cors._render_header` documents for its own headers.
+    """
+    return ", ".join(_http.header_values(head, "location"))
+
+
+class OpenRedirect:
+    id = "hx.active.open-redirect"
+    version = "1"
+    klass = "active_safe"
+    insertion_kinds = frozenset({"query"})
+
+    def probes(self, ctx, surface, insertions, sender) -> base.Verdict:
+        exemplar_exchange_id = surface[6]
+        candidates = []
+        gaps = []
+        probed_any = False
+
+        for insertion in insertions:
+            if insertion.kind != "query":
+                continue
+            if not _looks_like_redirect_target(insertion.name):
+                continue
+            path = _probe_path(sender.path, insertion.name, _MARKER_URL)
+            # A REFUSAL ENDS THIS POINT, NOT THE CHECK. `ProbeSender.get()`
+            # RAISES `ProbeRefused` on every refusal and never returns one
+            # (see `hx/checks/probe.py`), so this check can never mistake one
+            # for an answer; `_probe_util.send_or_gap` catches it per point
+            # rather than per surface, so a refusal on the first
+            # redirect-shaped parameter does not discard the second.
+            resp = _probe_util.send_or_gap(sender, path, insertion, gaps)
+            if resp is None:
+                continue
+            probed_any = True
+
+            # THE SAFETY RULE, ENFORCED BY WHAT THIS FUNCTION DOES NOT DO:
+            # `_redirect_host` only ever READS `resp.head`. Nothing below
+            # this line, or anywhere else in this module, calls
+            # `sender.get()` a second time with a target drawn from a
+            # response this check received -- that would be following the
+            # redirect, and `RedirectionMode.NEVER` exists precisely so a
+            # check cannot casually add that back.
+            host = _redirect_host(resp.status, resp.head)
+            if host is None or host.lower() != _MARKER_HOST:
+                # ASKED ONLY WHERE NOTHING WAS FOUND: a `Location` naming the
+                # marker answered this check's question whatever the status
+                # line said elsewhere, which is `_probe_util.verdict`'s "a
+                # candidate wins over a gap" one step earlier.
+                refusal = _probe_util.unanswered(resp)
+                if refusal is not None:
+                    gaps.append(f"{insertion.name}: {refusal}")
+            else:
+                candidates.append(base.Candidate(
+                    title=f"Open redirect via {insertion.name!r}",
+                    issue_type_id=_ISSUE_TYPE,
+                    severity="Medium", confidence="Certain",
+                    insertion=insertion,
+                    exchange_ids=(exemplar_exchange_id,), cwe="CWE-601",
+                    payload=_MARKER_URL,
+                    description=(
+                        f"Requesting {path} with {insertion.name}="
+                        f"{_MARKER_URL} (a host this target cannot have "
+                        f"expected) drew back status {resp.status} with "
+                        f"Location: {_location_value(resp.head)}. A browser "
+                        "following this response leaves the target for a "
+                        "host this check chose, which is what an attacker "
+                        "hosting a phishing or credential-harvesting page "
+                        "would choose instead."),
+                    remediation=(
+                        "Validate this parameter against an explicit "
+                        "allowlist of destinations (or require same-origin) "
+                        "before using it to build a redirect target.")))
+
+        if not probed_any:
+            # NOTHING WAS SENT, SO NOTHING WAS TESTED -- and that is not
+            # `clean`. N3 of the scoped re-review. Reached by either filter
+            # above: a point of the wrong KIND, or a query parameter whose
+            # name is `q` or `page` rather than redirect-shaped. Both are
+            # "this check did not look here", and a `clean` row for it claimed
+            # coverage in `report._coverage` (which counts surfaces per
+            # check and verdict) that no request backs. Nothing was ever
+            # retired on this path -- what it passed as `considered` was
+            # already empty -- so the coverage sentence is what was false.
+            return _probe_util.verdict(candidates, gaps,
+                                       unprobed=_NOTHING_PROBEABLE)
+        return _probe_util.verdict(candidates, gaps,
+                                   examined=(_ISSUE_TYPE,))

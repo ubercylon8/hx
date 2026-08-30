@@ -88,6 +88,32 @@ def test_a_second_set_cookie_header_is_still_checked():
     assert "b" in v.candidates[0].title
 
 
+def test_cookie_flags_considers_every_cookie_the_surface_set():
+    """Per-cookie issue types: exactly why `considered` is run-time and not a
+    class-level declaration. Both cookies are considered even though only
+    one of them is missing anything -- a check that examined a cookie and
+    found it fine still examined it."""
+    c = cookie_flags.CookieFlags()
+    blob = resp(b"Set-Cookie: a=1; Path=/; Secure; HttpOnly; SameSite=Lax",
+                b"Set-Cookie: b=2; Path=/")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
+    assert len(v.considered) == 2
+    assert set(v.considered) == {cookie_flags._issue_type("a"),
+                                 cookie_flags._issue_type("b")}
+
+
+def test_a_cookie_flag_candidates_issue_type_is_one_it_considered():
+    """The silent-drift hazard: a candidate whose issue type is not in
+    `considered` can never be retired, and nothing else in the suite would
+    notice."""
+    c = cookie_flags.CookieFlags()
+    blob = resp(b"Set-Cookie: session=abc; Path=/")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
+    assert v.state == "finding"
+    for candidate in v.candidates:
+        assert candidate.issue_type_id in v.considered
+
+
 def test_the_issue_type_carries_the_cookie_but_not_the_missing_flags():
     """D1 and D4 at the unit the dedupe key is built from.
 
@@ -156,6 +182,32 @@ def test_a_fully_headed_https_response_is_clean():
     assert c.on_surface(ctx_for(d1=blob), None, rows()).state == "clean"
 
 
+def test_security_headers_reports_every_header_it_examined():
+    c = security_headers.SecurityHeaders()
+    blob = resp(b"Content-Type: text/html",
+                b"Strict-Transport-Security: max-age=31536000",
+                b"X-Content-Type-Options: nosniff",
+                b"X-Frame-Options: DENY")
+    v = c.on_surface(ctx_for(d1=blob), None, rows())
+    assert v.state == "clean"
+    assert set(v.considered) == {
+        "missing-content-type-options",
+        "missing-frame-protection",
+        "missing-hsts",
+    }, "a clean answer that names nothing retires nothing, so a fixed header stays live forever"
+
+
+def test_an_inconclusive_verdict_considers_nothing():
+    """S10: never `clean` when the check could not run, and never with
+    `considered` populated either -- a check that could not read the
+    evidence has concluded nothing, and retiring on that basis would close a
+    finding on missing data."""
+    c = security_headers.SecurityHeaders()
+    v = c.on_surface(ctx_for(), None, rows())      # d1 absent from the store
+    assert v.state == "inconclusive"
+    assert v.considered == ()
+
+
 def test_csp_frame_ancestors_satisfies_the_frame_check():
     """Two headers answer one question, and a check that demands the older one
     when the newer is present reports a finding the client already fixed."""
@@ -183,6 +235,20 @@ def test_headers_are_not_demanded_of_a_non_document_response():
     blob = resp(b"Content-Type: application/json",
                 b"X-Content-Type-Options: nosniff")
     assert c.on_surface(ctx_for(d1=blob), None, rows()).state == "clean"
+
+
+def test_a_security_headers_candidate_issue_type_is_one_it_considered():
+    """The `cookie_flags` analog of the drift-catching test: both sides read
+    `_HeaderSpec.issue_type_id` off the same table today, but nothing pinned
+    that, and `security_headers` has no per-name identity like the cookie
+    check's `_issue_type` to fall back on if the two reads are ever pulled
+    apart. A candidate whose issue type is not in `considered` can never be
+    retired, and nothing else in the suite would notice."""
+    c = security_headers.SecurityHeaders()
+    v = c.on_surface(ctx_for(d1=resp(b"Content-Type: text/html")), None, rows())
+    assert v.state == "finding"
+    for candidate in v.candidates:
+        assert candidate.issue_type_id in v.considered
 
 
 # ---- secret in response -----------------------------------------------
@@ -238,6 +304,26 @@ def test_prose_mentioning_an_exception_is_clean():
     c = stack_trace.StackTrace()
     body = b"<p>If you see a NullPointerException, contact support.</p>"
     assert c.on_surface(ctx_for(d1=resp(body=body)), None, rows()).state == "clean"
+
+
+def test_stack_trace_does_not_claim_a_pattern_the_break_skipped():
+    """The per-exchange `break` stops at the FIRST matching pattern, so a
+    body that would also match a LATER pattern never has that later
+    pattern's `.search()` called. A `considered` that named it anyway would
+    let `scan._mark_unobserved` retire a still-live finding of a kind this
+    body was never actually checked against -- the false-close direction,
+    and the more dangerous one.
+
+    This body matches `php-error-disclosed` (3rd pattern) and would also
+    match `nodejs-stack-trace-disclosed` (5th pattern, "at foo.bar
+    (baz.js:12:5)") if the check ever got there. It must not.
+    """
+    c = stack_trace.StackTrace()
+    body = b"PHP Fatal error: Uncaught Error\n    at foo.bar (baz.js:12:5)\n"
+    v = c.on_surface(ctx_for(d1=resp(body=body)), None, rows(status=500))
+    assert v.state == "finding"
+    assert [x.issue_type_id for x in v.candidates] == ["php-error-disclosed"]
+    assert "nodejs-stack-trace-disclosed" not in v.considered
 
 
 # ---- unreadable evidence ----------------------------------------------
@@ -311,6 +397,40 @@ def test_a_partly_unreadable_surface_that_finds_something_still_says_finding():
                      two_rows(second_outcome="conn_refused", second_blob=None))
     assert v.state == "finding"
     assert "session" in v.candidates[0].title
+
+
+def test_a_finding_from_partial_evidence_retires_nothing_beside_it():
+    """F5 of the whole-branch review. `_http.verdict` used to pass
+    `considered` on the finding branch unconditionally while the `clean`
+    branch required zero gaps, and `considered` is exactly what
+    `hx.scan._mark_unobserved` retires by -- so a surface with one unreadable
+    exchange and one candidate found in another claimed to have EXAMINED
+    every issue type this check names, including the one whose only evidence
+    was the exchange nobody could read. The finding stays (the test above);
+    what it may not do is close its neighbours.
+    """
+    c = cookie_flags.CookieFlags()
+    v = c.on_surface(ctx_for(d1=resp(b"Set-Cookie: session=abc; Path=/")), None,
+                     two_rows(second_outcome="conn_refused", second_blob=None))
+    assert v.state == "finding"
+    assert v.considered == (), (
+        "a finding built on partial evidence claimed to have examined "
+        f"{v.considered}, every one of which `_mark_unobserved` would retire")
+
+
+def test_the_same_finding_on_whole_evidence_does_consider_what_it_examined():
+    """The separating case for the test above: withholding `considered`
+    unconditionally would make every finding un-retirable, which is the
+    other direction S12 forbids -- a client who fixes a flagless cookie
+    would never see it close."""
+    c = cookie_flags.CookieFlags()
+    rows_ok = (base.ExchangeRow(id="x-1", method="GET",
+                                url="https://app.test/x", status=200,
+                                outcome="ok", req_blob=None, resp_blob="d1"),)
+    v = c.on_surface(ctx_for(d1=resp(b"Set-Cookie: session=abc; Path=/")),
+                     None, rows_ok)
+    assert v.state == "finding"
+    assert v.considered, "a finding nothing considered can never be retired"
 
 
 def test_a_truncated_response_is_read_for_what_it_holds_and_still_not_clean():

@@ -1079,14 +1079,19 @@ def test_every_config_field_reaches_its_key(a_config):
     assert body["render.allow"] == a_config.render_allow
     assert body["limit.rate_rps"] == [str(a_config.rate_limit_rps)]
     assert body["limit.concurrency"] == [str(a_config.max_concurrency)]
+    assert body["limit.max_requests"] == [str(a_config.max_requests)]
     assert body["method.allow"] == ["GET", "HEAD", "OPTIONS"]
 
 
-def test_the_budget_key_is_absent(a_config):
-    # Java's Limits.arm() falls back to its documented default of 2000, and
-    # S4 says the budget never binds the operator's browser. The plan that
-    # spends it is the plan that bounds it.
-    assert "limit.max_requests" not in session.config_body(a_config)
+def test_the_budget_reaches_the_authorisation(a_config):
+    # Task 6: `hx.checks.probe.ProbeSender` is the send seam that spends the
+    # budget, so the plan that starts spending it is the plan that bounds it
+    # -- the key is no longer absent, and its value is `Config.max_requests`.
+    assert session.config_body(a_config)["limit.max_requests"] == [str(a_config.max_requests)]
+
+
+def test_the_budget_key_is_one_the_codec_permits(a_config):
+    assert set(session.config_body(a_config)) <= codec.CONFIG_KEYS
 
 
 # --- stored_scope_sha256 --------------------------------------------------
@@ -1230,12 +1235,16 @@ idempotent by S10's own definition, and GET is what idempotent means.
 def config_body(cfg) -> dict[str, list[str]]:
     """The authorisation, built from the engagement's config.
 
-    `limit.max_requests` IS DELIBERATELY ABSENT. `Limits.arm()` falls back to
-    a documented default of 2000 per run, and S4 is explicit that the method
-    allowlist, dangerous-path denylist, rate limit and budget "apply to the
-    send path in full, and to crawler traffic in full. They do NOT apply to
-    traffic from the operator's own browser." Nothing this plan starts spends
-    the budget, so bounding it here would be a number with no referent.
+    `limit.max_requests` IS NOW EMITTED. It was deliberately absent until
+    this task: `hx.checks.probe.ProbeSender` is the send seam an active check
+    spends it through, and before that module existed nothing here sent a
+    request, so a number in this dict would have had no referent. The value
+    comes straight from `Config.max_requests`, whose default (2000) matches
+    `Limits.arm()`'s own fallback for an absent key -- so an operator who sets
+    nothing in `config.yaml` gets exactly the documented behaviour rather
+    than a silent change: the budget was always 2000, it is now merely said
+    out loud, here, where the extension can be told it explicitly rather than
+    asked to assume it.
     """
     return {
         "scope.include": list(cfg.scope_include),
@@ -1245,6 +1254,7 @@ def config_body(cfg) -> dict[str, list[str]]:
         "method.allow": list(METHOD_ALLOW),
         "limit.rate_rps": [str(cfg.rate_limit_rps)],
         "limit.concurrency": [str(cfg.max_concurrency)],
+        "limit.max_requests": [str(cfg.max_requests)],
     }
 
 
@@ -1462,7 +1472,7 @@ def test_a_failed_configure_leaves_no_burp_running(monkeypatch, an_engagement, a
     # half that says WHICH, and swallowing it sends the next reader to the
     # wrong side of the socket.
     assert "bad_config" in str(exc.value)
-    assert not (an_engagement.root / "session" / "hx.sock").exists(), (
+    assert not (an_engagement.root / "session" / "capture" / "hx.sock").exists(), (
         "the bridge was not stopped: its socket outlives the session, and the "
         "next `session()` on this engagement dies inside BridgeServer.start()")
 
@@ -1555,7 +1565,7 @@ def test_burp_is_torn_down_when_the_body_raises(monkeypatch, an_engagement, a_ja
     live, = seen
     assert (live.operator_port, live.crawler_port) == (OPERATOR_PORT, CRAWLER_PORT)
     assert live.epoch == 1
-    assert live.workdir == an_engagement.root / "session"
+    assert live.workdir == an_engagement.root / "session" / "capture"
     assert live.bridge.engagement_id == an_engagement.id
     assert not (live.workdir / "hx.sock").exists(), (
         "the bridge was not stopped on the raising path")
@@ -1765,7 +1775,34 @@ def session(eng, *, instance: str, jar: Path | None = None,
     second answer to a question this parameter already answers.
     """
     jar = find_burp_jar(jar)
-    work = Path(workdir) if workdir else eng.root / "session"
+    # ONE WORKDIR PER COMMAND, NAMESPACED BY `instance`. F6 of the
+    # whole-branch review. Both callers defaulted to `eng.root / "session"`,
+    # so `hx capture start` and `hx scan` shared a bridge socket path: the
+    # second to start found the first's live `hx.sock`, and `BridgeServer.
+    # start()` refuses to adopt a path another process may own -- correctly,
+    # and the refusal reads as "a previous run did not shut down cleanly"
+    # when nothing is wrong at all. It was a corner case while `hx scan`
+    # stayed offline; `active_safe` is on by default in `DEFAULT_CHECKS` and
+    # five active checks now ship, so every default `hx scan` opens a session
+    # and the documented browse-then-scan workflow collided unconditionally.
+    # Plan 6's governing decision is "each command owns its own Burp", and
+    # this is the directory layout that decision implies: the same string
+    # that tells the extension which instance it is (`-Dhx.instance`) names
+    # the directory that instance owns.
+    #
+    # ONE PATH SEGMENT, CHECKED. This value becomes a directory under the
+    # engagement root -- which is 0o700 and holds the private Burp home, the
+    # licence key inside it, and the client's captured traffic -- so a
+    # caller's `../..` may not choose where that lands. Refused rather than
+    # sanitised: silently rewriting a caller's argument would make the
+    # directory and the `-Dhx.instance` the extension reports two different
+    # strings.
+    if instance != Path(instance).name or instance in ("", ".", ".."):
+        raise SessionError(
+            f"instance must be a single path segment, got {instance!r}: it "
+            "names both this session's `-Dhx.instance` and the directory "
+            "under the engagement root that this session owns")
+    work = Path(workdir) if workdir else eng.root / "session" / instance
     # secure_mkdir, not mkdir: this directory holds the private Burp home
     # (copied from the operator's own, licence key included), Burp's log, and
     # the bridge socket. It is created at 0o700 rather than created at the

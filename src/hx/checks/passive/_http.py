@@ -78,11 +78,45 @@ def _fetch(ctx, exchanges) -> Evidence:
     return Evidence(tuple(entries), tuple(gaps))
 
 
+def _split_head_body(raw: bytes) -> tuple[bytes, bytes]:
+    """Head and body, accepting either line terminator.
+
+    RFC 9112 s2.2 requires a recipient to accept a bare LF as a line
+    terminator. `partition(b"\\r\\n\\r\\n")` on a bare-LF response matches
+    nothing and returns `(raw, b"", b"")`, which hands every body-searching
+    check an EMPTY body and every header-reading check the whole response as
+    one unsplit head. The tool then answers `clean` because it failed to
+    read, which is the one direction an assessment must never be wrong in.
+
+    Whichever terminator appears FIRST is the real one, so a body that
+    happens to contain `\\r\\n\\r\\n` cannot pull the boundary backwards past
+    a head that actually ended with a bare `\\n\\n`.
+    """
+    crlf = raw.find(b"\r\n\r\n")
+    lf = raw.find(b"\n\n")
+    if crlf == -1 and lf == -1:
+        return raw, b""
+    if crlf != -1 and (lf == -1 or crlf <= lf):
+        return raw[:crlf], raw[crlf + 4:]
+    return raw[:lf], raw[lf + 2:]
+
+
+def _header_lines(head: bytes) -> list[bytes]:
+    """Header lines, minus the status line, for either terminator.
+
+    Splits on LF and strips at most one trailing CR per line, rather than
+    also splitting on a bare CR: a lone CR inside a header value is data, and
+    splitting on it would invent a header boundary the wire did not carry.
+    """
+    return [line[:-1] if line.endswith(b"\r") else line
+            for line in head.split(b"\n")[1:]]
+
+
 def bodies(ctx, exchanges) -> Evidence:
     """`(row, body_bytes)` per readable exchange, plus what could not be read."""
     got = _fetch(ctx, exchanges)
     return Evidence(
-        tuple((row, raw.partition(b"\r\n\r\n")[2]) for row, raw in got.entries),
+        tuple((row, _split_head_body(raw)[1]) for row, raw in got.entries),
         got.gaps)
 
 
@@ -90,11 +124,12 @@ def responses(ctx, exchanges) -> Evidence:
     """`(row, head_bytes)` per readable exchange, plus what could not be read."""
     got = _fetch(ctx, exchanges)
     return Evidence(
-        tuple((row, raw.partition(b"\r\n\r\n")[0]) for row, raw in got.entries),
+        tuple((row, _split_head_body(raw)[0]) for row, raw in got.entries),
         got.gaps)
 
 
-def verdict(evidence: Evidence, candidates) -> base.Verdict:
+def verdict(evidence: Evidence, candidates, *,
+            considered: tuple[str, ...] = ()) -> base.Verdict:
     """The corpus's one rule for when `clean` may be said.
 
     A check may answer `clean` only when EVERY exchange the surface holds was
@@ -104,29 +139,60 @@ def verdict(evidence: Evidence, candidates) -> base.Verdict:
 
     A CANDIDATE STILL WINS OVER A GAP. What was found was found; incomplete
     coverage does not un-find it, and downgrading a real finding to "could
-    not test" would lose the one thing the surface did prove. (What that
-    leaves open: `Verdict.finding` carries no reason, so a partially-covered
-    surface that DID find something records no trace of the gap. Closing that
-    means a reason on a finding verdict, which is a schema-visible change to
-    `check_run` semantics and not this fix's.)
+    not test" would lose the one thing the surface did prove. What a gap DOES
+    take from a finding is `considered`: the finding is reported, and the
+    surface's other issue types are not retired on evidence that was never
+    read. (What that leaves open: `Verdict.finding` carries no reason, so a
+    partially-covered surface that DID find something records no trace of the
+    gap in its own row. Closing that means a reason on a finding verdict,
+    which is a schema-visible change to `check_run` semantics and not this
+    fix's.)
+
+    `considered` NAMES WHAT THE CHECK EXAMINED, and only the two conclusive
+    returns carry it. An `inconclusive` verdict deliberately does not: the
+    surface's evidence was incomplete, so the check concluded nothing, and
+    `hx.scan._mark_unobserved` must not retire a finding on the strength of a
+    response it could not read.
     """
     if candidates:
-        return base.Verdict.finding(*candidates)
+        # F5 of the whole-branch review. This used to pass `considered`
+        # unconditionally while the `clean` return below required zero gaps,
+        # and the asymmetry retires findings: `considered` is what
+        # `hx.scan._mark_unobserved` reads, so a surface holding one
+        # unreadable exchange and one candidate found elsewhere claimed to
+        # have EXAMINED every issue type this check names -- including,
+        # exactly, the type whose only evidence was the exchange that could
+        # not be read. The finding is still reported (a candidate wins over a
+        # gap, above); what it may not do is retire its neighbours on
+        # evidence nobody could read.
+        return base.Verdict.finding(
+            *candidates, considered=() if evidence.gaps else considered)
     if not evidence.entries:
         return base.Verdict.inconclusive(
-            "no response could be read for this surface" + _detail(evidence))
+            "no response could be read for this surface"
+            + _detail(evidence.gaps))
     if evidence.gaps:
         return base.Verdict.inconclusive(
             "this surface's evidence is incomplete, so nothing found here "
-            "separates `tested, clean` from `never reached`" + _detail(evidence))
-    return base.Verdict.clean()
+            "separates `tested, clean` from `never reached`"
+            + _detail(evidence.gaps))
+    return base.Verdict.clean(considered=considered)
 
 
-def _detail(evidence: Evidence) -> str:
-    if not evidence.gaps:
+def _detail(gaps: tuple[str, ...]) -> str:
+    """The gap list as a coverage row shows it -- at most `_GAPS_SHOWN`, then
+    a count.
+
+    TAKES THE GAPS AND NOT AN `Evidence`, so that the active corpus can use
+    it too: `hx.checks.active._probe_util.verdict` collects a gap per probe
+    that came back without answering, and an operator reading a coverage row
+    must see them spelt the same way whichever half of the corpus wrote the
+    row.
+    """
+    if not gaps:
         return ""
-    shown = list(evidence.gaps[:_GAPS_SHOWN])
-    hidden = len(evidence.gaps) - len(shown)
+    shown = list(gaps[:_GAPS_SHOWN])
+    hidden = len(gaps) - len(shown)
     if hidden > 0:
         shown.append(f"and {hidden} more")
     return ": " + "; ".join(shown)
@@ -134,7 +200,7 @@ def _detail(evidence: Evidence) -> str:
 
 def header_names(head: bytes) -> list[str]:
     return [line.partition(b":")[0].decode("latin-1").strip()
-            for line in head.split(b"\r\n")[1:] if b":" in line]
+            for line in _header_lines(head) if b":" in line]
 
 
 def header_values(head: bytes, name: str) -> list[str]:
@@ -146,7 +212,7 @@ def header_values(head: bytes, name: str) -> list[str]:
     """
     want = name.lower()
     out = []
-    for line in head.split(b"\r\n")[1:]:
+    for line in _header_lines(head):
         key, sep, value = line.partition(b":")
         if sep and key.decode("latin-1").strip().lower() == want:
             out.append(value.decode("latin-1").strip())

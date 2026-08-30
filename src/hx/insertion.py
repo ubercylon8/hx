@@ -42,9 +42,9 @@ than an oversight:
     exclusion no test names is indistinguishable from one that was never
     there.
 
-The body kinds ARE derived and are NOT probeable in this plan or Plan 6: S4's
-production method allowlist is GET/HEAD/OPTIONS, so an active_safe check can
-only re-issue a GET. They are recorded so the coverage section can say
+The body kinds ARE derived and are NOT probeable in this plan or the active-
+checks plan that followed it: S4's production method allowlist is
+GET/HEAD/OPTIONS, so an active_safe check can only re-issue a GET. They are recorded so the coverage section can say
 `exists, not probed`, which is worth more than omitting them.
 """
 from __future__ import annotations
@@ -68,6 +68,74 @@ _NOT_INSERTABLE = frozenset({
 })
 
 
+def is_placeholder(segment: str) -> bool:
+    """Whether one path segment is a template placeholder.
+
+    THE ONE DEFINITION OF THE SHAPE, and it is read from two places rather
+    than spelt in each: `derive` below turns a placeholder into a
+    `path_segment` insertion point, and `hx.checks.probe.ProbeSender.get`
+    REFUSES to put one on the wire. Two spellings of "starts with `{`, ends
+    with `}`" would be two chances to disagree about the one thing separating
+    a template from an address, and the second of those callers is a safety
+    guard.
+
+    `hx.surface._template_segment` is what mints these -- `{id}`, `{uuid}`,
+    `{hex}`, `{slug}` -- and `hx.surface._kept_segment` percent-encodes a
+    literal `{` or `}` in every segment it KEEPS, so no captured segment can
+    forge one. `len > 2` excludes `{}`, which nothing mints.
+    """
+    return segment.startswith("{") and segment.endswith("}") and len(segment) > 2
+
+
+def _request_target(head: bytes) -> str | None:
+    """The request line's target, or None when there is no readable one.
+
+    The one place a captured request's request line is read. `request_path`
+    wants its path, `derive` wants its query, and a second `split` somewhere
+    else is a second chance to disagree about which field is which.
+
+    Tolerates a bare LF (RFC 9112 s2.2 requires a recipient to accept one),
+    stripping at most one trailing CR the way `hx.checks.passive._http.
+    _header_lines` does rather than every trailing CR: a lone CR before the
+    terminator is data.
+    """
+    line = head.split(b"\n", 1)[0]
+    if line.endswith(b"\r"):
+        line = line[:-1]
+    parts = line.split(b" ")
+    if len(parts) < 2:
+        return None
+    return parts[1].decode("latin-1")
+
+
+def request_path(request_bytes: bytes) -> str | None:
+    """The CONCRETE path this request asked for, in origin form.
+
+    THE ADDRESS, NOT THE TEMPLATE. `hx.surface` normalises `/user/12345/
+    profile` into the surface row's `path_template` `/user/{id}/profile`,
+    which is an identity and not somewhere a request can be sent: every
+    active check that built its probe out of it addressed a URL that cannot
+    exist and read the 404 as a clean answer. `hx.scan.run` reads this off
+    the surface's exemplar request instead and hands it to
+    `probe.ProbeSender`, so a probe goes where the capture went.
+
+    `urlsplit` because a captured request line can be ABSOLUTE-form as well
+    as origin-form -- that is how a browser addresses a proxy, which is the
+    only way anything reaches `hx.capture` today -- and the path is the same
+    field either way.
+
+    `None` rather than a guess for a request whose line cannot be read, or
+    whose target has no absolute path (`OPTIONS *`, an authority-form
+    CONNECT). The caller's answer to that is a `skipped` row naming it, never
+    a probe aimed at something invented here.
+    """
+    target = _request_target(request_bytes)
+    if target is None:
+        return None
+    path = urlsplit(target).path
+    return path if path.startswith("/") else None
+
+
 def derive(request_bytes: bytes, path_template: str) -> tuple[Insertion, ...]:
     """Every place a payload could go in this request.
 
@@ -87,11 +155,10 @@ def derive(request_bytes: bytes, path_template: str) -> tuple[Insertion, ...]:
     found: set[Insertion] = set()
 
     # --- the request line: query parameters and templated path segments ---
-    parts = lines[0].split(b" ")
-    if len(parts) >= 2:
-        target = parts[1].decode("latin-1")
-        query = urlsplit(target).query
-        for name, _value in parse_qsl(query, keep_blank_values=True):
+    target = _request_target(head)
+    if target is not None:
+        for name, _value in parse_qsl(urlsplit(target).query,
+                                      keep_blank_values=True):
             if name:
                 found.add(Insertion("query", name))
 
@@ -99,7 +166,7 @@ def derive(request_bytes: bytes, path_template: str) -> tuple[Insertion, ...]:
     # the normaliser already decided that and the finding is attributed to the
     # surface it produced. Re-guessing here would disagree with it.
     for segment in path_template.split("/"):
-        if segment.startswith("{") and segment.endswith("}") and len(segment) > 2:
+        if is_placeholder(segment):
             found.add(Insertion("path_segment", segment))
 
     # --- headers and cookies ---

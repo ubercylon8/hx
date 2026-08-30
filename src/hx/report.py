@@ -32,8 +32,9 @@ the review found this docstring claiming redaction "runs over everything
 rendered" while `records.redact_url` was called at exactly one site (the
 evidence URL) -- title, description, impact, remediation and the coverage
 table's `reason` cell all reached the export raw. `reason` is not a marginal
-vector: `hx.scan` builds it as `f"{type(exc).__name__}: {exc}"`
-(`scan.py:163`), an exception message that can quote a response body or a
+vector: `hx.scan` builds it as `f"{type(exc).__name__}: {exc}"` (`run`'s
+per-check `except Exception`), an exception message that can quote a
+response body or a
 request target, so it is attacker-influenced by construction. Every field
 below that can carry a URL -- a finding's title, description, impact and
 remediation, an evidence URL, a coverage reason, a run's `stop_reason`, a
@@ -68,6 +69,8 @@ import hashlib
 
 from hx import config as config_mod
 from hx import insertion as insertion_mod
+from hx import surface as surface_mod
+from hx.checks import probe
 from hx.checks import registry
 from hx.store import records
 from hx.store.blobs import CorruptBlob
@@ -219,7 +222,7 @@ def _by_class() -> tuple[tuple, tuple]:
     sentences -- "None were probed", "this build ships no active checks",
     "Every check in this build is passive" -- in a module that ALREADY
     derives its unshipped-class note from `registry.CHECKS` two functions
-    away. The first entry of Plan 6's active corpus makes all three false in
+    away. The first entry of this build's active corpus makes all three false in
     a client deliverable, with no test to redden: the Limits section would
     tell a client no request carrying a payload was ever issued while
     `check_run.requests_sent` said otherwise, and the passive-retest
@@ -807,18 +810,28 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # `## Findings` now that the severity group moved to `###`.
             #
             # D4 (fix round D). `finding.title` carries SERVER-CONTROLLED
-            # text: `cookie_flags.py:153` builds it as "Cookie {name} set
-            # without ...", and `name` is the cookie name off a `Set-Cookie`
+            # text: `cookie_flags.CookieFlags.on_surface` builds it as
+            # "Cookie {name} set without ...", and `name` is the cookie name
+            # off a `Set-Cookie`
             # RESPONSE header. The re-review judged a newline unreachable
-            # there on HTTP framing; it is not. `_http.header_values` splits
-            # the head on `\r\n` and `.strip()`s the value, so a BARE `\n`
-            # inside a header line survives both -- `Set-Cookie: se\nssion=1`
-            # yields the name `se\nssion` -- and this heading then ends at
-            # the newline with the remainder starting a line of its own.
-            # `_flat` is the whole fix: the heading is not a code span, so
-            # `_code` does not apply, and a backtick or a `**` in a heading
-            # is mangling that `_flat` deliberately does not touch (this
-            # module escapes, it does not drop).
+            # there on HTTP framing; that was wrong AT THE TIME. `_http.
+            # header_values` used to split the head on `\r\n` and `.strip()`
+            # the value, so a BARE `\n` inside a header line survived both --
+            # `Set-Cookie: se\nssion=1` yielded the name `se\nssion` -- and
+            # this heading would then end at the newline with the remainder
+            # starting a line of its own.
+            #
+            # That path is CLOSED as of `_http._header_lines` splitting on
+            # LF first (active-checks plan, bare-LF header parsing): a bare
+            # `\n` now terminates the header line before `header_values` ever
+            # sees it, so a cookie name can no longer carry one. `_flat` is
+            # kept anyway, and is still the whole fix here -- `title` is free
+            # text from ANY check, this build's and a future one's alike, and
+            # a guard that holds only because today's one producer of it
+            # happens to be safe is not a guard. The heading is not a code
+            # span, so `_code` does not apply, and a backtick or a `**` in a
+            # heading is mangling that `_flat` deliberately does not touch
+            # (this module escapes, it does not drop).
             out.append(f"#### {_flat(_redact(title))}\n")
             marker = ""
             observed = _latest_observed(conn, fid)
@@ -842,8 +855,9 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # and `_flat`'s own docstring says why that is wrong: "every
             # rendered free-text value is flattened -- not only the ones
             # that reach a table". They are free text by the same route the
-            # title is (`cookie_flags.py:161` interpolates the same
-            # server-controlled cookie name into `description`), and a
+            # title is (`cookie_flags.CookieFlags.on_surface` interpolates
+            # the same server-controlled cookie name into `description` a few
+            # lines below the title it builds), and a
             # newline in one starts a line at the top level of the
             # document. Flattening prose costs nothing a Markdown renderer
             # would have kept: a paragraph's own line breaks are already
@@ -1171,7 +1185,7 @@ def _insertion_coverage(conn, engagement_id, blobs) -> list[str]:
         return []
     _passive, active = _by_class()
     if active:
-        # F5: the moment Plan 6 registers its first active check, "None were
+        # F5: the moment the corpus registers its first active check, "None were
         # probed" is a sentence this module cannot support. It does not
         # become "all were probed" either -- `check_run.insertion_name`
         # exists but this build's coverage query does not read it, and
@@ -1287,6 +1301,189 @@ def _limits(conn, engagement_id) -> list[str]:
                    "config has no `method.allow` key, so the extension's "
                    "default method allowlist (GET, HEAD, OPTIONS) applies "
                    "unconditionally.")
+    if active:
+        # S12's own rule, applied to the EVIDENCE an active finding carries.
+        # Every active check in this build cites
+        # `surface.exemplar_exchange_id` -- the request the PROXY captured on
+        # the surface it found the flaw on -- because nothing in this build
+        # records a probe's own exchange: `HxExtension` registers proxy
+        # handlers only and `Capture.deliverExchange` hard-codes
+        # `h.put("via", "proxy")`, so no writer can produce an `exchange` row
+        # with any other `via`. A client reading an active finding is
+        # therefore looking at a citation that is NOT the request that proved
+        # it, and "a report that cannot distinguish tested-clean from
+        # never-reached is worse than no report" is the same rule one step
+        # down: a citation that cannot be distinguished from the proof is a
+        # citation a reader will replay and find nothing wrong with.
+        #
+        # BOTH HALVES ARE DERIVED, like the two bullets above and the crawl
+        # bullet: the checks come from the corpus, and whether this
+        # engagement holds any exchange hx itself issued comes from the
+        # store. `exchange.via` is CHECK-constrained to proxy|send|crawl, so
+        # the question is one this store answers -- and the day a send-path
+        # recorder lands, the engagement that used it stops being told its
+        # probe traffic was never recorded. LEFT JOINs on both sides because
+        # an `exchange` row reaches its engagement through EITHER column:
+        # `hx.capture` sets `surface_id` after the fact and the report
+        # fixtures set only `run_id`.
+        off_proxy = conn.execute(
+            "SELECT COUNT(*) FROM exchange x"
+            " LEFT JOIN surface s ON s.id = x.surface_id"
+            " LEFT JOIN run r ON r.id = x.run_id"
+            " WHERE x.via <> 'proxy'"
+            " AND (s.engagement_id = ? OR r.engagement_id = ?)",
+            (engagement_id, engagement_id)).fetchone()[0]
+        if off_proxy:
+            recorded = (f"{off_proxy} exchange(s) recorded here were issued "
+                        "by hx rather than captured through the proxy, and "
+                        "nothing records which of those a check's probe made")
+        else:
+            recorded = ("no exchange recorded for this engagement was issued "
+                        "by hx at all — every one of them was captured "
+                        "through the proxy")
+        out.append("- **An active finding cites captured traffic, not the "
+                   f"probe that proved it.** The {len(active)} active "
+                   f"check(s) in this build ({_names(active)}) cite the "
+                   "affected surface's captured exemplar request as their "
+                   f"evidence: {recorded}. The request shown under an active "
+                   "finding is therefore a request TO the affected surface, "
+                   "not the request that demonstrated the flaw; reproduce one "
+                   "from the finding's description and insertion point rather "
+                   "than by replaying its evidence bullet.")
+    if active:
+        # F3 OF THE WHOLE-BRANCH REVIEW: DISCLOSE, DO NOT FIX. `ProbeSender.
+        # _request_bytes` emits a request line, a `Host`, and at most the one
+        # header the check is probing -- nothing carries the exemplar's
+        # cookies, its `Authorization`, or the endpoint's OTHER parameters.
+        # Wiring identities into the sender reaches the identity model this
+        # build deliberately excludes; the client is told instead.
+        #
+        # THE SAFETY SENTENCE BELOW IS LOAD-BEARING AND HAS BEEN FALSE
+        # TWICE, WHICH IS WHY IT NO LONGER RESTS ON A LIST. It first credited
+        # fix round 1 with covering a login redirect; fix round 1 covered
+        # 401/403/404/429/5xx and left 3xx OUT, so the commonest shape of the
+        # very case this bullet describes -- a browser-facing application
+        # answering an unauthenticated probe with `302 /login` -- was read as
+        # a conclusive negative and retired live findings (N1 of the scoped
+        # re-review, measured end to end). Fix round 3 added 3xx, 400 and 405
+        # and this comment then declared the sentence true: it checked the
+        # three ADDITIONS and never asked what the set still OMITTED. 422,
+        # 410, 407, 406, 414 and their neighbours went on reading as answers,
+        # and a target refusing every probe with one of them rendered five
+        # `clean` Coverage rows -- under this very denial, measured end to
+        # end at the final review.
+        #
+        # So `_probe_util.unanswered` is a rule and not a set: it reads a 2xx
+        # and nothing else as an answer a check may reason about. The
+        # sentence below is true of every status there is rather than of the
+        # ones somebody remembered, and it cannot go stale as the web adds
+        # more. If that rule is ever loosened this sentence has to go with
+        # it, which is what `tests/test_report.py::test_the_unauthenticated_
+        # bullets_safety_claim_is_one_the_code_honours` holds -- it asks the
+        # doctrine itself for a status of each shape the sentence names, and
+        # for both rounds' counterexamples.
+        #
+        # WHAT NO RULE OVER STATUSES CAN CATCH is named in the same breath
+        # rather than left for the client to discover, and it is a CLASS
+        # rather than one shape: a refusal delivered UNDER a 2xx. The 200
+        # login page is the member that cost the most; an API reporting a
+        # rejected parameter in a 200 error envelope is another, and it is
+        # the same family as the 422 above. The bullet no longer claims to
+        # enumerate them -- "one shape escapes that" was itself a
+        # completeness claim, and the last one printed here was false.
+        #
+        # AND SINCE FIX ROUND 6 THE BULLET BELOW IT DISCLOSES A BEHAVIOUR AS
+        # WELL AS A GAP. F3 was decided as DISCLOSE, NOT FIX -- and a
+        # disclosure does not stop a retirement, which is the actual harm the
+        # 200-login-page shape does. Fix round 5 suppressed retirement only
+        # where the captured request carried a credential header; that
+        # predicate keyed on the first sighting and could read only a header
+        # NAME, so it could not tell a session cookie from an analytics one.
+        # `hx.scan._retirable` now refuses retirement for EVERY active check,
+        # so no shape of this can close a finding and the residual below is a
+        # coverage gap rather than a wrong closure. The bullet after this one
+        # is where the client is told, and `tests/test_report.py::test_the_
+        # bullet_that_says_active_findings_never_retire_is_one_the_code_
+        # honours` holds it against `scan._retirable` itself.
+        #
+        out.append("- **Every probe was sent unauthenticated.** The "
+                   f"{len(active)} active check(s) in this build "
+                   f"({_names(active)}) build each probe from the affected "
+                   "surface's captured request line and send nothing else "
+                   "with it: no cookie, no `Authorization`, and none of the "
+                   "endpoint's other parameters. Against an application that "
+                   "requires a session, a probe therefore tests the "
+                   "logged-out view of it. A login redirect, an authorisation "
+                   "refusal, or a rejection of the request itself is recorded "
+                   "as `inconclusive` rather than as a clean result — hx "
+                   "reads only a 2xx response as an answer it may reason "
+                   "about — so no surface is reported as tested on the "
+                   "strength of one, but nothing was covered on those "
+                   "surfaces either. What that cannot catch is a refusal "
+                   "delivered UNDER a 2xx: an application that answers a "
+                   "logged-out request with a 200 login PAGE, or an API that "
+                   "reports a rejected parameter in a 200 error envelope, "
+                   "cannot be told apart here from one that answered, so a "
+                   "probe against it is recorded as a clean result. That "
+                   "costs coverage and nothing more — the bullet below is "
+                   "why no clean result from an active check can close "
+                   "anything.")
+        out.append("- **An active finding is never automatically marked as "
+                   f"fixed.** The {len(active)} active check(s) in this build "
+                   f"({_names(active)}) re-issue requests, so a later scan "
+                   "does see the application as it is now — but it sees the "
+                   "logged-out view of it, for the reason above, and that is "
+                   "not the view your users are in. hx therefore never "
+                   "records a finding from one of these checks as no longer "
+                   "observed, however many times it is re-scanned and "
+                   "whatever those scans see. **Verify an active finding "
+                   "against the fixed application yourself before closing "
+                   "it.** Where the Coverage table shows one of these checks "
+                   "as `clean`, that means it ran and found nothing this "
+                   "time; it is not a statement that a previously reported "
+                   "issue is gone.")
+        # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
+        # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
+        # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.
+        # `hx.scan.run` declines these points before a check is handed them,
+        # so no budget is spent proving what the send path already refuses.
+        # Computed beside the one bullet that renders them: fix round 5 had a
+        # second reader (its suppression named the same three names at the
+        # client) and fix round 6 removed it.
+        #
+        # The insertion-point table is NOT cross-referenced here: it is
+        # conditional on a blob store this function does not have, and a
+        # bullet naming a section that may not have rendered is a worse
+        # disclosure than one that stands alone.
+        names = [f"`{h}`" for h in sorted(probe.CREDENTIAL_HEADERS)]
+        credential_headers = " or ".join(
+            [", ".join(names[:-1]), names[-1]] if len(names) > 1 else names)
+        out.append("- **Cookie and credential-header insertion points were "
+                   "not probed.** The extension refuses any request carrying "
+                   f"an {credential_headers} header it did not inject "
+                   "itself, so no active check can put a payload in one. "
+                   "Wherever the captured traffic held a cookie or one of "
+                   "those headers, that input was skipped rather than "
+                   "tested.")
+    # A NAME FILTER THAT CANNOT MATCH A PLACEHOLDER. Derived from the two
+    # halves that make it true: the check declares `path_segment`, and its own
+    # `probes_templated_segments` is the answer to running its name filter
+    # over `hx.surface.PLACEHOLDERS`. Either half changing removes this
+    # bullet, which is the point -- a typed sentence here would outlive the
+    # gap it describes.
+    unreachable = tuple(
+        c for c in active
+        if "path_segment" in (getattr(c, "insertion_kinds", None) or ())
+        and not getattr(c, "probes_templated_segments", True))
+    if unreachable:
+        placeholders = ", ".join(f"`{p}`" for p in surface_mod.PLACEHOLDERS)
+        out.append(f"- **{_names(unreachable)} probed no templated path "
+                   "segment.** It declares that insertion kind, but it probes "
+                   "a point only when the point's name looks like it names a "
+                   "file, and every templated segment hx can mint is one of "
+                   f"{placeholders} -- none of which does. Where this report "
+                   "says that check examined a surface, it examined that "
+                   "surface's query parameters.")
     if passive and not active:
         out.append("- **A fixed issue cannot be shown as fixed by "
                    "re-browsing.** "
@@ -1304,16 +1501,33 @@ def _limits(conn, engagement_id) -> list[str]:
         # PASSIVE check raised, and is false of the rest. Naming which
         # checks it covers is what keeps it a disclosure rather than a
         # blanket that has quietly stopped being true.
-        out.append("- **A fixed issue may not be shown as fixed by "
-                   "re-browsing.** The passive checks in this build "
-                   f"({_names(passive)}) read this engagement's whole "
+        #
+        # AND THE ACTIVE HALF OF THIS SENTENCE HAS NOW BEEN WRONG TWICE. It
+        # read "the active checks re-issue requests and are not limited this
+        # way" -- a claim about EVERY active finding -- until fix round 5
+        # qualified it by the credential header the capture carried, and fix
+        # round 6 removed retirement from the active corpus altogether. Both
+        # earlier versions pointed the client the same way ("the active
+        # findings will retire, so re-run the scan"), which is the direction
+        # a deliverable must not lean when it is false. The two halves now
+        # reach the same conclusion by different routes, and the sentence
+        # says which route each takes rather than merging them: a passive
+        # finding cannot retire because the offending exchange stays on file,
+        # an active one because hx will not close what an unauthenticated
+        # probe saw.
+        out.append("- **No finding in this report can be shown as fixed by "
+                   "re-running this assessment.** The passive checks in this "
+                   f"build ({_names(passive)}) read this engagement's whole "
                    "captured history for a surface, not only the newest "
                    "traffic, so one recorded response keeps a finding of "
                    "theirs live for the life of the engagement however much "
                    "clean traffic follows it; a retest of one must be run as "
                    "a NEW engagement against the fixed application. The "
-                   f"active checks ({_names(active)}) re-issue requests and "
-                   "are not limited this way.")
+                   f"active checks ({_names(active)}) do re-issue requests, "
+                   "but hx never marks one of their findings as no longer "
+                   "observed, for the reason the bullet above gives. Either "
+                   "way, a fix is confirmed by re-testing the application "
+                   "and not by re-reading this document.")
 
     dropped = conn.execute(
         "SELECT COALESCE(SUM(dropped_total), 0) FROM run WHERE engagement_id=?",

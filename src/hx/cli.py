@@ -6,6 +6,7 @@ rather than in the agent-facing tool layer.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import re
 import signal
@@ -294,7 +295,16 @@ def _sigterm_ends_the_session():
          "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
          "a guess, because the report records the version under test.",
 )
-def capture_start(kind, root, burp_jar) -> None:
+@click.option(
+    "--max-requests",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Per-run request budget, authorised on the extension's first "
+         "configure. Default: the engagement's own config.yaml (2000 if "
+         "unset) -- this flag overrides that number for this run only, it "
+         "does not rewrite config.yaml.",
+)
+def capture_start(kind, root, burp_jar, max_requests) -> None:
     """Launch Burp, open the live run of KIND, and hold the session open
     until interrupted.
 
@@ -307,6 +317,12 @@ def capture_start(kind, root, burp_jar) -> None:
     """
     path = root or default_root()
     eng = _open_engagement(path)
+    if max_requests is not None:
+        # A per-invocation OVERRIDE, not a rewrite: `eng.config` is replaced
+        # in memory so `session.config_body` picks it up, and `config.yaml`
+        # on disk is untouched -- the flag says what THIS run authorises,
+        # the file stays the record of what the operator wrote down.
+        eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
     try:
         with _sigterm_ends_the_session(), \
                 session_mod.session(eng, instance="capture", jar=burp_jar) as live:
@@ -525,10 +541,42 @@ def resume(root) -> None:
 @click.option("--max-seconds", type=int, default=None,
               help="Stop after this long. Remaining checks are recorded as "
                    "skipped, never left absent.")
-def scan(root, max_seconds) -> None:
+@click.option(
+    "--max-requests",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Per-run request budget an active check's session is authorised "
+         "against. Default: the engagement's own config.yaml (2000 if "
+         "unset) -- this flag overrides that number for this run only, it "
+         "does not rewrite config.yaml.",
+)
+# F6 of the whole-branch review. THE SAME OPTION `capture start` HAS, spelt
+# the same way and with the same help text, because it answers the same
+# question about the same launch. `hx scan` opens a Burp on every default
+# run now (`active_safe` is on in `DEFAULT_CHECKS` and five active checks
+# ship), and without this an operator with two jars in `$HX_BURP_LAB` and no
+# `$HX_BURP_JAR` could not scan at all: `find_burp_jar` refuses to guess,
+# deliberately -- the report records the version under test -- and this was
+# the only command with no way to answer it.
+@click.option(
+    "--burp-jar",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Which Burp jar to launch against. Default: $HX_BURP_JAR, then the "
+         "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
+         "a guess, because the report records the version under test.",
+)
+def scan(root, max_seconds, max_requests, burp_jar) -> None:
     """Run the enabled check corpus over everything captured so far."""
     path = root or default_root()
     eng = _open_engagement(path)
+    if max_requests is not None:
+        # Same override as `capture start`'s -- see its comment. `scan.run`
+        # takes `eng.config` as-is, and the active-check session opened
+        # below hands the same object to `session.config_body`, so this
+        # single replacement is what authorises the extension for THIS
+        # invocation. It must stay ahead of both.
+        eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
     try:
         surfaces = eng.db.execute(
             "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
@@ -541,15 +589,74 @@ def scan(root, max_seconds) -> None:
                        "through the proxy first, then scan")
             return
 
-        summary = scan_mod.run(
-            eng.db, engagement_id=eng.id, blobs=eng.blobs,
-            config=eng.config, max_seconds=max_seconds)
+        # THE SESSION IS OPENED HERE, AND ONLY WHEN SOMETHING WILL SEND.
+        # `scan.run` takes a bridge and never builds one: it has no
+        # engagement root, no jar and no business owning a JVM whose
+        # lifetime is a local variable's. This command has all three.
+        #
+        # ONLY WHEN SOMETHING WILL SEND, because a passive scan that paid
+        # Burp's ~10 s startup to send nothing would be a cost with no answer
+        # attached. THE COMMON `hx scan` IS NOT THAT SCAN ANY MORE, and the
+        # sentence here used to say it was: "the corpus this build ships is
+        # still all passive, so the common `hx scan` stays entirely offline"
+        # survived Tasks 7 through 13 and both of Task 13's fix rounds, by
+        # which time five `active_safe` checks were registered and
+        # `config.DEFAULT_CHECKS` had `active_safe: True`. A default-
+        # configured engagement opens a Burp on every scan; what stays
+        # offline is a scan of an engagement whose config has switched the
+        # active classes off, which is now the exception rather than the
+        # rule. The guard below is unchanged -- it was always the right
+        # guard, and only its justification was stale.
+        #
+        # TWO FILTERS, TWO DIFFERENT QUESTIONS, AND NEITHER IS RESTATED HERE.
+        # `registry.enabled` is the one place "switched on for this
+        # engagement" is decided, which also settles a class enabled with no
+        # checks in it (the shipped `active_timing`) -- `enabled` returns
+        # nothing for it, so it starts no Burp. `scan.needs_a_bridge` is the
+        # one place "will the runner send for this check" is decided, and it
+        # answers by asking which hook the runner would dispatch to.
+        #
+        # This second one was `c.klass != "passive"` until fix round 1 (LOW):
+        # a class-string restatement of a rule the registry owns, of exactly
+        # the kind `scan._runner_hook` refuses to make. A future non-passive
+        # class whose `_HOOKS` entry never gets `probes` would have launched
+        # a JVM here while `scan.run` called `on_surface` and sent nothing,
+        # with no test anywhere pinning the disagreement.
+        sending = tuple(c for c in registry.enabled(eng.config)
+                        if scan_mod.needs_a_bridge(c))
+        try:
+            if sending:
+                with session_mod.session(eng, instance="scan",
+                                          jar=burp_jar) as live:
+                    summary = scan_mod.run(
+                        eng.db, engagement_id=eng.id, blobs=eng.blobs,
+                        config=eng.config, max_seconds=max_seconds,
+                        bridge=live.bridge)
+            else:
+                summary = scan_mod.run(
+                    eng.db, engagement_id=eng.id, blobs=eng.blobs,
+                    config=eng.config, max_seconds=max_seconds)
+        except session_mod.SessionError as exc:
+            # The message intact, as `capture start` does: every one of
+            # them already names the fix (a stale socket to remove, an
+            # unbuilt extension jar, a listener that came up off loopback),
+            # and re-wording it here would put this command between the
+            # operator and the sentence that tells them what to do.
+            raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
         click.echo(f"findings  {summary.findings}")
         if summary.skipped:
             for reason, n in sorted(summary.by_reason.items()):
                 click.echo(f"skipped   {n} ({reason})")
+        # A DIFFERENT LINE FROM `skipped`, and F11's reason for existing: a
+        # skipped row is one the runner never ran, a refused probe is one it
+        # ran and the extension or the bridge said no to. `budget_exhausted`
+        # here is the operator's warning that everything after some point in
+        # the corpus was reported `inconclusive` -- the same sentence the
+        # run row's `stop_reason` now carries.
+        for reason, n in sorted(summary.refused.items()):
+            click.echo(f"refused   {n} ({reason})")
 
         # A class the operator enabled that this build ships nothing for.
         # Without this line, `active_timing: true` plus no rows reads as

@@ -293,6 +293,31 @@ def test_a_blank_entry_in_a_string_list_is_refused(tmp_path: Path):
             config.load(p)
 
 
+# --- Task 6: the request budget -------------------------------------------
+
+
+def test_max_requests_defaults_to_javas_documented_default():
+    """`Distress.java`/`HxExtension.DEFAULT_MAX_REQUESTS` documents 2000 as
+    `Limits.arm()`'s fallback. Matching it means adding the key changes no
+    behaviour for an operator who sets nothing -- the number was always
+    2000, it was just never said."""
+    cfg = config.Config(
+        name="acme-2026-09", client="Acme Corp",
+        scope_include=["https://app.acme.com/*"])
+    assert cfg.max_requests == 2000
+
+
+def test_max_requests_must_be_a_positive_integer(tmp_path: Path):
+    for bad in ("0", "-1", "true", "many"):
+        p = _write(
+            tmp_path,
+            "name: a\nclient: b\nscope:\n  include: ['https://a/*']\n"
+            f"max_requests: {bad}\n",
+        )
+        with pytest.raises(config.ConfigError, match="max_requests.*integer >= 1"):
+            config.load(p)
+
+
 def test_a_deliberately_empty_list_is_still_allowed(tmp_path: Path):
     """The blank-ENTRY guard must not become a no-empty-LISTS guard.
 

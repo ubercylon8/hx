@@ -96,14 +96,19 @@ def test_every_config_field_reaches_its_key(a_config):
     assert body["render.allow"] == a_config.render_allow
     assert body["limit.rate_rps"] == [str(a_config.rate_limit_rps)]
     assert body["limit.concurrency"] == [str(a_config.max_concurrency)]
+    assert body["limit.max_requests"] == [str(a_config.max_requests)]
     assert body["method.allow"] == ["GET", "HEAD", "OPTIONS"]
 
 
-def test_the_budget_key_is_absent(a_config):
-    # Java's Limits.arm() falls back to its documented default of 2000, and
-    # S4 says the budget never binds the operator's browser. The plan that
-    # spends it is the plan that bounds it.
-    assert "limit.max_requests" not in session.config_body(a_config)
+def test_the_budget_reaches_the_authorisation(a_config):
+    # Task 6: `hx.checks.probe.ProbeSender` is the send seam that spends the
+    # budget, so the plan that starts spending it is the plan that bounds it
+    # -- the key is no longer absent, and its value is `Config.max_requests`.
+    assert session.config_body(a_config)["limit.max_requests"] == [str(a_config.max_requests)]
+
+
+def test_the_budget_key_is_one_the_codec_permits(a_config):
+    assert set(session.config_body(a_config)) <= codec.CONFIG_KEYS
 
 
 # --- stored_scope_sha256 --------------------------------------------------

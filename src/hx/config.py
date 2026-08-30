@@ -50,6 +50,12 @@ class Config:
     dangerous_paths: list[str] = field(default_factory=lambda: list(DEFAULT_DANGEROUS_PATHS))
     checks: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_CHECKS))
     rate_limit_rps: int = 5
+    # `Limits.arm()` (extension/src/hx/send/Limits.java) falls back to this
+    # same number -- documented in HxExtension.DEFAULT_MAX_REQUESTS -- when a
+    # configure body omits `limit.max_requests`. Matching it means adding the
+    # field to this dataclass changes no behaviour for an operator who set
+    # nothing: the budget was always 2000, it was just never written down.
+    max_requests: int = 2000
     max_concurrency: int = 2
     identities: dict[str, dict] = field(default_factory=dict)
     # `preserve_segments` names path segments the normaliser must NOT template.
@@ -190,6 +196,7 @@ def load(path: Path) -> Config:
         dangerous_paths=_string_list(raw, "dangerous_paths", DEFAULT_DANGEROUS_PATHS),
         checks=checks,
         rate_limit_rps=_positive_int(raw, "rate_limit_rps", 5),
+        max_requests=_positive_int(raw, "max_requests", 2000),
         max_concurrency=_positive_int(raw, "max_concurrency", 2),
         identities=_mapping(raw, "identities"),
         preserve_segments=_string_list(raw, "preserve_segments", ["api", "v1", "v2", "v3"]),
@@ -208,6 +215,7 @@ def dumps(cfg: Config) -> str:
             "dangerous_paths": cfg.dangerous_paths,
             "checks": cfg.checks,
             "rate_limit_rps": cfg.rate_limit_rps,
+            "max_requests": cfg.max_requests,
             "max_concurrency": cfg.max_concurrency,
             "identities": cfg.identities,
             "preserve_segments": cfg.preserve_segments,
