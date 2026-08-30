@@ -17695,7 +17695,28 @@ public final class Sender {
                              + req.host());
         }
 
-        // ---- AND NOTHING BELOW THIS LINE REFUSES ------------------------
+        // ---- AND NOTHING BELOW THIS LINE DECIDES ------------------------
+        //
+        // NOT "nothing below refuses", which is what this banner said until
+        // the Task 5 review measured it false three ways over -- once in the
+        // very next statement and twice more below it: compose() refuses a
+        // range whose bytes are not the credential it was measured for
+        // (Redactor.RangeError -> `bad_frame`, as issue()'s own javadoc says),
+        // http.send failing is `transport_error`, and an overshot deadline is
+        // `timeout` -- all three before anything is framed as a result. That is
+        // the same defect cc886ac fixed one step higher -- a banner placed
+        // above the lines that contradict it -- reintroduced at the line the
+        // fix moved it to.
+        //
+        // WHAT IS TRUE HERE is the thing the ordering actually rests on: every
+        // POLICY question has been answered -- scope, method, dangerous path,
+        // the Gate, the unmanaged credential, the identity and its origin --
+        // and none of them can be re-asked once a credential has been written
+        // into the bytes. What can still fail below is mechanical: a range
+        // that does not check out, a transport that will not carry it, a clock
+        // that has run out. None of them is a decision this request could have
+        // been spared by asking earlier, which is why moving the composition
+        // above them would buy nothing and cost the ordering.
         //
         // The bytes that go on the wire, composed ONCE and here rather than in
         // the adapter: the Injected inside holds the array it was measured
@@ -17703,6 +17724,11 @@ public final class Sender {
         // an array no range set names. `ident` is null for an anonymous send,
         // and compose() then registers nothing -- an empty Injected, which
         // redactRequest answers with a verbatim copy.
+        //
+        // ChokepointTest.theCompositionHappensAfterTheGate is what holds this
+        // line's position: the behavioural suite cannot see compose() moved
+        // above policy.checkGate on its own, because the array it builds is
+        // local and a refused request discards it.
         Composed composed = compose(req, ident);
 
         HttpReply reply;
@@ -18722,6 +18748,8 @@ public class ChokepointTest {
           ChokepointTest::everyPathThatSpendsTheGateArmsItFirst);
         t("theGateIsSpentOnlyWhereTheHalvesArePaired",
           () -> theGateIsSpentOnlyWhereTheHalvesArePaired(sources));
+        t("theCompositionHappensAfterTheGate",
+          ChokepointTest::theCompositionHappensAfterTheGate);
         t("oneRunHasOnePolicy", () -> oneRunHasOnePolicy(sources));
         t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
@@ -19488,6 +19516,79 @@ public class ChokepointTest {
         }
         check("and no other file in extension/src asks either half -- the "
               + "entry point included " + elsewhere, elsewhere.isEmpty());
+    }
+
+    /**
+     * THE CREDENTIAL IS WRITTEN INTO THE BYTES AFTER THE GATE HAS ANSWERED.
+     *
+     * The refusal half of that ordering IS behavioural and is pinned:
+     * `IdentityInjectionTest.aRequestTheGateREFUSEDNeverHasACredentialWrittenIntoIt`
+     * hands the send path an input for which both a gate refusal and an
+     * identity refusal are available, and discriminates on WHICH class comes
+     * back. Moving the identity block above `policy.checkGate` turns that
+     * suite red -- measured by the Task 5 reviewer at 15 ALL PASS, rc=1,
+     * 2 FAIL, with exactly the two messages the report claimed.
+     *
+     * THE COMPOSITION HALF IS NOT, AND CANNOT BE. Moving `compose(` ALONE
+     * above the gate -- bytes built and the credential written in for a
+     * request the gate then refuses, both refusals left where they are --
+     * left the whole suite at 16 ALL PASS / 0 FAIL / rc=0, also measured by
+     * the reviewer. There is nothing for a behavioural test to see: the array
+     * is a local, the `Injected` is a local, the request is refused, and both
+     * are discarded with no trace outside `decideAndIssue` that any test can
+     * read. So it was held by a comment, and this method is what makes it a
+     * fact.
+     *
+     * WHAT IS ASSERTED IS THE ORDERING AND NOTHING MORE. Not that a
+     * pre-gate composition would leak -- it would not, on today's code; the
+     * consequence is bounded and the report said so. What it would break is
+     * §4's invariant that every byte leaving this machine crossed a point
+     * inside this JVM that decided about it: a credential written into a
+     * request the Gate has not yet allowed is a request assembled on the
+     * strength of no decision, and the only thing keeping it off the wire is
+     * that the refusal happens to return in time.
+     *
+     * THE COUNT IS TWO AND BOTH ARE CHECKED. `compose(` occurs twice in
+     * Sender.java's code -- the call in `decideAndIssue` and the declaration
+     * of the method itself -- and this does not try to tell them apart. It
+     * requires BOTH to sit after `.checkGate(`, which is sound whichever is
+     * which: the call is one of the two. The cost is that moving the
+     * DECLARATION above `decideAndIssue` would redden this for no behavioural
+     * reason, and that is the trade taken rather than a fragile needle that
+     * tries to name the call site alone. The count arm is what keeps "both"
+     * exact: a third occurrence would leave a middle one unexamined, and the
+     * count is what stops there being one.
+     *
+     * `.checkGate(` is read positionally here and its count is pinned at one
+     * by {@link #theGateIsSpentOnlyWhereTheHalvesArePaired} in this same
+     * class, so the offset taken below is the only occurrence rather than the
+     * first of several.
+     *
+     * WHAT IT DOES NOT SEE, the limitation every offset in this file carries:
+     * THESE ARE OFFSETS, NOT BRACE NESTING. A `compose(` moved into a branch
+     * that runs before the gate but written lower in the file would pass. What
+     * it catches is the mutation that was actually measured green -- the
+     * statement cut and pasted above `policy.checkGate`.
+     */
+    static void theCompositionHappensAfterTheGate() throws IOException {
+        String sender = code(Path.of(SENDER));
+        int composes = calls(sender, "compose(", "::compose");
+        check("compose( occurs twice in Sender.java -- one call, one "
+              + "declaration (" + composes + ")", composes == 2);
+        int gate = sender.indexOf(".checkGate(");
+        int firstCompose = sender.indexOf("compose(");
+        int lastCompose = sender.lastIndexOf("compose(");
+        // Anti-vacuity: indexOf answers -1 for a needle that is absent and -1
+        // is below every real offset, so a DELETED gate call would satisfy
+        // "after the gate" perfectly.
+        check("the Gate is asked in this file (" + gate + ")", gate >= 0);
+        check("and the composition is in it (" + firstCompose + ".."
+              + lastCompose + ")", firstCompose >= 0 && lastCompose > firstCompose);
+        check("the first compose( is after the Gate (" + gate + " < "
+              + firstCompose + ")", gate >= 0 && firstCompose > gate);
+        check("and so is the second, so whichever is the call site is after "
+              + "it (" + gate + " < " + lastCompose + ")",
+              gate >= 0 && lastCompose > gate);
     }
 
     /**
@@ -20620,8 +20721,9 @@ public class ChokepointTest {
      * method needles -- `http().sendRequest(`, `gate.decide(`, `limits.arm(`,
      * `pending.put(`, `recorder.record(`, `policy.decideScopeOnly(`,
      * `.authorisation()`, `HttpService.httpService(`,
-     * `HttpRequest.httpRequest(` -- all have rows, because they are counted
-     * somewhere too.
+     * `HttpRequest.httpRequest(`, and `.checkGate(` with `compose(` from
+     * {@link #theCompositionHappensAfterTheGate} -- all have rows, because
+     * they are counted somewhere too.
      *
      * What the positional exemption leaves open is narrower and is named where
      * it lives -- an ORDER check cannot see a call it does not spell, so
@@ -20734,6 +20836,11 @@ public class ChokepointTest {
                                                            "capture::start"},
             {"arm",                   "limits",     "(a)", "limits.arm(",
                                                            "limits::arm"},
+            // ...and the composition, counted by
+            // theCompositionHappensAfterTheGate so that the two offsets it
+            // then takes are known to be all of them.
+            {"compose",               "Sender",     "(a, b)", "compose(",
+                                                           "::compose"},
             // ...and the three the false sentence ALSO missed, found by
             // mechanising the direction it claimed rather than by re-reading
             // it. Each is a needle PAIR handed to calls() with no row here.

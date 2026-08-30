@@ -333,7 +333,28 @@ public final class Sender {
                              + req.host());
         }
 
-        // ---- AND NOTHING BELOW THIS LINE REFUSES ------------------------
+        // ---- AND NOTHING BELOW THIS LINE DECIDES ------------------------
+        //
+        // NOT "nothing below refuses", which is what this banner said until
+        // the Task 5 review measured it false three ways over -- once in the
+        // very next statement and twice more below it: compose() refuses a
+        // range whose bytes are not the credential it was measured for
+        // (Redactor.RangeError -> `bad_frame`, as issue()'s own javadoc says),
+        // http.send failing is `transport_error`, and an overshot deadline is
+        // `timeout` -- all three before anything is framed as a result. That is
+        // the same defect cc886ac fixed one step higher -- a banner placed
+        // above the lines that contradict it -- reintroduced at the line the
+        // fix moved it to.
+        //
+        // WHAT IS TRUE HERE is the thing the ordering actually rests on: every
+        // POLICY question has been answered -- scope, method, dangerous path,
+        // the Gate, the unmanaged credential, the identity and its origin --
+        // and none of them can be re-asked once a credential has been written
+        // into the bytes. What can still fail below is mechanical: a range
+        // that does not check out, a transport that will not carry it, a clock
+        // that has run out. None of them is a decision this request could have
+        // been spared by asking earlier, which is why moving the composition
+        // above them would buy nothing and cost the ordering.
         //
         // The bytes that go on the wire, composed ONCE and here rather than in
         // the adapter: the Injected inside holds the array it was measured
@@ -341,6 +362,11 @@ public final class Sender {
         // an array no range set names. `ident` is null for an anonymous send,
         // and compose() then registers nothing -- an empty Injected, which
         // redactRequest answers with a verbatim copy.
+        //
+        // ChokepointTest.theCompositionHappensAfterTheGate is what holds this
+        // line's position: the behavioural suite cannot see compose() moved
+        // above policy.checkGate on its own, because the array it builds is
+        // local and a refused request discards it.
         Composed composed = compose(req, ident);
 
         HttpReply reply;
