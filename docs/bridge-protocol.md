@@ -45,6 +45,11 @@ characters JSON requires are escaped: `"` `\\` and the control characters.
   py -> burp   configure   {v,t,id,deadline_us,engagement_id,scope_sha256,profile}
                            body: config lines (below)
   burp -> py   configured  {v,t,id,config_epoch}
+  py -> burp   identity    {v,t,id,deadline_us,engagement_id}
+                           body: {identity_id, generation,
+                                  inject: {header, value}, origins: [...]},
+                           JSON. THE ONE FRAME WHOSE BODY IS A SECRET
+  burp -> py   identity_registered  {v,t,id,identity_id,generation}
   py -> burp   send        {v,t,id,deadline_us,engagement_id,identity_id,target_host,target_port,tls}
                            body: raw HTTP request bytes
   burp -> py   result      {v,t,id,status,bytes,ms,outcome,config_epoch}
@@ -60,6 +65,27 @@ characters JSON requires are escaped: `"` `\\` and the control characters.
   burp -> py   dropped     {v,t,n,source}   unsolicited; no id. ONE body, empty.
   py -> burp   halt        {v,t,reason}
   py -> burp   resume      {v,t}
+
+`identity` is its own frame type and not a `configure` key. §5 and §6 say a later
+`configure` naming a different rate or budget is *refused, not applied* -- configure
+re-authorises **scope**, and a run must not talk its way into a larger allowance
+mid-flight. A programmatic refresh has to advance an identity's generation *without*
+re-opening scope, so folding identities into `configure` would either weaken that rule or
+make refresh impossible.
+
+Registration is per-identity and **idempotent by generation**: a frame naming the
+generation the extension already holds is accepted and changes nothing -- including its
+credential, so a second frame at the same generation cannot swap one -- and a *lower*
+generation is refused `stale_generation`. `origins` bounds which hosts the credential may
+be applied to, and is checked on the send path in addition to scope, never instead of it.
+The frame is refused unless the extension is configured and not halted, exactly as `send`
+is.
+
+**The `identity` body carries a live credential, so neither side logs it.** The bridge's
+diagnostics print frame kinds, correlation ids and -- for this frame -- the identity id
+and generation, which are not secrets. A second implementation must hold to that: this is
+the only frame in the protocol whose payload is a secret, and a debug line added later is
+exactly how it would leak.
 
 `send.engagement_id` is required. The extension serves exactly one engagement
 and refuses a send that names another with class `engagement_mismatch`, before
@@ -157,12 +183,35 @@ build the mapping the spec forbids.)
                          under the same `denial.kind`
     unmanaged_credential the request carries a credential header the extension
                          did not inject; refused AND never persisted
+    unknown_identity     the send names an `identity_id` the extension holds
+                         nothing for. FAIL CLOSED: issuing anonymously instead
+                         is the outcome the identity feature exists to prevent
+                         -- a `clean` answer about a view no user is in
+    identity_origin      the send's target host is not one of the identity's
+                         `origins`. Scope and origins answer different
+                         questions: a third-party host may be perfectly in
+                         scope and still have no business receiving the
+                         target's session
     transport_error      it was issued and no response came back
     timeout              the deadline passed; the caller has stopped waiting
     bridge_lost          the control channel went away
     bad_frame            the frame could not be read as a request at all
     engagement_mismatch  the frame names another engagement
     bad_config           the configure body could not be acted on
+    bad_identity         the `identity` body could not be acted on: unreadable
+                         JSON, a field missing or empty, or a frame the
+                         registry itself refuses. `bad_config`'s shape for the
+                         other body, with one difference -- it does NOT drop to
+                         DENY-ALL, because an identity frame is not the
+                         operator's authorisation for the run and refusing it
+                         leaves the scope in force untouched
+    stale_generation     the `identity` frame's generation does not advance the
+                         one the extension already holds. A REFUSAL BY DESIGN
+                         and not a fault: generation is monotonic for the
+                         reason the run's budget is, so a replayed or reordered
+                         frame cannot roll a session back to a credential the
+                         operator has already replaced. The identity in force
+                         is unchanged and the channel is kept
     protocol_mismatch    the frame's `v` is not this protocol version
     halted               issuance is stopped: a `halt` frame, the sentinel
                          file, a stalled sentinel poller, or the auto-halt on

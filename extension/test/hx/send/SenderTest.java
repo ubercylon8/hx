@@ -134,6 +134,10 @@ public class SenderTest {
     static final class FakeHttp implements Http {
         int calls = 0;
         HxRequest last;
+        /** The bytes Sender composed for the last call. Http takes them as a
+         *  parameter rather than building them from `last`, so this is what
+         *  actually goes to Burp -- including any injected identity header. */
+        byte[] lastWire;
         HttpReply reply = new HttpReply(200, RESPONSE, 12L, false);
         IOException boom = null;
         /** An UNCHECKED failure from inside issue(), which is a different
@@ -149,9 +153,10 @@ public class SenderTest {
         CyclicBarrier bothInFlight = null;
         volatile String barrierError = null;
 
-        public HttpReply send(HxRequest req, long deadlineUs) throws IOException {
+        public HttpReply send(HxRequest req, byte[] wire, long deadlineUs) throws IOException {
             calls++;
             last = req;
+            lastWire = wire;
             if (clock != null) clock.advance(advanceUsPerCall);
             if (bothInFlight != null) {
                 // Recorded rather than thrown: a barrier that timed out means
@@ -220,6 +225,10 @@ public class SenderTest {
         final FakeHttp http = new FakeHttp();
         final Redactor redactor = new Redactor();
         final RecordingNotifier notifier = new RecordingNotifier();
+        /** Empty unless a test registers something. Every case in this file
+         *  sends `identity_id: null`, so the registry is never consulted --
+         *  hx.send.IdentityInjectionTest is where it is. */
+        final IdentityRegistry identities = new IdentityRegistry();
         final HaltSwitch halt;
         final Distress distress;
         final Sender sender;
@@ -246,7 +255,8 @@ public class SenderTest {
                  : new HaltSwitch(clock, sentinel, HaltSwitch.DEFAULT_POLL_MS);
             // The spec s4 production defaults: 20% 5xx, 5x baseline latency.
             distress = new Distress(clock, 0.20, 5.0, maxConsecutiveErrors);
-            sender = new Sender(new Policy(gate), redactor, halt, distress, http, clock);
+            sender = new Sender(new Policy(gate), redactor, halt, distress, http, clock,
+                                identities);
             sender.setHaltNotifier(notifier);
         }
 

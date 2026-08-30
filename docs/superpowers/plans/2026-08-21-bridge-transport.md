@@ -1899,23 +1899,52 @@ Expected: FAIL — compilation error, `cannot find symbol: class Frame`
 // extension/src/hx/bridge/Json.java
 package hx.bridge;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
- * A JSON reader and writer for FLAT objects only.
+ * A JSON reader and writer. The HEADER it writes and reads is FLAT; a frame
+ * BODY it reads may nest.
  *
- * Values may be string, integer, boolean or null -- no nested objects, no
- * arrays. That is not a shortcut, it is the contract: the bridge header schema
- * is flat precisely so this parser stays small enough to be obviously correct,
- * and structured payloads travel in the frame body instead. A nested value is
- * rejected loudly rather than half-parsed.
+ * {@link #write} and {@link #parse} are the header pair, and header values may
+ * be string, integer, boolean or null -- no nested objects, no arrays. That is
+ * not a shortcut, it is the contract: the bridge header schema is flat
+ * precisely so this parser stays small enough to be obviously correct, and
+ * structured payloads travel in the frame body instead. A nested value in a
+ * header is rejected loudly rather than half-parsed.
+ *
+ * {@link #parseBody} is the BODY reader, and it is the same grammar with
+ * nesting allowed and a depth bound. It exists because the `identity` frame's
+ * body IS a structured payload -- `{"inject": {"header": ..., "value": ...},
+ * "origins": [...]}` -- written by `hx.bridge.codec.identity_body` on the
+ * Python side. ONE grammar and not two: the alternative was a second JSON
+ * reader for that one body, and two readers of one grammar that disagree
+ * about a surrogate pair, a control character or a leading zero is a frame
+ * that is valid on one side of the bridge and not the other. Nothing is
+ * loosened for the header path -- {@link #parse} sets the flag that permits
+ * nesting to false and every existing refusal is byte-identical.
  */
 public final class Json {
 
     public static class JsonError extends RuntimeException {
         public JsonError(String m) { super(m); }
     }
+
+    /**
+     * How many objects and arrays a body may nest INSIDE its outermost object.
+     *
+     * A BOUND, because the alternative to one is a StackOverflowError. A frame
+     * body is bounded only by {@link Frame#MAX_FRAME} -- 64 MB -- so a body of
+     * `[[[[[...` recurses as far as the peer chose to write, and a
+     * StackOverflowError is an Error rather than a RuntimeException: it is not
+     * a {@link JsonError} that any arm of the frame switch answers with a
+     * refusal. The identity body needs ONE level of nesting (`inject`, and
+     * `origins` beside it), so eight is generous for every body this protocol
+     * has and small enough that nothing can be reached through it.
+     */
+    static final int MAX_DEPTH = 8;
 
     private Json() { }
 
@@ -1965,14 +1994,32 @@ public final class Json {
 
     // ---- parsing ----------------------------------------------------
 
+    /** A frame HEADER: a FLAT object, exactly as before. */
     public static Map<String, Object> parse(String text) {
-        P p = new P(text);
+        return parse(text, false, "header");
+    }
+
+    /**
+     * A frame BODY: the same grammar with nesting allowed, bounded by
+     * {@link #MAX_DEPTH}.
+     *
+     * A separate entry point rather than a flag on {@link #parse}, so that no
+     * caller reaches nesting by accident and every header stays as flat as it
+     * was. The one body that uses it today is the `identity` frame's; see
+     * {@link IdentityBody}, which owns the SCHEMA while this owns the grammar.
+     */
+    public static Map<String, Object> parseBody(String text) {
+        return parse(text, true, "body");
+    }
+
+    private static Map<String, Object> parse(String text, boolean nested, String what) {
+        P p = new P(text, nested);
         Map<String, Object> out = parseObject(p);
         p.ws();
         // Python's json.loads raises "Extra data" here. Accepting it would let a
         // crafted frame be valid on one side of the bridge and not the other.
         if (p.i != text.length())
-            throw new JsonError("trailing data after the header object at " + p.i);
+            throw new JsonError("trailing data after the " + what + " object at " + p.i);
         return out;
     }
 
@@ -1996,10 +2043,32 @@ public final class Json {
         }
     }
 
+    /** A JSON array, for a body. Header values never reach this. */
+    private static List<Object> parseArray(P p) {
+        p.ws();
+        p.expect('[');
+        List<Object> out = new ArrayList<>();
+        p.ws();
+        if (p.peek() == ']') { p.next(); return out; }
+        while (true) {
+            p.ws();
+            out.add(p.value());
+            p.ws();
+            char c = p.next();
+            if (c == ']') return out;
+            if (c != ',') throw new JsonError("expected ',' or ']' at " + p.i);
+        }
+    }
+
     private static final class P {
         final String s;
+        /** Whether a nested object or array is a value here. False for every
+         *  header, which is what keeps the header schema flat. */
+        final boolean nested;
+        /** How many objects and arrays are open above the value being read. */
+        int depth = 0;
         int i = 0;
-        P(String s) { this.s = s; }
+        P(String s, boolean nested) { this.s = s; this.nested = nested; }
 
         char peek() {
             if (i >= s.length()) throw new JsonError("unexpected end of input");
@@ -2086,8 +2155,16 @@ public final class Json {
         Object value() {
             char c = peek();
             if (c == '"') return string();
-            if (c == '{' || c == '[')
-                throw new JsonError("header must be flat; nested values are not supported");
+            if (c == '{' || c == '[') {
+                if (!nested)
+                    throw new JsonError("header must be flat; nested values are not supported");
+                if (depth + 1 > MAX_DEPTH)
+                    throw new JsonError("body nests deeper than " + MAX_DEPTH + " at " + i);
+                depth++;
+                Object v = c == '{' ? parseObject(this) : parseArray(this);
+                depth--;
+                return v;
+            }
             if (s.startsWith("true", i))  { i += 4; return Boolean.TRUE; }
             if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }
             if (s.startsWith("null", i))  { i += 4; return null; }
@@ -7958,6 +8035,64 @@ public final class BridgeClient {
     public void setHaltSource(HaltSource s) { this.haltSource = s; }
 
     /**
+     * Where an `identity` frame's contents go: the registry the send path
+     * injects from.
+     *
+     * DECLARED HERE, for {@link SendHandler}'s and {@link HaltSink}'s reason.
+     * The registry lives in hx.send, hx.send already imports this class, and a
+     * type from hx.send named here would close that into a cycle -- which
+     * javac does not mind, because it sees every source at once, and which a
+     * reader trying to work out which of two files is the authority on a
+     * refusal does. So the bridge names a callback of its own and HxExtension,
+     * the file that already knows about both packages, wires the registry to
+     * it.
+     *
+     * The five parameters are the frame's, not the registry's: this interface
+     * is what the WIRE carries, and an implementation is free to hold it
+     * however it likes.
+     */
+    public interface IdentitySink {
+        /**
+         * Register or refresh one identity.
+         *
+         * @throws StaleIdentity the generation does not advance the one
+         *   already held. Answered `stale_generation`.
+         * @throws IllegalArgumentException the frame cannot be registered as
+         *   it stands. Answered `bad_identity`.
+         */
+        void register(String identityId, int generation, String header, String value,
+                      List<String> origins);
+    }
+
+    /**
+     * What an {@link IdentitySink} raises for a generation that goes backwards.
+     *
+     * Declared in the package that has to answer `stale_generation` on the
+     * wire, rather than caught by its own type from hx.send, for the reason
+     * IdentitySink itself is declared here. HxExtension's sink translates
+     * `IdentityRegistry.StaleGeneration` into this one, which is the only
+     * place the two vocabularies meet.
+     *
+     * A REFUSAL AND NOT A FAULT. A replayed or reordered frame carrying an
+     * older generation is exactly what the registry's monotonic rule exists to
+     * refuse, so the channel survives it: one frame is answered `error`, and
+     * the run goes on under the identity it already holds.
+     */
+    public static final class StaleIdentity extends RuntimeException {
+        public StaleIdentity(String m) { super(m); }
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile IdentitySink identitySink;
+
+    /** Install the identity registry. Called before connect(): until it is
+     *  installed every `identity` frame is refused, which is the right answer
+     *  -- a credential the send path could not have been given must not be
+     *  acknowledged as registered. */
+    public void setIdentitySink(IdentitySink s) { this.identitySink = s; }
+
+    /**
      * Whether a `configure` can be acted on, asked before it is committed.
      *
      * There is exactly one thing this answers today and spec s4 names it:
@@ -8367,6 +8502,96 @@ public final class BridgeClient {
                 }
                 Object raw = reply.remove(BODY_KEY);
                 send(reply, raw instanceof byte[] b ? b : new byte[0]);
+            }
+            case "identity" -> {
+                if (!(f.header.get("deadline_us") instanceof Long)) {
+                    // Required on every request frame, checked here for the
+                    // reason the configure arm checks it: a sender that omits
+                    // it is not speaking this protocol version properly.
+                    error(f, "bad_frame", "request frame has no deadline_us");
+                    return true;
+                }
+                if (!engagementId.equals(f.header.get("engagement_id"))) {
+                    error(f, "engagement_mismatch",
+                          "identity names engagement " + f.header.get("engagement_id")
+                          + " but this extension serves " + engagementId);
+                    return true;
+                }
+                // s5: "refused unless the extension is `configured` and not
+                // halted, exactly as `send` is". BOTH checks, and in the send
+                // path's order -- not_configured first, then the run-wide stop
+                // -- because the two answers are opposite instructions and an
+                // operator reading `halted` on an extension that was never
+                // configured would go looking for a halt nobody raised.
+                //
+                // It is not merely symmetry. Registering a credential is the
+                // one frame that puts a live secret into this JVM, and doing
+                // it for a run that is stopped, or one whose scope was never
+                // authorised, leaves it held for a send that may never be
+                // authorised to use it.
+                if (!configured.get()) {
+                    error(f, "not_configured", "no configure frame acknowledged yet");
+                    return true;
+                }
+                String stopped = halted.get()
+                        ? "halt frame: " + (haltReason == null ? "no reason given" : haltReason)
+                        : heldReason();
+                if (stopped != null) {
+                    error(f, "halted", stopped);
+                    return true;
+                }
+                IdentitySink sink = identitySink;
+                if (sink == null) {
+                    // Wiring, not policy -- the same shape as a missing
+                    // SendHandler, and EXTENSION_FAULT for the same reason:
+                    // "the operator has not authorised this run" and "this jar
+                    // is broken" are opposite instructions.
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "no identity sink is installed");
+                    return true;
+                }
+                IdentityBody.Parsed body;
+                try {
+                    body = IdentityBody.parse(f.body);
+                } catch (Frame.FrameError e) {
+                    error(f, "bad_identity", e.getMessage());
+                    return true;
+                }
+                try {
+                    sink.register(body.identityId(), body.generation(), body.header(),
+                                  body.value(), body.origins());
+                } catch (StaleIdentity e) {
+                    // A replayed or reordered frame, refused BY DESIGN. One
+                    // frame is answered; the channel and the held identity
+                    // both survive.
+                    error(f, "stale_generation", e.getMessage());
+                    return true;
+                } catch (IllegalArgumentException e) {
+                    error(f, "bad_identity", e.getMessage());
+                    return true;
+                }
+                // THE BODY IS NEVER LOGGED. Spec s5: this is the only frame in
+                // the protocol whose payload is a secret, and a debug line
+                // added later is exactly how it would leak. The id and the
+                // generation are not secrets and are what an operator needs to
+                // see; `body.value()` and `body.header()`'s content reach no
+                // log on either side, and `Parsed.toString()` is redacted so
+                // that an exception message cannot become the leak either.
+                log.info("hx: identity " + body.identityId()
+                         + " registered at generation " + body.generation());
+                Map<String, Object> ack = new LinkedHashMap<>();
+                ack.put("v", PROTOCOL_VERSION);
+                ack.put("t", "identity_registered");
+                ack.put("id", f.header.get("id"));
+                // Saying back WHICH identity is now at WHICH generation, so a
+                // caller can check what it registered without asking for the
+                // value. Not a secret and not derivable from `t` alone; the
+                // registry holds this generation for this id by the time this
+                // line runs, because an equal generation keeps the held entry
+                // (which is at the same number) and a lower one threw above.
+                ack.put("identity_id", body.identityId());
+                ack.put("generation", (long) body.generation());
+                send(ack, new byte[0]);
             }
             case "halt" -> {
                 // NOT String.valueOf(): for an absent key that answers the

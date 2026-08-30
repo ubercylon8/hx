@@ -31,6 +31,7 @@ import hx.proxy.Source;
 import hx.send.HaltSwitch;
 import hx.send.Http;
 import hx.send.HttpReply;
+import hx.send.IdentityRegistry;
 import hx.send.Limits;
 import hx.send.Redactor;
 import hx.send.Sender;
@@ -148,8 +149,16 @@ public class HxExtension implements BurpExtension {
         // is the wiring Task 7 needs; the inline construction this replaces is
         // the shape that makes a second one the natural thing to write.
         Policy policy = new Policy(limits);
+        // ONE registry for the whole extension, for the reason there is one
+        // Policy: the `identity` frame writes it and the send path reads it,
+        // and a second instance would be a credential registered into one and
+        // looked for in the other -- which fails as `unknown_identity`, so
+        // fail-closed, but with an operator who registered an identity and is
+        // told nothing knows about it.
+        IdentityRegistry identities = new IdentityRegistry();
         Sender sender = new Sender(policy, redactor, haltSwitch,
-                                   distress, montoyaHttp(api, clock), clock);
+                                   distress, montoyaHttp(api, clock), clock,
+                                   identities);
         // Auto-halt is extension-initiated: there is no outstanding id to
         // answer, so this frame is the only way the harness hears about a stop
         // before the next send fails -- and run.status = 'aborted' needs a
@@ -185,6 +194,22 @@ public class HxExtension implements BurpExtension {
         // silently ignored -- an operator who believes they slowed the run
         // down and did not is the failure this exists to prevent.
         c.setConfigGuard(limits::refuseIfLimitsMoved);
+        // The `identity` frame's landing place. NOT a method reference to
+        // `identities::register`, because the two sides spell a refusal
+        // differently and this is the one place they meet: the registry raises
+        // IdentityRegistry.StaleGeneration and the wire answers
+        // `stale_generation`, and BridgeClient must not import hx.send to
+        // learn that -- see BridgeClient.IdentitySink for why the dependency
+        // runs this way. IllegalArgumentException needs no translation: the
+        // sink's contract already names it as the malformed-frame signal, and
+        // the arm answers it `bad_identity`.
+        c.setIdentitySink((id, generation, header, value, origins) -> {
+            try {
+                identities.register(id, generation, header, value, origins);
+            } catch (IdentityRegistry.StaleGeneration e) {
+                throw new BridgeClient.StaleIdentity(e.getMessage());
+            }
+        });
 
         // ---- S4's SECOND enforcement point -------------------------------
         //
@@ -725,7 +750,7 @@ public class HxExtension implements BurpExtension {
      * something.
      */
     private static Http montoyaHttp(MontoyaApi api, Clock clock) {
-        return (req, deadlineUs) -> {
+        return (req, wire, deadlineUs) -> {
             // Monotonic, because this one IS a duration. Instant.now() would
             // measure an NTP step as latency and feed it to Distress, whose
             // latency rule stops the whole run at 5x baseline. Taken before the
@@ -743,8 +768,14 @@ public class HxExtension implements BurpExtension {
             try {
                 HttpService service = HttpService.httpService(
                         req.host(), Sender.portOf(req), Sender.secureOf(req));
+                // `wire`, NOT `Sender.wireBytes(req)`. Sender composes the
+                // request once, after the gate, and registers the byte range
+                // of any injected credential against THAT array -- and
+                // Redactor.Injected holds its array by identity. Re-serialising
+                // here would issue a third array that no range set names, and
+                // would drop the identity header for good measure.
                 HttpRequest request = HttpRequest.httpRequest(
-                        service, ByteArray.byteArray(Sender.wireBytes(req)));
+                        service, ByteArray.byteArray(wire));
 
                 // Burp's own timeout is an optimisation; ours is the
                 // enforcement. Sender re-reads the clock after this returns
