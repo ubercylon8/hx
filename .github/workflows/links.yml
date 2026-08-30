@@ -1,0 +1,25 @@
+mise ~/.config/mise/config.toml tools: gh@2.98.0
+name: Link check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lychee:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # zizmor[artipacked]: the checkout's credentials are not needed past this step.
+          persist-credentials: false
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8  # v2.9.0
+        with:
+          args: "--no-progress './**/*.md'"
+          fail: false  # external links rot; report, don't block
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # avoid anon GitHub rate limits

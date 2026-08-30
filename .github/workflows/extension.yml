@@ -1,0 +1,59 @@
+name: Extension
+
+# The Java half of hx. `extension/` holds the code that enforces every safety
+# rule -- scope, the method allowlist, the dangerous-path denylist, the rate
+# limit, budgets, auto-halt and redaction -- because spec section 4 puts the
+# enforcement point inside Burp's JVM where Python cannot reach past it. Until
+# this job existed, 2330 assertions guarding that boundary had no CI at all.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+    env:
+      # The API artifact, NOT Burp. `montoya-api` is PortSwigger's published
+      # extension API on Maven Central; Burp Suite itself is not redistributable
+      # and is not downloaded here or anywhere else in CI. This is the whole
+      # reason the Java suite can run on a runner while the integration suite
+      # cannot -- the latter needs the product, this needs only the interface.
+      MONTOYA_VERSION: "2025.5"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # zizmor[artipacked]: the checkout's credentials are not needed past this step.
+          persist-credentials: false
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c  # v6.0.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Fetch montoya-api from Maven Central
+        run: |
+          curl -sSfL -o /tmp/montoya-api.jar \
+            "https://repo1.maven.org/maven2/net/portswigger/burp/extensions/montoya-api/${MONTOYA_VERSION}/montoya-api-${MONTOYA_VERSION}.jar"
+      # extension/test.sh refuses to run without the jar rather than compiling a
+      # subset: without it every `import burp.api.montoya.*` is a javac error and
+      # ZERO summary lines print, which a naive `grep -q FAIL` would read as
+      # success. The count assertions below are the second half of that guard.
+      - name: Extension suite
+        run: MONTOYA_JAR=/tmp/montoya-api.jar ./extension/test.sh | tee /tmp/ext.out
+      # A suite that silently stops running half its assertions still exits 0 and
+      # still prints ALL PASS for whatever did run. These three numbers are the
+      # ones a shrinking suite changes, and they were measured against this commit
+      # rather than copied from a report. Raise them deliberately when the suite
+      # grows; never lower them to make a build green.
+      - name: Assert the suite did not shrink
+        run: |
+          suites=$(grep -ac 'ALL PASS' /tmp/ext.out)
+          oks=$(grep -ac '^  ok' /tmp/ext.out)
+          lines=$(wc -l < /tmp/ext.out)
+          echo "suites=$suites oks=$oks lines=$lines"
+          [ "$suites" -eq 13 ]   || { echo "::error::expected 13 ALL PASS, got $suites"; exit 1; }
+          [ "$oks" -ge 2330 ]    || { echo "::error::expected >=2330 ok lines, got $oks"; exit 1; }
+          [ "$lines" -ge 2352 ]  || { echo "::error::expected >=2352 output lines, got $lines"; exit 1; }
