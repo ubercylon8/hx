@@ -156,7 +156,7 @@ public final class Redactor {
      * direction -- it decides what may be WRITTEN -- so a trim would be
      * fail-OPEN: `"Cookie "` would match, and `withHeaderFirst` would then
      * emit `Cookie : v`, a field name with a space before its colon that
-     * RFC 9112 §2.2 requires a server to reject and that parsers disagree
+     * RFC 9112 §5.1 requires a server to reject and that parsers disagree
      * about, which is the shape a smuggling pair is built from.
      *
      * Case-insensitive because RFC 9110 §5.1 field names are, and matched on

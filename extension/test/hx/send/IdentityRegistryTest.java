@@ -284,7 +284,7 @@ public final class IdentityRegistryTest {
      * TRIMS -- correctly, because it is a fail-closed gate on a name the
      * harness sent -- and reusing it here would accept `"Cookie "`, which
      * `withHeaderFirst` then emits as `Cookie : v`: a field name with a space
-     * before its colon, which RFC 9112 s2.2 requires a server to reject and
+     * before its colon, which RFC 9112 s5.1 requires a server to reject and
      * which parsers disagree about. `Redactor.isCredentialHeader` exists
      * because acceptance and refusal want opposite answers here.
      */

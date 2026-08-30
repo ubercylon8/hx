@@ -11493,7 +11493,7 @@ public final class Redactor {
      * direction -- it decides what may be WRITTEN -- so a trim would be
      * fail-OPEN: `"Cookie "` would match, and `withHeaderFirst` would then
      * emit `Cookie : v`, a field name with a space before its colon that
-     * RFC 9112 §2.2 requires a server to reject and that parsers disagree
+     * RFC 9112 §5.1 requires a server to reject and that parsers disagree
      * about, which is the shape a smuggling pair is built from.
      *
      * Case-insensitive because RFC 9110 §5.1 field names are, and matched on
@@ -19529,15 +19529,23 @@ public class ChokepointTest {
      * suite red -- measured by the Task 5 reviewer at 15 ALL PASS, rc=1,
      * 2 FAIL, with exactly the two messages the report claimed.
      *
-     * THE COMPOSITION HALF IS NOT, AND CANNOT BE. Moving `compose(` ALONE
-     * above the gate -- bytes built and the credential written in for a
-     * request the gate then refuses, both refusals left where they are --
-     * left the whole suite at 16 ALL PASS / 0 FAIL / rc=0, also measured by
-     * the reviewer. There is nothing for a behavioural test to see: the array
+     * THE COMPOSITION HALF IS NOT, AND CANNOT BE. The reviewer reported
+     * moving `compose(` ALONE above the gate -- bytes built and the credential
+     * written in for a request the gate then refuses, both refusals left where
+     * they are -- at 16 ALL PASS / 0 FAIL / rc=0. THAT LITERAL MUTATION DOES
+     * NOT COMPILE on this tree: `ident` is resolved below the gate, so the
+     * statement has nothing to pass. What was re-measured here is the nearest
+     * mutation that does compile and has the same effect -- a second
+     * `compose` of the same identity, resolved and composed above
+     * `policy.checkGate`, with every refusal left exactly where it is. Against
+     * the suite WITHOUT this method it is 16 ALL PASS / 0 FAIL / rc=0, which
+     * is the claim that matters. There is nothing for a behavioural test to
+     * see: the array
      * is a local, the `Injected` is a local, the request is refused, and both
      * are discarded with no trace outside `decideAndIssue` that any test can
      * read. So it was held by a comment, and this method is what makes it a
-     * fact.
+     * fact: against the suite WITH it, the same mutation is 15 ALL PASS,
+     * 2 FAIL, rc=1, both FAILs here.
      *
      * WHAT IS ASSERTED IS THE ORDERING AND NOTHING MORE. Not that a
      * pre-gate composition would leak -- it would not, on today's code; the

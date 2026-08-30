@@ -288,9 +288,10 @@ def build_config_body(pairs: dict[str, list[str]]) -> bytes:
 def _refuse_unwritable(identity_id: str, what: str, text: str) -> None:
     """Refuse text the extension could not write into a header as itself.
 
-    THE SAME RULE `build_config_body` TWENTY LINES ABOVE ALREADY APPLIES, and
-    the one body in this protocol that carries a live credential was the one
-    body less strict about it than the config writer. `Sender.compose` writes
+    THE SAME RULE `build_config_body` DIRECTLY ABOVE ALREADY APPLIES to a
+    config value, and the one body in this protocol that carries a live
+    credential was the one body less strict about it than the config writer.
+    `Sender.compose` writes
     `header + ": " + value` and ends the field with CRLF, so:
 
       * CR or LF splits the field. `"sess=1\\r\\nX-Smuggled: yes"` issues a
@@ -362,9 +363,9 @@ def identity_body(identity_id: str, generation: int, header: str, value: str,
     than a refusal there.
 
     AND THE HEADER AND VALUE MUST BE WRITABLE AS THEMSELVES -- see
-    `_refuse_unwritable`, which is the same rule `build_config_body` twenty
-    lines above already applies to a config value, arriving late at the one
-    body that carries a credential.
+    `_refuse_unwritable`, which is the rule `build_config_body` has always
+    applied to a config value, arriving late at the one body in this protocol
+    that carries a credential.
     """
     if not identity_id:
         raise FrameError("an identity frame needs an identity_id")
