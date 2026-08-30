@@ -1178,10 +1178,10 @@ def build_config_body(pairs: dict[str, list[str]]) -> bytes:
 def _refuse_unwritable(identity_id: str, what: str, text: str) -> None:
     """Refuse text the extension could not write into a header as itself.
 
-    THE SAME RULE `build_config_body` DIRECTLY ABOVE ALREADY APPLIES to a
-    config value, and the one body in this protocol that carries a live
-    credential was the one body less strict about it than the config writer.
-    `Sender.compose` writes
+    THE NEWLINE HALF OF THIS IS THE RULE `build_config_body` DIRECTLY ABOVE
+    HAS ALWAYS APPLIED to a config value ("rejected rather than escaped"), and
+    the one body in this protocol that carries a live credential was the one
+    body less strict about it than the config writer. `Sender.compose` writes
     `header + ": " + value` and ends the field with CRLF, so:
 
       * CR or LF splits the field. `"sess=1\\r\\nX-Smuggled: yes"` issues a
@@ -1190,8 +1190,10 @@ def _refuse_unwritable(identity_id: str, what: str, text: str) -> None:
         registered range ARE the credential, and for a CRLF-carrying value
         they are. A blank line ends the head early and turns the caller's
         remaining fields, `Host` included, into a body.
-      * NUL cannot split a field and is refused anyway: it terminates a string
-        in most of what sits between here and a socket.
+      * NUL cannot split a field and is refused anyway: RFC 9110 s5.5's
+        field-content admits VCHAR, SP, HTAB and obs-text and nothing else, so
+        a credential carrying one is a credential whose treatment is left to
+        whatever parses it.
       * anything above U+00FF is SILENTLY MANGLED. `Sender.wireBytes` encodes
         ISO-8859-1 and Java replaces an unmappable character with `?`, so
         `sess=€123` goes out as `sess=?123` -- a dead credential, an
@@ -1199,8 +1201,10 @@ def _refuse_unwritable(identity_id: str, what: str, text: str) -> None:
 
     THIS IS THE EARLIER ERROR, NOT THE ENFORCEMENT. `IdentityRegistry.register`
     refuses all three on the extension side and that is the check the invariant
-    rests on -- spec section 4 is explicit that the JVM may not depend on this
-    process being correct. What this buys is a refusal raised where the
+    rests on -- spec section 4 puts both enforcement points "inside the JVM",
+    so a check living in this process is not one of them and a run whose
+    harness was replaced, patched or bypassed is exactly the case it must hold
+    for. What this buys is a refusal raised where the
     operator's own `refresh` command and environment variable are in view,
     before a frame is written, rather than a `bad_identity` coming back over a
     socket.

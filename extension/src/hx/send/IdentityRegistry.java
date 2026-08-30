@@ -23,10 +23,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * happens to hold an Entry.
  *
  * WHAT MAY BE WRITTEN ONTO THE WIRE IS DECIDED HERE, NOT BY THE CALLER. §4's
- * invariant is that every byte leaving this machine crosses a point inside
- * this JVM that decided about it, and `Policy.checkGate` decides about a
- * REQUEST -- so bytes appended to that request after it answered are bytes
- * nothing decided about. {@link Sender#compose} appends
+ * invariant is that "every byte that leaves this machine crosses exactly one
+ * of two enforcement points, BOTH INSIDE THE JVM", and `Policy.checkGate`
+ * decides about a REQUEST -- so bytes appended to that request after it
+ * answered are bytes that crossed no such point. {@link Sender#compose} appends
  * `header + ": " + value` and its self-check cannot see the difference: it
  * verifies that the bytes at the registered range ARE the credential, and a
  * value containing CRLF satisfies that exactly while splitting into a second
@@ -149,10 +149,13 @@ public final class IdentityRegistry {
      *     caller's remaining fields, `Host` included, into a body;
      *     {@code "\r\nContent-Length: 0"} is a request-smuggling primitive
      *     written by the enforcement point itself.
-     *   - NUL is not CR or LF and cannot split a header, and it is refused
-     *     anyway: it terminates a string in most of what sits between here and
-     *     a socket, and a credential that is one length in this JVM and
-     *     another on the wire is one whose registered range means nothing.
+     *   - NUL IS NOT LEGAL FIELD CONTENT. It cannot split a header, and it is
+     *     refused anyway: RFC 9110 §5.5's field-content admits VCHAR, SP, HTAB
+     *     and obs-text and nothing else, so a credential carrying one is a
+     *     credential whose treatment is left to whatever parses it. Everything
+     *     between here and the socket is Java, so this is NOT a claim that it
+     *     would be truncated somewhere -- it is a refusal to write a field the
+     *     grammar does not admit and then reason about what came back.
      *   - ABOVE LATIN-1 IS SILENTLY MANGLED. `wireBytes` encodes ISO-8859-1
      *     and `String.getBytes` replaces an unmappable character with '?', so
      *     {@code "sess=€123"} goes out as {@code "sess=?123"}: a

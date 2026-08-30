@@ -11487,7 +11487,7 @@ public final class Redactor {
      * would inject anything else without keeping a second copy of the list.
      *
      * IT DOES NOT TRIM, and that is the one way it deliberately differs from
-     * {@link #asciiEqualsIgnoreCase(String, String)} beside it. That matcher
+     * {@link #asciiEqualsIgnoreCase(String, String)} below. That matcher
      * trims OWS because it is a FAIL-CLOSED gate on a name the harness sent:
      * widening it can only produce extra refusals. This one is the opposite
      * direction -- it decides what may be WRITTEN -- so a trim would be
@@ -11497,9 +11497,11 @@ public final class Redactor {
      * about, which is the shape a smuggling pair is built from.
      *
      * Case-insensitive because RFC 9110 §5.1 field names are, and matched on
-     * ASCII alone for {@link #asciiLower}'s locale reason. The
-     * `equalsIgnoreCase` half of that reasoning -- which the matcher below
-     * calls a preference, because nothing there rests on it -- does carry
+     * ASCII alone for the locale reason written on
+     * {@link #asciiEqualsIgnoreCase(String, String)}: `toLowerCase()` folds
+     * per the DEFAULT locale, and in tr_TR 'I' folds to 'ı'. The
+     * `equalsIgnoreCase` half of that reasoning -- which that javadoc calls a
+     * preference, because nothing there rests on it -- does carry
      * weight here: "COOKIE" spelled with a U+212A KELVIN SIGN is
      * `equalsIgnoreCase` "cookie", and the answer this method gives is an
      * ACCEPTANCE. Registration refuses that spelling before it can reach this
