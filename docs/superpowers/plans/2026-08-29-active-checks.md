@@ -1304,8 +1304,8 @@ _NOT_ISSUED = frozenset({
     # test separates from its absence.
     "unmanaged_credential",
     # The identity pair, and they are here on the same ground and NOT on the
-    # same mechanism -- see the module docstring. `Sender.decide()` answers
-    # both after `policy.checkGate` rather than before it, so each has already
+    # same mechanism -- see the module docstring. `Sender.decideAndIssue`
+    # answers both AFTER `policy.checkGate`, not before, so each has already
     # cost a rate token and a budget slot inside the JVM; what neither has
     # done is reach the target, because both `return error(...)` above
     # `compose()` and `http.send`. The set is about the traffic hx put on a
