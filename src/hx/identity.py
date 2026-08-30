@@ -95,9 +95,37 @@ def refresh(ident: Identity, generation: int) -> Resolved:
         raise IdentityError(
             f"refresh command for {ident.id!r} could not run: {exc}") from exc
     if proc.returncode != 0:
+        # THE COMMAND'S OUTPUT DOES NOT TRAVEL WITH THIS MESSAGE, and that
+        # sentence is the whole of the guard. F1 of fix round A: this string
+        # is caught by `hx.scan._IdentityBracket._settle`, interpolated into
+        # an `IdentityDead`, and written to `run.stop_reason`, which
+        # `hx.report._provenance` renders on the CLIENT-FACING page through a
+        # `_redact` that strips URL userinfo and nothing else. The command
+        # whose stderr this was is the one that MINTS A CREDENTIAL: a
+        # `curl -v`, a `set -x`, or an auth error quoting the request it just
+        # made prints the token on stderr, and 200 bytes of it went into the
+        # deliverable. Task 7 is what made that path reachable -- before it,
+        # nothing a run could execute called this function at all.
+        #
+        # NOT TRUNCATED HARDER, NOT SUMMARISED, NOT HASHED. Each of those is
+        # still a function of the secret, and a shorter prefix of a bearer
+        # token is still a prefix of a bearer token. The exit code stays
+        # because it is the command's own status and carries nothing of what
+        # the command printed, and it is what tells an operator which of
+        # their own failures they are looking at.
+        #
+        # WHERE THE OPERATOR GETS THE OUTPUT: by running the command, which
+        # is theirs. There is no operator-only channel here to divert it to
+        # -- `hx.scan.run` builds its one `CheckContext` with
+        # `log=lambda s: None` -- so a field holding it would be a leak
+        # waiting for its first reader, which is F5's complaint pointed the
+        # other way.
         raise IdentityError(
-            f"refresh command for {ident.id!r} exit {proc.returncode}: "
-            f"{proc.stderr.strip()[:200]}")
+            f"refresh command for {ident.id!r} exit {proc.returncode}. Its "
+            "output is deliberately not repeated here: this message reaches "
+            "the client-facing report, and the stderr of a command that "
+            "mints a credential is presumed to carry one. Run the command "
+            "yourself to see what it said")
     value = proc.stdout.strip()
     if not value:
         raise IdentityError(

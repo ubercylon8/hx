@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from hx import config, identity
@@ -94,3 +96,31 @@ def test_resolve_refuses_a_programmatic_identity_by_name():
     """
     with pytest.raises(identity.IdentityError, match="minted by refresh"):
         identity.resolve(_programmatic(["true"]), {})
+
+
+def test_a_failing_refresh_commands_stderr_is_not_in_the_message():
+    """F1 OF FIX ROUND A, AT THE POINT THE MESSAGE IS BUILT.
+
+    This exception's text is caught by `hx.scan._IdentityBracket._settle`,
+    interpolated into an `IdentityDead`, and -- before the store-point cut in
+    `hx.scan._halt_reason` -- written verbatim to `run.stop_reason`, which
+    `hx.report._provenance` renders on the client-facing page. The command
+    whose stderr it was is the one that MINTS the credential, so its output
+    is presumed to be one: a `curl -v`, a `set -x` or an auth error quoting
+    the request it just made prints the token there.
+
+    `tests/test_scan_probes.py::test_a_failing_refresh_commands_output_never_
+    reaches_a_rendered_report` is the same fact asserted on the deliverable.
+    This one holds the half that must not depend on it.
+    """
+    leaky = [sys.executable, "-c",
+             "import sys; sys.stderr.write("
+             "'Authorization: Bearer SUPERSECRET\\n'); raise SystemExit(3)"]
+    with pytest.raises(identity.IdentityError) as raised:
+        identity.refresh(_programmatic(leaky), generation=1)
+
+    assert "SUPERSECRET" not in str(raised.value)
+    assert "exit 3" in str(raised.value), (
+        "the exit code is what tells an operator WHICH of their failures "
+        "this is, and it carries nothing the command printed")
+    assert "admin" in str(raised.value), "the message names no identity"

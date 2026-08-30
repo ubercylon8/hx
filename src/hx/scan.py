@@ -75,7 +75,35 @@ class IdentityDead(Exception):
     `run()`'s own `except BaseException` closes the row `error` and re-raises
     -- and each of those messages says which of the two actually happened,
     which "could not be proved live" would not.
+
+    IT CARRIES ITS OWN `stop_reason`, AND `run` STORES THAT RATHER THAN
+    `str(self)`. F1 of fix round A. `run`'s `except BaseException` wrote
+    `f"...: {exc}"` into `run.stop_reason`, and `hx.report._provenance`
+    renders a non-completed run's `stop_reason` onto the CLIENT-FACING page
+    through a `_redact` that strips URL userinfo and nothing else -- so every
+    string any raise site ever interpolates into this exception was one edit
+    away from the deliverable, and one of them already carried a failing
+    refresh command's stderr out of `hx.identity.refresh`.
+
+    So the two halves are separated and they are not the same sentence. The
+    MESSAGE is for the operator's terminal and may say as much as it likes,
+    including chaining an exception from outside this process. The
+    `stop_reason` is composed by the raise site out of values this module
+    holds -- an identity id, which phase of the bracket failed, and a
+    refusal class from the wire's own vocabulary -- and is the only half
+    that crosses into the store. The cut is here as well as at
+    `hx.identity.refresh` on purpose: a containment that lives only at
+    today's one leaking call site is a containment the next call site does
+    not get.
     """
+
+    def __init__(self, message: str, *, stop_reason: str) -> None:
+        # KEYWORD-ONLY AND REQUIRED, so a raise site cannot acquire the old
+        # behaviour by forgetting: without it this class would default to
+        # storing its own message again the first time someone added a
+        # fourth raise site in a hurry.
+        super().__init__(message)
+        self.stop_reason = stop_reason
 
 
 @dataclass
@@ -662,7 +690,7 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
         # crash instead of a fast retest. `error`, not `completed`: S5 "an
         # aborted run must never render as a clean one."
         run_mod.close_run(conn, run_id=run_id, status="error",
-                          stop_reason=f"scan.run raised: {type(exc).__name__}: {exc}")
+                          stop_reason=_halt_reason(exc))
         raise
     # F7 of the task-6 review: a budget-truncated scan used to close
     # `('completed', NULL)`, identical at the `run` row to a scan that
@@ -706,6 +734,36 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     run_mod.close_run(conn, run_id=run_id, status="completed",
                       stop_reason=stop_reason)
     return summary
+
+
+def _halt_reason(exc) -> str:
+    """What a run that RAISED writes to `run.stop_reason`.
+
+    ONE EXCEPTION TYPE DOES NOT GET TO SPEAK FOR ITSELF HERE, and F1 of fix
+    round A is why. This string is stored and then RENDERED:
+    `report._provenance` puts a non-completed run's `stop_reason` on the
+    client-facing page, through a `_redact` that is `records.redact_url` and
+    strips URL userinfo and nothing else. `IdentityDead` is the one exception
+    reaching this line whose text is assembled from something outside this
+    process -- a refresh command's own output, by way of
+    `hx.identity.refresh` -- so its text is not what is stored. Its
+    `stop_reason`, composed at the raise site from an identity id and which
+    phase of the bracket failed, is.
+
+    EVERY OTHER EXCEPTION KEEPS ITS TEXT, and that is a decision rather than
+    an omission. A `sqlite3.Error`, a `BridgeError` or a `codec.FrameError`
+    says what happened and there is nothing else available to say it;
+    `report._provenance`'s own comment has named this field
+    attacker-influenceable free text since fix round B and routes it through
+    `_redact` for that reason; and narrowing it to a bare type name would
+    take away the only diagnosis a crashed run has. What made `IdentityDead`
+    different is not that its text is untrusted -- all of them are -- but
+    that a SUBPROCESS'S STDERR reached it, which no other exception on this
+    path can do.
+    """
+    if isinstance(exc, IdentityDead):
+        return f"scan.run raised: IdentityDead: {exc.stop_reason}"
+    return f"scan.run raised: {type(exc).__name__}: {exc}"
 
 
 # --- the identity a run issues under --------------------------------------
@@ -883,7 +941,9 @@ class _IdentityBracket:
                 "not answer with the signature this identity is declared to "
                 "prove itself by. Halting rather than scanning anonymously: "
                 "an unauthenticated run of an authenticated application "
-                "answers `clean` about a view none of its users are in")
+                "answers `clean` about a view none of its users are in",
+                stop_reason=(f"identity {self.resolved.id!r} could not be "
+                             "proved live before the first probe"))
 
     def note(self, probes: int) -> None:
         """Count probes issued inside the current window.
@@ -923,7 +983,9 @@ class _IdentityBracket:
                 "the signature it is declared to prove itself by. Halting "
                 "rather than issuing the rest of this run's probes "
                 "unauthenticated, which would answer `clean` for every "
-                "surface still to come")
+                "surface still to come",
+                stop_reason=(f"identity {self.resolved.id!r} stopped being "
+                             "live during the run"))
         self.window.open(passed=True)
 
     def finish(self) -> None:
@@ -971,9 +1033,19 @@ class _IdentityBracket:
             # exception's own subject -- the cause is chained, so the
             # command's exit code or its empty output is still in the
             # traceback an operator reads.
+            #
+            # `{exc}` IS IN THE MESSAGE AND NOT IN THE `stop_reason`, and
+            # that is F1 of fix round A in one line. This is the only place
+            # in the runner where a string built outside the process reaches
+            # an exception a halted run records: `hx.identity.refresh` no
+            # longer repeats the command's stderr, and this half keeps the
+            # containment even if a future message there does.
             raise IdentityDead(
                 f"identity {self.resolved.id!r} failed its canary and could "
-                f"not be refreshed: {exc}") from exc
+                f"not be refreshed: {exc}",
+                stop_reason=(f"identity {self.resolved.id!r} failed its "
+                             "canary and its refresh command failed too")
+            ) from exc
         self._bridge.register_identity(self.resolved, origins=self._origins)
         return raw, self._canary()
 

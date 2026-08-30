@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
+import sys
 from urllib.parse import unquote_to_bytes
 
 import pytest
@@ -2223,3 +2224,106 @@ def test_a_passive_only_scan_sends_no_canary(tmp_path):
                        identity=_resolved())
     assert bridge.calls == 0 and bridge.identity_frames == []
     assert summary.identity_state is None
+
+
+# --- a refresh command's output may not reach the deliverable -------------
+#
+# F1 OF FIX ROUND A (HIGH), AND THIS TASK IS WHAT MADE THE PATH REACHABLE.
+# `_resolve_scan_identity`'s own docstring calls itself the only reader of
+# `scan_identity` in the product, so before Task 7 nothing a run could
+# execute called `hx.identity.refresh` at all. Once it did, the chain was:
+# `identity.refresh` put `proc.stderr.strip()[:200]` in an `IdentityError`;
+# `_settle` interpolated that into an `IdentityDead`; `run`'s `except
+# BaseException` wrote the whole thing to `run.stop_reason`; and
+# `report._provenance` rendered `stop_reason` onto the client-facing page
+# through a `_redact` that strips URL userinfo and nothing else. A refresh
+# script that fails while echoing a token -- `curl -v`, a `set -x`, an auth
+# error quoting the request it just made -- put that token in the
+# deliverable. Section 11's failure-mode table does not accept that: its
+# programmatic-refresh row is about shell injection, not about stderr.
+#
+# THE CUT IS IN TWO PLACES and each has its own test below: at the point the
+# message is BUILT (`identity.refresh` no longer repeats the output) and at
+# the point it is STORED (`scan._halt_reason` writes the raise site's own
+# `stop_reason`, never `str(exc)`). One alone would hold today and fail the
+# first time someone added a third path into either.
+
+# A command that fails LOUDLY, printing what a real one prints when it
+# fails: the request it was making, credential header and all. `printf`
+# cannot set an exit status, so this is the interpreter running the tests.
+_LEAKY_REFRESH = (
+    sys.executable, "-c",
+    "import sys; sys.stderr.write('> POST /oauth/token\\n"
+    "> Authorization: Bearer SUPERSECRET-DO-NOT-SHIP\\n"
+    "< 401 invalid_grant\\n'); raise SystemExit(7)")
+
+
+def test_a_failing_refresh_commands_output_never_reaches_a_rendered_report(
+        tmp_path):
+    """ASSERTED ON THE DELIVERABLE, not on the intermediate string.
+
+    An assertion on `str(exc)` alone would have passed with the store-point
+    cut missing and the report still leaking, and an assertion on
+    `run.stop_reason` alone would have passed with the report rendering some
+    other field. So this renders the report and reads the page.
+
+    The `stop reason:` guard is not decoration: without it, a change that
+    stopped `report._provenance` rendering `stop_reason` at all would leave
+    this test green while proving nothing.
+    """
+    leaky = dataclasses.replace(
+        ADMIN, refresh=config_mod.Refresh(command=_LEAKY_REFRESH))
+    env = _declaring(_env(tmp_path), leaky)
+    # Generation 99 is never reached, so the opening canary fails, the
+    # `programmatic` row of section 6's table gives it one refresh, and the
+    # refresh is the command above.
+    bridge = _SessionBridge(live_at_generation=99)
+    with pytest.raises(scan.IdentityDead) as raised:
+        scan.run(**env, checks=(_Probes(),), bridge=bridge,
+                 identity=_resolved(leaky, value="stale"))
+
+    assert "SUPERSECRET" not in str(raised.value), (
+        "the operator's own message carries the command's stderr, which is "
+        "the string every layer below copies")
+    assert "exit 7" in str(raised.value), (
+        "the exit code went with the output; an operator now has neither")
+
+    status, stop_reason = _run_row(env["conn"])
+    assert status == "error"
+    assert "SUPERSECRET" not in stop_reason, "the store holds the credential"
+
+    rendered = report_mod.render(**env)
+    assert "stop reason:" in rendered, (
+        "the report rendered no stop reason at all, so the absence below "
+        "proves nothing -- fix this test before trusting it")
+    assert "SUPERSECRET" not in rendered, (
+        "a failing refresh command's stderr is on the client-facing page")
+
+
+def test_the_store_takes_the_raise_sites_stop_reason_and_not_the_message(
+        tmp_path):
+    """The store-point half on its own, so it cannot be lost behind the
+    build-point half. `IdentityDead`'s message may say anything -- it is the
+    operator's terminal -- and `run.stop_reason` is rendered to a client, so
+    the two are different strings by construction rather than by the good
+    behaviour of every raise site."""
+    dead = scan.IdentityDead(
+        "anything at all, including SUPERSECRET out of a subprocess",
+        stop_reason="identity 'user' could not be proved live")
+    reason = scan._halt_reason(dead)
+
+    assert "SUPERSECRET" not in reason
+    assert "could not be proved live" in reason
+    assert "IdentityDead" in reason, (
+        "the run row no longer names what stopped the run")
+
+
+def test_every_other_exception_still_reaches_the_run_row_intact(tmp_path):
+    """THE SEPARATING CASE, and the reason `_halt_reason` is a branch rather
+    than a blanket. A `sqlite3.Error` or a `BridgeError` says what happened
+    and nothing else is available to say it; narrowing every halt to a type
+    name would take away the only diagnosis a crashed run has. Only
+    `IdentityDead` can carry a subprocess's stderr, and only it is cut."""
+    reason = scan._halt_reason(RuntimeError("the disk went away at offset 4"))
+    assert "the disk went away at offset 4" in reason
+    assert "RuntimeError" in reason
