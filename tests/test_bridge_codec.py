@@ -659,3 +659,21 @@ def test_a_blank_origin_is_refused_on_both_sides():
     tampered = good.replace(b'"https://app.test"', b'"   "')
     with pytest.raises(codec.FrameError, match="origin"):
         codec.parse_identity(tampered)
+
+
+def test_an_identity_id_carrying_a_newline_is_refused():
+    """The Task 5 re-review's open item, traced to where it actually lands.
+
+    The id is interpolated into `Sender`'s `unknown_identity` and
+    `identity_origin` refusals, and `hx.store.records` writes those into
+    `denial.reason` -- so an id carrying a line feed forges a line in a STORED
+    ROW, not merely in the harness log. Not SQL injection (the insert is
+    parameterised); a forged record, which is the same defect as a credential
+    carrying CRLF, one layer out from the wire.
+    """
+    with pytest.raises(codec.FrameError, match="id"):
+        codec.identity_body("user\r\nX-Forged: yes", 1, "Cookie", "v",
+                            ("https://app.test",))
+    with pytest.raises(codec.FrameError, match="id"):
+        codec.identity_body("user\nsecond line", 1, "Cookie", "v",
+                            ("https://app.test",))

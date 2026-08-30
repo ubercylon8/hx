@@ -76,6 +76,19 @@ public final class IdentityRegistry {
                          List<String> origins) {
         if (id == null || id.isBlank())
             throw new IllegalArgumentException("an identity needs an id");
+        // THE ID IS CHECKED FOR THE SAME CHARACTERS AS THE CREDENTIAL, and it
+        // is not decoration. The id is interpolated into every refusal this
+        // class and `Sender` produce, and `unknown_identity`/`identity_origin`
+        // are RECORDED: `hx.store.records` writes the refusal text into
+        // `denial.reason`. So an id carrying a line feed forges a line in a
+        // STORED ROW, not merely in a log -- the same defect as a credential
+        // carrying one, one layer out. The Task 5 re-review traced how far it
+        // reached rather than stopping at the log.
+        //
+        // Checked BEFORE the id is used in any message below, so a refusal
+        // about a hostile id cannot itself carry that id into the row that
+        // records it.
+        checkWritable(id, "id", id);
         if (generation < 1)
             throw new IllegalArgumentException(
                 "generation must be at least 1, got " + generation);

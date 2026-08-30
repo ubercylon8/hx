@@ -379,6 +379,11 @@ def identity_body(identity_id: str, generation: int, header: str, value: str,
         raise FrameError("an identity frame needs a header to inject into")
     if not value:
         raise FrameError("an identity frame with no value registers nothing")
+    # The id first, and before it is interpolated into the two refusals below:
+    # it reaches `denial.reason` in the store by way of `Sender`'s
+    # `unknown_identity`/`identity_origin`, so a line feed here forges a stored
+    # row rather than only a log line.
+    _refuse_unwritable(identity_id, "id", identity_id)
     _refuse_unwritable(identity_id, "header name", header)
     _refuse_unwritable(identity_id, "value", value)
     if not origins or not all(o and o.strip() for o in origins):

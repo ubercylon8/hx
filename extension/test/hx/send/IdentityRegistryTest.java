@@ -37,6 +37,7 @@ public final class IdentityRegistryTest {
         t("aHigherGenerationReplacesTheValue", IdentityRegistryTest::aHigherGenerationReplacesTheValue);
         t("aLowerGenerationIsRefused", IdentityRegistryTest::aLowerGenerationIsRefused);
         t("sameGenerationWithDifferentContentDoesNotSwapTheCredential", IdentityRegistryTest::sameGenerationWithDifferentContentDoesNotSwapTheCredential);
+        t("anIdCarryingCrlfIsRefused", IdentityRegistryTest::anIdCarryingCrlfIsRefused);
         t("aBlankIdIsRefused", IdentityRegistryTest::aBlankIdIsRefused);
         t("aGenerationBelowOneIsRefused", IdentityRegistryTest::aGenerationBelowOneIsRefused);
         t("aBlankHeaderIsRefused", IdentityRegistryTest::aBlankHeaderIsRefused);
@@ -332,5 +333,22 @@ public final class IdentityRegistryTest {
     static boolean refused(Runnable body) {
         try { body.run(); return false; }
         catch (IllegalArgumentException expected) { return true; }
+    }
+
+    /** The Task 5 re-review's open item. The id is interpolated into this
+     *  class's refusals and into Sender's unknown_identity/identity_origin,
+     *  and hx.store.records writes those into `denial.reason` -- so an id
+     *  carrying a line feed forges a line in a STORED ROW, not only in a log.
+     *  Same defect as a credential carrying CRLF, one layer out. */
+    static void anIdCarryingCrlfIsRefused() {
+        check("an id with CRLF is refused", refused(() ->
+            new IdentityRegistry().register("user\r\nX-Forged", 1, "Cookie",
+                                            "v", List.of("https://app.test"))));
+        check("an id with a bare LF is refused", refused(() ->
+            new IdentityRegistry().register("user\nsecond", 1, "Cookie",
+                                            "v", List.of("https://app.test"))));
+        check("an id outside Latin-1 is refused", refused(() ->
+            new IdentityRegistry().register("us\u20acr", 1, "Cookie",
+                                            "v", List.of("https://app.test"))));
     }
 }
