@@ -4759,6 +4759,56 @@ def test_report_redacts_a_credential_reaching_the_export(engagement_with_surface
     assert "SECRETTOKEN" not in text
     assert "hunter2" not in text
     assert "Token leak" in text
+
+
+def test_scan_tells_the_operator_how_many_canaries_it_sent(
+        engagement_with_surface, monkeypatch):
+    """F5 OF FIX ROUND A. Section 6: the canary "is counted in `requests_sent`
+    for the run, because it is a request `hx` put on the client's system".
+    `ScanSummary.canary_requests` counted it faithfully and was read by
+    nothing -- not `check_run.requests_sent` (no row owns it), not the `run`
+    table (no request column), not `report._limits` (no request tally at
+    all). A number that satisfies a spec sentence and reaches nobody
+    satisfies nothing.
+
+    THE WHOLE PATH, not a stubbed summary: the config declares an identity
+    and names it as `scan_identity`, the credential comes out of the
+    environment, and the two canaries that bracket the run are the ones the
+    line counts.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    monkeypatch.setenv("HX_ID_USER", "session=abc")
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        eng.config = dataclasses.replace(
+            eng.config, identities={USER.id: USER}, scan_identity=USER.id,
+            scope_include=["https://app.acme.com/*"])
+        eng_mod.record_scope_version(
+            eng, author="test", reason="declare an identity for this scan")
+    finally:
+        eng.db.close()
+
+    _stub_session(monkeypatch, bridge=_SessionBridge())
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code == 0, result.output
+    assert "canaries  2" in result.output, (
+        "the run's own traffic reaches no reader: " + result.output)
+
+
+def test_a_scan_with_no_identity_prints_no_canary_line(
+        engagement_with_surface, monkeypatch):
+    """THE OTHER HALF. An anonymous run sends no canary, and `canaries  0` on
+    every scan is a line an operator learns to skip past -- which is how the
+    one that matters gets missed."""
+    _stub_session(monkeypatch)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code == 0, result.output
+    assert "canaries" not in result.output, result.output
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -5429,6 +5479,29 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
         # run row's `stop_reason` now carries.
         for reason, n in sorted(summary.refused.items()):
             click.echo(f"refused   {n} ({reason})")
+        # THE CANARIES ARE HX'S OWN TRAFFIC AND AN OPERATOR IS TOLD ABOUT
+        # THEM -- F5 of the task-7 fix round A review. Section 6 says the
+        # canary "is counted in `requests_sent` for the run, because it is a
+        # request `hx` put on the client's system", and
+        # `ScanSummary.canary_requests` counted it faithfully and was READ BY
+        # NOTHING: `check_run.requests_sent` excludes it (no check asked for
+        # it, so no row owns it), the `run` table has no request column, and
+        # `report._limits` renders no request tally at all. A number that
+        # satisfies a spec sentence and reaches nobody satisfies nothing.
+        #
+        # THIS IS NOT THE WHOLE OF WHAT SECTION 6 ASKS and the difference is
+        # worth naming rather than papering over: the section says
+        # `requests_sent` FOR THE RUN, and this build has no such column to
+        # add it to. What it can have today is the operator being told, at
+        # the same terminal that already gets `skipped` and `refused`, that
+        # a run put N requests of its own on a client's system. The client's
+        # own copy of that fact belongs in section 10's identity section,
+        # which the plan gives to Task 8, derived from the run.
+        #
+        # ONLY WHEN THERE WERE ANY. An anonymous run sends no canary, and
+        # `canaries  0` on every scan is a line an operator learns to skip.
+        if summary.canary_requests:
+            click.echo(f"canaries  {summary.canary_requests}")
 
         # A class the operator enabled that this build ships nothing for.
         # Without this line, `active_timing: true` plus no rows reads as

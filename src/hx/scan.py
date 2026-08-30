@@ -180,9 +180,20 @@ class ScanSummary:
     # `requests_sent` for the run, because it is a request `hx` put on the
     # client's system" -- and it belongs to no `check_run` row, because no
     # check asked for it. Counted beside the probes rather than folded into
-    # them for the reason `refused` is not folded into `by_reason`: a number
-    # an operator reads has to be one they can go and check against a row
-    # that exists.
+    # them for the reason `refused` is not folded into `by_reason`: folding
+    # it in would make a row's `requests_sent` disagree with what that row's
+    # check actually sent, and a number an operator can go and check against
+    # a row is worth more than one that is merely larger.
+    #
+    # `hx scan` PRINTS IT -- F5 of the task-7 fix round A review. It was
+    # written here and read by nothing: not `check_run.requests_sent` (which
+    # excludes it, above), not the `run` table (no request column), not
+    # `report._limits` (which renders no request tally at all). A field that
+    # exists to satisfy a spec sentence and reaches nothing satisfies
+    # nothing. It is NOT the whole of what section 6 asks -- that is
+    # `requests_sent` FOR THE RUN, and this build has no such column -- and
+    # the client's own copy of the fact belongs in section 10's identity
+    # section, which the plan gives to Task 8.
     canary_requests: int = 0
 
 

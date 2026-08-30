@@ -657,6 +657,29 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
         # run row's `stop_reason` now carries.
         for reason, n in sorted(summary.refused.items()):
             click.echo(f"refused   {n} ({reason})")
+        # THE CANARIES ARE HX'S OWN TRAFFIC AND AN OPERATOR IS TOLD ABOUT
+        # THEM -- F5 of the task-7 fix round A review. Section 6 says the
+        # canary "is counted in `requests_sent` for the run, because it is a
+        # request `hx` put on the client's system", and
+        # `ScanSummary.canary_requests` counted it faithfully and was READ BY
+        # NOTHING: `check_run.requests_sent` excludes it (no check asked for
+        # it, so no row owns it), the `run` table has no request column, and
+        # `report._limits` renders no request tally at all. A number that
+        # satisfies a spec sentence and reaches nobody satisfies nothing.
+        #
+        # THIS IS NOT THE WHOLE OF WHAT SECTION 6 ASKS and the difference is
+        # worth naming rather than papering over: the section says
+        # `requests_sent` FOR THE RUN, and this build has no such column to
+        # add it to. What it can have today is the operator being told, at
+        # the same terminal that already gets `skipped` and `refused`, that
+        # a run put N requests of its own on a client's system. The client's
+        # own copy of that fact belongs in section 10's identity section,
+        # which the plan gives to Task 8, derived from the run.
+        #
+        # ONLY WHEN THERE WERE ANY. An anonymous run sends no canary, and
+        # `canaries  0` on every scan is a line an operator learns to skip.
+        if summary.canary_requests:
+            click.echo(f"canaries  {summary.canary_requests}")
 
         # A class the operator enabled that this build ships nothing for.
         # Without this line, `active_timing: true` plus no rows reads as
