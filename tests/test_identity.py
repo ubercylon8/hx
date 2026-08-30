@@ -60,8 +60,14 @@ def test_a_refresh_command_that_prints_nothing_is_refused():
 
 
 def test_the_command_is_never_run_through_a_shell():
-    # `;` and `>` are ordinary argv characters to execve. If a shell were
-    # involved this would create the file and the value would be empty.
+    # `;` and `>` reach printf as ORDINARY ARGV CHARACTERS, because a list
+    # argv goes straight to execve and no shell ever sees them. Under a shell
+    # this command does not survive: the review measured both regression
+    # shapes (list-form and string-join) and each fails on a non-zero exit
+    # rather than by creating a file, which an earlier version of this comment
+    # claimed. The test still catches the regression; only the mechanism was
+    # described wrongly, and a comment that names the wrong mechanism is how
+    # the next person "fixes" the wrong thing.
     r = identity.refresh(
         _programmatic(["printf", "%s", "a;b>c"]), generation=1)
     assert r.value == "a;b>c"
@@ -73,3 +79,18 @@ def test_a_resolved_credential_is_not_in_its_own_repr():
     r = identity.resolve(_static(), {"HX_ID_USER": "session=SUPERSECRET"})
     assert "SUPERSECRET" not in repr(r)
     assert "user" in repr(r)
+
+
+def test_resolve_refuses_a_programmatic_identity_by_name():
+    """Finding 3 of the Task 2 review: the guard, and the message it replaced.
+
+    Without it, `resolve()` on a programmatic identity read
+    `ident.inject.value_from_env`, found `None` -- which the config loader
+    deliberately allows for that strategy -- and raised "identity 'admin' needs
+    None in the environment and it is not set". That reads like an operator
+    forgot to export something, sending them to fix a variable that was never
+    supposed to exist, when the real fault is a caller reaching for the wrong
+    function.
+    """
+    with pytest.raises(identity.IdentityError, match="minted by refresh"):
+        identity.resolve(_programmatic(["true"]), {})

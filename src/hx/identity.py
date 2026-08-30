@@ -1,8 +1,10 @@
 """Credentials, and the one place in this codebase that holds one.
 
-WHY THIS IS NOT ON `Config`. `hx.store.records` writes the config YAML VERBATIM
-into `scope_version.yaml`, a table the schema calls "append-only:
-tamper-evidence for contract disputes". A credential reachable from a `Config`
+WHY THIS IS NOT ON `Config`. `hx.engagement.record_scope_version` writes the
+config YAML VERBATIM into `scope_version.yaml` (the `INSERT INTO scope_version`
+at `engagement.py:114`, whose `yaml` column takes `config.dumps(cfg)` whole), a
+table the schema calls "append-only: tamper-evidence for contract disputes". A
+credential reachable from a `Config`
 is therefore a credential copied, unredactable, into a table designed to be
 impossible to rewrite -- which is spec section 7's warning about the blob store
 wearing different clothes. `Config` holds the DECLARATION; a `Resolved` holds
@@ -37,7 +39,20 @@ class Resolved:
 
 
 def resolve(ident: Identity, env: dict[str, str]) -> Resolved:
-    """The static strategy: read the declared variable out of the environment."""
+    """The static strategy: read the declared variable out of the environment.
+
+    A PROGRAMMATIC identity does not come through here -- its credential is
+    minted by `refresh()` from a command's stdout, and the config loader
+    deliberately does not require `value_from_env` for one. Without the guard
+    below, calling this on one produced "identity 'admin' needs None in the
+    environment and it is not set", which reads like a missing variable rather
+    than a call that should never have been made.
+    """
+    if ident.strategy != "static":
+        raise IdentityError(
+            f"identity {ident.id!r} is {ident.strategy!r} and has no "
+            "environment variable to read; a programmatic identity is minted "
+            "by refresh(), not resolved")
     name = ident.inject.value_from_env
     if name not in env:
         raise IdentityError(
