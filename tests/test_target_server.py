@@ -783,3 +783,74 @@ def test_the_state_changing_route_answers_both_the_post_and_the_get(target):
 
     assert [(h.method, h.path) for h in target.hits] == [
         ("POST", path), ("GET", path)]
+
+
+# --- /account: the route a liveness canary is declared against -------------
+
+
+def test_the_account_route_answers_two_hundred_whether_or_not_it_is_logged_in(
+        target):
+    """THE WHOLE ARGUMENT FOR A BODY SIGNATURE, in one assertion.
+
+    The identity design's s6: a canary that accepted a STATUS would be
+    satisfied by an application answering a logged-out request with a 200
+    login PAGE, stamp the identity `proven`, and hand section 9's retirement
+    gate a hazard with a proof attached. This route is that application. If
+    it ever starts answering 302 or 401 while logged out, every liveness test
+    built on it would pass on the status alone and stop measuring the thing
+    it was built for."""
+    cookie = {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"}
+    logged_in = _get(target, "/account", cookie)
+    logged_out = _get(target, "/account")
+
+    assert logged_in[0] == logged_out[0] == 200, (logged_in[0], logged_out[0])
+    assert ts.SESSION_SIGNATURE.encode() in logged_in[2]
+    assert ts.NO_SESSION_SIGNATURE.encode() not in logged_in[2]
+    assert ts.NO_SESSION_SIGNATURE.encode() in logged_out[2]
+    assert ts.SESSION_SIGNATURE.encode() not in logged_out[2]
+
+
+def test_the_account_route_wants_the_right_cookie_and_not_merely_a_cookie(
+        target):
+    """A canary proves a CREDENTIAL, not the presence of a header. A route
+    that accepted any `session=` would let a run that injected the wrong
+    value -- or a stale generation after a refresh that changed nothing --
+    read as logged in."""
+    assert ts.SESSION_SIGNATURE.encode() not in _get(
+        target, "/account", {"Cookie": "session=not-the-one"})[2]
+    assert ts.SESSION_SIGNATURE.encode() not in _get(
+        target, "/account", {"Cookie": "analytics=1; consent=yes"})[2]
+
+
+def test_kill_session_makes_the_right_cookie_stop_working(target):
+    """The mid-run death s6's motivating case is about: an SSO session dying
+    at 01:50. The cookie is unchanged and the server has stopped honouring
+    it, which is what an expiry actually is -- a test that changed the VALUE
+    would be measuring a client that forgot its credential."""
+    cookie = {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"}
+    assert ts.SESSION_SIGNATURE.encode() in _get(target, "/account", cookie)[2]
+
+    target.kill_session()
+    after = _get(target, "/account", cookie)
+
+    assert after[0] == 200, "a killed session must not become a status a rule catches"
+    assert ts.SESSION_SIGNATURE.encode() not in after[2]
+    assert ts.NO_SESSION_SIGNATURE.encode() in after[2]
+
+
+def test_killing_the_session_leaves_every_other_route_answering(target):
+    """`kill_session` is one route's state, not the server's. The scans built
+    on it have to go on probing everything else, or "the run halted on a dead
+    session" could not be told from "the target stopped answering"."""
+    target.kill_session()
+    assert _get(target, "/health")[0] == 200
+    assert _get(target, ts.VULNERABLE_ROUTES["hx.active.reflected-input"])[0] == 200
+
+
+def test_the_two_liveness_signatures_are_disjoint():
+    """`expect_body` and `expect_absent`, and a page carrying both would pass
+    the positive signature while being the logged-out view -- which is the
+    exact case `expect_absent` exists for. Asserted against the pages this
+    server actually serves rather than against the constants alone."""
+    assert ts.NO_SESSION_SIGNATURE not in ts.ACCOUNT_PAGE
+    assert ts.SESSION_SIGNATURE not in ts.LOGIN_PAGE

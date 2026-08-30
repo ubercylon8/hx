@@ -59,6 +59,29 @@ SESSION_COOKIE_VALUE = "s3cr3t-live-session-2f9a41c0"
 # unambiguous absence to find has one, without touching the frozen string.
 FLAGLESS_COOKIE_VALUE = "s3cr3t-legacy-session-9b21fe70"
 
+# `/account`'s two bodies, and the pair of signatures a liveness canary is
+# declared against. The identity design's s6 is that a canary which accepted a
+# STATUS would be satisfied by an application answering a logged-out request
+# with a 200 login PAGE -- the one shape no response-status rule can catch --
+# so `/account` answers 200 either way and the ONLY difference is the body.
+# That makes this route the fixture for the whole liveness argument: a canary
+# reading the status here cannot tell the two apart, and one reading
+# `expect_body` can.
+#
+# THE TWO STRINGS ARE DISJOINT AND MUST STAY SO. `Sign out` is
+# `liveness.expect_body` and `Sign in` is `liveness.expect_absent`; a page
+# carrying both would satisfy the positive signature while being the logged-out
+# view, which is the case `expect_absent` exists for. tests/test_target_server.py
+# asserts the disjointness in the FAST suite, where it costs no JVM.
+SESSION_SIGNATURE = "Sign out"
+NO_SESSION_SIGNATURE = "Sign in"
+ACCOUNT_PAGE = ("<html><body><h1>Account</h1>"
+                f"<p><a href=\"/account/logout\">{SESSION_SIGNATURE}</a></p>"
+                "</body></html>")
+LOGIN_PAGE = ("<html><body><h1>Welcome</h1>"
+              f"<form method=\"post\" action=\"/login\">"
+              f"<button>{NO_SESSION_SIGNATURE}</button></form></body></html>")
+
 # The most /slow will ever sleep, whatever the query string says. A typo in a
 # test ("ms=3600000") would otherwise wedge the suite for an hour with no
 # diagnostic; five seconds is longer than any deadline this suite sets and
@@ -388,6 +411,26 @@ class _Handler(BaseHTTPRequestHandler):
         elif parts.path == "/account/logout":
             # On the dangerous-path denylist, and deliberately harmless here.
             self._reply(200, {"logged_out": True})
+        elif parts.path == "/account":
+            # THE SESSION-BEARING ROUTE. Answers the account page to a request
+            # carrying the right cookie and a 200 LOGIN PAGE to one that does
+            # not -- see SESSION_SIGNATURE above for why both are 200.
+            #
+            # NOT A SECOND `require_login()`. That one walls
+            # `/account/summary` with a 302, which is a refusal a STATUS rule
+            # catches (`_probe_util.unanswered` reads only a 2xx as an
+            # answer) and is the fixture for "a login wall is not a clean
+            # result". This route is the opposite fixture: nothing about the
+            # response tells a status rule anything, which is what makes a
+            # body signature the only proof of a session there is.
+            #
+            # `Cookie` IS READ WHOLE, not parsed. The request either carries
+            # `session=<the value>` or it does not, and a parser here would
+            # be a second implementation of cookie splitting in a file whose
+            # job is to be simple enough to trust.
+            live = self.server.target.session_accepted(
+                self.headers.get("Cookie"))
+            self._reply_text(200, ACCOUNT_PAGE if live else LOGIN_PAGE)
         elif parts.path == "/login":
             self._reply(200, {"welcome": True}, extra=[
                 ("Set-Cookie",
@@ -683,6 +726,7 @@ class TargetServer:
         self._hits: list[Hit] = []
         self._fixed: set[str] = set()
         self._login_required = False
+        self._session_live = True
         self._lock = threading.Lock()
         self._httpd = _Server((host, 0), _Handler)
         # Read by every handler through self.server. Set before any thread is
@@ -783,6 +827,38 @@ class TargetServer:
         """Read by a handler thread on every request; see `fix`."""
         with self._lock:
             return check_id in self._fixed
+
+    def session_accepted(self, cookie_header: str | None) -> bool:
+        """Does this request carry a session `/account` still honours?
+
+        Read by a handler thread on every request to that route. Both halves
+        matter and they are different facts: `kill_session` makes the server
+        stop honouring the cookie at all, and a request that never carried it
+        was logged out to begin with. A version that answered only the first
+        would let a probe with NO credential read as logged in for as long as
+        the session lived, which is precisely the confusion the canary exists
+        to remove.
+        """
+        with self._lock:
+            if not self._session_live:
+                return False
+        return f"session={SESSION_COOKIE_VALUE}" in (cookie_header or "")
+
+    def kill_session(self) -> None:
+        """Stop honouring the session cookie, for the rest of this run.
+
+        ONE DIRECTION ONLY, for `fix()`'s and `require_login()`'s reason, and
+        it bites hardest here: a knob that could bring the session BACK would
+        let a test assert that a run halted on a dead session and then quietly
+        log back in before the scan that had to prove it. A run wanting the
+        live session back gets a fresh server, which every test already does.
+
+        The cookie VALUE is untouched -- `/login` goes on setting it -- so
+        what changes is the server's willingness to accept it, which is what
+        an expiring session actually is.
+        """
+        with self._lock:
+            self._session_live = False
 
     def require_login(self) -> None:
         """Put `LOGIN_WALL_ROUTE` behind its login wall for the rest of this
