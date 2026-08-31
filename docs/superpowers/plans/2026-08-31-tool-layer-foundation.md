@@ -1626,10 +1626,13 @@ tested.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import Any
 
 from . import envelope, journal, registry, schema
 from .errors import ToolError
+
+_log = logging.getLogger(__name__)
 
 #: Design section 5. Asserted by a test, so it cannot become a comment.
 DECISION_ORDER = ("not_registered", "halted", "missing_why", "bad_args",
@@ -1714,13 +1717,22 @@ def _journalled(ctx: ToolContext, name: str, args: dict[str, Any],
     is the thing that is allowed to be missing. An engagement whose database
     has gone read-only has larger problems than an unrecorded row, and the
     caller finding out about them from `surface.query` would be misleading.
+
+    MISSING, BUT NEVER SILENT. This block was written `except Exception: pass`,
+    and the paragraph above was the argument for it -- correctly, right up to
+    the word `pass`. A swallowed failure lets the journal go incomplete with
+    nothing anywhere saying so, and `run.journal` and `run.resume` then answer
+    "what have I already tried" out of a record that is quietly short. That is
+    section 12's governing rule broken inside the table built to keep it: a
+    journal that cannot tell "did not happen" from "happened and was not
+    recorded". `hx.bridge.server` sets the convention this uses.
     """
     try:
         journal.record(ctx.conn, engagement_id=ctx.engagement.id,
                        run_id=ctx.run_id, tool=name, args=args, why=why,
                        env=env, blobs=ctx.blobs, actor=ctx.actor)
     except Exception:  # noqa: BLE001
-        pass
+        _log.exception("could not journal %s; the call itself stands", name)
     return env
 ```
 
