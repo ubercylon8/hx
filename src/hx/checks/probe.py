@@ -142,7 +142,13 @@ BEFORE issuing and never increments `issued` for them; `halted` /
 and `unmanaged_credential` is decided by `Sender.decide()` ahead of both the
 Gate and `http.send`, placed there in that method's own words so that
 `Limits.check()` does not "spend a rate token and a budget slot on a request
-that is about to be refused". So none of the eight is a request the target
+that is about to be refused". `unknown_identity` and `identity_origin` are
+that same method's last two refusals and sit on the OTHER side of the Gate --
+`Limiter.check` has already incremented `issued` by the time either is
+decided, so those two DO spend a rate token and a budget slot in the JVM --
+but both `return error(...)` above `compose()` and `http.send`, so the target
+saw nothing and this set is about what hx put on a client's system. So none
+of the ten is a request the target
 saw, and counting them would overstate the traffic AND make every retry above
 double-count. Everything else counts, by default and including a class this
 build has never seen: `transport_error`, `timeout` and `bridge_lost` may
@@ -218,6 +224,17 @@ _NOT_ISSUED = frozenset({
     # produce them, and a name here that no input can exercise is a claim no
     # test separates from its absence.
     "unmanaged_credential",
+    # The identity pair, and they are here on the same ground and NOT on the
+    # same mechanism -- see the module docstring. `Sender.decideAndIssue`
+    # answers both AFTER `policy.checkGate`, not before, so each has already
+    # cost a rate token and a budget slot inside the JVM; what neither has
+    # done is reach the target, because both `return error(...)` above
+    # `compose()` and `http.send`. The set is about the traffic hx put on a
+    # client's system, so both belong in it. Reachable from this sender the
+    # moment one is bound to an identity: `unknown_identity` is what every
+    # probe draws if registration never happened, and `identity_origin` is
+    # what a probe at a host outside the identity's origins draws.
+    "unknown_identity", "identity_origin",
 })
 
 # The header names `Sender.decide()` will not carry from a check, matching
@@ -330,15 +347,31 @@ def _rate_limit_wait(exc: BridgeError) -> float | None:
 
 
 class ProbeSender:
-    """Bound to one surface for the life of one `check_run`."""
+    """Bound to one surface for the life of one `check_run`, and to at most
+    one identity for the life of the run.
+
+    THE IDENTITY IS AN ID AND NEVER A CREDENTIAL. What travels here is the
+    name the extension's `IdentityRegistry` holds the credential under; the
+    value itself reached the JVM once, through `BridgeServer.
+    register_identity`, and is written into the request there -- after every
+    gate, so a refused request never has one composed for it. Nothing on this
+    side of the bridge can put a credential on the wire, which is what keeps
+    S7's redaction claim ("the extension knows exactly which byte ranges it
+    injected") true of every request a check causes.
+
+    A CHECK STILL CANNOT SEE ANY OF THIS. It is handed a sender already
+    bound, exactly as it is handed one already bound to a surface: S7 puts
+    identity below the check layer, and `hx.scan.run` decides.
+    """
 
     def __init__(self, bridge, *, scheme: str, host: str, port: int,
-                 path: str) -> None:
+                 path: str, identity_id: str | None = None) -> None:
         self._bridge = bridge
         self._scheme = scheme
         self._host = host
         self._port = port
         self._path = path
+        self._identity_id = identity_id
         self._sent = 0
         self._refused: dict[str, int] = {}
 
@@ -407,14 +440,21 @@ class ProbeSender:
                 "an address; build the probe from `sender.path` -- the "
                 "exemplar's own concrete path -- and substitute into that")
         raw = self._request_bytes(path, headers or {})
+        req = {"target_host": self._host, "target_port": self._port,
+               "tls": self._scheme == "https"}
+        if self._identity_id is not None:
+            # PRESENT ONLY WHEN BOUND. An absent key is "anonymous"; a null
+            # would leave the extension deciding what a null means. It reads
+            # the field as `header.get("identity_id") instanceof String`
+            # (`Sender.decideAndIssue`), so a null happens to be anonymous
+            # there today -- and a key this side sends only when it means
+            # something cannot be given a second meaning by a later reader.
+            req["identity_id"] = self._identity_id
         attempts_left = _RATE_LIMIT_ATTEMPTS
         while True:
             attempts_left -= 1
             try:
-                result = self._bridge.send(
-                    {"target_host": self._host, "target_port": self._port,
-                     "tls": self._scheme == "https"},
-                    raw, timeout=timeout)
+                result = self._bridge.send(req, raw, timeout=timeout)
             except BridgeError as exc:
                 # BridgeServer.send() never returns a refusal -- it raises
                 # this, with the wire's class on .error_class (None only for a

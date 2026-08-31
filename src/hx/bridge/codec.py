@@ -285,6 +285,172 @@ def build_config_body(pairs: dict[str, list[str]]) -> bytes:
     return bytes(out)
 
 
+def _refuse_unwritable(identity_id: str, what: str, text: str) -> None:
+    """Refuse text the extension could not write into a header as itself.
+
+    THE NEWLINE HALF OF THIS IS THE RULE `build_config_body` DIRECTLY ABOVE
+    HAS ALWAYS APPLIED to a config value ("rejected rather than escaped"), and
+    the one body in this protocol that carries a live credential was the one
+    body less strict about it than the config writer. `Sender.compose` writes
+    `header + ": " + value` and ends the field with CRLF, so:
+
+      * CR or LF splits the field. `"sess=1\\r\\nX-Smuggled: yes"` issues a
+        SECOND header that no gate decided about, and `compose`'s own
+        self-check cannot see it -- that check verifies the bytes at the
+        registered range ARE the credential, and for a CRLF-carrying value
+        they are. A blank line ends the head early and turns the caller's
+        remaining fields, `Host` included, into a body.
+      * NUL cannot split a field and is refused anyway: RFC 9110 s5.5's
+        field-content admits VCHAR, SP, HTAB and obs-text and nothing else, so
+        a credential carrying one is a credential whose treatment is left to
+        whatever parses it.
+      * anything above U+00FF is SILENTLY MANGLED. `Sender.wireBytes` encodes
+        ISO-8859-1 and Java replaces an unmappable character with `?`, so
+        `sess=€123` goes out as `sess=?123` -- a dead credential, an
+        answer given to nobody, and a check that reads it as "not vulnerable".
+
+    THIS IS THE EARLIER ERROR, NOT THE ENFORCEMENT. `IdentityRegistry.register`
+    refuses all three on the extension side and that is the check the invariant
+    rests on -- spec section 4 puts both enforcement points "inside the JVM",
+    so a check living in this process is not one of them and a run whose
+    harness was replaced, patched or bypassed is exactly the case it must hold
+    for. What this buys is a refusal raised where the
+    operator's own `refresh` command and environment variable are in view,
+    before a frame is written, rather than a `bad_identity` coming back over a
+    socket.
+
+    NOT THE HEADER NAME SET. `hx.config` refuses an `inject.header` outside
+    `Cookie`, `Authorization` and `Proxy-Authorization` at load
+    (`hx.config.CREDENTIAL_HEADERS`), with a better message than this could
+    give, and `IdentityRegistry.register` refuses it again in the JVM. A third
+    copy of those three names here would be a vocabulary in three places.
+    """
+    for ch in text:
+        # The character is never quoted, and neither is the text it came from.
+        # Spec section 5: the credential is logged on neither side, and a
+        # FrameError message is logged by whatever catches it.
+        if ch in "\r\n":
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a carriage return "
+                "or line feed; such values are rejected rather than escaped, "
+                "because injecting one would write a header the extension "
+                "never decided about")
+        if ch == "\0":
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a NUL")
+        if ord(ch) > 0xFF:
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a character "
+                "outside Latin-1; the extension's wire encoding would replace "
+                "it with '?', and a mangled credential answers as an "
+                "unauthenticated one")
+
+
+def identity_body(identity_id: str, generation: int, header: str, value: str,
+                  origins: tuple[str, ...]) -> bytes:
+    """The `identity` frame's body: `{identity_id, generation,
+    inject: {header, value}, origins}`, JSON-encoded.
+
+    NOT A CONFIG KEY, and the reason is spec section 5's: a `configure` naming
+    a different rate or budget is REFUSED rather than applied, because a run
+    must not talk its way into a larger allowance mid-flight. A programmatic
+    refresh has to advance a generation WITHOUT re-opening scope, so folding
+    identity into `configure` would either weaken that rule or make refresh
+    impossible. Its own frame keeps both intact -- see `BridgeServer.
+    register_identity`, which sends this body under `t: "identity"` rather
+    than through `configure`.
+
+    GENERATION MUST BE >= 1, validated here rather than left for the
+    extension-side registry alone to catch: the registry treats a lower
+    generation than the one it holds as a refusal, so 0 or negative could
+    never be above anything it holds, and is a malformed frame here rather
+    than a refusal there.
+
+    AND THE HEADER AND VALUE MUST BE WRITABLE AS THEMSELVES -- see
+    `_refuse_unwritable`, which is the rule `build_config_body` has always
+    applied to a config value, arriving late at the one body in this protocol
+    that carries a credential.
+    """
+    if not identity_id:
+        raise FrameError("an identity frame needs an identity_id")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise FrameError(f"generation must be an integer >= 1, got {generation!r}")
+    if not header:
+        raise FrameError("an identity frame needs a header to inject into")
+    if not value:
+        raise FrameError("an identity frame with no value registers nothing")
+    # The id first, and before it is interpolated into the two refusals below:
+    # it reaches `denial.reason` in the store by way of `Sender`'s
+    # `unknown_identity`/`identity_origin`, so a line feed here forges a stored
+    # row rather than only a log line.
+    _refuse_unwritable(identity_id, "id", identity_id)
+    _refuse_unwritable(identity_id, "header name", header)
+    _refuse_unwritable(identity_id, "value", value)
+    if not origins or not all(o and o.strip() for o in origins):
+        raise FrameError(
+            "an identity frame needs at least one origin; an identity with no "
+            "origin could be applied to any host the scope allows")
+    payload = {
+        "identity_id": identity_id,
+        "generation": generation,
+        "inject": {"header": header, "value": value},
+        "origins": list(origins),
+    }
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def parse_identity(body: bytes) -> dict:
+    """The reverse of `identity_body`.
+
+    Re-validates the same fields rather than trusting the writer, on the
+    principle `parse_config_body` already follows: a body is checked on the
+    reading side because the writing side being in this repo is not a
+    guarantee about what actually arrived on the wire.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except ValueError as exc:  # UnicodeDecodeError is a ValueError
+        raise FrameError(f"identity body is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise FrameError("identity body must be a JSON object")
+
+    identity_id = payload.get("identity_id")
+    if not identity_id or not isinstance(identity_id, str):
+        raise FrameError("an identity frame needs an identity_id")
+
+    generation = payload.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise FrameError(f"generation must be an integer >= 1, got {generation!r}")
+
+    inject = payload.get("inject")
+    if not isinstance(inject, dict):
+        raise FrameError("an identity frame needs an inject object")
+    header = inject.get("header")
+    if not header or not isinstance(header, str):
+        raise FrameError("an identity frame needs a header to inject into")
+    value = inject.get("value")
+    if not value or not isinstance(value, str):
+        raise FrameError("an identity frame with no value registers nothing")
+
+    origins = payload.get("origins")
+    # A BLANK origin is refused alongside a missing list, for the same reason
+    # `identity_id` and `value` refuse emptiness: an entry that matches no host
+    # is not a narrower scope, it is a silently dead rule -- and the caller
+    # believes it registered a bound the extension will never apply.
+    if not origins or not isinstance(origins, list) or not all(
+            isinstance(o, str) and o.strip() for o in origins):
+        raise FrameError(
+            "an identity frame needs at least one origin; an identity with no "
+            "origin could be applied to any host the scope allows")
+
+    return {
+        "identity_id": identity_id,
+        "generation": generation,
+        "inject": {"header": header, "value": value},
+        "origins": origins,
+    }
+
+
 def parse_config_body(body: bytes) -> dict[str, list[str]]:
     pairs: dict[str, list[str]] = {}
     for raw_line in body.decode("utf-8").split("\n"):

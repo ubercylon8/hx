@@ -237,10 +237,19 @@ def test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan():
     lost its Java arm or its Python arm would drop first are named
     individually: `unknown_frame` has a single Java site, `bridge_lost` is
     mostly Python, and `rate_limited` is the one added by hand.
+
+    It was 16 until the identity plan's send path and `identity` frame arm
+    added four -- `unknown_identity`, `identity_origin`, `stale_generation`
+    and `bad_identity`. That this number MOVES is the point of it: a count
+    that only ever went up because someone edited it would pin nothing, and a
+    count that never moved would mean the derivation had stopped seeing the
+    tree grow. Two of the four are named below for the same reason the six
+    already there are -- each has exactly one emit site.
     """
-    assert len(ERROR_CLASSES) == 16, sorted(ERROR_CLASSES)
+    assert len(ERROR_CLASSES) == 20, sorted(ERROR_CLASSES)
     for expected in ("halted", "unknown_frame", "bridge_lost", "rate_limited",
-                     "scope_denied", "not_configured"):
+                     "scope_denied", "not_configured",
+                     "unknown_identity", "stale_generation"):
         assert expected in ERROR_CLASSES, (
             f"{expected!r} is emitted by this tree and the scan did not find "
             "it; a spelling changed and the derivation went narrow silently")
@@ -374,9 +383,13 @@ def test_the_extension_fault_marker_is_the_same_string_on_both_sides():
     assert declarations == [records.EXTENSION_FAULT], (
         f"BridgeClient.java declares {declarations!r}; "
         f"records.EXTENSION_FAULT is {records.EXTENSION_FAULT!r}")
-    # ...and it is actually USED at the two sites that mean "this jar is
-    # broken", rather than declared and forgotten.
-    assert java.read_text().count("EXTENSION_FAULT +") == 2
+    # ...and it is actually USED at the sites that mean "this jar is broken",
+    # rather than declared and forgotten. THREE of them: a send with no
+    # handler installed, a send path that threw, and -- since the identity
+    # plan -- an `identity` frame with no registry to put it in. All three are
+    # wiring failures rather than an operator who has not authorised the run,
+    # which is the distinction the whole marker exists to carry.
+    assert java.read_text().count("EXTENSION_FAULT +") == 3
 
 
 def test_the_module_docstrings_counts_are_the_counts():

@@ -112,6 +112,24 @@ def test_run_kinds_matches_the_schema():
     assert set(run_mod.RUN_KINDS) == _checks()["run.kind"]
 
 
+def test_identity_states_matches_the_schema_on_both_tables():
+    """`run.IDENTITY_STATES` against the CHECK, on BOTH columns that carry it.
+
+    The identity design's section 6 names three states and `run.
+    identity_state` (added at SCHEMA_VERSION 9) and `exchange.identity_state`
+    (declared since Plan 1) both constrain a column to them. Two columns
+    spelling one vocabulary is exactly the drift this file exists for, and
+    section 6's own amendment says the pair is deliberate: the exchange column
+    is where the state belongs per request once send-path recording lands, and
+    the run column is the run-level fact section 9's retirement gate reads
+    today. They must not be allowed to become two vocabularies in the
+    meantime.
+    """
+    checks = _checks()
+    assert set(run_mod.IDENTITY_STATES) == checks["run.identity_state"]
+    assert checks["exchange.identity_state"] == checks["run.identity_state"]
+
+
 def test_valid_profiles_matches_the_schema():
     assert set(config_mod.VALID_PROFILES) == _checks()["run.safety_profile"]
 
@@ -224,6 +242,7 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
     paired = {
         "hx.capture.DISCOVERED_BY",
         "hx.run.RUN_KINDS",
+        "hx.run.IDENTITY_STATES",
         # The two error-class MAPS. Their KEYS are the wire vocabulary and are
         # pinned in test_records.py against the emit sites; their VALUES are
         # column vocabularies and are pinned above -- DENIAL_KIND through
@@ -281,6 +300,25 @@ def test_every_python_vocabulary_in_this_repo_is_covered_here():
         # Open question 1 in the spec: constrain it with a CHECK once a
         # second consumer of the vocabulary appears.
         "hx.checks.base.INSERTION_KINDS",
+        # The identity plan's two new declaration-time vocabularies. Neither
+        # is a stored column: this build persists no `identities` table (the
+        # registry the identity plan describes lives in the extension's
+        # memory -- `IdentityRegistry`, a later task -- not SQLite), so there
+        # is no schema CHECK to pin either against.
+        #   - CREDENTIAL_HEADERS restates `hx.checks.probe.CREDENTIAL_HEADERS`
+        #     (itself hand-verified against `Redactor.CREDENTIAL_HEADERS`,
+        #     extension/src/hx/send/Redactor.java:143-144) in the title
+        #     casing `inject.header` is written in. Pinned against that copy
+        #     in `test_config.py::test_credential_headers_matches_the_probe_modules_own_list`
+        #     rather than re-derived here, the same shape as
+        #     `hx.store.records.CREDENTIAL_PARAMS` above: the other copy is
+        #     already covered by its own comparison test.
+        #   - VALID_STRATEGIES (`static`, `programmatic`) is enforced only by
+        #     `config._identity` at load time and consumed by
+        #     `hx.identity.resolve`, a later task in this same plan; nothing
+        #     downstream stores it.
+        "hx.config.CREDENTIAL_HEADERS",
+        "hx.config.VALID_STRATEGIES",
     }
     found = set()
     for mod, name in ((run_mod, "hx.run"), (config_mod, "hx.config"),

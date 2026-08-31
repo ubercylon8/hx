@@ -65,7 +65,33 @@ CREATE TABLE IF NOT EXISTS run (
   stop_reason      TEXT,
   heartbeat_us     INTEGER,
   requests_issued  INTEGER NOT NULL DEFAULT 0,
-  dropped_total    INTEGER NOT NULL DEFAULT 0
+  dropped_total    INTEGER NOT NULL DEFAULT 0,
+  -- WHICH IDENTITY THIS RUN ISSUED ITS OWN REQUESTS UNDER, and what the
+  -- bracketed liveness window settled at. Added 2026-08-30 with
+  -- SCHEMA_VERSION 9. All three are NULL for a run that issued anonymously,
+  -- which is every `browse` run (the operator's own browser carries its own
+  -- session; the identity design's s2 puts proxy traffic out of scope) and
+  -- every scan whose config names no `scan_identity`.
+  --
+  -- THE SAME THREE NAMES `exchange` ALREADY CARRIES, deliberately. That
+  -- section-6 triple is where the state belongs per request, and the same
+  -- section's 2026-08-30 amendment records why it cannot be written yet:
+  -- `Capture.java` delivers `via: proxy` and nothing else, so this build
+  -- stores no send-path exchange row at all. What section 9's retirement
+  -- gate actually needs is narrower -- whether the run's traffic was issued
+  -- inside a proven window -- and that is a run-level fact. Spelling it the
+  -- same way here means the day send-path recording lands, the per-exchange
+  -- column is a refinement of this one rather than a second vocabulary.
+  --
+  -- `identity_state` COLLAPSES TO THE WORST WINDOW IN THE RUN
+  -- (`hx.identity.IdentityWindow`): one failed canary anywhere makes the
+  -- whole run `assumed`, so a run that reads `proven` had every window in it
+  -- proven. `hx.scan.run` also refuses to write `proven` for a run that
+  -- stopped short, because a window is proof only once BOTH its canaries
+  -- have passed and a halted run never ran its closing one.
+  identity            TEXT,
+  identity_generation INTEGER,
+  identity_state      TEXT CHECK (identity_state IN ('proven','assumed','dead'))
 );
 
 -- Surface identity is the TEMPLATE. /order/1..9999 is one surface, not 9999.

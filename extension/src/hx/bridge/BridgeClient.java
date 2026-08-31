@@ -195,6 +195,64 @@ public final class BridgeClient {
     public void setHaltSource(HaltSource s) { this.haltSource = s; }
 
     /**
+     * Where an `identity` frame's contents go: the registry the send path
+     * injects from.
+     *
+     * DECLARED HERE, for {@link SendHandler}'s and {@link HaltSink}'s reason.
+     * The registry lives in hx.send, hx.send already imports this class, and a
+     * type from hx.send named here would close that into a cycle -- which
+     * javac does not mind, because it sees every source at once, and which a
+     * reader trying to work out which of two files is the authority on a
+     * refusal does. So the bridge names a callback of its own and HxExtension,
+     * the file that already knows about both packages, wires the registry to
+     * it.
+     *
+     * The five parameters are the frame's, not the registry's: this interface
+     * is what the WIRE carries, and an implementation is free to hold it
+     * however it likes.
+     */
+    public interface IdentitySink {
+        /**
+         * Register or refresh one identity.
+         *
+         * @throws StaleIdentity the generation does not advance the one
+         *   already held. Answered `stale_generation`.
+         * @throws IllegalArgumentException the frame cannot be registered as
+         *   it stands. Answered `bad_identity`.
+         */
+        void register(String identityId, int generation, String header, String value,
+                      List<String> origins);
+    }
+
+    /**
+     * What an {@link IdentitySink} raises for a generation that goes backwards.
+     *
+     * Declared in the package that has to answer `stale_generation` on the
+     * wire, rather than caught by its own type from hx.send, for the reason
+     * IdentitySink itself is declared here. HxExtension's sink translates
+     * `IdentityRegistry.StaleGeneration` into this one, which is the only
+     * place the two vocabularies meet.
+     *
+     * A REFUSAL AND NOT A FAULT. A replayed or reordered frame carrying an
+     * older generation is exactly what the registry's monotonic rule exists to
+     * refuse, so the channel survives it: one frame is answered `error`, and
+     * the run goes on under the identity it already holds.
+     */
+    public static final class StaleIdentity extends RuntimeException {
+        public StaleIdentity(String m) { super(m); }
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile IdentitySink identitySink;
+
+    /** Install the identity registry. Called before connect(): until it is
+     *  installed every `identity` frame is refused, which is the right answer
+     *  -- a credential the send path could not have been given must not be
+     *  acknowledged as registered. */
+    public void setIdentitySink(IdentitySink s) { this.identitySink = s; }
+
+    /**
      * Whether a `configure` can be acted on, asked before it is committed.
      *
      * There is exactly one thing this answers today and spec s4 names it:
@@ -604,6 +662,96 @@ public final class BridgeClient {
                 }
                 Object raw = reply.remove(BODY_KEY);
                 send(reply, raw instanceof byte[] b ? b : new byte[0]);
+            }
+            case "identity" -> {
+                if (!(f.header.get("deadline_us") instanceof Long)) {
+                    // Required on every request frame, checked here for the
+                    // reason the configure arm checks it: a sender that omits
+                    // it is not speaking this protocol version properly.
+                    error(f, "bad_frame", "request frame has no deadline_us");
+                    return true;
+                }
+                if (!engagementId.equals(f.header.get("engagement_id"))) {
+                    error(f, "engagement_mismatch",
+                          "identity names engagement " + f.header.get("engagement_id")
+                          + " but this extension serves " + engagementId);
+                    return true;
+                }
+                // s5: "refused unless the extension is `configured` and not
+                // halted, exactly as `send` is". BOTH checks, and in the send
+                // path's order -- not_configured first, then the run-wide stop
+                // -- because the two answers are opposite instructions and an
+                // operator reading `halted` on an extension that was never
+                // configured would go looking for a halt nobody raised.
+                //
+                // It is not merely symmetry. Registering a credential is the
+                // one frame that puts a live secret into this JVM, and doing
+                // it for a run that is stopped, or one whose scope was never
+                // authorised, leaves it held for a send that may never be
+                // authorised to use it.
+                if (!configured.get()) {
+                    error(f, "not_configured", "no configure frame acknowledged yet");
+                    return true;
+                }
+                String stopped = halted.get()
+                        ? "halt frame: " + (haltReason == null ? "no reason given" : haltReason)
+                        : heldReason();
+                if (stopped != null) {
+                    error(f, "halted", stopped);
+                    return true;
+                }
+                IdentitySink sink = identitySink;
+                if (sink == null) {
+                    // Wiring, not policy -- the same shape as a missing
+                    // SendHandler, and EXTENSION_FAULT for the same reason:
+                    // "the operator has not authorised this run" and "this jar
+                    // is broken" are opposite instructions.
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "no identity sink is installed");
+                    return true;
+                }
+                IdentityBody.Parsed body;
+                try {
+                    body = IdentityBody.parse(f.body);
+                } catch (Frame.FrameError e) {
+                    error(f, "bad_identity", e.getMessage());
+                    return true;
+                }
+                try {
+                    sink.register(body.identityId(), body.generation(), body.header(),
+                                  body.value(), body.origins());
+                } catch (StaleIdentity e) {
+                    // A replayed or reordered frame, refused BY DESIGN. One
+                    // frame is answered; the channel and the held identity
+                    // both survive.
+                    error(f, "stale_generation", e.getMessage());
+                    return true;
+                } catch (IllegalArgumentException e) {
+                    error(f, "bad_identity", e.getMessage());
+                    return true;
+                }
+                // THE BODY IS NEVER LOGGED. Spec s5: this is the only frame in
+                // the protocol whose payload is a secret, and a debug line
+                // added later is exactly how it would leak. The id and the
+                // generation are not secrets and are what an operator needs to
+                // see; `body.value()` and `body.header()`'s content reach no
+                // log on either side, and `Parsed.toString()` is redacted so
+                // that an exception message cannot become the leak either.
+                log.info("hx: identity " + body.identityId()
+                         + " registered at generation " + body.generation());
+                Map<String, Object> ack = new LinkedHashMap<>();
+                ack.put("v", PROTOCOL_VERSION);
+                ack.put("t", "identity_registered");
+                ack.put("id", f.header.get("id"));
+                // Saying back WHICH identity is now at WHICH generation, so a
+                // caller can check what it registered without asking for the
+                // value. Not a secret and not derivable from `t` alone; the
+                // registry holds this generation for this id by the time this
+                // line runs, because an equal generation keeps the held entry
+                // (which is at the same number) and a lower one threw above.
+                ack.put("identity_id", body.identityId());
+                ack.put("generation", (long) body.generation());
+                send(ack, new byte[0]);
             }
             case "halt" -> {
                 // NOT String.valueOf(): for an absent key that answers the

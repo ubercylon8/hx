@@ -91,10 +91,12 @@ genuine test: the endpoint took the marker and chose not to redirect to it.
 
 EXAMINED, NAMED HONESTLY -- AND THE VERDICT SAYS SO TOO. `_ISSUE_TYPE` is
 passed to `_probe_util.verdict` as `examined` only when this check actually
-issued at least one probe on this surface. Until fix round 6 that was the
-verdict's `considered` and the reason mattered most for retirement -- a
-finding could not be closed on the strength of a question this check never
-asked. An active check retires nothing now, and the branch stays because the
+issued at least one probe on this surface. On a `clean` verdict that becomes
+the verdict's `considered`, and the reason matters most for retirement -- a
+finding must not be closed on the strength of a question this check never
+asked. (It stopped being `considered` in fix round 6, when `hx.scan._retirable`
+honoured no active check's, and became it again in Task 8, which honours one
+for a run that proved its session live. The branch was right throughout.) The
 coverage half was always the other reason for it: N3 of the scoped re-review,
 where a surface with query parameters but none of them canary-shaped answered
 `clean` with `requests_sent = 0`. Nothing was retired even then -- but

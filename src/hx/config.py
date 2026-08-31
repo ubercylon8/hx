@@ -39,6 +39,304 @@ class ConfigError(Exception):
     """The engagement config is missing something required, or is nonsense."""
 
 
+# The three headers `Redactor.unmanagedCredential`
+# (extension/src/hx/send/Redactor.java:143-144) already refuses when the
+# extension did not itself inject them -- confirmed against that file rather
+# than assumed: `CREDENTIAL_HEADERS = {"authorization", "cookie",
+# "proxy-authorization"}`, byte for byte the same three, there lower-cased for
+# ASCII-insensitive comparison. Injecting anything else through `identity`
+# would not be a credential in the sense the send path enforces, and would
+# not need any of this machinery. Not configurable: an operator cannot widen
+# the set here without also widening what the extension itself will carry.
+CREDENTIAL_HEADERS = ("Cookie", "Authorization", "Proxy-Authorization")
+
+VALID_STRATEGIES = ("static", "programmatic")
+
+
+@dataclass(frozen=True)
+class Inject:
+    """Which header carries the credential, and where the value comes from.
+
+    `value_from_env` names an environment variable rather than holding a
+    value -- see the module-level note on `Config.identities` for why. It is
+    required for a `static` identity (the only place a value ever comes from
+    the environment) and optional for a `programmatic` one, whose credential
+    instead comes from `Refresh.command`'s stdout at resolve time (spec §4's
+    `admin` example declares `inject: {header: Authorization}` with no
+    `value_from_env` at all).
+    """
+    header: str
+    value_from_env: str | None = None
+
+
+@dataclass(frozen=True)
+class Liveness:
+    """How this identity proves it is still logged in.
+
+    `expect_body` is REQUIRED and is the load-bearing field. A canary that
+    accepted a status code would be satisfied by an application answering a
+    logged-out request with a 200 login page -- the one shape no
+    response-status rule can catch, and the one `hx.scan._retirable` refused
+    ALL active-check retirement over until this plan gave it a proof to read.
+    It reads one now: an active check's `considered` is honoured for a run
+    whose canary came back `proven`, so a canary a login page could satisfy
+    would hand that hazard straight back with a stamp on it. This field is
+    what stops it.
+    """
+    path: str
+    expect_body: str
+    expect_absent: str | None = None
+    every_n_probes: int = 25
+
+
+@dataclass(frozen=True)
+class Refresh:
+    # A LIST, never a string. `hx.identity.refresh` (a later task) executes
+    # this without a shell, and the list is what makes "no shell ever sees
+    # it" true regardless of what an operator writes -- a string would invite
+    # `shell=True` at the call site however it was spelled.
+    command: tuple[str, ...]
+    value_from: str = "stdout"
+
+
+@dataclass(frozen=True)
+class Identity:
+    id: str
+    strategy: str
+    inject: Inject
+    liveness: Liveness
+    refresh: Refresh | None = None
+    # WHERE THIS IDENTITY'S CREDENTIAL MAY BE APPLIED, and EMPTY IS NOT
+    # "everywhere" -- it is "the operator did not widen it", and
+    # `hx.scan._identity_bracket` then bounds the credential to the ONE
+    # origin the liveness canary is about to prove. Spec section 5 as
+    # amended 2026-08-30: it used to default to `scope.include`, which made
+    # the bound useless on exactly the engagements it exists for -- a scope
+    # naming the app, an API, an SSO provider and a CDN had the client's
+    # live session sent to all four while the canary proved one.
+    #
+    # AN OPERATOR MAY WIDEN IT, AND WRITING IT HERE IS THE POINT. A session
+    # that legitimately spans two hosts is a fact only the operator knows;
+    # section 4's whole shape is that anything increasing blast radius is a
+    # decision recorded in `config.yaml` rather than a default. Widening
+    # origins does NOT widen the proof: `hx.scan._retirable` still retires
+    # only on the origin the canary reached.
+    #
+    # ENTRIES ARE HOSTS OR URL PREFIXES, and `_origin_host` below refuses
+    # anything the extension's `Sender.hostOf` would read as no host at all
+    # -- a glob, a bare path -- because such an entry matches nothing and
+    # would be a bound an operator believed in and never got.
+    origins: tuple[str, ...] = ()
+
+
+# The host characters `Sender.appliesTo` can match. A host name is compared
+# byte for byte and case-insensitively against `req.host()`, so anything
+# outside this set -- a `*`, a space, a `[` left by an IPv6 literal `hostOf`
+# cut at its first colon -- can never equal any host a send frame carries.
+_ORIGIN_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-_")
+
+
+def _origin_host(origin: str) -> str:
+    """The host an `origins` entry names, the way the extension reads it.
+
+    A DELIBERATE MIRROR OF `Sender.hostOf`, and the extension's copy is the
+    one spec section 4 rests on: everything after `://` and before the first
+    `/`, `:` or `?`, lower-cased. This one exists so an entry that would
+    match no host is refused at LOAD time with a sentence naming it, rather
+    than at run time as a silent `identity_origin` refusal of every probe --
+    the same division of labour as `codec._refuse_unwritable` (an early,
+    better-worded refusal) and `IdentityRegistry.checkWritable` (the one that
+    actually guards the wire).
+
+    Returning "" for an entry with no readable host is the fail-closed
+    answer, and `_identity` turns it into a `ConfigError` rather than
+    accepting a bound that binds nothing.
+    """
+    rest = origin.strip().lower()
+    scheme = rest.find("://")
+    if scheme >= 0:
+        rest = rest[scheme + 3:]
+    cut = len(rest)
+    for delimiter in ("/", ":", "?"):
+        at = rest.find(delimiter)
+        if 0 <= at < cut:
+            cut = at
+    return rest[:cut]
+
+
+def _identity(name: str, raw: dict) -> Identity:
+    """Parse one `identities.<name>` block into a declaration.
+
+    Structurally cannot carry a resolved secret: every field here is a name
+    (a header, an env var, a command) or a proof (a liveness signature),
+    never a value. Task 2's `hx.identity.resolve` reads the environment
+    separately and keeps the result off this type entirely.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError(f"identities.{name} must be a mapping")
+
+    strategy = raw.get("strategy")
+    if strategy not in VALID_STRATEGIES:
+        raise ConfigError(
+            f"identities.{name}.strategy must be one of {VALID_STRATEGIES}, "
+            f"got {strategy!r}"
+        )
+
+    inj = _mapping(raw, "inject")
+    header = inj.get("header")
+    if header not in CREDENTIAL_HEADERS:
+        raise ConfigError(
+            f"identities.{name}.inject.header must be one of "
+            f"{CREDENTIAL_HEADERS}, got {header!r}"
+        )
+    env = inj.get("value_from_env")
+    if env is not None and (not isinstance(env, str) or not env.strip()):
+        raise ConfigError(
+            f"identities.{name}.inject.value_from_env must be a non-empty "
+            "string naming an environment variable when given; a credential "
+            "may not be written here"
+        )
+    if strategy == "static" and not env:
+        raise ConfigError(
+            f"identities.{name}.inject.value_from_env is required for a "
+            "static identity: it is the only source of the credential a "
+            "static identity has, and the config must name where the "
+            "secret comes from without ever holding it"
+        )
+
+    live = _mapping(raw, "liveness")
+    if not live:
+        raise ConfigError(
+            f"identities.{name} has no liveness block. An identity that "
+            "cannot prove it is live can never be `proven`, and traffic "
+            "issued under it is indistinguishable from anonymous traffic"
+        )
+    expect = live.get("expect_body")
+    if not isinstance(expect, str) or not expect.strip():
+        raise ConfigError(
+            f"identities.{name}.liveness.expect_body is required and must "
+            "be a non-empty string: a signature only an AUTHENTICATED "
+            "response carries. A status code is not one -- a 200 login "
+            "page has one too, and accepting that is the exact defect this "
+            "declaration exists to close"
+        )
+    path = live.get("path")
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ConfigError(
+            f"identities.{name}.liveness.path must be an origin-form path "
+            f"starting with '/', got {path!r}"
+        )
+    absent = live.get("expect_absent")
+    if absent is not None and (not isinstance(absent, str) or not absent.strip()):
+        raise ConfigError(
+            f"identities.{name}.liveness.expect_absent, when given, must be "
+            "a non-empty string"
+        )
+    liveness = Liveness(
+        path=path,
+        expect_body=expect,
+        expect_absent=absent,
+        every_n_probes=_positive_int(live, "every_n_probes", 25),
+    )
+
+    refresh_raw = _mapping(raw, "refresh")
+    if strategy == "static" and refresh_raw:
+        raise ConfigError(
+            f"identities.{name} is static and may not declare refresh: "
+            "there is no command to re-run, and a static credential that "
+            "expired is a dead session, not a refreshable one"
+        )
+    if strategy == "programmatic" and not refresh_raw:
+        raise ConfigError(
+            f"identities.{name} is programmatic and must declare refresh"
+        )
+
+    refresh = None
+    if refresh_raw:
+        command = refresh_raw.get("command")
+        if not isinstance(command, list) or not command:
+            raise ConfigError(
+                f"identities.{name}.refresh.command must be a non-empty "
+                "list of arguments, never a string: it is executed without "
+                "a shell, and a string would invite one"
+            )
+        if not all(isinstance(x, str) for x in command):
+            raise ConfigError(
+                f"every entry in identities.{name}.refresh.command must be "
+                "a string"
+            )
+        value_from = refresh_raw.get("value_from", "stdout")
+        if value_from != "stdout":
+            raise ConfigError(
+                f"identities.{name}.refresh.value_from must be 'stdout', "
+                f"got {value_from!r}"
+            )
+        refresh = Refresh(command=tuple(command), value_from=value_from)
+
+    return Identity(
+        id=name,
+        strategy=strategy,
+        inject=Inject(header=header, value_from_env=env),
+        liveness=liveness,
+        refresh=refresh,
+        origins=_origins(name, raw),
+    )
+
+
+def _origins(name: str, raw: dict) -> tuple[str, ...]:
+    """`identities.<name>.origins`, validated, or `()` for the default.
+
+    ABSENT IS THE SAFE ANSWER AND IS NOT SPELLED HERE: `hx.scan.
+    _identity_bracket` turns `()` into the single origin the run's liveness
+    canary is about to prove. This function's whole job is the OTHER case --
+    an operator deliberately widening the bound -- and every refusal below is
+    a widening that would not have widened anything.
+
+    A DECLARED-BUT-EMPTY LIST IS REFUSED rather than read as the default. The
+    two are opposite intentions -- "I did not think about this" and "I
+    thought about it and chose nothing" -- and the second one bounds the
+    credential to no host at all, so every probe of the run would be refused
+    `identity_origin`. An operator who wants that wants `scan_identity`
+    omitted.
+
+    THE ENTRIES ARE NOT CHECKED AGAINST `scope.include`, deliberately. Scope
+    patterns are globs and origins are hosts, so "is this host inside that
+    glob" is a matcher this file does not have; and it would be a check with
+    no teeth either way, because scope is enforced on the send path
+    regardless -- an origin naming a host outside scope simply never gets a
+    request to apply to. Origins narrow, they never widen what scope allows.
+    """
+    if "origins" not in raw:
+        return ()
+    declared = raw["origins"]
+    if not isinstance(declared, list) or not declared:
+        raise ConfigError(
+            f"identities.{name}.origins must be a non-empty list of hosts or "
+            "URL prefixes when given; omit the key entirely to bound the "
+            "credential to the one host the liveness canary proves, which is "
+            "the default and the safe answer"
+        )
+    for entry in declared:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ConfigError(
+                f"every entry in identities.{name}.origins must be a "
+                f"non-empty string, got {entry!r}"
+            )
+        host = _origin_host(entry)
+        if not host or set(host) - _ORIGIN_HOST_CHARS:
+            raise ConfigError(
+                f"identities.{name}.origins entry {entry!r} names no host the "
+                "send path can match. An origin is a host (`api.acme.test`) "
+                "or a URL prefix (`https://api.acme.test/`); the extension "
+                "reads everything after '://' and before the first '/', ':' "
+                "or '?' and compares it to the host it is about to connect "
+                f"to, and {host!r} can never equal one. A glob is not an "
+                "origin -- it would bound the credential to nothing and "
+                "refuse every probe"
+            )
+    return tuple(entry.strip() for entry in declared)
+
+
 @dataclass(frozen=True)
 class Config:
     name: str
@@ -57,7 +355,26 @@ class Config:
     # nothing: the budget was always 2000, it was just never written down.
     max_requests: int = 2000
     max_concurrency: int = 2
-    identities: dict[str, dict] = field(default_factory=dict)
+    # A credential value must NEVER be reachable from here.
+    # `hx.engagement.record_scope_version` writes the loaded config's YAML
+    # verbatim into `scope_version.yaml` -- `_record_scope`'s `INSERT INTO
+    # scope_version` at `engagement.py:114`, whose `yaml` column takes
+    # `config.dumps(cfg)` whole -- a
+    # table the schema calls "append-only: tamper-evidence for contract
+    # disputes" -- so a secret on this object is a secret copied,
+    # unredactably, into a table designed to be impossible to rewrite. Each
+    # `Identity` names an environment variable instead; the value that
+    # variable holds is resolved separately (`hx.identity.resolve`, a later
+    # task) into an object that never touches `Config`. `dumps()` below is
+    # built to make that structural, not just documented: it reads only
+    # declaration fields off `Identity`, so there is no field to leak even by
+    # accident.
+    identities: dict[str, Identity] = field(default_factory=dict)
+    # Which declared identity `hx scan` issues its probes under. `None` is
+    # anonymous, same as before this field existed. Validated against
+    # `identities` at load time -- see `load_text` -- so a typo here is a
+    # config-time error, not a scan that silently runs unauthenticated.
+    scan_identity: str | None = None
     # `preserve_segments` names path segments the normaliser must NOT template.
     # THE DEFAULT PROTECTS NOTHING, and an operator who leaves it alone should
     # know that: no rule in `hx.surface` matches `api`, `v1`, `v2` or `v3` at
@@ -140,13 +457,24 @@ def _positive_int(raw: dict, key: str, default: int) -> int:
 
 
 def load(path: Path) -> Config:
+    """Read `path` and parse it. Everything else lives in `load_text`.
+
+    Two parsers that must agree is how they come to disagree, so `load`
+    is reduced to the read and delegates parsing entirely -- `load_text` is
+    the one place YAML becomes a `Config`, whether the text came from disk
+    or, as the round-trip test does, from `dumps()` still in memory.
+    """
+    return load_text(Path(path).read_text(encoding="utf-8"))
+
+
+def load_text(text: str) -> Config:
     # A YAML syntax error is "nonsense" by this module's own definition of
     # ConfigError. Wrapping it here means no caller has to know PyYAML is
     # the parser underneath.
     try:
-        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
+        raise ConfigError(f"invalid YAML: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
 
@@ -186,6 +514,24 @@ def load(path: Path) -> Config:
             raise ConfigError(f"checks.{key} must be a boolean, got {type(value).__name__}")
         checks[key] = value
 
+    identities = {
+        ident_name: _identity(ident_name, body)
+        for ident_name, body in _mapping(raw, "identities").items()
+    }
+
+    scan_identity = raw.get("scan_identity")
+    if scan_identity is not None:
+        if not isinstance(scan_identity, str):
+            raise ConfigError(
+                "scan_identity must be a string, got "
+                f"{type(scan_identity).__name__}"
+            )
+        if scan_identity not in identities:
+            raise ConfigError(
+                f"scan_identity names {scan_identity!r}, which is not a "
+                f"declared identity. Declared: {sorted(identities) or 'none'}"
+            )
+
     return Config(
         name=raw["name"],
         client=raw["client"],
@@ -198,10 +544,50 @@ def load(path: Path) -> Config:
         rate_limit_rps=_positive_int(raw, "rate_limit_rps", 5),
         max_requests=_positive_int(raw, "max_requests", 2000),
         max_concurrency=_positive_int(raw, "max_concurrency", 2),
-        identities=_mapping(raw, "identities"),
+        identities=identities,
+        scan_identity=scan_identity,
         preserve_segments=_string_list(raw, "preserve_segments", ["api", "v1", "v2", "v3"]),
         slug_threshold=_positive_int(raw, "slug_threshold", 12),
     )
+
+
+def _identity_yaml(i: Identity) -> dict:
+    """The DECLARATION, and structurally nothing else.
+
+    Built field by field from the dataclass rather than by dumping an
+    object, so there is no path by which a resolved credential could ride
+    along: `Identity` has no field holding one (see `hx.identity.resolve`,
+    a later task, which keeps secrets in a separate mapping that is never
+    passed here). `scope_version.yaml` stores whatever this returns
+    VERBATIM in an append-only table -- see the spec's §3.
+    """
+    out: dict = {
+        "strategy": i.strategy,
+        "inject": {"header": i.inject.header},
+        "liveness": {
+            "path": i.liveness.path,
+            "expect_body": i.liveness.expect_body,
+            "every_n_probes": i.liveness.every_n_probes,
+        },
+    }
+    if i.inject.value_from_env is not None:
+        out["inject"]["value_from_env"] = i.inject.value_from_env
+    if i.liveness.expect_absent is not None:
+        out["liveness"]["expect_absent"] = i.liveness.expect_absent
+    if i.refresh is not None:
+        out["refresh"] = {
+            "command": list(i.refresh.command),
+            "value_from": i.refresh.value_from,
+        }
+    if i.origins:
+        # Omitted when empty, so an engagement that never widened the bound
+        # renders the same YAML it always did -- and so `scope_version.yaml`
+        # records the operator's DECISION to widen and nothing else. The
+        # default is not a decision and has no business being written down as
+        # one: it is derived per run from the surface the canary goes to,
+        # which is a fact about the run rather than about the config.
+        out["origins"] = list(i.origins)
+    return out
 
 
 def dumps(cfg: Config) -> str:
@@ -217,7 +603,8 @@ def dumps(cfg: Config) -> str:
             "rate_limit_rps": cfg.rate_limit_rps,
             "max_requests": cfg.max_requests,
             "max_concurrency": cfg.max_concurrency,
-            "identities": cfg.identities,
+            "identities": {n: _identity_yaml(i) for n, i in cfg.identities.items()},
+            "scan_identity": cfg.scan_identity,
             "preserve_segments": cfg.preserve_segments,
             "slug_threshold": cfg.slug_threshold,
         },

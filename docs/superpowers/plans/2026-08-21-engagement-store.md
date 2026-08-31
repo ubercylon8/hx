@@ -771,7 +771,33 @@ CREATE TABLE IF NOT EXISTS run (
   stop_reason      TEXT,
   heartbeat_us     INTEGER,
   requests_issued  INTEGER NOT NULL DEFAULT 0,
-  dropped_total    INTEGER NOT NULL DEFAULT 0
+  dropped_total    INTEGER NOT NULL DEFAULT 0,
+  -- WHICH IDENTITY THIS RUN ISSUED ITS OWN REQUESTS UNDER, and what the
+  -- bracketed liveness window settled at. Added 2026-08-30 with
+  -- SCHEMA_VERSION 9. All three are NULL for a run that issued anonymously,
+  -- which is every `browse` run (the operator's own browser carries its own
+  -- session; the identity design's s2 puts proxy traffic out of scope) and
+  -- every scan whose config names no `scan_identity`.
+  --
+  -- THE SAME THREE NAMES `exchange` ALREADY CARRIES, deliberately. That
+  -- section-6 triple is where the state belongs per request, and the same
+  -- section's 2026-08-30 amendment records why it cannot be written yet:
+  -- `Capture.java` delivers `via: proxy` and nothing else, so this build
+  -- stores no send-path exchange row at all. What section 9's retirement
+  -- gate actually needs is narrower -- whether the run's traffic was issued
+  -- inside a proven window -- and that is a run-level fact. Spelling it the
+  -- same way here means the day send-path recording lands, the per-exchange
+  -- column is a refinement of this one rather than a second vocabulary.
+  --
+  -- `identity_state` COLLAPSES TO THE WORST WINDOW IN THE RUN
+  -- (`hx.identity.IdentityWindow`): one failed canary anywhere makes the
+  -- whole run `assumed`, so a run that reads `proven` had every window in it
+  -- proven. `hx.scan.run` also refuses to write `proven` for a run that
+  -- stopped short, because a window is proof only once BOTH its canaries
+  -- have passed and a halted run never ran its closing one.
+  identity            TEXT,
+  identity_generation INTEGER,
+  identity_state      TEXT CHECK (identity_state IN ('proven','assumed','dead'))
 );
 
 -- Surface identity is the TEMPLATE. /order/1..9999 is one surface, not 9999.
@@ -1168,7 +1194,19 @@ from hx.store.paths import secure_mkdir
 # and "the column list did not change" is not the test -- whether an older
 # file still MEANS what this code assumes is. `engagement.open_`'s version
 # check is the only thing in the tree that can notice.
-SCHEMA_VERSION = 8
+#
+# 8 -> 9 (2026-08-30, identity Task 8): `run` gained `identity`,
+# `identity_generation` and `identity_state`, additive and nullable. As with
+# 6 -> 7 no existing row's meaning changes, and the bump exists to make an
+# older store's absence of the columns loud rather than a
+# `sqlite3.OperationalError` out of a query with every right to expect them:
+# `hx.report._limits` and the report's identity section now READ
+# `run.identity_state`, and `hx.scan.run` writes it on every path a run can
+# end by. A store written before this commit answers NULL for a scan that did
+# issue under a proved session -- which renders as the anonymous case, the
+# safe direction, but says something false about that run. Refusing to open
+# it is the loud version of the same fact.
+SCHEMA_VERSION = 9
 
 TABLES: tuple[str, ...] = (
     "engagement",
@@ -1693,6 +1731,7 @@ git commit -m "feat(store): content-addressed blob store with atomic writes and 
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hx import config
 
@@ -2020,6 +2059,268 @@ def test_a_deliberately_empty_list_is_still_allowed(tmp_path: Path):
     p = _write(tmp_path, 'name: a\nclient: b\nscope:\n  include: ["https://a/*"]\n  exclude: []\n')
     cfg = config.load(p)
     assert cfg.scope_exclude == []
+
+
+# --- Task 1 (identity plan): the identity declaration ----------------------
+
+
+def test_credential_headers_matches_the_probe_modules_own_list():
+    """One fact, two casings, two modules. `hx.checks.probe.CREDENTIAL_HEADERS`
+    is already hand-verified against `Redactor.CREDENTIAL_HEADERS`
+    (extension/src/hx/send/Redactor.java:143-144, lower-cased there for
+    ASCII-insensitive comparison). This pins `config.CREDENTIAL_HEADERS`
+    against THAT copy rather than re-deriving the claim a third time, so the
+    title-cased header names an operator writes in `inject.header` cannot
+    silently drift from the send path's own enforcement list."""
+    from hx.checks import probe
+    assert {h.lower() for h in config.CREDENTIAL_HEADERS} == probe.CREDENTIAL_HEADERS
+
+
+def _identity_yaml(**over) -> str:
+    body = {
+        "strategy": "static",
+        "inject": {"header": "Cookie", "value_from_env": "HX_ID_USER"},
+        "liveness": {"path": "/account", "expect_body": "Sign out"},
+    }
+    body.update(over)
+    return yaml.safe_dump({
+        "name": "e", "client": "c",
+        "scope": {"include": ["https://app.test/*"]},
+        "identities": {"user": body},
+    })
+
+
+def test_a_static_identity_parses_into_a_typed_declaration(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(), encoding="utf-8")
+    cfg = config.load(p)
+    ident = cfg.identities["user"]
+    assert ident.id == "user" and ident.strategy == "static"
+    assert ident.inject.header == "Cookie"
+    assert ident.inject.value_from_env == "HX_ID_USER"
+    assert ident.liveness.expect_body == "Sign out"
+    assert ident.liveness.every_n_probes == 25      # the documented default
+    assert ident.refresh is None
+
+
+def test_the_declaration_carries_no_secret_and_dumps_none(tmp_path, monkeypatch):
+    # THE POINT OF THE WHOLE SHAPE. scope_version.yaml stores this text
+    # verbatim in an append-only table, so a credential here is permanent.
+    monkeypatch.setenv("HX_ID_USER", "session=SUPERSECRET")
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(), encoding="utf-8")
+    cfg = config.load(p)
+    rendered = config.dumps(cfg)
+    assert "SUPERSECRET" not in rendered
+    assert "HX_ID_USER" in rendered, "the declaration must survive a round trip"
+    assert config.load_text(rendered).identities["user"] == cfg.identities["user"]
+
+
+def test_a_credential_header_outside_the_three_is_refused(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        inject={"header": "X-Api-Key", "value_from_env": "HX_ID_USER"}),
+        encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="Cookie"):
+        config.load(p)
+
+
+def test_an_identity_without_liveness_is_refused(tmp_path):
+    p = tmp_path / "config.yaml"
+    body = yaml.safe_load(_identity_yaml())
+    del body["identities"]["user"]["liveness"]
+    p.write_text(yaml.safe_dump(body), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="liveness"):
+        config.load(p)
+
+
+def test_liveness_without_expect_body_is_refused(tmp_path):
+    # A canary satisfied by a status only is satisfied by a 200 LOGIN PAGE,
+    # which is the whole reason retirement was removed from active checks.
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(liveness={"path": "/account"}), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="expect_body"):
+        config.load(p)
+
+
+def test_a_static_identity_may_not_declare_refresh(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        refresh={"command": ["true"], "value_from": "stdout"}), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="static"):
+        config.load(p)
+
+
+def test_a_programmatic_identity_must_declare_refresh(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(strategy="programmatic"), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="refresh"):
+        config.load(p)
+
+
+def test_refresh_command_must_be_a_list_never_a_string(tmp_path):
+    # A string would invite shell=True at the call site. The list is the
+    # guarantee that no shell ever sees it.
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        strategy="programmatic",
+        refresh={"command": "mint.sh --admin", "value_from": "stdout"}),
+        encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="list"):
+        config.load(p)
+
+
+def test_scan_identity_must_name_a_declared_identity(tmp_path):
+    p = tmp_path / "config.yaml"
+    body = yaml.safe_load(_identity_yaml())
+    body["scan_identity"] = "nobody"
+    p.write_text(yaml.safe_dump(body), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="nobody"):
+        config.load(p)
+
+
+def test_a_programmatic_identity_needs_no_value_from_env(tmp_path):
+    """Deviation from the task-1 brief, recorded here rather than silently
+    fixed: the brief's sketch made `inject.value_from_env` unconditionally
+    required, but spec §4's own `admin` example is a programmatic identity
+    whose `inject` block names only a header (`{header: Authorization}`) --
+    its credential comes from `refresh.command`'s stdout, not the
+    environment, so there is no env var to name. Requiring one unconditionally
+    would refuse the spec's own example. `value_from_env` is required only
+    for `static`, where the environment is the sole source of the value."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        strategy="programmatic",
+        inject={"header": "Authorization"},
+        refresh={"command": ["./mint.sh"], "value_from": "stdout"}),
+        encoding="utf-8")
+    cfg = config.load(p)
+    ident = cfg.identities["user"]
+    assert ident.inject.value_from_env is None
+    assert ident.inject.header == "Authorization"
+    rendered = config.dumps(cfg)
+    assert "value_from_env" not in rendered
+    assert config.load_text(rendered).identities["user"] == ident
+
+
+def test_a_static_identity_without_value_from_env_is_refused(tmp_path):
+    """The inverse of the programmatic case, and the half that was unpinned.
+
+    A programmatic identity legitimately has no `value_from_env` -- its
+    credential comes from `refresh.command`'s stdout, which is why spec section
+    4's own `admin` example omits it. A STATIC one has no other source, so
+    omitting it there leaves an identity that can never produce a credential:
+    `hx.identity.resolve` would have no variable to read and the run would
+    either halt or, worse, issue anonymously against an application that
+    requires a session -- answering `clean` about a view none of its users are
+    in. The rule was enforced from the start; only this direction of it went
+    untested, which is how it would have regressed silently.
+    """
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(inject={"header": "Cookie"}), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="value_from_env"):
+        config.load(p)
+
+
+# --- branch fix A: `identities.<id>.origins`, the operator's widening ------
+#
+# F1 of the whole-branch review, first half. The credential used to be
+# registered for every host in `scope.include` while the canary proved one,
+# so a client's live session went to whatever third party the operator had
+# authorised for SCANNING. The default is now the proven host alone
+# (`hx.scan._identity_bracket`), and this key is how an operator says a
+# session genuinely spans more than one -- a decision recorded in
+# `config.yaml`, which is the shape spec section 4 asks for from anything
+# that increases blast radius.
+
+
+def test_an_identity_declares_no_origins_by_default(tmp_path):
+    """ABSENT IS THE COMMON CASE AND MEANS "DO NOT WIDEN". The bound itself
+    is not empty: `hx.scan._identity_bracket` turns `()` into the single
+    origin the run's liveness canary is about to prove, which is a fact about
+    the run's surfaces and cannot be known here."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(), encoding="utf-8")
+    assert config.load(p).identities["user"].origins == ()
+
+
+def test_declared_origins_parse_and_survive_a_round_trip(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        origins=["https://app.test/", "api.test"]), encoding="utf-8")
+    cfg = config.load(p)
+    assert cfg.identities["user"].origins == ("https://app.test/", "api.test")
+    rendered = config.dumps(cfg)
+    assert config.load_text(rendered).identities["user"] == cfg.identities["user"]
+
+
+def test_an_identity_that_widened_nothing_renders_no_origins_key(tmp_path):
+    """`scope_version.yaml` stores this text verbatim in an append-only
+    table, and what belongs there is the operator's DECISION. The default is
+    not one -- it is derived per run from the surface the canary goes to --
+    so an engagement that never widened the bound renders the YAML it always
+    did, and every pre-fix scope version stays byte-comparable."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(), encoding="utf-8")
+    assert "origins" not in config.dumps(config.load(p))
+
+
+def test_a_declared_but_empty_origins_list_is_refused(tmp_path):
+    """The two are opposite intentions and must not collapse: absent is "I
+    did not widen this", `[]` is "I chose nothing", and nothing is a bound
+    that refuses every probe of the run as `identity_origin`. An operator who
+    wants that wants `scan_identity` omitted."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(origins=[]), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="non-empty list"):
+        config.load(p)
+
+
+@pytest.mark.parametrize("entry", ["", "   ", 7, None])
+def test_an_origins_entry_that_is_not_a_non_empty_string_is_refused(
+        tmp_path, entry):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(origins=[entry]), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="non-empty string"):
+        config.load(p)
+
+
+@pytest.mark.parametrize("entry", [
+    "*.test",                    # a scope glob: `hostOf` reads `*.test`
+    "https://*.acme.test/*",     # the same, URL-shaped
+    "/account",                  # a path, so `hostOf` reads nothing at all
+    "https://",                  # a scheme and nothing after it
+    "[::1]:8080",                # cut at the first colon, leaving `[`
+])
+def test_an_origin_the_send_path_could_never_match_is_refused(tmp_path, entry):
+    """THE REASON THIS CHECK EXISTS AT ALL. `Sender.appliesTo` compares the
+    host it is about to connect to against `hostOf(origin)` -- exactly,
+    case-insensitively, with no suffix or glob matching -- so an entry naming
+    no matchable host bounds the credential to nothing and refuses every
+    probe. Fail-closed, but silently: the operator wrote a widening and got a
+    scan that could not send. Refusing at load says so in a sentence.
+
+    The last case is why the charset check is not merely "non-empty": an IPv6
+    literal is cut at its first colon and leaves `[`, which is a non-empty
+    string that can never equal a host."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(origins=[entry]), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="names no host"):
+        config.load(p)
+
+
+def test_the_loaders_host_reading_is_the_extensions_own(tmp_path):
+    """A MIRROR, AND THE ORIGINAL IS THE ONE THAT GUARDS THE WIRE.
+    `extension/src/hx/send/Sender.java`'s `hostOf` is what section 4 rests
+    on; `config._origin_host` exists only to refuse an unmatchable entry
+    early. The two must read the same string out of the same origin or this
+    loader would accept a bound the send path reads differently -- so the
+    cases below are transcribed from that method's own javadoc: everything
+    after `://` and before the first `/`, `:` or `?`, lower-cased."""
+    assert config._origin_host("https://App.Test:8443/x?y") == "app.test"
+    assert config._origin_host("app.test") == "app.test"
+    assert config._origin_host("  HTTP://api.test/  ") == "api.test"
+    assert config._origin_host("/account") == ""
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2072,6 +2373,304 @@ class ConfigError(Exception):
     """The engagement config is missing something required, or is nonsense."""
 
 
+# The three headers `Redactor.unmanagedCredential`
+# (extension/src/hx/send/Redactor.java:143-144) already refuses when the
+# extension did not itself inject them -- confirmed against that file rather
+# than assumed: `CREDENTIAL_HEADERS = {"authorization", "cookie",
+# "proxy-authorization"}`, byte for byte the same three, there lower-cased for
+# ASCII-insensitive comparison. Injecting anything else through `identity`
+# would not be a credential in the sense the send path enforces, and would
+# not need any of this machinery. Not configurable: an operator cannot widen
+# the set here without also widening what the extension itself will carry.
+CREDENTIAL_HEADERS = ("Cookie", "Authorization", "Proxy-Authorization")
+
+VALID_STRATEGIES = ("static", "programmatic")
+
+
+@dataclass(frozen=True)
+class Inject:
+    """Which header carries the credential, and where the value comes from.
+
+    `value_from_env` names an environment variable rather than holding a
+    value -- see the module-level note on `Config.identities` for why. It is
+    required for a `static` identity (the only place a value ever comes from
+    the environment) and optional for a `programmatic` one, whose credential
+    instead comes from `Refresh.command`'s stdout at resolve time (spec §4's
+    `admin` example declares `inject: {header: Authorization}` with no
+    `value_from_env` at all).
+    """
+    header: str
+    value_from_env: str | None = None
+
+
+@dataclass(frozen=True)
+class Liveness:
+    """How this identity proves it is still logged in.
+
+    `expect_body` is REQUIRED and is the load-bearing field. A canary that
+    accepted a status code would be satisfied by an application answering a
+    logged-out request with a 200 login page -- the one shape no
+    response-status rule can catch, and the one `hx.scan._retirable` refused
+    ALL active-check retirement over until this plan gave it a proof to read.
+    It reads one now: an active check's `considered` is honoured for a run
+    whose canary came back `proven`, so a canary a login page could satisfy
+    would hand that hazard straight back with a stamp on it. This field is
+    what stops it.
+    """
+    path: str
+    expect_body: str
+    expect_absent: str | None = None
+    every_n_probes: int = 25
+
+
+@dataclass(frozen=True)
+class Refresh:
+    # A LIST, never a string. `hx.identity.refresh` (a later task) executes
+    # this without a shell, and the list is what makes "no shell ever sees
+    # it" true regardless of what an operator writes -- a string would invite
+    # `shell=True` at the call site however it was spelled.
+    command: tuple[str, ...]
+    value_from: str = "stdout"
+
+
+@dataclass(frozen=True)
+class Identity:
+    id: str
+    strategy: str
+    inject: Inject
+    liveness: Liveness
+    refresh: Refresh | None = None
+    # WHERE THIS IDENTITY'S CREDENTIAL MAY BE APPLIED, and EMPTY IS NOT
+    # "everywhere" -- it is "the operator did not widen it", and
+    # `hx.scan._identity_bracket` then bounds the credential to the ONE
+    # origin the liveness canary is about to prove. Spec section 5 as
+    # amended 2026-08-30: it used to default to `scope.include`, which made
+    # the bound useless on exactly the engagements it exists for -- a scope
+    # naming the app, an API, an SSO provider and a CDN had the client's
+    # live session sent to all four while the canary proved one.
+    #
+    # AN OPERATOR MAY WIDEN IT, AND WRITING IT HERE IS THE POINT. A session
+    # that legitimately spans two hosts is a fact only the operator knows;
+    # section 4's whole shape is that anything increasing blast radius is a
+    # decision recorded in `config.yaml` rather than a default. Widening
+    # origins does NOT widen the proof: `hx.scan._retirable` still retires
+    # only on the origin the canary reached.
+    #
+    # ENTRIES ARE HOSTS OR URL PREFIXES, and `_origin_host` below refuses
+    # anything the extension's `Sender.hostOf` would read as no host at all
+    # -- a glob, a bare path -- because such an entry matches nothing and
+    # would be a bound an operator believed in and never got.
+    origins: tuple[str, ...] = ()
+
+
+# The host characters `Sender.appliesTo` can match. A host name is compared
+# byte for byte and case-insensitively against `req.host()`, so anything
+# outside this set -- a `*`, a space, a `[` left by an IPv6 literal `hostOf`
+# cut at its first colon -- can never equal any host a send frame carries.
+_ORIGIN_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-_")
+
+
+def _origin_host(origin: str) -> str:
+    """The host an `origins` entry names, the way the extension reads it.
+
+    A DELIBERATE MIRROR OF `Sender.hostOf`, and the extension's copy is the
+    one spec section 4 rests on: everything after `://` and before the first
+    `/`, `:` or `?`, lower-cased. This one exists so an entry that would
+    match no host is refused at LOAD time with a sentence naming it, rather
+    than at run time as a silent `identity_origin` refusal of every probe --
+    the same division of labour as `codec._refuse_unwritable` (an early,
+    better-worded refusal) and `IdentityRegistry.checkWritable` (the one that
+    actually guards the wire).
+
+    Returning "" for an entry with no readable host is the fail-closed
+    answer, and `_identity` turns it into a `ConfigError` rather than
+    accepting a bound that binds nothing.
+    """
+    rest = origin.strip().lower()
+    scheme = rest.find("://")
+    if scheme >= 0:
+        rest = rest[scheme + 3:]
+    cut = len(rest)
+    for delimiter in ("/", ":", "?"):
+        at = rest.find(delimiter)
+        if 0 <= at < cut:
+            cut = at
+    return rest[:cut]
+
+
+def _identity(name: str, raw: dict) -> Identity:
+    """Parse one `identities.<name>` block into a declaration.
+
+    Structurally cannot carry a resolved secret: every field here is a name
+    (a header, an env var, a command) or a proof (a liveness signature),
+    never a value. Task 2's `hx.identity.resolve` reads the environment
+    separately and keeps the result off this type entirely.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError(f"identities.{name} must be a mapping")
+
+    strategy = raw.get("strategy")
+    if strategy not in VALID_STRATEGIES:
+        raise ConfigError(
+            f"identities.{name}.strategy must be one of {VALID_STRATEGIES}, "
+            f"got {strategy!r}"
+        )
+
+    inj = _mapping(raw, "inject")
+    header = inj.get("header")
+    if header not in CREDENTIAL_HEADERS:
+        raise ConfigError(
+            f"identities.{name}.inject.header must be one of "
+            f"{CREDENTIAL_HEADERS}, got {header!r}"
+        )
+    env = inj.get("value_from_env")
+    if env is not None and (not isinstance(env, str) or not env.strip()):
+        raise ConfigError(
+            f"identities.{name}.inject.value_from_env must be a non-empty "
+            "string naming an environment variable when given; a credential "
+            "may not be written here"
+        )
+    if strategy == "static" and not env:
+        raise ConfigError(
+            f"identities.{name}.inject.value_from_env is required for a "
+            "static identity: it is the only source of the credential a "
+            "static identity has, and the config must name where the "
+            "secret comes from without ever holding it"
+        )
+
+    live = _mapping(raw, "liveness")
+    if not live:
+        raise ConfigError(
+            f"identities.{name} has no liveness block. An identity that "
+            "cannot prove it is live can never be `proven`, and traffic "
+            "issued under it is indistinguishable from anonymous traffic"
+        )
+    expect = live.get("expect_body")
+    if not isinstance(expect, str) or not expect.strip():
+        raise ConfigError(
+            f"identities.{name}.liveness.expect_body is required and must "
+            "be a non-empty string: a signature only an AUTHENTICATED "
+            "response carries. A status code is not one -- a 200 login "
+            "page has one too, and accepting that is the exact defect this "
+            "declaration exists to close"
+        )
+    path = live.get("path")
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ConfigError(
+            f"identities.{name}.liveness.path must be an origin-form path "
+            f"starting with '/', got {path!r}"
+        )
+    absent = live.get("expect_absent")
+    if absent is not None and (not isinstance(absent, str) or not absent.strip()):
+        raise ConfigError(
+            f"identities.{name}.liveness.expect_absent, when given, must be "
+            "a non-empty string"
+        )
+    liveness = Liveness(
+        path=path,
+        expect_body=expect,
+        expect_absent=absent,
+        every_n_probes=_positive_int(live, "every_n_probes", 25),
+    )
+
+    refresh_raw = _mapping(raw, "refresh")
+    if strategy == "static" and refresh_raw:
+        raise ConfigError(
+            f"identities.{name} is static and may not declare refresh: "
+            "there is no command to re-run, and a static credential that "
+            "expired is a dead session, not a refreshable one"
+        )
+    if strategy == "programmatic" and not refresh_raw:
+        raise ConfigError(
+            f"identities.{name} is programmatic and must declare refresh"
+        )
+
+    refresh = None
+    if refresh_raw:
+        command = refresh_raw.get("command")
+        if not isinstance(command, list) or not command:
+            raise ConfigError(
+                f"identities.{name}.refresh.command must be a non-empty "
+                "list of arguments, never a string: it is executed without "
+                "a shell, and a string would invite one"
+            )
+        if not all(isinstance(x, str) for x in command):
+            raise ConfigError(
+                f"every entry in identities.{name}.refresh.command must be "
+                "a string"
+            )
+        value_from = refresh_raw.get("value_from", "stdout")
+        if value_from != "stdout":
+            raise ConfigError(
+                f"identities.{name}.refresh.value_from must be 'stdout', "
+                f"got {value_from!r}"
+            )
+        refresh = Refresh(command=tuple(command), value_from=value_from)
+
+    return Identity(
+        id=name,
+        strategy=strategy,
+        inject=Inject(header=header, value_from_env=env),
+        liveness=liveness,
+        refresh=refresh,
+        origins=_origins(name, raw),
+    )
+
+
+def _origins(name: str, raw: dict) -> tuple[str, ...]:
+    """`identities.<name>.origins`, validated, or `()` for the default.
+
+    ABSENT IS THE SAFE ANSWER AND IS NOT SPELLED HERE: `hx.scan.
+    _identity_bracket` turns `()` into the single origin the run's liveness
+    canary is about to prove. This function's whole job is the OTHER case --
+    an operator deliberately widening the bound -- and every refusal below is
+    a widening that would not have widened anything.
+
+    A DECLARED-BUT-EMPTY LIST IS REFUSED rather than read as the default. The
+    two are opposite intentions -- "I did not think about this" and "I
+    thought about it and chose nothing" -- and the second one bounds the
+    credential to no host at all, so every probe of the run would be refused
+    `identity_origin`. An operator who wants that wants `scan_identity`
+    omitted.
+
+    THE ENTRIES ARE NOT CHECKED AGAINST `scope.include`, deliberately. Scope
+    patterns are globs and origins are hosts, so "is this host inside that
+    glob" is a matcher this file does not have; and it would be a check with
+    no teeth either way, because scope is enforced on the send path
+    regardless -- an origin naming a host outside scope simply never gets a
+    request to apply to. Origins narrow, they never widen what scope allows.
+    """
+    if "origins" not in raw:
+        return ()
+    declared = raw["origins"]
+    if not isinstance(declared, list) or not declared:
+        raise ConfigError(
+            f"identities.{name}.origins must be a non-empty list of hosts or "
+            "URL prefixes when given; omit the key entirely to bound the "
+            "credential to the one host the liveness canary proves, which is "
+            "the default and the safe answer"
+        )
+    for entry in declared:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ConfigError(
+                f"every entry in identities.{name}.origins must be a "
+                f"non-empty string, got {entry!r}"
+            )
+        host = _origin_host(entry)
+        if not host or set(host) - _ORIGIN_HOST_CHARS:
+            raise ConfigError(
+                f"identities.{name}.origins entry {entry!r} names no host the "
+                "send path can match. An origin is a host (`api.acme.test`) "
+                "or a URL prefix (`https://api.acme.test/`); the extension "
+                "reads everything after '://' and before the first '/', ':' "
+                "or '?' and compares it to the host it is about to connect "
+                f"to, and {host!r} can never equal one. A glob is not an "
+                "origin -- it would bound the credential to nothing and "
+                "refuse every probe"
+            )
+    return tuple(entry.strip() for entry in declared)
+
+
 @dataclass(frozen=True)
 class Config:
     name: str
@@ -2090,7 +2689,26 @@ class Config:
     # nothing: the budget was always 2000, it was just never written down.
     max_requests: int = 2000
     max_concurrency: int = 2
-    identities: dict[str, dict] = field(default_factory=dict)
+    # A credential value must NEVER be reachable from here.
+    # `hx.engagement.record_scope_version` writes the loaded config's YAML
+    # verbatim into `scope_version.yaml` -- `_record_scope`'s `INSERT INTO
+    # scope_version` at `engagement.py:114`, whose `yaml` column takes
+    # `config.dumps(cfg)` whole -- a
+    # table the schema calls "append-only: tamper-evidence for contract
+    # disputes" -- so a secret on this object is a secret copied,
+    # unredactably, into a table designed to be impossible to rewrite. Each
+    # `Identity` names an environment variable instead; the value that
+    # variable holds is resolved separately (`hx.identity.resolve`, a later
+    # task) into an object that never touches `Config`. `dumps()` below is
+    # built to make that structural, not just documented: it reads only
+    # declaration fields off `Identity`, so there is no field to leak even by
+    # accident.
+    identities: dict[str, Identity] = field(default_factory=dict)
+    # Which declared identity `hx scan` issues its probes under. `None` is
+    # anonymous, same as before this field existed. Validated against
+    # `identities` at load time -- see `load_text` -- so a typo here is a
+    # config-time error, not a scan that silently runs unauthenticated.
+    scan_identity: str | None = None
     # `preserve_segments` names path segments the normaliser must NOT template.
     # THE DEFAULT PROTECTS NOTHING, and an operator who leaves it alone should
     # know that: no rule in `hx.surface` matches `api`, `v1`, `v2` or `v3` at
@@ -2173,13 +2791,24 @@ def _positive_int(raw: dict, key: str, default: int) -> int:
 
 
 def load(path: Path) -> Config:
+    """Read `path` and parse it. Everything else lives in `load_text`.
+
+    Two parsers that must agree is how they come to disagree, so `load`
+    is reduced to the read and delegates parsing entirely -- `load_text` is
+    the one place YAML becomes a `Config`, whether the text came from disk
+    or, as the round-trip test does, from `dumps()` still in memory.
+    """
+    return load_text(Path(path).read_text(encoding="utf-8"))
+
+
+def load_text(text: str) -> Config:
     # A YAML syntax error is "nonsense" by this module's own definition of
     # ConfigError. Wrapping it here means no caller has to know PyYAML is
     # the parser underneath.
     try:
-        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
+        raise ConfigError(f"invalid YAML: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
 
@@ -2219,6 +2848,24 @@ def load(path: Path) -> Config:
             raise ConfigError(f"checks.{key} must be a boolean, got {type(value).__name__}")
         checks[key] = value
 
+    identities = {
+        ident_name: _identity(ident_name, body)
+        for ident_name, body in _mapping(raw, "identities").items()
+    }
+
+    scan_identity = raw.get("scan_identity")
+    if scan_identity is not None:
+        if not isinstance(scan_identity, str):
+            raise ConfigError(
+                "scan_identity must be a string, got "
+                f"{type(scan_identity).__name__}"
+            )
+        if scan_identity not in identities:
+            raise ConfigError(
+                f"scan_identity names {scan_identity!r}, which is not a "
+                f"declared identity. Declared: {sorted(identities) or 'none'}"
+            )
+
     return Config(
         name=raw["name"],
         client=raw["client"],
@@ -2231,10 +2878,50 @@ def load(path: Path) -> Config:
         rate_limit_rps=_positive_int(raw, "rate_limit_rps", 5),
         max_requests=_positive_int(raw, "max_requests", 2000),
         max_concurrency=_positive_int(raw, "max_concurrency", 2),
-        identities=_mapping(raw, "identities"),
+        identities=identities,
+        scan_identity=scan_identity,
         preserve_segments=_string_list(raw, "preserve_segments", ["api", "v1", "v2", "v3"]),
         slug_threshold=_positive_int(raw, "slug_threshold", 12),
     )
+
+
+def _identity_yaml(i: Identity) -> dict:
+    """The DECLARATION, and structurally nothing else.
+
+    Built field by field from the dataclass rather than by dumping an
+    object, so there is no path by which a resolved credential could ride
+    along: `Identity` has no field holding one (see `hx.identity.resolve`,
+    a later task, which keeps secrets in a separate mapping that is never
+    passed here). `scope_version.yaml` stores whatever this returns
+    VERBATIM in an append-only table -- see the spec's §3.
+    """
+    out: dict = {
+        "strategy": i.strategy,
+        "inject": {"header": i.inject.header},
+        "liveness": {
+            "path": i.liveness.path,
+            "expect_body": i.liveness.expect_body,
+            "every_n_probes": i.liveness.every_n_probes,
+        },
+    }
+    if i.inject.value_from_env is not None:
+        out["inject"]["value_from_env"] = i.inject.value_from_env
+    if i.liveness.expect_absent is not None:
+        out["liveness"]["expect_absent"] = i.liveness.expect_absent
+    if i.refresh is not None:
+        out["refresh"] = {
+            "command": list(i.refresh.command),
+            "value_from": i.refresh.value_from,
+        }
+    if i.origins:
+        # Omitted when empty, so an engagement that never widened the bound
+        # renders the same YAML it always did -- and so `scope_version.yaml`
+        # records the operator's DECISION to widen and nothing else. The
+        # default is not a decision and has no business being written down as
+        # one: it is derived per run from the surface the canary goes to,
+        # which is a fact about the run rather than about the config.
+        out["origins"] = list(i.origins)
+    return out
 
 
 def dumps(cfg: Config) -> str:
@@ -2250,7 +2937,8 @@ def dumps(cfg: Config) -> str:
             "rate_limit_rps": cfg.rate_limit_rps,
             "max_requests": cfg.max_requests,
             "max_concurrency": cfg.max_concurrency,
-            "identities": cfg.identities,
+            "identities": {n: _identity_yaml(i) for n, i in cfg.identities.items()},
+            "scan_identity": cfg.scan_identity,
             "preserve_segments": cfg.preserve_segments,
             "slug_threshold": cfg.slug_threshold,
         },
@@ -3041,6 +3729,7 @@ from click.testing import CliRunner
 from hx import cli
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import report
 from hx import run as run_mod
 from hx import scan as scan_mod
 from hx import session as session_mod
@@ -4333,6 +5022,289 @@ def test_report_redacts_a_credential_reaching_the_export(engagement_with_surface
     assert "SECRETTOKEN" not in text
     assert "hunter2" not in text
     assert "Token leak" in text
+
+
+def test_scan_tells_the_operator_how_many_canaries_it_sent(
+        engagement_with_surface, monkeypatch):
+    """F5 OF FIX ROUND A. Section 6: the canary "is counted in `requests_sent`
+    for the run, because it is a request `hx` put on the client's system".
+    `ScanSummary.canary_requests` counted it faithfully and was read by
+    nothing -- not `check_run.requests_sent` (no row owns it), not the `run`
+    table (no request column), not `report._limits` (no request tally at
+    all). A number that satisfies a spec sentence and reaches nobody
+    satisfies nothing.
+
+    THE WHOLE PATH, not a stubbed summary: the config declares an identity
+    and names it as `scan_identity`, the credential comes out of the
+    environment, and the two canaries that bracket the run are the ones the
+    line counts.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    monkeypatch.setenv("HX_ID_USER", "session=abc")
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        eng.config = dataclasses.replace(
+            eng.config, identities={USER.id: USER}, scan_identity=USER.id,
+            scope_include=["https://app.acme.com/*"])
+        eng_mod.record_scope_version(
+            eng, author="test", reason="declare an identity for this scan")
+    finally:
+        eng.db.close()
+
+    _stub_session(monkeypatch, bridge=_SessionBridge())
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code == 0, result.output
+    assert "canaries  2" in result.output, (
+        "the run's own traffic reaches no reader: " + result.output)
+
+
+def test_a_scan_with_no_identity_prints_no_canary_line(
+        engagement_with_surface, monkeypatch):
+    """THE OTHER HALF. An anonymous run sends no canary, and `canaries  0` on
+    every scan is a line an operator learns to skip past -- which is how the
+    one that matters gets missed."""
+    _stub_session(monkeypatch)
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code == 0, result.output
+    assert "canaries" not in result.output, result.output
+
+
+def _declare_identity(root, ident, monkeypatch, *, value="session=abc",
+                      export=True):
+    """Give the engagement at `root` one identity and scan under it.
+
+    The scope becomes a URL PREFIX rather than whatever the fixture carries.
+    It stopped being the identity's `origins` in branch fix A -- the
+    credential is bounded to the one host the canary proves -- but scope is
+    still what decides whether a probe may be sent at all.
+    `record_scope_version` is called because `engagement.open_` refuses a
+    store whose config and newest scope version have diverged, and every
+    `hx scan` below opens the store for itself.
+
+    `export=False` DECLARES THE IDENTITY WITHOUT SETTING ITS VARIABLE, for
+    the operator mistake that is ordinary rather than the session that dies
+    mid-run: a static identity whose `HX_ID_USER` was simply never
+    exported."""
+    if export:
+        monkeypatch.setenv("HX_ID_USER", value)
+    eng = eng_mod.open_(root)
+    try:
+        eng.config = dataclasses.replace(
+            eng.config, identities={ident.id: ident}, scan_identity=ident.id,
+            scope_include=["https://app.acme.com/*"])
+        eng_mod.record_scope_version(
+            eng, author="test", reason="declare an identity for this scan")
+    finally:
+        eng.db.close()
+
+
+def test_a_dead_session_is_reported_as_a_result_and_not_a_traceback(
+        engagement_with_surface, monkeypatch):
+    """HAZARD ONE OF TASK 8. `scan.run` halts on a session it cannot prove --
+    spec s7's instruction, and s6's reason: a dead session produces a run of
+    "not vulnerable" answers indistinguishable from a clean application --
+    and `hx scan` caught only `SessionError`, so the one outcome this plan
+    exists to make visible reached an operator as a stack trace.
+
+    THE MESSAGE NAMES WHICH OF SECTION 6'S FOUR OUTCOMES IT WAS. `user` is
+    static, so the table gives it no refresh: the operator is told that
+    rather than left to wonder whether their (nonexistent) refresh command
+    ran. It also says the canary was ANSWERED rather than refused, which is
+    the difference between re-authenticating and fixing a scope that bounds
+    the credential to no host at all.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch)
+    # A session that never proves, at any generation the run can reach.
+    _stub_session(monkeypatch, bridge=_SessionBridge(live_at_generation=99))
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code != 0, result.output
+    assert result.exception is None or isinstance(result.exception,
+                                                  SystemExit), (
+        "the halt escaped as an exception: an operator reads a traceback "
+        f"instead of a result -- {result.exception!r}")
+    assert "could not be proved live before the first probe" in result.output
+    assert "no refresh command to try" in result.output, (
+        "the message does not say which of section 6's outcomes happened, so "
+        f"an operator cannot tell where to look: {result.output}")
+    assert "`fails, static`" in result.output
+    assert "not with the signature this identity is declared to prove itself "\
+        "by" in result.output, (
+            "a canary that was ANSWERED reads like one that was refused: "
+            + result.output)
+
+
+def test_an_unexported_identity_variable_is_reported_as_a_result_and_not_a_traceback(
+        engagement_with_surface, monkeypatch):
+    """FINDING 3 OF THE TASK 8 REVIEW. `hx scan` caught `IdentityDead` (the
+    session that WAS opened and then died or never proved live) but not
+    `hx.identity.IdentityError`, which is what `_resolve_scan_identity`
+    raises when a declared identity's variable was simply never exported --
+    no session is ever opened for this case, so `IdentityDead` was never
+    going to catch it. Forgetting an `export` is the ordinary mistake, one
+    exception class over from the rarer one commit a88388d fixed, and until
+    now it still reached the operator as a traceback.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch, export=False)
+    _stub_session(monkeypatch, bridge=_SessionBridge())
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code != 0, result.output
+    assert result.exception is None or isinstance(result.exception,
+                                                  SystemExit), (
+        "the missing export escaped as an exception: an operator reads a "
+        f"traceback instead of a result -- {result.exception!r}")
+    assert "HX_ID_USER" in result.output, (
+        "the operator is not told which variable to export: " + result.output)
+    assert "not set" in result.output
+    assert "Traceback" not in result.output
+
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        row = eng.db.execute(
+            "SELECT status, identity, identity_state, stop_reason FROM run"
+            " WHERE kind='scan'").fetchone()
+    finally:
+        eng.db.close()
+    assert row[0] == "error", tuple(row)
+    assert "IdentityError" in row[3]
+    assert "HX_ID_USER" in row[3]
+
+
+def test_an_unwritable_credential_is_reported_as_a_result_and_not_a_traceback(
+        engagement_with_surface, monkeypatch):
+    """F5 OF THE WHOLE-BRANCH REVIEW, FIRST ARM. `BridgeServer.
+    register_identity`'s own docstring tells its caller it "has two exception
+    types to handle, not one" -- `BridgeError` and `codec.FrameError` --
+    `_IdentityBracket.start` deliberately wraps neither, and `hx scan` caught
+    neither. So a credential with an internal newline, which is what a token
+    pasted out of a file looks like, reached the operator as a traceback with
+    the sentence `codec._refuse_unwritable` had already written for them at
+    the bottom of it.
+
+    THE VALUE IS NOWHERE IN THE OUTPUT, and that is the same rule the refusal
+    itself follows: `_refuse_unwritable` never quotes the character or the
+    text it came from, because a `FrameError`'s message is logged by whatever
+    catches it. `X-Smuggled` is the half of this credential that would show up
+    if it did.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    class _BuildsTheBody(_SessionBridge):
+        """`_SessionBridge`, plus the one statement that raises this.
+
+        The real `BridgeServer.register_identity` builds the frame body with
+        `codec.identity_body(...)` BEFORE it writes anything to the socket,
+        and that call is where an unwritable credential is refused. Every
+        other double in this suite skips it, so the whole chain from
+        `HX_ID_USER` to the operator's terminal had no test that could see
+        this exception at all -- which is how it went unhandled.
+        """
+
+        def register_identity(self, resolved, *, origins):
+            cli.codec_mod.identity_body(resolved.id, resolved.generation,
+                                        resolved.header, resolved.value,
+                                        origins)
+            super().register_identity(resolved, origins=origins)
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch,
+                      value="session=abc\r\nX-Smuggled: yes")
+    _stub_session(monkeypatch, bridge=_BuildsTheBody())
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code != 0, result.output
+    assert result.exception is None or isinstance(result.exception,
+                                                  SystemExit), (
+        "the refusal escaped as an exception: an operator reads a traceback "
+        f"instead of a result -- {result.exception!r}")
+    assert "carriage return or line feed" in result.output, result.output
+    assert "Traceback" not in result.output
+    assert "X-Smuggled" not in result.output, (
+        "the credential reached the operator's terminal: " + result.output)
+
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        row = eng.db.execute(
+            "SELECT status, stop_reason FROM run WHERE kind='scan'").fetchone()
+    finally:
+        eng.db.close()
+    assert row[0] == "error", tuple(row)
+    assert "X-Smuggled" not in row[1], (
+        "the credential reached the run row, which the report renders")
+
+
+def test_a_peer_that_refuses_the_identity_frame_is_a_result_too(
+        engagement_with_surface, monkeypatch):
+    """F5'S OTHER ARM, AND WHY ONE HANDLER COVERS BOTH. `register_identity`
+    raises `BridgeError` when the peer refuses the frame or is gone -- a
+    `bad_identity`, a `stale_generation`, a socket that closed. From the
+    operator's side that is the same outcome as the arm above: the identity
+    could not be registered, so no probe was issued under it and the run
+    stopped. What differs is the message, and it is the message that is kept
+    intact.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    class _RefusingBridge(_SessionBridge):
+        def register_identity(self, resolved, *, origins):
+            raise cli.bridge_mod.BridgeError(
+                "peer refused identity: bad_identity: generation must be >= 1",
+                error_class="bad_identity")
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch)
+    _stub_session(monkeypatch, bridge=_RefusingBridge())
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code != 0, result.output
+    assert result.exception is None or isinstance(result.exception,
+                                                  SystemExit), (
+        "the peer's refusal escaped as an exception -- "
+        f"{result.exception!r}")
+    assert "bad_identity" in result.output, (
+        "the peer's own refusal class was lost: " + result.output)
+    assert "Traceback" not in result.output
+
+
+def test_a_halted_scan_leaves_the_run_row_error_and_dead(
+        engagement_with_surface, monkeypatch):
+    """The halt is a RESULT, so it has to be recorded as one. `report.
+    _provenance` names the run among those that did not finish and
+    `report._identity` says prominently that the session died -- both read
+    the run row, and neither can say anything if the halt left it
+    `running`."""
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch)
+    _stub_session(monkeypatch, bridge=_SessionBridge(live_at_generation=99))
+    CliRunner().invoke(cli.main, ["scan", "--root",
+                                  str(engagement_with_surface)])
+
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        row = eng.db.execute(
+            "SELECT status, identity, identity_state, stop_reason FROM run"
+            " WHERE kind='scan'").fetchone()
+        assert (row[0], row[1], row[2]) == ("error", "user", "dead"), tuple(row)
+        assert "IdentityDead" in row[3]
+        rendered = report.render(eng.db, engagement_id=eng.id,
+                                 config=eng.config, blobs=eng.blobs)
+    finally:
+        eng.db.close()
+    assert ("**1 run(s) stopped because the session being tested under "
+            "stopped being valid.**") in rendered
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -4366,10 +5338,13 @@ import click
 from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import identity as identity_mod
 from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
 from hx import session as session_mod
+from hx.bridge import codec as codec_mod
+from hx.bridge import server as bridge_mod
 from hx.checks import registry
 from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
@@ -4989,6 +5964,99 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # and re-wording it here would put this command between the
             # operator and the sentence that tells them what to do.
             raise click.ClickException(str(exc)) from exc
+        except scan_mod.IdentityDead as exc:
+            # A DEAD SESSION IS A RESULT, NOT A CRASH -- and until Task 8 it
+            # was a traceback. `scan.run` halts rather than scanning
+            # anonymously (spec s7's instruction, and the identity design's
+            # s6 gives the reason: a dead session produces a run of "not
+            # vulnerable" answers that look exactly like a clean
+            # application), and nothing here caught it, so the one outcome
+            # this whole plan exists to make visible arrived at an operator
+            # as a stack trace with the sentence at the bottom.
+            #
+            # THE MESSAGE INTACT, for the reason above it: it names which of
+            # section 6's four outcomes happened (`_IdentityBracket._outcome`
+            # -- `fails, static` and `fails after refresh` send an operator
+            # to different places), whether the canary was REFUSED or
+            # answered without the declared signature (`_unproved` -- a
+            # refused canary means no credential they can mint will help),
+            # and why halting was the right answer.
+            #
+            # NON-ZERO EXIT, like every other `ClickException`, and that is
+            # the point rather than an accident: the run did not complete,
+            # its `run` row reads `error`, and a shell that treated this as
+            # success would let a scheduled scan report clean coverage for
+            # an application it stopped testing at the first surface. The
+            # run's own tallies are in that row's `stop_reason`
+            # (`scan._halt_reason`) and reach a reader through `hx report`,
+            # not through this line.
+            raise click.ClickException(str(exc)) from exc
+        except identity_mod.IdentityError as exc:
+            # THE FAR COMMONER MISTAKE, ONE EXCEPTION CLASS OVER FROM
+            # `IdentityDead` ABOVE. `_resolve_scan_identity` (`scan.py:986`)
+            # reads a static identity's credential out of `os.environ` and
+            # RAISES `IdentityError` when the declared variable was simply
+            # never exported -- no session was ever opened, no canary was
+            # ever sent, so `IdentityDead` (which is a session that WAS
+            # proved and then died, or never provably lived) is the wrong
+            # class for it and always was. Forgetting an `export` on a
+            # terminal an operator just opened is ordinary; nothing here
+            # caught it, so it reached them as a traceback with the message
+            # `identity.resolve` already wrote for them at the bottom of it
+            # -- the same defect commit a88388d fixed for the rarer case,
+            # one exception class over.
+            #
+            # THE MESSAGE INTACT, for the same reason as above: `resolve`
+            # already names the variable that is missing and refuses to
+            # issue anonymously rather than silently testing the logged-out
+            # view of an authenticated application, and re-wording it here
+            # would put this command between the operator and the sentence
+            # that tells them what to do. No credential value is in it --
+            # `resolve` raises before it has one to leak.
+            #
+            # NON-ZERO EXIT, like every other `ClickException`: the run's
+            # own row still closes `error` (`scan.run`'s `except
+            # BaseException`, unconditionally), so nothing here masks a
+            # scan that sent no probe or canary as one that succeeded.
+            raise click.ClickException(str(exc)) from exc
+        except (bridge_mod.BridgeError, codec_mod.FrameError) as exc:
+            # THE TWO `register_identity` FLAGS FOR ITS CALLER, AND NEITHER
+            # HAD ONE. F5 of the whole-branch review. That method's docstring
+            # says in as many words that the caller "has two exception types
+            # to handle, not one", `_IdentityBracket.start` deliberately
+            # wraps neither -- correctly, since each says what actually
+            # happened -- and this command caught neither. So a credential
+            # with an internal newline or a smart quote pasted out of a file
+            # reached the operator as a traceback, with the sentence
+            # `codec._refuse_unwritable` had already written for them at the
+            # bottom of it. The same defect commit a88388d fixed for
+            # `IdentityDead` and 20b0a64 for `IdentityError`, two doors over.
+            #
+            # BOTH ARMS, ONE HANDLER, because from the operator's side they
+            # are one outcome: the identity could not be registered, so no
+            # probe was issued under it and the run stopped. The message is
+            # what tells them which -- `FrameError` names the character class
+            # and why such a value is refused rather than escaped, and
+            # `BridgeError` names the peer's own refusal class.
+            #
+            # THE MESSAGE INTACT, and it holds no credential: every branch of
+            # `_refuse_unwritable` refuses to quote the character or the text
+            # it came from (spec section 5 -- the credential is logged on
+            # neither side, and a caught `FrameError`'s message is logged by
+            # whatever catches it), and `register_identity`'s `BridgeError`
+            # quotes the peer's `class` and `detail`, which the extension
+            # builds from the identity id and the host and never from the
+            # value. A traceback would have leaked nothing either -- Python
+            # prints source lines, not values -- so this is about the
+            # operator's experience of an ordinary mistake, not about a leak.
+            #
+            # NOT NARROWER THAN `BridgeError`, deliberately. Every other
+            # bridge failure a scan can suffer is already translated before
+            # it gets here: `ProbeSender` turns one into a `ProbeRefused`
+            # (`probe.py`'s `except BridgeError`), which the runner records
+            # as an `inconclusive` row. What is left to arrive raw is the
+            # identity registration, which is the one this handler is for.
+            raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
         click.echo(f"findings  {summary.findings}")
@@ -5003,6 +6071,29 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
         # run row's `stop_reason` now carries.
         for reason, n in sorted(summary.refused.items()):
             click.echo(f"refused   {n} ({reason})")
+        # THE CANARIES ARE HX'S OWN TRAFFIC AND AN OPERATOR IS TOLD ABOUT
+        # THEM -- F5 of the task-7 fix round A review. Section 6 says the
+        # canary "is counted in `requests_sent` for the run, because it is a
+        # request `hx` put on the client's system", and
+        # `ScanSummary.canary_requests` counted it faithfully and was READ BY
+        # NOTHING: `check_run.requests_sent` excludes it (no check asked for
+        # it, so no row owns it), the `run` table has no request column, and
+        # `report._limits` renders no request tally at all. A number that
+        # satisfies a spec sentence and reaches nobody satisfies nothing.
+        #
+        # THIS IS NOT THE WHOLE OF WHAT SECTION 6 ASKS and the difference is
+        # worth naming rather than papering over: the section says
+        # `requests_sent` FOR THE RUN, and this build has no such column to
+        # add it to. What it can have today is the operator being told, at
+        # the same terminal that already gets `skipped` and `refused`, that
+        # a run put N requests of its own on a client's system. The client's
+        # own copy of that fact belongs in section 10's identity section,
+        # which the plan gives to Task 8, derived from the run.
+        #
+        # ONLY WHEN THERE WERE ANY. An anonymous run sends no canary, and
+        # `canaries  0` on every scan is a line an operator learns to skip.
+        if summary.canary_requests:
+            click.echo(f"canaries  {summary.canary_requests}")
 
         # A class the operator enabled that this build ships nothing for.
         # Without this line, `active_timing: true` plus no rows reads as

@@ -149,16 +149,29 @@ In `src/hx/checks/base.py`, add to `Verdict` after `reason`:
     # nothing retires nothing. The failure mode is a finding staying live,
     # never one falsely closed.
     #
-    # PASSIVE CHECKS ONLY, SINCE FIX ROUND 6, AND THE RUNNER ENFORCES IT.
-    # `hx.scan._retirable` returns nothing for a check driven through the
-    # `probes` hook and RAISES if such a check populated this at all: every
-    # probe this build sends is unauthenticated, so an active check's
-    # conclusion is about the logged-out view of the application and cannot
-    # close a finding about the view the client's users are in. An active
-    # check names what it examined to `hx.checks.active._probe_util.verdict`
-    # as `examined` instead -- which is what lets it say `clean` -- and that
-    # value deliberately never reaches this field. See `_retirable` for the
-    # argument and for the two narrower rules that were tried first.
+    # BOTH KINDS OF CHECK POPULATE THIS, AND `hx.scan._retirable` DECIDES
+    # WHAT MAY BE DONE WITH IT. This comment used to say three other things
+    # -- "passive checks only", "`_retirable` RAISES if a probing check
+    # populated this at all", and "an active check's `examined` deliberately
+    # never reaches this field" -- and Task 8 falsified all three in the same
+    # commit, leaving them standing here until F2 of the whole-branch review
+    # read them. They are not merely stale: a reader following them would
+    # sever `examined` from `considered` again and silently disable the
+    # retirement this branch exists to give back, or would believe a hard
+    # raise guards the gate where only a state comparison does.
+    #
+    # WHAT IS TRUE NOW. A PASSIVE check's `considered` is honoured whatever
+    # the run's session did: it reads the CAPTURED traffic, so no probe of
+    # hx's own is involved and no session can have been dead for it. An
+    # ACTIVE check names what it examined to `hx.checks.active._probe_util.
+    # verdict` as `examined`, and that function puts it on the `clean`
+    # branch's `considered` (`return base.Verdict.clean(considered=
+    # examined)`); `_retirable` then honours it only for a run whose liveness
+    # canary proved the session (`identity_state == "proven"`) and only for
+    # the ONE ORIGIN that canary was actually sent to. It no longer raises
+    # for a populated one, because a raise would have made every active row
+    # of every anonymous scan an `error`. See `_retirable` for the argument
+    # and for the narrower rules that were tried first.
     considered: tuple[str, ...] = ()
 ```
 
@@ -329,15 +342,34 @@ In `scan.run`, beside `seen_findings: set[str] = set()`, add:
 
 ```python
 # src/hx/scan.py -- Task 2: the considered set the runner collects
-        # (surface_id, check_id, issue_type_id) this run examined AND may
-        # speak for the client's own view of. Retirement reads this, NOT
-        # `check_run.verdict == 'clean'`: a check filing one of three
-        # findings answers `finding`, and the other two still need retiring.
-        # The second clause is `_retirable`'s and it is why nothing an
-        # ACTIVE check said can be in here: every probe this build sends is
-        # unauthenticated, so what it saw is not necessarily the view the
-        # client's users are in.
-        considered: set[tuple[str, str, str]] = set()
+        # What each accepted verdict OFFERS for retirement -- its own
+        # `considered`, with the hook that produced it and the row it belongs
+        # to. Retirement reads this, NOT `check_run.verdict == 'clean'`: a
+        # check filing one of three findings answers `finding`, and the other
+        # two still need retiring.
+        #
+        # OFFERED HERE AND DECIDED AFTER THE LOOP, which is Task 8's ordering
+        # and is load-bearing. `_retirable` gates an active check's offer on
+        # the run's settled window state, and `bracket.finish()` -- the
+        # closing canary -- is the last thing that can turn `proven` into
+        # `assumed`. Calling the gate in this loop would read `proven` for a
+        # run whose closing canary was about to fail and retire on traffic
+        # section 6 downgrades, which is the hole the bracket exists to
+        # close. So the decision happens once, below, between `finish()` and
+        # `_mark_unobserved` (the only writer of `observed = 0`).
+        #
+        # A VERDICT WITH NOTHING TO OFFER IS NOT KEPT. An `inconclusive`
+        # verdict carries no `considered` -- the classmethod does not offer
+        # it -- so exactly the state that must retire nothing contributes no
+        # entry at all, and the list holds one tuple per row that named an
+        # issue type rather than one per row.
+        # THE ROW'S OWN ORIGIN TRAVELS WITH THE OFFER -- `(scheme, host,
+        # port)`, the same triple the bracket keeps for its canaries.
+        # Retirement is gated on it (`_retirable`), and it has to be captured
+        # HERE because the gate runs after the loop, by which time `surface`
+        # is whichever row happened to be last.
+        offered: list[tuple[str, str, str, tuple[str, str, int],
+                            base.Verdict]] = []
 ```
 
 After the `isinstance(verdict, base.Verdict)` guard and before the
@@ -346,16 +378,16 @@ After the `isinstance(verdict, base.Verdict)` guard and before the
 ```python
 # src/hx/scan.py -- Task 2: every accepted verdict contributes to it
                     reason = verdict.reason
-                    # An `inconclusive` verdict carries no `considered` -- the
-                    # classmethod does not offer it -- so this loop is empty
-                    # for exactly the state that must retire nothing, and
-                    # `_retirable` empties it for every check the runner
-                    # drove through the wire. The verdict itself is not
-                    # touched either way: a `finding` is still written and
-                    # still reported, a `clean` is still `clean`, and what
-                    # `report._coverage` renders for the row is unchanged.
-                    for issue_type in _retirable(hook, verdict):
-                        considered.add((surface[0], check.id, issue_type))
+                    # KEPT, NOT DECIDED -- see `offered`'s own comment above
+                    # for why the gate cannot run here. The verdict itself is
+                    # not touched either way: a `finding` is still written
+                    # and still reported, a `clean` is still `clean`, and
+                    # what `report._coverage` renders for the row is
+                    # unchanged.
+                    if verdict.considered:
+                        offered.append((hook, surface[0], check.id,
+                                        (surface[2], surface[3], surface[4]),
+                                        verdict))
 ```
 
 Change the call at the end of the run from `_mark_unobserved(conn, engagement_id, run_id, seen_findings)` to:
@@ -398,14 +430,18 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
     run's `checks` retires none of its prior findings: none of those states
     ever added an entry for them.
 
-    AND SINCE FIX ROUND 6, ONLY A PASSIVE CHECK EVER GETS INTO IT.
-    `scan.run` reads `_retirable`, which returns nothing for a check driven
-    through the wire: every probe this build sends is unauthenticated, so an
-    active `clean` is a statement about the logged-out view and not about
-    the one the client's users are in. That function carries the argument
-    and the two spellings the branch tried before it. So "in `considered`"
-    means "examined, by a check that read the captured traffic itself", and
-    that is the only reading under which retirement is sound today.
+    WHICH CHECKS GET INTO IT IS `_retirable`'S DECISION AND NOT THIS
+    FUNCTION'S, and the split is deliberate: a rule written here, or keyed on
+    the finding or on the surface, would have taken the passive corpus's
+    whole retest story with it. `scan.run` builds `considered` by asking that
+    function once per accepted verdict, with the run's SETTLED identity
+    state. A passive check's offer is honoured whatever the session did -- it
+    read the captured traffic itself, session and all. An active check's is
+    honoured only for a run whose liveness canary proved the session live at
+    both ends of the window its probes were issued in (section 9); an
+    anonymous run, and one downgraded to `assumed` by a canary that failed
+    anywhere, both offer nothing. So "in `considered`" means "examined, by a
+    check whose view of the application this run can vouch for".
 
     Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
     the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses
@@ -1221,7 +1257,13 @@ BEFORE issuing and never increments `issued` for them; `halted` /
 and `unmanaged_credential` is decided by `Sender.decide()` ahead of both the
 Gate and `http.send`, placed there in that method's own words so that
 `Limits.check()` does not "spend a rate token and a budget slot on a request
-that is about to be refused". So none of the eight is a request the target
+that is about to be refused". `unknown_identity` and `identity_origin` are
+that same method's last two refusals and sit on the OTHER side of the Gate --
+`Limiter.check` has already incremented `issued` by the time either is
+decided, so those two DO spend a rate token and a budget slot in the JVM --
+but both `return error(...)` above `compose()` and `http.send`, so the target
+saw nothing and this set is about what hx put on a client's system. So none
+of the ten is a request the target
 saw, and counting them would overstate the traffic AND make every retry above
 double-count. Everything else counts, by default and including a class this
 build has never seen: `transport_error`, `timeout` and `bridge_lost` may
@@ -1297,6 +1339,17 @@ _NOT_ISSUED = frozenset({
     # produce them, and a name here that no input can exercise is a claim no
     # test separates from its absence.
     "unmanaged_credential",
+    # The identity pair, and they are here on the same ground and NOT on the
+    # same mechanism -- see the module docstring. `Sender.decideAndIssue`
+    # answers both AFTER `policy.checkGate`, not before, so each has already
+    # cost a rate token and a budget slot inside the JVM; what neither has
+    # done is reach the target, because both `return error(...)` above
+    # `compose()` and `http.send`. The set is about the traffic hx put on a
+    # client's system, so both belong in it. Reachable from this sender the
+    # moment one is bound to an identity: `unknown_identity` is what every
+    # probe draws if registration never happened, and `identity_origin` is
+    # what a probe at a host outside the identity's origins draws.
+    "unknown_identity", "identity_origin",
 })
 
 # The header names `Sender.decide()` will not carry from a check, matching
@@ -1409,15 +1462,31 @@ def _rate_limit_wait(exc: BridgeError) -> float | None:
 
 
 class ProbeSender:
-    """Bound to one surface for the life of one `check_run`."""
+    """Bound to one surface for the life of one `check_run`, and to at most
+    one identity for the life of the run.
+
+    THE IDENTITY IS AN ID AND NEVER A CREDENTIAL. What travels here is the
+    name the extension's `IdentityRegistry` holds the credential under; the
+    value itself reached the JVM once, through `BridgeServer.
+    register_identity`, and is written into the request there -- after every
+    gate, so a refused request never has one composed for it. Nothing on this
+    side of the bridge can put a credential on the wire, which is what keeps
+    S7's redaction claim ("the extension knows exactly which byte ranges it
+    injected") true of every request a check causes.
+
+    A CHECK STILL CANNOT SEE ANY OF THIS. It is handed a sender already
+    bound, exactly as it is handed one already bound to a surface: S7 puts
+    identity below the check layer, and `hx.scan.run` decides.
+    """
 
     def __init__(self, bridge, *, scheme: str, host: str, port: int,
-                 path: str) -> None:
+                 path: str, identity_id: str | None = None) -> None:
         self._bridge = bridge
         self._scheme = scheme
         self._host = host
         self._port = port
         self._path = path
+        self._identity_id = identity_id
         self._sent = 0
         self._refused: dict[str, int] = {}
 
@@ -1486,14 +1555,21 @@ class ProbeSender:
                 "an address; build the probe from `sender.path` -- the "
                 "exemplar's own concrete path -- and substitute into that")
         raw = self._request_bytes(path, headers or {})
+        req = {"target_host": self._host, "target_port": self._port,
+               "tls": self._scheme == "https"}
+        if self._identity_id is not None:
+            # PRESENT ONLY WHEN BOUND. An absent key is "anonymous"; a null
+            # would leave the extension deciding what a null means. It reads
+            # the field as `header.get("identity_id") instanceof String`
+            # (`Sender.decideAndIssue`), so a null happens to be anonymous
+            # there today -- and a key this side sends only when it means
+            # something cannot be given a second meaning by a later reader.
+            req["identity_id"] = self._identity_id
         attempts_left = _RATE_LIMIT_ATTEMPTS
         while True:
             attempts_left -= 1
             try:
-                result = self._bridge.send(
-                    {"target_host": self._host, "target_port": self._port,
-                     "tls": self._scheme == "https"},
-                    raw, timeout=timeout)
+                result = self._bridge.send(req, raw, timeout=timeout)
             except BridgeError as exc:
                 # BridgeServer.send() never returns a refusal -- it raises
                 # this, with the wire's class on .error_class (None only for a

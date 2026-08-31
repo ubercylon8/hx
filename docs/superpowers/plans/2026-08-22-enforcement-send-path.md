@@ -8270,12 +8270,33 @@ public final class Limiter implements Gate {
      * predicate: an allow is recorded as an issuance, so calling `check` twice
      * for one request costs two slots and one budget unit.
      *
-     * That is safe here because the gate is the last thing consulted on the
-     * decision path -- the published order is not_configured, halted, scope,
-     * method, dangerous, rate, budget -- so nothing downstream of an allow can
-     * turn round and deny. Anything that grows a new refusal AFTER the gate
-     * must run before it instead, or it burns budget on requests that never
-     * left the JVM.
+     * That is safe here because an allow is only ever spent on a request the
+     * published decision order -- not_configured, halted, scope, method,
+     * dangerous, rate, budget -- has already cleared, so nothing downstream
+     * can turn round and ISSUE MORE than this budget allowed.
+     *
+     * IT CAN SPEND MORE THAN IT SENDS, AND THE RULE THIS PARAGRAPH USED TO
+     * STATE -- "anything that grows a new refusal AFTER the gate must run
+     * before it instead" -- HAS BEEN FALSE SINCE THE IDENTITY BRANCH.
+     * {@code Sender.decide} asks two identity questions after this gate
+     * (`unknown_identity` and `identity_origin`, Sender.java:325,331), and
+     * they are there because neither can be asked until the send frame has
+     * been read and neither is worth resolving for a request the boundary
+     * checks are about to turn away. So a probe refused by either has
+     * already cost a rate slot and a budget unit while the target saw
+     * nothing, and `requests_sent` for that row reads 0.
+     *
+     * THE BURN IS ACCEPTED RATHER THAN FIXED, and the false rule is
+     * corrected rather than deleted because it had already made one
+     * implementer's brief reason from a premise the tree does not obey. It
+     * fails in one direction only: it can make hx send FEWER requests than
+     * the client authorised, never more, and it reaches no client-facing
+     * number -- `run.requests_issued` is written by `hx.capture` alone and
+     * the report renders no request tally. When identity refusals do exhaust
+     * the budget, the next liveness canary is refused `budget_exhausted`,
+     * which halts the run or downgrades it to `assumed`; both fail safe.
+     * `src/hx/checks/probe.py`'s `ProbeSender.refused` documents the same
+     * divergence from the Python side.
      *
      * `synchronized` because a rate limit that races is not a rate limit: two
      * threads reading `issued` before either writes it both see room and both
@@ -11480,6 +11501,47 @@ public final class Redactor {
     private static final String[] CREDENTIAL_HEADERS = {
         "authorization", "cookie", "proxy-authorization"
     };
+
+    /**
+     * True when {@code name} is one of those three, so that
+     * {@link IdentityRegistry#register} can refuse to hold an identity that
+     * would inject anything else without keeping a second copy of the list.
+     *
+     * IT DOES NOT TRIM, and that is the one way it deliberately differs from
+     * {@link #asciiEqualsIgnoreCase(String, String)} below. That matcher
+     * trims OWS because it is a FAIL-CLOSED gate on a name the harness sent:
+     * widening it can only produce extra refusals. This one is the opposite
+     * direction -- it decides what may be WRITTEN -- so a trim would be
+     * fail-OPEN: `"Cookie "` would match, and `withHeaderFirst` would then
+     * emit `Cookie : v`, a field name with a space before its colon that
+     * RFC 9112 §5.1 requires a server to reject and that parsers disagree
+     * about, which is the shape a smuggling pair is built from.
+     *
+     * Case-insensitive because RFC 9110 §5.1 field names are, and matched on
+     * ASCII alone for the locale reason written on
+     * {@link #asciiEqualsIgnoreCase(String, String)}: `toLowerCase()` folds
+     * per the DEFAULT locale, and in tr_TR 'I' folds to 'ı'. The
+     * `equalsIgnoreCase` half of that reasoning -- which that javadoc calls a
+     * preference, because nothing there rests on it -- does carry
+     * weight here: "COOKIE" spelled with a U+212A KELVIN SIGN is
+     * `equalsIgnoreCase` "cookie", and the answer this method gives is an
+     * ACCEPTANCE. Registration refuses that spelling before it can reach this
+     * method, because U+212A is outside Latin-1 and
+     * `IdentityRegistry.checkWritable` runs first -- so today the ordering is
+     * what makes it moot, and a matcher that is right on its own does not
+     * depend on the ordering staying that way.
+     */
+    static boolean isCredentialHeader(String name) {
+        if (name == null) return false;
+        for (String wanted : CREDENTIAL_HEADERS) {
+            if (name.length() != wanted.length()) continue;
+            boolean same = true;
+            for (int i = 0; i < wanted.length(); i++)
+                if (asciiLower(name.charAt(i)) != wanted.charAt(i)) { same = false; break; }
+            if (same) return true;
+        }
+        return false;
+    }
 
     private static final byte[] OBSERVED_COOKIE =
         "{{observed:set-cookie}}".getBytes(StandardCharsets.US_ASCII);
@@ -14725,7 +14787,27 @@ import java.io.IOException;
 public interface Http {
 
     /**
-     * Issue {@code req} and return what came back.
+     * Issue {@code wire} to the service {@code req} names, and return what came
+     * back.
+     *
+     * THE BYTES ARE A PARAMETER, and they used to be built here from {@code
+     * req} by the one implementation. Identity injection is why they moved:
+     * {@code Sender} composes the request AFTER the gate, writes the identity
+     * header into it and registers the byte range of the credential with the
+     * {@link Redactor.Injected} for THAT array -- and {@code Injected} holds
+     * its array by identity, so an implementation that re-serialised {@code
+     * req} would issue a third array that no range set names. One
+     * serialisation, in the class that decided about it, is also what makes
+     * the exact bytes assertable against a fake.
+     *
+     * {@code req} still comes with them because the DESTINATION is not in the
+     * bytes: an implementation reads {@code host()}, {@link Sender#portOf} and
+     * {@link Sender#secureOf} off it to open the connection, exactly as before.
+     * The two DESCRIBE THE SAME REQUEST -- {@code Sender} serialised one from
+     * the other and hands both on, so {@code req} carries any injected header
+     * too -- and an implementation must still not re-derive the payload from
+     * it, because an equal-looking array is not the array the ranges were
+     * measured from.
      *
      * @param deadlineUs absolute microseconds since epoch, straight from the
      *   send frame. An implementation should cap its own wait at the time
@@ -14736,7 +14818,7 @@ public interface Http {
      *   this into `transport_error` and feeds it to Distress as a connection
      *   error, which is one of the three auto-halt conditions in spec s4.
      */
-    HttpReply send(HxRequest req, long deadlineUs) throws IOException;
+    HttpReply send(HxRequest req, byte[] wire, long deadlineUs) throws IOException;
 }
 ```
 
@@ -14932,6 +15014,10 @@ public class SenderTest {
     static final class FakeHttp implements Http {
         int calls = 0;
         HxRequest last;
+        /** The bytes Sender composed for the last call. Http takes them as a
+         *  parameter rather than building them from `last`, so this is what
+         *  actually goes to Burp -- including any injected identity header. */
+        byte[] lastWire;
         HttpReply reply = new HttpReply(200, RESPONSE, 12L, false);
         IOException boom = null;
         /** An UNCHECKED failure from inside issue(), which is a different
@@ -14947,9 +15033,10 @@ public class SenderTest {
         CyclicBarrier bothInFlight = null;
         volatile String barrierError = null;
 
-        public HttpReply send(HxRequest req, long deadlineUs) throws IOException {
+        public HttpReply send(HxRequest req, byte[] wire, long deadlineUs) throws IOException {
             calls++;
             last = req;
+            lastWire = wire;
             if (clock != null) clock.advance(advanceUsPerCall);
             if (bothInFlight != null) {
                 // Recorded rather than thrown: a barrier that timed out means
@@ -15018,6 +15105,10 @@ public class SenderTest {
         final FakeHttp http = new FakeHttp();
         final Redactor redactor = new Redactor();
         final RecordingNotifier notifier = new RecordingNotifier();
+        /** Empty unless a test registers something. Every case in this file
+         *  sends `identity_id: null`, so the registry is never consulted --
+         *  hx.send.IdentityInjectionTest is where it is. */
+        final IdentityRegistry identities = new IdentityRegistry();
         final HaltSwitch halt;
         final Distress distress;
         final Sender sender;
@@ -15044,7 +15135,8 @@ public class SenderTest {
                  : new HaltSwitch(clock, sentinel, HaltSwitch.DEFAULT_POLL_MS);
             // The spec s4 production defaults: 20% 5xx, 5x baseline latency.
             distress = new Distress(clock, 0.20, 5.0, maxConsecutiveErrors);
-            sender = new Sender(new Policy(gate), redactor, halt, distress, http, clock);
+            sender = new Sender(new Policy(gate), redactor, halt, distress, http, clock,
+                                identities);
             sender.setHaltNotifier(notifier);
         }
 
@@ -15837,13 +15929,15 @@ public class SenderTest {
     /**
      * A Redactor.RangeError is a DENIAL, never an implicit allow (s4).
      *
-     * Plan 5's identity injection lands on issue(), between the credential
-     * refusal and the issue, and a range that will not fit the bytes in hand
-     * says the frame describes a request other than this one. Nothing
-     * registers a range yet, so the one input that reaches the catch today is
-     * a reply whose bytes the redactor cannot reason about at all -- the same
-     * shape of failure, and the same answer: bytes that were not redacted are
-     * not framed as evidence.
+     * TWO inputs reach the catch now. Identity injection registers a range
+     * between the gate and the issue, and `Sender.compose` raises a RangeError
+     * for one whose bytes are not the credential it was measured for -- a
+     * range that does not describe the request in hand. The one driven here is
+     * the other: a reply whose bytes the redactor cannot reason about at all.
+     * Same shape of failure, same answer -- bytes that were not redacted are
+     * not framed as evidence -- and this input is the one a test can actually
+     * produce, since a bad range needs an Entry the registry would refuse.
+     * hx.send.IdentityInjectionTest drives that one at compose() directly.
      *
      * Without the catch the RangeError leaves issue() as an unhandled
      * RuntimeException, reaches BridgeClient's send arm, and takes the control
@@ -17306,6 +17400,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -17345,6 +17440,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *                            the scope violation was then recorded nowhere;
  *                            the ordering stands on the first reason alone.)
  *   6. Policy, second half   the Gate: rate -> budget.
+ *   7. unknown_identity      LAST, with identity_origin beside it, and the
+ *   8. identity_origin       position is spec s7's: injection composes a
+ *                            request carrying a live credential, so it happens
+ *                            after every gate -- a refused request must never
+ *                            have had one written into it. These two are the
+ *                            only refusals that need an identity in hand, and
+ *                            they are the last things on this path that can
+ *                            refuse at all.
  *
  * Steps 2-6 hold the pinned order -- not_configured, halted, scope_denied,
  * method_denied, dangerous_denied, rate_limited, budget_exhausted. Policy
@@ -17368,6 +17471,9 @@ public final class Sender {
     private final Distress distress;
     private final Http http;
     private final Clock clock;
+    /** The identities this run may issue under. Read AFTER the gate and
+     *  nowhere else -- see decideAndIssue, where the position is the point. */
+    private final IdentityRegistry identities;
 
     // Installed by HxExtension after construction, because it comes from the
     // BridgeClient and the Sender is what the BridgeClient is given. Volatile
@@ -17382,13 +17488,15 @@ public final class Sender {
     private final AtomicBoolean announced = new AtomicBoolean(false);
 
     public Sender(Policy policy, Redactor redactor, HaltSwitch halt,
-                  Distress distress, Http http, Clock clock) {
+                  Distress distress, Http http, Clock clock,
+                  IdentityRegistry identities) {
         this.policy = policy;
         this.redactor = redactor;
         this.halt = halt;
         this.distress = distress;
         this.http = http;
         this.clock = clock;
+        this.identities = identities;
     }
 
     /**
@@ -17474,11 +17582,11 @@ public final class Sender {
      * here would clear on whichever thread happened to run issue(), while a
      * worker's copy leaked into its next request.
      *
-     * A RangeError is a denial, never an allow (s4): nothing registers a
-     * range until identity injection ships in Plan 5, so it cannot be raised
-     * today -- but injection lands ON THIS METHOD, between the credential
-     * refusal and the issue, and a range that will not fit the bytes in hand
-     * says the frame describes a request other than this one.
+     * A RangeError is a denial, never an allow (s4), and identity injection
+     * is what can now raise one: {@link #compose} refuses a range whose bytes
+     * are not the credential it was measured for, BEFORE http.send, so a
+     * request whose redaction range cannot be trusted is answered `bad_frame`
+     * rather than issued.
      */
     public Map<String, Object> issue(Map<String, Object> header, byte[] body,
                                      BridgeClient.Authorisation auth) {
@@ -17572,9 +17680,83 @@ public final class Sender {
         Decision d = policy.checkGate(req);
         if (!d.allowed()) return error(id, d);
 
+        // ---- EVERY GATE HAS NOW ANSWERED --------------------------------
+        //
+        // AFTER THE GATE, DELIBERATELY. Injection composes a request carrying
+        // a live credential, and doing it before the gate would mean an
+        // out-of-scope or dangerous-path send had one composed for it -- with
+        // only the refusal returning in time keeping it off the wire. Spec s7
+        // pins the ordering.
+        //
+        // The two refusals below are the last things on this path that can
+        // refuse, and they are HERE rather than above because they are the
+        // only two that need an identity in hand: there is no identity to
+        // resolve until the frame has been read, and no reason to resolve one
+        // for a request the boundary checks are about to turn away.
+        //
+        // IdentityInjectionTest's aRequestTheGateREFUSEDNeverHasACredentialWrittenIntoIt
+        // is what holds the order, and it holds it through the REFUSAL CLASS:
+        // an input for which both a gate refusal and an identity refusal are
+        // available can only be answered once, and the class names which step
+        // ran. Moving this block above `policy.checkGate` turns that suite red.
+        String identityId = header.get("identity_id") instanceof String s ? s : null;
+        IdentityRegistry.Entry ident = null;
+        if (identityId != null && !identityId.isBlank()) {
+            ident = identities.get(identityId);
+            if (ident == null)
+                // FAIL CLOSED. Issuing anonymously because the identity is
+                // unknown is the single outcome this whole feature exists to
+                // prevent: a `clean` answer about a view no user is in.
+                return error(id, "unknown_identity",
+                             "no identity registered as " + identityId);
+            if (!appliesTo(ident, req))
+                // A credential is not sprayed at whatever host a check names.
+                // The scope may well allow a third-party host; the operator's
+                // session on the TARGET has no business being sent to it.
+                return error(id, "identity_origin",
+                             "identity " + identityId + " is not registered for "
+                             + req.host());
+        }
+
+        // ---- AND NOTHING BELOW THIS LINE DECIDES ------------------------
+        //
+        // NOT "nothing below refuses", which is what this banner said until
+        // the Task 5 review measured it false three ways over -- once in the
+        // very next statement and twice more below it: compose() refuses a
+        // range whose bytes are not the credential it was measured for
+        // (Redactor.RangeError -> `bad_frame`, as issue()'s own javadoc says),
+        // http.send failing is `transport_error`, and an overshot deadline is
+        // `timeout` -- all three before anything is framed as a result. That is
+        // the same defect cc886ac fixed one step higher -- a banner placed
+        // above the lines that contradict it -- reintroduced at the line the
+        // fix moved it to.
+        //
+        // WHAT IS TRUE HERE is the thing the ordering actually rests on: every
+        // POLICY question has been answered -- scope, method, dangerous path,
+        // the Gate, the unmanaged credential, the identity and its origin --
+        // and none of them can be re-asked once a credential has been written
+        // into the bytes. What can still fail below is mechanical: a range
+        // that does not check out, a transport that will not carry it, a clock
+        // that has run out. None of them is a decision this request could have
+        // been spared by asking earlier, which is why moving the composition
+        // above them would buy nothing and cost the ordering.
+        //
+        // The bytes that go on the wire, composed ONCE and here rather than in
+        // the adapter: the Injected inside holds the array it was measured
+        // from BY IDENTITY, so a second serialisation downstream would issue
+        // an array no range set names. `ident` is null for an anonymous send,
+        // and compose() then registers nothing -- an empty Injected, which
+        // redactRequest answers with a verbatim copy.
+        //
+        // ChokepointTest.theCompositionHappensAfterTheGate is what holds this
+        // line's position: the behavioural suite cannot see compose() moved
+        // above policy.checkGate on its own, because the array it builds is
+        // local and a refused request discards it.
+        Composed composed = compose(req, ident);
+
         HttpReply reply;
         try {
-            reply = http.send(req, deadlineUs);
+            reply = http.send(composed.req(), composed.wire(), deadlineUs);
         } catch (IOException e) {
             // It tried. Distress has to see it: five consecutive connection
             // errors are one of the three auto-halt conditions in spec s4, and
@@ -17766,10 +17948,7 @@ public final class Sender {
      * frame body rather than reconstructing it; see the note in the plan.
      */
     public static byte[] wireBytes(HxRequest req) {
-        StringBuilder s = new StringBuilder();
-        s.append(req.method()).append(' ').append(req.path());
-        if (!req.query().isEmpty()) s.append('?').append(req.query());
-        s.append(" HTTP/1.1\r\n");
+        StringBuilder s = new StringBuilder(requestLine(req));
         req.headers().forEach((name, values) -> {
             for (String v : values) s.append(name).append(": ").append(v).append("\r\n");
         });
@@ -17779,6 +17958,187 @@ public final class Sender {
         System.arraycopy(head, 0, out, 0, head.length);
         System.arraycopy(req.body(), 0, out, head.length, req.body().length);
         return out;
+    }
+
+    /**
+     * The request line and the CRLF that ends it, up to the first header.
+     *
+     * Extracted so that {@link #wireBytes} and {@link #compose} cannot
+     * disagree about where the first header starts. compose measures the
+     * injected credential's byte offset from exactly this length, and a second
+     * spelling of the request line here would be a byte offset derived from
+     * one grammar and applied to another -- which is a placeholder written
+     * over the wrong bytes, with the credential left verbatim beside it.
+     */
+    private static String requestLine(HxRequest req) {
+        StringBuilder s = new StringBuilder();
+        s.append(req.method()).append(' ').append(req.path());
+        if (!req.query().isEmpty()) s.append('?').append(req.query());
+        return s.append(" HTTP/1.1\r\n").toString();
+    }
+
+    /**
+     * The request to issue, the bytes it serialises to, and the ranges this
+     * extension wrote into them.
+     *
+     * THE REQUEST IS IN HERE TOO, and not just the bytes, because the two must
+     * not disagree: {@code Http} reads the destination off the request and the
+     * payload off the bytes, so handing it the PRE-injection request beside
+     * POST-injection bytes would leave an implementation two answers to "what
+     * is this request", differing by exactly the credential. The one it read
+     * would be the one it happened to reach for.
+     *
+     * The bytes and the ranges travel together because {@link Redactor.Injected} holds its
+     * array BY IDENTITY and {@link Redactor#redactRequest} refuses any other:
+     * a range set that arrives without the array it was measured from cannot
+     * be used, and one that arrives beside a DIFFERENT array is a RangeError
+     * rather than a silent rewrite at the wrong offsets.
+     *
+     * WHAT READS `injected` TODAY: nothing in production, and that is worth
+     * saying plainly rather than leaving a reader to discover it. The send
+     * path's `result` frame carries ONE body -- the redacted RESPONSE -- so no
+     * copy of the request crosses the bridge from here at all; and nothing on
+     * the Python side writes an `exchange` row for a send yet either, since
+     * `records.record_exchange` has exactly one caller and it is
+     * `hx.capture.Capture.on_exchange`, which serves the PROXY's `exchange`
+     * frames. The registration happens anyway because spec s7
+     * requires it to precede issuance and storage, and because the moment a
+     * request half is added to this frame it must be redacted rather than
+     * retrofitted: s7 calls the blob store the one item that cannot be
+     * retrofitted, since a content-addressed credential is not merely stored,
+     * it becomes an address that exists in every backup. The check inside
+     * compose() is what stops the registration from being decorative in the
+     * meantime -- an offset that does not name the credential fails the send.
+     */
+    record Composed(HxRequest req, byte[] wire, Redactor.Injected injected) { }
+
+    /**
+     * Serialise the request, writing {@code ident}'s header into it and
+     * telling the Redactor precisely where the secret landed.
+     *
+     * BYTE RANGES, NOT A HEADER NAME: the range is known exactly because this
+     * method wrote it, and Redactor's own javadoc says a name match is a
+     * guess. The header goes FIRST, immediately after the request line, which
+     * is what makes the offset computable from {@link #requestLine} alone.
+     *
+     * {@code ident} is null for an anonymous send and then this is
+     * {@link #wireBytes} plus an empty {@link Redactor.Injected} -- required,
+     * because redactRequest takes one, and empty because nothing was injected.
+     *
+     * THE OFFSETS ARE CHECKED AGAINST THE BYTES, not trusted. They are correct
+     * by construction, and "by construction" is exactly the claim that stops
+     * being true when someone changes how a header is emitted; the failure it
+     * would cause is silent and unrecoverable -- a placeholder written over
+     * innocent bytes while the credential stays verbatim in the copy that gets
+     * content-addressed. A mismatch is a {@link Redactor.RangeError}, which
+     * {@link #issue} answers `bad_frame` with, BEFORE http.send: the request
+     * is refused rather than issued with a range nobody can trust.
+     */
+    static Composed compose(HxRequest req, IdentityRegistry.Entry ident) {
+        if (ident == null) {
+            byte[] wire = wireBytes(req);
+            return new Composed(req, wire, new Redactor.Injected(wire));
+        }
+        HxRequest carrying = withHeaderFirst(req, ident.header(), ident.value());
+        byte[] wire = wireBytes(carrying);
+        byte[] value = ident.value().getBytes(StandardCharsets.ISO_8859_1);
+        int start = requestLine(carrying).getBytes(StandardCharsets.ISO_8859_1).length
+                  + (ident.header() + ": ").getBytes(StandardCharsets.ISO_8859_1).length;
+        int end = start + value.length;
+        if (end > wire.length
+                || !Arrays.equals(wire, start, end, value, 0, value.length))
+            throw new Redactor.RangeError(
+                "the range computed for identity " + ident.id() + " is [" + start + ","
+                + end + ") of " + wire.length + " bytes and those bytes are not the "
+                + "credential; refusing to issue a request whose redaction range is wrong");
+        Redactor.Injected injected = new Redactor.Injected(wire);
+        injected.register(ident.id(), start, end);
+        return new Composed(carrying, wire, injected);
+    }
+
+    /**
+     * {@code req} with {@code name: value} as its FIRST header, replacing any
+     * header the caller sent under that name.
+     *
+     * FIRST, because compose() measures the credential's offset from the end
+     * of the request line, and a header emitted anywhere else would need the
+     * lengths of everything in front of it.
+     *
+     * REPLACING, because the request is being issued AS this identity and two
+     * values for one field name leave the server to choose which -- so a check
+     * could read an answer given to the caller's own credential and file it as
+     * the identity's. The three field names that matter most cannot reach this
+     * point at all: Authorization, Cookie and Proxy-Authorization are
+     * {@code Redactor.CREDENTIAL_HEADERS}, and a request carrying one this
+     * extension did not inject was refused `unmanaged_credential` above.
+     *
+     * Field names are case-insensitive (RFC 9110 s5.1), so the match is too.
+     * {@code equalsIgnoreCase} rather than Redactor's ASCII comparison because
+     * nothing here is deciding whether a value is a credential -- this is
+     * "which of the caller's headers is the one I am about to write", and the
+     * name being replaced is one an operator put in the config.
+     */
+    private static HxRequest withHeaderFirst(HxRequest req, String name, String value) {
+        Map<String, List<String>> headers = new LinkedHashMap<>();
+        headers.put(name, List.of(value));
+        req.headers().forEach((k, v) -> {
+            if (!k.equalsIgnoreCase(name)) headers.put(k, v);
+        });
+        return new HxRequest(req.method(), req.url(), req.host(), req.path(),
+                             req.query(), Collections.unmodifiableMap(headers),
+                             req.body());
+    }
+
+    /**
+     * Whether {@code ident} may be applied to the host {@code req} is going to.
+     *
+     * spec s5: origins bound WHERE a credential may be applied, so a probe
+     * against a third-party host that is perfectly in scope never carries the
+     * target's session. Scope and origins answer different questions and both
+     * have to say yes.
+     *
+     * An origin is matched by its HOST, and the comparison is against
+     * {@code req.host()} -- the name Burp will actually connect to, taken from
+     * the send frame's `target_host` -- and never against the request's own
+     * Host line, for the reason {@link #parse} gives: deciding on a Host header
+     * would let a request authorised for one service open a connection
+     * somewhere else. An origin written as a URL -- the shape spec s5's own
+     * example uses, and the shape an operator's widened
+     * `identities.<id>.origins` entry may take -- contributes its authority's
+     * host; one written as a bare host contributes itself, which is the shape
+     * the DEFAULT takes: since the 2026-08-30 amendment to s5, `hx.scan.
+     * _identity_bracket` sends the bare host of the surface the liveness
+     * canary is addressed to, and not (as it did until then) the engagement's
+     * `scope.include` patterns, which made the bound equal the thing it
+     * bounds. A PORT in the origin is ignored: this compares hosts,
+     * and the port a send goes to is settled by the frame and by scope.
+     *
+     * Case-insensitive, because host names are (RFC 9110 s4.2.3), and exact
+     * otherwise -- no suffix matching. `evil-app.test` must not satisfy an
+     * origin of `app.test`, and neither must a subdomain nobody listed.
+     */
+    static boolean appliesTo(IdentityRegistry.Entry ident, HxRequest req) {
+        String host = req.host().toLowerCase(Locale.ROOT);
+        for (String origin : ident.origins())
+            if (host.equals(hostOf(origin))) return true;
+        return false;
+    }
+
+    /** The host part of an origin, lower-cased: everything after `://` and
+     *  before the first `/`, `:` or `?`, or the whole string when there is no
+     *  scheme. Deliberately not a URL parser -- an origin is a bound an
+     *  operator wrote, and anything this cannot read simply matches no host,
+     *  which is the fail-closed direction. */
+    private static String hostOf(String origin) {
+        String rest = origin.trim().toLowerCase(Locale.ROOT);
+        int scheme = rest.indexOf("://");
+        if (scheme >= 0) rest = rest.substring(scheme + 3);
+        int cut = rest.length();
+        for (String d : new String[] { "/", ":", "?" }) {
+            int at = rest.indexOf(d);
+            if (at >= 0 && at < cut) cut = at;
+        }
+        return rest.substring(0, cut);
     }
 
     /**
@@ -18415,6 +18775,8 @@ public class ChokepointTest {
           ChokepointTest::everyPathThatSpendsTheGateArmsItFirst);
         t("theGateIsSpentOnlyWhereTheHalvesArePaired",
           () -> theGateIsSpentOnlyWhereTheHalvesArePaired(sources));
+        t("theCompositionHappensAfterTheGate",
+          ChokepointTest::theCompositionHappensAfterTheGate);
         t("oneRunHasOnePolicy", () -> oneRunHasOnePolicy(sources));
         t("noSecondEgressFamilyExists", () -> noSecondEgressFamilyExists(sources));
         t("theAdapterBuildsItsRequestInsideTheTry",
@@ -19181,6 +19543,87 @@ public class ChokepointTest {
         }
         check("and no other file in extension/src asks either half -- the "
               + "entry point included " + elsewhere, elsewhere.isEmpty());
+    }
+
+    /**
+     * THE CREDENTIAL IS WRITTEN INTO THE BYTES AFTER THE GATE HAS ANSWERED.
+     *
+     * The refusal half of that ordering IS behavioural and is pinned:
+     * `IdentityInjectionTest.aRequestTheGateREFUSEDNeverHasACredentialWrittenIntoIt`
+     * hands the send path an input for which both a gate refusal and an
+     * identity refusal are available, and discriminates on WHICH class comes
+     * back. Moving the identity block above `policy.checkGate` turns that
+     * suite red -- measured by the Task 5 reviewer at 15 ALL PASS, rc=1,
+     * 2 FAIL, with exactly the two messages the report claimed.
+     *
+     * THE COMPOSITION HALF IS NOT, AND CANNOT BE. The reviewer reported
+     * moving `compose(` ALONE above the gate -- bytes built and the credential
+     * written in for a request the gate then refuses, both refusals left where
+     * they are -- at 16 ALL PASS / 0 FAIL / rc=0. THAT LITERAL MUTATION DOES
+     * NOT COMPILE on this tree: `ident` is resolved below the gate, so the
+     * statement has nothing to pass. What was re-measured here is the nearest
+     * mutation that does compile and has the same effect -- a second
+     * `compose` of the same identity, resolved and composed above
+     * `policy.checkGate`, with every refusal left exactly where it is. Against
+     * the suite WITHOUT this method it is 16 ALL PASS / 0 FAIL / rc=0, which
+     * is the claim that matters. There is nothing for a behavioural test to
+     * see: the array
+     * is a local, the `Injected` is a local, the request is refused, and both
+     * are discarded with no trace outside `decideAndIssue` that any test can
+     * read. So it was held by a comment, and this method is what makes it a
+     * fact: against the suite WITH it, the same mutation is 15 ALL PASS,
+     * 2 FAIL, rc=1, both FAILs here.
+     *
+     * WHAT IS ASSERTED IS THE ORDERING AND NOTHING MORE. Not that a
+     * pre-gate composition would leak -- it would not, on today's code; the
+     * consequence is bounded and the report said so. What it would break is
+     * §4's invariant that every byte leaving this machine crossed a point
+     * inside this JVM that decided about it: a credential written into a
+     * request the Gate has not yet allowed is a request assembled on the
+     * strength of no decision, and the only thing keeping it off the wire is
+     * that the refusal happens to return in time.
+     *
+     * THE COUNT IS TWO AND BOTH ARE CHECKED. `compose(` occurs twice in
+     * Sender.java's code -- the call in `decideAndIssue` and the declaration
+     * of the method itself -- and this does not try to tell them apart. It
+     * requires BOTH to sit after `.checkGate(`, which is sound whichever is
+     * which: the call is one of the two. The cost is that moving the
+     * DECLARATION above `decideAndIssue` would redden this for no behavioural
+     * reason, and that is the trade taken rather than a fragile needle that
+     * tries to name the call site alone. The count arm is what keeps "both"
+     * exact: a third occurrence would leave a middle one unexamined, and the
+     * count is what stops there being one.
+     *
+     * `.checkGate(` is read positionally here and its count is pinned at one
+     * by {@link #theGateIsSpentOnlyWhereTheHalvesArePaired} in this same
+     * class, so the offset taken below is the only occurrence rather than the
+     * first of several.
+     *
+     * WHAT IT DOES NOT SEE, the limitation every offset in this file carries:
+     * THESE ARE OFFSETS, NOT BRACE NESTING. A `compose(` moved into a branch
+     * that runs before the gate but written lower in the file would pass. What
+     * it catches is the mutation that was actually measured green -- the
+     * statement cut and pasted above `policy.checkGate`.
+     */
+    static void theCompositionHappensAfterTheGate() throws IOException {
+        String sender = code(Path.of(SENDER));
+        int composes = calls(sender, "compose(", "::compose");
+        check("compose( occurs twice in Sender.java -- one call, one "
+              + "declaration (" + composes + ")", composes == 2);
+        int gate = sender.indexOf(".checkGate(");
+        int firstCompose = sender.indexOf("compose(");
+        int lastCompose = sender.lastIndexOf("compose(");
+        // Anti-vacuity: indexOf answers -1 for a needle that is absent and -1
+        // is below every real offset, so a DELETED gate call would satisfy
+        // "after the gate" perfectly.
+        check("the Gate is asked in this file (" + gate + ")", gate >= 0);
+        check("and the composition is in it (" + firstCompose + ".."
+              + lastCompose + ")", firstCompose >= 0 && lastCompose > firstCompose);
+        check("the first compose( is after the Gate (" + gate + " < "
+              + firstCompose + ")", gate >= 0 && firstCompose > gate);
+        check("and so is the second, so whichever is the call site is after "
+              + "it (" + gate + " < " + lastCompose + ")",
+              gate >= 0 && lastCompose > gate);
     }
 
     /**
@@ -20313,8 +20756,9 @@ public class ChokepointTest {
      * method needles -- `http().sendRequest(`, `gate.decide(`, `limits.arm(`,
      * `pending.put(`, `recorder.record(`, `policy.decideScopeOnly(`,
      * `.authorisation()`, `HttpService.httpService(`,
-     * `HttpRequest.httpRequest(` -- all have rows, because they are counted
-     * somewhere too.
+     * `HttpRequest.httpRequest(`, and `.checkGate(` with `compose(` from
+     * {@link #theCompositionHappensAfterTheGate} -- all have rows, because
+     * they are counted somewhere too.
      *
      * What the positional exemption leaves open is narrower and is named where
      * it lives -- an ORDER check cannot see a call it does not spell, so
@@ -20427,6 +20871,11 @@ public class ChokepointTest {
                                                            "capture::start"},
             {"arm",                   "limits",     "(a)", "limits.arm(",
                                                            "limits::arm"},
+            // ...and the composition, counted by
+            // theCompositionHappensAfterTheGate so that the two offsets it
+            // then takes are known to be all of them.
+            {"compose",               "Sender",     "(a, b)", "compose(",
+                                                           "::compose"},
             // ...and the three the false sentence ALSO missed, found by
             // mechanising the direction it claimed rather than by re-reading
             // it. Each is a needle PAIR handed to calls() with no row here.
@@ -20994,6 +21443,7 @@ import hx.proxy.Source;
 import hx.send.HaltSwitch;
 import hx.send.Http;
 import hx.send.HttpReply;
+import hx.send.IdentityRegistry;
 import hx.send.Limits;
 import hx.send.Redactor;
 import hx.send.Sender;
@@ -21111,8 +21561,16 @@ public class HxExtension implements BurpExtension {
         // is the wiring Task 7 needs; the inline construction this replaces is
         // the shape that makes a second one the natural thing to write.
         Policy policy = new Policy(limits);
+        // ONE registry for the whole extension, for the reason there is one
+        // Policy: the `identity` frame writes it and the send path reads it,
+        // and a second instance would be a credential registered into one and
+        // looked for in the other -- which fails as `unknown_identity`, so
+        // fail-closed, but with an operator who registered an identity and is
+        // told nothing knows about it.
+        IdentityRegistry identities = new IdentityRegistry();
         Sender sender = new Sender(policy, redactor, haltSwitch,
-                                   distress, montoyaHttp(api, clock), clock);
+                                   distress, montoyaHttp(api, clock), clock,
+                                   identities);
         // Auto-halt is extension-initiated: there is no outstanding id to
         // answer, so this frame is the only way the harness hears about a stop
         // before the next send fails -- and run.status = 'aborted' needs a
@@ -21148,6 +21606,22 @@ public class HxExtension implements BurpExtension {
         // silently ignored -- an operator who believes they slowed the run
         // down and did not is the failure this exists to prevent.
         c.setConfigGuard(limits::refuseIfLimitsMoved);
+        // The `identity` frame's landing place. NOT a method reference to
+        // `identities::register`, because the two sides spell a refusal
+        // differently and this is the one place they meet: the registry raises
+        // IdentityRegistry.StaleGeneration and the wire answers
+        // `stale_generation`, and BridgeClient must not import hx.send to
+        // learn that -- see BridgeClient.IdentitySink for why the dependency
+        // runs this way. IllegalArgumentException needs no translation: the
+        // sink's contract already names it as the malformed-frame signal, and
+        // the arm answers it `bad_identity`.
+        c.setIdentitySink((id, generation, header, value, origins) -> {
+            try {
+                identities.register(id, generation, header, value, origins);
+            } catch (IdentityRegistry.StaleGeneration e) {
+                throw new BridgeClient.StaleIdentity(e.getMessage());
+            }
+        });
 
         // ---- S4's SECOND enforcement point -------------------------------
         //
@@ -21688,7 +22162,7 @@ public class HxExtension implements BurpExtension {
      * something.
      */
     private static Http montoyaHttp(MontoyaApi api, Clock clock) {
-        return (req, deadlineUs) -> {
+        return (req, wire, deadlineUs) -> {
             // Monotonic, because this one IS a duration. Instant.now() would
             // measure an NTP step as latency and feed it to Distress, whose
             // latency rule stops the whole run at 5x baseline. Taken before the
@@ -21706,8 +22180,23 @@ public class HxExtension implements BurpExtension {
             try {
                 HttpService service = HttpService.httpService(
                         req.host(), Sender.portOf(req), Sender.secureOf(req));
+                // `wire`, NOT `Sender.wireBytes(req)`. Sender composes the
+                // request once, after the gate, and registers the byte range
+                // of any injected credential against THAT array -- and
+                // Redactor.Injected holds its array by identity. Re-serialising
+                // here would issue a third array that no range set names.
+                //
+                // AND THAT IS THE WHOLE OF IT. This used to add "and would
+                // drop the identity header for good measure", which is false:
+                // `req` here is `composed.req()`, the POST-injection request,
+                // so `Sender.wireBytes(req)` would reproduce the identity
+                // header byte for byte. Http.send's javadoc says so correctly
+                // ("req carries any injected header too... an equal-looking
+                // array is not the array the ranges were measured from"); a
+                // second, false reason attached to a true one reads as
+                // corroboration and is worse than no reason at all.
                 HttpRequest request = HttpRequest.httpRequest(
-                        service, ByteArray.byteArray(Sender.wireBytes(req)));
+                        service, ByteArray.byteArray(wire));
 
                 // Burp's own timeout is an optimisation; ours is the
                 // enforcement. Sender re-reads the clock after this returns
@@ -22544,10 +23033,19 @@ def test_the_class_set_really_was_derived_and_is_not_a_narrowed_scan():
     lost its Java arm or its Python arm would drop first are named
     individually: `unknown_frame` has a single Java site, `bridge_lost` is
     mostly Python, and `rate_limited` is the one added by hand.
+
+    It was 16 until the identity plan's send path and `identity` frame arm
+    added four -- `unknown_identity`, `identity_origin`, `stale_generation`
+    and `bad_identity`. That this number MOVES is the point of it: a count
+    that only ever went up because someone edited it would pin nothing, and a
+    count that never moved would mean the derivation had stopped seeing the
+    tree grow. Two of the four are named below for the same reason the six
+    already there are -- each has exactly one emit site.
     """
-    assert len(ERROR_CLASSES) == 16, sorted(ERROR_CLASSES)
+    assert len(ERROR_CLASSES) == 20, sorted(ERROR_CLASSES)
     for expected in ("halted", "unknown_frame", "bridge_lost", "rate_limited",
-                     "scope_denied", "not_configured"):
+                     "scope_denied", "not_configured",
+                     "unknown_identity", "stale_generation"):
         assert expected in ERROR_CLASSES, (
             f"{expected!r} is emitted by this tree and the scan did not find "
             "it; a spelling changed and the derivation went narrow silently")
@@ -22681,9 +23179,13 @@ def test_the_extension_fault_marker_is_the_same_string_on_both_sides():
     assert declarations == [records.EXTENSION_FAULT], (
         f"BridgeClient.java declares {declarations!r}; "
         f"records.EXTENSION_FAULT is {records.EXTENSION_FAULT!r}")
-    # ...and it is actually USED at the two sites that mean "this jar is
-    # broken", rather than declared and forgotten.
-    assert java.read_text().count("EXTENSION_FAULT +") == 2
+    # ...and it is actually USED at the sites that mean "this jar is broken",
+    # rather than declared and forgotten. THREE of them: a send with no
+    # handler installed, a send path that threw, and -- since the identity
+    # plan -- an `identity` frame with no registry to put it in. All three are
+    # wiring failures rather than an operator who has not authorised the run,
+    # which is the distinction the whole marker exists to carry.
+    assert java.read_text().count("EXTENSION_FAULT +") == 3
 
 
 def test_the_module_docstrings_counts_are_the_counts():
@@ -23142,6 +23644,24 @@ DENIAL_KIND: dict[str, str] = {
     # reached `hx.capture` and vanished silently. S7's "never persisted" is
     # about the request bytes; the refusal is a denial like any other.
     "unmanaged_credential": "credential",
+    # The identity plan's two send-path refusals, and they are DENIALS: both
+    # are decided about a request the extension agreed to look at, after every
+    # gate, and S4's "denials are never silent" covers them exactly as it
+    # covers the seven above. So they get a kind rather than a line in
+    # UNRECORDABLE -- which is the rule that set's own comment states.
+    #
+    # THE KIND IS THE EXISTING `credential` AND NOT A NEW ONE, and that is a
+    # cost taken deliberately rather than an oversight. `denial.kind` is a
+    # CHECK-constrained vocabulary, so an `identity` kind is a schema
+    # migration -- a new SCHEMA_VERSION and a table rebuild -- which is not
+    # this change. Filing all three under `credential` reads correctly in
+    # `SELECT kind, COUNT(*) FROM denial GROUP BY kind` ("refusals about
+    # credentials") and loses the three-way split in that column ONLY: the
+    # error class is what the caller is told, and `denial.reason` carries the
+    # detail, which names the identity and the host. The split is worth a kind
+    # of its own on the day someone needs to count these separately.
+    "unknown_identity": "credential",
+    "identity_origin": "credential",
 }
 DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 
@@ -23539,9 +24059,23 @@ VIA_VALUES = frozenset({"proxy", "send", "crawl"})
 #       transcribed from S6 by hand and S6 did not list it either. Both ends
 #       of that are fixed: S6 lists it, and the set is now DERIVED from the
 #       emit sites.
+#   bad_identity -- an `identity` frame whose body could not be acted on.
+#       bad_config's shape, for the other body: it is a refusal about a FRAME,
+#       no request was decided about, and there is no method or url a `denial`
+#       row could put in its columns. The identity plan's two OTHER classes are
+#       not here, and the difference is the rule above: `unknown_identity` and
+#       `identity_origin` are decided about a REQUEST the extension agreed to
+#       look at, so they are denials and they got a kind.
+#   stale_generation -- an `identity` frame whose generation does not advance
+#       the one already held. Also about a frame rather than a request, and
+#       DELIBERATELY not a denial in the store's sense: nothing was refused
+#       passage anywhere. It is the monotonic rule doing its job on a replayed
+#       or reordered frame, and the run carries on under the identity it
+#       already holds.
 UNRECORDABLE = frozenset({"transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
-                          "protocol_mismatch", "bad_config", "unknown_frame"})
+                          "protocol_mismatch", "bad_config", "unknown_frame",
+                          "bad_identity", "stale_generation"})
 
 
 def row_for(error_class: str, *,
@@ -24714,6 +25248,7 @@ First the imports. Replace the import block at the top of
 
 ```python
 # tests/test_bridge_server.py -- the import block, replaced
+import logging
 import os
 import socket
 import stat
@@ -24725,6 +25260,7 @@ from pathlib import Path
 import pytest
 
 from hx import halt as halt_mod
+from hx import identity
 from hx.bridge import codec, server
 from hx.store import db as db_mod
 from hx.store import records
@@ -25892,7 +26428,7 @@ arms with these three:
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error"):
+        if t in ("result", "error", "identity_registered"):
             self._deliver(header, body)
             return True
 ```
@@ -27159,6 +27695,77 @@ def test_the_state_changing_route_answers_both_the_post_and_the_get(target):
 
     assert [(h.method, h.path) for h in target.hits] == [
         ("POST", path), ("GET", path)]
+
+
+# --- /account: the route a liveness canary is declared against -------------
+
+
+def test_the_account_route_answers_two_hundred_whether_or_not_it_is_logged_in(
+        target):
+    """THE WHOLE ARGUMENT FOR A BODY SIGNATURE, in one assertion.
+
+    The identity design's s6: a canary that accepted a STATUS would be
+    satisfied by an application answering a logged-out request with a 200
+    login PAGE, stamp the identity `proven`, and hand section 9's retirement
+    gate a hazard with a proof attached. This route is that application. If
+    it ever starts answering 302 or 401 while logged out, every liveness test
+    built on it would pass on the status alone and stop measuring the thing
+    it was built for."""
+    cookie = {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"}
+    logged_in = _get(target, "/account", cookie)
+    logged_out = _get(target, "/account")
+
+    assert logged_in[0] == logged_out[0] == 200, (logged_in[0], logged_out[0])
+    assert ts.SESSION_SIGNATURE.encode() in logged_in[2]
+    assert ts.NO_SESSION_SIGNATURE.encode() not in logged_in[2]
+    assert ts.NO_SESSION_SIGNATURE.encode() in logged_out[2]
+    assert ts.SESSION_SIGNATURE.encode() not in logged_out[2]
+
+
+def test_the_account_route_wants_the_right_cookie_and_not_merely_a_cookie(
+        target):
+    """A canary proves a CREDENTIAL, not the presence of a header. A route
+    that accepted any `session=` would let a run that injected the wrong
+    value -- or a stale generation after a refresh that changed nothing --
+    read as logged in."""
+    assert ts.SESSION_SIGNATURE.encode() not in _get(
+        target, "/account", {"Cookie": "session=not-the-one"})[2]
+    assert ts.SESSION_SIGNATURE.encode() not in _get(
+        target, "/account", {"Cookie": "analytics=1; consent=yes"})[2]
+
+
+def test_kill_session_makes_the_right_cookie_stop_working(target):
+    """The mid-run death s6's motivating case is about: an SSO session dying
+    at 01:50. The cookie is unchanged and the server has stopped honouring
+    it, which is what an expiry actually is -- a test that changed the VALUE
+    would be measuring a client that forgot its credential."""
+    cookie = {"Cookie": f"session={ts.SESSION_COOKIE_VALUE}"}
+    assert ts.SESSION_SIGNATURE.encode() in _get(target, "/account", cookie)[2]
+
+    target.kill_session()
+    after = _get(target, "/account", cookie)
+
+    assert after[0] == 200, "a killed session must not become a status a rule catches"
+    assert ts.SESSION_SIGNATURE.encode() not in after[2]
+    assert ts.NO_SESSION_SIGNATURE.encode() in after[2]
+
+
+def test_killing_the_session_leaves_every_other_route_answering(target):
+    """`kill_session` is one route's state, not the server's. The scans built
+    on it have to go on probing everything else, or "the run halted on a dead
+    session" could not be told from "the target stopped answering"."""
+    target.kill_session()
+    assert _get(target, "/health")[0] == 200
+    assert _get(target, ts.VULNERABLE_ROUTES["hx.active.reflected-input"])[0] == 200
+
+
+def test_the_two_liveness_signatures_are_disjoint():
+    """`expect_body` and `expect_absent`, and a page carrying both would pass
+    the positive signature while being the logged-out view -- which is the
+    exact case `expect_absent` exists for. Asserted against the pages this
+    server actually serves rather than against the constants alone."""
+    assert ts.NO_SESSION_SIGNATURE not in ts.ACCOUNT_PAGE
+    assert ts.SESSION_SIGNATURE not in ts.LOGIN_PAGE
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -27237,6 +27844,29 @@ SESSION_COOKIE_VALUE = "s3cr3t-live-session-2f9a41c0"
 # route's to change. `/insecure-cookie` exists so a check with a real,
 # unambiguous absence to find has one, without touching the frozen string.
 FLAGLESS_COOKIE_VALUE = "s3cr3t-legacy-session-9b21fe70"
+
+# `/account`'s two bodies, and the pair of signatures a liveness canary is
+# declared against. The identity design's s6 is that a canary which accepted a
+# STATUS would be satisfied by an application answering a logged-out request
+# with a 200 login PAGE -- the one shape no response-status rule can catch --
+# so `/account` answers 200 either way and the ONLY difference is the body.
+# That makes this route the fixture for the whole liveness argument: a canary
+# reading the status here cannot tell the two apart, and one reading
+# `expect_body` can.
+#
+# THE TWO STRINGS ARE DISJOINT AND MUST STAY SO. `Sign out` is
+# `liveness.expect_body` and `Sign in` is `liveness.expect_absent`; a page
+# carrying both would satisfy the positive signature while being the logged-out
+# view, which is the case `expect_absent` exists for. tests/test_target_server.py
+# asserts the disjointness in the FAST suite, where it costs no JVM.
+SESSION_SIGNATURE = "Sign out"
+NO_SESSION_SIGNATURE = "Sign in"
+ACCOUNT_PAGE = ("<html><body><h1>Account</h1>"
+                f"<p><a href=\"/account/logout\">{SESSION_SIGNATURE}</a></p>"
+                "</body></html>")
+LOGIN_PAGE = ("<html><body><h1>Welcome</h1>"
+              f"<form method=\"post\" action=\"/login\">"
+              f"<button>{NO_SESSION_SIGNATURE}</button></form></body></html>")
 
 # The most /slow will ever sleep, whatever the query string says. A typo in a
 # test ("ms=3600000") would otherwise wedge the suite for an hour with no
@@ -27567,6 +28197,26 @@ class _Handler(BaseHTTPRequestHandler):
         elif parts.path == "/account/logout":
             # On the dangerous-path denylist, and deliberately harmless here.
             self._reply(200, {"logged_out": True})
+        elif parts.path == "/account":
+            # THE SESSION-BEARING ROUTE. Answers the account page to a request
+            # carrying the right cookie and a 200 LOGIN PAGE to one that does
+            # not -- see SESSION_SIGNATURE above for why both are 200.
+            #
+            # NOT A SECOND `require_login()`. That one walls
+            # `/account/summary` with a 302, which is a refusal a STATUS rule
+            # catches (`_probe_util.unanswered` reads only a 2xx as an
+            # answer) and is the fixture for "a login wall is not a clean
+            # result". This route is the opposite fixture: nothing about the
+            # response tells a status rule anything, which is what makes a
+            # body signature the only proof of a session there is.
+            #
+            # `Cookie` IS READ WHOLE, not parsed. The request either carries
+            # `session=<the value>` or it does not, and a parser here would
+            # be a second implementation of cookie splitting in a file whose
+            # job is to be simple enough to trust.
+            live = self.server.target.session_accepted(
+                self.headers.get("Cookie"))
+            self._reply_text(200, ACCOUNT_PAGE if live else LOGIN_PAGE)
         elif parts.path == "/login":
             self._reply(200, {"welcome": True}, extra=[
                 ("Set-Cookie",
@@ -27862,6 +28512,7 @@ class TargetServer:
         self._hits: list[Hit] = []
         self._fixed: set[str] = set()
         self._login_required = False
+        self._session_live = True
         self._lock = threading.Lock()
         self._httpd = _Server((host, 0), _Handler)
         # Read by every handler through self.server. Set before any thread is
@@ -27963,6 +28614,38 @@ class TargetServer:
         with self._lock:
             return check_id in self._fixed
 
+    def session_accepted(self, cookie_header: str | None) -> bool:
+        """Does this request carry a session `/account` still honours?
+
+        Read by a handler thread on every request to that route. Both halves
+        matter and they are different facts: `kill_session` makes the server
+        stop honouring the cookie at all, and a request that never carried it
+        was logged out to begin with. A version that answered only the first
+        would let a probe with NO credential read as logged in for as long as
+        the session lived, which is precisely the confusion the canary exists
+        to remove.
+        """
+        with self._lock:
+            if not self._session_live:
+                return False
+        return f"session={SESSION_COOKIE_VALUE}" in (cookie_header or "")
+
+    def kill_session(self) -> None:
+        """Stop honouring the session cookie, for the rest of this run.
+
+        ONE DIRECTION ONLY, for `fix()`'s and `require_login()`'s reason, and
+        it bites hardest here: a knob that could bring the session BACK would
+        let a test assert that a run halted on a dead session and then quietly
+        log back in before the scan that had to prove it. A run wanting the
+        live session back gets a fresh server, which every test already does.
+
+        The cookie VALUE is untouched -- `/login` goes on setting it -- so
+        what changes is the server's willingness to accept it, which is what
+        an expiring session actually is.
+        """
+        with self._lock:
+            self._session_live = False
+
     def require_login(self) -> None:
         """Put `LOGIN_WALL_ROUTE` behind its login wall for the rest of this
         run.
@@ -27974,8 +28657,9 @@ class TargetServer:
         has tested nothing. A build that reads the two as the same thing
         records `tested, clean` for a surface it never reached, which is N1 of
         the scoped re-review and the reason this method exists. (N1's own harm
-        was a live finding retired behind that 302; no active check retires
-        anything since fix round 6, and the coverage row is what is left --
+        was a live finding retired behind that 302. An `inconclusive` verdict
+        carries no `considered` at all, so no run can retire on one whatever
+        its session proved -- the coverage row is what the wall still costs.
         S12 forbids both.)
 
         ONE DIRECTION ONLY, for `fix()`'s reason, and the asymmetry bites

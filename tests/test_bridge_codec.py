@@ -220,6 +220,205 @@ def test_config_body_rejects_a_line_without_a_tab():
         codec.parse_config_body(b"scope.include https://no-tab/*\n")
 
 
+# ---- identity body ------------------------------------------------------
+
+def test_the_identity_frame_round_trips():
+    body = codec.identity_body("user", 2, "Cookie", "session=abc",
+                               ("https://app.test",))
+    out = codec.parse_identity(body)
+    assert out["identity_id"] == "user" and out["generation"] == 2
+    assert out["inject"] == {"header": "Cookie", "value": "session=abc"}
+    assert out["origins"] == ["https://app.test"]
+
+
+def test_the_java_fixture_is_what_this_writer_emits():
+    """The `identity` body is a wire contract between two languages.
+
+    `IdentityFrameTest.java` transcribes one body and asserts that the Java
+    reader takes it apart correctly. On its own that pins what THAT side
+    accepts and nothing at all about what THIS side sends: key order,
+    `separators`, `ensure_ascii` -- any of them could move here and both
+    suites would stay green while the extension refused every real frame.
+
+    So the literal is read back out of the Java file and compared. Same shape
+    as `tests/test_credentials_never_reach_the_store.py`, which reads
+    `CREDENTIAL_PARAMS` out of `Redactor.java`: the copy that can drift is the
+    one in the other language, so the comparison lives on this side.
+    """
+    java = (Path(__file__).resolve().parents[1] / "extension" / "test" / "hx"
+            / "bridge" / "IdentityFrameTest.java").read_text(encoding="utf-8")
+    match = re.search(r"static final String PYTHON_WRITES =\n(.*?);\n", java, re.S)
+    assert match, ("IdentityFrameTest.java has no PYTHON_WRITES constant; the "
+                   "fixture it names is what this test compares against")
+    # The Java source of a string built by `+`: take every quoted run and undo
+    # the backslash-escaping of the quotes inside it.
+    pieces = re.findall(r'"((?:[^"\\]|\\.)*)"', match.group(1))
+    assert pieces, match.group(1)
+    transcribed = "".join(pieces).replace('\\"', '"')
+
+    assert transcribed.encode("utf-8") == codec.identity_body(
+        "user", 2, "Cookie", "session=abc", ("https://app.test",)), (
+        "the body IdentityFrameTest.java transcribes is not the one "
+        f"identity_body writes.\n  java:   {transcribed}\n"
+        f"  python: {codec.identity_body('user', 2, 'Cookie', 'session=abc', ('https://app.test',)).decode()}")
+
+
+def test_identity_body_carries_more_than_one_origin_in_order():
+    body = codec.identity_body("user", 1, "Cookie", "v",
+                               ("https://a.test", "https://b.test"))
+    assert codec.parse_identity(body)["origins"] == \
+        ["https://a.test", "https://b.test"]
+
+
+@pytest.mark.parametrize("generation", [0, -1, -100])
+def test_an_identity_frame_with_a_non_positive_generation_is_refused(generation):
+    # Generation is monotonic on the extension side. A zero or negative one
+    # could never be above what is held, so it is a malformed frame here
+    # rather than a refusal there.
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.identity_body("user", generation, "Cookie", "v",
+                            ("https://app.test",))
+
+
+def test_an_identity_frame_with_a_bool_generation_is_refused():
+    """`isinstance(True, int)` is True in Python; a bool must not sneak past
+    the integer check the way it does not sneak past the header check in
+    `_check_header`."""
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.identity_body("user", True, "Cookie", "v", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_identity_id_is_refused():
+    with pytest.raises(codec.FrameError, match="identity_id"):
+        codec.identity_body("", 1, "Cookie", "v", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_value_is_refused():
+    with pytest.raises(codec.FrameError, match="value"):
+        codec.identity_body("user", 1, "Cookie", "", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_origins_is_refused():
+    """An identity with no origin could be applied to any host the scope
+    allows -- the same rule the extension-side registry enforces."""
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.identity_body("user", 1, "Cookie", "v", ())
+
+
+@pytest.mark.parametrize("value", [
+    "sess=1\r\nX-Smuggled: yes",     # two headers, one of them undecided
+    "sess=1\nX-Smuggled: yes",       # a bare LF ends a field for some parsers
+    "sess=1\rX-Smuggled: yes",
+    "sess=1\r\n\r\nGET /evil HTTP/1.1",  # Host becomes a body
+])
+def test_an_identity_value_carrying_a_newline_is_refused_not_escaped(value):
+    """`build_config_body` twenty lines above already refuses a tab or newline
+    in a config value "rather than escaping" it. The one body in this protocol
+    that carries a live credential did not, and `hx.identity.refresh` only
+    `.strip()`s the ends of a command's stdout -- so a refresh script printing
+    two fields produces exactly this.
+
+    REFUSED, NOT ESCAPED, and the distinction is the whole point: an escaped
+    credential is a different credential, and the server answers it
+    logged-out. The extension refuses it too, in `IdentityRegistry.register`,
+    and that is the check the invariant rests on; this one is the better error
+    at the better time."""
+    with pytest.raises(codec.FrameError, match="carriage return or line feed"):
+        codec.identity_body("user", 1, "Cookie", value, ("https://app.test",))
+
+
+def test_an_identity_header_name_carrying_a_newline_is_refused_too():
+    """The value is not the only half of the field. `Sender.withHeaderFirst`
+    writes the registered NAME as the request's first header, so a name of
+    `Cookie: a\\r\\nX-Evil` composes into two of them."""
+    with pytest.raises(codec.FrameError, match="carriage return or line feed"):
+        codec.identity_body("user", 1, "Cookie: a\r\nX-Evil", "v",
+                            ("https://app.test",))
+
+
+def test_an_identity_value_carrying_a_nul_is_refused():
+    with pytest.raises(codec.FrameError, match="NUL"):
+        codec.identity_body("user", 1, "Cookie", "sess=1\0more",
+                            ("https://app.test",))
+
+
+def test_an_identity_value_outside_latin_1_is_refused_rather_than_mangled():
+    """The extension encodes ISO-8859-1 and Java replaces an unmappable
+    character with `?`, so `sess=€123` goes out as `sess=?123`: offsets
+    correct, redaction correct, credential dead. A dead credential produces an
+    unauthenticated answer that a check reads as "not vulnerable", which is the
+    single outcome this feature exists to prevent -- and nothing downstream can
+    notice, because everything downstream is measuring the mangled bytes."""
+    with pytest.raises(codec.FrameError, match="outside Latin-1"):
+        codec.identity_body("user", 1, "Cookie", "sess=€123",
+                            ("https://app.test",))
+
+
+def test_an_eight_bit_latin_1_identity_value_is_still_accepted():
+    """The bound is at what the wire encoding CHANGES, not at what looks
+    unusual: `0x80..0xFF` is legal field content (RFC 9110 s5.5 obs-text) and
+    survives ISO-8859-1 byte for byte, so refusing it would be refusing a
+    credential that works."""
+    body = codec.identity_body("user", 1, "Cookie", "sess=café",
+                               ("https://app.test",))
+    assert codec.parse_identity(body)["inject"]["value"] == "sess=café"
+
+
+def test_an_identity_refusal_never_quotes_the_credential():
+    """Spec section 5: the `identity` frame's payload is the one secret in this
+    protocol and neither side logs it. A FrameError raised here is logged by
+    whatever catches it, so a message that quoted the offending value -- or the
+    one character of it that failed -- would be the leak, arriving through the
+    door that exists to stop one."""
+    for value in ("SUPERSECRET\r\nX-Smuggled: yes", "SUPERSECRET\0",
+                  "SUPERSECRET€"):
+        with pytest.raises(codec.FrameError) as caught:
+            codec.identity_body("user", 1, "Cookie", value,
+                                ("https://app.test",))
+        assert "SUPERSECRET" not in str(caught.value)
+        assert "user" in str(caught.value)
+
+
+def test_parse_identity_rejects_a_body_that_is_not_json():
+    with pytest.raises(codec.FrameError):
+        codec.parse_identity(b"not json")
+
+
+def test_parse_identity_rejects_a_missing_generation():
+    body = json.dumps({"identity_id": "user",
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_a_stale_non_positive_generation_too():
+    """Re-validated on the reading side rather than trusted from the writer
+    -- the same discipline `parse_config_body` already follows -- so a body
+    that skipped `identity_body`'s own check is still caught here."""
+    body = json.dumps({"identity_id": "user", "generation": 0,
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_empty_origins():
+    body = json.dumps({"identity_id": "user", "generation": 1,
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": []}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_a_blank_value():
+    body = json.dumps({"identity_id": "user", "generation": 1,
+                       "inject": {"header": "Cookie", "value": ""},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="value"):
+        codec.parse_identity(body)
+
+
 # ---- golden vectors ----------------------------------------------------
 
 def test_every_vector_round_trips():
@@ -442,3 +641,39 @@ def test_the_java_side_rejects_the_same_malformed_two_body_payloads():
     # for someone to run the other suite.
     declaration = text.split("TWO_BODY_HEX =", 1)[1].split(";", 1)[0]
     assert "".join(re.findall(r'"([0-9a-f]*)"', declaration)) == TWO_BODY_HEX
+
+
+def test_a_blank_origin_is_refused_on_both_sides():
+    """Finding 2 of the Task 3 review: the asymmetry in re-validation.
+
+    `identity_id` and `value` both refuse emptiness; `origins` refused only a
+    MISSING list, so `[""]` passed. An origin that matches no host is not a
+    narrower bound, it is a dead rule -- and the caller believes it registered
+    a restriction the extension will never apply, which is the wrong direction
+    for a value whose whole job is to stop a credential going to the wrong
+    host.
+    """
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.identity_body("user", 1, "Cookie", "v", ("",))
+    good = codec.identity_body("user", 1, "Cookie", "v", ("https://app.test",))
+    tampered = good.replace(b'"https://app.test"', b'"   "')
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.parse_identity(tampered)
+
+
+def test_an_identity_id_carrying_a_newline_is_refused():
+    """The Task 5 re-review's open item, traced to where it actually lands.
+
+    The id is interpolated into `Sender`'s `unknown_identity` and
+    `identity_origin` refusals, and `hx.store.records` writes those into
+    `denial.reason` -- so an id carrying a line feed forges a line in a STORED
+    ROW, not merely in the harness log. Not SQL injection (the insert is
+    parameterised); a forged record, which is the same defect as a credential
+    carrying CRLF, one layer out from the wire.
+    """
+    with pytest.raises(codec.FrameError, match="id"):
+        codec.identity_body("user\r\nX-Forged: yes", 1, "Cookie", "v",
+                            ("https://app.test",))
+    with pytest.raises(codec.FrameError, match="id"):
+        codec.identity_body("user\nsecond line", 1, "Cookie", "v",
+                            ("https://app.test",))

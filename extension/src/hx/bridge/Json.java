@@ -1,22 +1,51 @@
 package hx.bridge;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
- * A JSON reader and writer for FLAT objects only.
+ * A JSON reader and writer. The HEADER it writes and reads is FLAT; a frame
+ * BODY it reads may nest.
  *
- * Values may be string, integer, boolean or null -- no nested objects, no
- * arrays. That is not a shortcut, it is the contract: the bridge header schema
- * is flat precisely so this parser stays small enough to be obviously correct,
- * and structured payloads travel in the frame body instead. A nested value is
- * rejected loudly rather than half-parsed.
+ * {@link #write} and {@link #parse} are the header pair, and header values may
+ * be string, integer, boolean or null -- no nested objects, no arrays. That is
+ * not a shortcut, it is the contract: the bridge header schema is flat
+ * precisely so this parser stays small enough to be obviously correct, and
+ * structured payloads travel in the frame body instead. A nested value in a
+ * header is rejected loudly rather than half-parsed.
+ *
+ * {@link #parseBody} is the BODY reader, and it is the same grammar with
+ * nesting allowed and a depth bound. It exists because the `identity` frame's
+ * body IS a structured payload -- `{"inject": {"header": ..., "value": ...},
+ * "origins": [...]}` -- written by `hx.bridge.codec.identity_body` on the
+ * Python side. ONE grammar and not two: the alternative was a second JSON
+ * reader for that one body, and two readers of one grammar that disagree
+ * about a surrogate pair, a control character or a leading zero is a frame
+ * that is valid on one side of the bridge and not the other. Nothing is
+ * loosened for the header path -- {@link #parse} sets the flag that permits
+ * nesting to false and every existing refusal is byte-identical.
  */
 public final class Json {
 
     public static class JsonError extends RuntimeException {
         public JsonError(String m) { super(m); }
     }
+
+    /**
+     * How many objects and arrays a body may nest INSIDE its outermost object.
+     *
+     * A BOUND, because the alternative to one is a StackOverflowError. A frame
+     * body is bounded only by {@link Frame#MAX_FRAME} -- 64 MB -- so a body of
+     * `[[[[[...` recurses as far as the peer chose to write, and a
+     * StackOverflowError is an Error rather than a RuntimeException: it is not
+     * a {@link JsonError} that any arm of the frame switch answers with a
+     * refusal. The identity body needs ONE level of nesting (`inject`, and
+     * `origins` beside it), so eight is generous for every body this protocol
+     * has and small enough that nothing can be reached through it.
+     */
+    static final int MAX_DEPTH = 8;
 
     private Json() { }
 
@@ -66,14 +95,32 @@ public final class Json {
 
     // ---- parsing ----------------------------------------------------
 
+    /** A frame HEADER: a FLAT object, exactly as before. */
     public static Map<String, Object> parse(String text) {
-        P p = new P(text);
+        return parse(text, false, "header");
+    }
+
+    /**
+     * A frame BODY: the same grammar with nesting allowed, bounded by
+     * {@link #MAX_DEPTH}.
+     *
+     * A separate entry point rather than a flag on {@link #parse}, so that no
+     * caller reaches nesting by accident and every header stays as flat as it
+     * was. The one body that uses it today is the `identity` frame's; see
+     * {@link IdentityBody}, which owns the SCHEMA while this owns the grammar.
+     */
+    public static Map<String, Object> parseBody(String text) {
+        return parse(text, true, "body");
+    }
+
+    private static Map<String, Object> parse(String text, boolean nested, String what) {
+        P p = new P(text, nested);
         Map<String, Object> out = parseObject(p);
         p.ws();
         // Python's json.loads raises "Extra data" here. Accepting it would let a
         // crafted frame be valid on one side of the bridge and not the other.
         if (p.i != text.length())
-            throw new JsonError("trailing data after the header object at " + p.i);
+            throw new JsonError("trailing data after the " + what + " object at " + p.i);
         return out;
     }
 
@@ -97,10 +144,32 @@ public final class Json {
         }
     }
 
+    /** A JSON array, for a body. Header values never reach this. */
+    private static List<Object> parseArray(P p) {
+        p.ws();
+        p.expect('[');
+        List<Object> out = new ArrayList<>();
+        p.ws();
+        if (p.peek() == ']') { p.next(); return out; }
+        while (true) {
+            p.ws();
+            out.add(p.value());
+            p.ws();
+            char c = p.next();
+            if (c == ']') return out;
+            if (c != ',') throw new JsonError("expected ',' or ']' at " + p.i);
+        }
+    }
+
     private static final class P {
         final String s;
+        /** Whether a nested object or array is a value here. False for every
+         *  header, which is what keeps the header schema flat. */
+        final boolean nested;
+        /** How many objects and arrays are open above the value being read. */
+        int depth = 0;
         int i = 0;
-        P(String s) { this.s = s; }
+        P(String s, boolean nested) { this.s = s; this.nested = nested; }
 
         char peek() {
             if (i >= s.length()) throw new JsonError("unexpected end of input");
@@ -187,8 +256,16 @@ public final class Json {
         Object value() {
             char c = peek();
             if (c == '"') return string();
-            if (c == '{' || c == '[')
-                throw new JsonError("header must be flat; nested values are not supported");
+            if (c == '{' || c == '[') {
+                if (!nested)
+                    throw new JsonError("header must be flat; nested values are not supported");
+                if (depth + 1 > MAX_DEPTH)
+                    throw new JsonError("body nests deeper than " + MAX_DEPTH + " at " + i);
+                depth++;
+                Object v = c == '{' ? parseObject(this) : parseArray(this);
+                depth--;
+                return v;
+            }
             if (s.startsWith("true", i))  { i += 4; return Boolean.TRUE; }
             if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }
             if (s.startsWith("null", i))  { i += 4; return null; }

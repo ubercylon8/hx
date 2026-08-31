@@ -438,6 +438,205 @@ def test_config_body_rejects_a_line_without_a_tab():
         codec.parse_config_body(b"scope.include https://no-tab/*\n")
 
 
+# ---- identity body ------------------------------------------------------
+
+def test_the_identity_frame_round_trips():
+    body = codec.identity_body("user", 2, "Cookie", "session=abc",
+                               ("https://app.test",))
+    out = codec.parse_identity(body)
+    assert out["identity_id"] == "user" and out["generation"] == 2
+    assert out["inject"] == {"header": "Cookie", "value": "session=abc"}
+    assert out["origins"] == ["https://app.test"]
+
+
+def test_the_java_fixture_is_what_this_writer_emits():
+    """The `identity` body is a wire contract between two languages.
+
+    `IdentityFrameTest.java` transcribes one body and asserts that the Java
+    reader takes it apart correctly. On its own that pins what THAT side
+    accepts and nothing at all about what THIS side sends: key order,
+    `separators`, `ensure_ascii` -- any of them could move here and both
+    suites would stay green while the extension refused every real frame.
+
+    So the literal is read back out of the Java file and compared. Same shape
+    as `tests/test_credentials_never_reach_the_store.py`, which reads
+    `CREDENTIAL_PARAMS` out of `Redactor.java`: the copy that can drift is the
+    one in the other language, so the comparison lives on this side.
+    """
+    java = (Path(__file__).resolve().parents[1] / "extension" / "test" / "hx"
+            / "bridge" / "IdentityFrameTest.java").read_text(encoding="utf-8")
+    match = re.search(r"static final String PYTHON_WRITES =\n(.*?);\n", java, re.S)
+    assert match, ("IdentityFrameTest.java has no PYTHON_WRITES constant; the "
+                   "fixture it names is what this test compares against")
+    # The Java source of a string built by `+`: take every quoted run and undo
+    # the backslash-escaping of the quotes inside it.
+    pieces = re.findall(r'"((?:[^"\\]|\\.)*)"', match.group(1))
+    assert pieces, match.group(1)
+    transcribed = "".join(pieces).replace('\\"', '"')
+
+    assert transcribed.encode("utf-8") == codec.identity_body(
+        "user", 2, "Cookie", "session=abc", ("https://app.test",)), (
+        "the body IdentityFrameTest.java transcribes is not the one "
+        f"identity_body writes.\n  java:   {transcribed}\n"
+        f"  python: {codec.identity_body('user', 2, 'Cookie', 'session=abc', ('https://app.test',)).decode()}")
+
+
+def test_identity_body_carries_more_than_one_origin_in_order():
+    body = codec.identity_body("user", 1, "Cookie", "v",
+                               ("https://a.test", "https://b.test"))
+    assert codec.parse_identity(body)["origins"] == \
+        ["https://a.test", "https://b.test"]
+
+
+@pytest.mark.parametrize("generation", [0, -1, -100])
+def test_an_identity_frame_with_a_non_positive_generation_is_refused(generation):
+    # Generation is monotonic on the extension side. A zero or negative one
+    # could never be above what is held, so it is a malformed frame here
+    # rather than a refusal there.
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.identity_body("user", generation, "Cookie", "v",
+                            ("https://app.test",))
+
+
+def test_an_identity_frame_with_a_bool_generation_is_refused():
+    """`isinstance(True, int)` is True in Python; a bool must not sneak past
+    the integer check the way it does not sneak past the header check in
+    `_check_header`."""
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.identity_body("user", True, "Cookie", "v", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_identity_id_is_refused():
+    with pytest.raises(codec.FrameError, match="identity_id"):
+        codec.identity_body("", 1, "Cookie", "v", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_value_is_refused():
+    with pytest.raises(codec.FrameError, match="value"):
+        codec.identity_body("user", 1, "Cookie", "", ("https://app.test",))
+
+
+def test_an_identity_frame_with_no_origins_is_refused():
+    """An identity with no origin could be applied to any host the scope
+    allows -- the same rule the extension-side registry enforces."""
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.identity_body("user", 1, "Cookie", "v", ())
+
+
+@pytest.mark.parametrize("value", [
+    "sess=1\r\nX-Smuggled: yes",     # two headers, one of them undecided
+    "sess=1\nX-Smuggled: yes",       # a bare LF ends a field for some parsers
+    "sess=1\rX-Smuggled: yes",
+    "sess=1\r\n\r\nGET /evil HTTP/1.1",  # Host becomes a body
+])
+def test_an_identity_value_carrying_a_newline_is_refused_not_escaped(value):
+    """`build_config_body` twenty lines above already refuses a tab or newline
+    in a config value "rather than escaping" it. The one body in this protocol
+    that carries a live credential did not, and `hx.identity.refresh` only
+    `.strip()`s the ends of a command's stdout -- so a refresh script printing
+    two fields produces exactly this.
+
+    REFUSED, NOT ESCAPED, and the distinction is the whole point: an escaped
+    credential is a different credential, and the server answers it
+    logged-out. The extension refuses it too, in `IdentityRegistry.register`,
+    and that is the check the invariant rests on; this one is the better error
+    at the better time."""
+    with pytest.raises(codec.FrameError, match="carriage return or line feed"):
+        codec.identity_body("user", 1, "Cookie", value, ("https://app.test",))
+
+
+def test_an_identity_header_name_carrying_a_newline_is_refused_too():
+    """The value is not the only half of the field. `Sender.withHeaderFirst`
+    writes the registered NAME as the request's first header, so a name of
+    `Cookie: a\\r\\nX-Evil` composes into two of them."""
+    with pytest.raises(codec.FrameError, match="carriage return or line feed"):
+        codec.identity_body("user", 1, "Cookie: a\r\nX-Evil", "v",
+                            ("https://app.test",))
+
+
+def test_an_identity_value_carrying_a_nul_is_refused():
+    with pytest.raises(codec.FrameError, match="NUL"):
+        codec.identity_body("user", 1, "Cookie", "sess=1\0more",
+                            ("https://app.test",))
+
+
+def test_an_identity_value_outside_latin_1_is_refused_rather_than_mangled():
+    """The extension encodes ISO-8859-1 and Java replaces an unmappable
+    character with `?`, so `sess=€123` goes out as `sess=?123`: offsets
+    correct, redaction correct, credential dead. A dead credential produces an
+    unauthenticated answer that a check reads as "not vulnerable", which is the
+    single outcome this feature exists to prevent -- and nothing downstream can
+    notice, because everything downstream is measuring the mangled bytes."""
+    with pytest.raises(codec.FrameError, match="outside Latin-1"):
+        codec.identity_body("user", 1, "Cookie", "sess=€123",
+                            ("https://app.test",))
+
+
+def test_an_eight_bit_latin_1_identity_value_is_still_accepted():
+    """The bound is at what the wire encoding CHANGES, not at what looks
+    unusual: `0x80..0xFF` is legal field content (RFC 9110 s5.5 obs-text) and
+    survives ISO-8859-1 byte for byte, so refusing it would be refusing a
+    credential that works."""
+    body = codec.identity_body("user", 1, "Cookie", "sess=café",
+                               ("https://app.test",))
+    assert codec.parse_identity(body)["inject"]["value"] == "sess=café"
+
+
+def test_an_identity_refusal_never_quotes_the_credential():
+    """Spec section 5: the `identity` frame's payload is the one secret in this
+    protocol and neither side logs it. A FrameError raised here is logged by
+    whatever catches it, so a message that quoted the offending value -- or the
+    one character of it that failed -- would be the leak, arriving through the
+    door that exists to stop one."""
+    for value in ("SUPERSECRET\r\nX-Smuggled: yes", "SUPERSECRET\0",
+                  "SUPERSECRET€"):
+        with pytest.raises(codec.FrameError) as caught:
+            codec.identity_body("user", 1, "Cookie", value,
+                                ("https://app.test",))
+        assert "SUPERSECRET" not in str(caught.value)
+        assert "user" in str(caught.value)
+
+
+def test_parse_identity_rejects_a_body_that_is_not_json():
+    with pytest.raises(codec.FrameError):
+        codec.parse_identity(b"not json")
+
+
+def test_parse_identity_rejects_a_missing_generation():
+    body = json.dumps({"identity_id": "user",
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_a_stale_non_positive_generation_too():
+    """Re-validated on the reading side rather than trusted from the writer
+    -- the same discipline `parse_config_body` already follows -- so a body
+    that skipped `identity_body`'s own check is still caught here."""
+    body = json.dumps({"identity_id": "user", "generation": 0,
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="generation"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_empty_origins():
+    body = json.dumps({"identity_id": "user", "generation": 1,
+                       "inject": {"header": "Cookie", "value": "v"},
+                       "origins": []}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.parse_identity(body)
+
+
+def test_parse_identity_rejects_a_blank_value():
+    body = json.dumps({"identity_id": "user", "generation": 1,
+                       "inject": {"header": "Cookie", "value": ""},
+                       "origins": ["https://app.test"]}).encode("utf-8")
+    with pytest.raises(codec.FrameError, match="value"):
+        codec.parse_identity(body)
+
+
 # ---- golden vectors ----------------------------------------------------
 
 def test_every_vector_round_trips():
@@ -660,6 +859,42 @@ def test_the_java_side_rejects_the_same_malformed_two_body_payloads():
     # for someone to run the other suite.
     declaration = text.split("TWO_BODY_HEX =", 1)[1].split(";", 1)[0]
     assert "".join(re.findall(r'"([0-9a-f]*)"', declaration)) == TWO_BODY_HEX
+
+
+def test_a_blank_origin_is_refused_on_both_sides():
+    """Finding 2 of the Task 3 review: the asymmetry in re-validation.
+
+    `identity_id` and `value` both refuse emptiness; `origins` refused only a
+    MISSING list, so `[""]` passed. An origin that matches no host is not a
+    narrower bound, it is a dead rule -- and the caller believes it registered
+    a restriction the extension will never apply, which is the wrong direction
+    for a value whose whole job is to stop a credential going to the wrong
+    host.
+    """
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.identity_body("user", 1, "Cookie", "v", ("",))
+    good = codec.identity_body("user", 1, "Cookie", "v", ("https://app.test",))
+    tampered = good.replace(b'"https://app.test"', b'"   "')
+    with pytest.raises(codec.FrameError, match="origin"):
+        codec.parse_identity(tampered)
+
+
+def test_an_identity_id_carrying_a_newline_is_refused():
+    """The Task 5 re-review's open item, traced to where it actually lands.
+
+    The id is interpolated into `Sender`'s `unknown_identity` and
+    `identity_origin` refusals, and `hx.store.records` writes those into
+    `denial.reason` -- so an id carrying a line feed forges a line in a STORED
+    ROW, not merely in the harness log. Not SQL injection (the insert is
+    parameterised); a forged record, which is the same defect as a credential
+    carrying CRLF, one layer out from the wire.
+    """
+    with pytest.raises(codec.FrameError, match="id"):
+        codec.identity_body("user\r\nX-Forged: yes", 1, "Cookie", "v",
+                            ("https://app.test",))
+    with pytest.raises(codec.FrameError, match="id"):
+        codec.identity_body("user\nsecond line", 1, "Cookie", "v",
+                            ("https://app.test",))
 ```
 
 - [ ] **Step 4: Run tests to verify they fail**
@@ -956,6 +1191,172 @@ def build_config_body(pairs: dict[str, list[str]]) -> bytes:
                 )
             out += key.encode("utf-8") + b"\t" + value.encode("utf-8") + b"\n"
     return bytes(out)
+
+
+def _refuse_unwritable(identity_id: str, what: str, text: str) -> None:
+    """Refuse text the extension could not write into a header as itself.
+
+    THE NEWLINE HALF OF THIS IS THE RULE `build_config_body` DIRECTLY ABOVE
+    HAS ALWAYS APPLIED to a config value ("rejected rather than escaped"), and
+    the one body in this protocol that carries a live credential was the one
+    body less strict about it than the config writer. `Sender.compose` writes
+    `header + ": " + value` and ends the field with CRLF, so:
+
+      * CR or LF splits the field. `"sess=1\\r\\nX-Smuggled: yes"` issues a
+        SECOND header that no gate decided about, and `compose`'s own
+        self-check cannot see it -- that check verifies the bytes at the
+        registered range ARE the credential, and for a CRLF-carrying value
+        they are. A blank line ends the head early and turns the caller's
+        remaining fields, `Host` included, into a body.
+      * NUL cannot split a field and is refused anyway: RFC 9110 s5.5's
+        field-content admits VCHAR, SP, HTAB and obs-text and nothing else, so
+        a credential carrying one is a credential whose treatment is left to
+        whatever parses it.
+      * anything above U+00FF is SILENTLY MANGLED. `Sender.wireBytes` encodes
+        ISO-8859-1 and Java replaces an unmappable character with `?`, so
+        `sess=€123` goes out as `sess=?123` -- a dead credential, an
+        answer given to nobody, and a check that reads it as "not vulnerable".
+
+    THIS IS THE EARLIER ERROR, NOT THE ENFORCEMENT. `IdentityRegistry.register`
+    refuses all three on the extension side and that is the check the invariant
+    rests on -- spec section 4 puts both enforcement points "inside the JVM",
+    so a check living in this process is not one of them and a run whose
+    harness was replaced, patched or bypassed is exactly the case it must hold
+    for. What this buys is a refusal raised where the
+    operator's own `refresh` command and environment variable are in view,
+    before a frame is written, rather than a `bad_identity` coming back over a
+    socket.
+
+    NOT THE HEADER NAME SET. `hx.config` refuses an `inject.header` outside
+    `Cookie`, `Authorization` and `Proxy-Authorization` at load
+    (`hx.config.CREDENTIAL_HEADERS`), with a better message than this could
+    give, and `IdentityRegistry.register` refuses it again in the JVM. A third
+    copy of those three names here would be a vocabulary in three places.
+    """
+    for ch in text:
+        # The character is never quoted, and neither is the text it came from.
+        # Spec section 5: the credential is logged on neither side, and a
+        # FrameError message is logged by whatever catches it.
+        if ch in "\r\n":
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a carriage return "
+                "or line feed; such values are rejected rather than escaped, "
+                "because injecting one would write a header the extension "
+                "never decided about")
+        if ch == "\0":
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a NUL")
+        if ord(ch) > 0xFF:
+            raise FrameError(
+                f"identity {identity_id!r}'s {what} contains a character "
+                "outside Latin-1; the extension's wire encoding would replace "
+                "it with '?', and a mangled credential answers as an "
+                "unauthenticated one")
+
+
+def identity_body(identity_id: str, generation: int, header: str, value: str,
+                  origins: tuple[str, ...]) -> bytes:
+    """The `identity` frame's body: `{identity_id, generation,
+    inject: {header, value}, origins}`, JSON-encoded.
+
+    NOT A CONFIG KEY, and the reason is spec section 5's: a `configure` naming
+    a different rate or budget is REFUSED rather than applied, because a run
+    must not talk its way into a larger allowance mid-flight. A programmatic
+    refresh has to advance a generation WITHOUT re-opening scope, so folding
+    identity into `configure` would either weaken that rule or make refresh
+    impossible. Its own frame keeps both intact -- see `BridgeServer.
+    register_identity`, which sends this body under `t: "identity"` rather
+    than through `configure`.
+
+    GENERATION MUST BE >= 1, validated here rather than left for the
+    extension-side registry alone to catch: the registry treats a lower
+    generation than the one it holds as a refusal, so 0 or negative could
+    never be above anything it holds, and is a malformed frame here rather
+    than a refusal there.
+
+    AND THE HEADER AND VALUE MUST BE WRITABLE AS THEMSELVES -- see
+    `_refuse_unwritable`, which is the rule `build_config_body` has always
+    applied to a config value, arriving late at the one body in this protocol
+    that carries a credential.
+    """
+    if not identity_id:
+        raise FrameError("an identity frame needs an identity_id")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise FrameError(f"generation must be an integer >= 1, got {generation!r}")
+    if not header:
+        raise FrameError("an identity frame needs a header to inject into")
+    if not value:
+        raise FrameError("an identity frame with no value registers nothing")
+    # The id first, and before it is interpolated into the two refusals below:
+    # it reaches `denial.reason` in the store by way of `Sender`'s
+    # `unknown_identity`/`identity_origin`, so a line feed here forges a stored
+    # row rather than only a log line.
+    _refuse_unwritable(identity_id, "id", identity_id)
+    _refuse_unwritable(identity_id, "header name", header)
+    _refuse_unwritable(identity_id, "value", value)
+    if not origins or not all(o and o.strip() for o in origins):
+        raise FrameError(
+            "an identity frame needs at least one origin; an identity with no "
+            "origin could be applied to any host the scope allows")
+    payload = {
+        "identity_id": identity_id,
+        "generation": generation,
+        "inject": {"header": header, "value": value},
+        "origins": list(origins),
+    }
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def parse_identity(body: bytes) -> dict:
+    """The reverse of `identity_body`.
+
+    Re-validates the same fields rather than trusting the writer, on the
+    principle `parse_config_body` already follows: a body is checked on the
+    reading side because the writing side being in this repo is not a
+    guarantee about what actually arrived on the wire.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except ValueError as exc:  # UnicodeDecodeError is a ValueError
+        raise FrameError(f"identity body is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise FrameError("identity body must be a JSON object")
+
+    identity_id = payload.get("identity_id")
+    if not identity_id or not isinstance(identity_id, str):
+        raise FrameError("an identity frame needs an identity_id")
+
+    generation = payload.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise FrameError(f"generation must be an integer >= 1, got {generation!r}")
+
+    inject = payload.get("inject")
+    if not isinstance(inject, dict):
+        raise FrameError("an identity frame needs an inject object")
+    header = inject.get("header")
+    if not header or not isinstance(header, str):
+        raise FrameError("an identity frame needs a header to inject into")
+    value = inject.get("value")
+    if not value or not isinstance(value, str):
+        raise FrameError("an identity frame with no value registers nothing")
+
+    origins = payload.get("origins")
+    # A BLANK origin is refused alongside a missing list, for the same reason
+    # `identity_id` and `value` refuse emptiness: an entry that matches no host
+    # is not a narrower scope, it is a silently dead rule -- and the caller
+    # believes it registered a bound the extension will never apply.
+    if not origins or not isinstance(origins, list) or not all(
+            isinstance(o, str) and o.strip() for o in origins):
+        raise FrameError(
+            "an identity frame needs at least one origin; an identity with no "
+            "origin could be applied to any host the scope allows")
+
+    return {
+        "identity_id": identity_id,
+        "generation": generation,
+        "inject": {"header": header, "value": value},
+        "origins": origins,
+    }
 
 
 def parse_config_body(body: bytes) -> dict[str, list[str]]:
@@ -1579,6 +1980,15 @@ import java.util.*;
  * placeholder standing in for the header -- through the same flat parser.
  * Widening Json.parse to accept nesting, just to satisfy a test, is the
  * wrong trade.
+ *
+ * {@code Json.parseBody} DOES read nesting now, and that sentence still holds
+ * as written: it was added for the `identity` frame's BODY, which is a
+ * structured payload on the wire, and it is a separate entry point that leaves
+ * {@code Json.parse} -- every frame HEADER -- as flat as it ever was. This
+ * reader is left alone rather than rewritten onto it, because a vector file
+ * that both languages read is not the place to change readers in a commit
+ * about something else. Doing so later would be a simplification and not a
+ * fix.
  */
 final class MiniVectorReader {
 
@@ -1695,23 +2105,52 @@ Expected: FAIL — compilation error, `cannot find symbol: class Frame`
 // extension/src/hx/bridge/Json.java
 package hx.bridge;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
- * A JSON reader and writer for FLAT objects only.
+ * A JSON reader and writer. The HEADER it writes and reads is FLAT; a frame
+ * BODY it reads may nest.
  *
- * Values may be string, integer, boolean or null -- no nested objects, no
- * arrays. That is not a shortcut, it is the contract: the bridge header schema
- * is flat precisely so this parser stays small enough to be obviously correct,
- * and structured payloads travel in the frame body instead. A nested value is
- * rejected loudly rather than half-parsed.
+ * {@link #write} and {@link #parse} are the header pair, and header values may
+ * be string, integer, boolean or null -- no nested objects, no arrays. That is
+ * not a shortcut, it is the contract: the bridge header schema is flat
+ * precisely so this parser stays small enough to be obviously correct, and
+ * structured payloads travel in the frame body instead. A nested value in a
+ * header is rejected loudly rather than half-parsed.
+ *
+ * {@link #parseBody} is the BODY reader, and it is the same grammar with
+ * nesting allowed and a depth bound. It exists because the `identity` frame's
+ * body IS a structured payload -- `{"inject": {"header": ..., "value": ...},
+ * "origins": [...]}` -- written by `hx.bridge.codec.identity_body` on the
+ * Python side. ONE grammar and not two: the alternative was a second JSON
+ * reader for that one body, and two readers of one grammar that disagree
+ * about a surrogate pair, a control character or a leading zero is a frame
+ * that is valid on one side of the bridge and not the other. Nothing is
+ * loosened for the header path -- {@link #parse} sets the flag that permits
+ * nesting to false and every existing refusal is byte-identical.
  */
 public final class Json {
 
     public static class JsonError extends RuntimeException {
         public JsonError(String m) { super(m); }
     }
+
+    /**
+     * How many objects and arrays a body may nest INSIDE its outermost object.
+     *
+     * A BOUND, because the alternative to one is a StackOverflowError. A frame
+     * body is bounded only by {@link Frame#MAX_FRAME} -- 64 MB -- so a body of
+     * `[[[[[...` recurses as far as the peer chose to write, and a
+     * StackOverflowError is an Error rather than a RuntimeException: it is not
+     * a {@link JsonError} that any arm of the frame switch answers with a
+     * refusal. The identity body needs ONE level of nesting (`inject`, and
+     * `origins` beside it), so eight is generous for every body this protocol
+     * has and small enough that nothing can be reached through it.
+     */
+    static final int MAX_DEPTH = 8;
 
     private Json() { }
 
@@ -1761,14 +2200,32 @@ public final class Json {
 
     // ---- parsing ----------------------------------------------------
 
+    /** A frame HEADER: a FLAT object, exactly as before. */
     public static Map<String, Object> parse(String text) {
-        P p = new P(text);
+        return parse(text, false, "header");
+    }
+
+    /**
+     * A frame BODY: the same grammar with nesting allowed, bounded by
+     * {@link #MAX_DEPTH}.
+     *
+     * A separate entry point rather than a flag on {@link #parse}, so that no
+     * caller reaches nesting by accident and every header stays as flat as it
+     * was. The one body that uses it today is the `identity` frame's; see
+     * {@link IdentityBody}, which owns the SCHEMA while this owns the grammar.
+     */
+    public static Map<String, Object> parseBody(String text) {
+        return parse(text, true, "body");
+    }
+
+    private static Map<String, Object> parse(String text, boolean nested, String what) {
+        P p = new P(text, nested);
         Map<String, Object> out = parseObject(p);
         p.ws();
         // Python's json.loads raises "Extra data" here. Accepting it would let a
         // crafted frame be valid on one side of the bridge and not the other.
         if (p.i != text.length())
-            throw new JsonError("trailing data after the header object at " + p.i);
+            throw new JsonError("trailing data after the " + what + " object at " + p.i);
         return out;
     }
 
@@ -1792,10 +2249,32 @@ public final class Json {
         }
     }
 
+    /** A JSON array, for a body. Header values never reach this. */
+    private static List<Object> parseArray(P p) {
+        p.ws();
+        p.expect('[');
+        List<Object> out = new ArrayList<>();
+        p.ws();
+        if (p.peek() == ']') { p.next(); return out; }
+        while (true) {
+            p.ws();
+            out.add(p.value());
+            p.ws();
+            char c = p.next();
+            if (c == ']') return out;
+            if (c != ',') throw new JsonError("expected ',' or ']' at " + p.i);
+        }
+    }
+
     private static final class P {
         final String s;
+        /** Whether a nested object or array is a value here. False for every
+         *  header, which is what keeps the header schema flat. */
+        final boolean nested;
+        /** How many objects and arrays are open above the value being read. */
+        int depth = 0;
         int i = 0;
-        P(String s) { this.s = s; }
+        P(String s, boolean nested) { this.s = s; this.nested = nested; }
 
         char peek() {
             if (i >= s.length()) throw new JsonError("unexpected end of input");
@@ -1882,8 +2361,16 @@ public final class Json {
         Object value() {
             char c = peek();
             if (c == '"') return string();
-            if (c == '{' || c == '[')
-                throw new JsonError("header must be flat; nested values are not supported");
+            if (c == '{' || c == '[') {
+                if (!nested)
+                    throw new JsonError("header must be flat; nested values are not supported");
+                if (depth + 1 > MAX_DEPTH)
+                    throw new JsonError("body nests deeper than " + MAX_DEPTH + " at " + i);
+                depth++;
+                Object v = c == '{' ? parseObject(this) : parseArray(this);
+                depth--;
+                return v;
+            }
             if (s.startsWith("true", i))  { i += 4; return Boolean.TRUE; }
             if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }
             if (s.startsWith("null", i))  { i += 4; return null; }
@@ -2380,6 +2867,7 @@ from pathlib import Path
 import pytest
 
 from hx import halt as halt_mod
+from hx import identity
 from hx.bridge import codec, server
 from hx.store import db as db_mod
 from hx.store import records
@@ -3182,6 +3670,172 @@ def test_a_refused_reconfigure_returns_this_side_to_deny_all(srv):
             f"must not go on claiming {srv.state!r}"
         )
         assert srv.config_epoch == 0, srv.config_epoch
+    finally:
+        c.close()
+
+
+# ---- register_identity ------------------------------------------------
+
+# `register_identity` blocks waiting for the peer's reply, exactly like
+# `configure()` above. See test_configure_round_trip_returns_an_epoch for the
+# shape this borrows and the race it guards against: calling it inline and
+# then trying to read the frame off the same thread deadlocks, since nothing
+# is left to send the reply. `_connected` already drives past the hello
+# handshake before handing back the socket, which is what keeps these three
+# clear of that race -- `_conn` is set and `state` is "connected" before the
+# thread below ever calls in.
+
+
+def test_registering_an_identity_sends_an_identity_frame(srv):
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie",
+                                      value="session=abc", generation=1),
+                    origins=("https://app.test",))
+                result["ok"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+
+        header, body = reader.read()
+        assert header["t"] == "identity"
+        assert header["engagement_id"] == "e-1"
+        assert isinstance(header["id"], int) and header["id"] > 0
+        parsed = codec.parse_identity(body)
+        assert parsed["identity_id"] == "user" and parsed["generation"] == 1
+        assert parsed["inject"] == {"header": "Cookie", "value": "session=abc"}
+        assert parsed["origins"] == ["https://app.test"]
+
+        c.sendall(codec.encode({"v": 1, "t": "identity_registered",
+                                "id": header["id"]}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert result.get("ok") is True, result
+    finally:
+        c.close()
+
+
+def test_an_identity_frame_is_never_logged(srv, caplog):
+    """The ONLY frame in this protocol whose payload is a secret. The bridge
+    logs frame kinds and correlation ids elsewhere in this class (see
+    test_a_refused_peer_is_counted_and_logged_rather_than_dropped_in_silence);
+    a debug line added to this method that printed `resolved.value` is
+    exactly how a live session cookie reaches a log file that outlives the
+    engagement.
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie",
+                                      value="session=SUPERSECRET",
+                                      generation=1),
+                    origins=("https://app.test",))
+                result["ok"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        with caplog.at_level("DEBUG"):
+            t = threading.Thread(target=do_register)
+            t.start()
+            header, _ = reader.read()
+            c.sendall(codec.encode({"v": 1, "t": "identity_registered",
+                                    "id": header["id"]}))
+            t.join(timeout=5)
+
+        assert not t.is_alive(), "do_register thread never finished"
+        assert result.get("ok") is True, result
+        assert "SUPERSECRET" not in caplog.text
+        assert "identity" in caplog.text, "the frame KIND is still loggable"
+    finally:
+        c.close()
+
+
+def test_a_refused_identity_frame_raises(srv):
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie", value="v",
+                                      generation=1),
+                    origins=("https://app.test",))
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+        header, _ = reader.read()
+        c.sendall(codec.encode({"v": 1, "t": "error", "id": header["id"],
+                                "class": "stale_generation",
+                                "detail": "generation 1 is not above 3"}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert isinstance(result.get("error"), server.BridgeError), result
+        assert result["error"].error_class == "stale_generation"
+        assert "stale_generation" in str(result["error"])
+    finally:
+        c.close()
+
+
+def test_an_unexpected_ack_shape_is_a_refusal_not_a_silent_success(srv):
+    """Finding 1 of the Task 3 review, and the direction the gap ran.
+
+    `register_identity` used to test only for `t == "error"` and return on
+    everything else, so a reply of any other shape -- a `result` frame from a
+    confused peer, an ack for a frame type this side does not know -- read as
+    "the credential is now live in the extension". Every probe after it would
+    then issue believing it carried a session it does not have, and answer
+    `clean` about the logged-out view of an authenticated application: the
+    exact confusion this whole feature exists to remove, arrived at by
+    agreeing with a peer instead of by having no identity at all.
+
+    `send()` has always been strict about its reply type. This is the same
+    rule on the one frame whose payload is a live credential.
+    """
+    c = _connected(srv)
+    reader = codec.FrameReader(c)
+    try:
+        result = {}
+
+        def do_register():
+            try:
+                srv.register_identity(
+                    identity.Resolved(id="user", header="Cookie", value="v",
+                                      generation=1),
+                    origins=("https://app.test",))
+                result["returned"] = True
+            except server.BridgeError as exc:
+                result["error"] = exc
+
+        t = threading.Thread(target=do_register)
+        t.start()
+        header, _ = reader.read()
+        # A well-formed frame of the WRONG type: not an error, not the ack.
+        c.sendall(codec.encode({"v": 1, "t": "result", "id": header["id"],
+                                "status": 200, "outcome": "ok"}))
+        t.join(timeout=5)
+        assert not t.is_alive(), "do_register thread never finished"
+        assert "returned" not in result, (
+            "a `result` frame was accepted as a successful identity "
+            "registration")
+        assert isinstance(result.get("error"), server.BridgeError), result
+        assert "result" in str(result["error"])
     finally:
         c.close()
 
@@ -5027,7 +5681,7 @@ class BridgeServer:
             self._deliver(header, body)
             return True
 
-        if t in ("result", "error"):
+        if t in ("result", "error", "identity_registered"):
             self._deliver(header, body)
             return True
 
@@ -5288,6 +5942,73 @@ class BridgeServer:
             # exactly what an operator should be able to do.
             self.state = "halted" if self.state == "halted" else "configured"
         return self.config_epoch
+
+    def register_identity(self, resolved, *, origins: tuple[str, ...]) -> None:
+        """Register or refresh one identity in the extension.
+
+        THE BODY IS NEVER LOGGED. Spec section 5 is explicit that `identity`
+        is the one frame in this protocol whose payload is a live credential,
+        and that neither side's diagnostics may print it. Everywhere else in
+        this class logs freely -- `_serve` names the peer's uid, pid and exe
+        at INFO, and a refused peer at WARNING -- because a frame *kind* and a
+        correlation id are not secrets. This method's own log line below is
+        held to the same rule the rest of the class already follows for
+        everything it prints: it names `resolved.id` and `resolved.
+        generation`, and nothing that touches `resolved.value` or
+        `resolved.header`'s injected content ever reaches `_log`.
+
+        `identity` is its own frame type rather than a `configure` key --
+        `configure()` above refuses a later call naming a different rate or
+        budget, because a run must not talk its way into a larger allowance
+        mid-flight, and a programmatic refresh has to advance a generation
+        WITHOUT re-opening scope. Folding identity into `configure` would
+        either weaken that rule or make refresh impossible.
+
+        The success and refusal frame types the peer answers with
+        (`identity_registered`, or `error` carrying a `class` such as
+        `stale_generation` for a generation that does not advance what the
+        extension already holds) are this side's choice: the extension-side
+        registry is a later task in this same plan and has not been built
+        yet, so nothing upstream of this file pins them. `_handle` delivers
+        both alongside `result`/`error` for exactly this method to collect.
+
+        Raises BridgeError: whatever `_request` raises when the peer is gone
+        or never answers, and `error_class` set to the peer's `class` on an
+        `error` reply.
+
+        Raises codec.FrameError, which is NOT a BridgeError, BEFORE any frame
+        is written: `identity_body` refuses a body it cannot build -- a
+        generation below 1, no origins, and (since the Task 5 fix round) a
+        header or value carrying CR, LF, NUL or a character outside Latin-1,
+        which the extension would refuse as `bad_identity` anyway. Named here
+        because this method has no caller yet and the one that arrives has two
+        exception types to handle, not one.
+        """
+        body = codec.identity_body(resolved.id, resolved.generation,
+                                   resolved.header, resolved.value, origins)
+        _log.debug("hx bridge: identity frame for %s generation %d -- kind "
+                  "and generation only, never the injected value",
+                  resolved.id, resolved.generation)
+        reply = self._request({"v": codec.PROTOCOL_VERSION, "t": "identity",
+                               "engagement_id": self.engagement_id}, body)
+        t = reply.get("t")
+        if t == "identity_registered":
+            return
+        if t == "error":
+            raise BridgeError(
+                "peer refused identity: "
+                f"{reply.get('class', 'unspecified')}: "
+                f"{reply.get('detail', '')}".rstrip(": "),
+                error_class=reply.get("class"),
+            )
+        # ANYTHING ELSE IS A REFUSAL, and this method is the one that most
+        # needs to say so. It used to test only for `error` and return on
+        # everything else, so a reply of an unexpected shape read as "the
+        # credential is now live in the extension" -- and every probe after it
+        # would issue believing it carried a session it does not have, which
+        # is the confusion this whole feature exists to remove. `send()` above
+        # has always been strict about its reply type; this is the same rule.
+        raise BridgeError(f"peer answered an identity frame with a {t!r} frame")
 
     def send(self, req: dict, body: bytes = b"", timeout: float = 30.0,
              *, enforce_locally: bool = True) -> dict:
@@ -7528,6 +8249,64 @@ public final class BridgeClient {
     public void setHaltSource(HaltSource s) { this.haltSource = s; }
 
     /**
+     * Where an `identity` frame's contents go: the registry the send path
+     * injects from.
+     *
+     * DECLARED HERE, for {@link SendHandler}'s and {@link HaltSink}'s reason.
+     * The registry lives in hx.send, hx.send already imports this class, and a
+     * type from hx.send named here would close that into a cycle -- which
+     * javac does not mind, because it sees every source at once, and which a
+     * reader trying to work out which of two files is the authority on a
+     * refusal does. So the bridge names a callback of its own and HxExtension,
+     * the file that already knows about both packages, wires the registry to
+     * it.
+     *
+     * The five parameters are the frame's, not the registry's: this interface
+     * is what the WIRE carries, and an implementation is free to hold it
+     * however it likes.
+     */
+    public interface IdentitySink {
+        /**
+         * Register or refresh one identity.
+         *
+         * @throws StaleIdentity the generation does not advance the one
+         *   already held. Answered `stale_generation`.
+         * @throws IllegalArgumentException the frame cannot be registered as
+         *   it stands. Answered `bad_identity`.
+         */
+        void register(String identityId, int generation, String header, String value,
+                      List<String> origins);
+    }
+
+    /**
+     * What an {@link IdentitySink} raises for a generation that goes backwards.
+     *
+     * Declared in the package that has to answer `stale_generation` on the
+     * wire, rather than caught by its own type from hx.send, for the reason
+     * IdentitySink itself is declared here. HxExtension's sink translates
+     * `IdentityRegistry.StaleGeneration` into this one, which is the only
+     * place the two vocabularies meet.
+     *
+     * A REFUSAL AND NOT A FAULT. A replayed or reordered frame carrying an
+     * older generation is exactly what the registry's monotonic rule exists to
+     * refuse, so the channel survives it: one frame is answered `error`, and
+     * the run goes on under the identity it already holds.
+     */
+    public static final class StaleIdentity extends RuntimeException {
+        public StaleIdentity(String m) { super(m); }
+    }
+
+    // Written on Burp's initialize thread before connect(), read on the read
+    // loop's thread. Volatile for the same reason every other field here is.
+    private volatile IdentitySink identitySink;
+
+    /** Install the identity registry. Called before connect(): until it is
+     *  installed every `identity` frame is refused, which is the right answer
+     *  -- a credential the send path could not have been given must not be
+     *  acknowledged as registered. */
+    public void setIdentitySink(IdentitySink s) { this.identitySink = s; }
+
+    /**
      * Whether a `configure` can be acted on, asked before it is committed.
      *
      * There is exactly one thing this answers today and spec s4 names it:
@@ -7937,6 +8716,96 @@ public final class BridgeClient {
                 }
                 Object raw = reply.remove(BODY_KEY);
                 send(reply, raw instanceof byte[] b ? b : new byte[0]);
+            }
+            case "identity" -> {
+                if (!(f.header.get("deadline_us") instanceof Long)) {
+                    // Required on every request frame, checked here for the
+                    // reason the configure arm checks it: a sender that omits
+                    // it is not speaking this protocol version properly.
+                    error(f, "bad_frame", "request frame has no deadline_us");
+                    return true;
+                }
+                if (!engagementId.equals(f.header.get("engagement_id"))) {
+                    error(f, "engagement_mismatch",
+                          "identity names engagement " + f.header.get("engagement_id")
+                          + " but this extension serves " + engagementId);
+                    return true;
+                }
+                // s5: "refused unless the extension is `configured` and not
+                // halted, exactly as `send` is". BOTH checks, and in the send
+                // path's order -- not_configured first, then the run-wide stop
+                // -- because the two answers are opposite instructions and an
+                // operator reading `halted` on an extension that was never
+                // configured would go looking for a halt nobody raised.
+                //
+                // It is not merely symmetry. Registering a credential is the
+                // one frame that puts a live secret into this JVM, and doing
+                // it for a run that is stopped, or one whose scope was never
+                // authorised, leaves it held for a send that may never be
+                // authorised to use it.
+                if (!configured.get()) {
+                    error(f, "not_configured", "no configure frame acknowledged yet");
+                    return true;
+                }
+                String stopped = halted.get()
+                        ? "halt frame: " + (haltReason == null ? "no reason given" : haltReason)
+                        : heldReason();
+                if (stopped != null) {
+                    error(f, "halted", stopped);
+                    return true;
+                }
+                IdentitySink sink = identitySink;
+                if (sink == null) {
+                    // Wiring, not policy -- the same shape as a missing
+                    // SendHandler, and EXTENSION_FAULT for the same reason:
+                    // "the operator has not authorised this run" and "this jar
+                    // is broken" are opposite instructions.
+                    error(f, "not_configured",
+                          EXTENSION_FAULT + "no identity sink is installed");
+                    return true;
+                }
+                IdentityBody.Parsed body;
+                try {
+                    body = IdentityBody.parse(f.body);
+                } catch (Frame.FrameError e) {
+                    error(f, "bad_identity", e.getMessage());
+                    return true;
+                }
+                try {
+                    sink.register(body.identityId(), body.generation(), body.header(),
+                                  body.value(), body.origins());
+                } catch (StaleIdentity e) {
+                    // A replayed or reordered frame, refused BY DESIGN. One
+                    // frame is answered; the channel and the held identity
+                    // both survive.
+                    error(f, "stale_generation", e.getMessage());
+                    return true;
+                } catch (IllegalArgumentException e) {
+                    error(f, "bad_identity", e.getMessage());
+                    return true;
+                }
+                // THE BODY IS NEVER LOGGED. Spec s5: this is the only frame in
+                // the protocol whose payload is a secret, and a debug line
+                // added later is exactly how it would leak. The id and the
+                // generation are not secrets and are what an operator needs to
+                // see; `body.value()` and `body.header()`'s content reach no
+                // log on either side, and `Parsed.toString()` is redacted so
+                // that an exception message cannot become the leak either.
+                log.info("hx: identity " + body.identityId()
+                         + " registered at generation " + body.generation());
+                Map<String, Object> ack = new LinkedHashMap<>();
+                ack.put("v", PROTOCOL_VERSION);
+                ack.put("t", "identity_registered");
+                ack.put("id", f.header.get("id"));
+                // Saying back WHICH identity is now at WHICH generation, so a
+                // caller can check what it registered without asking for the
+                // value. Not a secret and not derivable from `t` alone; the
+                // registry holds this generation for this id by the time this
+                // line runs, because an equal generation keeps the held entry
+                // (which is at the same number) and a lower one threw above.
+                ack.put("identity_id", body.identityId());
+                ack.put("generation", (long) body.generation());
+                send(ack, new byte[0]);
             }
             case "halt" -> {
                 // NOT String.valueOf(): for an absent key that answers the

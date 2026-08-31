@@ -60,16 +60,19 @@ into `inconclusive`, which is what stops a refusal being written up as a
 tested surface. See `_probe_util.py`'s own docstring for why that doctrine is
 shared across all five checks rather than spelt here.
 
-`_EXAMINED` NAMES ALL THREE, on every clean or finding answer, and since fix
-round 6 that is a statement about COVERAGE alone. It used to be the verdict's
-`considered` and therefore what `hx.scan._mark_unobserved` retired on, which
-made naming fewer than all three a client who fixes their CORS header never
-seeing the finding close. An active check retires nothing now
-(`hx.scan._retirable`), so what the tuple is for is that this check states in
-ONE place what it looked for -- `_probe_util.verdict` refuses a `clean` that
-names nothing, every candidate's `issue_type_id` comes out of the same three
-constants, and a fourth issue type added to `probes()` without being added
-here would be a finding of a kind the check does not claim to examine.
+`_EXAMINED` NAMES ALL THREE, on every clean or finding answer, and it does
+two jobs. It is what `_probe_util.verdict` requires before this check may say
+`clean` at all -- the coverage half: a check that names nothing it examined is
+one reporting `tested, clean` for a surface it never tested. And on a `clean`
+verdict it becomes `Verdict.considered`, which `hx.scan._retirable` honours for
+a run whose liveness canary proved the session live -- the retirement half, so
+naming fewer than all three would leave a client who fixes their CORS header
+never seeing the finding close. It was severed from `considered` in fix round 6
+and rejoined in Task 8, and the tuple is why neither move needed an edit here:
+this check states in ONE place what it looked for, every candidate's
+`issue_type_id` comes out of the same three constants, and a fourth issue type
+added to `probes()` without being added here would be a finding of a kind the
+check does not claim to examine.
 
 THE EVIDENCE THIS CHECK CITES IS THE SURFACE'S EXEMPLAR EXCHANGE, not a
 fresh one from this probe's own request/response. Nothing in this build
