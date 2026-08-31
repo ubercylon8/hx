@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from ... import run as run_mod
 from .. import envelope, registry, spec
-from ..errors import ToolUnavailable
+from ..errors import ToolRefused, ToolUnavailable
 
 #: `killed` is absent DELIBERATELY. The run table admits five statuses; that
 #: one is the operator's word for what they did to a run, and an agent writing
@@ -25,6 +25,17 @@ JOURNAL_DEFAULT = 20
 
 def start(ctx, kind: str) -> dict:
     """Open a run and bind it to this context."""
+    # Check for existing running runs of the same kind for this engagement.
+    # Per-kind, not per-engagement: a crawl running while you browse is two runs,
+    # because the enforcement rules differ by exactly that distinction.
+    existing = ctx.conn.execute(
+        "SELECT id FROM run WHERE engagement_id=? AND kind=? AND status='running'",
+        (ctx.engagement.id, kind)).fetchone()
+    if existing is not None:
+        raise ToolRefused(
+            "run_open",
+            f"a {kind} run is already open: {existing[0]}; run.finish closes it")
+
     run_id = run_mod.open_run(ctx.conn, engagement_id=ctx.engagement.id,
                               kind=kind,
                               safety_profile=ctx.config.safety_profile)

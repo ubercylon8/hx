@@ -31,7 +31,7 @@ OUTCOMES = ("ok", "empty", "unavailable", "refused", "error")
 #: client-facing number. Twelve tests passed with this open because only one
 #: tried a reason outside REASONS entirely; none crossed between groups.
 REASONS_FOR = {
-    "refused": frozenset({"not_registered", "halted", "missing_why", "bad_args"}),
+    "refused": frozenset({"not_registered", "halted", "missing_why", "bad_args", "run_open"}),
     "unavailable": frozenset({"no_session", "no_run", "not_implemented"}),
     "error": frozenset({"internal"}),
 }

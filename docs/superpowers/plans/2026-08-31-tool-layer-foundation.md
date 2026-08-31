@@ -38,11 +38,18 @@ dependencies.**
   `empty` means the tool ran and matched nothing; `unavailable` means it could
   not run. Never collapse them.
 - **`reason` comes from a closed vocabulary**, never free text. Free text
-  cannot be counted, and the report counts refusals.
+  cannot be counted, and the report counts refusals. `refused` takes
+  `not_registered`, `halted`, `missing_why`, `bad_args`, `run_open`;
+  `unavailable` takes `no_session`, `no_run`, `not_implemented`; `error` takes
+  `internal`.
 - **A credential value never reaches `agent_action`.** Identity is passed by
   name; `hx.identity.resolve` runs below this layer and no tool returns a
   `Resolved`.
-- **List defaults:** limit 50, hard ceiling 500.
+- **List defaults:** limit 50, hard ceiling 500 — with one named exception:
+  `run.journal` defaults to 20 (`JOURNAL_DEFAULT`), because it answers "what
+  have I already tried" and is read rather than paged through. An exception
+  visible only inside one task's code block would be a constraint the plan
+  states and the code quietly contradicts, so it is stated here.
 - **`args_blob`:** inline JSON to 4096 bytes, `sha256:<digest>` above it.
 - Python style follows the repo: module docstring first (no path-comment
   header), docstrings that argue rather than describe, `from __future__ import
@@ -1112,7 +1119,7 @@ OUTCOMES = ("ok", "empty", "unavailable", "refused", "error")
 #: client-facing number. Twelve tests passed with this open because only one
 #: tried a reason outside REASONS entirely; none crossed between groups.
 REASONS_FOR = {
-    "refused": frozenset({"not_registered", "halted", "missing_why", "bad_args"}),
+    "refused": frozenset({"not_registered", "halted", "missing_why", "bad_args", "run_open"}),
     "unavailable": frozenset({"no_session", "no_run", "not_implemented"}),
     "error": frozenset({"internal"}),
 }
@@ -2136,6 +2143,48 @@ def test_the_journal_page_is_capped_and_says_when_there_is_more(tool_ctx):
         dispatch.dispatch(tool_ctx, "run.journal", {})
     env = dispatch.dispatch(tool_ctx, "run.journal", {"last_n": 2})
     assert env.result["returned"] == 2 and env.result["truncated"] is True
+
+
+def test_starting_twice_on_the_same_context_is_refused(tool_ctx):
+    env1 = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="first")
+    run_id_1 = env1.result["id"]
+    env2 = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="second")
+    assert (env2.outcome, env2.reason) == ("refused", "run_open")
+    # Exactly one running row exists
+    rows = tool_ctx.conn.execute(
+        "SELECT id, status FROM run WHERE engagement_id=?",
+        (tool_ctx.engagement.id,)).fetchall()
+    running = [r for r in rows if r[1] == "running"]
+    assert len(running) == 1 and running[0][0] == run_id_1
+
+
+def test_a_different_kind_can_start_while_one_is_running(tool_ctx):
+    env1 = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="first")
+    run_id_1 = env1.result["id"]
+    env2 = dispatch.dispatch(tool_ctx, "run.start", {"kind": "browse"}, why="second")
+    assert env2.outcome == "ok" and env2.result["id"].startswith("r-")
+    run_id_2 = env2.result["id"]
+    assert run_id_1 != run_id_2
+    # Both running rows exist
+    rows = tool_ctx.conn.execute(
+        "SELECT id, kind, status FROM run WHERE engagement_id=?",
+        (tool_ctx.engagement.id,)).fetchall()
+    running = [(r[0], r[1]) for r in rows if r[2] == "running"]
+    assert len(running) == 2
+    assert {r[1] for r in running} == {"manual", "browse"}
+
+
+def test_starting_the_same_kind_from_a_new_context_is_refused(tool_ctx, engagement):
+    from hx import halt as halt_mod
+    from hx.tools import dispatch as dispatch_mod
+    dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="first")
+    # Create a new context for the same engagement
+    new_ctx = dispatch_mod.ToolContext(
+        engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
+        config=engagement.config,
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+    env2 = dispatch.dispatch(new_ctx, "run.start", {"kind": "manual"}, why="second")
+    assert (env2.outcome, env2.reason) == ("refused", "run_open")
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -2175,7 +2224,7 @@ from __future__ import annotations
 
 from ... import run as run_mod
 from .. import envelope, registry, spec
-from ..errors import ToolUnavailable
+from ..errors import ToolRefused, ToolUnavailable
 
 #: `killed` is absent DELIBERATELY. The run table admits five statuses; that
 #: one is the operator's word for what they did to a run, and an agent writing
@@ -2190,6 +2239,17 @@ JOURNAL_DEFAULT = 20
 
 def start(ctx, kind: str) -> dict:
     """Open a run and bind it to this context."""
+    # Check for existing running runs of the same kind for this engagement.
+    # Per-kind, not per-engagement: a crawl running while you browse is two runs,
+    # because the enforcement rules differ by exactly that distinction.
+    existing = ctx.conn.execute(
+        "SELECT id FROM run WHERE engagement_id=? AND kind=? AND status='running'",
+        (ctx.engagement.id, kind)).fetchone()
+    if existing is not None:
+        raise ToolRefused(
+            "run_open",
+            f"a {kind} run is already open: {existing[0]}; run.finish closes it")
+
     run_id = run_mod.open_run(ctx.conn, engagement_id=ctx.engagement.id,
                               kind=kind,
                               safety_profile=ctx.config.safety_profile)

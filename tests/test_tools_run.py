@@ -73,3 +73,45 @@ def test_the_journal_page_is_capped_and_says_when_there_is_more(tool_ctx):
         dispatch.dispatch(tool_ctx, "run.journal", {})
     env = dispatch.dispatch(tool_ctx, "run.journal", {"last_n": 2})
     assert env.result["returned"] == 2 and env.result["truncated"] is True
+
+
+def test_starting_twice_on_the_same_context_is_refused(tool_ctx):
+    env1 = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="first")
+    run_id_1 = env1.result["id"]
+    env2 = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="second")
+    assert (env2.outcome, env2.reason) == ("refused", "run_open")
+    # Exactly one running row exists
+    rows = tool_ctx.conn.execute(
+        "SELECT id, status FROM run WHERE engagement_id=?",
+        (tool_ctx.engagement.id,)).fetchall()
+    running = [r for r in rows if r[1] == "running"]
+    assert len(running) == 1 and running[0][0] == run_id_1
+
+
+def test_a_different_kind_can_start_while_one_is_running(tool_ctx):
+    env1 = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="first")
+    run_id_1 = env1.result["id"]
+    env2 = dispatch.dispatch(tool_ctx, "run.start", {"kind": "browse"}, why="second")
+    assert env2.outcome == "ok" and env2.result["id"].startswith("r-")
+    run_id_2 = env2.result["id"]
+    assert run_id_1 != run_id_2
+    # Both running rows exist
+    rows = tool_ctx.conn.execute(
+        "SELECT id, kind, status FROM run WHERE engagement_id=?",
+        (tool_ctx.engagement.id,)).fetchall()
+    running = [(r[0], r[1]) for r in rows if r[2] == "running"]
+    assert len(running) == 2
+    assert {r[1] for r in running} == {"manual", "browse"}
+
+
+def test_starting_the_same_kind_from_a_new_context_is_refused(tool_ctx, engagement):
+    from hx import halt as halt_mod
+    from hx.tools import dispatch as dispatch_mod
+    dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="first")
+    # Create a new context for the same engagement
+    new_ctx = dispatch_mod.ToolContext(
+        engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
+        config=engagement.config,
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+    env2 = dispatch.dispatch(new_ctx, "run.start", {"kind": "manual"}, why="second")
+    assert (env2.outcome, env2.reason) == ("refused", "run_open")
