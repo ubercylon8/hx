@@ -86,8 +86,21 @@ unauthenticated, so retirement was removed from the active corpus entirely.
 *Why removal rather than a ninth guard:* each guard is a discriminator that can be wrong,
 and this one had been wrong seven times. Removing the consequence removes the class.
 
-*Cost:* the active corpus has no retest story in v1. A client must verify an active finding
-by hand. The report says so in as many words.
+**Superseded 2026-08-31 by the identity work — read this heading as "may not retire
+without proof".** The seventh spelling's cause was that probes were unauthenticated, and
+that is no longer true. `hx.scan._retirable` now honours an active check's `considered`
+when **both** hold:
+
+- the run's `IdentityWindow.state_for_run()` is `proven`, and
+- the finding sits on the `(scheme, host, port)` the liveness canary actually proved.
+
+`proven` is **necessary and not sufficient** — a ninth spelling was found in exactly that
+gap. `origins` had defaulted to the whole of `scope.include`, so probes at hosts the canary
+never reached were stamped `proven` and retired findings there. See *Identity* below.
+
+Anonymous runs, `assumed` runs and `dead` runs still retire nothing, byte for byte as
+before. Passive retirement was never affected: it reads captured traffic and never depended
+on a session.
 
 ### A response is an answer only if it is 2xx
 
@@ -143,7 +156,97 @@ first-only substitution would leave the real value at the spot it skipped.
 The send path refuses credentials it did not inject, so probing them spends budget on a
 guaranteed refusal. A refusal on one insertion point ends that point, not the check.
 
+*Still true after the identity work, and "did not inject" now means something.* Until then
+nothing injected anything, so `unmanaged_credential` refused every credential header it saw.
+`hx` now injects one deliberately — and a **check** still cannot put a credential anywhere.
+The runner binds the identity; §7 keeps identity below the check layer, and a check may not
+choose, read, or ask about one.
+
 ---
+
+## Identity
+
+### A credential value never appears in `config.yaml`
+
+`hx.engagement.record_scope_version` writes the config YAML **verbatim** into
+`scope_version.yaml` (`engagement.py:114`), a table the schema calls "append-only:
+tamper-evidence for contract disputes". A credential written there is copied, unredactable,
+into a table designed to be impossible to rewrite — the same warning §7 gives about the
+content-addressed blob store, in a different table.
+
+So the config **declares** an identity and the environment **supplies** the secret. A
+`Resolved` holds the value and never touches `Config`; the two never meet in a serialiser,
+and `Resolved.__repr__` is overridden so a dataclass repr cannot put a live session cookie
+into every traceback that happens to hold one.
+
+*Second property, for free:* rotating a credential changes no scope hash. Rotating a session
+is not a movement of the engagement boundary, and a scope-version row that appeared because
+a cookie expired would make the tamper-evident record lie about what it is evidence of.
+
+### Identity is its own bridge frame, not a `configure` key
+
+A later `configure` naming a different rate or budget is *refused, not applied* — a run must
+not talk its way into a larger allowance mid-flight. A programmatic refresh has to advance a
+generation **without** re-opening scope, so folding identity into `configure` would either
+weaken that rule or make refresh impossible.
+
+It is also the only frame in the protocol whose payload is a secret. Kind and correlation id
+may be logged; the body never.
+
+### Injection happens after every gate, and the range is registered before the copy
+
+Order in `Sender.decideAndIssue` is `unmanagedCredential → checkGate → resolve identity →
+check origins → inject + register → send`. **A request the gate refused never has a
+credential written into it** — injecting first would mean an out-of-scope send composed a
+request carrying a live session, with only a refusal returning in time between it and the
+wire.
+
+Registration precedes the copy that crosses the bridge, which is what keeps "redaction runs
+before hashing" true. The blob store is content-addressed, so an unredacted credential does
+not merely get stored — it becomes an **address** that exists in every backup.
+
+### Generation is monotonic, and an equal generation changes nothing
+
+A lower generation is refused; an equal one **keeps the held entry**. A value that can go
+backwards is a value a replayed frame can control, and a same-generation frame carrying
+different content would be a content change that never advanced the counter whose only job
+is to gate content changes. `identity.refresh()` returns `generation + 1` unconditionally,
+so nothing legitimate needs that door.
+
+### A canary that a status code satisfies is worthless
+
+An application answering a logged-out request with a **200 login page** is the seventh
+spelling above, and no response-status rule can catch it. So `liveness.expect_body` is
+**required** by the config loader, a non-2xx is an automatic failure but never the only
+test, and `expect_absent` exists for a page carrying both signatures.
+
+### `proven` is a window bracketed by two passing canaries, not a moment
+
+§7's motivating case is a session dying *mid-run* — "an SSO session dying at 01:50 produces
+six hours of unauthenticated traffic that every check reads as *not vulnerable*". One canary
+at the start would stamp all six hours `proven`, and retirement runs on that stamp. So the
+canary fires at run start, every `every_n_probes`, and always at run end; **any failure
+anywhere downgrades the whole run to `assumed`.** The run under-claims rather than
+over-claims.
+
+A dead session **halts** the run, because the alternative is silent: a run carrying on under
+a dead session answers `clean` for every surface, and those answers are indistinguishable in
+the report from an application with nothing wrong.
+
+### `origins` binds a credential to the host its session was proved on
+
+It defaulted to the whole of `scope.include`, and the spec said in the same breath that a
+third-party host in scope must never carry the target's session. The second sentence defeated
+the first: a `scope.include` naming the app, an API, an SSO provider and a CDN is the
+ordinary shape of a multi-host engagement, so the bound equalled the thing it existed to
+bound and a client's live session was registered for a third party's server.
+
+It now defaults to the **one host the liveness canary proves**. An operator widens it
+explicitly per identity in `config.yaml` — where §4 wants blast-radius decisions recorded.
+
+*Cost:* a multi-host engagement that widens nothing loses active-check coverage on every host
+but the proved one. Probes there are refused `identity_origin` and read `inconclusive`; the
+report's Limits section explains the pattern and names the fix.
 
 ## Process decisions
 
@@ -189,4 +292,7 @@ not run since the commit that added the second.
 | `2026-08-27-checks-and-reporting.md` holds `plan-drift: pending` | 26 blocks uncompared, including whole-file markers for code later plans rewrote |
 | `open_redirect` can only be shown a fix on a 2xx | A fix delivered by `302 → /home` leaves the finding live indefinitely. The discriminator that would fix it does not exist without a control probe: a login redirect is typically same-origin too |
 | The probe's own exchange is not recorded | An active finding cites a captured request to the affected surface rather than the probe that demonstrated it. Needs a new bridge frame type and writer |
+| `Limiter.java`'s "no new refusal after the gate" rule is false | The identity branch added two — `unknown_identity` and `identity_origin` — which land after `checkGate` has spent a rate slot and a budget unit while the target sees nothing and `requests_sent` reads 0. The comment is corrected and the decision order deliberately untouched; the burn can only make `hx` send *fewer* requests than authorised, never more |
+| A surface carrying any finding retires nothing on that surface | The `finding` branch offers no `considered`, because it short-circuits above the gaps check the passive corpus relies on. Under-claims, and disclosed to the client |
+| `codec.identity_body` does not enforce the three-name header set | `hx.config` refuses a fourth name with a better message and `IdentityRegistry` refuses it inside the JVM, which is where §4 puts enforcement. A third copy would be a third place to drift |
 | `path_traversal` cannot probe a `path_segment` in practice | Its name filter wants a file-shaped name; the normaliser's vocabulary is `{id}/{uuid}/{hex}/{slug}`. A false negative, disclosed in the report |
