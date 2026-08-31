@@ -2608,13 +2608,21 @@ def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honou
             "before closing it") in limits
 
     considered = ("some-issue-type",)
+    # The origins are the pair `_retirable` compares once the state has
+    # passed -- and here it does not, because this fixture's runs are
+    # anonymous. Passing the SAME origin for both is what makes that the only
+    # thing being measured: an unequal pair would refuse for the wrong
+    # reason, and the bullet is about the anonymous run.
+    proved = ("https", "app.test", 443)
     assert scan._retirable(scan._PROBE_HOOK, base.Verdict.clean(),
-                           identity_state=None) == (), (
+                           identity_state=None, origin=proved,
+                           proven_origin=proved) == (), (
         "the Limits page tells a client no active finding is ever closed, "
         "and the runner enters one for retirement")
     assert scan._retirable(scan._PROBE_HOOK,
                            base.Verdict.clean(considered=considered),
-                           identity_state=None) == ()
+                           identity_state=None, origin=proved,
+                           proven_origin=proved) == ()
 
     # AND THE OTHER DIRECTION, which is what keeps the bullet honest rather
     # than merely safe: the page says this of the ACTIVE checks, and the
@@ -2623,7 +2631,8 @@ def test_the_bullet_that_says_active_findings_never_retire_is_one_the_code_honou
     # other direction.
     assert scan._retirable("on_surface",
                            base.Verdict.clean(considered=considered),
-                           identity_state=None) == considered
+                           identity_state=None, origin=proved,
+                           proven_origin=proved) == considered
 
 
 def test_the_unauthenticated_bullet_says_the_login_page_costs_coverage_only(

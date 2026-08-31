@@ -335,7 +335,13 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
         # it -- so exactly the state that must retire nothing contributes no
         # entry at all, and the list holds one tuple per row that named an
         # issue type rather than one per row.
-        offered: list[tuple[str, str, str, base.Verdict]] = []
+        # THE ROW'S OWN ORIGIN TRAVELS WITH THE OFFER -- `(scheme, host,
+        # port)`, the same triple the bracket keeps for its canaries.
+        # Retirement is gated on it (`_retirable`), and it has to be captured
+        # HERE because the gate runs after the loop, by which time `surface`
+        # is whichever row happened to be last.
+        offered: list[tuple[str, str, str, tuple[str, str, int],
+                            base.Verdict]] = []
 
         for surface in surfaces:
             if surface_filter is not None and not surface_filter(surface):
@@ -663,7 +669,9 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                     # what `report._coverage` renders for the row is
                     # unchanged.
                     if verdict.considered:
-                        offered.append((hook, surface[0], check.id, verdict))
+                        offered.append((hook, surface[0], check.id,
+                                        (surface[2], surface[3], surface[4]),
+                                        verdict))
                     if verdict.state == "finding":
                         for candidate in verdict.candidates:
                             fid = _write_finding(conn, engagement_id, run_id,
@@ -721,16 +729,25 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
             bracket.finish()
             summary.identity_state = bracket.state
             _record_identity(conn, run_id, bracket, bracket.state)
-        # SECTION 9'S GATE, ONCE, WITH THE SETTLED STATE. `_retirable` hands
-        # back a passive check's offer whatever the session did and an active
-        # check's only for a `proven` run; the set it builds is
-        # `(surface_id, check_id, issue_type_id)`, which is the key
+        # SECTION 9'S GATE, ONCE, WITH THE SETTLED STATE AND THE PROVED
+        # ORIGIN. `_retirable` hands back a passive check's offer whatever
+        # the session did and an active check's only for a `proven` run whose
+        # canary went to the same origin the row's probes did; the set it
+        # builds is `(surface_id, check_id, issue_type_id)`, which is the key
         # `_mark_unobserved` matches a finding on.
+        #
+        # `None` FOR AN ANONYMOUS RUN, and it can never satisfy the
+        # comparison: a surface row's origin is a `(str, str, int)` triple.
+        # The state check refuses that run first in any case -- this is the
+        # belt to its braces, and neither is load-bearing alone.
+        proven_origin = None if bracket is None else bracket.target
         considered = {
             (surface_id, check_id, issue_type)
-            for said_hook, surface_id, check_id, said in offered
+            for said_hook, surface_id, check_id, said_origin, said in offered
             for issue_type in _retirable(said_hook, said,
-                                         summary.identity_state)
+                                         summary.identity_state,
+                                         origin=said_origin,
+                                         proven_origin=proven_origin)
         }
         _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
     except BaseException as exc:
@@ -951,8 +968,37 @@ def _identity_bracket(bridge, config, identity, checks, surfaces,
     resolved = identity if identity is not None else _resolve_scan_identity(config)
     if resolved is None:
         return None
-    return _IdentityBracket(bridge, resolved, _declaration(config, resolved.id),
-                            target=target, origins=tuple(config.scope_include),
+    declared = _declaration(config, resolved.id)
+    # THE CREDENTIAL GOES WHERE THE CANARY GOES, AND NOWHERE ELSE BY
+    # DEFAULT. `target[3]` is the host of the surface the opening canary is
+    # about to be sent to -- the same row `_IdentityBracket` keeps as
+    # `_target` -- so the bound the extension enforces and the host the proof
+    # covers are one host, named once, from one row.
+    #
+    # THIS WAS `tuple(config.scope_include)` UNTIL THE BRANCH REVIEW (F1),
+    # and that default defeated the bound it was the default for. Spec
+    # section 5 says origins exist so that "a probe against a third-party
+    # host in scope never carries the target's session"; a real engagement
+    # scopes the app, an API, an SSO provider and a CDN, and scope-as-origins
+    # sent the client's live session cookie to all four while the canary
+    # proved one of them. That is an incident, not a coverage gap. Section 5
+    # is amended (2026-08-30) to say so.
+    #
+    # WIDENING IS THE OPERATOR'S TO DECLARE, per identity, in `config.yaml`
+    # (`config._origins`) -- section 4's shape for anything that increases
+    # blast radius. What it does NOT widen is the proof: `_retirable` retires
+    # only on the origin the canary reached, whatever this tuple says.
+    #
+    # THE COST IS VISIBLE AND IS NOT SILENT. On a multi-host engagement that
+    # widened nothing, every probe to a second host is refused
+    # `identity_origin` by the extension, which lands the row `inconclusive`
+    # and prints `refused N (identity_origin)` at the end of `hx scan`. The
+    # alternative -- sending anonymously to those hosts -- is the one spec
+    # section 7 step 3 forbids by name, and would hand active checks a
+    # logged-out view to read as an answer.
+    return _IdentityBracket(bridge, resolved, declared,
+                            target=target,
+                            origins=declared.origins or (target[3],),
                             summary=summary)
 
 
@@ -1050,13 +1096,16 @@ class _IdentityBracket:
         # declares ONE `liveness` block (section 4), so its proof is per
         # identity and not per host.
         self._target = (target[2], target[3], target[4])
-        # Section 5: `origins` bounds where the credential may be applied and
-        # "defaults to the hosts in `scope.include`". The extension reads the
-        # host out of each entry (`Sender.hostOf`: everything after `://` and
-        # before the first `/`, `:` or `?`), so a URL-prefix pattern bounds
-        # the credential to that host and a pattern with no host in it bounds
-        # it to nothing -- fail-closed, and visible as an `identity_origin`
-        # refusal rather than as a credential going somewhere it should not.
+        # Section 5: `origins` bounds where the credential may be applied.
+        # It defaults to the ONE host `target` names -- see
+        # `_identity_bracket`, which is where the default is chosen and where
+        # the argument for it is written down -- and an operator widens it
+        # per identity in `config.yaml`. The extension reads the host out of
+        # each entry (`Sender.hostOf`: everything after `://` and before the
+        # first `/`, `:` or `?`), so a URL-prefix entry bounds the credential
+        # to that host and an entry with no host in it bounds it to nothing;
+        # `config._origins` refuses the second shape at load rather than
+        # leaving an operator with a widening that refuses every probe.
         self._origins = origins
         self._summary = summary
         self.resolved = resolved
@@ -1067,6 +1116,17 @@ class _IdentityBracket:
     @property
     def identity_id(self) -> str:
         return self.resolved.id
+
+    @property
+    def target(self) -> tuple[str, str, int]:
+        """The origin every canary of this run is sent to: scheme, host, port.
+
+        READ BY THE RETIREMENT GATE, which is why it is exposed at all. The
+        window this class keeps is temporal -- it models WHEN the session was
+        proved and not WHERE -- so `run` has to compare this against the
+        origin of each row it is about to retire on. See `_retirable`.
+        """
+        return self._target
 
     @property
     def state(self) -> str:
@@ -1434,10 +1494,12 @@ def _citable_exemplar(surface, exchanges) -> str | None:
     return exemplar_id if any(x.id == exemplar_id for x in exchanges) else None
 
 
-def _retirable(hook, verdict, identity_state) -> tuple[str, ...]:
+def _retirable(hook, verdict, identity_state, *, origin,
+               proven_origin) -> tuple[str, ...]:
     """The issue types this verdict may retire a finding on.
 
-    AN ACTIVE CHECK RETIRES ONLY WHAT IT PROBED UNDER A SESSION PROVED LIVE.
+    AN ACTIVE CHECK RETIRES ONLY WHAT IT PROBED UNDER A SESSION PROVED LIVE,
+    AT THE ORIGIN THAT PROOF WAS TAKEN AT.
     Retirement is `_mark_unobserved` writing `observed = 0`, which
     `report._findings` renders to a client as "appears fixed; verify before
     closing" -- a claim about the application as the client's own users meet
@@ -1474,6 +1536,45 @@ def _retirable(hook, verdict, identity_state) -> tuple[str, ...]:
         function is not normally reached with it; it is written out rather
         than left to `!= "proven"` because a state that retires nothing must
         do so by name and not by falling off the end of a condition.
+
+    AND `proven` IS A CLAIM ABOUT ONE ORIGIN, NOT ABOUT THE RUN'S HOSTS.
+    F1 of the whole-branch review, second half. A run's canaries all go to
+    `_IdentityBracket._target` -- the scheme, host and port of the run's own
+    FIRST surface, because an identity declares ONE `liveness` block (section
+    4) and its proof is per identity, not per host. Probes go to each
+    surface's own origin. So a run whose canary passed on `api.acme.test`
+    read `proven` for probes issued at `app.acme.test`, and the offer from
+    those probes was honoured: if the session is not honoured on the second
+    host and it answers 2xx, the check reads a LOGGED-OUT view as an answer,
+    says `clean`, and the client is told the finding "appears fixed" and that
+    it "was re-tested under a session proved live". That sentence was false
+    for that host. Comparing the two origins is what makes it true again.
+
+    THE FULL TRIPLE, NOT THE HOST. `_target` is `(scheme, host, port)` and
+    that is what the canary actually addressed. `Sender.appliesTo` compares
+    hosts alone -- deliberately, because a port is settled by the frame and
+    by scope -- so the credential may legitimately be APPLIED at a second
+    port on a proved host. The proof still does not travel there: `https://
+    app.test:443` and `https://app.test:8443` are two services and section
+    9's licence is to retire what was re-tested, not what was reachable.
+    Retirement is the narrower claim of the two and gets the narrower rule.
+
+    WHY THE GATE IS HERE AND NOT AT INJECTION. Bounding `origins` to the
+    proved host (`_identity_bracket`) already stops the common case, since
+    the extension then refuses a probe at any other host outright. It is not
+    enough on its own: an operator may WIDEN origins, and section 4 says they
+    may -- a session really can span two hosts. Widening what the credential
+    is applied to must not widen what the run may claim to have proved, and
+    those are two different questions asked in two different places. This is
+    the second one, and it is asked in the same call that already refuses
+    every state but `proven`, once, after `bracket.finish()`.
+
+    NEITHER ARGUMENT HAS A DEFAULT, AND THAT IS DELIBERATE. `origin=None,
+    proven_origin=None` would have compared equal and RETIRED, so a caller
+    that forgot them would silently get the behaviour this function exists to
+    refuse -- the same shape as a state falling off the end of a condition,
+    which the three states above are spelled out by name to avoid. Keyword-
+    only so that no positional call can transpose the pair.
 
     WHY THE ARGUMENT IS PASSED IN RATHER THAN READ HERE. The state is a
     property of a WINDOW BRACKETED BY TWO PASSING CANARIES, and the closing
@@ -1554,7 +1655,9 @@ def _retirable(hook, verdict, identity_state) -> tuple[str, ...]:
     """
     if hook != _PROBE_HOOK:
         return verdict.considered
-    return verdict.considered if identity_state == "proven" else ()
+    if identity_state != "proven":
+        return ()
+    return verdict.considered if origin == proven_origin else ()
 
 
 # "Not read yet", and it cannot be `None` -- see the surface loop. Both facts

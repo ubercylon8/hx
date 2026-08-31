@@ -1889,10 +1889,11 @@ def _declaring(env, ident, *, scan_identity=None, every_n_probes=None):
     """The same env, with `ident` declared on its config.
 
     `scope_include` becomes a URL prefix rather than the bare `*.test` glob
-    `_env` builds, because that list is what the run registers as the
-    identity's `origins` and `Sender.hostOf` reads the host out of an origin
-    -- `https://app.test/*` names `app.test`, and a bare glob names no host
-    at all and would match none.
+    `_env` builds. It stopped being the identity's `origins` in branch fix A
+    -- the credential is now bounded to the one host the canary proves
+    (`scan._identity_bracket`) -- but scope is still what decides whether a
+    probe may be sent at all, and a scope that named no host would be a
+    different test from the one every caller here means.
     """
     if every_n_probes is not None:
         ident = dataclasses.replace(
@@ -2163,17 +2164,54 @@ def test_the_canary_is_ordinary_traffic_and_is_counted_as_hxs_own(tmp_path):
     assert summary.canary_requests == 2, "one canary opens the run and one closes it"
 
 
-def test_the_registered_origins_are_the_engagements_own_scope(tmp_path):
-    """Section 5: `origins` bounds where the credential may be applied, and
-    defaults to the hosts in `scope.include`. `Sender.appliesTo` compares
-    `req.host()` against `hostOf(origin)` -- everything after `://` and
-    before the first `/`, `:` or `?` -- so a scope entry that is a URL prefix
-    bounds the credential to that host, and one that is a bare glob bounds it
-    to nothing at all, which is the fail-closed direction."""
+def test_the_credential_is_not_offered_to_a_third_party_host_in_scope(tmp_path):
+    """F1 OF THE WHOLE-BRANCH REVIEW, FIRST HALF, AND THE MORE SERIOUS ONE.
+
+    A real engagement scopes several hosts -- the app, an API, an SSO
+    provider, a CDN -- and `origins` exists so that "a probe against a
+    third-party host in scope never carries the target's session" (spec
+    section 5). Until this fix `origins` WAS `scope.include`, so the bound
+    was the thing it was supposed to bound and the client's live session
+    cookie was registered for every host the operator had authorised for
+    SCANNING. Sending it to a third party's server is an incident, not a
+    coverage gap.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? It is the test that reddened:
+    against the previous build the frame carried both entries.
+
+    `app.test` and not `https://app.test/*`: the bound is now the host of the
+    surface the canary is about to be sent to, taken from the surface row
+    rather than from a scope pattern, so there is no pattern left to read a
+    host back out of. `Sender.appliesTo` compares `req.host()` against
+    `hostOf(origin)` and a bare host contributes itself."""
     env = _declaring(_env(tmp_path), USER)
+    env["config"] = dataclasses.replace(
+        env["config"],
+        scope_include=["https://app.test/*", "https://sso.example.test/*"])
     bridge = _SessionBridge()
     scan.run(**env, checks=(_Probes(),), bridge=bridge, identity=_resolved())
-    assert bridge.identity_frames[0]["origins"] == ("https://app.test/*",)
+
+    origins = bridge.identity_frames[0]["origins"]
+    assert origins == ("app.test",)
+    assert not any("sso.example.test" in o for o in origins), (
+        "the client's session was registered for a third party's host")
+
+
+def test_an_operator_may_widen_the_origins_in_the_config(tmp_path):
+    """THE ESCAPE HATCH, AND WHY IT IS IN `config.yaml`. A session that
+    genuinely spans two hosts is a fact only the operator knows, and section
+    4's shape for anything that increases blast radius is a decision recorded
+    in the config rather than a default. The declaration wins over the
+    derived single host, verbatim -- `Sender.hostOf` reads either shape."""
+    widened = dataclasses.replace(
+        USER, origins=("https://app.test/", "api.test"))
+    env = _declaring(_env(tmp_path), widened)
+    bridge = _SessionBridge()
+    scan.run(**env, checks=(_Probes(),), bridge=bridge,
+             identity=_resolved(widened))
+
+    assert bridge.identity_frames[0]["origins"] == (
+        "https://app.test/", "api.test")
 
 
 def test_the_runner_resolves_the_identity_the_config_names(tmp_path,
@@ -2557,6 +2595,16 @@ def _cors_hook():
     return scan._runner_hook(check)
 
 
+# The origin `_env`'s only surface row names, and the one every canary in
+# these tests is therefore sent to. Written out rather than derived so that
+# the pair below -- the origin of the row being decided, and the origin the
+# canary proved -- is visible at each call site: `_retirable` retires only
+# when they are equal, and a test that computed both from one expression
+# could not tell the equal case from the unequal one.
+_PROVED = ("https", "app.test", 443)
+_ELSEWHERE = ("https", "sso.example.test", 443)
+
+
 def test_an_active_check_still_retires_nothing_without_an_identity():
     """The unchanged OUTCOME, pinned so this task cannot widen it by
     accident: an anonymous run retires nothing an active check said.
@@ -2566,15 +2614,50 @@ def test_an_active_check_still_retires_nothing_without_an_identity():
     into an `error` row; it now returns empty, because `_probe_util.verdict`
     puts `examined` on a `clean` verdict again and a raise would make every
     active row of every anonymous scan an error. What is unchanged is the
-    only thing a client can see -- nothing is retired."""
+    only thing a client can see -- nothing is retired.
+
+    An anonymous run has no proved origin at all, which is what `None` is
+    here; the state is refused first, so the pair is never compared."""
     v = base.Verdict.clean(considered=("cors-reflects-origin",))
-    assert scan._retirable(_cors_hook(), v, identity_state=None) == ()
+    assert scan._retirable(_cors_hook(), v, identity_state=None,
+                           origin=_PROVED, proven_origin=None) == ()
 
 
 def test_an_active_check_retires_under_a_proven_identity():
     v = base.Verdict.clean(considered=("cors-reflects-origin",))
-    assert scan._retirable(_cors_hook(), v,
-                           identity_state="proven") == ("cors-reflects-origin",)
+    assert scan._retirable(_cors_hook(), v, identity_state="proven",
+                           origin=_PROVED,
+                           proven_origin=_PROVED) == ("cors-reflects-origin",)
+
+
+def test_a_proven_run_retires_nothing_at_a_host_its_canary_never_reached():
+    """F1 OF THE WHOLE-BRANCH REVIEW, SECOND HALF, AT THE GATE ITSELF.
+
+    The run proved its session -- on the origin its canaries went to, which
+    is the run's FIRST surface and nothing else. This row's probes went
+    somewhere else. If the session is not honoured there and the host answers
+    2xx, the check read a logged-out view as an answer and said `clean`;
+    retiring on it tells the client the finding "appears fixed" and that it
+    "was re-tested under a session proved live", and neither sentence is true
+    of that host.
+
+    Before the fix this returned `("cors-reflects-origin",)`: `proven` was
+    the whole of the question and the host was not asked about at all."""
+    v = base.Verdict.clean(considered=("cors-reflects-origin",))
+    assert scan._retirable(_cors_hook(), v, identity_state="proven",
+                           origin=_ELSEWHERE, proven_origin=_PROVED) == ()
+
+
+def test_the_proof_does_not_travel_to_another_port_on_the_proved_host():
+    """THE NARROWER OF THE TWO RULES, AND WHY THEY DIFFER. `Sender.appliesTo`
+    compares HOSTS and ignores the port, so the credential may legitimately
+    be applied at `app.test:8443` once `app.test` is an origin. The PROOF
+    does not follow it: two ports are two services, and section 9's licence
+    is to retire what was re-tested rather than what was reachable."""
+    v = base.Verdict.clean(considered=("cors-reflects-origin",))
+    assert scan._retirable(_cors_hook(), v, identity_state="proven",
+                           origin=("https", "app.test", 8443),
+                           proven_origin=_PROVED) == ()
 
 
 def test_an_assumed_window_retires_nothing_even_though_an_identity_applied():
@@ -2582,23 +2665,39 @@ def test_an_assumed_window_retires_nothing_even_though_an_identity_applied():
     # issued logged-out. Retiring here tells a client a live vulnerability is
     # fixed -- the exact outcome the whole active-check branch was spent
     # closing, and `assumed` is the state that says we cannot rule it out.
+    # The origin matches, so the state is the only thing refusing.
     v = base.Verdict.clean(considered=("cors-reflects-origin",))
-    assert scan._retirable(_cors_hook(), v, identity_state="assumed") == ()
+    assert scan._retirable(_cors_hook(), v, identity_state="assumed",
+                           origin=_PROVED, proven_origin=_PROVED) == ()
 
 
 def test_a_dead_identity_retires_nothing():
     v = base.Verdict.clean(considered=("cors-reflects-origin",))
-    assert scan._retirable(_cors_hook(), v, identity_state="dead") == ()
+    assert scan._retirable(_cors_hook(), v, identity_state="dead",
+                           origin=_PROVED, proven_origin=_PROVED) == ()
+
+
+def test_the_gate_has_no_default_for_either_origin():
+    """A DEFAULT PAIR WOULD HAVE COMPARED EQUAL AND RETIRED. `origin=None,
+    proven_origin=None` is exactly the shape a forgetful caller produces, and
+    `None == None` is the answer this function exists to refuse. Keyword-only
+    and required, so no positional call can transpose them either."""
+    v = base.Verdict.clean(considered=("cors-reflects-origin",))
+    with pytest.raises(TypeError, match="proven_origin"):
+        scan._retirable(_cors_hook(), v, identity_state="proven")
 
 
 def test_a_passive_check_is_unaffected_by_any_identity_state():
     # Passive retirement reads CAPTURED traffic and never depended on a
-    # session, so none of the four states may change it.
+    # session, so none of the four states may change it -- and neither may
+    # the origin, which is why a host the canary never reached is passed here
+    # alongside every state.
     check = next(c for c in registry.CHECKS if c.klass == "passive")
     v = base.Verdict.clean(considered=("missing-hsts",))
     for state in (None, "proven", "assumed", "dead"):
         assert scan._retirable(scan._runner_hook(check), v,
-                               identity_state=state) == ("missing-hsts",)
+                               identity_state=state, origin=_ELSEWHERE,
+                               proven_origin=_PROVED) == ("missing-hsts",)
 
 
 def test_a_proven_run_retires_a_reflection_that_is_genuinely_gone(tmp_path):
@@ -2641,6 +2740,118 @@ def test_a_proven_run_retires_a_reflection_that_is_genuinely_gone(tmp_path):
                                           ("r", 0)], (
         "a run that proved its session live did not retire the reflections "
         "that are genuinely gone")
+
+
+def _two_params_for(host: str) -> bytes:
+    """`REQ_TWO_PARAMS`, addressed to a named host.
+
+    The `Host` line is what `insertion.derive` reads the request out of, and
+    a second surface deserves its own exemplar rather than a copy of the
+    first one's: a test whose two hosts share a captured request is a test
+    that cannot tell a per-surface decision from a per-blob one.
+    """
+    return (b"GET /search?q=hello&r=world HTTP/1.1\r\n"
+            b"Host: " + host.encode() + b"\r\n\r\n")
+
+
+def _also_on(env, host, *, surface_id="s-2", exchange_id="x-2"):
+    """A SECOND HOST on the same engagement, surfaced and exemplared.
+
+    What a multi-host engagement looks like, and what nothing on this branch
+    covered until F1 was filed: `_env` builds one surface, so every identity
+    test in this file ran against a single origin and the run's canary
+    necessarily reached every host it probed.
+
+    The host sorts AFTER `app.test`, and that is load-bearing rather than
+    incidental: `scan.run` orders surfaces `BY host, path_template, method`
+    and `_identity_bracket` takes the first, so `app.test` stays the origin
+    the canary proves and this one stays the origin it does not.
+    """
+    conn = env["conn"]
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, kind, discovered_by, normaliser_version)"
+        " VALUES(?,'e-1','GET','https',?,443,'/search',?,'proxy',1)",
+        (surface_id, host, surface_mod.kind_for("GET")))
+    digest, _ = env["blobs"].put(_two_params_for(host))
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url, req_blob) VALUES(?, NULL, ?, 'proxy', 'ok', 1, 'GET',"
+        " ?, ?)",
+        (exchange_id, surface_id,
+         f"https://{host}/search?q=hello&r=world", digest))
+    conn.execute("UPDATE surface SET exemplar_exchange_id=? WHERE id=?",
+                 (exchange_id, surface_id))
+    return env
+
+
+def _observations_by_host(conn):
+    """`_observations`, with the host of the surface each finding is on.
+
+    The plain one orders by insertion name alone, which collapses `q` on two
+    hosts into two indistinguishable rows -- exactly the distinction the test
+    below exists to make.
+    """
+    return conn.execute(
+        "SELECT s.host, f.insertion_name, o.observed FROM finding_observation o"
+        " JOIN finding f ON f.id = o.finding_id"
+        " JOIN surface s ON s.id = f.surface_id"
+        " ORDER BY s.host, f.insertion_name, o.ts_us").fetchall()
+
+
+def test_a_proven_run_retires_nothing_on_a_host_the_canary_never_reached(
+        tmp_path):
+    """F1 OF THE WHOLE-BRANCH REVIEW, SECOND HALF, THROUGH A WHOLE RUN.
+
+    Two hosts, both in scope, both probed, and an operator who WIDENED
+    `origins` to cover both -- which is allowed, and is the only shape in
+    which this hole is still reachable once the credential is bounded to the
+    proved host by default. The canary still goes to one origin, because an
+    identity declares one `liveness` block and its proof is per identity.
+
+    So `app.test` was re-tested under a session proved live and `web.test`
+    was not. Both answered 2xx and both said `clean`; the second may have
+    answered a LOGGED-OUT view, which is the one shape no status rule can
+    catch. Retiring there tells the client a live vulnerability "appears
+    fixed" and that it "was re-tested under a session proved live", and that
+    sentence is false for that host.
+
+    WOULD THIS FAIL IF THE CLAIM WERE FALSE? Against the previous build the
+    last two rows read `("web.test", "q", 0)` and `("web.test", "r", 0)`:
+    `proven` was the whole of the question and the host was never asked
+    about. The first four rows are the separating half -- they show the run
+    really did prove its session and really did retire on the strength of it,
+    so this is not a test that passes because nothing was retired at all.
+    """
+    widened = dataclasses.replace(USER, origins=("app.test", "web.test"))
+    env = _declaring(_env(tmp_path, request_bytes=_two_params_for("app.test"),
+                          path_template="/search"), widened)
+    env["config"] = dataclasses.replace(
+        env["config"],
+        scope_include=["https://app.test/*", "https://web.test/*"])
+    _also_on(env, "web.test")
+
+    scan.run(**env, checks=(_reflected_input(),),
+             bridge=_SessionEchoBridge(), identity=_resolved(widened))
+    assert _observations_by_host(env["conn"]) == [
+        ("app.test", "q", 1), ("app.test", "r", 1),
+        ("web.test", "q", 1), ("web.test", "r", 1)], (
+        "both hosts did not reflect, so nothing below separates anything")
+
+    summary = scan.run(**env, checks=(_reflected_input(),),
+                       bridge=_SessionEchoBridge(reflects=False),
+                       identity=_resolved(widened))
+
+    assert summary.identity_state == "proven", (
+        "the run did not prove its session, so every offer is refused by the "
+        "state and this measures nothing about the host")
+    assert _observations_by_host(env["conn"]) == [
+        ("app.test", "q", 1), ("app.test", "q", 0),
+        ("app.test", "r", 1), ("app.test", "r", 0),
+        ("web.test", "q", 1), ("web.test", "r", 1)], (
+        "a finding was retired on a host the liveness canary never reached: "
+        "the client is told it was re-tested under a session proved live, "
+        "and it was not")
 
 
 def test_the_same_run_retires_nothing_once_its_closing_canary_fails(tmp_path):

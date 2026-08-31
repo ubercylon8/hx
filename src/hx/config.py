@@ -106,6 +106,62 @@ class Identity:
     inject: Inject
     liveness: Liveness
     refresh: Refresh | None = None
+    # WHERE THIS IDENTITY'S CREDENTIAL MAY BE APPLIED, and EMPTY IS NOT
+    # "everywhere" -- it is "the operator did not widen it", and
+    # `hx.scan._identity_bracket` then bounds the credential to the ONE
+    # origin the liveness canary is about to prove. Spec section 5 as
+    # amended 2026-08-30: it used to default to `scope.include`, which made
+    # the bound useless on exactly the engagements it exists for -- a scope
+    # naming the app, an API, an SSO provider and a CDN had the client's
+    # live session sent to all four while the canary proved one.
+    #
+    # AN OPERATOR MAY WIDEN IT, AND WRITING IT HERE IS THE POINT. A session
+    # that legitimately spans two hosts is a fact only the operator knows;
+    # section 4's whole shape is that anything increasing blast radius is a
+    # decision recorded in `config.yaml` rather than a default. Widening
+    # origins does NOT widen the proof: `hx.scan._retirable` still retires
+    # only on the origin the canary reached.
+    #
+    # ENTRIES ARE HOSTS OR URL PREFIXES, and `_origin_host` below refuses
+    # anything the extension's `Sender.hostOf` would read as no host at all
+    # -- a glob, a bare path -- because such an entry matches nothing and
+    # would be a bound an operator believed in and never got.
+    origins: tuple[str, ...] = ()
+
+
+# The host characters `Sender.appliesTo` can match. A host name is compared
+# byte for byte and case-insensitively against `req.host()`, so anything
+# outside this set -- a `*`, a space, a `[` left by an IPv6 literal `hostOf`
+# cut at its first colon -- can never equal any host a send frame carries.
+_ORIGIN_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-_")
+
+
+def _origin_host(origin: str) -> str:
+    """The host an `origins` entry names, the way the extension reads it.
+
+    A DELIBERATE MIRROR OF `Sender.hostOf`, and the extension's copy is the
+    one spec section 4 rests on: everything after `://` and before the first
+    `/`, `:` or `?`, lower-cased. This one exists so an entry that would
+    match no host is refused at LOAD time with a sentence naming it, rather
+    than at run time as a silent `identity_origin` refusal of every probe --
+    the same division of labour as `codec._refuse_unwritable` (an early,
+    better-worded refusal) and `IdentityRegistry.checkWritable` (the one that
+    actually guards the wire).
+
+    Returning "" for an entry with no readable host is the fail-closed
+    answer, and `_identity` turns it into a `ConfigError` rather than
+    accepting a bound that binds nothing.
+    """
+    rest = origin.strip().lower()
+    scheme = rest.find("://")
+    if scheme >= 0:
+        rest = rest[scheme + 3:]
+    cut = len(rest)
+    for delimiter in ("/", ":", "?"):
+        at = rest.find(delimiter)
+        if 0 <= at < cut:
+            cut = at
+    return rest[:cut]
 
 
 def _identity(name: str, raw: dict) -> Identity:
@@ -223,7 +279,62 @@ def _identity(name: str, raw: dict) -> Identity:
         inject=Inject(header=header, value_from_env=env),
         liveness=liveness,
         refresh=refresh,
+        origins=_origins(name, raw),
     )
+
+
+def _origins(name: str, raw: dict) -> tuple[str, ...]:
+    """`identities.<name>.origins`, validated, or `()` for the default.
+
+    ABSENT IS THE SAFE ANSWER AND IS NOT SPELLED HERE: `hx.scan.
+    _identity_bracket` turns `()` into the single origin the run's liveness
+    canary is about to prove. This function's whole job is the OTHER case --
+    an operator deliberately widening the bound -- and every refusal below is
+    a widening that would not have widened anything.
+
+    A DECLARED-BUT-EMPTY LIST IS REFUSED rather than read as the default. The
+    two are opposite intentions -- "I did not think about this" and "I
+    thought about it and chose nothing" -- and the second one bounds the
+    credential to no host at all, so every probe of the run would be refused
+    `identity_origin`. An operator who wants that wants `scan_identity`
+    omitted.
+
+    THE ENTRIES ARE NOT CHECKED AGAINST `scope.include`, deliberately. Scope
+    patterns are globs and origins are hosts, so "is this host inside that
+    glob" is a matcher this file does not have; and it would be a check with
+    no teeth either way, because scope is enforced on the send path
+    regardless -- an origin naming a host outside scope simply never gets a
+    request to apply to. Origins narrow, they never widen what scope allows.
+    """
+    if "origins" not in raw:
+        return ()
+    declared = raw["origins"]
+    if not isinstance(declared, list) or not declared:
+        raise ConfigError(
+            f"identities.{name}.origins must be a non-empty list of hosts or "
+            "URL prefixes when given; omit the key entirely to bound the "
+            "credential to the one host the liveness canary proves, which is "
+            "the default and the safe answer"
+        )
+    for entry in declared:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ConfigError(
+                f"every entry in identities.{name}.origins must be a "
+                f"non-empty string, got {entry!r}"
+            )
+        host = _origin_host(entry)
+        if not host or set(host) - _ORIGIN_HOST_CHARS:
+            raise ConfigError(
+                f"identities.{name}.origins entry {entry!r} names no host the "
+                "send path can match. An origin is a host (`api.acme.test`) "
+                "or a URL prefix (`https://api.acme.test/`); the extension "
+                "reads everything after '://' and before the first '/', ':' "
+                "or '?' and compares it to the host it is about to connect "
+                f"to, and {host!r} can never equal one. A glob is not an "
+                "origin -- it would bound the credential to nothing and "
+                "refuse every probe"
+            )
+    return tuple(entry.strip() for entry in declared)
 
 
 @dataclass(frozen=True)
@@ -468,6 +579,14 @@ def _identity_yaml(i: Identity) -> dict:
             "command": list(i.refresh.command),
             "value_from": i.refresh.value_from,
         }
+    if i.origins:
+        # Omitted when empty, so an engagement that never widened the bound
+        # renders the same YAML it always did -- and so `scope_version.yaml`
+        # records the operator's DECISION to widen and nothing else. The
+        # default is not a decision and has no business being written down as
+        # one: it is derived per run from the surface the canary goes to,
+        # which is a fact about the run rather than about the config.
+        out["origins"] = list(i.origins)
     return out
 
 

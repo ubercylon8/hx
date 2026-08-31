@@ -363,7 +363,13 @@ In `scan.run`, beside `seen_findings: set[str] = set()`, add:
         # it -- so exactly the state that must retire nothing contributes no
         # entry at all, and the list holds one tuple per row that named an
         # issue type rather than one per row.
-        offered: list[tuple[str, str, str, base.Verdict]] = []
+        # THE ROW'S OWN ORIGIN TRAVELS WITH THE OFFER -- `(scheme, host,
+        # port)`, the same triple the bracket keeps for its canaries.
+        # Retirement is gated on it (`_retirable`), and it has to be captured
+        # HERE because the gate runs after the loop, by which time `surface`
+        # is whichever row happened to be last.
+        offered: list[tuple[str, str, str, tuple[str, str, int],
+                            base.Verdict]] = []
 ```
 
 After the `isinstance(verdict, base.Verdict)` guard and before the
@@ -379,7 +385,9 @@ After the `isinstance(verdict, base.Verdict)` guard and before the
                     # what `report._coverage` renders for the row is
                     # unchanged.
                     if verdict.considered:
-                        offered.append((hook, surface[0], check.id, verdict))
+                        offered.append((hook, surface[0], check.id,
+                                        (surface[2], surface[3], surface[4]),
+                                        verdict))
 ```
 
 Change the call at the end of the run from `_mark_unobserved(conn, engagement_id, run_id, seen_findings)` to:
