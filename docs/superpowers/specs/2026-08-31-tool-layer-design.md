@@ -69,6 +69,7 @@ src/hx/tools/
   spec.py       ToolSpec — name, summary, params (JSON Schema), needs_egress,
                 mutates, requires_why, handler
   registry.py   TOOLS: dict[str, ToolSpec]        ← the allowlist
+  schema.py     a JSON Schema subset that REFUSES what it cannot enforce
   envelope.py   the uniform outer shape; Principle 3's page envelope
   dispatch.py   validate → authorise → call → journal
   errors.py     ToolRefused / ToolUnavailable, each carrying a closed reason
@@ -78,6 +79,14 @@ src/hx/tools/
     cli.py      `hx tool <name> --json '{…}' [--why '…']`
     mcp.py      `hx mcp` — stdio JSON-RPC                       (Plan B)
 ```
+
+`schema.py` exists because `params` is JSON Schema and validating it needs a
+validator this project will not add a dependency for. The subset is the easy
+half; the load-bearing half is that `check_schema` **refuses every keyword it
+does not implement**, and `registry.register` calls it — so an unenforceable
+schema fails at import and in a test run, never at an agent's call. A subset
+that silently ignored `pattern` would publish a constraint to the agent that
+nothing applies.
 
 A handler is a plain function `(ctx, **args) -> result`. It does not
 validate, does not authorise, does not journal, and does not know which
