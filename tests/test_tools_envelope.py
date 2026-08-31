@@ -81,3 +81,54 @@ def test_a_tool_error_refuses_a_reason_outside_the_vocabulary():
 def test_the_two_handler_exceptions_carry_their_outcomes():
     assert errors.ToolRefused("halted").outcome == "refused"
     assert errors.ToolUnavailable("no_session").outcome == "unavailable"
+
+
+def test_cross_partition_reasons_are_refused_in_envelope():
+    # "no_session" belongs to unavailable, not refused
+    with pytest.raises(ValueError, match="closed vocabulary"):
+        envelope.Envelope(tool="t", outcome="refused", reason="no_session")
+    # "halted" belongs to refused, not unavailable
+    with pytest.raises(ValueError, match="closed vocabulary"):
+        envelope.Envelope(tool="t", outcome="unavailable", reason="halted")
+
+
+def test_cross_partition_reasons_are_refused_in_exceptions():
+    # "no_session" belongs to unavailable, not refused
+    with pytest.raises(ValueError, match="closed vocabulary"):
+        errors.ToolRefused("no_session")
+    # "halted" belongs to refused, not unavailable
+    with pytest.raises(ValueError, match="closed vocabulary"):
+        errors.ToolUnavailable("halted")
+
+
+def test_every_reason_belongs_to_exactly_one_outcome():
+    # Each reason appears in exactly one outcome's set
+    all_reasons = set()
+    for outcome, reasons in envelope.REASONS_FOR.items():
+        overlap = all_reasons & reasons
+        assert not overlap, f"Reason(s) {overlap} appear in multiple outcomes"
+        all_reasons.update(reasons)
+    # REASONS is exactly the union of all reason sets
+    assert envelope.REASONS == all_reasons
+
+
+def test_envelope_may_not_be_subclassed():
+    with pytest.raises(TypeError, match="Envelope may not be subclassed"):
+        class Evil(envelope.Envelope):
+            pass
+
+
+def test_a_non_ran_envelope_may_not_carry_a_result():
+    # Non-ran outcomes cannot carry results
+    with pytest.raises(ValueError, match="did not run"):
+        envelope.Envelope(tool="t", outcome="refused", reason="halted",
+                         result={"leaked": "data"})
+    with pytest.raises(ValueError, match="did not run"):
+        envelope.Envelope(tool="t", outcome="unavailable", reason="no_session",
+                         result=[])
+    with pytest.raises(ValueError, match="did not run"):
+        envelope.Envelope(tool="t", outcome="error", reason="internal",
+                         result="error details")
+    # But result=None is allowed and will be the default
+    e = envelope.Envelope(tool="t", outcome="error", reason="internal")
+    assert e.result is None

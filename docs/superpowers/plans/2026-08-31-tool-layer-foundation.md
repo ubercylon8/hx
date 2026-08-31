@@ -1008,6 +1008,57 @@ def test_a_tool_error_refuses_a_reason_outside_the_vocabulary():
 def test_the_two_handler_exceptions_carry_their_outcomes():
     assert errors.ToolRefused("halted").outcome == "refused"
     assert errors.ToolUnavailable("no_session").outcome == "unavailable"
+
+
+def test_cross_partition_reasons_are_refused_in_envelope():
+    # "no_session" belongs to unavailable, not refused
+    with pytest.raises(ValueError, match="closed vocabulary"):
+        envelope.Envelope(tool="t", outcome="refused", reason="no_session")
+    # "halted" belongs to refused, not unavailable
+    with pytest.raises(ValueError, match="closed vocabulary"):
+        envelope.Envelope(tool="t", outcome="unavailable", reason="halted")
+
+
+def test_cross_partition_reasons_are_refused_in_exceptions():
+    # "no_session" belongs to unavailable, not refused
+    with pytest.raises(ValueError, match="closed vocabulary"):
+        errors.ToolRefused("no_session")
+    # "halted" belongs to refused, not unavailable
+    with pytest.raises(ValueError, match="closed vocabulary"):
+        errors.ToolUnavailable("halted")
+
+
+def test_every_reason_belongs_to_exactly_one_outcome():
+    # Each reason appears in exactly one outcome's set
+    all_reasons = set()
+    for outcome, reasons in envelope.REASONS_FOR.items():
+        overlap = all_reasons & reasons
+        assert not overlap, f"Reason(s) {overlap} appear in multiple outcomes"
+        all_reasons.update(reasons)
+    # REASONS is exactly the union of all reason sets
+    assert envelope.REASONS == all_reasons
+
+
+def test_envelope_may_not_be_subclassed():
+    with pytest.raises(TypeError, match="Envelope may not be subclassed"):
+        class Evil(envelope.Envelope):
+            pass
+
+
+def test_a_non_ran_envelope_may_not_carry_a_result():
+    # Non-ran outcomes cannot carry results
+    with pytest.raises(ValueError, match="did not run"):
+        envelope.Envelope(tool="t", outcome="refused", reason="halted",
+                         result={"leaked": "data"})
+    with pytest.raises(ValueError, match="did not run"):
+        envelope.Envelope(tool="t", outcome="unavailable", reason="no_session",
+                         result=[])
+    with pytest.raises(ValueError, match="did not run"):
+        envelope.Envelope(tool="t", outcome="error", reason="internal",
+                         result="error details")
+    # But result=None is allowed and will be the default
+    e = envelope.Envelope(tool="t", outcome="error", reason="internal")
+    assert e.result is None
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -1044,12 +1095,22 @@ from typing import Any, Callable, Sequence
 OUTCOMES = ("ok", "empty", "unavailable", "refused", "error")
 
 #: Closed, because the report counts refusals and free text cannot be counted.
-#: Grouped by the outcome each belongs to.
-REASONS = frozenset({
-    "not_registered", "halted", "missing_why", "bad_args",   # refused
-    "no_session", "no_run", "not_implemented",               # unavailable
-    "internal",                                              # error
-})
+#: Each outcome has its own set of reasons; nothing that crosses a boundary
+#: can construct. Before the review, REASONS was a flat frozenset with comment
+#: groups, and reasons from neighbouring outcomes constructed cleanly:
+#: `ToolRefused("no_session")` built, though "no_session" is unavailable's.
+#: The report counts refusals by reason -- a cross-partition reason corrupts a
+#: client-facing number. Twelve tests passed with this open because only one
+#: tried a reason outside REASONS entirely; none crossed between groups.
+REASONS_FOR = {
+    "refused": frozenset({"not_registered", "halted", "missing_why", "bad_args"}),
+    "unavailable": frozenset({"no_session", "no_run", "not_implemented"}),
+    "error": frozenset({"internal"}),
+}
+
+#: Union of all reason sets, used by `answered` and other generic code that
+#: does not know the outcome in advance.
+REASONS = frozenset().union(*REASONS_FOR.values())
 
 #: Principle 3: "a tool that can return 3,400 rows must never do so by
 #: default."
@@ -1067,6 +1128,18 @@ class Envelope:
     reason: str | None = None
     detail: str | None = None
 
+    def __init_subclass__(cls, **kwargs) -> None:
+        """An Envelope has no subclasses, and that is load-bearing.
+
+        The `ran` property decides whether a `reason` is permitted. A subclass
+        overriding `ran` produces a `refused` envelope that exits 0, and a
+        shell or CI job reads a refusal as success. `adapters/cli.py` sets the
+        process exit status from `ran`, so the fix is not a rule but a closing.
+        """
+        raise TypeError(
+            "Envelope may not be subclassed; ran is derived from outcome and "
+            "an override would un-derive it")
+
     def __post_init__(self) -> None:
         if self.outcome not in OUTCOMES:
             raise ValueError(
@@ -1078,10 +1151,17 @@ class Envelope:
                 # eventually read the reason and believe it.
                 raise ValueError(
                     f"{self.outcome!r} means the tool ran; it may not carry a reason")
-        elif self.reason not in REASONS:
-            raise ValueError(
-                f"{self.reason!r} is not in the closed vocabulary "
-                f"{sorted(REASONS)}; the report counts refusals by reason")
+        else:
+            # Non-ran outcomes: unavailable, refused, error
+            if self.reason not in REASONS_FOR.get(self.outcome, frozenset()):
+                raise ValueError(
+                    f"{self.reason!r} is not in the closed vocabulary "
+                    f"{sorted(REASONS_FOR.get(self.outcome, frozenset()))}; "
+                    f"the report counts refusals by reason")
+            if self.result is not None:
+                raise ValueError(
+                    f"{self.outcome!r} means the tool did not run; "
+                    f"it may not carry a result")
 
     @property
     def ran(self) -> bool:
@@ -1161,7 +1241,7 @@ handler cannot answer in a shape of its own.
 """
 from __future__ import annotations
 
-from .envelope import REASONS
+from .envelope import REASONS_FOR
 
 
 class ToolError(Exception):
@@ -1170,9 +1250,11 @@ class ToolError(Exception):
     outcome = "error"
 
     def __init__(self, reason: str, detail: str | None = None) -> None:
-        if reason not in REASONS:
+        if reason not in REASONS_FOR.get(self.outcome, frozenset()):
             raise ValueError(
-                f"{reason!r} is not in the closed vocabulary {sorted(REASONS)}")
+                f"{reason!r} is not in the closed vocabulary "
+                f"{sorted(REASONS_FOR.get(self.outcome, frozenset()))}; "
+                f"the report counts refusals by reason")
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail

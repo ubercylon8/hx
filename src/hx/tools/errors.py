@@ -7,7 +7,7 @@ handler cannot answer in a shape of its own.
 """
 from __future__ import annotations
 
-from .envelope import REASONS
+from .envelope import REASONS_FOR
 
 
 class ToolError(Exception):
@@ -16,9 +16,11 @@ class ToolError(Exception):
     outcome = "error"
 
     def __init__(self, reason: str, detail: str | None = None) -> None:
-        if reason not in REASONS:
+        if reason not in REASONS_FOR.get(self.outcome, frozenset()):
             raise ValueError(
-                f"{reason!r} is not in the closed vocabulary {sorted(REASONS)}")
+                f"{reason!r} is not in the closed vocabulary "
+                f"{sorted(REASONS_FOR.get(self.outcome, frozenset()))}; "
+                f"the report counts refusals by reason")
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail

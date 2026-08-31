@@ -23,12 +23,22 @@ from typing import Any, Callable, Sequence
 OUTCOMES = ("ok", "empty", "unavailable", "refused", "error")
 
 #: Closed, because the report counts refusals and free text cannot be counted.
-#: Grouped by the outcome each belongs to.
-REASONS = frozenset({
-    "not_registered", "halted", "missing_why", "bad_args",   # refused
-    "no_session", "no_run", "not_implemented",               # unavailable
-    "internal",                                              # error
-})
+#: Each outcome has its own set of reasons; nothing that crosses a boundary
+#: can construct. Before the review, REASONS was a flat frozenset with comment
+#: groups, and reasons from neighbouring outcomes constructed cleanly:
+#: `ToolRefused("no_session")` built, though "no_session" is unavailable's.
+#: The report counts refusals by reason -- a cross-partition reason corrupts a
+#: client-facing number. Twelve tests passed with this open because only one
+#: tried a reason outside REASONS entirely; none crossed between groups.
+REASONS_FOR = {
+    "refused": frozenset({"not_registered", "halted", "missing_why", "bad_args"}),
+    "unavailable": frozenset({"no_session", "no_run", "not_implemented"}),
+    "error": frozenset({"internal"}),
+}
+
+#: Union of all reason sets, used by `answered` and other generic code that
+#: does not know the outcome in advance.
+REASONS = frozenset().union(*REASONS_FOR.values())
 
 #: Principle 3: "a tool that can return 3,400 rows must never do so by
 #: default."
@@ -46,6 +56,18 @@ class Envelope:
     reason: str | None = None
     detail: str | None = None
 
+    def __init_subclass__(cls, **kwargs) -> None:
+        """An Envelope has no subclasses, and that is load-bearing.
+
+        The `ran` property decides whether a `reason` is permitted. A subclass
+        overriding `ran` produces a `refused` envelope that exits 0, and a
+        shell or CI job reads a refusal as success. `adapters/cli.py` sets the
+        process exit status from `ran`, so the fix is not a rule but a closing.
+        """
+        raise TypeError(
+            "Envelope may not be subclassed; ran is derived from outcome and "
+            "an override would un-derive it")
+
     def __post_init__(self) -> None:
         if self.outcome not in OUTCOMES:
             raise ValueError(
@@ -57,10 +79,17 @@ class Envelope:
                 # eventually read the reason and believe it.
                 raise ValueError(
                     f"{self.outcome!r} means the tool ran; it may not carry a reason")
-        elif self.reason not in REASONS:
-            raise ValueError(
-                f"{self.reason!r} is not in the closed vocabulary "
-                f"{sorted(REASONS)}; the report counts refusals by reason")
+        else:
+            # Non-ran outcomes: unavailable, refused, error
+            if self.reason not in REASONS_FOR.get(self.outcome, frozenset()):
+                raise ValueError(
+                    f"{self.reason!r} is not in the closed vocabulary "
+                    f"{sorted(REASONS_FOR.get(self.outcome, frozenset()))}; "
+                    f"the report counts refusals by reason")
+            if self.result is not None:
+                raise ValueError(
+                    f"{self.outcome!r} means the tool did not run; "
+                    f"it may not carry a result")
 
     @property
     def ran(self) -> bool:
