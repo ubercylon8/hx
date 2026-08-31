@@ -35,6 +35,26 @@ def test_filters_narrow_and_facets_count_the_filtered_set(tool_ctx):
     assert env.result["facets"]["host"] == {"a.test": 1}
 
 
+def test_both_facets_count_the_filtered_set_under_two_filters(tool_ctx):
+    # The test above exercises one filter and one facet key, so a bug isolated
+    # to the `kind` facet -- or to facet drift when two filters combine --
+    # would survive it. `total`, the page and both facets are three separate
+    # queries sharing one WHERE clause; this is what holds them together.
+    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-1", host="a.test",
+             path="/read")
+    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-2", host="a.test",
+             path="/write", method="POST", kind="state_changing")
+    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-3", host="b.test",
+             path="/other")
+    env = dispatch.dispatch(tool_ctx, "surface.query",
+                            {"host": "a.test", "kind": "state_changing"})
+    page = env.result
+    assert page["total"] == 1
+    assert sum(page["facets"]["host"].values()) == page["total"]
+    assert sum(page["facets"]["kind"].values()) == page["total"]
+    assert page["facets"]["kind"] == {"state_changing": 1}
+
+
 def test_the_default_limit_is_fifty_and_the_cursor_walks(tool_ctx):
     for i in range(60):
         _surface(tool_ctx.conn, tool_ctx.engagement.id, sid=f"s-{i:03d}", path=f"/p{i:03d}")
@@ -45,6 +65,31 @@ def test_the_default_limit_is_fifty_and_the_cursor_walks(tool_ctx):
                                {"cursor": first["next_cursor"]}).result
     assert second["returned"] == 10 and second["truncated"] is False
     assert not {r["id"] for r in first["rows"]} & {r["id"] for r in second["rows"]}
+
+
+def test_the_cursor_walks_three_pages_and_from_an_off_multiple_offset(tool_ctx):
+    # The two-page test proves full coverage only by pigeonhole on its exact
+    # fixture size (50 + 10 = 60). This walks three pages and then re-enters
+    # at an offset that is not a multiple of the limit, which is what an agent
+    # that resumed from a stale cursor actually does.
+    for i in range(12):
+        _surface(tool_ctx.conn, tool_ctx.engagement.id, sid=f"s-{i:02d}",
+                 path=f"/p{i:02d}")
+    seen, cursor = [], None
+    while True:
+        args = {"limit": 5}
+        if cursor:
+            args["cursor"] = cursor
+        page = dispatch.dispatch(tool_ctx, "surface.query", args).result
+        seen.extend(r["id"] for r in page["rows"])
+        cursor = page["next_cursor"]
+        if not cursor:
+            break
+    assert len(seen) == 12 and len(set(seen)) == 12
+
+    off = dispatch.dispatch(tool_ctx, "surface.query",
+                            {"limit": 5, "cursor": "o-3"}).result
+    assert [r["id"] for r in off["rows"]] == seen[3:8]
 
 
 def test_a_malformed_cursor_is_a_refusal_not_a_crash(tool_ctx):

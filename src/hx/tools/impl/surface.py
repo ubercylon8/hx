@@ -84,6 +84,18 @@ def detail(ctx, surface_id: str) -> dict | None:
     Returns None -- which the envelope reads as `empty` -- for a surface that
     does not exist. `unavailable` would claim the tool could not look, and an
     agent would go looking for a broken tool instead of a wrong id.
+
+    THE `engagement_id` IN THE WHERE CLAUSE IS DEFENCE IN DEPTH OVER A
+    STRUCTURAL GUARANTEE, and there is deliberately no test for it. Section 3
+    makes the engagement the isolation unit -- its own directory, its own
+    database -- and two engagements cannot share one store:
+    `trg_engagement_singleton` aborts a second `engagement` row, and
+    `surface.engagement_id REFERENCES engagement(id)` under `foreign_keys=ON`
+    aborts a surface naming any other. Both measured. A test for cross-
+    engagement leakage would have to disable the trigger AND the foreign keys
+    to build the row it then asserts is unreachable, which would exercise the
+    fixture rather than the product. The clause stays because it costs
+    nothing and it is what the day someone relaxes those guarantees will need.
     """
     row = ctx.conn.execute(
         "SELECT id, method, scheme, host, port, path_template, query_key_set,"

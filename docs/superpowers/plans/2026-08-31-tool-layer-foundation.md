@@ -2558,6 +2558,26 @@ def test_filters_narrow_and_facets_count_the_filtered_set(tool_ctx):
     assert env.result["facets"]["host"] == {"a.test": 1}
 
 
+def test_both_facets_count_the_filtered_set_under_two_filters(tool_ctx):
+    # The test above exercises one filter and one facet key, so a bug isolated
+    # to the `kind` facet -- or to facet drift when two filters combine --
+    # would survive it. `total`, the page and both facets are three separate
+    # queries sharing one WHERE clause; this is what holds them together.
+    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-1", host="a.test",
+             path="/read")
+    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-2", host="a.test",
+             path="/write", method="POST", kind="state_changing")
+    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-3", host="b.test",
+             path="/other")
+    env = dispatch.dispatch(tool_ctx, "surface.query",
+                            {"host": "a.test", "kind": "state_changing"})
+    page = env.result
+    assert page["total"] == 1
+    assert sum(page["facets"]["host"].values()) == page["total"]
+    assert sum(page["facets"]["kind"].values()) == page["total"]
+    assert page["facets"]["kind"] == {"state_changing": 1}
+
+
 def test_the_default_limit_is_fifty_and_the_cursor_walks(tool_ctx):
     for i in range(60):
         _surface(tool_ctx.conn, tool_ctx.engagement.id, sid=f"s-{i:03d}", path=f"/p{i:03d}")
@@ -2568,6 +2588,31 @@ def test_the_default_limit_is_fifty_and_the_cursor_walks(tool_ctx):
                                {"cursor": first["next_cursor"]}).result
     assert second["returned"] == 10 and second["truncated"] is False
     assert not {r["id"] for r in first["rows"]} & {r["id"] for r in second["rows"]}
+
+
+def test_the_cursor_walks_three_pages_and_from_an_off_multiple_offset(tool_ctx):
+    # The two-page test proves full coverage only by pigeonhole on its exact
+    # fixture size (50 + 10 = 60). This walks three pages and then re-enters
+    # at an offset that is not a multiple of the limit, which is what an agent
+    # that resumed from a stale cursor actually does.
+    for i in range(12):
+        _surface(tool_ctx.conn, tool_ctx.engagement.id, sid=f"s-{i:02d}",
+                 path=f"/p{i:02d}")
+    seen, cursor = [], None
+    while True:
+        args = {"limit": 5}
+        if cursor:
+            args["cursor"] = cursor
+        page = dispatch.dispatch(tool_ctx, "surface.query", args).result
+        seen.extend(r["id"] for r in page["rows"])
+        cursor = page["next_cursor"]
+        if not cursor:
+            break
+    assert len(seen) == 12 and len(set(seen)) == 12
+
+    off = dispatch.dispatch(tool_ctx, "surface.query",
+                            {"limit": 5, "cursor": "o-3"}).result
+    assert [r["id"] for r in off["rows"]] == seen[3:8]
 
 
 def test_a_malformed_cursor_is_a_refusal_not_a_crash(tool_ctx):
@@ -2702,6 +2747,18 @@ def detail(ctx, surface_id: str) -> dict | None:
     Returns None -- which the envelope reads as `empty` -- for a surface that
     does not exist. `unavailable` would claim the tool could not look, and an
     agent would go looking for a broken tool instead of a wrong id.
+
+    THE `engagement_id` IN THE WHERE CLAUSE IS DEFENCE IN DEPTH OVER A
+    STRUCTURAL GUARANTEE, and there is deliberately no test for it. Section 3
+    makes the engagement the isolation unit -- its own directory, its own
+    database -- and two engagements cannot share one store:
+    `trg_engagement_singleton` aborts a second `engagement` row, and
+    `surface.engagement_id REFERENCES engagement(id)` under `foreign_keys=ON`
+    aborts a surface naming any other. Both measured. A test for cross-
+    engagement leakage would have to disable the trigger AND the foreign keys
+    to build the row it then asserts is unreachable, which would exercise the
+    fixture rather than the product. The clause stays because it costs
+    nothing and it is what the day someone relaxes those guarantees will need.
     """
     row = ctx.conn.execute(
         "SELECT id, method, scheme, host, port, path_template, query_key_set,"
