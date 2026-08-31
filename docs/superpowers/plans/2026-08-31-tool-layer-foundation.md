@@ -3057,7 +3057,13 @@ from ...store import records
 from .. import envelope, registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
-#: The first part of the dedupe key for anything an agent records.
+#: One word, two columns, deliberately. It is the first part of the dedupe key
+#: for anything an agent records -- which is what keeps an agent finding from
+#: colliding with a check's finding of the same issue type on the same surface
+#: -- and it is `finding.created_by`, which section 12 renders. The two are the
+#: same claim about the same row, so they are one constant; and if the dedupe
+#: prefix were ever changed independently, `created_by`'s CHECK constraint
+#: would refuse the write rather than let the two drift quietly apart.
 AGENT_TYPE = "agent"
 
 #: The `evidence.role` column has no CHECK constraint -- it was written by one
@@ -3129,7 +3135,7 @@ def record(ctx, *, title, issue_type_id, severity, confidence, surface_id,
         fid = records.upsert_finding(
             ctx.conn, engagement_id=ctx.engagement.id, candidate=candidate,
             dedupe_key=key, run_id=ctx.run_id, surface_id=surface_id,
-            host=host, check_id=None)
+            host=host, check_id=None, created_by=AGENT_TYPE)
         records.record_observation(
             ctx.conn, finding_id=fid, run_id=ctx.run_id, observed=True,
             exchange_id=exchange_ids[0], severity_at=severity,
