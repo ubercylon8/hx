@@ -1512,8 +1512,11 @@ def _retirable(hook, verdict, identity_state, *, origin,
     closing" -- a claim about the application as the client's own users meet
     it. So the question this function answers is not "did the probe come
     back clean" but "was the probe issued into the view those users are in",
-    and there is exactly one state in which this build can say yes:
-    `identity_state == "proven"`. Spec section 9, in its own words: an active
+    and this build can say yes for exactly one state -- `identity_state ==
+    "proven"` -- and, within it, for exactly one origin: the one the canary
+    that proved it was sent to. The state is necessary and it is not
+    sufficient; the origin half is four paragraphs down. Spec section 9, in
+    its own words: an active
     check's `considered` is honoured "only if every probe it sent ran under
     an identity whose canary was `proven` at the generation in force for that
     request".
@@ -1648,8 +1651,9 @@ def _retirable(hook, verdict, identity_state, *, origin,
     a passive check reads the captured traffic ITSELF -- the very exchanges
     the operator's own browser produced, session and all -- so it was never
     looking at a different view of the application, and this whole question
-    is one only a re-issued request can have. `identity_state` therefore
-    reaches the passive branch and is not consulted in it.
+    is one only a re-issued request can have. `identity_state` and both
+    origins therefore reach the passive branch and none of the three is
+    consulted in it.
 
     WHAT THE CLIENT IS TOLD, and it is derived from the same state rather
     than typed: `report._limits` reads `run.identity_state` out of the store
