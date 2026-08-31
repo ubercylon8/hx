@@ -118,9 +118,9 @@ def test_a_mixed_type_enum_is_refused():
 
 
 def test_enum_on_an_array_is_refused():
-    with pytest.raises(schema.SchemaError, match="not meaningful"):
+    with pytest.raises(schema.SchemaError, match="does not apply"):
         schema.check_schema({"type": "array", "items": {"type": "string"},
-                             "enum": []})
+                             "enum": ["a"]})
 
 
 def test_an_empty_enum_is_refused():
@@ -131,3 +131,69 @@ def test_an_empty_enum_is_refused():
 def test_an_integer_enum_rejects_a_boolean():
     with pytest.raises(schema.SchemaError, match="not of type"):
         schema.check_schema({"type": "integer", "enum": [1, True]})
+
+
+def test_a_keyword_on_a_type_it_does_not_apply_to_is_refused():
+    # minimum applies only to integer/number, not string
+    with pytest.raises(schema.SchemaError, match="does not apply"):
+        schema.check_schema({"type": "string", "minimum": 5})
+    # required applies only to object, not array
+    with pytest.raises(schema.SchemaError, match="does not apply"):
+        schema.check_schema({"type": "array", "items": {"type": "string"},
+                             "required": ["x"]})
+
+
+def test_a_keyword_whose_value_is_the_wrong_type_is_refused():
+    # minimum must be int or float, not string
+    with pytest.raises(schema.SchemaError, match="must be of type"):
+        schema.check_schema({"type": "integer", "minimum": "five"})
+    # minLength must be int, not bool
+    with pytest.raises(schema.SchemaError, match="must be of type"):
+        schema.check_schema({"type": "string", "minLength": True})
+
+
+def test_every_constraint_keyword_is_enforced_for_every_applicable_type():
+    # For every (keyword, type) pair, either check_schema refuses it or
+    # validate enforces it. This invariant would have caught all three defects.
+    for keyword, (applicable_types, value_type) in schema._CONSTRAINT_TABLE.items():
+        for type_name in schema._TYPES:
+            if applicable_types is not None and type_name not in applicable_types:
+                # This pairing should be refused at registration.
+                continue
+            # Build a minimal schema for this type with the keyword present.
+            if type_name == "object":
+                sch = {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {},
+                }
+            elif type_name == "array":
+                sch = {"type": "array", "items": {"type": "string"}}
+            else:
+                sch = {"type": type_name}
+            # For keywords that require specific values, choose a valid one.
+            if keyword == "enum":
+                if type_name == "string":
+                    sch["enum"] = ["a"]
+                elif type_name == "boolean":
+                    sch["enum"] = [True]
+                else:
+                    sch["enum"] = [1]
+            elif keyword == "minimum":
+                sch["minimum"] = 0
+            elif keyword == "maximum":
+                sch["maximum"] = 10
+            elif keyword == "minLength":
+                sch["minLength"] = 1
+            elif keyword == "maxLength":
+                sch["maxLength"] = 10
+            elif keyword == "required":
+                sch["required"] = []
+            elif keyword == "properties":
+                sch["properties"] = {}
+            elif keyword == "additionalProperties":
+                sch["additionalProperties"] = False
+            elif keyword == "items":
+                sch["items"] = {"type": "string"}
+            # This should not raise.
+            schema.check_schema(sch)

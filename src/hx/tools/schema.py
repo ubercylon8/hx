@@ -13,6 +13,14 @@ argument was fine. So `check_schema` refuses every keyword this module does not
 implement, and `registry.register` calls it: the refusal lands at REGISTRATION,
 which is import time and a test run, never at a call. Adding a keyword to a
 tool's schema means implementing it here first.
+
+Each constraint keyword has two facts: (1) which types it applies to, and
+(2) what type its value must be. Leaving either unstated caused defects:
+`{"type": "string", "minimum": 5}` accepts and silently ignores `minimum` because
+it only applies to numbers; `{"type": "string", "minLength": "two"}` accepts and
+crashes on len(value) < "two"; `{"type": "integer", "minimum": "five"}` accepts
+and crashes on value < "five". check_schema now validates both by consulting a
+table for each keyword present.
 """
 from __future__ import annotations
 
@@ -23,21 +31,34 @@ class SchemaError(Exception):
     """A schema this module cannot enforce in full."""
 
 
-#: Keywords that constrain a value. Every one is implemented by `validate`, and
-#: a test proves each changes the answer for some value.
-CONSTRAINTS = frozenset({
-    "type", "properties", "required", "additionalProperties",
-    "enum", "items", "minimum", "maximum", "minLength", "maxLength",
-})
-
-#: Keywords that carry no constraint and are published to the agent as help.
-#: Accepted precisely because they cannot widen what is accepted.
-METADATA = frozenset({"description", "title", "default", "examples"})
-
 _TYPES: dict[str, Any] = {
     "object": dict, "array": list, "string": str,
     "integer": int, "number": (int, float), "boolean": bool,
 }
+
+#: Each constraint keyword paired with (applicable_types, value_type).
+#: applicable_types is a frozenset of type strings, or None if the keyword
+#: applies to any type. value_type is the type the keyword's value must have.
+_CONSTRAINT_TABLE: dict[str, tuple[frozenset[str] | None, type]] = {
+    "type": (None, str),
+    "enum": (frozenset({"string", "integer", "number", "boolean"}), list),
+    "properties": (frozenset({"object"}), dict),
+    "required": (frozenset({"object"}), list),
+    "additionalProperties": (frozenset({"object"}), bool),
+    "items": (frozenset({"array"}), dict),
+    "minimum": (frozenset({"integer", "number"}), (int, float)),
+    "maximum": (frozenset({"integer", "number"}), (int, float)),
+    "minLength": (frozenset({"string"}), int),
+    "maxLength": (frozenset({"string"}), int),
+}
+
+#: Keywords that constrain a value. Every one is implemented by `validate`, and
+#: a test proves each changes the answer for some value.
+CONSTRAINTS = frozenset(_CONSTRAINT_TABLE)
+
+#: Keywords that carry no constraint and are published to the agent as help.
+#: Accepted precisely because they cannot widen what is accepted.
+METADATA = frozenset({"description", "title", "default", "examples"})
 
 
 def check_schema(obj: Any, *, where: str = "params") -> None:
@@ -52,11 +73,6 @@ def check_schema(obj: Any, *, where: str = "params") -> None:
             "schema promises and nothing applies; implement it here first."
         )
     type_ = obj.get("type")
-    # _validate dispatches required/properties/additionalProperties off "object",
-    # items off "array", minimum/maximum off number types, minLength/maxLength off
-    # "string", and enum off a scalar type. Without a type, every constraint in
-    # the schema is inert. Measured: {"properties": {"name": ...}, "required":
-    # ["name"]} accepts {} and 42. The same hole as an unimplemented keyword.
     if type_ is None:
         raise SchemaError(
             f"{where}: a schema must declare a type; {where} gives _validate "
@@ -64,27 +80,41 @@ def check_schema(obj: Any, *, where: str = "params") -> None:
         )
     if type_ not in _TYPES:
         raise SchemaError(f"{where}: unknown type {type_!r}")
-    if "enum" in obj:
-        # Refuse enums on containers (not meaningful in this subset) and
-        # homogeneity errors: sorted() would raise TypeError on a mixed-type
-        # enum like [1, "two"], and that's the same hole the module doctrine
-        # exists to close. Also refuse the bool-is-not-int case.
-        if type_ not in ("string", "integer", "number", "boolean"):
+    # Validate each constraint keyword: applicability to this type and value type.
+    for keyword in obj:
+        if keyword in METADATA:
+            continue
+        applicable_types, value_type = _CONSTRAINT_TABLE[keyword]
+        if applicable_types is not None and type_ not in applicable_types:
             raise SchemaError(
-                f"{where}: enum on a {type_} is not meaningful in this subset"
+                f"{where}: {keyword!r} does not apply to type {type_!r}"
             )
-        enum_vals = obj.get("enum")
-        if not enum_vals:
-            raise SchemaError(f"{where}: enum must be non-empty")
-        for member in enum_vals:
-            want = _TYPES[type_]
-            # Same bool-is-not-int exclusion as _validate.
-            ok = isinstance(member, want) and not (
-                type_ in ("integer", "number") and isinstance(member, bool))
-            if not ok:
-                raise SchemaError(
-                    f"{where}: enum member {member!r} is not of type {type_}"
-                )
+        value = obj[keyword]
+        # bool-is-not-int exclusion for numeric constraint values.
+        # minimum, maximum take (int, float); minLength, maxLength take int.
+        if keyword in ("minimum", "maximum", "minLength", "maxLength"):
+            ok = isinstance(value, value_type) and not isinstance(value, bool)
+        else:
+            ok = isinstance(value, value_type) and not (
+                isinstance(value_type, tuple) and isinstance(value, bool))
+        if not ok:
+            raise SchemaError(
+                f"{where}: {keyword!r} value must be of type {value_type!r}, "
+                f"got {type(value).__name__!r}"
+            )
+        # Additional validation for enum members.
+        if keyword == "enum":
+            if not value:
+                raise SchemaError(f"{where}: enum must be non-empty")
+            for member in value:
+                want = _TYPES[type_]
+                # Same bool-is-not-int exclusion as _validate.
+                ok = isinstance(member, want) and not (
+                    type_ in ("integer", "number") and isinstance(member, bool))
+                if not ok:
+                    raise SchemaError(
+                        f"{where}: enum member {member!r} is not of type {type_}"
+                    )
     if type_ == "object":
         # `additionalProperties: false` is REQUIRED, never defaulted. An object
         # schema that admits extra keys accepts an argument the handler never
