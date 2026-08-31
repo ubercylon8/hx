@@ -2801,6 +2801,15 @@ def test_the_limits_bullet_is_conditional_on_a_proven_identity(
             "re-running this assessment") in proven
     assert "an active finding CAN be shown as fixed" in proven
 
+    # THE BULLET NAMES A SECTION, SO THE SECTION MUST BE THERE. `_limits`'
+    # own rule is that "a bullet naming a section that may not have rendered
+    # is a worse disclosure than one that stands alone", and this one names
+    # Session identity. It is safe because it is derivable -- the bullet is
+    # emitted only when a scan carried an identity, and `_identity` renders
+    # whenever any run does -- and this is where that derivation is held.
+    assert "Session identity, under Provenance" in proven
+    assert "### Session identity" in proven
+
 
 def test_a_run_that_carried_a_session_it_could_not_prove_closes_nothing(
         report_env_proven):
