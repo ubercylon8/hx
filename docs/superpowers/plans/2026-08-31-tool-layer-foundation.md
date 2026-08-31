@@ -1546,7 +1546,7 @@ git commit -m "feat(tools): the journal, refusals included"
 
 **Interfaces:**
 - Consumes: everything from Tasks 1-4.
-- Produces: `dispatch.DECISION_ORDER`;
+- Produces: `dispatch.DECISION_ORDER`; `dispatch._shape(args)`;
   `dispatch.ToolContext(engagement, conn, blobs, config, halt, run_id=None,
   session=None, actor="agent")`;
   `dispatch.dispatch(ctx, name, args=None, *, why=None) -> envelope.Envelope`.
@@ -1562,6 +1562,8 @@ device that made the send path's gate reviewable."""
 from __future__ import annotations
 
 import pytest
+
+import json
 
 from hx.tools import dispatch, registry, spec
 
@@ -1675,6 +1677,36 @@ def test_a_handler_raising_anything_else_becomes_an_error_not_a_traceback(tool_c
     env = dispatch.dispatch(tool_ctx, "checks.list", {})
     assert (env.outcome, env.reason) == ("error", "internal")
     assert "ZeroDivisionError" in env.detail
+
+
+def _last_args(conn):
+    return conn.execute("SELECT args_blob FROM agent_action"
+                        " ORDER BY ts_us DESC, rowid DESC LIMIT 1").fetchone()[0]
+
+
+def test_an_unvalidated_call_journals_key_names_and_never_values(tool_ctx):
+    # Principle 5 makes `args_blob` safe to store verbatim, and that argument
+    # covers calls a schema ACCEPTED. Every refusal at or before validation
+    # carries a dict nobody checked -- and `additionalProperties: false` means
+    # {"password": ...} sent to a REAL tool is exactly a bad_args refusal.
+    dispatch.dispatch(tool_ctx, "nothing.at.all", {"password": "hunter2"})
+    blob = _last_args(tool_ctx.conn)
+    assert "hunter2" not in blob
+    assert json.loads(blob) == {"unvalidated_argument_names": ["password"]}
+
+
+def test_bad_args_is_unvalidated_too_because_validation_is_what_failed(
+        tool_ctx, a_tool):
+    a_tool("surface.query", lambda c, n: n, params=ONE)
+    dispatch.dispatch(tool_ctx, "surface.query", {"password": "hunter2"})
+    blob = _last_args(tool_ctx.conn)
+    assert "hunter2" not in blob
+
+
+def test_a_validated_call_journals_its_argument_values(tool_ctx, a_tool):
+    a_tool("surface.query", lambda c, n: n, params=ONE)
+    dispatch.dispatch(tool_ctx, "surface.query", {"n": 7})
+    assert json.loads(_last_args(tool_ctx.conn)) == {"n": 7}
 
 
 def test_every_call_writes_exactly_one_action_row(tool_ctx, a_tool):
@@ -1813,11 +1845,13 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
         return _journalled(ctx, name, args, why, envelope.refused(
             name, "bad_args", "; ".join(problems)))
 
+    # EVERYTHING BELOW THIS LINE HAS PASSED A SCHEMA, and that is what makes
+    # `validated=True` safe -- see `_journalled`.
     if tool.needs_egress and ctx.session is None:
         return _journalled(ctx, name, args, why, envelope.unavailable(
             name, "no_session",
             f"{name} sends requests and there is no live session. Start a run "
-            "first."))
+            "first."), validated=True)
 
     try:
         result = tool.handler(ctx, **args)
@@ -1831,12 +1865,32 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
         env = envelope.failed(name, f"{type(exc).__name__}: {exc}")
     else:
         env = envelope.answered(name, result)
-    return _journalled(ctx, name, args, why, env)
+    return _journalled(ctx, name, args, why, env, validated=True)
+
+
+def _shape(args: dict[str, Any]) -> dict[str, Any]:
+    """The argument NAMES of a call nothing validated, never its values."""
+    return {"unvalidated_argument_names": sorted(args)}
 
 
 def _journalled(ctx: ToolContext, name: str, args: dict[str, Any],
-                why: str | None, env: envelope.Envelope) -> envelope.Envelope:
+                why: str | None, env: envelope.Envelope,
+                *, validated: bool = False) -> envelope.Envelope:
     """Write the row and hand back the envelope.
+
+    ARGUMENT VALUES ARE JOURNALLED ONLY FOR A CALL THAT PASSED A SCHEMA.
+    `hx.tools.journal` stores `args_blob` verbatim, and Principle 5 is the
+    argument for why that is safe: identity is passed by name and resolved
+    below this layer. That argument covers arguments a schema ACCEPTED. It
+    covers nothing about the four refusals above, which happen before or at
+    validation and carry a dict nobody has checked -- and since every tool
+    schema sets `additionalProperties: false`, `{"password": ...}` sent to a
+    real tool IS a `bad_args` refusal. So an unvalidated call journals its
+    sorted key NAMES and nothing else.
+
+    The names are kept rather than dropped because they are the whole
+    loop-prevention signal: "I keep calling this with a password field" is
+    what an agent needs to read back, and it needs no value to say it.
 
     A journal failure must not turn a successful call into a failed one, nor a
     refusal into a success: the envelope is returned either way, and the write
@@ -1855,7 +1909,8 @@ def _journalled(ctx: ToolContext, name: str, args: dict[str, Any],
     """
     try:
         journal.record(ctx.conn, engagement_id=ctx.engagement.id,
-                       run_id=ctx.run_id, tool=name, args=args, why=why,
+                       run_id=ctx.run_id, tool=name,
+                       args=args if validated else _shape(args), why=why,
                        env=env, blobs=ctx.blobs, actor=ctx.actor)
     except Exception:  # noqa: BLE001
         _log.exception("could not journal %s; the call itself stands", name)
