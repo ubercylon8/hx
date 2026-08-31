@@ -1606,7 +1606,20 @@ def test_the_order_is_the_published_one():
 def test_an_unregistered_name_is_refused_and_still_journalled(tool_ctx):
     env = dispatch.dispatch(tool_ctx, "nothing.at.all", {})
     assert (env.outcome, env.reason) == ("refused", "not_registered")
-    assert _actions(tool_ctx.conn) == [("nothing.at.all", "refused: not_registered")]
+    rows = _actions(tool_ctx.conn)
+    # The row names the tool that does NOT exist -- that is how an agent
+    # looping on a name it invented becomes visible.
+    #
+    # The summary is asserted by PARTS rather than as one string. It used to
+    # be `== "refused: not_registered"`, and Task 4's fix round made
+    # `journal.summarise` append a refusal's detail -- because a bare
+    # `bad_args` sends an agent round the same loop, which is what this table
+    # exists to break. Both changes are right and the exact-string assertion
+    # was what stood between them. The detail reaching the journal is now
+    # itself worth asserting, so it is.
+    assert len(rows) == 1 and rows[0][0] == "nothing.at.all"
+    assert rows[0][1].startswith("refused: not_registered")
+    assert "checks.list" in rows[0][1]
 
 
 def test_a_halt_stops_a_mutating_tool(tool_ctx, a_tool):

@@ -131,3 +131,31 @@ def engagement(tmp_path):
     eng = eng_mod.create(tmp_path / "e", cfg, author="test")
     yield eng
     eng.db.close()
+
+
+@pytest.fixture
+def tool_ctx(engagement):
+    """A ToolContext over a throwaway engagement, with no run and no session.
+
+    `run_id` is None because a fresh process has no open run, and `session` is
+    None because nothing in Plan A needs egress -- which is exactly the state
+    `needs_egress` tools are refused against.
+
+    `engagement.db`'s `row_factory` is reset to the sqlite3 default (a plain
+    tuple) before use. `db_mod.connect` sets it to `sqlite3.Row`, but
+    `test_tools_dispatch.py` compares a `fetchall()` result to a literal list
+    of tuples, and every Task 6-11 handler in this plan indexes a fetched row
+    positionally (`row[0]`, `row[1]`, ...), never by column name. `Row` and a
+    plain tuple both support positional indexing, so nothing downstream needs
+    `Row`; only this fixture's own equality-against-a-tuple tests do, and
+    `hx.engagement.create` has finished its own row reads by the time this
+    fixture receives `eng`, so resetting it here is safe.
+    """
+    from hx import halt as halt_mod
+    from hx.tools import dispatch
+
+    engagement.db.row_factory = None
+    return dispatch.ToolContext(
+        engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
+        config=engagement.config,
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
