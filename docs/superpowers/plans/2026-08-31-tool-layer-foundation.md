@@ -1031,10 +1031,35 @@ def test_the_why_is_stored_verbatim(engagement):
     assert _row(engagement.db, engagement.id)[4] == "mapping the checkout flow"
 ```
 
-If `tests/conftest.py` has no `engagement` fixture, add one there that builds a
-throwaway engagement in `tmp_path` via `hx.engagement.create` with a minimal
-`Config`; follow the pattern `tests/test_halt.py` already uses for the same
-need, and reuse its fixture if one exists rather than writing a second.
+`tests/conftest.py` has no `engagement` fixture yet — it has `engagement_conn`
+(an in-memory connection with no config, no blob store and no root). Add this
+one beside it. **`tests/test_halt.py` defines a LOCAL fixture also called
+`engagement` that returns a `(root, conn)` tuple**; a local fixture wins over
+conftest, so that file is unaffected, but the collision is worth the docstring.
+
+```python
+@pytest.fixture
+def engagement(tmp_path):
+    """A throwaway engagement on disk: config, database and blob store.
+
+    Returns `hx.engagement.Engagement`, NOT the `(root, conn)` tuple
+    `tests/test_halt.py` defines under this same name. A local fixture wins
+    over conftest, so that file keeps its own; the two shapes are worth
+    knowing about before reaching for either.
+
+    `staging` rather than `production` because nothing here sends a request
+    and the stricter profile would only make a future egress test harder to
+    write than it needs to be.
+    """
+    from hx import config as config_mod
+    from hx import engagement as eng_mod
+
+    cfg = config_mod.Config(name="t", client="T", safety_profile="staging",
+                            scope_include=["https://app.test/*"])
+    eng = eng_mod.create(tmp_path / "e", cfg, author="test")
+    yield eng
+    eng.db.close()
+```
 
 - [ ] **Step 2: Run it and watch it fail**
 
