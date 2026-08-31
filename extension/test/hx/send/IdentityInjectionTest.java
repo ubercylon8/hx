@@ -295,6 +295,16 @@ public class IdentityInjectionTest {
         // The host is IN SCOPE -- authorised() includes it -- so this refusal
         // is the origins rule and nothing else. Scope and origins answer
         // different questions and both have to say yes.
+        //
+        // AND THIS REGISTRATION IS WHAT PRODUCTION NOW SENDS. F1 of the
+        // whole-branch review measured that it was not: `origins` was the
+        // engagement's whole `scope.include`, so a registration naming one
+        // host while another was in scope could not arise, and this test
+        // proved a rule against a configuration the Python side could never
+        // build. Since the 2026-08-30 amendment to spec s5,
+        // `hx.scan._identity_bracket` registers the single host its liveness
+        // canary is addressed to, which is exactly the shape rig.registerUser()
+        // builds -- so what this refuses is the ordinary multi-host scan.
         check("the gate allowed the host", rig.gate.calls == 1);
         check("a host outside the identity's origins is an error (got "
               + reply.get("t") + ")", "error".equals(reply.get("t")));
