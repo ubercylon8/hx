@@ -1360,9 +1360,10 @@ def _declare_identity(root, ident, monkeypatch, *, value="session=abc",
                       export=True):
     """Give the engagement at `root` one identity and scan under it.
 
-    The scope becomes a URL PREFIX rather than whatever the fixture carries,
-    because that list is what the run registers as the identity's `origins`
-    and a pattern with no host in it bounds the credential to nothing at all.
+    The scope becomes a URL PREFIX rather than whatever the fixture carries.
+    It stopped being the identity's `origins` in branch fix A -- the
+    credential is bounded to the one host the canary proves -- but scope is
+    still what decides whether a probe may be sent at all.
     `record_scope_version` is called because `engagement.open_` refuses a
     store whose config and newest scope version have diverged, and every
     `hx scan` below opens the store for itself.
@@ -1461,6 +1462,102 @@ def test_an_unexported_identity_variable_is_reported_as_a_result_and_not_a_trace
     assert row[0] == "error", tuple(row)
     assert "IdentityError" in row[3]
     assert "HX_ID_USER" in row[3]
+
+
+def test_an_unwritable_credential_is_reported_as_a_result_and_not_a_traceback(
+        engagement_with_surface, monkeypatch):
+    """F5 OF THE WHOLE-BRANCH REVIEW, FIRST ARM. `BridgeServer.
+    register_identity`'s own docstring tells its caller it "has two exception
+    types to handle, not one" -- `BridgeError` and `codec.FrameError` --
+    `_IdentityBracket.start` deliberately wraps neither, and `hx scan` caught
+    neither. So a credential with an internal newline, which is what a token
+    pasted out of a file looks like, reached the operator as a traceback with
+    the sentence `codec._refuse_unwritable` had already written for them at
+    the bottom of it.
+
+    THE VALUE IS NOWHERE IN THE OUTPUT, and that is the same rule the refusal
+    itself follows: `_refuse_unwritable` never quotes the character or the
+    text it came from, because a `FrameError`'s message is logged by whatever
+    catches it. `X-Smuggled` is the half of this credential that would show up
+    if it did.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    class _BuildsTheBody(_SessionBridge):
+        """`_SessionBridge`, plus the one statement that raises this.
+
+        The real `BridgeServer.register_identity` builds the frame body with
+        `codec.identity_body(...)` BEFORE it writes anything to the socket,
+        and that call is where an unwritable credential is refused. Every
+        other double in this suite skips it, so the whole chain from
+        `HX_ID_USER` to the operator's terminal had no test that could see
+        this exception at all -- which is how it went unhandled.
+        """
+
+        def register_identity(self, resolved, *, origins):
+            cli.codec_mod.identity_body(resolved.id, resolved.generation,
+                                        resolved.header, resolved.value,
+                                        origins)
+            super().register_identity(resolved, origins=origins)
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch,
+                      value="session=abc\r\nX-Smuggled: yes")
+    _stub_session(monkeypatch, bridge=_BuildsTheBody())
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code != 0, result.output
+    assert result.exception is None or isinstance(result.exception,
+                                                  SystemExit), (
+        "the refusal escaped as an exception: an operator reads a traceback "
+        f"instead of a result -- {result.exception!r}")
+    assert "carriage return or line feed" in result.output, result.output
+    assert "Traceback" not in result.output
+    assert "X-Smuggled" not in result.output, (
+        "the credential reached the operator's terminal: " + result.output)
+
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        row = eng.db.execute(
+            "SELECT status, stop_reason FROM run WHERE kind='scan'").fetchone()
+    finally:
+        eng.db.close()
+    assert row[0] == "error", tuple(row)
+    assert "X-Smuggled" not in row[1], (
+        "the credential reached the run row, which the report renders")
+
+
+def test_a_peer_that_refuses_the_identity_frame_is_a_result_too(
+        engagement_with_surface, monkeypatch):
+    """F5'S OTHER ARM, AND WHY ONE HANDLER COVERS BOTH. `register_identity`
+    raises `BridgeError` when the peer refuses the frame or is gone -- a
+    `bad_identity`, a `stale_generation`, a socket that closed. From the
+    operator's side that is the same outcome as the arm above: the identity
+    could not be registered, so no probe was issued under it and the run
+    stopped. What differs is the message, and it is the message that is kept
+    intact.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    class _RefusingBridge(_SessionBridge):
+        def register_identity(self, resolved, *, origins):
+            raise cli.bridge_mod.BridgeError(
+                "peer refused identity: bad_identity: generation must be >= 1",
+                error_class="bad_identity")
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch)
+    _stub_session(monkeypatch, bridge=_RefusingBridge())
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code != 0, result.output
+    assert result.exception is None or isinstance(result.exception,
+                                                  SystemExit), (
+        "the peer's refusal escaped as an exception -- "
+        f"{result.exception!r}")
+    assert "bad_identity" in result.output, (
+        "the peer's own refusal class was lost: " + result.output)
+    assert "Traceback" not in result.output
 
 
 def test_a_halted_scan_leaves_the_run_row_error_and_dead(

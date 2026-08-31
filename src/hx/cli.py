@@ -25,6 +25,8 @@ from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
 from hx import session as session_mod
+from hx.bridge import codec as codec_mod
+from hx.bridge import server as bridge_mod
 from hx.checks import registry
 from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
@@ -698,6 +700,44 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # own row still closes `error` (`scan.run`'s `except
             # BaseException`, unconditionally), so nothing here masks a
             # scan that sent no probe or canary as one that succeeded.
+            raise click.ClickException(str(exc)) from exc
+        except (bridge_mod.BridgeError, codec_mod.FrameError) as exc:
+            # THE TWO `register_identity` FLAGS FOR ITS CALLER, AND NEITHER
+            # HAD ONE. F5 of the whole-branch review. That method's docstring
+            # says in as many words that the caller "has two exception types
+            # to handle, not one", `_IdentityBracket.start` deliberately
+            # wraps neither -- correctly, since each says what actually
+            # happened -- and this command caught neither. So a credential
+            # with an internal newline or a smart quote pasted out of a file
+            # reached the operator as a traceback, with the sentence
+            # `codec._refuse_unwritable` had already written for them at the
+            # bottom of it. The same defect commit a88388d fixed for
+            # `IdentityDead` and 20b0a64 for `IdentityError`, two doors over.
+            #
+            # BOTH ARMS, ONE HANDLER, because from the operator's side they
+            # are one outcome: the identity could not be registered, so no
+            # probe was issued under it and the run stopped. The message is
+            # what tells them which -- `FrameError` names the character class
+            # and why such a value is refused rather than escaped, and
+            # `BridgeError` names the peer's own refusal class.
+            #
+            # THE MESSAGE INTACT, and it holds no credential: every branch of
+            # `_refuse_unwritable` refuses to quote the character or the text
+            # it came from (spec section 5 -- the credential is logged on
+            # neither side, and a caught `FrameError`'s message is logged by
+            # whatever catches it), and `register_identity`'s `BridgeError`
+            # quotes the peer's `class` and `detail`, which the extension
+            # builds from the identity id and the host and never from the
+            # value. A traceback would have leaked nothing either -- Python
+            # prints source lines, not values -- so this is about the
+            # operator's experience of an ordinary mistake, not about a leak.
+            #
+            # NOT NARROWER THAN `BridgeError`, deliberately. Every other
+            # bridge failure a scan can suffer is already translated before
+            # it gets here: `ProbeSender` turns one into a `ProbeRefused`
+            # (`probe.py`'s `except BridgeError`), which the runner records
+            # as an `inconclusive` row. What is left to arrive raw is the
+            # identity registration, which is the one this handler is for.
             raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
