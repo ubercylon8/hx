@@ -41,8 +41,23 @@ jobs:
       # subset: without it every `import burp.api.montoya.*` is a javac error and
       # ZERO summary lines print, which a naive `grep -q FAIL` would read as
       # success. The count assertions below are the second half of that guard.
+      # `shell: bash` for `-o pipefail`, and it is not stylistic. GitHub's
+      # default for `run:` is `bash -e {0}` with NO pipefail, so
+      # `test.sh | tee` takes TEE's exit status -- a suite that failed would
+      # have left this step GREEN. The assertion below happens to catch the
+      # common case (a failure prints "N FAILURE(S)" rather than "ALL PASS",
+      # so the suite count drops), but that is the guard working by accident:
+      # any failure that did not move the three numbers would have passed
+      # silently, and the step's own exit status meant nothing.
+      #
+      # `2>&1` because the counts below must measure the SAME STREAM the
+      # numbers were measured against. They were taken locally from
+      # `test.sh > file 2>&1`, and this step captured stdout only, so CI saw
+      # 2527 where the assertion expected 2529 -- two lines that go to stderr.
+      # The gate was measuring a different thing than the number it asserted.
       - name: Extension suite
-        run: MONTOYA_JAR=/tmp/montoya-api.jar ./extension/test.sh | tee /tmp/ext.out
+        shell: bash
+        run: MONTOYA_JAR=/tmp/montoya-api.jar ./extension/test.sh 2>&1 | tee /tmp/ext.out
       # A suite that silently stops running half its assertions still exits 0 and
       # still prints ALL PASS for whatever did run. These three numbers are the
       # ones a shrinking suite changes, and they were measured against this commit
