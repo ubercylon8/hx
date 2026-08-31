@@ -299,6 +299,65 @@ def test_every_constraint_keyword_is_enforced_for_every_applicable_type():
                 sch["items"] = {"type": "string"}
             # This should not raise.
             schema.check_schema(sch)
+            # Also check that check_schema raises SchemaError, never any other exception,
+            # for a set of hostile values for every keyword.
+            hostile = [5, "five", None, True, [1], {"a": 1}]
+            for bad_value in hostile:
+                try:
+                    # Build a schema with this keyword and bad value.
+                    if keyword == "type":
+                        sch = {"type": bad_value}
+                    elif keyword == "enum":
+                        sch = {"type": "string", "enum": bad_value}
+                    elif keyword == "properties":
+                        sch = {"type": "object", "additionalProperties": False,
+                               "properties": bad_value}
+                    elif keyword == "required":
+                        sch = {"type": "object", "additionalProperties": False,
+                               "properties": {}, "required": bad_value}
+                    elif keyword == "additionalProperties":
+                        sch = {"type": "object", "additionalProperties": bad_value}
+                    elif keyword == "items":
+                        sch = {"type": "array", "items": bad_value}
+                    elif keyword == "minimum":
+                        sch = {"type": "integer", "minimum": bad_value}
+                    elif keyword == "maximum":
+                        sch = {"type": "integer", "maximum": bad_value}
+                    elif keyword == "minLength":
+                        sch = {"type": "string", "minLength": bad_value}
+                    elif keyword == "maxLength":
+                        sch = {"type": "string", "maxLength": bad_value}
+                    schema.check_schema(sch)
+                except schema.SchemaError:
+                    # Expected: SchemaError for invalid value.
+                    pass
+                except Exception as e:
+                    # Fail if any other exception is raised.
+                    pytest.fail(
+                        f"check_schema raised {type(e).__name__} for {keyword}={bad_value!r}, "
+                        f"expected SchemaError: {e}"
+                    )
+
+
+def test_check_schema_raises_schema_error_for_non_string_type():
+    # Finding A: type must be a string; non-string types would raise TypeError
+    # when hashed in the membership test. Must raise SchemaError instead.
+    with pytest.raises(schema.SchemaError, match="must be of type"):
+        schema.check_schema({"type": [1]})
+    with pytest.raises(schema.SchemaError, match="must be of type"):
+        schema.check_schema({"type": {"a": 1}})
+
+
+def test_property_names_and_required_members_must_be_strings():
+    # Finding B: property names and required members are compared against
+    # JSON object keys, which are always strings. Non-string names won't match
+    # and become permanently dead constraints, and the schema is not valid JSON.
+    with pytest.raises(schema.SchemaError, match="must be a string"):
+        schema.check_schema({"type": "object", "additionalProperties": False,
+                             "properties": {1: {"type": "string"}}})
+    with pytest.raises(schema.SchemaError, match="must be a string"):
+        schema.check_schema({"type": "object", "additionalProperties": False,
+                             "properties": {}, "required": [1]})
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -406,6 +465,12 @@ def check_schema(obj: Any, *, where: str = "params") -> None:
             f"{where}: a schema must declare a type; {where} gives _validate "
             "nothing to dispatch on, so every constraint in it is inert"
         )
+    # Check type's value type BEFORE using it as a dict key to avoid TypeError.
+    if not isinstance(type_, str):
+        raise SchemaError(
+            f"{where}: 'type' value must be of type {str!r}, "
+            f"got {type(type_).__name__!r}"
+        )
     if type_ not in _TYPES:
         raise SchemaError(f"{where}: unknown type {type_!r}")
     # Validate each constraint keyword: applicability to this type and value type.
@@ -455,8 +520,20 @@ def check_schema(obj: Any, *, where: str = "params") -> None:
             )
         props = obj.get("properties") or {}
         for key, sub in props.items():
+            # Property names are compared against JSON object keys, which are always strings.
+            if not isinstance(key, str):
+                raise SchemaError(
+                    f"{where}: property name {key!r} must be a string "
+                    "(JSON object keys are always strings)"
+                )
             check_schema(sub, where=f"{where}.{key}")
         for key in obj.get("required") or ():
+            # Required member names are compared against JSON object keys, which are always strings.
+            if not isinstance(key, str):
+                raise SchemaError(
+                    f"{where}: required member {key!r} must be a string "
+                    "(JSON object keys are always strings)"
+                )
             if key not in props:
                 raise SchemaError(
                     f"{where}: required names {key!r}, which has no property")

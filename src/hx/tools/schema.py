@@ -78,6 +78,12 @@ def check_schema(obj: Any, *, where: str = "params") -> None:
             f"{where}: a schema must declare a type; {where} gives _validate "
             "nothing to dispatch on, so every constraint in it is inert"
         )
+    # Check type's value type BEFORE using it as a dict key to avoid TypeError.
+    if not isinstance(type_, str):
+        raise SchemaError(
+            f"{where}: 'type' value must be of type {str!r}, "
+            f"got {type(type_).__name__!r}"
+        )
     if type_ not in _TYPES:
         raise SchemaError(f"{where}: unknown type {type_!r}")
     # Validate each constraint keyword: applicability to this type and value type.
@@ -127,8 +133,20 @@ def check_schema(obj: Any, *, where: str = "params") -> None:
             )
         props = obj.get("properties") or {}
         for key, sub in props.items():
+            # Property names are compared against JSON object keys, which are always strings.
+            if not isinstance(key, str):
+                raise SchemaError(
+                    f"{where}: property name {key!r} must be a string "
+                    "(JSON object keys are always strings)"
+                )
             check_schema(sub, where=f"{where}.{key}")
         for key in obj.get("required") or ():
+            # Required member names are compared against JSON object keys, which are always strings.
+            if not isinstance(key, str):
+                raise SchemaError(
+                    f"{where}: required member {key!r} must be a string "
+                    "(JSON object keys are always strings)"
+                )
             if key not in props:
                 raise SchemaError(
                     f"{where}: required names {key!r}, which has no property")
