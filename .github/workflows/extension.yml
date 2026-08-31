@@ -48,12 +48,21 @@ jobs:
       # ones a shrinking suite changes, and they were measured against this commit
       # rather than copied from a report. Raise them deliberately when the suite
       # grows; never lower them to make a build green.
+      #
+      # THE SUITE COUNT IS AN EQUALITY AND THE OTHER TWO ARE FLOORS, on purpose:
+      # a suite that vanishes is the failure this guard exists for, and `-ge`
+      # would not see it. The cost is that a branch which legitimately ADDS a
+      # suite trips the same wire -- which is what happened here. 13/2330/2352
+      # was measured when this file was written; the identity branch added two
+      # Java suites and 174 assertions before this branch merged, so the numbers
+      # below were re-measured against `master` at 56b39c3. A count that is a
+      # fact about the tree has to be updated in the commit that changes it.
       - name: Assert the suite did not shrink
         run: |
           suites=$(grep -ac 'ALL PASS' /tmp/ext.out)
           oks=$(grep -ac '^  ok' /tmp/ext.out)
           lines=$(wc -l < /tmp/ext.out)
           echo "suites=$suites oks=$oks lines=$lines"
-          [ "$suites" -eq 13 ]   || { echo "::error::expected 13 ALL PASS, got $suites"; exit 1; }
-          [ "$oks" -ge 2330 ]    || { echo "::error::expected >=2330 ok lines, got $oks"; exit 1; }
-          [ "$lines" -ge 2352 ]  || { echo "::error::expected >=2352 output lines, got $lines"; exit 1; }
+          [ "$suites" -eq 16 ]   || { echo "::error::expected 16 ALL PASS, got $suites"; exit 1; }
+          [ "$oks" -ge 2504 ]    || { echo "::error::expected >=2504 ok lines, got $oks"; exit 1; }
+          [ "$lines" -ge 2529 ]  || { echo "::error::expected >=2529 output lines, got $lines"; exit 1; }
