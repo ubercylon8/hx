@@ -1705,20 +1705,31 @@ def _limits(conn, engagement_id) -> list[str]:
                        "nothing this time; on its own it is not a statement "
                        "that a previously reported issue is gone.")
         else:
+            # "HOWEVER MANY TIMES IT IS RE-SCANNED AND WHATEVER THOSE SCANS
+            # SEE" IS GONE FROM THIS SENTENCE, and it is the last forward
+            # claim in the section. It was true while `_retirable` honoured
+            # no active check at all; it is now false of a re-scan issued
+            # under a session hx can prove live, and it pointed a client away
+            # from the one action that would work. What is left is a claim
+            # about THIS report and the scans behind it, which is what the
+            # store can answer.
             out.append("- **An active finding is never automatically marked "
                        f"as fixed.** The {len(active)} active check(s) in "
                        f"this build ({_names(active)}) re-issue requests, so "
                        "a later scan does see the application as it is now — "
                        "but no scan recorded here proved it was seeing the "
-                       "view your users are in, so hx never records a "
-                       "finding from one of these checks as no longer "
-                       "observed, however many times it is re-scanned and "
-                       "whatever those scans see. **Verify an active finding "
-                       "against the fixed application yourself before "
-                       "closing it.** Where the Coverage table shows one of "
-                       "these checks as `clean`, that means it ran and found "
-                       "nothing this time; it is not a statement that a "
-                       "previously reported issue is gone.")
+                       "view your users are in, so no finding from one of "
+                       "these checks is recorded here as no longer observed, "
+                       "whatever those scans saw. Re-running this assessment "
+                       "as it stands will not change that: hx closes an "
+                       "active finding only on a scan issued under a session "
+                       "it has proved live, and none of the scans behind "
+                       "this report was. **Verify an active finding against "
+                       "the fixed application yourself before closing it.** "
+                       "Where the Coverage table shows one of these checks "
+                       "as `clean`, that means it ran and found nothing this "
+                       "time; it is not a statement that a previously "
+                       "reported issue is gone.")
         # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
         # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
         # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.

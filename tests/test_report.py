@@ -2769,6 +2769,16 @@ def test_the_limits_bullet_is_conditional_on_a_proven_identity(
     assert "Every probe was sent unauthenticated" in anonymous
     assert "An active finding is never automatically marked as fixed" in anonymous
     assert "ran under a session" not in anonymous
+    # AND THE ANONYMOUS BULLET MAKES NO CLAIM ABOUT A FUTURE SCAN. It read
+    # "however many times it is re-scanned and whatever those scans see" --
+    # true while `_retirable` honoured no active check, false of a re-scan
+    # under a session hx can prove live, and it pointed a client away from
+    # the one action that would work. What replaced it is a claim about the
+    # scans BEHIND THIS REPORT, which the store can answer.
+    assert "however many times it is re-scanned" not in anonymous
+    assert ("hx closes an active finding only on a scan issued under a "
+            "session it has proved live, and none of the scans behind this "
+            "report was") in anonymous
 
     proven = report.render(**report_env_proven)
     assert "Every probe was sent unauthenticated" not in proven, (
