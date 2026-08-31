@@ -54,3 +54,41 @@ def test_the_report_is_a_read_and_survives_a_halt(tool_ctx):
     # A halted engagement is exactly when someone wants the report.
     tool_ctx.halt.halt("stop")
     assert dispatch.dispatch(tool_ctx, "report.render", {}).outcome == "ok"
+
+
+def test_the_report_is_rendered_with_the_blob_store_not_without_it(tool_ctx):
+    """`report.render` passes `ctx.blobs` through, proved rather than assumed.
+
+    The insertion-points section is derived at render time from the captured
+    request bytes -- `report._insertion_coverage` reads `blobs.get(req_blob)`
+    -- so it is the one part of the document that vanishes if the blob store
+    does not arrive. On the empty fixture the other tests use,
+    `render(blobs=...)` and `render(blobs=None)` are byte-identical: writing
+    `blobs=None` in the handler would silently drop insertion coverage from
+    every real engagement and change nothing they assert.
+
+    `_insertion_coverage`'s own docstring records this exact defect landing
+    once already -- a bare `except Exception` swallowed `blobs.get`'s
+    `AttributeError` for a `blobs=None` caller, and fourteen tests went on
+    passing.
+    """
+    digest, _ = tool_ctx.blobs.put(
+        b"GET /search?q=hello&page=2 HTTP/1.1\r\nHost: app.test\r\n\r\n")
+    tool_ctx.conn.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status) VALUES('r-1',?,'browse','staging',1,'completed')",
+        (tool_ctx.engagement.id,))
+    tool_ctx.conn.execute(
+        "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method, url,"
+        " status, req_blob) VALUES('x-1','r-1','proxy','ok',1,'GET',"
+        "'https://app.test/search?q=hello&page=2',200,?)", (digest,))
+    tool_ctx.conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, query_key_set, kind, discovered_by,"
+        " normaliser_version, exemplar_exchange_id)"
+        " VALUES('s-1',?,'GET','https','app.test',443,'/search','page,q',"
+        "'idempotent_read','proxy',2,'x-1')", (tool_ctx.engagement.id,))
+
+    out = dispatch.dispatch(tool_ctx, "report.render", {}).result["markdown"]
+    assert "### Insertion points" in out
+    assert "`query`" in out
