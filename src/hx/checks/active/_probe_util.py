@@ -367,14 +367,31 @@ def verdict(candidates, gaps, *,
 
     A CANDIDATE STILL WINS OVER A GAP: what was found was found, and another
     probe on this surface coming back without an answer does not un-find it.
-    AND A FINDING STILL CARRIES NO `considered`, which is the conservative
-    half and is deliberate: a check that found one of three issue types does
-    not retire the other two here, so a fix confirmed on this surface waits
-    for the scan on which the check comes back clean. That under-claims. The
-    over-claiming version -- putting `examined` on the finding branch -- is
-    the shape that let one check's finding retire that check's OTHER issue
-    types on the same surface, and nothing about a proven session makes it
-    sound.
+    AND A FINDING STILL CARRIES NO `considered`, which under-claims: a check
+    that found one of three issue types does not retire the other two here,
+    so a fix confirmed on this surface waits for the scan on which the check
+    comes back wholly clean. THE REASON IS NARROWER THAN AN EARLIER DRAFT OF
+    THIS PARAGRAPH CLAIMED, and Task 8's own review is why this note exists.
+    It is not that putting `examined` on the finding branch "over-claims" in
+    some general sense -- that is what `_http.verdict` does today,
+    deliberately, at `_http.py:168-169` (`considered=() if evidence.gaps else
+    considered`), and `_mark_unobserved`'s own docstring (`scan.py:1760-1767`)
+    names the OPPOSITE of that -- retiring on evidence nobody read -- as the
+    defect an earlier task fixed, not this shape.
+
+    THE REAL HAZARD IS ABOUT THIS FUNCTION'S BRANCH ORDER. The `if
+    candidates` return above answers BEFORE `gaps` is even looked at (the
+    `if gaps` below it, unreached once a candidate is found), so an
+    unconditional `examined` on the finding branch would retire on a surface
+    where some of this check's own probes were refused -- gaps this function
+    has not yet checked when the finding branch answers. `_http.verdict`'s
+    guard is the correct narrow fix for exactly that hazard, and it is what
+    this branch should become if a later round decides a partially-fixed
+    surface ought to retire the same way the passive corpus already does:
+    `considered=() if gaps else examined`. THIS ROUND DOES NOT MAKE THAT
+    CHANGE -- narrowing the guard here changes what retires on a gapless
+    surface, which is a branch-level decision about what this build's active
+    corpus retires, not a comment fix.
 
     `unprobed` IS A FOURTH FACT AND IT IS NOT A GAP. A gap is a probe that
     was SENT and came back without answering; `unprobed` is the check saying

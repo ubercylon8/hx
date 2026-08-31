@@ -2791,6 +2791,14 @@ def test_the_limits_bullet_is_conditional_on_a_proven_identity(
             "engagement where `scan._retirable` closes them")
     assert ("An active finding is marked as no longer observed only where it "
             "was re-tested under a session proved live") in proven
+    # FINDING 1 OF THE TASK 8 REVIEW: the coverage cost of a partially fixed
+    # surface was disclosed nowhere on the page. A surface where an active
+    # check reports any finding retires nothing on that surface -- not even
+    # the finding's own neighbours -- because `_probe_util.verdict`'s finding
+    # branch carries no `considered` at all, and a client reading only this
+    # bullet had no way to know that.
+    assert ("this build's active checks retire nothing on a surface they "
+            "reported any finding on this scan") in proven
     # THE WARNING SURVIVES THE REWRITE. Retirement being possible is not a
     # reason to stop telling a client to check for themselves, and this is
     # the sentence a reader acts on.
