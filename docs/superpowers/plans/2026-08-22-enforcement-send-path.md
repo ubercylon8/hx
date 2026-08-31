@@ -24436,6 +24436,17 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
     it. An agent finding is not a lesser one, but it is a differently-sourced
     one, and section 12 renders the distinction.
 
+    `created_by` IS ALSO NOT IN THE `DO UPDATE` CLAUSE, and the Task 9 review
+    asked the obvious question: if a check and an agent produced the same
+    dedupe key, who would win? The first writer, since the clause names what
+    moves and this is not among it. But the question is moot by construction,
+    which is the better answer: `dedupe_key`'s first part is `type_`, which is
+    the CHECK'S ID for a check and the literal `agent` for an agent
+    (`hx.tools.impl.finding.AGENT_TYPE`, the one place that prefix is
+    spelled). The two vocabularies cannot meet unless a check is ever named
+    `agent` -- which is the single thing to refuse if the corpus grows a
+    naming rule, and until then the only way this could stop being true.
+
     WHAT AN UPSERT MUST NOT TOUCH: `status`, and `first_seen_run`. An operator
     who marked something `false_positive` has made a judgement the next scan
     has no standing to reverse, and the run something was FIRST seen in is a
