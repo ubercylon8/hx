@@ -79,12 +79,14 @@ def _identity(**over) -> config_mod.Identity:
 def _declare(rig, monkeypatch, ident=None) -> None:
     """Give this run an identity, and the credential to resolve it with.
 
-    THE SCOPE IS NOT TOUCHED. `scope.include` is what `scan.run` registers as
-    the identity's `origins`, the extension reads the host out of each entry
-    (`Sender.hostOf`), and the rig's own entry is `http://127.0.0.1:<port>/*`
-    -- the target and nothing else. Rewriting it here would either widen where
-    the credential may be applied or, if it lost its host, bound it to nothing
-    and turn every canary into an `identity_origin` refusal.
+    THE SCOPE IS NOT TOUCHED, and since the 2026-08-30 amendment to spec
+    section 5 it is not what bounds the credential either: `scan.run`
+    registers the identity's `origins` as the single host of the surface its
+    liveness canary is addressed to, which here is `127.0.0.1` and can be
+    nothing else (the rig's target refuses any address outside 127.0.0.0/8).
+    Scope still decides whether a probe may be SENT, and the rig's own entry
+    is `http://127.0.0.1:<port>/*`, so rewriting it here would change what
+    this suite is allowed to reach.
 
     The extension is NOT re-configured either: identity is its own frame
     (s5), precisely so a credential can be registered without re-opening

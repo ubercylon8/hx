@@ -1601,7 +1601,10 @@ def _limits(conn, engagement_id) -> list[str]:
         # it back for one case: `hx.scan._retirable` honours an active
         # check's `considered` for a run whose LIVENESS CANARY proved the
         # session, which is a body-signature match at a declared address and
-        # is exactly the proof a 200 login page cannot produce. So on an
+        # is exactly the proof a 200 login page cannot produce -- and, since
+        # branch fix A, only for a row whose probes went to the origin that
+        # canary reached, because a canary proves one origin and a run may
+        # span several. So on an
         # engagement whose scans ran anonymously the residual is a coverage
         # gap and closes nothing; on one whose scans proved their session it
         # is closed at the source rather than tolerated. The pair of bullets

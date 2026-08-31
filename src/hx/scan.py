@@ -1095,6 +1095,13 @@ class _IdentityBracket:
         # spanning several hosts proves its session on this one: an identity
         # declares ONE `liveness` block (section 4), so its proof is per
         # identity and not per host.
+        #
+        # AND THAT IS NOW ENFORCED RATHER THAN MERELY OBSERVED. This note
+        # stood here through the whole branch while `_retirable` honoured a
+        # `proven` run's offer from every host it probed; F1 of the branch
+        # review is what turned the observation into a gate. `run` reads this
+        # triple back through `target` and retires only where a row's own
+        # origin equals it.
         self._target = (target[2], target[3], target[4])
         # Section 5: `origins` bounds where the credential may be applied.
         # It defaults to the ONE host `target` names -- see
