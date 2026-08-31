@@ -47,6 +47,15 @@ dependencies.**
 - Python style follows the repo: module docstring first (no path-comment
   header), docstrings that argue rather than describe, `from __future__ import
   annotations`.
+- **A block describing a future APPEND to a file an earlier task creates must
+  not carry a `# path` marker.** `tests/test_plan_matches_repo.py` skips a
+  marked block only while its file does not exist; once an earlier task creates
+  the file, a marked block describing content that has not been written yet is
+  compared and fails — reporting the later task's name while the earlier task
+  is what just landed. Such blocks are written unmarked (first line is code,
+  never a comment) and the prose names the file instead. This applies to
+  `src/hx/tools/impl/run.py` (Task 7), `src/hx/tools/impl/__init__.py`
+  (Task 11), `src/hx/store/records.py` (Task 9) and `src/hx/cli.py` (Task 11).
 - Run the suite with `.venv/bin/pytest -q`. It must stay green: the baseline is
   **1649 passed, 1 skipped, 44 deselected**.
 
@@ -2347,16 +2356,16 @@ Expected: FAIL — `refused / not_registered`
 - [ ] **Step 3: Append to `src/hx/tools/impl/run.py`**
 
 ```python
-# src/hx/tools/impl/run.py -- resume, appended by Task 7
-#: The brief is read when a context window is already under pressure, so it is
-#: capped rather than proportional to the engagement. Everything except the
-#: recent actions is a COUNT: a brief that grew with the store would be
-#: unreadable in exactly the situation it exists for.
 RECENT_LIMIT = 20
 
 
 def resume(ctx) -> dict:
     """The purpose-built recovery brief, section 8.
+
+    `RECENT_LIMIT` caps this brief rather than letting it grow with the
+    engagement. It is read when a context window is already under pressure, so
+    everything except the recent actions is a COUNT: a brief proportional to
+    the store would be unreadable in exactly the situation it exists for.
 
     "`run.journal` and `run.resume` exist because a long run compacts. Without
     them the agent re-scans surfaces it already covered and cannot tell what it
@@ -3321,7 +3330,6 @@ asserted once every Plan A tool is registered, which is why they live here.
 - [ ] **Step 1: Append the imports to `src/hx/tools/impl/__init__.py`**
 
 ```python
-# src/hx/tools/impl/__init__.py -- the imports, appended by Task 11
 from . import checks, finding, report, run, surface  # noqa: F401
 ```
 
