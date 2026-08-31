@@ -108,3 +108,26 @@ def scan_env_disabled():
     env = _scan_env(passive=False)
     yield env
     env["conn"].close()
+
+
+@pytest.fixture
+def engagement(tmp_path):
+    """A throwaway engagement on disk: config, database and blob store.
+
+    Returns `hx.engagement.Engagement`, NOT the `(root, conn)` tuple
+    `tests/test_halt.py` defines under this same name. A local fixture wins
+    over conftest, so that file keeps its own; the two shapes are worth
+    knowing about before reaching for either.
+
+    `staging` rather than `production` because nothing here sends a request
+    and the stricter profile would only make a future egress test harder to
+    write than it needs to be.
+    """
+    from hx import config as config_mod
+    from hx import engagement as eng_mod
+
+    cfg = config_mod.Config(name="t", client="T", safety_profile="staging",
+                            scope_include=["https://app.test/*"])
+    eng = eng_mod.create(tmp_path / "e", cfg, author="test")
+    yield eng
+    eng.db.close()
