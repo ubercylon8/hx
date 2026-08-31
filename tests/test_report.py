@@ -80,7 +80,7 @@ def _sections(out) -> list[str]:
 def _run(conn, run_id="r-1", *, dropped_total=0, started_us=1,
         scope_version_id=None, ended_us=None, kind="manual",
         status="completed", identity=None, generation=None,
-        identity_state=None) -> None:
+        identity_state=None, stop_reason=None) -> None:
     """One `run` row.
 
     The three identity columns are parameters (Task 8) for the reason every
@@ -94,14 +94,24 @@ def _run(conn, run_id="r-1", *, dropped_total=0, started_us=1,
     and `manual` -- this file's long-standing default, which predates
     `hx scan` -- is not one. A fixture that left it would have made every
     identity assertion below divide by zero scans.
+
+    `stop_reason` (branch fix B) is NOT only for a run that did not finish --
+    `_unfinished_run` below is for that. `hx.scan.run` writes it on a
+    `completed` run too, whenever `_tallies` has anything to say: a scan that
+    ran to its own end with a probe or two refused along the way is still
+    `completed`, and this is the only column carrying that fact. A fixture
+    exercising `report._origin_refused_scans` needs a `completed` row that
+    still carries one, which the dedicated `status='...'`-only
+    `_unfinished_run` helper cannot produce.
     """
     conn.execute(
         "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
         " ended_us, status, dropped_total, scope_version_id, identity,"
-        " identity_generation, identity_state)"
-        " VALUES(?,'e-1',?,'staging',?,?,?,?,?,?,?,?)",
+        " identity_generation, identity_state, stop_reason)"
+        " VALUES(?,'e-1',?,'staging',?,?,?,?,?,?,?,?,?)",
         (run_id, kind, started_us, ended_us, status, dropped_total,
-         scope_version_id, identity, generation, identity_state))
+         scope_version_id, identity, generation, identity_state,
+         stop_reason))
 
 
 def _scope_version(conn, sv_id, *, sha256, effective_from_us, author="james",
@@ -2867,6 +2877,53 @@ def test_a_mixed_engagement_names_both_halves(report_env_proven):
     assert "1 of the 2 scan(s) recorded here ran under a session" in out
     assert ("The other 1 scan(s) recorded here sent every probe logged out"
             in out)
+
+
+def test_the_origin_refusal_bullet_is_conditional_on_a_refused_probe(
+        report_env_proven):
+    """BRANCH FIX B, CONCERN 1 OF BRANCH FIX A. The origins default bound an
+    identity's credential to the one host its liveness canary proves, so a
+    multi-host engagement that widens nothing loses active-check coverage on
+    every OTHER host: those probes are refused `identity_origin`, and the
+    row reads `inconclusive`. That is loud per row (the Coverage reason cell
+    names the refusal) but said nowhere as a PATTERN until this bullet --
+    S12's "a report that cannot distinguish tested-clean from never-reached
+    is worse than no report", one level up from the row.
+
+    RED WITHOUT THE FIX: before `_origin_refused_scans` and the bullet it
+    feeds existed, nothing in `_limits` read `run.stop_reason` at all, so
+    this string could not appear regardless of what happened on the run.
+    """
+    out = report.render(**report_env_proven)
+    assert "probe refused `identity_origin`" not in out, (
+        "neither scan behind this fixture had a refusal recorded, so the "
+        "bullet must not render")
+
+    conn = report_env_proven["conn"]
+    conn.execute(
+        "UPDATE run SET stop_reason="
+        "'truncated: probes refused identity_origin=3' WHERE id='r-1'")
+    out = report.render(**report_env_proven)
+    assert ("1 of the 2 scan(s) recorded here had at least one probe "
+            "refused `identity_origin`") in out
+    assert "identities.<id>.origins" in out
+    assert "config.yaml" in out
+
+
+def test_the_origin_refusal_bullet_does_not_render_for_an_anonymous_run(
+        report_env_with_blobs):
+    """A refusal that names `identity_origin` cannot arise on a run that
+    carried no identity (`Sender.decideAndIssue` only reaches that class for
+    a request bound to one), but the render guards on `under` explicitly
+    rather than trusting that implication to hold forever -- so a store a
+    future writer left inconsistent (a `kind='scan'` run, no identity, a
+    `stop_reason` naming the refusal anyway) still renders nothing here."""
+    conn = report_env_with_blobs["conn"]
+    conn.execute(
+        "UPDATE run SET kind='scan', stop_reason="
+        "'truncated: probes refused identity_origin=1' WHERE id='r-1'")
+    out = report.render(**report_env_with_blobs)
+    assert "probe refused `identity_origin`" not in out
 
 
 def test_the_identity_section_is_derived_from_the_runs(report_env_proven):

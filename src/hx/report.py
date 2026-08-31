@@ -1407,6 +1407,50 @@ def _identity_counts(conn, engagement_id) -> tuple[int, int, int]:
     return int(row[0]), int(row[1]), int(row[2])
 
 
+def _origin_refused_scans(conn, engagement_id) -> int:
+    """How many scans recorded here had at least one probe refused
+    `identity_origin` -- the extension's refusal for a request addressed to a
+    host outside the identity's bound origins.
+
+    THE SAME GROUND AS `_identity_counts`, ONE COLUMN OVER. `run.stop_reason`
+    is where that refusal already lands: `hx.scan._tallies` folds
+    `summary.refused` -- every terminal refusal class every check's sender
+    saw, across the whole run (`_spent`, called at each of the three places a
+    row can close) -- into `'probes refused ' + 'identity_origin=N, ...'` and
+    `run()` writes it to `stop_reason` on the success path whenever that dict
+    is non-empty, status `completed` and all: a run is not truncated by a
+    refused probe (the surface it belongs to just reads `inconclusive`), so
+    this is not read off `_unfinished_runs` (`status <> 'completed'`).
+    `_halt_reason` folds the same tally in too, but only for `IdentityDead`
+    (`scan.py:883-888`'s own comment says why the other exceptions do not
+    carry it), and that path closes `status='error'` -- outside
+    `_unfinished_runs`' exclusion, so a halt with refused probes behind it is
+    counted here as well, alongside every other completed scan. This query
+    does not filter on `status` at all, matching `_identity_counts` above it:
+    both count every `kind='scan'` row, whatever it closed as.
+
+    NOT `check_run.reason`. That column is capped at `_GAPS_SHOWN` (3) gaps
+    per row before the rest collapses into "and N more" with no class named,
+    so a surface refused past the third insertion point would not say
+    `identity_origin` there at all. `stop_reason` is the run's own tally,
+    built from the uncapped dict, and it is the one place this fact is
+    guaranteed to be spelled out.
+
+    `identity_origin` NEVER APPEARS BY ACCIDENT: it is a wire class
+    (`hx.checks.probe._NOT_ISSUED`, `Sender.java:331`) and no other class or
+    English sentence this build writes shares that substring --
+    `unknown_identity` is the pair it sits beside and does not contain it.
+
+    DERIVED FROM THE RUNS, LIKE `_identity_counts` -- never from
+    `config._origins` or `config.scan_identity`: a config says what was
+    declared, and a run row says what a run did.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM run WHERE engagement_id=? AND kind='scan'"
+        " AND stop_reason LIKE '%identity_origin%'",
+        (engagement_id,)).fetchone()[0]
+
+
 def _limits(conn, engagement_id) -> list[str]:
     out = ["## Limits\n",
            "What this assessment did not cover, stated rather than implied.\n"]
@@ -1740,6 +1784,50 @@ def _limits(conn, engagement_id) -> list[str]:
                        "as `clean`, that means it ran and found nothing this "
                        "time; it is not a statement that a previously "
                        "reported issue is gone.")
+        # BRANCH FIX B, CONCERN 1 OF BRANCH FIX A. The origins default (F1 of
+        # the branch review) bound an identity's credential to the one host
+        # its liveness canary proves, so on a multi-host engagement that
+        # widens nothing every probe to a SECOND host is refused
+        # `identity_origin` and reads `inconclusive` -- loud at the row (the
+        # Coverage reason cell names the refusal) but never accounted for as
+        # a PATTERN: a client sees a cluster of `inconclusive` rows on
+        # particular hosts with nothing here saying why they cluster there.
+        # S12's rule -- "a report that cannot distinguish tested-clean from
+        # never-reached is worse than no report" -- is about exactly that
+        # gap between a row and the story its rows tell together.
+        #
+        # RENDERED ONLY WHEN IT HAPPENED, the same rule as the proven/anonymous
+        # pair above and for the same reason: a single-host engagement never
+        # pays this cost (its one host IS the default origin), so a bullet
+        # that rendered unconditionally would be noise on every report from
+        # one.
+        # `_origin_refused_scans` is `run.stop_reason`, not `config.origins`
+        # -- a declared-but-unused widening says nothing about what a run did,
+        # and this bullet is about what happened.
+        origin_refused = _origin_refused_scans(conn, engagement_id)
+        # GUARDED ON `under` TOO, though `identity_origin` cannot arise on a
+        # run that issued no probe under an identity (`_NOT_ISSUED` names it
+        # only for a request carrying `identity_id`, `hx/checks/probe.py`):
+        # belt and braces against a store a future writer could leave
+        # inconsistent, and it keeps this condition legible on its own
+        # without a reader having to prove the implication first.
+        if under and origin_refused:
+            out.append(f"- **{origin_refused} of the {scans} scan(s) "
+                       "recorded here had at least one probe refused "
+                       "`identity_origin`.** By default an identity's "
+                       "credential is bound to the single host its liveness "
+                       "canary proved live, so that the session never "
+                       "carries to a third-party host that happens to be in "
+                       "scope. On this engagement, a probe addressed to "
+                       "another host was refused before it reached the "
+                       "target rather than sent without the session: the "
+                       "affected surface reads `inconclusive` here instead of "
+                       "`clean`, and the Coverage table's reason cell names "
+                       "the refusal on each row it happened to. To test "
+                       "those hosts under this session, declare "
+                       "`identities.<id>.origins` for the identity in "
+                       "`config.yaml`, naming every host the session is "
+                       "valid for.")
         # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
         # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
         # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.
