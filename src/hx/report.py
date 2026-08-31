@@ -613,11 +613,15 @@ def _identity(conn, engagement_id, config) -> list[str]:
         declared = config.identities.get(ident)
         strategy = "not declared in this config" if declared is None \
             else declared.strategy
-        # The HIGHEST generation any run reached, which is what section 10
-        # asks for: a static identity is minted once and stays at 1, and a
-        # programmatic one advances by one per refresh, so this number is
-        # "how many credentials this identity was issued across the
-        # engagement" and a 3 says two refreshes happened.
+        # THE HIGHEST GENERATION ANY RUN ENDED ON, which is section 10's
+        # "how many generations". A static identity is minted once by
+        # `identity.resolve` at generation 1 and has no refresh command to
+        # advance it, so it reads 1 however many times it is scanned under. A
+        # programmatic one starts at 1 (`refresh(declared, 0)` returns
+        # `generation + 1`) and advances by one per refresh, so a 3 says some
+        # run of this engagement refreshed twice. NOT a sum across runs: two
+        # runs at generation 1 are one credential used twice, and adding them
+        # would read as two rotations that never happened.
         gens = [r[5] for r in mine if r[5] is not None]
         outcome = ", ".join(
             f"{state} ({sum(1 for r in mine if r[6] == state)})"
@@ -646,8 +650,10 @@ def _identity(conn, engagement_id, config) -> list[str]:
                "login page satisfies every status rule there is. `assumed` "
                "means one of those checks failed somewhere in the run, so "
                "requests in it may have been issued logged out and hx does "
-               "not claim otherwise; `dead` means the session could not be "
-               "proved at all and the run stopped.\n")
+               "not claim otherwise; `dead` means a check failed and the "
+               "session could not be renewed — at the start of a run or "
+               "partway through it — and the run stopped there rather than "
+               "carrying on logged out.\n")
     out.append("**Per-request identity is not recorded by this build.** The "
                "`exchange` table has columns for it and nothing writes them: "
                "the requests hx issues itself are not stored as exchanges at "
