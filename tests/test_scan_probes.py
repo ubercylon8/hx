@@ -1242,22 +1242,26 @@ def test_the_shipped_reflected_input_check_probes_a_cookie_bearing_surface(
     assert "Accept" in _headers_on_the_wire(fb)
 
 
-# --- an active check retires nothing ---------------------------------------
+# --- an ANONYMOUS run's active checks retire nothing ------------------------
 #
-# FIX ROUND 6, AND IT IS A CAPABILITY REMOVED ON PURPOSE. Retirement is
-# `_mark_unobserved` writing `observed = 0`, which `report._findings` renders
-# to a client as "appears fixed; verify before closing". Every probe this
-# build sends is unauthenticated, so an active check's `clean` is a statement
-# about the LOGGED-OUT view of the application -- and the shape that made
-# that fatal is an application answering a logged-out request with a 200
-# login PAGE, which no set of statuses can tell from an answer. Fix round 5
-# tried to suppress retirement only where the capture carried a credential
-# header; that predicate keyed on the FIRST sighting and could only read a
-# header NAME (the value is redacted before the digest, S7), so it could not
-# tell a session cookie from an analytics one. The rule is now flat, lives at
-# the runner (`scan._retirable`), and the tests below drive it from three
-# directions: a real check that would have retired, a synthetic one that
-# tries to, and the whole registry.
+# Retirement is `_mark_unobserved` writing `observed = 0`, which
+# `report._findings` renders to a client as "appears fixed; verify before
+# closing". An ANONYMOUS run's probes are unauthenticated, so an active
+# check's `clean` in one is a statement about the LOGGED-OUT view of the
+# application -- and the shape that makes that fatal is an application
+# answering a logged-out request with a 200 login PAGE, which no set of
+# statuses can tell from an answer. Fix round 5 tried to suppress retirement
+# only where the capture carried a credential header; that predicate keyed on
+# the FIRST sighting and could only read a header NAME (the value is redacted
+# before the digest, S7), so it could not tell a session cookie from an
+# analytics one. Fix round 6 refused every active check's `considered`
+# outright, and Task 8 replaced that with the one proof a login page cannot
+# produce: `scan._retirable` honours an active check for a run whose liveness
+# canary came back `proven`, and for nothing else. EVERY RUN IN THIS BLOCK IS
+# ANONYMOUS, so all three tests below measure the state that has never
+# retired -- a real check that would have retired, a synthetic one that tries
+# to, and the whole registry. The proven case is the block at the foot of
+# this file.
 #
 # POINT TWO OF F2 IS STILL HERE, in the first test: a refusal on one
 # insertion point must not abort the check, so the point that DID answer is
@@ -1329,9 +1333,11 @@ def test_a_refusal_on_one_point_does_not_cost_the_other_its_probe(tmp_path):
     would be paced out and answered rather than refused.
 
     IT NO LONGER SEPARATES ANYTHING ABOUT RETIREMENT. It used to: `q`'s
-    finding staying live was the refusal withholding `considered`. Nothing an
-    active check says retires anything now, so that half is guaranteed by the
-    runner and asserted where the runner is -- see the two tests below.
+    finding staying live was the refusal withholding `considered`. This run is
+    anonymous, so `scan._retirable` empties every active offer whatever the
+    refusal did -- that half is the runner's now, and is asserted where the
+    runner is (see the two tests below, and the proven case at the foot of
+    this file).
     """
     env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
     scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
@@ -1571,10 +1577,11 @@ class _PassiveOnce:
 
 # --- a login wall is not a clean result ------------------------------------
 #
-# N1 of the scoped re-review. Every probe this build sends is unauthenticated
-# (disclosed in `report._limits`), and the ordinary answer a BROWSER-FACING
-# application gives an unauthenticated request is not a 401 -- it is a 302 to
-# a login page, which is exactly the traffic hx captures through a proxy. A
+# N1 of the scoped re-review. An ANONYMOUS run's probes are unauthenticated
+# (which `report._limits` discloses, for an engagement whose scans were), and
+# the ordinary answer a BROWSER-FACING application gives an unauthenticated
+# request is not a 401 -- it is a 302 to a login page, which is exactly the
+# traffic hx captures through a proxy. A
 # 3xx used to sit outside `_probe_util`'s status doctrine on the ground that
 # it is `open_redirect`'s own finding; it is, and that is a fact about ONE
 # check rather than about the doctrine.
@@ -1610,10 +1617,11 @@ def test_a_login_redirect_is_not_a_clean_result(tmp_path):
     changed with it. Until fix round 6 the harm was the RETIREMENT -- a
     `clean` here populated `considered` and `_mark_unobserved` wrote
     `observed = 0`, which `report._findings` renders as "appears fixed;
-    verify before closing" for a live cross-site scripting vector. No active
-    check retires anything now, so that row is guarded by the runner whatever
-    this doctrine does; it is asserted below as the consequence and the
-    `inconclusive` verdict is the claim."""
+    verify before closing" for a live cross-site scripting vector. It is
+    closed twice over now: an `inconclusive` verdict carries no `considered`
+    at all, which holds whatever a run's session proved, and this run is
+    anonymous besides. The observation is asserted below as the consequence
+    and the `inconclusive` verdict is the claim."""
     env = _env(tmp_path, request_bytes=REQ_TWO_PARAMS, path_template="/search")
     scan.run(**env, checks=(_reflected_input(),), bridge=_EchoBridge())
     assert _observations(env["conn"]) == [("q", 1), ("r", 1)], (

@@ -200,10 +200,12 @@ def test_a_redirect_is_not_an_answer_for_any_check_that_shares_this_doctrine(
     """N1 of the scoped re-review, and the case that cost the most. A 3xx
     used to sit outside the set on the ground that it is `open_redirect`'s
     own FINDING. It is -- and that is a fact about one check, not about the
-    doctrine: every probe this build sends is unauthenticated, and the
-    ordinary answer a browser-facing application gives an unauthenticated
-    request is a 302 to a login page. Read as a conclusive negative, that
-    retired live findings on all five checks.
+    doctrine: an ANONYMOUS run's probes are unauthenticated, and the ordinary
+    answer a browser-facing application gives an unauthenticated request is a
+    302 to a login page. Read as a conclusive negative, that retired live
+    findings on all five checks. A run under a proved session does not make
+    the doctrine unnecessary -- a session can expire between two canaries, and
+    the 302 that follows must still be a gap and not a clean result.
 
     `open_redirect` is unharmed because of WHERE it asks: its marker in a
     `Location` is a candidate, and `unanswered` is consulted only where its

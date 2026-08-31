@@ -248,11 +248,13 @@ def test_an_allowlisted_origin_that_does_not_reflect_is_clean():
 
 
 def test_every_issue_type_this_check_can_conclude_is_in_examined():
-    """`_EXAMINED` is what `_probe_util.verdict` is told, and naming fewer
-    than all three would understate this check's coverage on every row it
-    closes `clean`. It was `considered` and therefore what could be retired
-    until fix round 6; an active check retires nothing now, and the set is
-    still the check's own statement of what it looked for."""
+    """`_EXAMINED` is what `_probe_util.verdict` is told, and naming
+    fewer than all three would understate this check's coverage on every row
+    it closes `clean` -- and, since Task 8, would leave the missing types
+    unretirable for a client who fixed them and re-scanned under a proved
+    session. It is `Verdict.considered` on a `clean` verdict again (it was
+    not, between fix round 6 and Task 8), so the set carries both jobs at
+    once."""
     assert set(cors._EXAMINED) == {
         cors._REFLECTS_WITH_CREDENTIALS,
         cors._REFLECTS_NO_CREDENTIALS,
@@ -324,11 +326,12 @@ def test_every_finding_has_an_insertion_of_none(headers):
 #
 # F4 of the whole-branch review: every active check treated ANY status as a
 # conclusive negative, so a WAF's 403, a 500 or a maintenance page recorded
-# `clean` with `considered` populated and retired live findings. Retirement
-# is gone from the active corpus since fix round 6 and the doctrine is not:
-# `clean` still asserts a test happened, and the coverage table is what a
-# client reads it off. It lives in `_probe_util`; these two tests are this
-# check's end of it.
+# `clean` with `considered` populated and retired live findings. Both halves
+# of that are still guarded and the doctrine is the one that does not depend
+# on the run: an `inconclusive` verdict carries no `considered`, so a refused
+# probe retires nothing whatever a run's session proved -- and `clean` still
+# asserts a test happened, which is what the coverage table is read off. It
+# lives in `_probe_util`; these two tests are this check's end of it.
 
 
 @pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])

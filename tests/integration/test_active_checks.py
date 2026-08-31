@@ -397,15 +397,21 @@ def test_a_second_scan_is_stable_and_a_wholly_fixed_target_retires_nothing(rig):
     gets an ordinary, complete, application-composed answer and every one of
     them says `clean` off a probe that really went. Not one finding may close.
 
-    THIS TEST ASSERTED THE OPPOSITE UNTIL FIX ROUND 6. It was
-    `..._and_a_fixed_endpoint_retires_only_its_own_finding`: it fixed CORS
-    alone and required `[1, 1, 0]` for that finding and `[1, 1, 1]` for the
-    four beside it. That was `Verdict.considered` working end to end, and it
-    is the capability the user's decision removed. Every probe this build
-    sends is unauthenticated, so a `clean` here is a statement about the
-    logged-out view of the application -- and the shape that makes that fatal,
-    an application answering a logged-out request with a 200 login PAGE, is
+    THIS TEST ASSERTED THE OPPOSITE UNTIL FIX ROUND 6, AND IT ASSERTS IT
+    AGAIN NEXT DOOR. It was `..._and_a_fixed_endpoint_retires_only_its_own_
+    finding`: it fixed CORS alone and required `[1, 1, 0]` for that finding
+    and `[1, 1, 1]` for the four beside it. THIS SCAN IS ANONYMOUS -- the
+    rig's config names no `scan_identity` -- so every probe it sends is
+    unauthenticated, a `clean` here is a statement about the logged-out view
+    of the application, and the shape that makes that fatal (an application
+    answering a logged-out request with a 200 login PAGE) is
     indistinguishable from the five genuine answers below.
+    `tests/integration/test_identity.py::test_a_proven_run_retires_the_
+    finding_it_can_no_longer_find` is this scan with a session hx proved
+    live, and it requires the retirement. The pair is the whole of section
+    9's gate: same corpus, same repair, same `clean` off a probe that really
+    went, and the outcome turns on whether the run could prove the view it
+    was looking at.
 
     WOULD THIS FAIL IF THE CLAIM WERE FALSE? MEASURED on this exact scan,
     with `_probe_util.verdict` putting `examined` back on the verdict and
@@ -470,9 +476,10 @@ def test_a_second_scan_is_stable_and_a_wholly_fixed_target_retires_nothing(rig):
     # therefore only be a retirement.
     for check_id, finding_id in first.items():
         assert _observations(rig, finding_id) == [1, 1], (
-            f"{check_id} retired: {_observations(rig, finding_id)}. Every "
-            "probe this build sends is unauthenticated, so no active check "
-            "may tell a client their issue appears fixed")
+            f"{check_id} retired: {_observations(rig, finding_id)}. This "
+            "scan is anonymous, so every probe in it was sent "
+            "unauthenticated and no active check may tell a client their "
+            "issue appears fixed")
 
     # WHERE THE CLIENT WOULD HAVE READ IT, and what the page says instead.
     out = report.render(rig.eng.db, engagement_id=rig.eng.id,
@@ -586,13 +593,15 @@ def test_a_login_wall_is_not_a_clean_result(rig):
     their own name filters decline `tab`, which is N3's fix and not this
     one's.)
 
-    THE NAME LOST ITS SECOND HALF IN FIX ROUND 6. N1's own harm was the
-    RETIREMENT behind that 302 -- `considered` populated, `observed = 0`, and
-    "appears fixed; verify before closing" rendered for a live cross-site
-    scripting vector. No active check retires anything now, so that half is
-    the runner's whatever this doctrine does; the observations are still
-    asserted below as the consequence, and the `inconclusive` verdicts are the
-    claim.
+    N1's OWN HARM WAS THE RETIREMENT behind that 302 -- `considered`
+    populated, `observed = 0`, and "appears fixed; verify before closing"
+    rendered for a live cross-site scripting vector. It is closed twice over
+    now and this doctrine is the half that does not depend on the run: an
+    `inconclusive` verdict carries no `considered`, so no session any run
+    could prove would let one of these rows retire anything. (`scan._retirable`
+    is the other half, and it is about a `clean` verdict rather than this
+    one.) The observations are asserted below as the consequence, and the
+    `inconclusive` verdicts are the claim.
     """
     _configure(rig)
     rig.browse("GET", LOGIN_WALL_ROUTE)
@@ -632,9 +641,12 @@ def test_a_login_wall_is_not_a_clean_result(rig):
         "the rows must name the redirect they got rather than some other "
         f"gap: {[r['reason'] for r in check_runs]}")
 
-    # AND THE FINDING IS STILL LIVE -- guarded twice since fix round 6, by
-    # the `inconclusive` above and by `scan._retirable`, which lets no active
-    # check retire anything whatever it answered.
+    # AND THE FINDING IS STILL LIVE -- guarded twice, and this scan is
+    # anonymous so both guards hold. The `inconclusive` above carries no
+    # `considered` at all, which is true whatever a run proves; and
+    # `scan._retirable` honours an active check's `considered` only for a run
+    # whose canary came back `proven`, which this run has no identity to
+    # attempt.
     assert {f["check_id"]: f["id"] for f in _active_findings(rig)} == first
     assert _observations(rig, finding_id) == [1], (
         "the login wall retired the finding: a client is told a live "
@@ -708,11 +720,13 @@ def test_a_state_changing_surface_is_skipped_rather_than_probed_with_a_get(rig):
         "the scan sent requests at a surface it recorded as unprobeable: "
         f"{[(h.method, h.path) for h in rig.target.hits[hits_before:]]}")
 
-    # AND THE FINDING IS UNTOUCHED. Guarded twice since fix round 6: a `clean`
-    # row here would have claimed, in Coverage, to have tested a surface no
-    # request addressed -- and before fix round 6 it would also have retired
-    # this finding on the strength of a request to a DIFFERENT surface, which
-    # is what the measurement in this docstring recorded.
+    # AND THE FINDING IS UNTOUCHED. Guarded twice: a `clean` row here would
+    # have claimed, in Coverage, to have tested a surface no request
+    # addressed -- and it would also have offered this finding for retirement
+    # on the strength of a request to a DIFFERENT surface, which is what the
+    # measurement in this docstring recorded. The offer would be refused for
+    # this anonymous run in any case (`scan._retirable`), and the skip is what
+    # stops the offer being made at all.
     assert _observations(rig, finding_id) == [1], (
         "a GET of a surface hx never captured retired a finding filed "
         f"against the POST one: {_observations(rig, finding_id)}")

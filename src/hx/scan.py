@@ -1438,9 +1438,12 @@ def _retirable(hook, verdict, identity_state) -> tuple[str, ...]:
         ways to answer None. Every probe of such a run tests the logged-out
         view, and an application that answers a logged-out request with a
         200 login PAGE is indistinguishable from one that answered (see the
-        seventh spelling, below). This is the behaviour every build before
-        this task had for every active check, and the first test in
-        `tests/test_scan_probes.py`'s retirement block pins it unchanged.
+        seventh spelling, below). This is the outcome every build before
+        this task had for every active check, and
+        `tests/test_scan_probes.py::test_an_active_check_still_retires_
+        nothing_without_an_identity` pins it unchanged -- the OUTCOME, not
+        the mechanism: the same call used to raise (see below), and a client
+        could not tell the difference because neither retired anything.
       * `assumed` -- A CANARY FAILED SOMEWHERE IN THE RUN. Section 6
         downgrades every exchange back to the last passing canary, because
         they were issued into an unknown state; the run collapses to the

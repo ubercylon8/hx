@@ -2309,11 +2309,12 @@ class Liveness:
     `expect_body` is REQUIRED and is the load-bearing field. A canary that
     accepted a status code would be satisfied by an application answering a
     logged-out request with a 200 login page -- the one shape no
-    response-status rule can catch, and the reason `hx.scan._retirable`
-    refuses all active-check retirement today (its own docstring: "AN ACTIVE
-    CHECK RETIRES NOTHING" because every probe is unauthenticated).
-    Re-enabling retirement on a proof that a login page satisfies would hand
-    that hazard back with a stamp on it.
+    response-status rule can catch, and the one `hx.scan._retirable` refused
+    ALL active-check retirement over until this plan gave it a proof to read.
+    It reads one now: an active check's `considered` is honoured for a run
+    whose canary came back `proven`, so a canary a login page could satisfy
+    would hand that hazard straight back with a stamp on it. This field is
+    what stops it.
     """
     path: str
     expect_body: str

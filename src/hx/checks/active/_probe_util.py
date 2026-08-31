@@ -68,14 +68,16 @@ and every question they answer is one where a disagreement is a false
     (N3), and a `clean` naming nothing it examined is refused outright
     rather than left to five callers to avoid asking for.
 
-    WHAT THIS DOCTRINE IS AND IS NOT FOR, SINCE FIX ROUND 6. It used to
-    guard two things at once: the coverage row (`clean` asserts a test
-    happened) and the RETIREMENT that a populated `considered` licensed.
-    An active check no longer retires anything at all -- `hx.scan._retirable`
-    refuses its `considered` -- so only the first is left, and it is reason
-    enough on its own: S12 says a report that cannot tell "tested, clean"
-    from "never reached" is worse than no report, and the coverage table is
-    where a client reads that distinction.
+    WHAT THIS DOCTRINE GUARDS, AND IT IS TWO THINGS AGAIN. The coverage row
+    (`clean` asserts a test happened) and the RETIREMENT that a populated
+    `considered` licenses. Fix round 6 left only the first, because
+    `hx.scan._retirable` then honoured no active check's `considered` at all;
+    Task 8 honours one for a run whose liveness canary proved the session, so
+    the second is back and this funnel is again the only place either is
+    decided. Either would be reason enough on its own: S12 says a report that
+    cannot tell "tested, clean" from "never reached" is worse than no report,
+    and a retirement is that same distinction turned into a claim about the
+    client's own application.
 
 RANDOM, PER CALL, AND WHY THAT MATTERS MORE HERE THAN IN EITHER PREDECESSOR.
 `records.dedupe_key` folds `insertion_kind`/`insertion_name` into a finding's

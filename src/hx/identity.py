@@ -158,12 +158,20 @@ def canary(liveness: Liveness, sender) -> bool:
     `clean` off nothing were closed by the status doctrine, an eighth was
     closed the same way a round later, and the SEVENTH -- this one -- was not,
     because "a fixture whose anonymous view differs from its anonymous view
-    does not exist" and so could never be measured against the corpus. That
-    is the open hazard `_retirable` refuses all active-check retirement over
-    today, and the reason `expect_body` is required by the config loader and
-    checked here rather than left to a status code: re-enabling retirement on
-    a proof a login page satisfies would hand the hazard back wearing a
-    stamp.
+    does not exist" and so could never be measured against the corpus. That is
+    the hazard `_retirable` refused all active-check retirement over, until
+    this plan gave it a proof to read; it honours one now for a run this
+    function has stamped `proven`, which is exactly why `expect_body` is
+    required by the config loader and checked here rather than left to a
+    status code. A canary a login page satisfies would hand the hazard back
+    wearing a stamp.
+
+    THE FIXTURE THAT DID NOT EXIST NOW DOES, and it is the whole reason the
+    sentence above can be checked rather than argued:
+    `tests/integration/target_server.py`'s `/account` answers 200 with `Sign
+    out` to a request carrying the session and 200 with `Sign in` to one that
+    does not, so the two views differ in the body and in nothing a status rule
+    can read.
 
     A refusal (`probe.ProbeRefused`) is a FAILURE, not an exception to
     propagate: a canary that could not be sent has proved nothing, and the

@@ -28632,8 +28632,9 @@ class TargetServer:
         has tested nothing. A build that reads the two as the same thing
         records `tested, clean` for a surface it never reached, which is N1 of
         the scoped re-review and the reason this method exists. (N1's own harm
-        was a live finding retired behind that 302; no active check retires
-        anything since fix round 6, and the coverage row is what is left --
+        was a live finding retired behind that 302. An `inconclusive` verdict
+        carries no `considered` at all, so no run can retire on one whatever
+        its session proved -- the coverage row is what the wall still costs.
         S12 forbids both.)
 
         ONE DIRECTION ONLY, for `fix()`'s reason, and the asymmetry bites
