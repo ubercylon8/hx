@@ -169,3 +169,48 @@ def test_every_call_writes_exactly_one_action_row(tool_ctx, a_tool):
         dispatch.dispatch(tool_ctx, "checks.list", {})
     dispatch.dispatch(tool_ctx, "not.a.tool", {})
     assert len(_actions(tool_ctx.conn)) == 4
+
+
+# `name`, `args` and `why` arrive over MCP or JSON-RPC, where nothing stops
+# the wrong JSON type reaching any of them. Before the guards at the top of
+# `dispatch`, each of the four below raised before a single row was written --
+# breaking both "never raises" and "exactly one row" at once, and reaching no
+# test, because nothing here had passed a non-string name/why or a non-dict
+# args.
+
+def test_a_non_string_name_is_refused_and_still_journalled(tool_ctx):
+    env = dispatch.dispatch(tool_ctx, ["nope"], {})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    rows = _actions(tool_ctx.conn)
+    # `agent_action.tool` is NOT NULL TEXT, so the row still names something --
+    # rendered, not dropped.
+    assert len(rows) == 1 and rows[0][0] == "<list>"
+
+
+def test_non_dict_arguments_are_refused_and_still_journalled(tool_ctx):
+    env = dispatch.dispatch(tool_ctx, "surface.query", "not a dict")
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert len(_actions(tool_ctx.conn)) == 1
+
+
+def test_non_string_argument_keys_are_refused_and_still_journalled(tool_ctx):
+    # A JSON object's keys are always strings, so a non-string key here did
+    # not come from JSON at all -- and `schema.validate`'s own
+    # `sorted(set(value) - set(props))` cannot sort a set of mixed types
+    # either, which is the second raise this same guard closes.
+    env = dispatch.dispatch(tool_ctx, "surface.query", {1: "x", "z": "y"})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert len(_actions(tool_ctx.conn)) == 1
+
+
+def test_a_non_string_why_is_refused_not_coerced(tool_ctx, a_tool):
+    a_tool("run.start", lambda c: {"id": "r-1"}, mutates=True)
+    env = dispatch.dispatch(tool_ctx, "run.start", {}, why=123)
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    row = tool_ctx.conn.execute(
+        "SELECT why FROM agent_action WHERE actor='agent'"
+        " ORDER BY ts_us DESC, rowid DESC LIMIT 1").fetchone()
+    # Refused, not coerced: `str(123)` in `agent_action.why` would read as an
+    # operator's reason for a state change nobody gave.
+    assert row[0] is None
+    assert len(_actions(tool_ctx.conn)) == 1

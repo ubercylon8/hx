@@ -24,10 +24,21 @@ answer that is a read.
 only one that depends on state outside this process.
 
 THIS FUNCTION NEVER RAISES. Every outcome -- refusal, unavailability, and a
-defect in hx itself -- comes back as an envelope, and every call writes exactly
-one `agent_action` row. An adapter that had to catch exceptions as well as read
+defect in hx itself -- comes back as an envelope, and every call writes AT
+MOST one `agent_action` row -- a failure to write it is logged, never silent;
+see `_journalled`. An adapter that had to catch exceptions as well as read
 envelopes would be two error paths, and the second would be the one nobody
 tested.
+
+`name`, `args` and `why` ARE THEMSELVES UNTRUSTED. They arrive over MCP or
+JSON-RPC, where nothing stops a `name` that is a list, an `args` that is a
+string, or a `why` that is an integer. The four guards at the top of
+`dispatch` catch exactly that, before `registry.lookup` (which needs a
+hashable `name`), before `dict(args or {})` (which needs a mapping or None),
+before `schema.validate`'s internal `sorted()` over argument names (which
+needs every key to be a string), and before `.strip()` on `why`. Each is a
+`bad_args` refusal, journalled like any other -- a malformed call is exactly
+what `agent_action` exists to make visible, not a crash that erases it.
 """
 from __future__ import annotations
 
@@ -71,7 +82,42 @@ class ToolContext:
 def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
              *, why: str | None = None) -> envelope.Envelope:
     """Validate, authorise, call, journal. Never raises."""
+    # A malformed `why` is never written to `agent_action.why`, in any of the
+    # rows the four guards below produce -- refused or not. `str(123)` there
+    # would read as an operator's reason for a state change nobody gave, so a
+    # non-string `why` is refused rather than coerced, and every row journalled
+    # before that refusal fires carries None instead of the raw value.
+    safe_why = why if why is None or isinstance(why, str) else None
+
+    if not isinstance(name, str):
+        # `agent_action.tool` is NOT NULL TEXT. A name malformed enough that
+        # it cannot be looked up still gets a row -- rendered, not dropped --
+        # because an agent looping on a malformed call is exactly what this
+        # table exists to make visible.
+        placeholder = f"<{type(name).__name__}>"
+        return _journalled(ctx, placeholder, {}, safe_why, envelope.refused(
+            placeholder, "bad_args",
+            f"tool name must be a string, got {type(name).__name__}"))
+
+    if args is not None and not isinstance(args, dict):
+        return _journalled(ctx, name, {}, safe_why, envelope.refused(
+            name, "bad_args",
+            f"arguments must be an object, got {type(args).__name__}"))
+
     args = dict(args or {})
+
+    if not all(isinstance(key, str) for key in args):
+        # The same guard that keeps `schema.validate`'s internal
+        # `sorted(set(value) - set(props))` from raising on a set of mixed
+        # str and non-str keys: a JSON object's keys are always strings, so a
+        # non-string key here did not come from JSON at all.
+        return _journalled(ctx, name, {}, safe_why, envelope.refused(
+            name, "bad_args", "argument names must be strings"))
+
+    if why is not None and not isinstance(why, str):
+        return _journalled(ctx, name, args, safe_why, envelope.refused(
+            name, "bad_args", f"why must be a string, got {type(why).__name__}"))
+
     tool = registry.lookup(name)
     if tool is None:
         return _journalled(ctx, name, args, why, envelope.refused(
@@ -130,7 +176,8 @@ def _journalled(ctx: ToolContext, name: str, args: dict[str, Any],
     `hx.tools.journal` stores `args_blob` verbatim, and Principle 5 is the
     argument for why that is safe: identity is passed by name and resolved
     below this layer. That argument covers arguments a schema ACCEPTED. It
-    covers nothing about the four refusals above, which happen before or at
+    covers nothing about the refusals above -- the four decision-order ones,
+    and the four call-shape guards ahead of them -- which happen before or at
     validation and carry a dict nobody has checked -- and since every tool
     schema sets `additionalProperties: false`, `{"password": ...}` sent to a
     real tool IS a `bad_args` refusal. So an unvalidated call journals its
