@@ -25255,7 +25255,6 @@ import stat
 import struct
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -29439,7 +29438,6 @@ Two rules run through it:
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from pathlib import Path
 

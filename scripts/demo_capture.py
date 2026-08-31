@@ -265,7 +265,7 @@ def drive(conn, sink, srv, operator_port, crawler_port, target, offside,
     did(f"GET {target.origin}/api/orders  through :{operator_port}")
     saw(f"client got {status}")
     got = settle(conn, "SELECT url, status, req_blob, resp_blob FROM exchange"
-                       " WHERE url LIKE ? ORDER BY rowid DESC", (f"%/api/orders",),
+                       " WHERE url LIKE ? ORDER BY rowid DESC", ("%/api/orders",),
                  want=1)
     if got:
         url, st, req_blob, resp_blob = got[0]
@@ -323,7 +323,7 @@ def drive(conn, sink, srv, operator_port, crawler_port, target, offside,
     step("4", "Two ids under one endpoint become one surface")
     for oid in ("1001", "1002"):
         through_proxy(operator_port, "GET", f"{target.origin}/api/orders/{oid}")
-    did(f"GET /api/orders/1001 and /api/orders/1002")
+    did("GET /api/orders/1001 and /api/orders/1002")
     # `path_template`, not `template`: the column carries the TEMPLATED path
     # and the query KEY SET lives beside it, because two URLs differing only in
     # a value are one surface while two differing in their key set are not.

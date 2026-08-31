@@ -1,0 +1,60 @@
+name: No bundled Burp
+
+# hx uses Burp Suite as an engine and must NEVER bundle or redistribute it.
+# That has been a rule held by convention since the first commit; this makes it
+# a gate. The failure it guards against is not malice but convenience -- a jar
+# dropped into the tree to make a test run on a second machine, committed
+# without anyone deciding to redistribute commercial software.
+#
+# `montoya-api` (the API artifact, Maven Central) is not exempt either: it is
+# fetched at build time in extension.yml, which is where a dependency belongs.
+#
+# SECOND line of defence, not the first: .gitignore already carries `*.jar`, so
+# an ordinary `git add` cannot land one. What this catches is `git add -f`, and
+# a jar renamed to something the glob does not match.
+#
+# BOTH halves were verified with a negative control before this landed, and the
+# first attempt at that control proved nothing: the decoy jar was refused by
+# .gitignore, so `git ls-files` never saw it and the gate "passed" without ever
+# being asked a question. Re-run with `git add -f`, the glob caught decoy.jar
+# and the magic-byte check caught the same file renamed decoy.bin.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-burp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # zizmor[artipacked]: the checkout's credentials are not needed past this step.
+          persist-credentials: false
+      # git ls-files, not find: only what is COMMITTED matters here. A jar in an
+      # untracked working directory is how the tool is meant to be used locally
+      # (MONTOYA_JAR and --burp-jar both point outside the repo), and failing on
+      # those would make the gate fire on correct local setups.
+      - name: No jar, and nothing Burp-shaped, is committed
+        run: |
+          jars=$(git ls-files '*.jar' '*.JAR')
+          if [ -n "$jars" ]; then
+            echo "::error::a jar is committed to this repository:"; echo "$jars"
+            echo "hx must never bundle or redistribute Burp Suite or its API jar."
+            exit 1
+          fi
+          # Belt and braces: a jar renamed to dodge the glob is still a zip whose
+          # first two bytes are PK. Checks only files big enough to be one.
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            case "$(head -c2 "$f" 2>/dev/null)" in
+              PK) echo "::error::$f is a zip/jar archive committed to the repo"; exit 1 ;;
+            esac
+          done <<< "$(git ls-files | while IFS= read -r p; do
+                        [ -f "$p" ] && [ "$(wc -c <"$p")" -gt 100000 ] && echo "$p"
+                      done)"
+          echo "no bundled Burp, no committed jar"

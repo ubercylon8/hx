@@ -95,7 +95,8 @@ def test_one_failed_canary_downgrades_the_whole_run_not_just_its_window():
     # that would be retired could live on a surface probed inside it.
     w = identity.IdentityWindow(due_every=2)
     w.open(passed=True)
-    w.note_probe(); w.note_probe()
+    w.note_probe()
+    w.note_probe()
     w.close(passed=False)
     w.open(passed=True)
     w.close(passed=True)

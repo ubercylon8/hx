@@ -194,7 +194,7 @@ def sync(plan_path: Path, targets: list[str]) -> int:
             # deliberately does NOT check the last line: a block's tail is
             # exactly where drift shows up, and two of the eight excerpts this
             # was written for had lost their final line to a fixed defect.
-            head = next((l for l in was.splitlines() if l.strip()), None)
+            head = next((line for line in was.splitlines() if line.strip()), None)
             if head is not None and lines[first - 1] != head and not extent_moved:
                 raise SystemExit(
                     f"{target}: line {first} of {path} is not where this block starts.\n"

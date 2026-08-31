@@ -22,3 +22,63 @@ markers = [
     "integration: loads a real headless Burp Suite; needs the jar (~5s to hello, ~20s per test)",
 ]
 addopts = "-m 'not integration'"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.14",
+    "mypy>=1.14",
+]
+
+[tool.ruff]
+# Matches what the codebase already writes rather than imposing a number on it:
+# the longest lines here are comment prose that wraps at 79, and source that
+# occasionally runs to 88.
+line-length = 88
+extend-exclude = ["extension/build"]
+
+[tool.ruff.lint]
+# Ruff's default rule set (pyflakes + a pycodestyle subset). Deliberately NOT
+# widened: this repo's density of intentional-looking-but-deliberate patterns
+# is high, and a large rule set arriving at once would land as a wave of
+# `# noqa` that teaches the next reader to ignore the gate.
+#
+# The gate earned its place before it was configured: on its first run it found
+# an F811 in tests/test_checks_cors.py -- one test shadowing another of the
+# same name, so the shadowed one had not run since the commit that added the
+# second. See 54a181a.
+#
+# MEASURED before choosing: widening to `["E", "F", "W"]` adds exactly 110
+# findings and every one of them is E501 line-too-long. Not one is a bug. This
+# repo's comments carry its reasoning and are wrapped deliberately, so a
+# line-length gate would be 110 edits to prose in exchange for nothing, and
+# would make the next person writing a careful comment fight the linter.
+select = ["E4", "E7", "E9", "F"]
+
+# NOT ENABLED, AND THIS IS THE REASON: `ruff format` would rewrite 89 of this
+# repo's 97 Python files. Every one of those files is quoted verbatim by
+# `tests/test_plan_matches_repo.py`, which compares 144 code blocks in the plan
+# documents against the source they name -- so a formatting pass would stale
+# essentially every block at once and force a 144-block re-sync across seven
+# merged plans. That is a large, risky, purely cosmetic diff whose only effect
+# on correctness is the chance of a mistake while making it. `ruff check` gives
+# the gate that finds bugs; `ruff format` would give churn.
+
+[tool.mypy]
+# NON-BLOCKING IN CI ON PURPOSE, and the CI job says so where it runs.
+# The plan is to tighten to `strict = true` once the annotations exist; landing
+# a strict gate on an as-yet-unannotated 9k-line codebase in the same change
+# that introduces CI would mean a large speculative refactor sitting between
+# this repo and its first green build.
+#
+# What is already true is pinned here, so tightening is a series of small
+# deletions from this block rather than one flag day.
+python_version = "3.12"
+files = ["src/hx"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+# Off for now, each a separate follow-up:
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false

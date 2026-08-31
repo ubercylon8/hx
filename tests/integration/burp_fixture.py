@@ -203,7 +203,7 @@ def unbuilt() -> list[str]:
         if problem == "stale":
             return ["extension jar is older than its sources (run extension/build.sh)"]
         return []
-    except OSError as exc:
+    except OSError:
         return []
 
 

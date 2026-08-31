@@ -7,7 +7,6 @@ and `stored_scope_sha256` supplies the hash that authorises it -- READ from
 `session.stored_scope_sha256`'s own docstring for why recomputing is the
 failure this module exists to design out.
 """
-import sqlite3
 from types import SimpleNamespace
 
 import pytest

@@ -1,0 +1,83 @@
+name: Extension
+
+# The Java half of hx. `extension/` holds the code that enforces every safety
+# rule -- scope, the method allowlist, the dangerous-path denylist, the rate
+# limit, budgets, auto-halt and redaction -- because spec section 4 puts the
+# enforcement point inside Burp's JVM where Python cannot reach past it. Until
+# this job existed, 2330 assertions guarding that boundary had no CI at all.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+    env:
+      # The API artifact, NOT Burp. `montoya-api` is PortSwigger's published
+      # extension API on Maven Central; Burp Suite itself is not redistributable
+      # and is not downloaded here or anywhere else in CI. This is the whole
+      # reason the Java suite can run on a runner while the integration suite
+      # cannot -- the latter needs the product, this needs only the interface.
+      MONTOYA_VERSION: "2025.5"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # zizmor[artipacked]: the checkout's credentials are not needed past this step.
+          persist-credentials: false
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c  # v6.0.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Fetch montoya-api from Maven Central
+        run: |
+          curl -sSfL -o /tmp/montoya-api.jar \
+            "https://repo1.maven.org/maven2/net/portswigger/burp/extensions/montoya-api/${MONTOYA_VERSION}/montoya-api-${MONTOYA_VERSION}.jar"
+      # extension/test.sh refuses to run without the jar rather than compiling a
+      # subset: without it every `import burp.api.montoya.*` is a javac error and
+      # ZERO summary lines print, which a naive `grep -q FAIL` would read as
+      # success. The count assertions below are the second half of that guard.
+      # `shell: bash` for `-o pipefail`, and it is not stylistic. GitHub's
+      # default for `run:` is `bash -e {0}` with NO pipefail, so
+      # `test.sh | tee` takes TEE's exit status -- a suite that failed would
+      # have left this step GREEN. The assertion below happens to catch the
+      # common case (a failure prints "N FAILURE(S)" rather than "ALL PASS",
+      # so the suite count drops), but that is the guard working by accident:
+      # any failure that did not move the three numbers would have passed
+      # silently, and the step's own exit status meant nothing.
+      #
+      # `2>&1` because the counts below must measure the SAME STREAM the
+      # numbers were measured against. They were taken locally from
+      # `test.sh > file 2>&1`, and this step captured stdout only, so CI saw
+      # 2527 where the assertion expected 2529 -- two lines that go to stderr.
+      # The gate was measuring a different thing than the number it asserted.
+      - name: Extension suite
+        shell: bash
+        run: MONTOYA_JAR=/tmp/montoya-api.jar ./extension/test.sh 2>&1 | tee /tmp/ext.out
+      # A suite that silently stops running half its assertions still exits 0 and
+      # still prints ALL PASS for whatever did run. These three numbers are the
+      # ones a shrinking suite changes, and they were measured against this commit
+      # rather than copied from a report. Raise them deliberately when the suite
+      # grows; never lower them to make a build green.
+      #
+      # THE SUITE COUNT IS AN EQUALITY AND THE OTHER TWO ARE FLOORS, on purpose:
+      # a suite that vanishes is the failure this guard exists for, and `-ge`
+      # would not see it. The cost is that a branch which legitimately ADDS a
+      # suite trips the same wire -- which is what happened here. 13/2330/2352
+      # was measured when this file was written; the identity branch added two
+      # Java suites and 174 assertions before this branch merged, so the numbers
+      # below were re-measured against `master` at 56b39c3. A count that is a
+      # fact about the tree has to be updated in the commit that changes it.
+      - name: Assert the suite did not shrink
+        run: |
+          suites=$(grep -ac 'ALL PASS' /tmp/ext.out)
+          oks=$(grep -ac '^  ok' /tmp/ext.out)
+          lines=$(wc -l < /tmp/ext.out)
+          echo "suites=$suites oks=$oks lines=$lines"
+          [ "$suites" -eq 16 ]   || { echo "::error::expected 16 ALL PASS, got $suites"; exit 1; }
+          [ "$oks" -ge 2504 ]    || { echo "::error::expected >=2504 ok lines, got $oks"; exit 1; }
+          [ "$lines" -ge 2529 ]  || { echo "::error::expected >=2529 output lines, got $lines"; exit 1; }

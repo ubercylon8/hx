@@ -1,0 +1,83 @@
+mise ~/.config/mise/config.toml tools: gh@2.98.0
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
+
+jobs:
+  claude-review:
+    # Skip bot-authored PRs (Dependabot bumps): the action rejects non-human
+    # actors, and reviewing machine-generated lockfile diffs wastes review quota.
+    if: github.actor != 'dependabot[bot]'
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          # This job only reads; findings are posted through the GitHub API rather
+          # than git, so the checkout's credential has no consumer. NOT true of
+          # claude.yml, where the @claude responder can commit.
+          persist-credentials: false
+
+      # A PR THAT EDITS THIS FILE GETS NO REVIEW, AND THE CHECK STILL SHOWS GREEN.
+      #
+      # claude-code-action validates that this workflow file is byte-identical to the
+      # copy on the default branch, and self-skips when it is not:
+      #
+      #   Skipping action due to workflow validation: Workflow validation failed. The
+      #   workflow file must exist and have identical content to the version on the
+      #   repository's default branch.
+      #
+      # The guard is correct — otherwise a PR could rewrite the reviewer's own
+      # instructions and have it approve anything. But the skip is a *success*: the job
+      # completes green in ~20s having reviewed nothing, which is indistinguishable from
+      # a clean review at a glance.
+      #
+      # So: when a PR touches this workflow, check the job duration (a real review takes
+      # 2-3 minutes) before trusting the green tick, and re-verify the change once it has
+      # landed on the default branch.
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@6b082c41935b4c8a3b8b0ef85ba4ba4d9eeb8975  # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Post + maintain a managed PR comment with the review (the switch that makes
+          # this behave like the working @claude responder). Without it the PR-review
+          # path relies on the agent explicitly calling a post tool and stays silent.
+          track_progress: true
+          # Direct review prompt (no code-review plugin). The plugin's slash-command
+          # run was sandboxed in CI (heavy tool-permission denials, no comments posted);
+          # the plain-prompt mode — the same one the @claude responder uses successfully —
+          # gets the tool access it needs to read the diff and post findings.
+          prompt: |
+            Do a security-focused code review of PR #${{ github.event.pull_request.number }}
+            in ${{ github.repository }}. This is f0_sectools: thin MCP servers + agentskills.io
+            skills that connect AI agents (esp. small local models) to security platforms.
+            Ground the review in the repo's CLAUDE.md Critical Rules:
+            - read-only by default; any state-changing (write) action must be gated
+              (config flag + per-action human confirmation + audit) and live in core/gating;
+            - secrets never leave the host or reach the model; redact before returning,
+              including error/exception paths;
+            - every tool returns the structured findings schema;
+            - tools must be small-model-safe (flat scalar args, short closed enums,
+              bounded/paginated output);
+            - correctness and test coverage of the changed logic.
+            Post findings as PR comments — a concise top-level summary plus inline comments
+            where a specific line is at fault. If nothing significant, say so briefly.
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+

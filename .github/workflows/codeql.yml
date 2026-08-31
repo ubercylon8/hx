@@ -1,0 +1,48 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read  # GitHub's recommended CodeQL permission set
+
+jobs:
+  analyze:
+    # Code scanning needs GitHub Advanced Security on PRIVATE repos (free on public).
+    # This job is skipped (green) while the repo is private and activates automatically
+    # once it is public. push + pull_request only — repository.private is unreliable on schedule.
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # BOTH halves. The Python side drives; the Java side is where every safety
+        # rule is actually enforced (spec section 4), so analysing only Python would
+        # leave the security-critical half unscanned.
+        language: [python, java-kotlin]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # zizmor[artipacked]: the checkout's credentials are not needed past this step.
+          persist-credentials: false
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c  # v6.0.0
+        if: matrix.language == 'java-kotlin'
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3  # v4
+        with:
+          languages: ${{ matrix.language }}
+      # The Java half needs a real compile for CodeQL to see it, and that needs the
+      # API jar — same Maven Central artifact and same reasoning as extension.yml.
+      - name: Build the extension for analysis
+        if: matrix.language == 'java-kotlin'
+        run: |
+          curl -sSfL -o /tmp/montoya-api.jar \
+            "https://repo1.maven.org/maven2/net/portswigger/burp/extensions/montoya-api/2025.5/montoya-api-2025.5.jar"
+          MONTOYA_JAR=/tmp/montoya-api.jar ./extension/build.sh
+      - uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3  # v4
