@@ -149,20 +149,29 @@ In `src/hx/checks/base.py`, add to `Verdict` after `reason`:
     # nothing retires nothing. The failure mode is a finding staying live,
     # never one falsely closed.
     #
-    # PASSIVE CHECKS ONLY, SINCE FIX ROUND 6, AND THE RUNNER ENFORCES IT.
-    # `hx.scan._retirable` returns nothing for a check driven through the
-    # `probes` hook and RAISES if such a check populated this at all: the
-    # runner cannot establish that an active check's conclusion is about the
-    # view the client's users are in, so it may not close a finding about
-    # that view. (Until fix round A this said "every probe this build sends
-    # is unauthenticated", which Task 7 falsified -- a run naming a
-    # `scan_identity` issues every probe under one. The rule did not change;
-    # its ground did, and `_retirable` now carries both halves of the new
-    # one.) An active
-    # check names what it examined to `hx.checks.active._probe_util.verdict`
-    # as `examined` instead -- which is what lets it say `clean` -- and that
-    # value deliberately never reaches this field. See `_retirable` for the
-    # argument and for the two narrower rules that were tried first.
+    # BOTH KINDS OF CHECK POPULATE THIS, AND `hx.scan._retirable` DECIDES
+    # WHAT MAY BE DONE WITH IT. This comment used to say three other things
+    # -- "passive checks only", "`_retirable` RAISES if a probing check
+    # populated this at all", and "an active check's `examined` deliberately
+    # never reaches this field" -- and Task 8 falsified all three in the same
+    # commit, leaving them standing here until F2 of the whole-branch review
+    # read them. They are not merely stale: a reader following them would
+    # sever `examined` from `considered` again and silently disable the
+    # retirement this branch exists to give back, or would believe a hard
+    # raise guards the gate where only a state comparison does.
+    #
+    # WHAT IS TRUE NOW. A PASSIVE check's `considered` is honoured whatever
+    # the run's session did: it reads the CAPTURED traffic, so no probe of
+    # hx's own is involved and no session can have been dead for it. An
+    # ACTIVE check names what it examined to `hx.checks.active._probe_util.
+    # verdict` as `examined`, and that function puts it on the `clean`
+    # branch's `considered` (`return base.Verdict.clean(considered=
+    # examined)`); `_retirable` then honours it only for a run whose liveness
+    # canary proved the session (`identity_state == "proven"`) and only for
+    # the ONE ORIGIN that canary was actually sent to. It no longer raises
+    # for a populated one, because a raise would have made every active row
+    # of every anonymous scan an `error`. See `_retirable` for the argument
+    # and for the narrower rules that were tried first.
     considered: tuple[str, ...] = ()
 ```
 

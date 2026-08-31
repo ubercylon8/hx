@@ -244,8 +244,11 @@ class Config:
     # nothing: the budget was always 2000, it was just never written down.
     max_requests: int = 2000
     max_concurrency: int = 2
-    # A credential value must NEVER be reachable from here. `hx.store.records`
-    # writes the loaded config's YAML verbatim into `scope_version.yaml`, a
+    # A credential value must NEVER be reachable from here.
+    # `hx.engagement.record_scope_version` writes the loaded config's YAML
+    # verbatim into `scope_version.yaml` -- `_record_scope`'s `INSERT INTO
+    # scope_version` at `engagement.py:114`, whose `yaml` column takes
+    # `config.dumps(cfg)` whole -- a
     # table the schema calls "append-only: tamper-evidence for contract
     # disputes" -- so a secret on this object is a secret copied,
     # unredactably, into a table designed to be impossible to rewrite. Each

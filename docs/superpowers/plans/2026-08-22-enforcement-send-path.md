@@ -8270,12 +8270,33 @@ public final class Limiter implements Gate {
      * predicate: an allow is recorded as an issuance, so calling `check` twice
      * for one request costs two slots and one budget unit.
      *
-     * That is safe here because the gate is the last thing consulted on the
-     * decision path -- the published order is not_configured, halted, scope,
-     * method, dangerous, rate, budget -- so nothing downstream of an allow can
-     * turn round and deny. Anything that grows a new refusal AFTER the gate
-     * must run before it instead, or it burns budget on requests that never
-     * left the JVM.
+     * That is safe here because an allow is only ever spent on a request the
+     * published decision order -- not_configured, halted, scope, method,
+     * dangerous, rate, budget -- has already cleared, so nothing downstream
+     * can turn round and ISSUE MORE than this budget allowed.
+     *
+     * IT CAN SPEND MORE THAN IT SENDS, AND THE RULE THIS PARAGRAPH USED TO
+     * STATE -- "anything that grows a new refusal AFTER the gate must run
+     * before it instead" -- HAS BEEN FALSE SINCE THE IDENTITY BRANCH.
+     * {@code Sender.decide} asks two identity questions after this gate
+     * (`unknown_identity` and `identity_origin`, Sender.java:325,331), and
+     * they are there because neither can be asked until the send frame has
+     * been read and neither is worth resolving for a request the boundary
+     * checks are about to turn away. So a probe refused by either has
+     * already cost a rate slot and a budget unit while the target saw
+     * nothing, and `requests_sent` for that row reads 0.
+     *
+     * THE BURN IS ACCEPTED RATHER THAN FIXED, and the false rule is
+     * corrected rather than deleted because it had already made one
+     * implementer's brief reason from a premise the tree does not obey. It
+     * fails in one direction only: it can make hx send FEWER requests than
+     * the client authorised, never more, and it reaches no client-facing
+     * number -- `run.requests_issued` is written by `hx.capture` alone and
+     * the report renders no request tally. When identity refusals do exhaust
+     * the budget, the next liveness canary is refused `budget_exhausted`,
+     * which halts the run or downgrades it to `assumed`; both fail safe.
+     * `src/hx/checks/probe.py`'s `ProbeSender.refused` documents the same
+     * divergence from the Python side.
      *
      * `synchronized` because a rate limit that races is not a rate limit: two
      * threads reading `issued` before either writes it both see room and both
