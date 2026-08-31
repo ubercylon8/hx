@@ -218,6 +218,10 @@ def test_every_constraint_keyword_is_actually_implemented():
         "properties": (OBJ, {"name": 1}),
         "additionalProperties": (OBJ, {"zzz": 1}),
         "required": (dict(OBJ, required=["name"]), {}),
+        "minItems": ({"type": "array", "items": {"type": "string"},
+                     "minItems": 2}, ["a"]),
+        "maxItems": ({"type": "array", "items": {"type": "string"},
+                     "maxItems": 1}, ["a", "b"]),
     }
     assert set(cases) == schema.CONSTRAINTS
     for keyword, (sch, bad) in cases.items():
@@ -313,6 +317,10 @@ def test_every_constraint_keyword_is_enforced_for_every_applicable_type():
                 sch["additionalProperties"] = False
             elif keyword == "items":
                 sch["items"] = {"type": "string"}
+            elif keyword == "minItems":
+                sch["minItems"] = 0
+            elif keyword == "maxItems":
+                sch["maxItems"] = 10
             # This should not raise.
             schema.check_schema(sch)
             # Also check that check_schema raises SchemaError, never any other exception,
@@ -343,6 +351,12 @@ def test_every_constraint_keyword_is_enforced_for_every_applicable_type():
                         sch = {"type": "string", "minLength": bad_value}
                     elif keyword == "maxLength":
                         sch = {"type": "string", "maxLength": bad_value}
+                    elif keyword == "minItems":
+                        sch = {"type": "array", "items": {"type": "string"},
+                               "minItems": bad_value}
+                    elif keyword == "maxItems":
+                        sch = {"type": "array", "items": {"type": "string"},
+                               "maxItems": bad_value}
                     schema.check_schema(sch)
                 except schema.SchemaError:
                     # Expected: SchemaError for invalid value.
@@ -460,6 +474,16 @@ it only applies to numbers; `{"type": "string", "minLength": "two"}` accepts and
 crashes on len(value) < "two"; `{"type": "integer", "minimum": "five"}` accepts
 and crashes on value < "five". check_schema now validates both by consulting a
 table for each keyword present.
+
+`minItems`/`maxItems` WERE MISSING ENTIRELY until the final whole-branch
+review's item 2, which is a sharper hole than a keyword with one fact
+unstated: with no array-length keyword AT ALL, no schema in this system could
+bound an array's size, so `finding.record`'s `exchange_ids` had no ceiling and
+60,000 of them became `OperationalError: too many SQL variables` from the
+`IN (...)` list the handler builds -- `error / internal`, which tells the
+agent hx is broken when its argument was simply too large. `minItems` doubles
+as the "must cite exchanges" rule `finding.record`'s docstring already wanted;
+`maxItems` is the ceiling.
 """
 from __future__ import annotations
 
@@ -489,6 +513,8 @@ _CONSTRAINT_TABLE: dict[str, tuple[frozenset[str] | None, type]] = {
     "maximum": (frozenset({"integer", "number"}), (int, float)),
     "minLength": (frozenset({"string"}), int),
     "maxLength": (frozenset({"string"}), int),
+    "minItems": (frozenset({"array"}), int),
+    "maxItems": (frozenset({"array"}), int),
 }
 
 #: Keywords that constrain a value. Every one is implemented by `validate`, and
@@ -536,8 +562,10 @@ def check_schema(obj: Any, *, where: str = "params") -> None:
             )
         value = obj[keyword]
         # bool-is-not-int exclusion for numeric constraint values.
-        # minimum, maximum take (int, float); minLength, maxLength take int.
-        if keyword in ("minimum", "maximum", "minLength", "maxLength"):
+        # minimum, maximum take (int, float); minLength, maxLength, minItems,
+        # maxItems take int.
+        if keyword in ("minimum", "maximum", "minLength", "maxLength",
+                       "minItems", "maxItems"):
             ok = isinstance(value, value_type) and not isinstance(value, bool)
         else:
             ok = isinstance(value, value_type) and not (
@@ -656,6 +684,12 @@ def _validate(obj, value, where, out) -> None:
             if key in value:
                 _validate(sub, value[key], f"{where}.{key}", out)
     elif type_ == "array":
+        # Same rule as minimum/maximum below: the constraint, never the
+        # value -- there is nothing to echo for an array's length anyway.
+        if "minItems" in obj and len(value) < obj["minItems"]:
+            out.append(f"{where}: fewer than {obj['minItems']} items")
+        if "maxItems" in obj and len(value) > obj["maxItems"]:
+            out.append(f"{where}: more than {obj['maxItems']} items")
         for i, item in enumerate(value):
             _validate(obj["items"], item, f"{where}[{i}]", out)
     elif type_ in ("integer", "number"):
@@ -1127,6 +1161,49 @@ def test_envelope_may_not_be_subclassed():
             pass
 
 
+def test_parse_offset_is_none_for_no_cursor():
+    assert envelope.parse_offset(None) == 0
+
+
+def test_parse_offset_reads_back_what_it_was_given():
+    assert envelope.parse_offset("o-50") == 50
+    assert envelope.parse_offset("o-0") == 0
+
+
+def test_parse_offset_refuses_a_cursor_from_nowhere():
+    with pytest.raises(errors.ToolRefused) as exc:
+        envelope.parse_offset("nonsense")
+    assert exc.value.reason == "bad_args"
+
+
+def test_parse_offset_refuses_an_overflowing_offset_before_sqlite_ever_sees_it():
+    # `int("9" * 20)` succeeds -- Python ints have no ceiling -- but SQLite
+    # binds an offset as a signed 64-bit C integer and raises `OverflowError`
+    # the moment the query runs. Uncaught, that lands in dispatch's generic
+    # `except Exception` and answers `error / internal`, telling the agent hx
+    # is broken when its cursor was merely implausible. `parse_offset` catches
+    # it here instead, as an ordinary `bad_args` refusal.
+    with pytest.raises(errors.ToolRefused) as exc:
+        envelope.parse_offset(f"{envelope.CURSOR_PREFIX}{'9' * 20}")
+    assert exc.value.reason == "bad_args"
+    # Comfortably inside the bound is still fine.
+    assert envelope.parse_offset(
+        f"{envelope.CURSOR_PREFIX}{envelope.MAX_OFFSET}") == envelope.MAX_OFFSET
+    with pytest.raises(errors.ToolRefused):
+        envelope.parse_offset(f"{envelope.CURSOR_PREFIX}{envelope.MAX_OFFSET + 1}")
+
+
+def test_parse_offset_refuses_a_unicode_digit_that_isdigit_would_have_missed():
+    # "²" (superscript two) answers True to `str.isdigit()` -- it IS a
+    # digit, by Unicode, just not one `int()` accepts in base 10 -- so a
+    # cursor built from it used to pass the digit check and then raise
+    # `ValueError` two lines later, inside `int()`.
+    assert "²".isdigit()
+    with pytest.raises(errors.ToolRefused) as exc:
+        envelope.parse_offset(f"{envelope.CURSOR_PREFIX}²")
+    assert exc.value.reason == "bad_args"
+
+
 def test_a_non_ran_envelope_may_not_carry_a_result():
     # Non-ran outcomes cannot carry results
     with pytest.raises(ValueError, match="did not run"):
@@ -1170,6 +1247,7 @@ one layer down.
 from __future__ import annotations
 
 import dataclasses
+import re
 from typing import Any, Callable, Sequence
 
 #: Design section 4. `ok` and `empty` both mean the tool RAN; `unavailable`
@@ -1308,6 +1386,64 @@ def page(rows: Sequence[Any], *, total: int, limit: int,
                        else None,
         "facets": facets or {},
     }
+
+
+#: Every list tool that pages by offset uses this cursor shape, `o-<n>`. One
+#: constant so `surface.query` and `finding.query` cannot drift into two
+#: prefixes for the same idea -- which is exactly what their two `_offset`
+#: functions had started to do before this fix.
+CURSOR_PREFIX = "o-"
+
+#: SQLite binds an offset as a signed 64-bit C integer and raises
+#: `OverflowError` past that range. Uncaught, that lands in `dispatch`'s
+#: generic `except Exception` and answers `error / internal` -- telling the
+#: agent hx is broken when its cursor was merely implausible. No real
+#: engagement's row count comes close to this, so a cursor naming more is
+#: refused as `bad_args` before it ever reaches a query.
+MAX_OFFSET = 1_000_000_000
+
+#: What `int(s, 10)` actually parses. `str.isdigit()` is NOT this: it answers
+#: True for `"²"` (superscript two) -- a digit BY UNICODE, not one base
+#: 10 accepts -- so a cursor built from it passed the old digit check and
+#: `int()` then raised `ValueError` two lines later. Anchored, so this never
+#: matches a substring of something longer.
+_CURSOR_DIGITS = re.compile(r"[0-9]+")
+
+
+def parse_offset(cursor: str | None) -> int:
+    """The offset an `o-<n>` cursor encodes, or 0 for none.
+
+    THE ONE COPY. `surface.query` and `finding.query` each carried their own
+    `_offset`, with divergent refusal messages, and neither bounded the
+    result nor restricted the digit check to ASCII -- the final whole-branch
+    review's item 2. Both defects were shared by construction: any cursor
+    parser built this way would have had them, so the fix is one function
+    both import, not two patches that could drift apart again.
+
+    RAISES `ToolRefused`, imported inside the function rather than at module
+    level: `hx.tools.errors` imports `REASONS_FOR` from this module, so a
+    top-level import back here would be a cycle. By the time anything CALLS
+    this function both modules have finished importing, so the deferred
+    import inside it is safe where one at the top would not be.
+    """
+    from .errors import ToolRefused
+
+    if cursor is None:
+        return 0
+    digits = cursor[len(CURSOR_PREFIX):]
+    if not cursor.startswith(CURSOR_PREFIX) or not _CURSOR_DIGITS.fullmatch(digits):
+        raise ToolRefused(
+            "bad_args",
+            f"{cursor!r} is not a cursor from this tool; pass back the "
+            "next_cursor you were given, or omit it to start over")
+    offset = int(digits)
+    if offset > MAX_OFFSET:
+        raise ToolRefused(
+            "bad_args",
+            f"{cursor!r} names an offset further than any real engagement "
+            "reaches; pass back the next_cursor you were given, or omit it "
+            "to start over")
+    return offset
 ```
 
 - [ ] **Step 4: Write `src/hx/tools/errors.py`**
@@ -1701,13 +1837,21 @@ def test_an_unregistered_name_is_refused_and_still_journalled(tool_ctx):
     # itself worth asserting, so it is.
     assert len(rows) == 1 and rows[0][0] == "nothing.at.all"
     assert rows[0][1].startswith("refused: not_registered")
-    assert "checks.list" in rows[0][1]
+    # `checks.list` lists security checks, not tools -- an agent told to "ask
+    # checks.list" for a tool list learns nothing and asks again. The message
+    # now points at the thing that actually lists tools, `hx tool --list`,
+    # and no longer tells the agent to ask checks.list for one.
+    assert "hx tool --list" in rows[0][1]
+    assert "Ask checks.list" not in rows[0][1]
 
 
 def test_a_halt_stops_a_mutating_tool(tool_ctx, a_tool):
-    a_tool("run.finish", lambda c: {"id": "r-1"}, mutates=True)
+    # `run.start`, not `run.finish` -- the latter is the one member of
+    # `HALT_EXEMPT` (item 6 of the final whole-branch review, tested below),
+    # and would make this test say the opposite of what it means to show.
+    a_tool("run.start", lambda c: {"id": "r-1"}, mutates=True)
     tool_ctx.halt.halt("stop now")
-    env = dispatch.dispatch(tool_ctx, "run.finish", {}, why="because")
+    env = dispatch.dispatch(tool_ctx, "run.start", {}, why="because")
     assert (env.outcome, env.reason) == ("refused", "halted")
 
 
@@ -1717,6 +1861,31 @@ def test_a_halt_does_not_stop_a_read(tool_ctx, a_tool):
     a_tool("run.journal", lambda c: ["an action"])
     tool_ctx.halt.halt("stop now")
     assert dispatch.dispatch(tool_ctx, "run.journal", {}).outcome == "ok"
+
+
+def test_the_halt_exemption_is_exactly_run_finish():
+    # Item 6 of the final whole-branch review: closing an open run does LESS,
+    # not more, so a halt must not block it -- and in Plan B, `run.finish` is
+    # what stops the Burp JVM, so refusing it under a halt would leave one
+    # running with nothing holding it. A named set, asserted exactly, so a
+    # future tool cannot join it quietly.
+    assert dispatch.HALT_EXEMPT == frozenset({"run.finish"})
+
+
+def test_a_halt_does_not_stop_the_exempt_tool(tool_ctx, a_tool):
+    a_tool("run.finish", lambda c: {"id": "r-1"}, mutates=True)
+    tool_ctx.halt.halt("stop now")
+    env = dispatch.dispatch(tool_ctx, "run.finish", {}, why="closing up")
+    assert env.outcome == "ok"
+
+
+def test_a_halt_still_stops_every_other_mutating_tool(tool_ctx, a_tool):
+    # The exemption is `run.finish` alone -- every other mutating tool must
+    # still be refused under a halt, or the set is not doing its job.
+    a_tool("run.start", lambda c: {"id": "r-1"}, mutates=True)
+    tool_ctx.halt.halt("stop now")
+    env = dispatch.dispatch(tool_ctx, "run.start", {}, why="mapping")
+    assert (env.outcome, env.reason) == ("refused", "halted")
 
 
 def test_a_mutating_tool_without_a_why_is_refused(tool_ctx, a_tool):
@@ -1747,10 +1916,25 @@ def test_halt_beats_missing_why_which_beats_bad_args(tool_ctx, a_tool):
            needs_egress=True)
     tool_ctx.halt.halt("stop")
     assert dispatch.dispatch(tool_ctx, "scan.run", {"bad": 1}).reason == "halted"
+    # The two LENGTH guards are `bad_args` refusals too, and used to sit above
+    # `lookup` and the halt check -- so a halted engagement plus a `why` too
+    # long to accept used to answer `bad_args` here instead of `halted`. Still
+    # halted, on the earliest-matching-rule rule.
+    assert dispatch.dispatch(tool_ctx, "scan.run", {"bad": 1},
+                             why="x" * 501).reason == "halted"
     tool_ctx.halt.resume()
     assert dispatch.dispatch(tool_ctx, "scan.run", {"bad": 1}).reason == "missing_why"
     assert dispatch.dispatch(tool_ctx, "scan.run", {"bad": 1}, why="w").reason == "bad_args"
     assert dispatch.dispatch(tool_ctx, "scan.run", {"n": 1}, why="w").reason == "no_session"
+
+
+def test_not_registered_beats_an_over_long_name(tool_ctx):
+    # The other length guard, same shape: a name over 64 characters that is
+    # ALSO unregistered used to answer `bad_args` -- the length guard sat
+    # above `lookup` -- when the order says `not_registered` should win,
+    # since a name that long was never going to be found anyway.
+    env = dispatch.dispatch(tool_ctx, "x" * 70, {})
+    assert (env.outcome, env.reason) == ("refused", "not_registered")
 
 
 def test_a_handler_raising_ToolUnavailable_keeps_its_outcome(tool_ctx, a_tool):
@@ -1855,6 +2039,27 @@ def test_a_non_string_why_is_refused_not_coerced(tool_ctx, a_tool):
     # operator's reason for a state change nobody gave.
     assert row[0] is None
     assert len(_actions(tool_ctx.conn)) == 1
+
+
+def test_a_why_longer_than_500_characters_is_refused_and_journalled(tool_ctx, a_tool):
+    a_tool("run.start", lambda c: {"id": "r-1"}, mutates=True)
+    long_why = "x" * 501
+    env = dispatch.dispatch(tool_ctx, "run.start", {}, why=long_why)
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert len(_actions(tool_ctx.conn)) == 1
+
+
+def test_a_name_longer_than_64_characters_on_an_unregistered_name_is_not_registered(
+        tool_ctx):
+    # A name this long cannot be registered -- nothing in V1_TOOL_NAMES is
+    # anywhere near 64 characters -- so `lookup` already answers None for it,
+    # and the published order gives `not_registered` before the length guard
+    # ever gets a turn. This used to answer `bad_args` instead, which is
+    # exactly the inversion the whole-branch review's item 1 named.
+    long_name = "x" * 65
+    env = dispatch.dispatch(tool_ctx, long_name, {})
+    assert (env.outcome, env.reason) == ("refused", "not_registered")
+    assert len(_actions(tool_ctx.conn)) == 1
 ```
 
 - [ ] **Step 2: Add the shared context fixture to `tests/conftest.py`**
@@ -1912,8 +2117,31 @@ engagement from changing; it does not blind the operator's agent. Someone who
 has just hit STOP wants to ask what was happening, and every tool that can
 answer that is a read.
 
+`halted` ALSO DOES NOT APPLY TO `HALT_EXEMPT`, which today holds exactly
+`run.finish`. The rule the gate encodes is "a halted engagement must not do
+MORE"; closing an open run does less, not more, and in Plan B `run.finish` is
+what stops the Burp JVM -- so refusing it under a halt would leave a JVM
+running with nothing left holding it, which is exactly what section 8's
+bracket exists to prevent. `HALT_EXEMPT` is a named, greppable set checked
+here, not a per-spec boolean on `ToolSpec`: a boolean would invite a future
+tool to opt itself out of the halt gate one flag at a time, and the set makes
+every exemption a decision visible in one place instead of scattered across
+specs.
+
 `no_session` LAST, because it is the most expensive question to answer and the
 only one that depends on state outside this process.
+
+THE TWO LENGTH GUARDS -- `why` OVER 500 CHARACTERS, `name` OVER 64 -- SIT
+BELOW `lookup` AND THE HALT CHECK, deliberately, and did not always: a
+too-long `why` used to answer `bad_args` on a halted engagement, ahead of
+`halted`, and a too-long unknown name used to answer `bad_args` ahead of
+`not_registered`. Neither length is a `bad_args` question the published order
+puts before those two: a name over 64 characters is simply not a registered
+name (nothing in `V1_TOOL_NAMES` is that long, so `lookup` already returns
+`None` for it), and a `why` over 500 characters is an argument problem the
+order deliberately ranks below `halted`. The four TYPE guards immediately
+below this docstring are a different kind of guard and stay above `lookup`:
+a non-string `name` cannot be looked up at all, hashable or not.
 
 THIS FUNCTION NEVER RAISES. Every outcome -- refusal, unavailability, and a
 defect in hx itself -- comes back as an envelope, and every call writes AT
@@ -1947,6 +2175,15 @@ _log = logging.getLogger(__name__)
 #: Design section 5. Asserted by a test, so it cannot become a comment.
 DECISION_ORDER = ("not_registered", "halted", "missing_why", "bad_args",
                   "no_session")
+
+#: Tools the halt gate does not apply to, even though they mutate. `run.finish`
+#: is the only member: closing an open run does LESS, not more, and section
+#: 8's bracket needs it reachable under a halt so Plan B's Burp JVM is never
+#: left running with nothing holding it. A named set here rather than a
+#: `ToolSpec` boolean, so a future tool cannot opt itself out of the halt gate
+#: one flag at a time -- every exemption is a decision visible in this one
+#: place, and a test asserts the set holds exactly this.
+HALT_EXEMPT = frozenset({"run.finish"})
 
 
 @dataclasses.dataclass
@@ -2054,23 +2291,29 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
         return _journalled(ctx, name, args, safe_why, envelope.refused(
             name, "bad_args", f"why must be a string, got {type(why).__name__}"))
 
-    if why is not None and len(why) > 500:
-        return _journalled(ctx, name, args, why, envelope.refused(
-            name, "bad_args",
-            f"why must be at most 500 characters, got {len(why)}"))
-
-    if len(name) > 64:
-        return _journalled(ctx, name, args, why, envelope.refused(
-            name, "bad_args",
-            f"tool name must be at most 64 characters, got {len(name)}"))
+    # THE TWO LENGTH GUARDS BELOW USED TO SIT HERE, ABOVE `registry.lookup`
+    # AND THE HALT CHECK, WHICH INVERTED THE PUBLISHED ORDER FOR BOTH. A name
+    # over 64 characters is simply not a registered name -- `bad_args` for it
+    # answered before `not_registered` got a chance to, on a call the order
+    # says `not_registered` should own. A `why` over 500 characters is an
+    # argument problem, and the order puts `bad_args` after `halted`
+    # deliberately: an operator who has hit STOP should hear "the engagement
+    # is halted", not a lecture about `why`'s length, for a call that was
+    # never going to run either way. Both guards move below `lookup` and the
+    # halt check for exactly that reason -- see the module docstring's
+    # account of the four TYPE guards that must stay above them, which this
+    # does not touch: a non-string name or `why` cannot be looked up or
+    # `.strip()`-ed at all, so those four are a different kind of guard from
+    # these two.
 
     tool = registry.lookup(name)
     if tool is None:
         return _journalled(ctx, name, args, why, envelope.refused(
             name, "not_registered",
-            f"{name} is not a tool. Ask checks.list or read the tool list."))
+            f"{name} is not a tool. Run `hx tool --list` to see the "
+            "registered tools; checks.list only lists security checks."))
 
-    if tool.mutates and ctx.halt.halted:
+    if tool.mutates and ctx.halt.halted and name not in HALT_EXEMPT:
         return _journalled(ctx, name, args, why, envelope.refused(
             name, "halted", ctx.halt.reason))
 
@@ -2079,6 +2322,16 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
             name, "missing_why",
             f"{name} changes state, so it needs a `why`: it is written to "
             "agent_action and read by whoever asks what this run did."))
+
+    if len(name) > 64:
+        return _journalled(ctx, name, args, why, envelope.refused(
+            name, "bad_args",
+            f"tool name must be at most 64 characters, got {len(name)}"))
+
+    if why is not None and len(why) > 500:
+        return _journalled(ctx, name, args, why, envelope.refused(
+            name, "bad_args",
+            f"why must be at most 500 characters, got {len(why)}"))
 
     problems = schema.validate(tool.params, args)
     if problems:
@@ -2766,6 +3019,26 @@ def test_a_malformed_cursor_is_a_refusal_not_a_crash(tool_ctx):
     assert (env.outcome, env.reason) == ("refused", "bad_args")
 
 
+def test_an_overflowing_cursor_is_a_refusal_not_error_internal(tool_ctx):
+    # Item 2 of the final whole-branch review, end to end: `o-` followed by
+    # twenty nines is a valid Python int but not a valid SQLite offset --
+    # SQLite binds it as a signed 64-bit C integer and raises `OverflowError`.
+    # This used to reach dispatch's generic `except Exception` and answer
+    # `error / internal`, which tells the agent hx is broken when its cursor
+    # was simply implausible.
+    env = dispatch.dispatch(tool_ctx, "surface.query",
+                            {"cursor": "o-" + "9" * 20})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+
+
+def test_a_unicode_digit_cursor_is_a_refusal_not_a_valueerror(tool_ctx):
+    # "²" (superscript two) is a digit BY UNICODE -- `str.isdigit()` answers
+    # True -- but not one `int()` accepts in base 10, so the old guard let it
+    # through and `int()` raised `ValueError` two lines later.
+    env = dispatch.dispatch(tool_ctx, "surface.query", {"cursor": "o-²"})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+
+
 def test_untested_is_the_filter_that_makes_coverage_actionable(tool_ctx):
     # DISTINCT PATHS, and not incidentally: `surface` is UNIQUE on
     # (engagement_id, method, scheme, host, port, path_template, query_key_set)
@@ -2824,31 +3097,17 @@ still real, and it is written down here rather than discovered later.
 from __future__ import annotations
 
 from .. import envelope, registry, spec
-from ..errors import ToolRefused
-
-CURSOR_PREFIX = "o-"
 
 #: The one ordering, used by the page and by the count, so they cannot drift.
 _ORDER = ("ORDER BY (kind = 'state_changing') DESC, host, path_template,"
           " method, id")
 
 
-def _offset(cursor: str | None) -> int:
-    if cursor is None:
-        return 0
-    if not cursor.startswith(CURSOR_PREFIX) or not cursor[2:].isdigit():
-        raise ToolRefused(
-            "bad_args",
-            f"{cursor!r} is not a cursor from this tool; pass back the "
-            "next_cursor you were given, or omit it to start over")
-    return int(cursor[2:])
-
-
 def query(ctx, host=None, method=None, kind=None, discovered_by=None,
           untested=None, limit=None, cursor=None) -> dict:
     """Surfaces matching the filter, riskiest first."""
     limit = envelope.DEFAULT_LIMIT if limit is None else limit
-    offset = _offset(cursor)
+    offset = envelope.parse_offset(cursor)
     where = ["engagement_id = ?"]
     params: list = [ctx.engagement.id]
     for column, value in (("host", host), ("method", method),
@@ -2884,7 +3143,7 @@ def query(ctx, host=None, method=None, kind=None, discovered_by=None,
           "kind": r[7], "discovered_by": r[8],
           "first_seen_run": r[9], "last_seen_run": r[10]} for r in rows],
         total=total, limit=limit, facets=facets,
-        cursor_of=lambda _row: f"{CURSOR_PREFIX}{offset + limit}")
+        cursor_of=lambda _row: f"{envelope.CURSOR_PREFIX}{offset + limit}")
 
 
 def detail(ctx, surface_id: str) -> dict | None:
@@ -3104,10 +3363,42 @@ def test_the_agent_does_not_get_to_spell_its_own_dedupe_key(ready):
 
 
 def test_a_finding_with_no_exchanges_is_refused(ready):
+    # `exchange_ids` now carries `minItems: 1` in the schema (final
+    # whole-branch review's item 2), so this is caught at validation, before
+    # the handler's own "a finding must cite the exchanges" check ever runs
+    # -- `dispatch` validates before it calls. The handler's own check stays
+    # in place as defence in depth for a caller that reaches `record()`
+    # directly, bypassing the schema (as `tests/test_records_findings.py`
+    # and this module's own fixtures do elsewhere).
     env = dispatch.dispatch(ready, "finding.record",
                             dict(BASE, exchange_ids=[]), why="w")
     assert (env.outcome, env.reason) == ("refused", "bad_args")
-    assert "cite" in env.detail
+    assert "exchange_ids" in env.detail and "fewer than 1" in env.detail
+
+
+def test_exchange_ids_past_the_ceiling_is_refused_not_too_many_sql_variables(ready):
+    # MEASURED, before this fix: 60,000 exchange ids reached `record`'s own
+    # `IN (...)` lookup and raised `OperationalError: too many SQL
+    # variables` -- `error / internal`, telling the agent hx was broken when
+    # its argument was simply too large. `exchange_ids` now carries
+    # `maxItems` (final whole-branch review's item 2), so an over-long list
+    # is `bad_args` at validation and the handler never builds the query.
+    from hx.tools.impl import finding as finding_mod
+    too_many = [f"x-{i}" for i in range(finding_mod.MAX_EXCHANGE_IDS + 1)]
+    env = dispatch.dispatch(ready, "finding.record",
+                            dict(BASE, exchange_ids=too_many), why="w")
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert "exchange_ids" in env.detail and "more than" in env.detail
+
+
+def test_finding_query_cursor_rejects_an_overflowing_offset(ready):
+    env = dispatch.dispatch(ready, "finding.query", {"cursor": "o-" + "9" * 20})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+
+
+def test_finding_query_cursor_rejects_a_unicode_digit(ready):
+    env = dispatch.dispatch(ready, "finding.query", {"cursor": "o-²"})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
 
 
 def test_recording_without_a_run_is_unavailable(tool_ctx):
@@ -3206,27 +3497,30 @@ from ..errors import ToolRefused, ToolUnavailable
 #: One word, two columns, deliberately. It is the first part of the dedupe key
 #: for anything an agent records -- which is what keeps an agent finding from
 #: colliding with a check's finding of the same issue type on the same surface
-#: -- and it is `finding.created_by`, which section 12 renders. The two are the
-#: same claim about the same row, so they are one constant; and if the dedupe
-#: prefix were ever changed independently, `created_by`'s CHECK constraint
-#: would refuse the write rather than let the two drift quietly apart.
+#: -- and it is `finding.created_by`. The two are the same claim about the
+#: same row, so they are one constant; and if the dedupe prefix were ever
+#: changed independently, `created_by`'s CHECK constraint would refuse the
+#: write rather than let the two drift quietly apart. `created_by` is a
+#: storage-layer distinction, not yet a reporting one -- no report renders it
+#: today; see `records.upsert_finding`'s docstring for the correction.
 AGENT_TYPE = "agent"
+
+#: The ceiling on `exchange_ids`. Before the final whole-branch review's item
+#: 2, no array in the schema subset could be bounded at all -- `schema.py` had
+#: no `maxItems` keyword to bound one with -- so `finding.record` built an
+#: `IN (...)` list straight from whatever an agent sent. MEASURED: 60,000
+#: exchange ids raised `OperationalError: too many SQL variables`, an
+#: `error / internal` that told the agent hx was broken when its argument was
+#: simply too large. Comfortably above any real citation -- a finding with a
+#: few dozen supporting exchanges is already generous -- and comfortably below
+#: SQLite's own default variable ceiling (999 in most builds).
+MAX_EXCHANGE_IDS = 200
 
 #: The `evidence.role` column has no CHECK constraint -- it was written by one
 #: caller with one literal, so it never needed one. Now that a tool can set it,
 #: the vocabulary has to live somewhere, and a closed set here is what stops it
 #: becoming free text that no report can group by.
 EVIDENCE_ROLES = ("proof", "baseline", "context")
-
-CURSOR_PREFIX = "o-"
-
-
-def _offset(cursor):
-    if cursor is None:
-        return 0
-    if not cursor.startswith(CURSOR_PREFIX) or not cursor[2:].isdigit():
-        raise ToolRefused("bad_args", f"{cursor!r} is not a cursor from this tool")
-    return int(cursor[2:])
 
 
 def record(ctx, *, title, issue_type_id, severity, confidence, surface_id,
@@ -3295,7 +3589,7 @@ def query(ctx, severity=None, status=None, host=None, surface_id=None,
           created_by=None, limit=None, cursor=None) -> dict:
     """Findings matching the filter, most severe first."""
     limit = envelope.DEFAULT_LIMIT if limit is None else limit
-    offset = _offset(cursor)
+    offset = envelope.parse_offset(cursor)
     where = ["engagement_id = ?"]
     params: list = [ctx.engagement.id]
     for column, value in (("severity", severity), ("status", status),
@@ -3326,7 +3620,7 @@ def query(ctx, severity=None, status=None, host=None, surface_id=None,
           "host": r[7], "surface_id": r[8], "check_id": r[9], "cwe": r[10]}
          for r in rows],
         total=total, limit=limit, facets=facets,
-        cursor_of=lambda _row: f"{CURSOR_PREFIX}{offset + limit}")
+        cursor_of=lambda _row: f"{envelope.CURSOR_PREFIX}{offset + limit}")
 
 
 def attach(ctx, finding_id, exchange_id, role="proof", note=None) -> dict:
@@ -3370,7 +3664,10 @@ registry.register(spec.ToolSpec(
                 "surface_id": {"type": "string", "maxLength": 64},
                 "exchange_ids": {"type": "array",
                                  "items": {"type": "string", "maxLength": 64},
-                                 "description": "the traffic that shows it"},
+                                 "minItems": 1, "maxItems": MAX_EXCHANGE_IDS,
+                                 "description": "the traffic that shows it -- "
+                                                f"at least one, at most "
+                                                f"{MAX_EXCHANGE_IDS}"},
                 "description": _TEXT, "impact": _TEXT, "remediation": _TEXT,
                 "cwe": {"type": "string", "maxLength": 32},
                 "payload": {"type": "string", "maxLength": 2000,
@@ -3773,9 +4070,15 @@ def test_the_agent_cannot_confirm_its_own_finding_two_ways_over(engagement):
 
 
 def test_every_mutating_tool_is_refused_while_a_halt_is_armed(tool_ctx):
+    # `run.finish` is the one deliberate exception -- `dispatch.HALT_EXEMPT`,
+    # item 6 of the final whole-branch review. Closing an open run does LESS,
+    # not more, and in Plan B it is what stops the Burp JVM, so the halt gate
+    # must not block it. `test_the_halt_exemption_is_exactly_run_finish` (in
+    # `test_tools_dispatch.py`) asserts the exempt set holds nothing else, so
+    # skipping it here does not widen what this test lets through silently.
     tool_ctx.halt.halt("stop")
     for name, tool in registry.TOOLS.items():
-        if not tool.mutates:
+        if not tool.mutates or name in dispatch.HALT_EXEMPT:
             continue
         env = dispatch.dispatch(tool_ctx, name, {}, why="trying anyway")
         assert env.reason == "halted", f"{name} ran while halted"

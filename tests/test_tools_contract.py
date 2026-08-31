@@ -97,9 +97,15 @@ def test_the_agent_cannot_confirm_its_own_finding_two_ways_over(engagement):
 
 
 def test_every_mutating_tool_is_refused_while_a_halt_is_armed(tool_ctx):
+    # `run.finish` is the one deliberate exception -- `dispatch.HALT_EXEMPT`,
+    # item 6 of the final whole-branch review. Closing an open run does LESS,
+    # not more, and in Plan B it is what stops the Burp JVM, so the halt gate
+    # must not block it. `test_the_halt_exemption_is_exactly_run_finish` (in
+    # `test_tools_dispatch.py`) asserts the exempt set holds nothing else, so
+    # skipping it here does not widen what this test lets through silently.
     tool_ctx.halt.halt("stop")
     for name, tool in registry.TOOLS.items():
-        if not tool.mutates:
+        if not tool.mutates or name in dispatch.HALT_EXEMPT:
             continue
         env = dispatch.dispatch(tool_ctx, name, {}, why="trying anyway")
         assert env.reason == "halted", f"{name} ran while halted"

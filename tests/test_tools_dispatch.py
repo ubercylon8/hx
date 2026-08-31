@@ -60,13 +60,21 @@ def test_an_unregistered_name_is_refused_and_still_journalled(tool_ctx):
     # itself worth asserting, so it is.
     assert len(rows) == 1 and rows[0][0] == "nothing.at.all"
     assert rows[0][1].startswith("refused: not_registered")
-    assert "checks.list" in rows[0][1]
+    # `checks.list` lists security checks, not tools -- an agent told to "ask
+    # checks.list" for a tool list learns nothing and asks again. The message
+    # now points at the thing that actually lists tools, `hx tool --list`,
+    # and no longer tells the agent to ask checks.list for one.
+    assert "hx tool --list" in rows[0][1]
+    assert "Ask checks.list" not in rows[0][1]
 
 
 def test_a_halt_stops_a_mutating_tool(tool_ctx, a_tool):
-    a_tool("run.finish", lambda c: {"id": "r-1"}, mutates=True)
+    # `run.start`, not `run.finish` -- the latter is the one member of
+    # `HALT_EXEMPT` (item 6 of the final whole-branch review, tested below),
+    # and would make this test say the opposite of what it means to show.
+    a_tool("run.start", lambda c: {"id": "r-1"}, mutates=True)
     tool_ctx.halt.halt("stop now")
-    env = dispatch.dispatch(tool_ctx, "run.finish", {}, why="because")
+    env = dispatch.dispatch(tool_ctx, "run.start", {}, why="because")
     assert (env.outcome, env.reason) == ("refused", "halted")
 
 
@@ -76,6 +84,31 @@ def test_a_halt_does_not_stop_a_read(tool_ctx, a_tool):
     a_tool("run.journal", lambda c: ["an action"])
     tool_ctx.halt.halt("stop now")
     assert dispatch.dispatch(tool_ctx, "run.journal", {}).outcome == "ok"
+
+
+def test_the_halt_exemption_is_exactly_run_finish():
+    # Item 6 of the final whole-branch review: closing an open run does LESS,
+    # not more, so a halt must not block it -- and in Plan B, `run.finish` is
+    # what stops the Burp JVM, so refusing it under a halt would leave one
+    # running with nothing holding it. A named set, asserted exactly, so a
+    # future tool cannot join it quietly.
+    assert dispatch.HALT_EXEMPT == frozenset({"run.finish"})
+
+
+def test_a_halt_does_not_stop_the_exempt_tool(tool_ctx, a_tool):
+    a_tool("run.finish", lambda c: {"id": "r-1"}, mutates=True)
+    tool_ctx.halt.halt("stop now")
+    env = dispatch.dispatch(tool_ctx, "run.finish", {}, why="closing up")
+    assert env.outcome == "ok"
+
+
+def test_a_halt_still_stops_every_other_mutating_tool(tool_ctx, a_tool):
+    # The exemption is `run.finish` alone -- every other mutating tool must
+    # still be refused under a halt, or the set is not doing its job.
+    a_tool("run.start", lambda c: {"id": "r-1"}, mutates=True)
+    tool_ctx.halt.halt("stop now")
+    env = dispatch.dispatch(tool_ctx, "run.start", {}, why="mapping")
+    assert (env.outcome, env.reason) == ("refused", "halted")
 
 
 def test_a_mutating_tool_without_a_why_is_refused(tool_ctx, a_tool):
@@ -106,10 +139,25 @@ def test_halt_beats_missing_why_which_beats_bad_args(tool_ctx, a_tool):
            needs_egress=True)
     tool_ctx.halt.halt("stop")
     assert dispatch.dispatch(tool_ctx, "scan.run", {"bad": 1}).reason == "halted"
+    # The two LENGTH guards are `bad_args` refusals too, and used to sit above
+    # `lookup` and the halt check -- so a halted engagement plus a `why` too
+    # long to accept used to answer `bad_args` here instead of `halted`. Still
+    # halted, on the earliest-matching-rule rule.
+    assert dispatch.dispatch(tool_ctx, "scan.run", {"bad": 1},
+                             why="x" * 501).reason == "halted"
     tool_ctx.halt.resume()
     assert dispatch.dispatch(tool_ctx, "scan.run", {"bad": 1}).reason == "missing_why"
     assert dispatch.dispatch(tool_ctx, "scan.run", {"bad": 1}, why="w").reason == "bad_args"
     assert dispatch.dispatch(tool_ctx, "scan.run", {"n": 1}, why="w").reason == "no_session"
+
+
+def test_not_registered_beats_an_over_long_name(tool_ctx):
+    # The other length guard, same shape: a name over 64 characters that is
+    # ALSO unregistered used to answer `bad_args` -- the length guard sat
+    # above `lookup` -- when the order says `not_registered` should win,
+    # since a name that long was never going to be found anyway.
+    env = dispatch.dispatch(tool_ctx, "x" * 70, {})
+    assert (env.outcome, env.reason) == ("refused", "not_registered")
 
 
 def test_a_handler_raising_ToolUnavailable_keeps_its_outcome(tool_ctx, a_tool):
@@ -224,8 +272,14 @@ def test_a_why_longer_than_500_characters_is_refused_and_journalled(tool_ctx, a_
     assert len(_actions(tool_ctx.conn)) == 1
 
 
-def test_a_name_longer_than_64_characters_is_refused_and_journalled(tool_ctx):
+def test_a_name_longer_than_64_characters_on_an_unregistered_name_is_not_registered(
+        tool_ctx):
+    # A name this long cannot be registered -- nothing in V1_TOOL_NAMES is
+    # anywhere near 64 characters -- so `lookup` already answers None for it,
+    # and the published order gives `not_registered` before the length guard
+    # ever gets a turn. This used to answer `bad_args` instead, which is
+    # exactly the inversion the whole-branch review's item 1 named.
     long_name = "x" * 65
     env = dispatch.dispatch(tool_ctx, long_name, {})
-    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert (env.outcome, env.reason) == ("refused", "not_registered")
     assert len(_actions(tool_ctx.conn)) == 1

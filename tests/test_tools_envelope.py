@@ -118,6 +118,49 @@ def test_envelope_may_not_be_subclassed():
             pass
 
 
+def test_parse_offset_is_none_for_no_cursor():
+    assert envelope.parse_offset(None) == 0
+
+
+def test_parse_offset_reads_back_what_it_was_given():
+    assert envelope.parse_offset("o-50") == 50
+    assert envelope.parse_offset("o-0") == 0
+
+
+def test_parse_offset_refuses_a_cursor_from_nowhere():
+    with pytest.raises(errors.ToolRefused) as exc:
+        envelope.parse_offset("nonsense")
+    assert exc.value.reason == "bad_args"
+
+
+def test_parse_offset_refuses_an_overflowing_offset_before_sqlite_ever_sees_it():
+    # `int("9" * 20)` succeeds -- Python ints have no ceiling -- but SQLite
+    # binds an offset as a signed 64-bit C integer and raises `OverflowError`
+    # the moment the query runs. Uncaught, that lands in dispatch's generic
+    # `except Exception` and answers `error / internal`, telling the agent hx
+    # is broken when its cursor was merely implausible. `parse_offset` catches
+    # it here instead, as an ordinary `bad_args` refusal.
+    with pytest.raises(errors.ToolRefused) as exc:
+        envelope.parse_offset(f"{envelope.CURSOR_PREFIX}{'9' * 20}")
+    assert exc.value.reason == "bad_args"
+    # Comfortably inside the bound is still fine.
+    assert envelope.parse_offset(
+        f"{envelope.CURSOR_PREFIX}{envelope.MAX_OFFSET}") == envelope.MAX_OFFSET
+    with pytest.raises(errors.ToolRefused):
+        envelope.parse_offset(f"{envelope.CURSOR_PREFIX}{envelope.MAX_OFFSET + 1}")
+
+
+def test_parse_offset_refuses_a_unicode_digit_that_isdigit_would_have_missed():
+    # "²" (superscript two) answers True to `str.isdigit()` -- it IS a
+    # digit, by Unicode, just not one `int()` accepts in base 10 -- so a
+    # cursor built from it used to pass the digit check and then raise
+    # `ValueError` two lines later, inside `int()`.
+    assert "²".isdigit()
+    with pytest.raises(errors.ToolRefused) as exc:
+        envelope.parse_offset(f"{envelope.CURSOR_PREFIX}²")
+    assert exc.value.reason == "bad_args"
+
+
 def test_a_non_ran_envelope_may_not_carry_a_result():
     # Non-ran outcomes cannot carry results
     with pytest.raises(ValueError, match="did not run"):

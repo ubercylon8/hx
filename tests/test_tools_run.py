@@ -169,6 +169,84 @@ def test_resume_is_a_read_and_survives_a_halt(tool_ctx):
     assert dispatch.dispatch(tool_ctx, "run.resume", {}).outcome == "ok"
 
 
+def test_operator_fields_in_the_brief_are_truncated_but_the_stored_values_are_not(
+        tmp_path):
+    """Item 3 of the final whole-branch review.
+
+    `test_the_brief_is_bounded` drives the brief off the `engagement` fixture,
+    whose `config.name == 't'`, `config.client == 'T'` and whose halt reason in
+    that older test was 24 characters -- every one of them already shorter
+    than `OPERATOR_FIELD_LIMIT`, so the truncated and untruncated brief were
+    byte-identical and the assertion (`< 1_000_000`) held at roughly 15 KB
+    either way. Deleting all three `OPERATOR_FIELD_LIMIT` slices in `resume()`
+    left the whole suite green -- they were the only survivors of 49 seeded
+    mutations. This test gives the engagement a name, a client and a halt
+    reason each longer than the limit, so a removed slice changes the
+    assertion instead of leaving it vacuously true.
+    """
+    from hx import config as config_mod
+    from hx import engagement as eng_mod
+    from hx import halt as halt_mod
+    from hx.tools import dispatch as dispatch_mod
+
+    limit = run_tools.OPERATOR_FIELD_LIMIT
+    long_name = "N" * (limit + 50)
+    long_client = "C" * (limit + 50)
+    long_reason = "R" * (limit + 50)
+
+    cfg = config_mod.Config(name=long_name, client=long_client,
+                            safety_profile="staging",
+                            scope_include=["https://app.test/*"])
+    eng = eng_mod.create(tmp_path / "e", cfg, author="test")
+    try:
+        eng.db.row_factory = None
+        ctx = dispatch_mod.ToolContext(
+            engagement=eng, conn=eng.db, blobs=eng.blobs, config=eng.config,
+            halt=halt_mod.OperatorHalt(eng.root, eng.db))
+        ctx.halt.halt(long_reason)
+
+        brief = dispatch.dispatch(ctx, "run.resume", {}).result
+
+        # Each of the three fields comes back at EXACTLY the limit.
+        assert len(brief["engagement"]["name"]) == limit
+        assert len(brief["engagement"]["client"]) == limit
+        assert len(brief["halt"]["reason"]) == limit
+        assert brief["engagement"]["name"] == long_name[:limit]
+        assert brief["engagement"]["client"] == long_client[:limit]
+        assert brief["halt"]["reason"] == long_reason[:limit]
+
+        # The STORED values are untouched -- truncation is a display-boundary
+        # choice the brief makes, not a rewrite of the config or the halt
+        # sentinel underneath it.
+        assert eng.config.name == long_name
+        assert eng.config.client == long_client
+        assert ctx.halt.reason == long_reason
+    finally:
+        eng.db.close()
+
+
+def test_a_halted_engagement_can_still_close_its_run(tool_ctx):
+    # Item 6 of the final whole-branch review: `run.finish` is exempt from
+    # the halt gate. Closing an open run does LESS, not more, and in Plan B
+    # it is what stops the Burp JVM -- a halt refusing it would leave one
+    # running with nothing holding it, exactly what section 8's bracket
+    # exists to prevent.
+    dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="mapping")
+    run_id = tool_ctx.run_id
+    tool_ctx.halt.halt("client asked us to stop")
+
+    env = dispatch.dispatch(tool_ctx, "run.finish",
+                            {"status": "aborted", "note": "halted"}, why="closing up")
+    assert env.outcome == "ok" and env.result["id"] == run_id
+    assert tool_ctx.run_id is None
+    assert tool_ctx.conn.execute("SELECT status FROM run WHERE id=?",
+                            (run_id,)).fetchone() == ("aborted",)
+
+    # Every OTHER mutating tool stays refused while the halt is armed.
+    env = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="again")
+    assert (env.outcome, env.reason) == ("refused", "halted")
+
+
 # ---- Finding 1 of the final whole-branch review: the CLI adapter builds a
 # fresh `ToolContext` per `hx tool` invocation, and before this fix
 # `ctx.run_id` was a plain field that only ever held what THAT process set --

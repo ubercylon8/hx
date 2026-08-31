@@ -100,6 +100,10 @@ def test_every_constraint_keyword_is_actually_implemented():
         "properties": (OBJ, {"name": 1}),
         "additionalProperties": (OBJ, {"zzz": 1}),
         "required": (dict(OBJ, required=["name"]), {}),
+        "minItems": ({"type": "array", "items": {"type": "string"},
+                     "minItems": 2}, ["a"]),
+        "maxItems": ({"type": "array", "items": {"type": "string"},
+                     "maxItems": 1}, ["a", "b"]),
     }
     assert set(cases) == schema.CONSTRAINTS
     for keyword, (sch, bad) in cases.items():
@@ -195,6 +199,10 @@ def test_every_constraint_keyword_is_enforced_for_every_applicable_type():
                 sch["additionalProperties"] = False
             elif keyword == "items":
                 sch["items"] = {"type": "string"}
+            elif keyword == "minItems":
+                sch["minItems"] = 0
+            elif keyword == "maxItems":
+                sch["maxItems"] = 10
             # This should not raise.
             schema.check_schema(sch)
             # Also check that check_schema raises SchemaError, never any other exception,
@@ -225,6 +233,12 @@ def test_every_constraint_keyword_is_enforced_for_every_applicable_type():
                         sch = {"type": "string", "minLength": bad_value}
                     elif keyword == "maxLength":
                         sch = {"type": "string", "maxLength": bad_value}
+                    elif keyword == "minItems":
+                        sch = {"type": "array", "items": {"type": "string"},
+                               "minItems": bad_value}
+                    elif keyword == "maxItems":
+                        sch = {"type": "array", "items": {"type": "string"},
+                               "maxItems": bad_value}
                     schema.check_schema(sch)
                 except schema.SchemaError:
                     # Expected: SchemaError for invalid value.

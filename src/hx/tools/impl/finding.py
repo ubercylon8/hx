@@ -35,27 +35,30 @@ from ..errors import ToolRefused, ToolUnavailable
 #: One word, two columns, deliberately. It is the first part of the dedupe key
 #: for anything an agent records -- which is what keeps an agent finding from
 #: colliding with a check's finding of the same issue type on the same surface
-#: -- and it is `finding.created_by`, which section 12 renders. The two are the
-#: same claim about the same row, so they are one constant; and if the dedupe
-#: prefix were ever changed independently, `created_by`'s CHECK constraint
-#: would refuse the write rather than let the two drift quietly apart.
+#: -- and it is `finding.created_by`. The two are the same claim about the
+#: same row, so they are one constant; and if the dedupe prefix were ever
+#: changed independently, `created_by`'s CHECK constraint would refuse the
+#: write rather than let the two drift quietly apart. `created_by` is a
+#: storage-layer distinction, not yet a reporting one -- no report renders it
+#: today; see `records.upsert_finding`'s docstring for the correction.
 AGENT_TYPE = "agent"
+
+#: The ceiling on `exchange_ids`. Before the final whole-branch review's item
+#: 2, no array in the schema subset could be bounded at all -- `schema.py` had
+#: no `maxItems` keyword to bound one with -- so `finding.record` built an
+#: `IN (...)` list straight from whatever an agent sent. MEASURED: 60,000
+#: exchange ids raised `OperationalError: too many SQL variables`, an
+#: `error / internal` that told the agent hx was broken when its argument was
+#: simply too large. Comfortably above any real citation -- a finding with a
+#: few dozen supporting exchanges is already generous -- and comfortably below
+#: SQLite's own default variable ceiling (999 in most builds).
+MAX_EXCHANGE_IDS = 200
 
 #: The `evidence.role` column has no CHECK constraint -- it was written by one
 #: caller with one literal, so it never needed one. Now that a tool can set it,
 #: the vocabulary has to live somewhere, and a closed set here is what stops it
 #: becoming free text that no report can group by.
 EVIDENCE_ROLES = ("proof", "baseline", "context")
-
-CURSOR_PREFIX = "o-"
-
-
-def _offset(cursor):
-    if cursor is None:
-        return 0
-    if not cursor.startswith(CURSOR_PREFIX) or not cursor[2:].isdigit():
-        raise ToolRefused("bad_args", f"{cursor!r} is not a cursor from this tool")
-    return int(cursor[2:])
 
 
 def record(ctx, *, title, issue_type_id, severity, confidence, surface_id,
@@ -124,7 +127,7 @@ def query(ctx, severity=None, status=None, host=None, surface_id=None,
           created_by=None, limit=None, cursor=None) -> dict:
     """Findings matching the filter, most severe first."""
     limit = envelope.DEFAULT_LIMIT if limit is None else limit
-    offset = _offset(cursor)
+    offset = envelope.parse_offset(cursor)
     where = ["engagement_id = ?"]
     params: list = [ctx.engagement.id]
     for column, value in (("severity", severity), ("status", status),
@@ -155,7 +158,7 @@ def query(ctx, severity=None, status=None, host=None, surface_id=None,
           "host": r[7], "surface_id": r[8], "check_id": r[9], "cwe": r[10]}
          for r in rows],
         total=total, limit=limit, facets=facets,
-        cursor_of=lambda _row: f"{CURSOR_PREFIX}{offset + limit}")
+        cursor_of=lambda _row: f"{envelope.CURSOR_PREFIX}{offset + limit}")
 
 
 def attach(ctx, finding_id, exchange_id, role="proof", note=None) -> dict:
@@ -199,7 +202,10 @@ registry.register(spec.ToolSpec(
                 "surface_id": {"type": "string", "maxLength": 64},
                 "exchange_ids": {"type": "array",
                                  "items": {"type": "string", "maxLength": 64},
-                                 "description": "the traffic that shows it"},
+                                 "minItems": 1, "maxItems": MAX_EXCHANGE_IDS,
+                                 "description": "the traffic that shows it -- "
+                                                f"at least one, at most "
+                                                f"{MAX_EXCHANGE_IDS}"},
                 "description": _TEXT, "impact": _TEXT, "remediation": _TEXT,
                 "cwe": {"type": "string", "maxLength": 32},
                 "payload": {"type": "string", "maxLength": 2000,

@@ -53,10 +53,42 @@ def test_the_agent_does_not_get_to_spell_its_own_dedupe_key(ready):
 
 
 def test_a_finding_with_no_exchanges_is_refused(ready):
+    # `exchange_ids` now carries `minItems: 1` in the schema (final
+    # whole-branch review's item 2), so this is caught at validation, before
+    # the handler's own "a finding must cite the exchanges" check ever runs
+    # -- `dispatch` validates before it calls. The handler's own check stays
+    # in place as defence in depth for a caller that reaches `record()`
+    # directly, bypassing the schema (as `tests/test_records_findings.py`
+    # and this module's own fixtures do elsewhere).
     env = dispatch.dispatch(ready, "finding.record",
                             dict(BASE, exchange_ids=[]), why="w")
     assert (env.outcome, env.reason) == ("refused", "bad_args")
-    assert "cite" in env.detail
+    assert "exchange_ids" in env.detail and "fewer than 1" in env.detail
+
+
+def test_exchange_ids_past_the_ceiling_is_refused_not_too_many_sql_variables(ready):
+    # MEASURED, before this fix: 60,000 exchange ids reached `record`'s own
+    # `IN (...)` lookup and raised `OperationalError: too many SQL
+    # variables` -- `error / internal`, telling the agent hx was broken when
+    # its argument was simply too large. `exchange_ids` now carries
+    # `maxItems` (final whole-branch review's item 2), so an over-long list
+    # is `bad_args` at validation and the handler never builds the query.
+    from hx.tools.impl import finding as finding_mod
+    too_many = [f"x-{i}" for i in range(finding_mod.MAX_EXCHANGE_IDS + 1)]
+    env = dispatch.dispatch(ready, "finding.record",
+                            dict(BASE, exchange_ids=too_many), why="w")
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert "exchange_ids" in env.detail and "more than" in env.detail
+
+
+def test_finding_query_cursor_rejects_an_overflowing_offset(ready):
+    env = dispatch.dispatch(ready, "finding.query", {"cursor": "o-" + "9" * 20})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+
+
+def test_finding_query_cursor_rejects_a_unicode_digit(ready):
+    env = dispatch.dispatch(ready, "finding.query", {"cursor": "o-²"})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
 
 
 def test_recording_without_a_run_is_unavailable(tool_ctx):

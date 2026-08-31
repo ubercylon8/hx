@@ -15,31 +15,17 @@ still real, and it is written down here rather than discovered later.
 from __future__ import annotations
 
 from .. import envelope, registry, spec
-from ..errors import ToolRefused
-
-CURSOR_PREFIX = "o-"
 
 #: The one ordering, used by the page and by the count, so they cannot drift.
 _ORDER = ("ORDER BY (kind = 'state_changing') DESC, host, path_template,"
           " method, id")
 
 
-def _offset(cursor: str | None) -> int:
-    if cursor is None:
-        return 0
-    if not cursor.startswith(CURSOR_PREFIX) or not cursor[2:].isdigit():
-        raise ToolRefused(
-            "bad_args",
-            f"{cursor!r} is not a cursor from this tool; pass back the "
-            "next_cursor you were given, or omit it to start over")
-    return int(cursor[2:])
-
-
 def query(ctx, host=None, method=None, kind=None, discovered_by=None,
           untested=None, limit=None, cursor=None) -> dict:
     """Surfaces matching the filter, riskiest first."""
     limit = envelope.DEFAULT_LIMIT if limit is None else limit
-    offset = _offset(cursor)
+    offset = envelope.parse_offset(cursor)
     where = ["engagement_id = ?"]
     params: list = [ctx.engagement.id]
     for column, value in (("host", host), ("method", method),
@@ -75,7 +61,7 @@ def query(ctx, host=None, method=None, kind=None, discovered_by=None,
           "kind": r[7], "discovered_by": r[8],
           "first_seen_run": r[9], "last_seen_run": r[10]} for r in rows],
         total=total, limit=limit, facets=facets,
-        cursor_of=lambda _row: f"{CURSOR_PREFIX}{offset + limit}")
+        cursor_of=lambda _row: f"{envelope.CURSOR_PREFIX}{offset + limit}")
 
 
 def detail(ctx, surface_id: str) -> dict | None:

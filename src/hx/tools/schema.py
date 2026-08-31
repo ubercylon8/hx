@@ -21,6 +21,16 @@ it only applies to numbers; `{"type": "string", "minLength": "two"}` accepts and
 crashes on len(value) < "two"; `{"type": "integer", "minimum": "five"}` accepts
 and crashes on value < "five". check_schema now validates both by consulting a
 table for each keyword present.
+
+`minItems`/`maxItems` WERE MISSING ENTIRELY until the final whole-branch
+review's item 2, which is a sharper hole than a keyword with one fact
+unstated: with no array-length keyword AT ALL, no schema in this system could
+bound an array's size, so `finding.record`'s `exchange_ids` had no ceiling and
+60,000 of them became `OperationalError: too many SQL variables` from the
+`IN (...)` list the handler builds -- `error / internal`, which tells the
+agent hx is broken when its argument was simply too large. `minItems` doubles
+as the "must cite exchanges" rule `finding.record`'s docstring already wanted;
+`maxItems` is the ceiling.
 """
 from __future__ import annotations
 
@@ -50,6 +60,8 @@ _CONSTRAINT_TABLE: dict[str, tuple[frozenset[str] | None, type]] = {
     "maximum": (frozenset({"integer", "number"}), (int, float)),
     "minLength": (frozenset({"string"}), int),
     "maxLength": (frozenset({"string"}), int),
+    "minItems": (frozenset({"array"}), int),
+    "maxItems": (frozenset({"array"}), int),
 }
 
 #: Keywords that constrain a value. Every one is implemented by `validate`, and
@@ -97,8 +109,10 @@ def check_schema(obj: Any, *, where: str = "params") -> None:
             )
         value = obj[keyword]
         # bool-is-not-int exclusion for numeric constraint values.
-        # minimum, maximum take (int, float); minLength, maxLength take int.
-        if keyword in ("minimum", "maximum", "minLength", "maxLength"):
+        # minimum, maximum take (int, float); minLength, maxLength, minItems,
+        # maxItems take int.
+        if keyword in ("minimum", "maximum", "minLength", "maxLength",
+                       "minItems", "maxItems"):
             ok = isinstance(value, value_type) and not isinstance(value, bool)
         else:
             ok = isinstance(value, value_type) and not (
@@ -217,6 +231,12 @@ def _validate(obj, value, where, out) -> None:
             if key in value:
                 _validate(sub, value[key], f"{where}.{key}", out)
     elif type_ == "array":
+        # Same rule as minimum/maximum below: the constraint, never the
+        # value -- there is nothing to echo for an array's length anyway.
+        if "minItems" in obj and len(value) < obj["minItems"]:
+            out.append(f"{where}: fewer than {obj['minItems']} items")
+        if "maxItems" in obj and len(value) > obj["maxItems"]:
+            out.append(f"{where}: more than {obj['maxItems']} items")
         for i, item in enumerate(value):
             _validate(obj["items"], item, f"{where}[{i}]", out)
     elif type_ in ("integer", "number"):

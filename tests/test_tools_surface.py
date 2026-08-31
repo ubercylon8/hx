@@ -97,6 +97,26 @@ def test_a_malformed_cursor_is_a_refusal_not_a_crash(tool_ctx):
     assert (env.outcome, env.reason) == ("refused", "bad_args")
 
 
+def test_an_overflowing_cursor_is_a_refusal_not_error_internal(tool_ctx):
+    # Item 2 of the final whole-branch review, end to end: `o-` followed by
+    # twenty nines is a valid Python int but not a valid SQLite offset --
+    # SQLite binds it as a signed 64-bit C integer and raises `OverflowError`.
+    # This used to reach dispatch's generic `except Exception` and answer
+    # `error / internal`, which tells the agent hx is broken when its cursor
+    # was simply implausible.
+    env = dispatch.dispatch(tool_ctx, "surface.query",
+                            {"cursor": "o-" + "9" * 20})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+
+
+def test_a_unicode_digit_cursor_is_a_refusal_not_a_valueerror(tool_ctx):
+    # "²" (superscript two) is a digit BY UNICODE -- `str.isdigit()` answers
+    # True -- but not one `int()` accepts in base 10, so the old guard let it
+    # through and `int()` raised `ValueError` two lines later.
+    env = dispatch.dispatch(tool_ctx, "surface.query", {"cursor": "o-²"})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+
+
 def test_untested_is_the_filter_that_makes_coverage_actionable(tool_ctx):
     # DISTINCT PATHS, and not incidentally: `surface` is UNIQUE on
     # (engagement_id, method, scheme, host, port, path_template, query_key_set)

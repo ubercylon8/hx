@@ -24434,7 +24434,15 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
     unchanged byte for byte -- the same widening `record_evidence` took for
     `role` -- and the column has always admitted `agent`; nothing could reach
     it. An agent finding is not a lesser one, but it is a differently-sourced
-    one, and section 12 renders the distinction.
+    one, and the column records which writer asserted it.
+
+    NO REPORT RENDERS THAT DISTINCTION YET -- an earlier version of this
+    docstring said "section 12 renders the distinction", which was false:
+    `created_by` appears nowhere in `hx/report.py`. The column is written and
+    queryable (`finding.query`'s own `created_by` filter reads it back), but
+    whether a client deliverable should say "the agent found this" is a
+    reporting decision nobody has made, not a storage one this function
+    settles by writing the column.
 
     `created_by` IS ALSO NOT IN THE `DO UPDATE` CLAUSE, and the Task 9 review
     asked the obvious question: if a check and an agent produced the same

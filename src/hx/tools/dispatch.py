@@ -20,8 +20,31 @@ engagement from changing; it does not blind the operator's agent. Someone who
 has just hit STOP wants to ask what was happening, and every tool that can
 answer that is a read.
 
+`halted` ALSO DOES NOT APPLY TO `HALT_EXEMPT`, which today holds exactly
+`run.finish`. The rule the gate encodes is "a halted engagement must not do
+MORE"; closing an open run does less, not more, and in Plan B `run.finish` is
+what stops the Burp JVM -- so refusing it under a halt would leave a JVM
+running with nothing left holding it, which is exactly what section 8's
+bracket exists to prevent. `HALT_EXEMPT` is a named, greppable set checked
+here, not a per-spec boolean on `ToolSpec`: a boolean would invite a future
+tool to opt itself out of the halt gate one flag at a time, and the set makes
+every exemption a decision visible in one place instead of scattered across
+specs.
+
 `no_session` LAST, because it is the most expensive question to answer and the
 only one that depends on state outside this process.
+
+THE TWO LENGTH GUARDS -- `why` OVER 500 CHARACTERS, `name` OVER 64 -- SIT
+BELOW `lookup` AND THE HALT CHECK, deliberately, and did not always: a
+too-long `why` used to answer `bad_args` on a halted engagement, ahead of
+`halted`, and a too-long unknown name used to answer `bad_args` ahead of
+`not_registered`. Neither length is a `bad_args` question the published order
+puts before those two: a name over 64 characters is simply not a registered
+name (nothing in `V1_TOOL_NAMES` is that long, so `lookup` already returns
+`None` for it), and a `why` over 500 characters is an argument problem the
+order deliberately ranks below `halted`. The four TYPE guards immediately
+below this docstring are a different kind of guard and stay above `lookup`:
+a non-string `name` cannot be looked up at all, hashable or not.
 
 THIS FUNCTION NEVER RAISES. Every outcome -- refusal, unavailability, and a
 defect in hx itself -- comes back as an envelope, and every call writes AT
@@ -55,6 +78,15 @@ _log = logging.getLogger(__name__)
 #: Design section 5. Asserted by a test, so it cannot become a comment.
 DECISION_ORDER = ("not_registered", "halted", "missing_why", "bad_args",
                   "no_session")
+
+#: Tools the halt gate does not apply to, even though they mutate. `run.finish`
+#: is the only member: closing an open run does LESS, not more, and section
+#: 8's bracket needs it reachable under a halt so Plan B's Burp JVM is never
+#: left running with nothing holding it. A named set here rather than a
+#: `ToolSpec` boolean, so a future tool cannot opt itself out of the halt gate
+#: one flag at a time -- every exemption is a decision visible in this one
+#: place, and a test asserts the set holds exactly this.
+HALT_EXEMPT = frozenset({"run.finish"})
 
 
 @dataclasses.dataclass
@@ -162,23 +194,29 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
         return _journalled(ctx, name, args, safe_why, envelope.refused(
             name, "bad_args", f"why must be a string, got {type(why).__name__}"))
 
-    if why is not None and len(why) > 500:
-        return _journalled(ctx, name, args, why, envelope.refused(
-            name, "bad_args",
-            f"why must be at most 500 characters, got {len(why)}"))
-
-    if len(name) > 64:
-        return _journalled(ctx, name, args, why, envelope.refused(
-            name, "bad_args",
-            f"tool name must be at most 64 characters, got {len(name)}"))
+    # THE TWO LENGTH GUARDS BELOW USED TO SIT HERE, ABOVE `registry.lookup`
+    # AND THE HALT CHECK, WHICH INVERTED THE PUBLISHED ORDER FOR BOTH. A name
+    # over 64 characters is simply not a registered name -- `bad_args` for it
+    # answered before `not_registered` got a chance to, on a call the order
+    # says `not_registered` should own. A `why` over 500 characters is an
+    # argument problem, and the order puts `bad_args` after `halted`
+    # deliberately: an operator who has hit STOP should hear "the engagement
+    # is halted", not a lecture about `why`'s length, for a call that was
+    # never going to run either way. Both guards move below `lookup` and the
+    # halt check for exactly that reason -- see the module docstring's
+    # account of the four TYPE guards that must stay above them, which this
+    # does not touch: a non-string name or `why` cannot be looked up or
+    # `.strip()`-ed at all, so those four are a different kind of guard from
+    # these two.
 
     tool = registry.lookup(name)
     if tool is None:
         return _journalled(ctx, name, args, why, envelope.refused(
             name, "not_registered",
-            f"{name} is not a tool. Ask checks.list or read the tool list."))
+            f"{name} is not a tool. Run `hx tool --list` to see the "
+            "registered tools; checks.list only lists security checks."))
 
-    if tool.mutates and ctx.halt.halted:
+    if tool.mutates and ctx.halt.halted and name not in HALT_EXEMPT:
         return _journalled(ctx, name, args, why, envelope.refused(
             name, "halted", ctx.halt.reason))
 
@@ -187,6 +225,16 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
             name, "missing_why",
             f"{name} changes state, so it needs a `why`: it is written to "
             "agent_action and read by whoever asks what this run did."))
+
+    if len(name) > 64:
+        return _journalled(ctx, name, args, why, envelope.refused(
+            name, "bad_args",
+            f"tool name must be at most 64 characters, got {len(name)}"))
+
+    if why is not None and len(why) > 500:
+        return _journalled(ctx, name, args, why, envelope.refused(
+            name, "bad_args",
+            f"why must be at most 500 characters, got {len(why)}"))
 
     problems = schema.validate(tool.params, args)
     if problems:
