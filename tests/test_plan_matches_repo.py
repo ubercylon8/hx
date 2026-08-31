@@ -330,7 +330,21 @@ def test_a_stale_excerpt_is_caught_where_a_whole_file_compare_never_looked(tmp_p
 # 2026-08-27-checks-and-reporting.md is still `pending` and still contributes
 # none of its 26, and that is a merged plan: worth fixing, and a bigger job
 # than marking one.
-EXPECTED_BLOCKS = 139
+#
+# 141 = 139 plus the TWO the identity plan contributed on 2026-08-30, when Task
+# 1 shipped `src/hx/config.py`'s identity declaration and its tests and synced
+# both blocks against the code. The rest of that plan's fences are deliberately
+# unmarked: they specify files Tasks 2-8 have not written yet, and a marker on
+# a block whose file does not exist is a comparison against nothing. Markers go
+# on at the END of a plan's execution, which is the same rule the active-checks
+# plan followed above.
+#
+# Writing that plan is what taught this: its first commit added fourteen marked
+# blocks at once and turned this suite red before a line of the feature was
+# written. The marker line is inside the fence, so any fenced Python whose
+# first line is a comment becomes a tracked block whether or not anyone meant
+# it to be.
+EXPECTED_BLOCKS = 141
 
 
 def test_the_check_actually_found_some_blocks():

@@ -80,10 +80,10 @@ directory be read", regardless of which line of `/etc/passwd` proved it --
 passed to `_probe_util.verdict` as `examined` only when at least one
 file-shaped parameter was actually probed, never on a surface with no
 insertion point this check's name filter accepted. Such a surface answers
-`inconclusive` and not `clean` (N3 of the scoped re-review): nothing an
-active check says retires anything since fix round 6, but a `clean` row
-still tells `report._coverage` this check examined a surface it never sent
-a request to. `_NOTHING_PROBEABLE` is the sentence it says instead.
+`inconclusive` and not `clean` (N3 of the scoped re-review): an `inconclusive`
+verdict carries no `considered` and so retires nothing whatever the run proved,
+and a `clean` row would tell `report._coverage` this check examined a surface it
+never sent a request to. `_NOTHING_PROBEABLE` is the sentence it says instead.
 
 EACH CANDIDATE CARRIES ITS `Insertion`, for the same reason
 `open_redirect.py`, `reflected_input.py` and `sql_error.py` all give:

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hx import config
 
@@ -328,3 +329,265 @@ def test_a_deliberately_empty_list_is_still_allowed(tmp_path: Path):
     p = _write(tmp_path, 'name: a\nclient: b\nscope:\n  include: ["https://a/*"]\n  exclude: []\n')
     cfg = config.load(p)
     assert cfg.scope_exclude == []
+
+
+# --- Task 1 (identity plan): the identity declaration ----------------------
+
+
+def test_credential_headers_matches_the_probe_modules_own_list():
+    """One fact, two casings, two modules. `hx.checks.probe.CREDENTIAL_HEADERS`
+    is already hand-verified against `Redactor.CREDENTIAL_HEADERS`
+    (extension/src/hx/send/Redactor.java:143-144, lower-cased there for
+    ASCII-insensitive comparison). This pins `config.CREDENTIAL_HEADERS`
+    against THAT copy rather than re-deriving the claim a third time, so the
+    title-cased header names an operator writes in `inject.header` cannot
+    silently drift from the send path's own enforcement list."""
+    from hx.checks import probe
+    assert {h.lower() for h in config.CREDENTIAL_HEADERS} == probe.CREDENTIAL_HEADERS
+
+
+def _identity_yaml(**over) -> str:
+    body = {
+        "strategy": "static",
+        "inject": {"header": "Cookie", "value_from_env": "HX_ID_USER"},
+        "liveness": {"path": "/account", "expect_body": "Sign out"},
+    }
+    body.update(over)
+    return yaml.safe_dump({
+        "name": "e", "client": "c",
+        "scope": {"include": ["https://app.test/*"]},
+        "identities": {"user": body},
+    })
+
+
+def test_a_static_identity_parses_into_a_typed_declaration(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(), encoding="utf-8")
+    cfg = config.load(p)
+    ident = cfg.identities["user"]
+    assert ident.id == "user" and ident.strategy == "static"
+    assert ident.inject.header == "Cookie"
+    assert ident.inject.value_from_env == "HX_ID_USER"
+    assert ident.liveness.expect_body == "Sign out"
+    assert ident.liveness.every_n_probes == 25      # the documented default
+    assert ident.refresh is None
+
+
+def test_the_declaration_carries_no_secret_and_dumps_none(tmp_path, monkeypatch):
+    # THE POINT OF THE WHOLE SHAPE. scope_version.yaml stores this text
+    # verbatim in an append-only table, so a credential here is permanent.
+    monkeypatch.setenv("HX_ID_USER", "session=SUPERSECRET")
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(), encoding="utf-8")
+    cfg = config.load(p)
+    rendered = config.dumps(cfg)
+    assert "SUPERSECRET" not in rendered
+    assert "HX_ID_USER" in rendered, "the declaration must survive a round trip"
+    assert config.load_text(rendered).identities["user"] == cfg.identities["user"]
+
+
+def test_a_credential_header_outside_the_three_is_refused(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        inject={"header": "X-Api-Key", "value_from_env": "HX_ID_USER"}),
+        encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="Cookie"):
+        config.load(p)
+
+
+def test_an_identity_without_liveness_is_refused(tmp_path):
+    p = tmp_path / "config.yaml"
+    body = yaml.safe_load(_identity_yaml())
+    del body["identities"]["user"]["liveness"]
+    p.write_text(yaml.safe_dump(body), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="liveness"):
+        config.load(p)
+
+
+def test_liveness_without_expect_body_is_refused(tmp_path):
+    # A canary satisfied by a status only is satisfied by a 200 LOGIN PAGE,
+    # which is the whole reason retirement was removed from active checks.
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(liveness={"path": "/account"}), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="expect_body"):
+        config.load(p)
+
+
+def test_a_static_identity_may_not_declare_refresh(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        refresh={"command": ["true"], "value_from": "stdout"}), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="static"):
+        config.load(p)
+
+
+def test_a_programmatic_identity_must_declare_refresh(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(strategy="programmatic"), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="refresh"):
+        config.load(p)
+
+
+def test_refresh_command_must_be_a_list_never_a_string(tmp_path):
+    # A string would invite shell=True at the call site. The list is the
+    # guarantee that no shell ever sees it.
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        strategy="programmatic",
+        refresh={"command": "mint.sh --admin", "value_from": "stdout"}),
+        encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="list"):
+        config.load(p)
+
+
+def test_scan_identity_must_name_a_declared_identity(tmp_path):
+    p = tmp_path / "config.yaml"
+    body = yaml.safe_load(_identity_yaml())
+    body["scan_identity"] = "nobody"
+    p.write_text(yaml.safe_dump(body), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="nobody"):
+        config.load(p)
+
+
+def test_a_programmatic_identity_needs_no_value_from_env(tmp_path):
+    """Deviation from the task-1 brief, recorded here rather than silently
+    fixed: the brief's sketch made `inject.value_from_env` unconditionally
+    required, but spec §4's own `admin` example is a programmatic identity
+    whose `inject` block names only a header (`{header: Authorization}`) --
+    its credential comes from `refresh.command`'s stdout, not the
+    environment, so there is no env var to name. Requiring one unconditionally
+    would refuse the spec's own example. `value_from_env` is required only
+    for `static`, where the environment is the sole source of the value."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        strategy="programmatic",
+        inject={"header": "Authorization"},
+        refresh={"command": ["./mint.sh"], "value_from": "stdout"}),
+        encoding="utf-8")
+    cfg = config.load(p)
+    ident = cfg.identities["user"]
+    assert ident.inject.value_from_env is None
+    assert ident.inject.header == "Authorization"
+    rendered = config.dumps(cfg)
+    assert "value_from_env" not in rendered
+    assert config.load_text(rendered).identities["user"] == ident
+
+
+def test_a_static_identity_without_value_from_env_is_refused(tmp_path):
+    """The inverse of the programmatic case, and the half that was unpinned.
+
+    A programmatic identity legitimately has no `value_from_env` -- its
+    credential comes from `refresh.command`'s stdout, which is why spec section
+    4's own `admin` example omits it. A STATIC one has no other source, so
+    omitting it there leaves an identity that can never produce a credential:
+    `hx.identity.resolve` would have no variable to read and the run would
+    either halt or, worse, issue anonymously against an application that
+    requires a session -- answering `clean` about a view none of its users are
+    in. The rule was enforced from the start; only this direction of it went
+    untested, which is how it would have regressed silently.
+    """
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(inject={"header": "Cookie"}), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="value_from_env"):
+        config.load(p)
+
+
+# --- branch fix A: `identities.<id>.origins`, the operator's widening ------
+#
+# F1 of the whole-branch review, first half. The credential used to be
+# registered for every host in `scope.include` while the canary proved one,
+# so a client's live session went to whatever third party the operator had
+# authorised for SCANNING. The default is now the proven host alone
+# (`hx.scan._identity_bracket`), and this key is how an operator says a
+# session genuinely spans more than one -- a decision recorded in
+# `config.yaml`, which is the shape spec section 4 asks for from anything
+# that increases blast radius.
+
+
+def test_an_identity_declares_no_origins_by_default(tmp_path):
+    """ABSENT IS THE COMMON CASE AND MEANS "DO NOT WIDEN". The bound itself
+    is not empty: `hx.scan._identity_bracket` turns `()` into the single
+    origin the run's liveness canary is about to prove, which is a fact about
+    the run's surfaces and cannot be known here."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(), encoding="utf-8")
+    assert config.load(p).identities["user"].origins == ()
+
+
+def test_declared_origins_parse_and_survive_a_round_trip(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(
+        origins=["https://app.test/", "api.test"]), encoding="utf-8")
+    cfg = config.load(p)
+    assert cfg.identities["user"].origins == ("https://app.test/", "api.test")
+    rendered = config.dumps(cfg)
+    assert config.load_text(rendered).identities["user"] == cfg.identities["user"]
+
+
+def test_an_identity_that_widened_nothing_renders_no_origins_key(tmp_path):
+    """`scope_version.yaml` stores this text verbatim in an append-only
+    table, and what belongs there is the operator's DECISION. The default is
+    not one -- it is derived per run from the surface the canary goes to --
+    so an engagement that never widened the bound renders the YAML it always
+    did, and every pre-fix scope version stays byte-comparable."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(), encoding="utf-8")
+    assert "origins" not in config.dumps(config.load(p))
+
+
+def test_a_declared_but_empty_origins_list_is_refused(tmp_path):
+    """The two are opposite intentions and must not collapse: absent is "I
+    did not widen this", `[]` is "I chose nothing", and nothing is a bound
+    that refuses every probe of the run as `identity_origin`. An operator who
+    wants that wants `scan_identity` omitted."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(origins=[]), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="non-empty list"):
+        config.load(p)
+
+
+@pytest.mark.parametrize("entry", ["", "   ", 7, None])
+def test_an_origins_entry_that_is_not_a_non_empty_string_is_refused(
+        tmp_path, entry):
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(origins=[entry]), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="non-empty string"):
+        config.load(p)
+
+
+@pytest.mark.parametrize("entry", [
+    "*.test",                    # a scope glob: `hostOf` reads `*.test`
+    "https://*.acme.test/*",     # the same, URL-shaped
+    "/account",                  # a path, so `hostOf` reads nothing at all
+    "https://",                  # a scheme and nothing after it
+    "[::1]:8080",                # cut at the first colon, leaving `[`
+])
+def test_an_origin_the_send_path_could_never_match_is_refused(tmp_path, entry):
+    """THE REASON THIS CHECK EXISTS AT ALL. `Sender.appliesTo` compares the
+    host it is about to connect to against `hostOf(origin)` -- exactly,
+    case-insensitively, with no suffix or glob matching -- so an entry naming
+    no matchable host bounds the credential to nothing and refuses every
+    probe. Fail-closed, but silently: the operator wrote a widening and got a
+    scan that could not send. Refusing at load says so in a sentence.
+
+    The last case is why the charset check is not merely "non-empty": an IPv6
+    literal is cut at its first colon and leaves `[`, which is a non-empty
+    string that can never equal a host."""
+    p = tmp_path / "config.yaml"
+    p.write_text(_identity_yaml(origins=[entry]), encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="names no host"):
+        config.load(p)
+
+
+def test_the_loaders_host_reading_is_the_extensions_own(tmp_path):
+    """A MIRROR, AND THE ORIGINAL IS THE ONE THAT GUARDS THE WIRE.
+    `extension/src/hx/send/Sender.java`'s `hostOf` is what section 4 rests
+    on; `config._origin_host` exists only to refuse an unmatchable entry
+    early. The two must read the same string out of the same origin or this
+    loader would accept a bound the send path reads differently -- so the
+    cases below are transcribed from that method's own javadoc: everything
+    after `://` and before the first `/`, `:` or `?`, lower-cased."""
+    assert config._origin_host("https://App.Test:8443/x?y") == "app.test"
+    assert config._origin_host("app.test") == "app.test"
+    assert config._origin_host("  HTTP://api.test/  ") == "api.test"
+    assert config._origin_host("/account") == ""

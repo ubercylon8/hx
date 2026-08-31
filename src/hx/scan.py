@@ -24,9 +24,11 @@ a derivation whenever it runs, and neither side stores one for the other.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 
+from hx import identity as identity_mod
 from hx import insertion as insertion_mod
 from hx import run as run_mod
 from hx.checks import base, probe, registry
@@ -43,6 +45,65 @@ from hx.engagement import now_us
 from hx.store import blobs as blobs_mod
 from hx.store import db as db_mod
 from hx.store import records
+
+
+class IdentityDead(Exception):
+    """The session could not be proved live, so the run stops.
+
+    NOT a verdict and not an `inconclusive` row -- an exception, because
+    there is no honest partial answer here. Master spec section 7 requires
+    the halt in as many words ("on failure the run halts rather than
+    continuing") and the identity design's section 6 gives the reason: the
+    alternative is SILENT. A run that carried on under a dead session would
+    answer `clean` for every surface it touched, and those answers are
+    indistinguishable in the report from an application that genuinely has
+    nothing wrong with it.
+
+    RAISED WHILE THERE IS STILL TRAFFIC TO PREVENT, and only then. The
+    opening canary and every canary that falls due mid-run raise it; the
+    CLOSING canary does not, because at the close there is nothing left to
+    halt -- every request has already been made -- and raising would throw
+    away a completed pass's rows to prevent traffic that no longer exists.
+    Section 11 names the remedy for that case and it is not a halt: "a
+    failing canary downgrades the whole window to `assumed`, so the run
+    under-claims instead of over-claiming, and retires nothing".
+
+    A REFUSED REGISTRATION IS NOT THIS. `BridgeServer.register_identity`
+    raises `BridgeError` (a peer that refused the frame, or one that is
+    gone) and `codec.FrameError` (a credential that cannot be written as
+    itself), and both propagate as themselves: the run stops either way --
+    `run()`'s own `except BaseException` closes the row `error` and re-raises
+    -- and each of those messages says which of the two actually happened,
+    which "could not be proved live" would not.
+
+    IT CARRIES ITS OWN `stop_reason`, AND `run` STORES THAT RATHER THAN
+    `str(self)`. F1 of fix round A. `run`'s `except BaseException` wrote
+    `f"...: {exc}"` into `run.stop_reason`, and `hx.report._provenance`
+    renders a non-completed run's `stop_reason` onto the CLIENT-FACING page
+    through a `_redact` that strips URL userinfo and nothing else -- so every
+    string any raise site ever interpolates into this exception was one edit
+    away from the deliverable, and one of them already carried a failing
+    refresh command's stderr out of `hx.identity.refresh`.
+
+    So the two halves are separated and they are not the same sentence. The
+    MESSAGE is for the operator's terminal and may say as much as it likes,
+    including chaining an exception from outside this process. The
+    `stop_reason` is composed by the raise site out of values this module
+    holds -- an identity id, which phase of the bracket failed, and a
+    refusal class from the wire's own vocabulary -- and is the only half
+    that crosses into the store. The cut is here as well as at
+    `hx.identity.refresh` on purpose: a containment that lives only at
+    today's one leaking call site is a containment the next call site does
+    not get.
+    """
+
+    def __init__(self, message: str, *, stop_reason: str) -> None:
+        # KEYWORD-ONLY AND REQUIRED, so a raise site cannot acquire the old
+        # behaviour by forgetting: without it this class would default to
+        # storing its own message again the first time someone added a
+        # fourth raise site in a hurry.
+        super().__init__(message)
+        self.stop_reason = stop_reason
 
 
 @dataclass
@@ -92,11 +153,84 @@ class ScanSummary:
     skipped: int = 0
     by_reason: dict = field(default_factory=dict)
     refused: dict = field(default_factory=dict)
+    # `proven` / `assumed` / `dead` for a run that issued under an identity,
+    # None for one that did not -- `hx.identity.IdentityWindow.state_for_run`,
+    # settled by the closing canary.
+    #
+    # NOT THE ONLY PLACE IT GOES ANY MORE, and this comment said it was. Task
+    # 8 gave `run` its own `identity`, `identity_generation` and
+    # `identity_state` (SCHEMA_VERSION 9), written by `_record_identity` on
+    # every path a run can end by, because `report._limits` is handed a
+    # connection and an engagement id and a return value reaches it never.
+    # This field is the same fact on its way to the CALLER -- `hx scan` and
+    # the tests -- and the two are written from one value a line apart.
+    #
+    # Spec section 6 writes the state on `exchange`, and that section's
+    # 2026-08-30 amendment records why THAT column still cannot be:
+    # `Capture.java` delivers `via: proxy` and nothing else, so this build
+    # stores no send-path exchange row for a probe at all.
+    #
+    # A RUN-LEVEL FACT AND NOT A PER-PROBE ONE, because `IdentityWindow`
+    # collapses to the worst window in the run: one failed canary anywhere
+    # makes the whole run `assumed`, which under-claims rather than
+    # over-claims. The narrower thing section 6's amendment says the
+    # retirement gate actually needs -- "whether every probe a given
+    # `check_run` sent was issued inside a proven window" -- is answered by
+    # this from above rather than from below: a run that is `proven` had every
+    # window in it proven.
+    #
+    # `hx scan` (cli.py) still does not PRINT it -- it echoes surfaces,
+    # checks, findings, skips, refusals and canaries, and this is not one of
+    # them -- but it is no longer a field nothing reads: the run row carries
+    # it to the report, and `hx scan`'s `except IdentityDead` prints the halt
+    # that produced a `dead` one.
+    identity_state: str | None = None
+    # The canaries' OWN requests. Section 6: the canary "is counted in
+    # `requests_sent` for the run, because it is a request `hx` put on the
+    # client's system" -- and it belongs to no `check_run` row, because no
+    # check asked for it. Counted beside the probes rather than folded into
+    # them for the reason `refused` is not folded into `by_reason`: folding
+    # it in would make a row's `requests_sent` disagree with what that row's
+    # check actually sent, and a number an operator can go and check against
+    # a row is worth more than one that is merely larger.
+    #
+    # `hx scan` PRINTS IT -- F5 of the task-7 fix round A review. It was
+    # written here and read by nothing: not `check_run.requests_sent` (which
+    # excludes it, above), not the `run` table (no request column), not
+    # `report._limits` (which renders no request tally at all). A field that
+    # exists to satisfy a spec sentence and reaches nothing satisfies
+    # nothing. It is NOT the whole of what section 6 asks -- that is
+    # `requests_sent` FOR THE RUN, and this build has no such column -- and
+    # the client's own copy of the fact belongs in section 10's identity
+    # section, which the plan gives to Task 8.
+    canary_requests: int = 0
 
 
 def run(conn, *, engagement_id, blobs, config, checks=None,
-        surface_filter=None, max_seconds=None, bridge=None) -> ScanSummary:
+        surface_filter=None, max_seconds=None, bridge=None,
+        identity=None) -> ScanSummary:
     """Run the enabled corpus over every surface in the engagement.
+
+    `identity` IS A RESOLVED CREDENTIAL, NEVER A DECLARATION. It is a
+    `hx.identity.Resolved` -- the secret, which spec section 3 keeps off
+    `Config` because `scope_version.yaml` copies a config verbatim into an
+    append-only table. Passing None does NOT mean anonymous: this function
+    then resolves `config.scan_identity` itself (`_resolve_scan_identity`),
+    which is the only thing in the product that reads that field, and
+    anonymous is what it answers when the field is absent.
+
+    WHAT AN IDENTITY BUYS AND WHAT IT COSTS. Every `ProbeSender` this
+    function builds is bound to it, so every probe of the run issues under
+    one session; and the run is BRACKETED by canaries (section 6), so a
+    session that dies mid-run is caught rather than producing hours of
+    unauthenticated traffic every check reads as "not vulnerable". A canary
+    that cannot be satisfied raises `IdentityDead` out of this function
+    rather than letting the pass continue.
+
+    A CHECK STILL KNOWS NOTHING ABOUT ANY OF IT (section 8). It is handed a
+    sender already bound, exactly as it is handed one already bound to a
+    surface, and cannot choose an identity, read one, or ask whether one
+    applied.
 
     `bridge` IS TAKEN, NEVER BUILT. It is a `hx.bridge.server.BridgeServer`
     already connected to a live extension, and this function has no business
@@ -124,6 +258,13 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     ctx = base.CheckContext(config=config, blobs=blobs, run_id=run_id,
                             log=lambda s: None)
     deadline = None if max_seconds is None else time.monotonic() + max_seconds
+    # BOUND BEFORE THE `try`, because the `except BaseException` below reads
+    # it and the statement that assigns it is INSIDE that try. Resolving a
+    # `scan_identity` raises `IdentityError` for a variable the operator did
+    # not export (`hx.identity.resolve`), and a handler that then referenced
+    # an unbound local would replace that diagnosis with a `NameError` from
+    # this module.
+    bracket = None
 
     # THE RUNNER OWNS CLOSING WHAT IT OPENED. `run.current_run`'s reuse
     # window exists for a continuous browsing session ("avoid one specific
@@ -156,16 +297,51 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
             " exemplar_exchange_id FROM surface WHERE engagement_id=?"
             " ORDER BY host, path_template, method", (engagement_id,)).fetchall()
 
+        # INSIDE THE TRY, so that a run halted over a dead session closes its
+        # own row `error` with the halt named in `stop_reason` -- S5's "an
+        # aborted run must never render as a clean one" -- rather than
+        # leaving a `running` row for `reap_stale` to guess about. AFTER the
+        # surfaces are read, because the opening canary is ordinary traffic
+        # and needs an address to go to, and the run's own first surface is
+        # the one host it is certain to be probing.
+        bracket = _identity_bracket(bridge, config, identity, checks,
+                                    surfaces, surface_filter, summary)
+        if bracket is not None:
+            bracket.start()
+        # Read once: a refresh mints a new credential at a new generation but
+        # never a new id, so this is stable for the life of the run even
+        # though `bracket.resolved` is not.
+        identity_id = None if bracket is None else bracket.identity_id
+
         seen_findings: set[str] = set()
-        # (surface_id, check_id, issue_type_id) this run examined AND may
-        # speak for the client's own view of. Retirement reads this, NOT
-        # `check_run.verdict == 'clean'`: a check filing one of three
-        # findings answers `finding`, and the other two still need retiring.
-        # The second clause is `_retirable`'s and it is why nothing an
-        # ACTIVE check said can be in here: every probe this build sends is
-        # unauthenticated, so what it saw is not necessarily the view the
-        # client's users are in.
-        considered: set[tuple[str, str, str]] = set()
+        # What each accepted verdict OFFERS for retirement -- its own
+        # `considered`, with the hook that produced it and the row it belongs
+        # to. Retirement reads this, NOT `check_run.verdict == 'clean'`: a
+        # check filing one of three findings answers `finding`, and the other
+        # two still need retiring.
+        #
+        # OFFERED HERE AND DECIDED AFTER THE LOOP, which is Task 8's ordering
+        # and is load-bearing. `_retirable` gates an active check's offer on
+        # the run's settled window state, and `bracket.finish()` -- the
+        # closing canary -- is the last thing that can turn `proven` into
+        # `assumed`. Calling the gate in this loop would read `proven` for a
+        # run whose closing canary was about to fail and retire on traffic
+        # section 6 downgrades, which is the hole the bracket exists to
+        # close. So the decision happens once, below, between `finish()` and
+        # `_mark_unobserved` (the only writer of `observed = 0`).
+        #
+        # A VERDICT WITH NOTHING TO OFFER IS NOT KEPT. An `inconclusive`
+        # verdict carries no `considered` -- the classmethod does not offer
+        # it -- so exactly the state that must retire nothing contributes no
+        # entry at all, and the list holds one tuple per row that named an
+        # issue type rather than one per row.
+        # THE ROW'S OWN ORIGIN TRAVELS WITH THE OFFER -- `(scheme, host,
+        # port)`, the same triple the bracket keeps for its canaries.
+        # Retirement is gated on it (`_retirable`), and it has to be captured
+        # HERE because the gate runs after the loop, by which time `surface`
+        # is whichever row happened to be last.
+        offered: list[tuple[str, str, str, tuple[str, str, int],
+                            base.Verdict]] = []
 
         for surface in surfaces:
             if surface_filter is not None and not surface_filter(surface):
@@ -208,6 +384,18 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
             insertions = None
 
             for check in checks:
+                # THE CANARY GOES BETWEEN CHECKS, AND HERE IS WHY IT IS AT
+                # THE TOP OF THIS LOOP RATHER THAN AFTER THE ROW CLOSES: a
+                # probing row closes at three places (a verdict, a refusal, a
+                # crash) and two of them `continue` out of the loop body, so
+                # a call sited after them would be reached by one path in
+                # three. `_spent` -- which all three call, exactly once per
+                # row -- is what counts the probes toward the next canary;
+                # this is what acts on the count. Raises `IdentityDead` for a
+                # session that cannot be proved live again, before the next
+                # check sends anything.
+                if bracket is not None:
+                    bracket.canary_if_due()
                 row_id = _open_row(conn, run_id, surface, check)
                 summary.checks_run += 1
                 # DISPATCH ON THE HOOK, NOT ON `check.klass`. `registry.
@@ -445,7 +633,8 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             continue
                         sender = probe.ProbeSender(
                             bridge, scheme=surface[2], host=surface[3],
-                            port=surface[4], path=probe_path)
+                            port=surface[4], path=probe_path,
+                            identity_id=identity_id)
                         verdict = check.probes(ctx, surface, usable, sender)
                     else:
                         verdict = check.on_surface(ctx, surface, exchanges)
@@ -473,16 +662,16 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                             "hx.checks.base.Verdict; a check may not "
                             "construct the runner's own vocabulary by hand")
                     reason = verdict.reason
-                    # An `inconclusive` verdict carries no `considered` -- the
-                    # classmethod does not offer it -- so this loop is empty
-                    # for exactly the state that must retire nothing, and
-                    # `_retirable` empties it for every check the runner
-                    # drove through the wire. The verdict itself is not
-                    # touched either way: a `finding` is still written and
-                    # still reported, a `clean` is still `clean`, and what
-                    # `report._coverage` renders for the row is unchanged.
-                    for issue_type in _retirable(hook, verdict):
-                        considered.add((surface[0], check.id, issue_type))
+                    # KEPT, NOT DECIDED -- see `offered`'s own comment above
+                    # for why the gate cannot run here. The verdict itself is
+                    # not touched either way: a `finding` is still written
+                    # and still reported, a `clean` is still `clean`, and
+                    # what `report._coverage` renders for the row is
+                    # unchanged.
+                    if verdict.considered:
+                        offered.append((hook, surface[0], check.id,
+                                        (surface[2], surface[3], surface[4]),
+                                        verdict))
                     if verdict.state == "finding":
                         for candidate in verdict.candidates:
                             fid = _write_finding(conn, engagement_id, run_id,
@@ -522,25 +711,75 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
                     # `hx.checks.probe`'s `_NOT_ISSUED`.
                     _close_row(conn, row_id, "inconclusive",
                                f"probe refused: {exc}",
-                               requests_sent=_spent(summary, sender))
+                               requests_sent=_spent(summary, sender, bracket))
                     continue
                 except Exception as exc:                    # noqa: BLE001
                     _close_row(conn, row_id, "error",
                                f"{type(exc).__name__}: {exc}",
-                               requests_sent=_spent(summary, sender))
+                               requests_sent=_spent(summary, sender, bracket))
                     continue
                 _close_row(conn, row_id, verdict.state, reason,
-                           requests_sent=_spent(summary, sender))
+                           requests_sent=_spent(summary, sender, bracket))
 
+        if bracket is not None:
+            # BEFORE the gate below, and that ordering is load-bearing. The
+            # closing canary is what settles the run's state -- a window is
+            # only proof if BOTH its canaries passed -- and retirement is the
+            # last thing this function does that a state could change.
+            bracket.finish()
+            summary.identity_state = bracket.state
+            _record_identity(conn, run_id, bracket, bracket.state)
+        # SECTION 9'S GATE, ONCE, WITH THE SETTLED STATE AND THE PROVED
+        # ORIGIN. `_retirable` hands back a passive check's offer whatever
+        # the session did and an active check's only for a `proven` run whose
+        # canary went to the same origin the row's probes did; the set it
+        # builds is `(surface_id, check_id, issue_type_id)`, which is the key
+        # `_mark_unobserved` matches a finding on.
+        #
+        # `None` FOR AN ANONYMOUS RUN, and it can never satisfy the
+        # comparison: a surface row's origin is a `(str, str, int)` triple.
+        # The state check refuses that run first in any case -- this is the
+        # belt to its braces, and neither is load-bearing alone.
+        proven_origin = None if bracket is None else bracket.target
+        considered = {
+            (surface_id, check_id, issue_type)
+            for said_hook, surface_id, check_id, said_origin, said in offered
+            for issue_type in _retirable(said_hook, said,
+                                         summary.identity_state,
+                                         origin=said_origin,
+                                         proven_origin=proven_origin)
+        }
         _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
     except BaseException as exc:
+        # THE IDENTITY GOES ON THE ROW EVEN HERE, and never as `proven`.
+        # Almost every way of reaching this handler stops the run BEFORE
+        # `bracket.finish()`, and section 6 is explicit that a window is
+        # proof only once both its canaries have passed -- so `bracket.state`
+        # can still read `proven` here on the strength of an opening canary
+        # alone, and storing it would be over-claiming. `IdentityDead` IS the
+        # session being dead, by name; everything else settles as `assumed`.
+        #
+        # ONE PATH REACHES THIS WITH THE WINDOW ALREADY CLOSED -- a raise out
+        # of the gate or `_mark_unobserved` above -- and it is written down
+        # to `assumed` too. That under-claims by exactly one state for a run
+        # whose retirement pass crashed, which is the safe direction and
+        # cheaper than a flag whose only reader would be this line.
+        #
+        # `report._limits` and the report's identity section both read this
+        # column, so a halted run must not leave it NULL: NULL is how a
+        # report tells an anonymous run from one that carried a session, and
+        # a halt is emphatically the second.
+        if bracket is not None:
+            state = "dead" if isinstance(exc, IdentityDead) else "assumed"
+            summary.identity_state = state
+            _record_identity(conn, run_id, bracket, state)
         # Left `running` here would mean the NEXT scan.run() call inherits
         # this one's half-finished state via current_run's reuse window --
         # the same collision this try/except exists to prevent, but for a
         # crash instead of a fast retest. `error`, not `completed`: S5 "an
         # aborted run must never render as a clean one."
         run_mod.close_run(conn, run_id=run_id, status="error",
-                          stop_reason=f"scan.run raised: {type(exc).__name__}: {exc}")
+                          stop_reason=_halt_reason(exc, summary))
         raise
     # F7 of the task-6 review: a budget-truncated scan used to close
     # `('completed', NULL)`, identical at the `run` row to a scan that
@@ -573,6 +812,39 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     # `skipped` names rows the runner never ran, `probes refused` names the
     # wire's own classes on rows that did run, and an operator chasing one
     # looks in a different place from an operator chasing the other.
+    parts = _tallies(summary)
+    stop_reason = f"truncated: {'; '.join(parts)}" if parts else None
+    run_mod.close_run(conn, run_id=run_id, status="completed",
+                      stop_reason=stop_reason)
+    return summary
+
+
+def _tallies(summary) -> list[str]:
+    """The two labelled counts a run row carries when it stopped short.
+
+    EXTRACTED SO THE HALT PATH CAN CARRY THEM TOO -- F2 of fix round A. This
+    string was assembled inline on the SUCCESS path only, so a run that
+    halted recorded `summary.refused` nowhere: not in the run row and not in
+    any message. On the one path where diagnosis matters most, the wire's own
+    word for what stopped the run existed in no place an operator could read.
+
+    THE RUN ROW IS WHERE THEY LAND, AND NOT THE TERMINAL. `hx scan` now has
+    its `except IdentityDead` (Task 8) and it prints the exception's own
+    message: what stopped the run, and which of section 6's outcomes it was.
+    The tallies are not in it, because `summary` is a local of `run()` and
+    the exception is raised two frames below it -- they go to `run.
+    stop_reason` through `_halt_reason`, which is where `report._provenance`
+    reads them and where `hx report` puts them in front of a reader. An
+    earlier version of this paragraph predicted the terminal would get them;
+    it does not, and saying so is cheaper than a field on the exception whose
+    only reader would be one `click.echo`.
+
+    The two are labelled rather than merged, and that is the same decision
+    F11 took: `skipped` names rows the runner never ran, `probes refused`
+    names the wire's own classes on rows that did run, and an operator
+    chasing one looks in a different place from an operator chasing the
+    other.
+    """
     parts = []
     if summary.by_reason:
         parts.append("skipped " + ", ".join(
@@ -580,10 +852,578 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
     if summary.refused:
         parts.append("probes refused " + ", ".join(
             f"{k}={v}" for k, v in sorted(summary.refused.items())))
-    stop_reason = f"truncated: {'; '.join(parts)}" if parts else None
-    run_mod.close_run(conn, run_id=run_id, status="completed",
-                      stop_reason=stop_reason)
-    return summary
+    return parts
+
+
+def _halt_reason(exc, summary) -> str:
+    """What a run that RAISED writes to `run.stop_reason`.
+
+    ONE EXCEPTION TYPE DOES NOT GET TO SPEAK FOR ITSELF HERE, and F1 of fix
+    round A is why. This string is stored and then RENDERED:
+    `report._provenance` puts a non-completed run's `stop_reason` on the
+    client-facing page, through a `_redact` that is `records.redact_url` and
+    strips URL userinfo and nothing else. `IdentityDead` is the one exception
+    reaching this line whose text is assembled from something outside this
+    process -- a refresh command's own output, by way of
+    `hx.identity.refresh` -- so its text is not what is stored. Its
+    `stop_reason`, composed at the raise site from an identity id and which
+    phase of the bracket failed, is.
+
+    EVERY OTHER EXCEPTION KEEPS ITS TEXT, and that is a decision rather than
+    an omission. A `sqlite3.Error`, a `BridgeError` or a `codec.FrameError`
+    says what happened and there is nothing else available to say it;
+    `report._provenance`'s own comment names this field
+    attacker-influenceable free text and routes it through `_redact` for that
+    reason; and narrowing it to a bare type name would
+    take away the only diagnosis a crashed run has. What made `IdentityDead`
+    different is not that its text is untrusted -- all of them are -- but
+    that a SUBPROCESS'S STDERR reached it, which no other exception on this
+    path can do.
+
+    THE RUN'S TALLIES GO WITH IT, for `IdentityDead` and not for the rest.
+    A halt is the one stop where `summary.refused` reached the store nowhere
+    (`_tallies`' own docstring), and a run that halted after two hundred
+    refused probes has to be able to say so. The other exceptions do not get
+    them because their text already IS the diagnosis and a `sqlite3.Error`
+    with a refusal tally bolted on reads as though the refusals caused it.
+
+    The canary's own refusal therefore appears twice on a halt that had no
+    other traffic -- once as the diagnosis, once as the run's whole tally --
+    and that is not a duplication to engineer away. They are different
+    facts that happen to coincide in the smallest case: the first says what
+    stopped the run, the second says everything the run was refused, and the
+    moment a probe is refused as well they say different things.
+    """
+    if isinstance(exc, IdentityDead):
+        return "scan.run raised: IdentityDead: " + "; ".join(
+            [exc.stop_reason, *_tallies(summary)])
+    return f"scan.run raised: {type(exc).__name__}: {exc}"
+
+
+def _record_identity(conn, run_id, bracket, state) -> None:
+    """Put this run's identity and its settled state on the `run` row.
+
+    THE ONE PLACE A LATER READER CAN LEARN THIS FROM. Until Task 8 the fact
+    lived only on `ScanSummary`, which is a return value: it reached the
+    operator's terminal and died there, so `report._limits` -- handed `conn`
+    and an engagement id -- had nothing to condition its sentences on and
+    went on telling every client that every probe was sent unauthenticated.
+    Section 6's own amendment records why `exchange.identity_state` cannot be
+    the source (this build stores no send-path exchange row at all), so the
+    fact goes where the run that holds it lives.
+
+    NOT DERIVED FROM `config` AT RENDER TIME, and that is the whole reason
+    this function exists rather than a `config.scan_identity` lookup in the
+    report. A config says what was DECLARED; a run row says what a run
+    actually did. They disagree the moment an identity is added after a scan,
+    removed before a report, or resolved and then halted -- and `_limits`
+    has twice been found asserting a build fact it had not derived.
+
+    `generation` is `bracket.resolved`'s, read at the call rather than
+    latched at the start: a programmatic refresh replaces `resolved` with a
+    higher generation mid-run, and the number worth recording is the one the
+    run finished on -- section 10 asks the report for "how many generations
+    each reached".
+    """
+    run_mod.record_identity(conn, run_id=run_id,
+                            identity_id=bracket.identity_id,
+                            generation=bracket.resolved.generation,
+                            state=state)
+
+
+# --- the identity a run issues under --------------------------------------
+
+
+def _identity_bracket(bridge, config, identity, checks, surfaces,
+                      surface_filter, summary):
+    """The identity in force for this run, or None for an anonymous one.
+
+    FOUR WAYS TO GET NONE, and every one of them means "this run issues
+    nothing under an identity" rather than "the identity was ignored":
+
+      * no bridge. `run()` has no route to the wire at all and every probing
+        check is about to be skipped `no_bridge`, so there is no traffic to
+        bracket.
+      * no check the runner drives through the wire. `needs_a_bridge` is the
+        same question `hx scan` asks before it pays for a JVM; a bracket here
+        would put two canary requests on a client's system for a pass that
+        sends nothing else.
+      * no surface this run will probe. The canary is ordinary traffic and
+        needs an address, and there is no honest one to invent for a run with
+        nowhere to send anything.
+      * nothing declared. No `identity=` and no `config.scan_identity`.
+
+    ASKED IN THAT ORDER, CHEAPEST AND MOST INERT FIRST. Resolution is last
+    because it is the only step with a side effect outside this process: a
+    static identity reads the environment and RAISES when the variable is
+    missing, and a programmatic one runs the operator's refresh command. A
+    run that was never going to send should do neither.
+    """
+    if bridge is None or not any(needs_a_bridge(c) for c in checks):
+        return None
+    target = next((s for s in surfaces
+                   if surface_filter is None or surface_filter(s)), None)
+    if target is None:
+        return None
+    resolved = identity if identity is not None else _resolve_scan_identity(config)
+    if resolved is None:
+        return None
+    declared = _declaration(config, resolved.id)
+    # THE CREDENTIAL GOES WHERE THE CANARY GOES, AND NOWHERE ELSE BY
+    # DEFAULT. `target[3]` is the host of the surface the opening canary is
+    # about to be sent to -- the same row `_IdentityBracket` keeps as
+    # `_target` -- so the bound the extension enforces and the host the proof
+    # covers are one host, named once, from one row.
+    #
+    # THIS WAS `tuple(config.scope_include)` UNTIL THE BRANCH REVIEW (F1),
+    # and that default defeated the bound it was the default for. Spec
+    # section 5 says origins exist so that "a probe against a third-party
+    # host in scope never carries the target's session"; a real engagement
+    # scopes the app, an API, an SSO provider and a CDN, and scope-as-origins
+    # sent the client's live session cookie to all four while the canary
+    # proved one of them. That is an incident, not a coverage gap. Section 5
+    # is amended (2026-08-30) to say so.
+    #
+    # WIDENING IS THE OPERATOR'S TO DECLARE, per identity, in `config.yaml`
+    # (`config._origins`) -- section 4's shape for anything that increases
+    # blast radius. What it does NOT widen is the proof: `_retirable` retires
+    # only on the origin the canary reached, whatever this tuple says.
+    #
+    # THE COST IS VISIBLE AND IS NOT SILENT. On a multi-host engagement that
+    # widened nothing, every probe to a second host is refused
+    # `identity_origin` by the extension, which lands the row `inconclusive`
+    # and prints `refused N (identity_origin)` at the end of `hx scan`. The
+    # alternative -- sending anonymously to those hosts -- is the one spec
+    # section 7 step 3 forbids by name, and would hand active checks a
+    # logged-out view to read as an answer.
+    return _IdentityBracket(bridge, resolved, declared,
+                            target=target,
+                            origins=declared.origins or (target[3],),
+                            summary=summary)
+
+
+def _resolve_scan_identity(config):
+    """The identity `config.scan_identity` names, resolved, or None.
+
+    THE ONLY READER OF THAT FIELD IN THE PRODUCT. Spec section 4 gives an
+    operator `scan_identity: user` and the loader validates that it names a
+    declared identity; without this, that would be a config key nothing acts
+    on, which is the state section 1 opens by complaining about ("`config.
+    yaml` accepts an `identities` block that nothing reads").
+
+    THE ENVIRONMENT IS READ HERE AND NOWHERE ELSE ON THIS PATH. `resolve`
+    takes the mapping as an argument precisely so that the read is at a call
+    site rather than buried in the resolver, and the value it returns is a
+    `Resolved` -- which never touches `Config` and never reaches
+    `scope_version.yaml`.
+
+    A PROGRAMMATIC IDENTITY IS MINTED, NOT READ. It has no `value_from_env`
+    to resolve (`resolve` refuses one by name), so its first credential comes
+    from the same command a refresh would run. Generation 0 is the
+    "nothing registered yet" value: `refresh` returns `generation + 1`
+    unconditionally, so the first mint is generation 1 -- the same number
+    `resolve` gives a static identity, and the lowest `codec.identity_body`
+    will carry.
+    """
+    if config.scan_identity is None:
+        return None
+    declared = _declaration(config, config.scan_identity)
+    if declared.strategy == "static":
+        return identity_mod.resolve(declared, dict(os.environ))
+    return identity_mod.refresh(declared, 0)
+
+
+def _declaration(config, identity_id):
+    """The `Identity` declaration behind an id, which must exist.
+
+    A `Resolved` carries the credential and not the liveness proof, so the
+    canary, the refresh command and `every_n_probes` all come from the
+    config's own declaration. An id with none is a caller's mistake rather
+    than an operator's: `config.load_text` refuses a `scan_identity` naming
+    an undeclared identity, so this is only reachable by passing `identity=`
+    a `Resolved` this config never declared -- and section 4 requires a
+    liveness block for every identity precisely because one without a proof
+    could never be `proven`.
+    """
+    declared = config.identities.get(identity_id)
+    if declared is None:
+        raise ValueError(
+            f"identity {identity_id!r} is not declared in this config, so it "
+            "has no liveness proof and a run cannot be bracketed by one. "
+            f"Declared: {sorted(config.identities) or 'none'}")
+    return declared
+
+
+class _IdentityBracket:
+    """One run's identity, and the canaries that bracket its traffic.
+
+    SPEC SECTION 6 IS THE WHOLE OF THIS CLASS. A canary at the start of a run
+    proves the session was live AT THE START and says nothing about the
+    request issued an hour later, so `proven` is a property of a window
+    bracketed by two passing canaries: one at the start, one every
+    `every_n_probes` probes, one at the end always. `hx.identity.
+    IdentityWindow` holds that bookkeeping; this holds the traffic and the
+    decisions.
+
+    THE WINDOW IS OPENED ONCE PER BRACKET, WITH THE SETTLED RESULT. `open()`
+    latches its FIRST argument for the life of the run -- the run either had
+    a proved starting point or it did not -- so a driver that called it once
+    per raw canary attempt would record `dead` for a run that failed its
+    opening canary, refreshed, passed, and by section 6's table CONTINUES.
+    `_settle` therefore does the refresh-and-re-canary dance first and
+    returns both halves of the answer: what the canary said, and what it said
+    once the one refresh a programmatic identity gets had been tried.
+
+    THE TWO HALVES ARE USED FOR DIFFERENT THINGS, and that is not a
+    duplication. The settled half decides whether the run goes on; the raw
+    half decides what to say about the window that just ENDED, because a
+    canary that failed means the traffic behind it was issued into an unknown
+    state whether or not a refresh then brought the session back. Section 6:
+    "When a canary fails, every exchange back to the last passing canary is
+    downgraded from `proven` to `assumed`."
+    """
+
+    def __init__(self, bridge, resolved, declared, *, target, origins,
+                 summary) -> None:
+        self._bridge = bridge
+        self._declared = declared
+        # (scheme, host, port) from the run's own first surface. The canary is
+        # ordinary traffic and needs an address; `liveness.path` is
+        # origin-form (the config loader refuses anything else), so the origin
+        # comes from a surface this run is actually going to probe rather than
+        # from a scope pattern, which may be a glob with no host in it. A run
+        # spanning several hosts proves its session on this one: an identity
+        # declares ONE `liveness` block (section 4), so its proof is per
+        # identity and not per host.
+        #
+        # AND THAT IS NOW ENFORCED RATHER THAN MERELY OBSERVED. This note
+        # stood here through the whole branch while `_retirable` honoured a
+        # `proven` run's offer from every host it probed; F1 of the branch
+        # review is what turned the observation into a gate. `run` reads this
+        # triple back through `target` and retires only where a row's own
+        # origin equals it.
+        self._target = (target[2], target[3], target[4])
+        # Section 5: `origins` bounds where the credential may be applied.
+        # It defaults to the ONE host `target` names -- see
+        # `_identity_bracket`, which is where the default is chosen and where
+        # the argument for it is written down -- and an operator widens it
+        # per identity in `config.yaml`. The extension reads the host out of
+        # each entry (`Sender.hostOf`: everything after `://` and before the
+        # first `/`, `:` or `?`), so a URL-prefix entry bounds the credential
+        # to that host and an entry with no host in it bounds it to nothing;
+        # `config._origins` refuses the second shape at load rather than
+        # leaving an operator with a widening that refuses every probe.
+        self._origins = origins
+        self._summary = summary
+        self.resolved = resolved
+        self.window = identity_mod.IdentityWindow(
+            due_every=declared.liveness.every_n_probes)
+        self._due = False
+
+    @property
+    def identity_id(self) -> str:
+        return self.resolved.id
+
+    @property
+    def target(self) -> tuple[str, str, int]:
+        """The origin every canary of this run is sent to: scheme, host, port.
+
+        READ BY THE RETIREMENT GATE, which is why it is exposed at all. The
+        window this class keeps is temporal -- it models WHEN the session was
+        proved and not WHERE -- so `run` has to compare this against the
+        origin of each row it is about to retire on. See `_retirable`.
+        """
+        return self._target
+
+    @property
+    def state(self) -> str:
+        return self.window.state_for_run()
+
+    def start(self) -> None:
+        """Register the credential, prove the session, open the window.
+
+        The registration is NOT wrapped: `register_identity` raises
+        `BridgeError` or `codec.FrameError` and each says what actually
+        happened -- see `IdentityDead`'s own docstring.
+        """
+        self._bridge.register_identity(self.resolved, origins=self._origins)
+        _raw, settled, refusal, refreshed = self._settle()
+        self.window.open(passed=settled)
+        if not settled:
+            told, stored = self._unproved(refusal)
+            raise IdentityDead(
+                f"identity {self.resolved.id!r} could not be proved live "
+                f"before the first probe: {told}. {self._outcome(refreshed)}. "
+                "Halting rather than scanning anonymously: an "
+                "unauthenticated run of an authenticated application answers "
+                "`clean` about a view none of its users are in",
+                stop_reason=(f"identity {self.resolved.id!r} could not be "
+                             f"proved live before the first probe: {stored}"))
+
+    def note(self, probes: int) -> None:
+        """Count probes issued inside the current window.
+
+        Called once per `check_run` row with what that row's sender issued,
+        so the canary falls due AT A CHECK BOUNDARY rather than between two
+        probes of one check: a check that sends 60 probes with
+        `every_n_probes` at 25 draws one canary after it, not two during it.
+        The count then restarts FROM that canary rather than carrying a
+        remainder: `note_probe` zeroes its own counter each time it comes
+        due, and `IdentityWindow.open` zeroes it again when the next window
+        opens. So `every_n_probes` bounds how much traffic one undetected
+        death can contaminate -- which is what section 6 asks of it -- rather
+        than fixing the exact request a canary lands on.
+        """
+        for _ in range(probes):
+            if self.window.note_probe():
+                self._due = True
+
+    def canary_if_due(self) -> None:
+        """The mid-run canary, if `every_n_probes` have gone by.
+
+        A failure closes the window that just ended as unproven WHETHER OR
+        NOT the refresh below rescues the run -- section 6's downgrade -- and
+        a session that cannot be brought back halts the run here, with probes
+        still to come.
+        """
+        if not self._due:
+            return
+        self._due = False
+        raw, settled, refusal, refreshed = self._settle()
+        self.window.close(passed=raw)
+        if not settled:
+            told, stored = self._unproved(refusal)
+            raise IdentityDead(
+                f"identity {self.resolved.id!r} stopped being live during the "
+                f"run: {told}. {self._outcome(refreshed)}. Halting rather "
+                "than issuing the rest of this run's probes unauthenticated, "
+                "which would answer `clean` for every surface still to come",
+                stop_reason=(f"identity {self.resolved.id!r} stopped being "
+                             f"live during the run: {stored}"))
+        self.window.open(passed=True)
+
+    def finish(self) -> None:
+        """The closing canary, which always runs and never halts.
+
+        Section 6 requires one at the end of the run "always, even if no
+        probe was sent since the last one", because a window is only proof if
+        BOTH its canaries passed. It does not raise: see `IdentityDead`.
+
+        No refresh either, and for the same reason -- a refresh exists to
+        keep the run's remaining traffic authenticated, and there is none.
+        Renewing the session here would be a request on a client's system
+        that buys nothing, and it would also hide the failure this canary
+        exists to report.
+
+        The refusal class is dropped here and only here: nothing raises at
+        the close, so there is no message for it to correct, and it has
+        already been folded into `summary.refused` by `_canary` itself.
+        """
+        passed, _refusal = self._canary()
+        self.window.close(passed=passed)
+
+    def _settle(self) -> tuple[bool, bool, str | None, bool]:
+        """`(what the canary said, what it said after the one refresh, why,
+        whether a refresh was tried)`.
+
+        Section 6's outcome table, implemented literally. A passing canary
+        settles as itself. A failing one on a `static` identity settles as
+        itself too -- there is no command to run -- and the caller halts. A
+        failing one on a `programmatic` identity gets exactly one refresh,
+        re-registered AT THE NEW GENERATION, and the canary is asked again.
+
+        THE NEW GENERATION IS WHAT MAKES THE RE-REGISTRATION MEAN ANYTHING.
+        `IdentityRegistry.register` keeps the entry it already holds for an
+        EQUAL generation ("a second frame at the SAME generation carrying a
+        DIFFERENT credential swapped it silently: a content change that never
+        advanced the counter whose whole job is to gate content changes") and
+        refuses a lower one. So a refresh that did not advance would be
+        accepted, change nothing, and leave the run issuing under the dead
+        credential -- which is why `hx.identity.refresh` returns
+        `generation + 1` unconditionally.
+
+        THE THIRD MEMBER IS THE LAST CANARY'S REFUSAL CLASS, or None if a
+        response actually came back. The LAST one, because it is the canary
+        that decided `settled` and therefore the one the halt is about: a
+        run whose first canary was refused `identity_origin` and whose
+        post-refresh canary was refused it too has one story, and this
+        returns the attempt the caller is about to raise over.
+
+        THE FOURTH IS WHICH OF SECTION 6'S FOUR OUTCOMES A HALT IS, and it
+        cannot be recovered from the other three. Its table gives `fails,
+        static -> dead` and `fails after refresh -> dead` different rows, and
+        both arrive at the caller's raise site looking identical: `settled`
+        is False either way. An operator told only "could not be proved
+        live" does not know whether their refresh command ran, which is the
+        difference between re-minting a credential and reading a script's
+        output. `_outcome` turns this into the sentence they read.
+        """
+        raw, refusal = self._canary()
+        if raw or self._declared.strategy != "programmatic":
+            return raw, raw, refusal, False
+        try:
+            self.resolved = identity_mod.refresh(self._declared,
+                                                 self.resolved.generation)
+        except identity_mod.IdentityError as exc:
+            # The session is dead and cannot be renewed, which is this
+            # exception's own subject -- the cause is chained, so the
+            # command's exit code or its empty output is still in the
+            # traceback an operator reads.
+            #
+            # `{exc}` IS IN THE MESSAGE AND NOT IN THE `stop_reason`, and
+            # that is F1 of fix round A in one line. This is the only place
+            # in the runner where a string built outside the process reaches
+            # an exception a halted run records: `hx.identity.refresh` no
+            # longer repeats the command's stderr, and this half keeps the
+            # containment even if a future message there does.
+            _told, stored = self._unproved(refusal)
+            raise IdentityDead(
+                f"identity {self.resolved.id!r} failed its canary and could "
+                f"not be refreshed: {exc}",
+                stop_reason=(f"identity {self.resolved.id!r} could not be "
+                             f"refreshed after {stored}")
+            ) from exc
+        self._bridge.register_identity(self.resolved, origins=self._origins)
+        settled, refusal = self._canary()
+        return raw, settled, refusal, True
+
+    def _outcome(self, refreshed: bool) -> str:
+        """Which row of section 6's outcome table this halt is.
+
+        THE TABLE HAS FOUR ROWS AND TWO OF THEM HALT: `fails, static ->
+        dead` and `fails after refresh -> dead`. Both reach a raise site
+        with `settled` False and produced the same sentence until Task 8,
+        which sent an operator to look for a fault this run may never have
+        touched -- a `static` identity has no refresh command, so "the
+        refresh did not help" is a claim about something that did not
+        happen, and "there was no refresh to try" is a claim about the
+        config they wrote.
+
+        The remaining two rows do not reach here at all: a passing canary is
+        `proven` and the run continues, and a `programmatic` identity whose
+        refresh RESCUES the session continues too (`_settle` returns a
+        settled True and nothing raises). A refresh command that could not
+        run or printed nothing raises from `_settle` itself, with its own
+        message, and never reaches this.
+
+        SAFE IN A STORED `stop_reason` -- it is written here out of a
+        strategy string the config loader constrains to two values and
+        nothing else. It is not put in one today: `stop_reason` carries the
+        canary's own diagnosis, and this is the sentence that tells an
+        OPERATOR what to go and do about their own machine.
+        """
+        if refreshed:
+            return ("Its credential was refreshed once and the canary failed "
+                    "again -- section 6's `fails after refresh`, which is a "
+                    "dead session")
+        return (f"It is a {self._declared.strategy!r} identity, so section 6 "
+                "gives it no refresh command to try -- section 6's `fails, "
+                "static`, which is a dead session")
+
+    def _canary(self) -> bool:
+        """One liveness request, through the ordinary send path.
+
+        Section 6: "The canary is ordinary traffic. It goes through the send
+        path like any other request, carries the identity, and is subject to
+        scope, the method allowlist, the rate limit and the budget." So it is
+        a `ProbeSender` like a check's -- which also means a refusal is a
+        FAILURE and not an exception (`hx.identity.canary` catches
+        `ProbeRefused`): a canary that could not be sent has proved nothing.
+
+        A FRESH SENDER PER CANARY, so `sent` and `refused` are this canary's
+        own. `_spent` folds those refusals in where the probes' are counted,
+        rather than letting them vanish because no `check_run` row owns them,
+        and is passed no bracket, because a canary is not a probe.
+
+        IT RETURNS THE REFUSAL CLASS AS WELL AS THE VERDICT -- F2 of fix
+        round A (HIGH). `hx.identity.canary` collapses a `ProbeRefused` to
+        `False`, which is right (a canary that could not be sent has proved
+        nothing), and this method USED TO THROW THE CLASS AWAY into
+        `summary.refused` and nowhere else. The caller then said "/account
+        did not answer with the signature this identity is declared to prove
+        itself by" about a request that never left the JVM. See `_unproved`
+        for what that costs an operator.
+
+        AT MOST ONE ENTRY, AND IT IS THIS CANARY'S. `identity.canary` issues
+        exactly one request through this sender, and the sender is built here
+        and discarded here, so `sender.refused` is either empty or a single
+        class with a count of one. `sorted()` is not for the ordering -- there
+        is nothing to order -- it is so that a future canary sending two
+        requests picks a class deterministically rather than at dict-insert
+        order.
+        """
+        scheme, host, port = self._target
+        sender = probe.ProbeSender(
+            self._bridge, scheme=scheme, host=host, port=port,
+            path=self._declared.liveness.path, identity_id=self.resolved.id)
+        try:
+            passed = identity_mod.canary(self._declared.liveness, sender)
+        finally:
+            self._summary.canary_requests += _spent(self._summary, sender)
+        # `refused` is a copy, so reading it after `_spent` has folded it in
+        # reads the same dict `_spent` read.
+        classes = sorted(sender.refused)
+        return passed, (classes[0] if classes else None)
+
+    def _unproved(self, refusal: str | None) -> tuple[str, str]:
+        """`(what to tell the operator, what to store)` about a canary that
+        did not prove the session.
+
+        A CANARY THAT WAS REFUSED AND A CANARY THAT WAS ANSWERED WRONGLY ARE
+        DIFFERENT FACTS, and until F2 of fix round A both read as the second.
+        Measured by the review, with a bridge refusing every send
+        `identity_origin` -- at the time, the fail-closed outcome of
+        registering `origins` as a whole `scope_include` written as a bare
+        glob, the shape `tests/conftest.py` and `_env` actually used -- the
+        halt said
+
+            identity 'user' could not be proved live before the first probe:
+            /account did not answer with the signature this identity is
+            declared to prove itself by.
+
+        and `/account` never left the JVM. That sends an operator to
+        re-authenticate against a message blaming their credential when the
+        fault lay elsewhere, and no credential they can mint will ever fix
+        it. It was compounded, at the time, by `hx scan` having no `except
+        IdentityDead`: they read that sentence at the foot of a traceback and
+        re-ran for ever. Task 8 added the handler, so this string is now the
+        whole of what an operator sees -- which raises rather than lowers
+        what it has to be right about.
+
+        THE SCENARIO OUTLIVED ITS ORIGINAL CAUSE. `ba56ba6` (2026-08-30)
+        stopped registering `origins` as `scope_include` and rewrote
+        `_identity_bracket`'s own comment, so neither half of the paragraph
+        above is true of the tree today. A canary can still be refused
+        `identity_origin`, though: an operator who declares
+        `identities.<id>.origins` omitting the run's first surface host gets
+        exactly this halt, and this is still the whole of what they read.
+
+        THE CLASS IS A CODE-AUTHORED WORD, never free text, which is why it
+        is safe to put in a stored `stop_reason` when `_halt_reason` will not
+        store an exception's message. `ProbeSender` keys `refused` on
+        `BridgeError.error_class` or on a non-`ok` `outcome`, both of which
+        are the extension's own vocabulary, and falls back to the literal
+        `"transport_error"` when a `BridgeError` carries no class. There is
+        no path by which a target's bytes become one of these keys.
+
+        "WAS NOT ANSWERED" COVERS BOTH MEMBERS OF THAT VOCABULARY. A
+        `identity_origin` or a `budget_exhausted` never reached the target; a
+        `truncated` reached it and did not come back whole. The sentence
+        claims neither -- it says what the send path returned and that
+        nothing came back to compare -- because that is the whole of what
+        this side knows, and it is enough to stop the operator fixing the
+        credential.
+        """
+        path = self._declared.liveness.path
+        if refusal is not None:
+            return (f"the canary to {path} was not answered -- the send path "
+                    f"returned {refusal}, so nothing came back to compare "
+                    "against the signature this identity is declared to "
+                    "prove itself by",
+                    f"its canary was refused {refusal}")
+        return (f"{path} answered, but not with the signature this identity "
+                "is declared to prove itself by",
+                "its canary was answered without the declared signature")
 
 
 def _exchanges_for(conn, surface_id):
@@ -669,18 +1509,102 @@ def _citable_exemplar(surface, exchanges) -> str | None:
     return exemplar_id if any(x.id == exemplar_id for x in exchanges) else None
 
 
-def _retirable(hook, verdict) -> tuple[str, ...]:
+def _retirable(hook, verdict, identity_state, *, origin,
+               proven_origin) -> tuple[str, ...]:
     """The issue types this verdict may retire a finding on.
 
-    AN ACTIVE CHECK RETIRES NOTHING. Retirement is `_mark_unobserved`
-    writing `observed = 0`, which `report._findings` renders to a client as
-    "appears fixed; verify before closing" -- a claim about the application
-    as the client's own users meet it. Every probe this build sends is
-    UNAUTHENTICATED (`ProbeSender._request_bytes` emits a request line, a
-    `Host` and at most the one header the check is probing), so an active
-    check's `clean` is a statement about the logged-out view and nothing
-    else. It is reported, because a reflection found in the logged-out view
-    is still a reflection; it may not close anything.
+    AN ACTIVE CHECK RETIRES ONLY WHAT IT PROBED UNDER A SESSION PROVED LIVE,
+    AT THE ORIGIN THAT PROOF WAS TAKEN AT.
+    Retirement is `_mark_unobserved` writing `observed = 0`, which
+    `report._findings` renders to a client as "appears fixed; verify before
+    closing" -- a claim about the application as the client's own users meet
+    it. So the question this function answers is not "did the probe come
+    back clean" but "was the probe issued into the view those users are in",
+    and this build can say yes for exactly one state -- `identity_state ==
+    "proven"` -- and, within it, for exactly one origin: the one the canary
+    that proved it was sent to. The state is necessary and it is not
+    sufficient; the origin half is four paragraphs down. Spec section 9, in
+    its own words: an active
+    check's `considered` is honoured "only if every probe it sent ran under
+    an identity whose canary was `proven` at the generation in force for that
+    request".
+
+    THE THREE STATES THAT RETIRE NOTHING, and none of them is a near miss:
+
+      * `None` -- THE RUN WAS ANONYMOUS. `scan_identity` is optional,
+        `bridge` may be absent, and `_identity_bracket` has four separate
+        ways to answer None. Every probe of such a run tests the logged-out
+        view, and an application that answers a logged-out request with a
+        200 login PAGE is indistinguishable from one that answered (see the
+        seventh spelling, below). This is the outcome every build before
+        this task had for every active check, and
+        `tests/test_scan_probes.py::test_an_active_check_still_retires_
+        nothing_without_an_identity` pins it unchanged -- the OUTCOME, not
+        the mechanism: the same call used to raise (see below), and a client
+        could not tell the difference because neither retired anything.
+      * `assumed` -- A CANARY FAILED SOMEWHERE IN THE RUN. Section 6
+        downgrades every exchange back to the last passing canary, because
+        they were issued into an unknown state; the run collapses to the
+        worst window in it (`IdentityWindow`'s own docstring). Retiring here
+        would tell a client a live vulnerability is fixed on traffic that may
+        have been unauthenticated -- the exact outcome this whole branch was
+        spent closing.
+      * `dead` -- THE SESSION NEVER PROVED, OR STOPPED PROVING AND COULD NOT
+        BE BROUGHT BACK. `run` halts on that (`IdentityDead`), so this
+        function is not normally reached with it; it is written out rather
+        than left to `!= "proven"` because a state that retires nothing must
+        do so by name and not by falling off the end of a condition.
+
+    AND `proven` IS A CLAIM ABOUT ONE ORIGIN, NOT ABOUT THE RUN'S HOSTS.
+    F1 of the whole-branch review, second half. A run's canaries all go to
+    `_IdentityBracket._target` -- the scheme, host and port of the run's own
+    FIRST surface, because an identity declares ONE `liveness` block (section
+    4) and its proof is per identity, not per host. Probes go to each
+    surface's own origin. So a run whose canary passed on `api.acme.test`
+    read `proven` for probes issued at `app.acme.test`, and the offer from
+    those probes was honoured: if the session is not honoured on the second
+    host and it answers 2xx, the check reads a LOGGED-OUT view as an answer,
+    says `clean`, and the client is told the finding "appears fixed" and that
+    it "was re-tested under a session proved live". That sentence was false
+    for that host. Comparing the two origins is what makes it true again.
+
+    THE FULL TRIPLE, NOT THE HOST. `_target` is `(scheme, host, port)` and
+    that is what the canary actually addressed. `Sender.appliesTo` compares
+    hosts alone -- deliberately, because a port is settled by the frame and
+    by scope -- so the credential may legitimately be APPLIED at a second
+    port on a proved host. The proof still does not travel there: `https://
+    app.test:443` and `https://app.test:8443` are two services and section
+    9's licence is to retire what was re-tested, not what was reachable.
+    Retirement is the narrower claim of the two and gets the narrower rule.
+
+    WHY THE GATE IS HERE AND NOT AT INJECTION. Bounding `origins` to the
+    proved host (`_identity_bracket`) already stops the common case, since
+    the extension then refuses a probe at any other host outright. It is not
+    enough on its own: an operator may WIDEN origins, and section 4 says they
+    may -- a session really can span two hosts. Widening what the credential
+    is applied to must not widen what the run may claim to have proved, and
+    those are two different questions asked in two different places. This is
+    the second one, and it is asked in the same call that already refuses
+    every state but `proven`, once, after `bracket.finish()`.
+
+    NEITHER ARGUMENT HAS A DEFAULT, AND THAT IS DELIBERATE. `origin=None,
+    proven_origin=None` would have compared equal and RETIRED, so a caller
+    that forgot them would silently get the behaviour this function exists to
+    refuse -- the same shape as a state falling off the end of a condition,
+    which the three states above are spelled out by name to avoid. Keyword-
+    only so that no positional call can transpose the pair.
+
+    WHY THE ARGUMENT IS PASSED IN RATHER THAN READ HERE. The state is a
+    property of a WINDOW BRACKETED BY TWO PASSING CANARIES, and the closing
+    canary is the last thing that can flip `proven` to `assumed`. `run`
+    therefore does not call this function inside its surface loop at all: it
+    collects each accepted verdict's offer, runs `bracket.finish()`, and only
+    then asks this -- once, with the settled state -- immediately before
+    `_mark_unobserved`, which is the only writer of `observed = 0`. Asking
+    inside the loop would have read `proven` for a run whose closing canary
+    was about to fail, which is precisely the hole section 6 exists to close
+    (`tests/test_scan_probes.py::test_a_run_whose_closing_canary_fails_is_
+    assumed_and_not_a_halt` is that run).
 
     DECIDED OFF `hook`, WHICH IS THE DISPATCH ITSELF. `run` picks the probe
     pass with the same value, `registry._HOOKS` gives `probes` to the four
@@ -689,41 +1613,33 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     inherits this by being an active check: there is no list of check ids
     here to update, and no rule for its author to remember.
 
-    IT RAISES RATHER THAN DROPPING QUIETLY, and that is the half that keeps
-    the two ends of the rule together. The five active checks pass what they
-    examined to `_probe_util.verdict` as `examined`, which uses it to refuse
-    a `clean` that tested nothing and does NOT put it on the verdict -- so a
-    probing check reaching here with a non-empty `considered` is one whose
-    author believed it would retire something. Silently discarding it would
-    leave that belief in the tree, unfalsified, exactly as fix round 5's
-    suppression would have. `run`'s per-check `except Exception` turns this
-    into an `error` row for that check, which is loud, retires nothing, and
-    ends no scan.
+    IT NO LONGER RAISES, AND THE RAISE IS WHAT TASK 8 REMOVED. Until this
+    commit a probing check arriving with a non-empty `considered` was a
+    `ValueError` -- `run`'s per-check `except Exception` turned it into an
+    `error` row -- on the ground that the five active checks pass what they
+    examined to `_probe_util.verdict` as `examined`, which deliberately did
+    not reach `Verdict.considered`, so a populated one was an author
+    believing in a retirement that could never happen. That belief is now
+    the ordinary case: `_probe_util.verdict` puts `examined` on a `clean`
+    verdict again, and the sentence "may not retire anything" has become
+    "retires when the run proved its session". A refusal here would have
+    made every active row of every anonymous run an `error`.
 
-    WHY THE SEVENTH SPELLING FORCED THIS. Six ways an active check could
-    answer `clean` off a probe that tested nothing were closed by the status
-    doctrine (`_probe_util.unanswered`), by the skips in `run` above, and by
-    `_probe_util.verdict`'s `unprobed` branch -- and the EIGHTH was closed by
-    that same doctrine a round later, when it stopped being an enumeration of
-    refusing statuses and became the rule that only a 2xx is an answer. The
-    seventh is an application that answers a logged-out request with a 200
-    LOGIN PAGE: a complete, well-formed, application-composed response,
-    indistinguishable from an answer at every level a status rule operates.
-    That one is an ARGUMENT AND NOT A MEASUREMENT, and saying otherwise is a
-    mistake this branch has already made once: fix round 3 measured five
-    `clean` rows and a retired finding behind a `302 /login` (see
-    `_probe_util.unanswered`), which is the shape a status CAN catch and is
-    now caught. A fixture whose anonymous view differs from its anonymous
-    view does not exist, so the 200 login page has never been put in front of
-    this corpus and cannot be.
-
-    WHAT IS MEASURED is the same `clean` arriving off a genuine answer:
-    `tests/integration/test_active_checks.py::test_a_second_scan_is_stable_
-    and_a_wholly_fixed_target_retires_nothing` repairs all five vulnerable
-    routes and, with this function passing `considered` through, closes all
-    five findings -- `[1, 1, 0]` each, rendered five times as "appears fixed;
-    verify before closing". Nothing in those rows distinguishes them from
-    what a login page would have produced, which is the whole argument.
+    WHY THE SEVENTH SPELLING FORCED THE GATE TO BE THIS NARROW. Six ways an
+    active check could answer `clean` off a probe that tested nothing were
+    closed by the status doctrine (`_probe_util.unanswered`), by the skips in
+    `run` above, and by `_probe_util.verdict`'s `unprobed` branch -- and the
+    EIGHTH was closed by that same doctrine a round later, when it stopped
+    being an enumeration of refusing statuses and became the rule that only a
+    2xx is an answer. The seventh is an application that answers a logged-out
+    request with a 200 LOGIN PAGE: a complete, well-formed,
+    application-composed response, indistinguishable from an answer at every
+    level a status rule operates. No status rule catches it, which is why the
+    liveness canary is a BODY signature (`hx.identity.canary`, and
+    `config.Liveness.expect_body` is required for this reason) rather than a
+    status check. A canary that accepted a status code would be satisfied by
+    that same page and would stamp `proven` on it -- handing the hazard back
+    with a proof attached, which is section 6's own warning.
 
     Fix round 5 tried to contain the login page by suppressing retirement
     only where the surface's captured request carried a credential header.
@@ -734,33 +1650,33 @@ def _retirable(hook, verdict) -> tuple[str, ...]:
     more fundamentally `Redactor.redactObservedRequest` replaces a
     credential header's VALUE before the bytes are hashed (S7), so only the
     NAME survives and an analytics or consent cookie is indistinguishable
-    from a session. The discriminator could not see what it claimed to.
-    Retirement is a passive-corpus property until probes can authenticate.
+    from a session. The discriminator could not see what it claimed to. What
+    replaces it is not a better guess at the capture: it is a request `hx`
+    issued itself, to a path the operator declared, whose body had to carry a
+    signature only an authenticated response carries.
 
     THE PASSIVE CORPUS IS UNTOUCHED, and the asymmetry is not a compromise:
     a passive check reads the captured traffic ITSELF -- the very exchanges
     the operator's own browser produced, session and all -- so it was never
     looking at a different view of the application, and this whole question
-    is one only a re-issued request can have.
+    is one only a re-issued request can have. `identity_state` and both
+    origins therefore reach the passive branch and none of the three is
+    consulted in it.
 
-    THE ACCEPTED COST, stated where the decision was taken: the active
-    corpus has no automatic retest story at all. A client re-running a scan
-    after a fix sees the active finding still listed, and must verify it by
-    hand before closing it. `report._limits` says so in as many words.
+    WHAT THE CLIENT IS TOLD, and it is derived from the same state rather
+    than typed: `report._limits` reads `run.identity_state` out of the store
+    and renders one pair of bullets for an engagement whose scans issued
+    under a proved session and another for one whose scans did not. Before
+    this task that bullet said flatly that an active finding is never
+    automatically marked as fixed, and its neighbour said every probe was
+    sent unauthenticated; Task 7 falsified the second and this function
+    falsifies the first.
     """
     if hook != _PROBE_HOOK:
         return verdict.considered
-    if verdict.considered:
-        raise ValueError(
-            "an active check returned considered="
-            f"{list(verdict.considered)}; a check the runner drives through "
-            "the wire may not retire anything, because every probe this "
-            "build sends is unauthenticated and cannot tell the client's "
-            "own view of the application from the logged-out one. Pass what "
-            "was examined to `_probe_util.verdict` as `examined` instead -- "
-            "it is what lets a check say `clean` -- and leave `considered` "
-            "to the passive corpus")
-    return ()
+    if identity_state != "proven":
+        return ()
+    return verdict.considered if origin == proven_origin else ()
 
 
 # "Not read yet", and it cannot be `None` -- see the surface loop. Both facts
@@ -855,15 +1771,21 @@ def _skip(conn, row_id, summary, key, reason) -> None:
     summary.by_reason[key] = summary.by_reason.get(key, 0) + 1
 
 
-def _spent(summary, sender) -> int:
+def _spent(summary, sender, bracket=None) -> int:
     """What this check's sender issued, folding what it was refused into the
-    run's tally on the way past.
+    run's tally -- and its issuances into the identity window -- on the way
+    past.
 
     ONE CALL PER ROW, at each of the three places a probing row can close.
     `requests_sent` and `summary.refused` are two halves of the same fact --
     what this check spent, and what it did not get to spend -- and reading
     them at one point is what keeps the second from being counted twice or
-    missed on the `error` path.
+    missed on the `error` path. THE WINDOW IS COUNTED HERE FOR THAT SAME
+    REASON: spec section 6 puts a canary every `every_n_probes` PROBES, and
+    this is the one place that sees every probe a row issued however the row
+    ended. `bracket` is None for an anonymous run and for the canary's own
+    sender -- a canary is not a probe, and counting it toward the schedule
+    it is itself running would be a canary counting itself down.
 
     THE RUNNER CANNOT SEE THESE REFUSALS ANY MORE, which is why they are read
     off the sender rather than counted where `except ProbeRefused` sits.
@@ -875,6 +1797,8 @@ def _spent(summary, sender) -> int:
         return 0
     for cls, n in sender.refused.items():
         summary.refused[cls] = summary.refused.get(cls, 0) + n
+    if bracket is not None:
+        bracket.note(sender.sent)
     return sender.sent
 
 
@@ -978,14 +1902,18 @@ def _mark_unobserved(conn, engagement_id, run_id, seen, considered) -> None:
     run's `checks` retires none of its prior findings: none of those states
     ever added an entry for them.
 
-    AND SINCE FIX ROUND 6, ONLY A PASSIVE CHECK EVER GETS INTO IT.
-    `scan.run` reads `_retirable`, which returns nothing for a check driven
-    through the wire: every probe this build sends is unauthenticated, so an
-    active `clean` is a statement about the logged-out view and not about
-    the one the client's users are in. That function carries the argument
-    and the two spellings the branch tried before it. So "in `considered`"
-    means "examined, by a check that read the captured traffic itself", and
-    that is the only reading under which retirement is sound today.
+    WHICH CHECKS GET INTO IT IS `_retirable`'S DECISION AND NOT THIS
+    FUNCTION'S, and the split is deliberate: a rule written here, or keyed on
+    the finding or on the surface, would have taken the passive corpus's
+    whole retest story with it. `scan.run` builds `considered` by asking that
+    function once per accepted verdict, with the run's SETTLED identity
+    state. A passive check's offer is honoured whatever the session did -- it
+    read the captured traffic itself, session and all. An active check's is
+    honoured only for a run whose liveness canary proved the session live at
+    both ends of the window its probes were issued in (section 9); an
+    anonymous run, and one downgraded to `assumed` by a canary that failed
+    anywhere, both offer nothing. So "in `considered`" means "examined, by a
+    check whose view of the application this run can vouch for".
 
     Row G, spec S8: a surface can vanish between capture and scan. MEASURED:
     the schema's own FK (`finding.surface_id REFERENCES surface(id)`) refuses

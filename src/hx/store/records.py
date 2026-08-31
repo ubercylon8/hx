@@ -62,6 +62,24 @@ DENIAL_KIND: dict[str, str] = {
     # reached `hx.capture` and vanished silently. S7's "never persisted" is
     # about the request bytes; the refusal is a denial like any other.
     "unmanaged_credential": "credential",
+    # The identity plan's two send-path refusals, and they are DENIALS: both
+    # are decided about a request the extension agreed to look at, after every
+    # gate, and S4's "denials are never silent" covers them exactly as it
+    # covers the seven above. So they get a kind rather than a line in
+    # UNRECORDABLE -- which is the rule that set's own comment states.
+    #
+    # THE KIND IS THE EXISTING `credential` AND NOT A NEW ONE, and that is a
+    # cost taken deliberately rather than an oversight. `denial.kind` is a
+    # CHECK-constrained vocabulary, so an `identity` kind is a schema
+    # migration -- a new SCHEMA_VERSION and a table rebuild -- which is not
+    # this change. Filing all three under `credential` reads correctly in
+    # `SELECT kind, COUNT(*) FROM denial GROUP BY kind` ("refusals about
+    # credentials") and loses the three-way split in that column ONLY: the
+    # error class is what the caller is told, and `denial.reason` carries the
+    # detail, which names the identity and the host. The split is worth a kind
+    # of its own on the day someone needs to count these separately.
+    "unknown_identity": "credential",
+    "identity_origin": "credential",
 }
 DENIAL_KINDS = frozenset(DENIAL_KIND.values())
 
@@ -459,9 +477,23 @@ VIA_VALUES = frozenset({"proxy", "send", "crawl"})
 #       transcribed from S6 by hand and S6 did not list it either. Both ends
 #       of that are fixed: S6 lists it, and the set is now DERIVED from the
 #       emit sites.
+#   bad_identity -- an `identity` frame whose body could not be acted on.
+#       bad_config's shape, for the other body: it is a refusal about a FRAME,
+#       no request was decided about, and there is no method or url a `denial`
+#       row could put in its columns. The identity plan's two OTHER classes are
+#       not here, and the difference is the rule above: `unknown_identity` and
+#       `identity_origin` are decided about a REQUEST the extension agreed to
+#       look at, so they are denials and they got a kind.
+#   stale_generation -- an `identity` frame whose generation does not advance
+#       the one already held. Also about a frame rather than a request, and
+#       DELIBERATELY not a denial in the store's sense: nothing was refused
+#       passage anywhere. It is the monotonic rule doing its job on a replayed
+#       or reordered frame, and the run carries on under the identity it
+#       already holds.
 UNRECORDABLE = frozenset({"transport_error", "halted",
                           "bad_frame", "engagement_mismatch",
-                          "protocol_mismatch", "bad_config", "unknown_frame"})
+                          "protocol_mismatch", "bad_config", "unknown_frame",
+                          "bad_identity", "stale_generation"})
 
 
 def row_for(error_class: str, *,

@@ -50,7 +50,19 @@ from hx.store.paths import secure_mkdir
 # and "the column list did not change" is not the test -- whether an older
 # file still MEANS what this code assumes is. `engagement.open_`'s version
 # check is the only thing in the tree that can notice.
-SCHEMA_VERSION = 8
+#
+# 8 -> 9 (2026-08-30, identity Task 8): `run` gained `identity`,
+# `identity_generation` and `identity_state`, additive and nullable. As with
+# 6 -> 7 no existing row's meaning changes, and the bump exists to make an
+# older store's absence of the columns loud rather than a
+# `sqlite3.OperationalError` out of a query with every right to expect them:
+# `hx.report._limits` and the report's identity section now READ
+# `run.identity_state`, and `hx.scan.run` writes it on every path a run can
+# end by. A store written before this commit answers NULL for a scan that did
+# issue under a proved session -- which renders as the anonymous case, the
+# safe direction, but says something false about that run. Refusing to open
+# it is the loud version of the same fact.
+SCHEMA_VERSION = 9
 
 TABLES: tuple[str, ...] = (
     "engagement",

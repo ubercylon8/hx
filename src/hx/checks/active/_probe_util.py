@@ -68,14 +68,16 @@ and every question they answer is one where a disagreement is a false
     (N3), and a `clean` naming nothing it examined is refused outright
     rather than left to five callers to avoid asking for.
 
-    WHAT THIS DOCTRINE IS AND IS NOT FOR, SINCE FIX ROUND 6. It used to
-    guard two things at once: the coverage row (`clean` asserts a test
-    happened) and the RETIREMENT that a populated `considered` licensed.
-    An active check no longer retires anything at all -- `hx.scan._retirable`
-    refuses its `considered` -- so only the first is left, and it is reason
-    enough on its own: S12 says a report that cannot tell "tested, clean"
-    from "never reached" is worse than no report, and the coverage table is
-    where a client reads that distinction.
+    WHAT THIS DOCTRINE GUARDS, AND IT IS TWO THINGS AGAIN. The coverage row
+    (`clean` asserts a test happened) and the RETIREMENT that a populated
+    `considered` licenses. Fix round 6 left only the first, because
+    `hx.scan._retirable` then honoured no active check's `considered` at all;
+    Task 8 honours one for a run whose liveness canary proved the session, so
+    the second is back and this funnel is again the only place either is
+    decided. Either would be reason enough on its own: S12 says a report that
+    cannot tell "tested, clean" from "never reached" is worse than no report,
+    and a retirement is that same distinction turned into a claim about the
+    client's own application.
 
 RANDOM, PER CALL, AND WHY THAT MATTERS MORE HERE THAN IN EITHER PREDECESSOR.
 `records.dedupe_key` folds `insertion_kind`/`insertion_name` into a finding's
@@ -198,9 +200,12 @@ def reflected(response, marker: str) -> bool:
 #     nonsense" is not "your payload was safe".
 #   * 401, 403, 407 -- a WAF, an expired session, an authorisation layer or a
 #     proxy in front of the application. The probe never reached the code
-#     under test, and every probe this build sends is unauthenticated, so
-#     this is the ordinary answer from an authenticated application rather
-#     than an exotic one. A 407 is not composed by the application at all.
+#     under test, and this is the ordinary answer from an authenticated
+#     application rather than an exotic one: an anonymous run carries no
+#     credential at all, and a run issued under an identity (Task 7) can
+#     still be outside what that identity is authorised for, or be holding a
+#     session the application has since dropped. A 407 is not composed by
+#     the application at all.
 #   * 404, 410 -- the resource is gone. Reachable even now that probes go to
 #     the exemplar's concrete path: a capture from an hour ago can name a row
 #     that has since been deleted.
@@ -341,23 +346,52 @@ def verdict(candidates, gaps, *,
     `unprobed` below. `gaps` is one string per probe that came back without
     answering; `examined` is what the check looked for.
 
-    `examined` IS NOT `Verdict.considered`, AND FIX ROUND 6 IS WHY IT IS
-    SPELT DIFFERENTLY. It was that field until this round, and it reached it
-    through this function: the four looping checks and `cors` each named
-    their issue types here and `hx.scan._mark_unobserved` retired on them.
-    An active check now retires nothing at all -- every probe this build
-    sends is unauthenticated, and the argument is `hx.scan._retirable`'s --
-    so this parameter feeds exactly ONE question: may this check say `clean`
-    at all. A check passes the same fact it always did, under a name that no
-    longer promises a retirement, and `_retirable` refuses a probing check's
-    `considered` outright so the two cannot quietly join up again.
+    `examined` KEEPS ITS OWN NAME AND REACHES `Verdict.considered` AGAIN.
+    It was that field until fix round 6, which severed the two because
+    `hx.scan._retirable` had stopped honouring a probing check's `considered`
+    at all: an active check retired nothing, so a field promising a
+    retirement was a promise nothing could keep. Task 8 re-opened that gate
+    narrowly -- section 9 honours an active check's `considered` for a run
+    whose liveness canary proved the session, and for no other run -- so the
+    fact this parameter carries is exactly the fact the gate needs, and
+    severing them now would leave the gate with nothing to decide.
+
+    THE TWO NAMES STAY DIFFERENT BECAUSE THEY ANSWER DIFFERENT QUESTIONS,
+    and only one of them is this module's. `examined` decides whether this
+    check may say `clean` AT ALL (the raise at the end of this function), and
+    that is a rule about the check. `considered` is the runner's word for
+    what a retirement may key on, and whether any of it is honoured is
+    decided by `_retirable` from the run's settled identity state -- which
+    nothing in a check can see, choose or ask about (section 8). A check
+    passes what it looked for; the runner decides what that is worth.
 
     A CANDIDATE STILL WINS OVER A GAP: what was found was found, and another
     probe on this surface coming back without an answer does not un-find it.
-    The gap used to take `considered` off that finding as well, so the
-    surface's other issue types were not retired on partial evidence; the
-    runner's blanket rule subsumes that, and a finding here is reported with
-    nothing withheld from it.
+    AND A FINDING STILL CARRIES NO `considered`, which under-claims: a check
+    that found one of three issue types does not retire the other two here,
+    so a fix confirmed on this surface waits for the scan on which the check
+    comes back wholly clean. THE REASON IS NARROWER THAN AN EARLIER DRAFT OF
+    THIS PARAGRAPH CLAIMED, and Task 8's own review is why this note exists.
+    It is not that putting `examined` on the finding branch "over-claims" in
+    some general sense -- that is what `_http.verdict` does today,
+    deliberately, at `_http.py:168-169` (`considered=() if evidence.gaps else
+    considered`), and `_mark_unobserved`'s own docstring (`scan.py:1760-1767`)
+    names the OPPOSITE of that -- retiring on evidence nobody read -- as the
+    defect an earlier task fixed, not this shape.
+
+    THE REAL HAZARD IS ABOUT THIS FUNCTION'S BRANCH ORDER. The `if
+    candidates` return above answers BEFORE `gaps` is even looked at (the
+    `if gaps` below it, unreached once a candidate is found), so an
+    unconditional `examined` on the finding branch would retire on a surface
+    where some of this check's own probes were refused -- gaps this function
+    has not yet checked when the finding branch answers. `_http.verdict`'s
+    guard is the correct narrow fix for exactly that hazard, and it is what
+    this branch should become if a later round decides a partially-fixed
+    surface ought to retire the same way the passive corpus already does:
+    `considered=() if gaps else examined`. THIS ROUND DOES NOT MAKE THAT
+    CHANGE -- narrowing the guard here changes what retires on a gapless
+    surface, which is a branch-level decision about what this build's active
+    corpus retires, not a comment fix.
 
     `unprobed` IS A FOURTH FACT AND IT IS NOT A GAP. A gap is a probe that
     was SENT and came back without answering; `unprobed` is the check saying
@@ -419,4 +453,4 @@ def verdict(candidates, gaps, *,
             "found, nothing was refused, and no issue type was examined, "
             "which is a check reporting `tested, clean` for a surface it "
             "never tested. Pass `unprobed=<why>` instead")
-    return base.Verdict.clean()
+    return base.Verdict.clean(considered=examined)

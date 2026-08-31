@@ -27,6 +27,14 @@ IDLE_CLOSE_US = 15 * 60 * 1_000_000
 # invisible to every query that filters on one.
 RUN_KINDS = frozenset({"browse", "crawl", "manual", "scan"})
 
+# The identity design's section 6 vocabulary, and it is closed for the reason
+# `RUN_KINDS` is: `run.identity_state` and `exchange.identity_state` both
+# carry it as a CHECK constraint, and `hx.scan._retirable` gates a client-
+# facing retirement on one of the three by name. A fourth spelling reaching
+# the column would be refused by SQLite with a message naming neither the
+# value nor the alternatives.
+IDENTITY_STATES = frozenset({"proven", "assumed", "dead"})
+
 
 def open_run(conn: sqlite3.Connection, *, engagement_id: str, kind: str,
              safety_profile: str, now_us: int | None = None) -> str:
@@ -62,6 +70,41 @@ def close_run(conn: sqlite3.Connection, *, run_id: str,
         "UPDATE run SET status=?, ended_us=?, stop_reason=?"
         " WHERE id=? AND status='running'",
         (status, at, stop_reason, run_id))
+
+
+def record_identity(conn: sqlite3.Connection, *, run_id: str,
+                    identity_id: str, generation: int, state: str) -> None:
+    """Which identity a run issued under, and what its liveness settled at.
+
+    NOT PART OF `close_run`, and the split is the same one `count_drop`
+    makes. `close_run` is a lifecycle transition guarded on
+    `status='running'`; this is a FACT ABOUT WHAT THE RUN DID, and it has to
+    be recordable on the halt path -- where `hx.scan.run` writes it a line
+    before closing the row `error` -- as readily as on the happy one. A
+    version folded into `close_run` would also have to be threaded through
+    `current_run`'s idle close and `reap_stale`, neither of which knows
+    anything about an identity.
+
+    THE STATE IS CHECKED HERE AS WELL AS BY THE COLUMN. `schema.sql`'s CHECK
+    is the backstop and its message is SQLite's ("CHECK constraint failed"),
+    which names neither the value nor the vocabulary. `hx.scan` composes this
+    argument from three places -- `IdentityWindow.state_for_run()`, and two
+    literals on the halt path -- and a fourth caller spelling `alive` would
+    otherwise be diagnosed by a constraint rather than by a sentence.
+
+    Deliberately no `WHERE status='running'`: a run whose identity is being
+    recorded on the way out of a crash is one this statement must still
+    reach, and there is no second writer for it to race.
+    """
+    if state not in IDENTITY_STATES:
+        raise ValueError(
+            f"{state!r} is not an identity state; the identity design's "
+            f"section 6 names {sorted(IDENTITY_STATES)}, and `run."
+            "identity_state` carries the same CHECK constraint `exchange."
+            "identity_state` does")
+    conn.execute(
+        "UPDATE run SET identity=?, identity_generation=?, identity_state=?"
+        " WHERE id=?", (identity_id, generation, state, run_id))
 
 
 def current_run(conn: sqlite3.Connection, *, engagement_id: str, kind: str,

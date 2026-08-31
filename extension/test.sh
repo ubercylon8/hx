@@ -31,12 +31,15 @@ javac --release 21 -nowarn -Xlint:-options \
 CLASSES=(
     hx.bridge.CodecTest
     hx.bridge.BridgeClientTest
+    hx.bridge.IdentityFrameTest
     hx.policy.PolicyTest
     hx.policy.LimiterTest
     hx.policy.DistressTest
     hx.send.RedactorTest
     hx.send.HaltSwitchTest
     hx.send.SenderTest
+    hx.send.IdentityRegistryTest
+    hx.send.IdentityInjectionTest
     hx.proxy.ProxyGateTest
     hx.proxy.CaptureTest
     hx.proxy.PendingTest

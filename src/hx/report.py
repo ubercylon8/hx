@@ -482,9 +482,25 @@ def _provenance(conn, engagement_id, config, *, created_us,
                     f"{_when(started_us)}) ended `{_flat(status)}`")
             if stop_reason:
                 # `stop_reason` is free text and attacker-influenceable:
-                # `hx.scan.run` writes `f"scan.run raised: {type(exc).__name__}:
-                # {exc}"`, an exception message that can quote a request
-                # target. Through `_redact` like every other such field.
+                # `hx.scan._halt_reason` writes `f"scan.run raised:
+                # {type(exc).__name__}: {exc}"`, an exception message that can
+                # quote a request target. Through `_redact` like every other
+                # such field.
+                #
+                # WITH ONE EXCEPTION TYPE HELD BACK AT THE SOURCE, and
+                # `_redact` is why it had to be. F1 of the task-7 fix round A
+                # review: `hx.identity.refresh` put a failing refresh
+                # command's stderr in an `IdentityError`, `scan._settle`
+                # interpolated that into an `IdentityDead`, and this line
+                # rendered it -- `_redact` is `records.redact_url`, which
+                # strips URL userinfo and NOTHING ELSE, so a token echoed by
+                # a `curl -v` or a `set -x` arrived on the page intact. That
+                # is contained where it is created (the message no longer
+                # repeats the output) and again where it is stored
+                # (`_halt_reason` writes an `IdentityDead`'s own composed
+                # `stop_reason`, never `str(exc)`). This line is unchanged:
+                # the containment belongs upstream of a renderer that cannot
+                # know what a string means.
                 line += f" — stop reason: {_flat(_redact(stop_reason))}"
             else:
                 line += " and recorded no stop reason"
@@ -493,6 +509,158 @@ def _provenance(conn, engagement_id, config, *, created_us,
 
     out.extend(_scope_of_record(conn, engagement_id, config))
     out.extend(_authorization(conn, engagement_id))
+    out.extend(_identity(conn, engagement_id, config))
+    return out
+
+
+def _identity_runs(conn, engagement_id) -> list[tuple]:
+    """Every run that issued its own requests under a declared identity.
+
+    `identity IS NOT NULL` rather than `kind='scan'`, and the difference is
+    real: `hx.scan.run` is the only writer of these columns today, but the
+    predicate that matters is "did this run carry a session", not "which
+    subcommand opened it". A `browse` run is anonymous BY DESIGN -- the
+    operator's own browser carries its own session and the identity design's
+    s2 puts proxy traffic outside this machinery -- so it answers NULL and
+    stays out of here for a reason that is about the run rather than about
+    the query.
+    """
+    return conn.execute(
+        "SELECT id, kind, status, started_us, identity, identity_generation,"
+        " identity_state FROM run WHERE engagement_id=? AND identity IS NOT"
+        " NULL ORDER BY started_us, id", (engagement_id,)).fetchall()
+
+
+def _identity(conn, engagement_id, config) -> list[str]:
+    """As whom this engagement was tested, and how that was proved.
+
+    SECTION 10, DERIVED FROM THE RUNS AND NOT FROM THE CONFIG ALONE. The
+    config says what was DECLARED; `run.identity_state` says what a run
+    actually ended in. They disagree the moment an identity is declared and
+    never scanned under, added after a scan, or resolved into a run that then
+    halted -- and `_limits` has twice been found asserting a build fact it
+    had not derived. So the table below has a row per DECLARED identity (the
+    config's question) and every number in it comes off the run rows (the
+    store's).
+
+    NOTHING RENDERS FOR AN ENGAGEMENT THAT DECLARED NONE AND RAN NONE, which
+    keeps every report this build produced before Task 8 byte-identical. The
+    unauthenticated-probe limitation stays in Limits for exactly that case,
+    which is section 10's own instruction.
+
+    NO CREDENTIAL AND NO ENVIRONMENT VALUE REACHES THIS PAGE, and the two
+    fields that could carry one are not rendered rather than redacted:
+
+      * `inject.value_from_env` is a variable NAME and its value is what the
+        identity design's s3 keeps off `Config` altogether -- but the name
+        buys a client nothing, and a field that is one dereference from a
+        credential is better absent from a deliverable than present and
+        argued about.
+      * `refresh.command` is an operator's own argv. It is not passed
+        anything from the target, but an operator who put a token in an
+        argument would have put it in the client's report.
+      * `liveness.expect_body` is not rendered either, and this one is a
+        judgement rather than a rule: it is a string chosen because it
+        appears in an AUTHENTICATED response, so an operator who reached for
+        a username or a session-bound token would be quoting response
+        content into the deliverable. What the client needs is that the
+        proof was a body match at a declared address and not a status code,
+        and that is said in words below.
+
+    `hx.identity.Resolved` -- the object that does hold the secret -- never
+    reaches this module at all: `render` is handed `conn`, `config` and a
+    blob store, and the credential is on none of them.
+    """
+    rows = _identity_runs(conn, engagement_id)
+    if not rows and not config.identities:
+        return []
+
+    out = ["### Session identity\n"]
+    # THE HALT COMES FIRST AND IN BOLD. Section 10: a run that halted on a
+    # dead session says so prominently, because "we tested this and found
+    # nothing" and "our session died at 01:50" are indistinguishable from a
+    # coverage table -- every surface after the halt simply has no row, which
+    # reads as never-reached only if the reader already knows to look.
+    halted = [r for r in rows if r[6] == "dead"]
+    if halted:
+        out.append(
+            f"**{len(halted)} run(s) stopped because the session being "
+            "tested under stopped being valid.** hx halts rather than "
+            "carrying on logged out: an unauthenticated run of an "
+            "authenticated application answers `clean` about a view none of "
+            "its users are in. Everything those runs had reached is in this "
+            "report and everything after the halt was never attempted, so "
+            "read their coverage as partial:\n")
+        for run_id, kind, status, started_us, ident, _gen, _state in halted:
+            out.append(f"- run `{_flat(run_id)}` ({_flat(kind)}, started "
+                       f"{_when(started_us)}) was testing as "
+                       f"{_code(_redact(ident))} and ended "
+                       f"`{_flat(status)}`")
+        out.append("")
+
+    out.append("| Identity | Strategy | Runs | Generations | Outcome |")
+    out.append("|---|---|---|---|---|")
+    # Declared first, in the config's own order, then any identity the store
+    # holds a run for that the config no longer declares -- a rotation, or a
+    # block removed after the scan that used it. Dropping the second would
+    # let an edit to `config.yaml` erase a run's own record of what it tested
+    # as, which is the direction `_scope_of_record` refuses for the same
+    # reason.
+    seen = list(config.identities)
+    seen += sorted({r[4] for r in rows} - set(seen))
+    for ident in seen:
+        mine = [r for r in rows if r[4] == ident]
+        declared = config.identities.get(ident)
+        strategy = "not declared in this config" if declared is None \
+            else declared.strategy
+        # THE HIGHEST GENERATION ANY RUN ENDED ON, which is section 10's
+        # "how many generations". A static identity is minted once by
+        # `identity.resolve` at generation 1 and has no refresh command to
+        # advance it, so it reads 1 however many times it is scanned under. A
+        # programmatic one starts at 1 (`refresh(declared, 0)` returns
+        # `generation + 1`) and advances by one per refresh, so a 3 says some
+        # run of this engagement refreshed twice. NOT a sum across runs: two
+        # runs at generation 1 are one credential used twice, and adding them
+        # would read as two rotations that never happened.
+        gens = [r[5] for r in mine if r[5] is not None]
+        outcome = ", ".join(
+            f"{state} ({sum(1 for r in mine if r[6] == state)})"
+            for state in ("proven", "assumed", "dead")
+            if any(r[6] == state for r in mine)) or "never used"
+        # `len(mine)` and `outcome` are composed here out of an int and this
+        # function's own literals and cannot break a row. The other three come
+        # from the store or the config and go through `_cell`, including the
+        # generation: SQLite gives that column INTEGER AFFINITY, not an
+        # integer TYPE, so a hand-written row can leave a string in it and
+        # `_cell` is what stops a `|` in one ending the table. Nothing this
+        # build can write puts anything but an int there -- `run.
+        # record_identity` takes `Resolved.generation`.
+        out.append(f"| {_cell(_code(_redact(ident)))} |"
+                   f" {_cell(_redact(strategy))} | {len(mine)} |"
+                   f" {_cell(max(gens) if gens else 0)} | {outcome} |")
+    out.append("")
+
+    out.append("**`proven` means the session was proved live at both ends of "
+               "the window a run's requests were issued in.** hx requests a "
+               "page the engagement declared, at the start of a run, "
+               "periodically during it and at the end, and requires the "
+               "response body to carry a string only an authenticated "
+               "response has — a status code is never enough, because an "
+               "application that answers a logged-out request with a 200 "
+               "login page satisfies every status rule there is. `assumed` "
+               "means one of those checks failed somewhere in the run, so "
+               "requests in it may have been issued logged out and hx does "
+               "not claim otherwise; `dead` means a check failed and the "
+               "session could not be renewed — at the start of a run or "
+               "partway through it — and the run stopped there rather than "
+               "carrying on logged out.\n")
+    out.append("**Per-request identity is not recorded by this build.** The "
+               "`exchange` table has columns for it and nothing writes them: "
+               "the requests hx issues itself are not stored as exchanges at "
+               "all in this version, so the state above is per RUN, and a run "
+               "reads `proven` only if every window in it did. That is the "
+               "conservative direction — one failed check anywhere makes the "
+               "whole run `assumed`.\n")
     return out
 
 
@@ -1209,6 +1377,115 @@ def _insertion_coverage(conn, engagement_id, blobs) -> list[str]:
     return out
 
 
+def _identity_counts(conn, engagement_id) -> tuple[int, int, int]:
+    """`(scans, scans under an identity, scans that proved the session)`.
+
+    THREE NUMBERS OFF ONE PASS, and they are nested: every `proven` run is
+    also an `under` run and every `under` run is also a scan, so a render
+    cannot claim more sessions than scans however the columns are filled in.
+
+    `kind='scan'` here where `_identity_runs` uses `identity IS NOT NULL`,
+    and the difference is not an inconsistency. That function answers "which
+    runs carried a session" for a section about sessions; this one answers
+    "how many of the runs that PROBE carried one" for a bullet whose subject
+    is the active corpus, and the denominator a client needs there is the
+    number of scans -- a `browse` run sends no probe and belongs in neither
+    half of the fraction.
+
+    `hx.scan.run` is the only writer of these columns, and it writes them for
+    a run it opened `kind='scan'` (`run_mod.current_run(..., kind="scan")`),
+    so the two predicates select the same rows today. They are spelled
+    differently because they would stop doing so the day anything else issues
+    under an identity, and the right answer then differs per caller.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*),"
+        " COUNT(identity),"
+        " COUNT(CASE WHEN identity_state='proven' THEN 1 END)"
+        " FROM run WHERE engagement_id=? AND kind='scan'",
+        (engagement_id,)).fetchone()
+    return int(row[0]), int(row[1]), int(row[2])
+
+
+def _origin_refused_scans(conn, engagement_id) -> int:
+    """How many scans recorded here had at least one PROBE refused
+    `identity_origin` -- the extension's refusal for a request addressed to a
+    host outside the identity's bound origins.
+
+    THE SAME GROUND AS `_identity_counts`, ONE COLUMN OVER. `run.stop_reason`
+    is where that refusal already lands: `hx.scan._tallies` folds
+    `summary.refused` -- every terminal refusal class every check's sender
+    saw, across the whole run (`_spent`, called at each of the three places a
+    row can close) -- into `'probes refused ' + 'identity_origin=N, ...'` and
+    `run()` writes it to `stop_reason` on the success path whenever that dict
+    is non-empty, status `completed` and all: a run is not truncated by a
+    refused probe (the surface it belongs to just reads `inconclusive`), so
+    this is not read off `_unfinished_runs` (`status <> 'completed'`).
+    `_halt_reason` folds the same tally in too, but only for `IdentityDead`
+    (`scan.py:883-888`'s own comment says why the other exceptions do not
+    carry it), and that path closes `status='error'` -- outside
+    `_unfinished_runs`' exclusion, so a halt with refused probes behind it is
+    counted here as well, alongside every other completed scan. This query
+    does not filter on `status` at all, matching `_identity_counts` above it:
+    both count every `kind='scan'` row, whatever it closed as.
+
+    NOT `check_run.reason`. That column is capped at `_GAPS_SHOWN` (3) gaps
+    per row before the rest collapses into "and N more" with no class named,
+    so a surface refused past the third insertion point would not say
+    `identity_origin` there at all. `stop_reason` is the run's own tally,
+    built from the uncapped dict, and it is the one place this fact is
+    guaranteed to be spelled out.
+
+    THE SECOND `NOT LIKE` IS N4 OF THE SCOPED RE-REVIEW (LOW). `_spent`
+    folds `sender.refused` into `summary.refused` for EVERY `ProbeSender`
+    including the canary's own (`_IdentityBracket._canary`,
+    `scan.py:1356-1361`) -- so a canary refused `identity_origin` lands in
+    the same tally a probe refusal would, and `_unproved`'s stored half for
+    that canary is literally `its canary was refused identity_origin`
+    (`scan.py:1414`), which also matches the first `LIKE`. Left alone, a run
+    whose canary -- and no probe -- was refused would be counted here and
+    then described to a client as a refused probe.
+
+    A CANARY REFUSED `identity_origin` HALTS BEFORE THE FIRST PROBE, ALWAYS,
+    which is what makes the second `LIKE` exact rather than a heuristic.
+    `_target` -- what every canary in one bracket's life is addressed to --
+    and `origins` are both fixed once, at construction (`_identity_bracket`,
+    `scan.py:999-1002`), and the extension's refusal is a pure function of
+    that pair against a fixed host: if the opening canary is not refused
+    `identity_origin`, no later canary on the same bracket can be either,
+    refresh or no refresh (refresh mints a new credential, not new origins).
+    So the only route to this refusal is `_IdentityBracket.start`, called
+    before the per-surface loop begins (`scan.py:307-310`), and it halts
+    there -- before a single `check_run` row has been opened -- with the
+    one `stop_reason` naming
+    "could not be proved live before the first probe". The other two halt
+    sites (`canary_if_due`'s own failure and the refresh failure inside it)
+    are reachable only through `canary_if_due`, which returns immediately
+    unless a previous row has already closed and counted a probe toward it
+    (`note`, called from `_spent`, `scan.py:1801`) -- so an `identity_origin`
+    surviving on either of those halts, or on a `completed` run's tally,
+    names an actual probe every time.
+
+    `identity_origin` NEVER APPEARS BY ACCIDENT: it is a wire class
+    (`hx.checks.probe._NOT_ISSUED`, `Sender.java:331`) and no other class or
+    English sentence this build writes shares that substring --
+    `unknown_identity` is the pair it sits beside and does not contain it.
+    Nor does "could not be proved live before the first probe": `_unproved`
+    is its only writer, and it is a literal string with nothing interpolated
+    ahead of it.
+
+    DERIVED FROM THE RUNS, LIKE `_identity_counts` -- never from
+    `config._origins` or `config.scan_identity`: a config says what was
+    declared, and a run row says what a run did.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM run WHERE engagement_id=? AND kind='scan'"
+        " AND stop_reason LIKE '%identity_origin%'"
+        " AND stop_reason NOT LIKE"
+        " '%could not be proved live before the first probe%'",
+        (engagement_id,)).fetchone()[0]
+
+
 def _limits(conn, engagement_id) -> list[str]:
     out = ["## Limits\n",
            "What this assessment did not cover, stated rather than implied.\n"]
@@ -1392,56 +1669,200 @@ def _limits(conn, engagement_id) -> list[str]:
         # enumerate them -- "one shape escapes that" was itself a
         # completeness claim, and the last one printed here was false.
         #
-        # AND SINCE FIX ROUND 6 THE BULLET BELOW IT DISCLOSES A BEHAVIOUR AS
-        # WELL AS A GAP. F3 was decided as DISCLOSE, NOT FIX -- and a
-        # disclosure does not stop a retirement, which is the actual harm the
-        # 200-login-page shape does. Fix round 5 suppressed retirement only
-        # where the captured request carried a credential header; that
-        # predicate keyed on the first sighting and could read only a header
-        # NAME, so it could not tell a session cookie from an analytics one.
-        # `hx.scan._retirable` now refuses retirement for EVERY active check,
-        # so no shape of this can close a finding and the residual below is a
-        # coverage gap rather than a wrong closure. The bullet after this one
-        # is where the client is told, and `tests/test_report.py::test_the_
-        # bullet_that_says_active_findings_never_retire_is_one_the_code_
-        # honours` holds it against `scan._retirable` itself.
+        # AND WHAT THAT RESIDUAL COSTS IS NOW A QUESTION WITH TWO ANSWERS.
+        # F3 was decided as DISCLOSE, NOT FIX -- and a disclosure does not
+        # stop a retirement, which is the actual harm the 200-login-page
+        # shape does. Fix round 5 suppressed retirement only where the
+        # captured request carried a credential header; that predicate keyed
+        # on the first sighting and could read only a header NAME, so it
+        # could not tell a session cookie from an analytics one. Fix round 6
+        # removed retirement from the active corpus outright, and Task 8 gave
+        # it back for one case: `hx.scan._retirable` honours an active
+        # check's `considered` for a run whose LIVENESS CANARY proved the
+        # session, which is a body-signature match at a declared address and
+        # is exactly the proof a 200 login page cannot produce -- and, since
+        # branch fix A, only for a row whose probes went to the origin that
+        # canary reached, because a canary proves one origin and a run may
+        # span several. So on an
+        # engagement whose scans ran anonymously the residual is a coverage
+        # gap and closes nothing; on one whose scans proved their session it
+        # is closed at the source rather than tolerated. The pair of bullets
+        # below is where the client is told which of the two they are
+        # reading, and `tests/test_report.py::test_the_limits_bullet_is_
+        # conditional_on_a_proven_identity` renders both.
         #
-        out.append("- **Every probe was sent unauthenticated.** The "
-                   f"{len(active)} active check(s) in this build "
-                   f"({_names(active)}) build each probe from the affected "
-                   "surface's captured request line and send nothing else "
-                   "with it: no cookie, no `Authorization`, and none of the "
-                   "endpoint's other parameters. Against an application that "
-                   "requires a session, a probe therefore tests the "
-                   "logged-out view of it. A login redirect, an authorisation "
-                   "refusal, or a rejection of the request itself is recorded "
-                   "as `inconclusive` rather than as a clean result — hx "
-                   "reads only a 2xx response as an answer it may reason "
-                   "about — so no surface is reported as tested on the "
-                   "strength of one, but nothing was covered on those "
-                   "surfaces either. What that cannot catch is a refusal "
-                   "delivered UNDER a 2xx: an application that answers a "
-                   "logged-out request with a 200 login PAGE, or an API that "
-                   "reports a rejected parameter in a 200 error envelope, "
-                   "cannot be told apart here from one that answered, so a "
-                   "probe against it is recorded as a clean result. That "
-                   "costs coverage and nothing more — the bullet below is "
-                   "why no clean result from an active check can close "
-                   "anything.")
-        out.append("- **An active finding is never automatically marked as "
-                   f"fixed.** The {len(active)} active check(s) in this build "
-                   f"({_names(active)}) re-issue requests, so a later scan "
-                   "does see the application as it is now — but it sees the "
-                   "logged-out view of it, for the reason above, and that is "
-                   "not the view your users are in. hx therefore never "
-                   "records a finding from one of these checks as no longer "
-                   "observed, however many times it is re-scanned and "
-                   "whatever those scans see. **Verify an active finding "
-                   "against the fixed application yourself before closing "
-                   "it.** Where the Coverage table shows one of these checks "
-                   "as `clean`, that means it ran and found nothing this "
-                   "time; it is not a statement that a previously reported "
-                   "issue is gone.")
+        # C-4's RULE, ARRIVING WHERE IT COULD NOT REACH BEFORE. Both bullets
+        # below were claims about the BUILD -- "every probe was sent
+        # unauthenticated", "an active finding is never automatically marked
+        # as fixed" -- typed rather than derived, and the identity plan
+        # falsified both: probes now carry a declared credential (Task 7) and
+        # a run that proved its session live retires on what its active
+        # checks examined (Task 8, `hx.scan._retirable`). The task-7 fix
+        # round left the first sentence standing and said why: `_limits` is
+        # handed `conn` and an engagement id, and NOTHING IN THE STORE
+        # recorded whether a run issued under an identity. `run.identity` and
+        # `run.identity_state` (SCHEMA_VERSION 9) are that record, written by
+        # `scan.run` on every path a run can end by, and this is the reader.
+        #
+        # DERIVED FROM THE RUNS, NEVER FROM `config.scan_identity`. A config
+        # says what was DECLARED and a run row says what a run DID, and the
+        # two disagree for an identity declared after the scan, removed
+        # before the report, or resolved into a run that then halted.
+        # Deriving this bullet from the config would be the same mistake F5
+        # and F7 record this function making twice.
+        scans, under, proven = _identity_counts(conn, engagement_id)
+        if under:
+            anonymous = ""
+            if scans > under:
+                anonymous = (
+                    f"The other {scans - under} scan(s) recorded here sent "
+                    "every probe logged out, and against an application that "
+                    "requires a session those probes tested the logged-out "
+                    "view of it. ")
+            out.append(f"- **{under} of the {scans} scan(s) recorded here "
+                       "ran under a session.** The "
+                       f"{len(active)} active check(s) in this build "
+                       f"({_names(active)}) build each probe from the "
+                       "affected surface's captured request line and add the "
+                       "one credential header the engagement declared for "
+                       "that session; they send nothing else with it, and "
+                       "none of the endpoint's other parameters. "
+                       + anonymous +
+                       "A login redirect, an authorisation refusal, or a "
+                       "rejection of the request itself is recorded as "
+                       "`inconclusive` rather than as a clean result — hx "
+                       "reads only a 2xx response as an answer it may reason "
+                       "about — so no surface is reported as tested on the "
+                       "strength of one, but nothing was covered on those "
+                       "surfaces either. What that cannot catch is a refusal "
+                       "delivered UNDER a 2xx: an application that answers a "
+                       "logged-out request with a 200 login PAGE, or an API "
+                       "that reports a rejected parameter in a 200 error "
+                       "envelope, cannot be told apart here from one that "
+                       "answered, so a probe against it is recorded as a "
+                       "clean result. Session identity, under Provenance, "
+                       "says which runs proved their session live and which "
+                       "did not.")
+        else:
+            out.append("- **Every probe was sent unauthenticated.** The "
+                       f"{len(active)} active check(s) in this build "
+                       f"({_names(active)}) build each probe from the "
+                       "affected surface's captured request line and send "
+                       "nothing else with it: no cookie, no `Authorization`, "
+                       "and none of the endpoint's other parameters. Against "
+                       "an application that requires a session, a probe "
+                       "therefore tests the logged-out view of it. A login "
+                       "redirect, an authorisation refusal, or a rejection "
+                       "of the request itself is recorded as `inconclusive` "
+                       "rather than as a clean result — hx reads only a 2xx "
+                       "response as an answer it may reason about — so no "
+                       "surface is reported as tested on the strength of "
+                       "one, but nothing was covered on those surfaces "
+                       "either. What that cannot catch is a refusal "
+                       "delivered UNDER a 2xx: an application that answers a "
+                       "logged-out request with a 200 login PAGE, or an API "
+                       "that reports a rejected parameter in a 200 error "
+                       "envelope, cannot be told apart here from one that "
+                       "answered, so a probe against it is recorded as a "
+                       "clean result. That costs coverage and nothing more — "
+                       "the bullet below is why no clean result from an "
+                       "active check can close anything.")
+        if proven:
+            out.append("- **An active finding is marked as no longer "
+                       "observed only where it was re-tested under a session "
+                       f"proved live.** {proven} of the {scans} scan(s) here "
+                       "ran under such a session, and where one of the "
+                       f"{len(active)} active check(s) in this build "
+                       f"({_names(active)}) looked for a previously reported "
+                       "issue on the same surface and did not find it, that "
+                       "finding is shown as appearing fixed. That does not "
+                       "extend to a surface where the check found something "
+                       "else: this build's active checks retire nothing on "
+                       "a surface they reported any finding on this scan, "
+                       "even under a proven session, so a surface partially "
+                       "fixed since a prior finding was reported waits for "
+                       "a scan on which the check comes back wholly clean "
+                       "before any of it is shown as fixed. A scan that ran "
+                       "anonymously closes nothing, and neither does one "
+                       "whose session failed its liveness check anywhere in "
+                       "the run: hx under-claims rather than telling you an "
+                       "issue is fixed on the strength of a probe that may "
+                       "have been logged out. **Verify an active finding "
+                       "against the fixed application yourself before "
+                       "closing it.** Where the Coverage table shows one of "
+                       "these checks as `clean`, that means it ran and found "
+                       "nothing this time; on its own it is not a statement "
+                       "that a previously reported issue is gone.")
+        else:
+            # "HOWEVER MANY TIMES IT IS RE-SCANNED AND WHATEVER THOSE SCANS
+            # SEE" IS GONE FROM THIS SENTENCE, and it is the last forward
+            # claim in the section. It was true while `_retirable` honoured
+            # no active check at all; it is now false of a re-scan issued
+            # under a session hx can prove live, and it pointed a client away
+            # from the one action that would work. What is left is a claim
+            # about THIS report and the scans behind it, which is what the
+            # store can answer.
+            out.append("- **An active finding is never automatically marked "
+                       f"as fixed.** The {len(active)} active check(s) in "
+                       f"this build ({_names(active)}) re-issue requests, so "
+                       "a later scan does see the application as it is now — "
+                       "but no scan recorded here proved it was seeing the "
+                       "view your users are in, so no finding from one of "
+                       "these checks is recorded here as no longer observed, "
+                       "whatever those scans saw. Re-running this assessment "
+                       "as it stands will not change that: hx closes an "
+                       "active finding only on a scan issued under a session "
+                       "it has proved live, and none of the scans behind "
+                       "this report was. **Verify an active finding against "
+                       "the fixed application yourself before closing it.** "
+                       "Where the Coverage table shows one of these checks "
+                       "as `clean`, that means it ran and found nothing this "
+                       "time; it is not a statement that a previously "
+                       "reported issue is gone.")
+        # BRANCH FIX B, CONCERN 1 OF BRANCH FIX A. The origins default (F1 of
+        # the branch review) bound an identity's credential to the one host
+        # its liveness canary proves, so on a multi-host engagement that
+        # widens nothing every probe to a SECOND host is refused
+        # `identity_origin` and reads `inconclusive` -- loud at the row (the
+        # Coverage reason cell names the refusal) but never accounted for as
+        # a PATTERN: a client sees a cluster of `inconclusive` rows on
+        # particular hosts with nothing here saying why they cluster there.
+        # S12's rule -- "a report that cannot distinguish tested-clean from
+        # never-reached is worse than no report" -- is about exactly that
+        # gap between a row and the story its rows tell together.
+        #
+        # RENDERED ONLY WHEN IT HAPPENED, the same rule as the proven/anonymous
+        # pair above and for the same reason: a single-host engagement never
+        # pays this cost (its one host IS the default origin), so a bullet
+        # that rendered unconditionally would be noise on every report from
+        # one.
+        # `_origin_refused_scans` is `run.stop_reason`, not `config.origins`
+        # -- a declared-but-unused widening says nothing about what a run did,
+        # and this bullet is about what happened.
+        origin_refused = _origin_refused_scans(conn, engagement_id)
+        # GUARDED ON `under` TOO, though `identity_origin` cannot arise on a
+        # run that issued no probe under an identity (`_NOT_ISSUED` names it
+        # only for a request carrying `identity_id`, `hx/checks/probe.py`):
+        # belt and braces against a store a future writer could leave
+        # inconsistent, and it keeps this condition legible on its own
+        # without a reader having to prove the implication first.
+        if under and origin_refused:
+            out.append(f"- **{origin_refused} of the {scans} scan(s) "
+                       "recorded here had at least one probe refused "
+                       "`identity_origin`.** By default an identity's "
+                       "credential is bound to the single host its liveness "
+                       "canary proved live, so that the session never "
+                       "carries to a third-party host that happens to be in "
+                       "scope. On this engagement, a probe addressed to "
+                       "another host was refused before it reached the "
+                       "target rather than sent without the session: the "
+                       "affected surface reads `inconclusive` here instead of "
+                       "`clean`, and the Coverage table's reason cell names "
+                       "the refusal on each row it happened to. To test "
+                       "those hosts under this session, declare "
+                       "`identities.<id>.origins` for the identity in "
+                       "`config.yaml`, naming every host the session is "
+                       "valid for.")
         # THE THREE NAMES ARE THE EXTENSION'S OWN, read from the one place
         # this side keeps them (`hx.checks.probe.CREDENTIAL_HEADERS`, which
         # matches `Redactor.CREDENTIAL_HEADERS`) rather than typed here.
@@ -1502,32 +1923,54 @@ def _limits(conn, engagement_id) -> list[str]:
         # checks it covers is what keeps it a disclosure rather than a
         # blanket that has quietly stopped being true.
         #
-        # AND THE ACTIVE HALF OF THIS SENTENCE HAS NOW BEEN WRONG TWICE. It
-        # read "the active checks re-issue requests and are not limited this
-        # way" -- a claim about EVERY active finding -- until fix round 5
-        # qualified it by the credential header the capture carried, and fix
-        # round 6 removed retirement from the active corpus altogether. Both
-        # earlier versions pointed the client the same way ("the active
-        # findings will retire, so re-run the scan"), which is the direction
-        # a deliverable must not lean when it is false. The two halves now
-        # reach the same conclusion by different routes, and the sentence
-        # says which route each takes rather than merging them: a passive
-        # finding cannot retire because the offending exchange stays on file,
-        # an active one because hx will not close what an unauthenticated
-        # probe saw.
-        out.append("- **No finding in this report can be shown as fixed by "
-                   "re-running this assessment.** The passive checks in this "
+        # AND THE ACTIVE HALF OF THIS SENTENCE HAS NOW BEEN WRONG THREE
+        # TIMES, which is why it is the half that is derived. It read "the
+        # active checks re-issue requests and are not limited this way" -- a
+        # claim about EVERY active finding -- until fix round 5 qualified it
+        # by the credential header the capture carried; fix round 6 removed
+        # retirement from the active corpus altogether and this became "hx
+        # never marks one of their findings as no longer observed"; Task 8
+        # gave retirement back for a run that proved its session, which
+        # falsified that in turn. Every one of those three was TYPED. The
+        # passive half has been true throughout and is typed still, because
+        # it follows from what a passive check reads and not from any run.
+        #
+        # The two halves reach their conclusions by different routes and the
+        # sentence says which route each takes rather than merging them: a
+        # passive finding cannot retire because the offending exchange stays
+        # on file, an active one only where a run could prove the view its
+        # probes saw.
+        # THE HEADLINE MOVES WITH THE HALF THAT CHANGED. "No finding in this
+        # report can be shown as fixed" is a claim over BOTH corpora, and it
+        # stops being true the moment one active finding can close -- a bold
+        # sentence contradicted by its own paragraph is worse than either
+        # version of it alone.
+        if proven:
+            headline = ("- **A passive finding in this report cannot be "
+                        "shown as fixed by re-running this assessment.**")
+            active_half = (
+                f"The active checks ({_names(active)}) do re-issue requests, "
+                f"and {proven} of the {scans} scan(s) here ran under a "
+                "session proved live -- so an active finding CAN be shown as "
+                "fixed by a further scan under such a session, on the terms "
+                "the bullet above gives.")
+        else:
+            headline = ("- **No finding in this report can be shown as fixed "
+                        "by re-running this assessment.**")
+            active_half = (
+                f"The active checks ({_names(active)}) do re-issue requests, "
+                "but hx never marks one of their findings as no longer "
+                "observed, for the reason the bullet above gives.")
+        out.append(headline + " The passive checks in this "
                    f"build ({_names(passive)}) read this engagement's whole "
                    "captured history for a surface, not only the newest "
                    "traffic, so one recorded response keeps a finding of "
                    "theirs live for the life of the engagement however much "
                    "clean traffic follows it; a retest of one must be run as "
-                   "a NEW engagement against the fixed application. The "
-                   f"active checks ({_names(active)}) do re-issue requests, "
-                   "but hx never marks one of their findings as no longer "
-                   "observed, for the reason the bullet above gives. Either "
-                   "way, a fix is confirmed by re-testing the application "
-                   "and not by re-reading this document.")
+                   "a NEW engagement against the fixed application. "
+                   + active_half +
+                   " Either way, a fix is confirmed by re-testing the "
+                   "application and not by re-reading this document.")
 
     dropped = conn.execute(
         "SELECT COALESCE(SUM(dropped_total), 0) FROM run WHERE engagement_id=?",

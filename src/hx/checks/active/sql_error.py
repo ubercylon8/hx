@@ -80,9 +80,10 @@ with both predecessors, `_ISSUE_TYPE` is passed to `_probe_util.verdict` as
 `examined` only when at least one point was actually probed, never on a
 surface with none of the declared kinds -- and, since N3 of the scoped
 re-review, such a call answers `inconclusive` with `_nothing_probeable()`
-rather than `clean`: nothing an active check says retires anything since fix
-round 6, but a `clean` row still claimed coverage in `report._coverage` of a
-surface this check never sent a request to.
+rather than `clean`: an `inconclusive` verdict carries no `considered` and so
+retires nothing whatever the run proved, and a `clean` row still claimed
+coverage in `report._coverage` of a surface this check never sent a request
+to.
 
 EACH CANDIDATE CARRIES ITS `Insertion`, for the reason `open_redirect.py`
 and `reflected_input.py` both give: `records.dedupe_key` folds

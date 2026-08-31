@@ -144,6 +144,47 @@ public final class Redactor {
         "authorization", "cookie", "proxy-authorization"
     };
 
+    /**
+     * True when {@code name} is one of those three, so that
+     * {@link IdentityRegistry#register} can refuse to hold an identity that
+     * would inject anything else without keeping a second copy of the list.
+     *
+     * IT DOES NOT TRIM, and that is the one way it deliberately differs from
+     * {@link #asciiEqualsIgnoreCase(String, String)} below. That matcher
+     * trims OWS because it is a FAIL-CLOSED gate on a name the harness sent:
+     * widening it can only produce extra refusals. This one is the opposite
+     * direction -- it decides what may be WRITTEN -- so a trim would be
+     * fail-OPEN: `"Cookie "` would match, and `withHeaderFirst` would then
+     * emit `Cookie : v`, a field name with a space before its colon that
+     * RFC 9112 §5.1 requires a server to reject and that parsers disagree
+     * about, which is the shape a smuggling pair is built from.
+     *
+     * Case-insensitive because RFC 9110 §5.1 field names are, and matched on
+     * ASCII alone for the locale reason written on
+     * {@link #asciiEqualsIgnoreCase(String, String)}: `toLowerCase()` folds
+     * per the DEFAULT locale, and in tr_TR 'I' folds to 'ı'. The
+     * `equalsIgnoreCase` half of that reasoning -- which that javadoc calls a
+     * preference, because nothing there rests on it -- does carry
+     * weight here: "COOKIE" spelled with a U+212A KELVIN SIGN is
+     * `equalsIgnoreCase` "cookie", and the answer this method gives is an
+     * ACCEPTANCE. Registration refuses that spelling before it can reach this
+     * method, because U+212A is outside Latin-1 and
+     * `IdentityRegistry.checkWritable` runs first -- so today the ordering is
+     * what makes it moot, and a matcher that is right on its own does not
+     * depend on the ordering staying that way.
+     */
+    static boolean isCredentialHeader(String name) {
+        if (name == null) return false;
+        for (String wanted : CREDENTIAL_HEADERS) {
+            if (name.length() != wanted.length()) continue;
+            boolean same = true;
+            for (int i = 0; i < wanted.length(); i++)
+                if (asciiLower(name.charAt(i)) != wanted.charAt(i)) { same = false; break; }
+            if (same) return true;
+        }
+        return false;
+    }
+
     private static final byte[] OBSERVED_COOKIE =
         "{{observed:set-cookie}}".getBytes(StandardCharsets.US_ASCII);
 

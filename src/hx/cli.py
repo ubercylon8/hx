@@ -20,10 +20,13 @@ import click
 from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import identity as identity_mod
 from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
 from hx import session as session_mod
+from hx.bridge import codec as codec_mod
+from hx.bridge import server as bridge_mod
 from hx.checks import registry
 from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
@@ -643,6 +646,99 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # and re-wording it here would put this command between the
             # operator and the sentence that tells them what to do.
             raise click.ClickException(str(exc)) from exc
+        except scan_mod.IdentityDead as exc:
+            # A DEAD SESSION IS A RESULT, NOT A CRASH -- and until Task 8 it
+            # was a traceback. `scan.run` halts rather than scanning
+            # anonymously (spec s7's instruction, and the identity design's
+            # s6 gives the reason: a dead session produces a run of "not
+            # vulnerable" answers that look exactly like a clean
+            # application), and nothing here caught it, so the one outcome
+            # this whole plan exists to make visible arrived at an operator
+            # as a stack trace with the sentence at the bottom.
+            #
+            # THE MESSAGE INTACT, for the reason above it: it names which of
+            # section 6's four outcomes happened (`_IdentityBracket._outcome`
+            # -- `fails, static` and `fails after refresh` send an operator
+            # to different places), whether the canary was REFUSED or
+            # answered without the declared signature (`_unproved` -- a
+            # refused canary means no credential they can mint will help),
+            # and why halting was the right answer.
+            #
+            # NON-ZERO EXIT, like every other `ClickException`, and that is
+            # the point rather than an accident: the run did not complete,
+            # its `run` row reads `error`, and a shell that treated this as
+            # success would let a scheduled scan report clean coverage for
+            # an application it stopped testing at the first surface. The
+            # run's own tallies are in that row's `stop_reason`
+            # (`scan._halt_reason`) and reach a reader through `hx report`,
+            # not through this line.
+            raise click.ClickException(str(exc)) from exc
+        except identity_mod.IdentityError as exc:
+            # THE FAR COMMONER MISTAKE, ONE EXCEPTION CLASS OVER FROM
+            # `IdentityDead` ABOVE. `_resolve_scan_identity` (`scan.py:986`)
+            # reads a static identity's credential out of `os.environ` and
+            # RAISES `IdentityError` when the declared variable was simply
+            # never exported -- no session was ever opened, no canary was
+            # ever sent, so `IdentityDead` (which is a session that WAS
+            # proved and then died, or never provably lived) is the wrong
+            # class for it and always was. Forgetting an `export` on a
+            # terminal an operator just opened is ordinary; nothing here
+            # caught it, so it reached them as a traceback with the message
+            # `identity.resolve` already wrote for them at the bottom of it
+            # -- the same defect commit a88388d fixed for the rarer case,
+            # one exception class over.
+            #
+            # THE MESSAGE INTACT, for the same reason as above: `resolve`
+            # already names the variable that is missing and refuses to
+            # issue anonymously rather than silently testing the logged-out
+            # view of an authenticated application, and re-wording it here
+            # would put this command between the operator and the sentence
+            # that tells them what to do. No credential value is in it --
+            # `resolve` raises before it has one to leak.
+            #
+            # NON-ZERO EXIT, like every other `ClickException`: the run's
+            # own row still closes `error` (`scan.run`'s `except
+            # BaseException`, unconditionally), so nothing here masks a
+            # scan that sent no probe or canary as one that succeeded.
+            raise click.ClickException(str(exc)) from exc
+        except (bridge_mod.BridgeError, codec_mod.FrameError) as exc:
+            # THE TWO `register_identity` FLAGS FOR ITS CALLER, AND NEITHER
+            # HAD ONE. F5 of the whole-branch review. That method's docstring
+            # says in as many words that the caller "has two exception types
+            # to handle, not one", `_IdentityBracket.start` deliberately
+            # wraps neither -- correctly, since each says what actually
+            # happened -- and this command caught neither. So a credential
+            # with an internal newline or a smart quote pasted out of a file
+            # reached the operator as a traceback, with the sentence
+            # `codec._refuse_unwritable` had already written for them at the
+            # bottom of it. The same defect commit a88388d fixed for
+            # `IdentityDead` and 20b0a64 for `IdentityError`, two doors over.
+            #
+            # BOTH ARMS, ONE HANDLER, because from the operator's side they
+            # are one outcome: the identity could not be registered, so no
+            # probe was issued under it and the run stopped. The message is
+            # what tells them which -- `FrameError` names the character class
+            # and why such a value is refused rather than escaped, and
+            # `BridgeError` names the peer's own refusal class.
+            #
+            # THE MESSAGE INTACT, and it holds no credential: every branch of
+            # `_refuse_unwritable` refuses to quote the character or the text
+            # it came from (spec section 5 -- the credential is logged on
+            # neither side, and a caught `FrameError`'s message is logged by
+            # whatever catches it), and `register_identity`'s `BridgeError`
+            # quotes the peer's `class` and `detail`, which the extension
+            # builds from the identity id and the host and never from the
+            # value. A traceback would have leaked nothing either -- Python
+            # prints source lines, not values -- so this is about the
+            # operator's experience of an ordinary mistake, not about a leak.
+            #
+            # NOT NARROWER THAN `BridgeError`, deliberately. Every other
+            # bridge failure a scan can suffer is already translated before
+            # it gets here: `ProbeSender` turns one into a `ProbeRefused`
+            # (`probe.py`'s `except BridgeError`), which the runner records
+            # as an `inconclusive` row. What is left to arrive raw is the
+            # identity registration, which is the one this handler is for.
+            raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
         click.echo(f"findings  {summary.findings}")
@@ -657,6 +753,29 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
         # run row's `stop_reason` now carries.
         for reason, n in sorted(summary.refused.items()):
             click.echo(f"refused   {n} ({reason})")
+        # THE CANARIES ARE HX'S OWN TRAFFIC AND AN OPERATOR IS TOLD ABOUT
+        # THEM -- F5 of the task-7 fix round A review. Section 6 says the
+        # canary "is counted in `requests_sent` for the run, because it is a
+        # request `hx` put on the client's system", and
+        # `ScanSummary.canary_requests` counted it faithfully and was READ BY
+        # NOTHING: `check_run.requests_sent` excludes it (no check asked for
+        # it, so no row owns it), the `run` table has no request column, and
+        # `report._limits` renders no request tally at all. A number that
+        # satisfies a spec sentence and reaches nobody satisfies nothing.
+        #
+        # THIS IS NOT THE WHOLE OF WHAT SECTION 6 ASKS and the difference is
+        # worth naming rather than papering over: the section says
+        # `requests_sent` FOR THE RUN, and this build has no such column to
+        # add it to. What it can have today is the operator being told, at
+        # the same terminal that already gets `skipped` and `refused`, that
+        # a run put N requests of its own on a client's system. The client's
+        # own copy of that fact belongs in section 10's identity section,
+        # which the plan gives to Task 8, derived from the run.
+        #
+        # ONLY WHEN THERE WERE ANY. An anonymous run sends no canary, and
+        # `canaries  0` on every scan is a line an operator learns to skip.
+        if summary.canary_requests:
+            click.echo(f"canaries  {summary.canary_requests}")
 
         # A class the operator enabled that this build ships nothing for.
         # Without this line, `active_timing: true` plus no rows reads as
