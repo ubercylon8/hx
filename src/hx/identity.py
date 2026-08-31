@@ -56,6 +56,45 @@ def resolve(ident: Identity, env: dict[str, str]) -> Resolved:
     below, calling this on one produced "identity 'admin' needs None in the
     environment and it is not set", which reads like a missing variable rather
     than a call that should never have been made.
+
+    `generation=1` IS A CONSTANT, AND IT IS SAFE ONLY BECAUSE NO REGISTRY
+    OUTLIVES ONE RUN. F6 of the whole-branch review, written down rather than
+    fixed, with the ground named so the next reader can check it instead of
+    trusting it.
+
+    THE HAZARD, IF A REGISTRY EVER DID. `IdentityRegistry.register` keeps the
+    HELD entry for an EQUAL generation -- deliberately, and it is the right
+    rule: a second frame at the same number carrying different content is a
+    content change that never advanced the counter whose whole job is to gate
+    content changes. So a second scan against a registry that already held
+    this identity at generation 1 would register a rotated credential, be
+    told nothing, and go on issuing the OLD one. Silently, and worse than
+    silently: the canary would prove the old credential, so the run would
+    read `proven` for traffic issued under a credential the operator believed
+    they had replaced.
+
+    WHAT MAKES IT UNREACHABLE TODAY, NAMED SO IT CAN BE RE-CHECKED. `hx.cli.
+    scan` is the only caller of `hx.scan.run` that supplies a bridge, and it
+    opens `session_mod.session(eng, instance="scan", jar=burp_jar)` per
+    invocation. That context manager launches a Burp (`launch_burp`) and
+    `proc.kill()`s it in its own `finally` -- "the guarantee this function
+    makes is that nothing is left running" -- so the JVM, and the
+    `IdentityRegistry` living inside it, do not survive the command. Every
+    scan registers into an EMPTY registry, where `held` is null and no
+    generation comparison is made at all.
+
+    WHAT WOULD MAKE IT REACHABLE is a scan that reuses a live session: a
+    long-running harness, or an `hx scan` that attaches to the Burp `hx
+    capture start` already has open. Plan 6's "each command owns its own
+    Burp" is what currently forbids that, and a decision is not a mechanism.
+
+    AND THE FIX ON THAT DAY IS NOT A BIGGER CONSTANT. It is a generation that
+    survives the process: either this function is handed the number to
+    advance from -- the shape `refresh(ident, generation)` already has -- with
+    the previous one read back from the registry, which needs a bridge frame
+    this protocol does not have, or the engagement store carries a
+    per-identity counter. Both are more than a comment, which is why this is
+    one.
     """
     if ident.strategy != "static":
         raise IdentityError(

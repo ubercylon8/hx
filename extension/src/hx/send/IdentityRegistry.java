@@ -141,6 +141,15 @@ public final class IdentityRegistry {
             // sends, is unaffected either way. A real rotation advances the
             // generation -- `hx.identity.refresh` returns `generation + 1`
             // unconditionally -- so nothing legitimate needs this door.
+            //
+            // A STATIC identity does not advance it: `hx.identity.resolve`
+            // hard-codes generation 1, so a rotated static credential
+            // arriving here at 1 would be dropped in favour of the held one.
+            // That is unreachable while every scan gets a fresh JVM and an
+            // empty registry, and the full argument -- what makes it
+            // unreachable, what would make it reachable, and what the fix
+            // would be -- is written on `resolve` rather than duplicated
+            // here. Read it before making this registry outlive a run.
             if (held != null && generation == held.generation())
                 return held;
             return new Entry(id, generation, header, value, frozen);
