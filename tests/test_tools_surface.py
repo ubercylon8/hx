@@ -53,8 +53,12 @@ def test_a_malformed_cursor_is_a_refusal_not_a_crash(tool_ctx):
 
 
 def test_untested_is_the_filter_that_makes_coverage_actionable(tool_ctx):
-    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-1")
-    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-2")
+    # DISTINCT PATHS, and not incidentally: `surface` is UNIQUE on
+    # (engagement_id, method, scheme, host, port, path_template, query_key_set)
+    # -- schema.sql:128 -- because a surface IS its template. Two rows that
+    # differ only by id are not two surfaces, and the store says so.
+    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-1", path="/tested")
+    _surface(tool_ctx.conn, tool_ctx.engagement.id, sid="s-2", path="/untested")
     tool_ctx.conn.execute(
         "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
         " status) VALUES('r-1',?,'scan','staging',1,'running')",
