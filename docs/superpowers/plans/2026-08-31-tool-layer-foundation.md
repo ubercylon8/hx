@@ -704,6 +704,19 @@ def test_lookup_of_an_unregistered_name_is_none_not_an_error():
 def test_requires_why_is_derived_from_mutates():
     assert _spec("run.start", mutates=True).requires_why is True
     assert _spec("run.journal").requires_why is False
+
+
+def test_a_toolspec_may_not_be_subclassed():
+    """The third door into `requires_why`, found by the Task 2 review.
+
+    `frozen=True` already refuses `dataclasses.replace` and
+    `object.__setattr__`. A subclass overriding the property was open, and it
+    registered cleanly: a mutating tool reporting `requires_why False` is one
+    the dispatcher never asks a `why` for.
+    """
+    with pytest.raises(TypeError, match="may not be subclassed"):
+        class Evil(spec.ToolSpec):
+            requires_why = property(lambda self: False)
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -777,13 +790,33 @@ class ToolSpec:
     needs_egress: bool = False
     mutates: bool = False
 
+    def __init_subclass__(cls, **kwargs) -> None:
+        """A ToolSpec has no subclasses, and that is load-bearing.
+
+        THE THIRD DOOR INTO `requires_why`. `frozen=True` blocks the first two
+        -- `dataclasses.replace` and `object.__setattr__` both raise -- and a
+        subclass overriding the property was open until the Task 2 review
+        found it. MEASURED: `class Evil(ToolSpec): requires_why = property(
+        lambda self: False)` constructed with `mutates=True`, registered
+        cleanly, and reported `requires_why False` -- a state-changing tool the
+        dispatcher would never ask a `why` for, which is Principle 5 defeated
+        by a subclass rather than by a typo.
+
+        Nothing needs to subclass this: a tool varies by its data, never by its
+        type. So the door is closed rather than watched.
+        """
+        raise TypeError(
+            "ToolSpec may not be subclassed; requires_why is derived from "
+            "mutates and an override would un-derive it")
+
     @property
     def requires_why(self) -> bool:
         """Principle 5: "state-changing tools require `why`".
 
         DERIVED, never stored. A separate field could be set False on a
         mutating tool, and then the rule would hold everywhere except the one
-        place someone typed it wrong.
+        place someone typed it wrong. See `__init_subclass__` for the other
+        way that was possible.
         """
         return self.mutates
 ```

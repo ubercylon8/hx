@@ -76,3 +76,16 @@ def test_lookup_of_an_unregistered_name_is_none_not_an_error():
 def test_requires_why_is_derived_from_mutates():
     assert _spec("run.start", mutates=True).requires_why is True
     assert _spec("run.journal").requires_why is False
+
+
+def test_a_toolspec_may_not_be_subclassed():
+    """The third door into `requires_why`, found by the Task 2 review.
+
+    `frozen=True` already refuses `dataclasses.replace` and
+    `object.__setattr__`. A subclass overriding the property was open, and it
+    registered cleanly: a mutating tool reporting `requires_why False` is one
+    the dispatcher never asks a `why` for.
+    """
+    with pytest.raises(TypeError, match="may not be subclassed"):
+        class Evil(spec.ToolSpec):
+            requires_why = property(lambda self: False)

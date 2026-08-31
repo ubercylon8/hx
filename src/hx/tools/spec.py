@@ -60,12 +60,32 @@ class ToolSpec:
     needs_egress: bool = False
     mutates: bool = False
 
+    def __init_subclass__(cls, **kwargs) -> None:
+        """A ToolSpec has no subclasses, and that is load-bearing.
+
+        THE THIRD DOOR INTO `requires_why`. `frozen=True` blocks the first two
+        -- `dataclasses.replace` and `object.__setattr__` both raise -- and a
+        subclass overriding the property was open until the Task 2 review
+        found it. MEASURED: `class Evil(ToolSpec): requires_why = property(
+        lambda self: False)` constructed with `mutates=True`, registered
+        cleanly, and reported `requires_why False` -- a state-changing tool the
+        dispatcher would never ask a `why` for, which is Principle 5 defeated
+        by a subclass rather than by a typo.
+
+        Nothing needs to subclass this: a tool varies by its data, never by its
+        type. So the door is closed rather than watched.
+        """
+        raise TypeError(
+            "ToolSpec may not be subclassed; requires_why is derived from "
+            "mutates and an override would un-derive it")
+
     @property
     def requires_why(self) -> bool:
         """Principle 5: "state-changing tools require `why`".
 
         DERIVED, never stored. A separate field could be set False on a
         mutating tool, and then the rule would hold everywhere except the one
-        place someone typed it wrong.
+        place someone typed it wrong. See `__init_subclass__` for the other
+        way that was possible.
         """
         return self.mutates
