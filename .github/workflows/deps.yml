@@ -32,9 +32,18 @@ jobs:
   # fork PRs too.
   dependency-review:
     runs-on: ubuntu-latest
-    # deps.yml also runs on a Monday cron, and dependency-review-action errors out
+    # TWO conditions, and the second was learned the hard way. The first: this
+    # file also runs on a Monday cron, and dependency-review-action errors out
     # when there is no pull request to diff.
-    if: github.event_name == 'pull_request'
+    #
+    # The second: dependency review needs Dependency Graph plus GitHub
+    # Advanced Security, which a PRIVATE repo does not have -- the action
+    # answers "Dependency review is not supported on this repository" and
+    # fails. Same gate, same reason and same wording as codeql.yml's: the job
+    # skips green while the repo is private and activates by itself if it is
+    # ever published. The `pip-audit` job above needs none of that and keeps
+    # running either way, so the scheduled audit is unaffected.
+    if: github.event_name == 'pull_request' && github.event.repository.private == false
     permissions:
       contents: read
       pull-requests: write  # comment-summary-in-pr only; scoped to this job
