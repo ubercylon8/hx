@@ -130,6 +130,12 @@ registry.register(spec.ToolSpec(
                  "description": "only this tool's actions"}}}))
 
 RECENT_LIMIT = 20
+#: Operator-supplied fields (name, client, halt reason) are truncated at the
+#: display boundary for the brief, not refused. Agent-supplied fields (why)
+#: are refused at the input boundary, because refusing costs the agent one
+#: retry; an operator-supplied value is already on disk, and refusing it here
+#: would reject the engagement itself.
+OPERATOR_FIELD_LIMIT = 100
 
 
 def resume(ctx) -> dict:
@@ -171,11 +177,15 @@ def resume(ctx) -> dict:
         "SELECT ts_us, tool, why, result_summary FROM agent_action"
         " WHERE engagement_id=? AND actor=? ORDER BY ts_us DESC, rowid DESC"
         " LIMIT ?", (eid, ctx.actor, RECENT_LIMIT)).fetchall()
+    halt_reason = ctx.halt.reason
     return {
-        "engagement": {"id": eid, "name": ctx.config.name,
-                       "client": ctx.config.client,
+        "engagement": {"id": eid,
+                       "name": ctx.config.name[:OPERATOR_FIELD_LIMIT],
+                       "client": ctx.config.client[:OPERATOR_FIELD_LIMIT],
                        "safety_profile": ctx.config.safety_profile},
-        "halt": {"armed": ctx.halt.halted, "reason": ctx.halt.reason},
+        "halt": {"armed": ctx.halt.halted,
+                 "reason": halt_reason[:OPERATOR_FIELD_LIMIT]
+                           if halt_reason is not None else None},
         "run": run,
         "surfaces": {"total": surfaces[0], "untested": surfaces[1]},
         "findings": findings,

@@ -214,3 +214,18 @@ def test_a_non_string_why_is_refused_not_coerced(tool_ctx, a_tool):
     # operator's reason for a state change nobody gave.
     assert row[0] is None
     assert len(_actions(tool_ctx.conn)) == 1
+
+
+def test_a_why_longer_than_500_characters_is_refused_and_journalled(tool_ctx, a_tool):
+    a_tool("run.start", lambda c: {"id": "r-1"}, mutates=True)
+    long_why = "x" * 501
+    env = dispatch.dispatch(tool_ctx, "run.start", {}, why=long_why)
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert len(_actions(tool_ctx.conn)) == 1
+
+
+def test_a_name_longer_than_64_characters_is_refused_and_journalled(tool_ctx):
+    long_name = "x" * 65
+    env = dispatch.dispatch(tool_ctx, long_name, {})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert len(_actions(tool_ctx.conn)) == 1

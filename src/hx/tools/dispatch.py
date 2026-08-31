@@ -118,6 +118,16 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
         return _journalled(ctx, name, args, safe_why, envelope.refused(
             name, "bad_args", f"why must be a string, got {type(why).__name__}"))
 
+    if why is not None and len(why) > 500:
+        return _journalled(ctx, name, args, why, envelope.refused(
+            name, "bad_args",
+            f"why must be at most 500 characters, got {len(why)}"))
+
+    if len(name) > 64:
+        return _journalled(ctx, name, args, why, envelope.refused(
+            name, "bad_args",
+            f"tool name must be at most 64 characters, got {len(name)}"))
+
     tool = registry.lookup(name)
     if tool is None:
         return _journalled(ctx, name, args, why, envelope.refused(

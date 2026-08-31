@@ -138,10 +138,29 @@ def test_resume_says_there_is_no_run_rather_than_omitting_the_key(tool_ctx):
 
 
 def test_the_brief_is_bounded(tool_ctx):
-    for _ in range(run_tools.RECENT_LIMIT + 5):
-        dispatch.dispatch(tool_ctx, "run.journal", {})
+    # Make calls distinguishable with different why values
+    for i in range(run_tools.RECENT_LIMIT + 5):
+        dispatch.dispatch(tool_ctx, "run.journal", {}, why=f"call-{i:02d}")
     brief = dispatch.dispatch(tool_ctx, "run.resume", {}).result
     assert len(brief["recent"]) == run_tools.RECENT_LIMIT
+    # Verify order: recent[0] should be the LAST call (call-24), and
+    # recent[-1] should be the 20th-from-last (call-05)
+    assert brief["recent"][0]["why"] == "call-24"
+    assert brief["recent"][-1]["why"] == "call-05"
+
+
+def test_the_brief_size_is_bounded_even_with_maximum_length_values(tool_ctx):
+    import json
+    # Create a brief with maximum-length agent-supplied why values
+    max_why = "x" * 500
+    for _ in range(run_tools.RECENT_LIMIT):
+        dispatch.dispatch(tool_ctx, "run.journal", {}, why=max_why)
+    brief = dispatch.dispatch(tool_ctx, "run.resume", {}).result
+    # Serialize the brief and check its size is reasonable
+    serialized = json.dumps(brief)
+    # With RECENT_LIMIT=20, max_why=500, and other fields, the brief should
+    # be much less than 1MB even with maximum values
+    assert len(serialized) < 1_000_000
 
 
 def test_resume_is_a_read_and_survives_a_halt(tool_ctx):
