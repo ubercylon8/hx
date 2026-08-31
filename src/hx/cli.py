@@ -20,6 +20,7 @@ import click
 from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import identity as identity_mod
 from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
@@ -669,6 +670,34 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # run's own tallies are in that row's `stop_reason`
             # (`scan._halt_reason`) and reach a reader through `hx report`,
             # not through this line.
+            raise click.ClickException(str(exc)) from exc
+        except identity_mod.IdentityError as exc:
+            # THE FAR COMMONER MISTAKE, ONE EXCEPTION CLASS OVER FROM
+            # `IdentityDead` ABOVE. `_resolve_scan_identity` (`scan.py:986`)
+            # reads a static identity's credential out of `os.environ` and
+            # RAISES `IdentityError` when the declared variable was simply
+            # never exported -- no session was ever opened, no canary was
+            # ever sent, so `IdentityDead` (which is a session that WAS
+            # proved and then died, or never provably lived) is the wrong
+            # class for it and always was. Forgetting an `export` on a
+            # terminal an operator just opened is ordinary; nothing here
+            # caught it, so it reached them as a traceback with the message
+            # `identity.resolve` already wrote for them at the bottom of it
+            # -- the same defect commit a88388d fixed for the rarer case,
+            # one exception class over.
+            #
+            # THE MESSAGE INTACT, for the same reason as above: `resolve`
+            # already names the variable that is missing and refuses to
+            # issue anonymously rather than silently testing the logged-out
+            # view of an authenticated application, and re-wording it here
+            # would put this command between the operator and the sentence
+            # that tells them what to do. No credential value is in it --
+            # `resolve` raises before it has one to leak.
+            #
+            # NON-ZERO EXIT, like every other `ClickException`: the run's
+            # own row still closes `error` (`scan.run`'s `except
+            # BaseException`, unconditionally), so nothing here masks a
+            # scan that sent no probe or canary as one that succeeded.
             raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")

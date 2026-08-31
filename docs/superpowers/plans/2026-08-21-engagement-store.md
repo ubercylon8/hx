@@ -4851,7 +4851,8 @@ def test_a_scan_with_no_identity_prints_no_canary_line(
     assert "canaries" not in result.output, result.output
 
 
-def _declare_identity(root, ident, monkeypatch, *, value="session=abc"):
+def _declare_identity(root, ident, monkeypatch, *, value="session=abc",
+                      export=True):
     """Give the engagement at `root` one identity and scan under it.
 
     The scope becomes a URL PREFIX rather than whatever the fixture carries,
@@ -4859,8 +4860,14 @@ def _declare_identity(root, ident, monkeypatch, *, value="session=abc"):
     and a pattern with no host in it bounds the credential to nothing at all.
     `record_scope_version` is called because `engagement.open_` refuses a
     store whose config and newest scope version have diverged, and every
-    `hx scan` below opens the store for itself."""
-    monkeypatch.setenv("HX_ID_USER", value)
+    `hx scan` below opens the store for itself.
+
+    `export=False` DECLARES THE IDENTITY WITHOUT SETTING ITS VARIABLE, for
+    the operator mistake that is ordinary rather than the session that dies
+    mid-run: a static identity whose `HX_ID_USER` was simply never
+    exported."""
+    if export:
+        monkeypatch.setenv("HX_ID_USER", value)
     eng = eng_mod.open_(root)
     try:
         eng.config = dataclasses.replace(
@@ -4909,6 +4916,46 @@ def test_a_dead_session_is_reported_as_a_result_and_not_a_traceback(
         "by" in result.output, (
             "a canary that was ANSWERED reads like one that was refused: "
             + result.output)
+
+
+def test_an_unexported_identity_variable_is_reported_as_a_result_and_not_a_traceback(
+        engagement_with_surface, monkeypatch):
+    """FINDING 3 OF THE TASK 8 REVIEW. `hx scan` caught `IdentityDead` (the
+    session that WAS opened and then died or never proved live) but not
+    `hx.identity.IdentityError`, which is what `_resolve_scan_identity`
+    raises when a declared identity's variable was simply never exported --
+    no session is ever opened for this case, so `IdentityDead` was never
+    going to catch it. Forgetting an `export` is the ordinary mistake, one
+    exception class over from the rarer one commit a88388d fixed, and until
+    now it still reached the operator as a traceback.
+    """
+    from tests.test_scan_probes import USER, _SessionBridge
+
+    _declare_identity(engagement_with_surface, USER, monkeypatch, export=False)
+    _stub_session(monkeypatch, bridge=_SessionBridge())
+    result = CliRunner().invoke(
+        cli.main, ["scan", "--root", str(engagement_with_surface)])
+
+    assert result.exit_code != 0, result.output
+    assert result.exception is None or isinstance(result.exception,
+                                                  SystemExit), (
+        "the missing export escaped as an exception: an operator reads a "
+        f"traceback instead of a result -- {result.exception!r}")
+    assert "HX_ID_USER" in result.output, (
+        "the operator is not told which variable to export: " + result.output)
+    assert "not set" in result.output
+    assert "Traceback" not in result.output
+
+    eng = eng_mod.open_(engagement_with_surface)
+    try:
+        row = eng.db.execute(
+            "SELECT status, identity, identity_state, stop_reason FROM run"
+            " WHERE kind='scan'").fetchone()
+    finally:
+        eng.db.close()
+    assert row[0] == "error", tuple(row)
+    assert "IdentityError" in row[3]
+    assert "HX_ID_USER" in row[3]
 
 
 def test_a_halted_scan_leaves_the_run_row_error_and_dead(
@@ -4971,6 +5018,7 @@ import click
 from hx import config as config_mod
 from hx import engagement as eng_mod
 from hx import halt as halt_mod
+from hx import identity as identity_mod
 from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
@@ -5620,6 +5668,34 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # run's own tallies are in that row's `stop_reason`
             # (`scan._halt_reason`) and reach a reader through `hx report`,
             # not through this line.
+            raise click.ClickException(str(exc)) from exc
+        except identity_mod.IdentityError as exc:
+            # THE FAR COMMONER MISTAKE, ONE EXCEPTION CLASS OVER FROM
+            # `IdentityDead` ABOVE. `_resolve_scan_identity` (`scan.py:986`)
+            # reads a static identity's credential out of `os.environ` and
+            # RAISES `IdentityError` when the declared variable was simply
+            # never exported -- no session was ever opened, no canary was
+            # ever sent, so `IdentityDead` (which is a session that WAS
+            # proved and then died, or never provably lived) is the wrong
+            # class for it and always was. Forgetting an `export` on a
+            # terminal an operator just opened is ordinary; nothing here
+            # caught it, so it reached them as a traceback with the message
+            # `identity.resolve` already wrote for them at the bottom of it
+            # -- the same defect commit a88388d fixed for the rarer case,
+            # one exception class over.
+            #
+            # THE MESSAGE INTACT, for the same reason as above: `resolve`
+            # already names the variable that is missing and refuses to
+            # issue anonymously rather than silently testing the logged-out
+            # view of an authenticated application, and re-wording it here
+            # would put this command between the operator and the sentence
+            # that tells them what to do. No credential value is in it --
+            # `resolve` raises before it has one to leak.
+            #
+            # NON-ZERO EXIT, like every other `ClickException`: the run's
+            # own row still closes `error` (`scan.run`'s `except
+            # BaseException`, unconditionally), so nothing here masks a
+            # scan that sent no probe or canary as one that succeeded.
             raise click.ClickException(str(exc)) from exc
         click.echo(f"surfaces  {summary.surfaces}")
         click.echo(f"checks    {summary.checks_run}")
