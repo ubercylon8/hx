@@ -67,6 +67,22 @@ def record(ctx, *, title, issue_type_id, severity, confidence, surface_id,
            insertion_kind=None, insertion_name=None) -> dict:
     """Write a finding the agent believes in. Returns its id and dedupe key."""
     if ctx.run_id is None:
+        # "There is nothing" and "I cannot tell" are different facts --
+        # section 12's distinction, and `run.finish` already draws it for
+        # the same `None`. Ambiguity is DIFFERENT from an empty engagement:
+        # an agent reading `no_run` when two runs are actually open would
+        # believe `run.start` is what it needs, when what it needs is
+        # `run.finish` closing the one it did not mean. `ctx.open_runs()`
+        # reads the SAME per-call snapshot `ctx.run_id` just consulted above
+        # -- no second live query, and so no chance of a different answer.
+        open_now = ctx.open_runs()
+        if len(open_now) > 1:
+            kinds = sorted(k for _, k in open_now)
+            raise ToolRefused(
+                "bad_args",
+                f"{len(open_now)} runs are open ({', '.join(kinds)}); a "
+                "finding cannot be attributed to one without run.finish "
+                "closing the rest first")
         raise ToolUnavailable(
             "no_run", "a finding belongs to a run; run.start opens one")
     if not exchange_ids:

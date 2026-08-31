@@ -55,14 +55,21 @@ def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -
     refusal above only blocks a second run of the SAME kind -- so with no
     `kind` given, `ctx.run_id` already tells "one open run" from "zero or
     several" (it resolves to a run only when exactly one is open); this only
-    re-queries the store when it comes back `None`, to say WHICH of those two
-    -- none open, or several and ambiguous -- is the case. With `kind` given,
-    the run of that kind closes -- there can be at most one, by the rule
-    `start` enforces -- regardless of what (if anything) this context has
-    bound.
+    reads `ctx.open_runs()` when it comes back `None`, to say WHICH of those
+    two -- none open, or several and ambiguous -- is the case. With `kind`
+    given, the run of that kind closes -- there can be at most one, by the
+    rule `start` enforces -- regardless of what (if anything) this context
+    has bound.
+
+    `ctx.open_runs()`, NOT `run_mod.open_runs(...)` DIRECTLY, in both
+    branches below. The two used to be separate live queries -- one here, a
+    different one behind `ctx.run_id` -- that could disagree if a run opened
+    or closed between them; `ctx.open_runs()` is memoised for the whole
+    `dispatch()` call, so this and `ctx.run_id`'s own resolution above always
+    read the same snapshot.
     """
     if kind is not None:
-        running = run_mod.open_runs(ctx.conn, engagement_id=ctx.engagement.id)
+        running = ctx.open_runs()
         matches = [rid for rid, k in running if k == kind]
         if not matches:
             raise ToolUnavailable(
@@ -72,7 +79,7 @@ def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -
     else:
         closed = ctx.run_id
         if closed is None:
-            running = run_mod.open_runs(ctx.conn, engagement_id=ctx.engagement.id)
+            running = ctx.open_runs()
             if len(running) > 1:
                 kinds = sorted(k for _, k in running)
                 raise ToolRefused(
@@ -201,10 +208,12 @@ def resume(ctx) -> dict:
     yours". `run` stays the single resolved run (or `None` when there is
     none, or more than one); `open_runs` lists every running run beside it,
     kind included, so the second case reads as what it is instead of as the
-    first.
+    first. Read via `ctx.open_runs()`, not a direct query, so this list and
+    `run` (which reads `ctx.run_id`, resolved from the same memoised
+    snapshot) can never disagree about what was open when this call started.
     """
     conn, eid = ctx.conn, ctx.engagement.id
-    running = run_mod.open_runs(conn, engagement_id=eid)
+    running = ctx.open_runs()
     run = None
     if ctx.run_id is not None:
         row = conn.execute(

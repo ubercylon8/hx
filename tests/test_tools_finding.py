@@ -144,3 +144,104 @@ def test_an_evidence_role_outside_the_set_is_refused(ready):
                             {"finding_id": fid, "exchange_id": "x-1",
                              "role": "smoking-gun"}, why="w")
     assert (env.outcome, env.reason) == ("refused", "bad_args")
+
+
+# ---- The scoped re-review's finding in Finding 1's own fix: `ctx.run_id`
+# used to re-query the store on EVERY read, and `record()` above reads it
+# three times (the guard, and once in each of two writes). `ready` binds its
+# context via `run.start` on the SAME `tool_ctx` it hands back, which makes
+# `ctx.run_id` a fixed, already-bound answer for the rest of that context's
+# life -- exactly the case the memoisation fix does not need to touch. Both
+# tests below build fresh, UNBOUND contexts instead, the shape that actually
+# resolves `run_id` from the store and the only shape the bug could reach. --
+
+
+def _fresh_ctx(engagement):
+    """A brand-new `ToolContext` -- nothing bound -- the way
+    `adapters.cli.build_context` makes one for every `hx tool` invocation."""
+    from hx import halt as halt_mod
+    from hx.tools import dispatch as dispatch_mod
+    return dispatch_mod.ToolContext(
+        engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
+        config=engagement.config,
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+
+
+def test_a_run_opening_between_the_guard_and_the_writes_cannot_corrupt_the_write(
+        engagement, monkeypatch):
+    """MEASURED, before this fix: one `manual` run open, the guard passes on
+    an unbound context; a `browse` run opens (a different, now-discarded
+    context, the way an operator's `hx scan` or a second agent's `run.start`
+    would) between the guard and the writes; the now-ambiguous `ctx.run_id`
+    turns `None` for the second and third reads, `finding_observation.
+    run_id` (`NOT NULL`) raises `IntegrityError`, and the transaction rolls
+    back -- `error/internal`, the agent's finding and evidence lost, for
+    ordinary concurrent use.
+
+    `ctx.open_runs()` is memoised per `dispatch()` call, so this must now
+    complete exactly as if the concurrent `run.start` never happened: every
+    read inside this one `finding.record` invocation agrees with the guard.
+    """
+    conn = engagement.db
+    started = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                                {"kind": "manual"}, why="setup")
+    assert started.outcome == "ok"
+    run_id = started.result["id"]
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, query_key_set, kind, discovered_by,"
+        " normaliser_version) VALUES('s-1',?,'GET','https','app.test',443,"
+        "'/login','','idempotent_read','proxy',2)", (engagement.id,))
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url, status) VALUES('x-1',?, 's-1','proxy','ok',1,'GET',"
+        "'https://app.test/login',200)", (run_id,))
+
+    opened = {}
+
+    def hook():
+        # Fires once `record()` has already passed its `ctx.run_id is None`
+        # guard and finished everything but the write -- the exact gap the
+        # review's repro used. Opened via a THIRD, separate context: the
+        # concurrent actor is not this call's own context either.
+        if not opened:
+            opened["id"] = dispatch.dispatch(
+                _fresh_ctx(engagement), "run.start", {"kind": "browse"},
+                why="concurrent").result["id"]
+        return real_now_us()
+
+    real_now_us = finding_tools.now_us
+    monkeypatch.setattr(finding_tools, "now_us", hook)
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "finding.record", BASE,
+                            why="saw it")
+
+    assert opened, "the hook never fired -- this test proves nothing"
+    assert env.outcome != "error", f"a defect leaked to the agent: {env.detail}"
+    assert env.outcome == "ok"
+    fid = env.result["id"]
+    # Attributed to the run the guard actually saw, never the one opened
+    # underneath it, and no partial chain: the finding, its observation and
+    # its evidence all landed together.
+    assert conn.execute("SELECT run_id FROM finding_observation WHERE"
+                        " finding_id=?", (fid,)).fetchone()[0] == run_id
+    assert conn.execute("SELECT COUNT(*) FROM finding WHERE id=?",
+                        (fid,)).fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM evidence WHERE finding_id=?",
+                        (fid,)).fetchone()[0] == 1
+
+
+def test_recording_with_two_kinds_open_names_them_rather_than_saying_no_run(
+        engagement):
+    """§12's distinction, given to `finding.record` the way `run.finish`
+    already has it: "nothing is open" and "I cannot tell which of two" are
+    different facts, and only one of them means `run.start` is the fix."""
+    dispatch.dispatch(_fresh_ctx(engagement), "run.start", {"kind": "manual"},
+                      why="w")
+    dispatch.dispatch(_fresh_ctx(engagement), "run.start", {"kind": "browse"},
+                      why="w")
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "finding.record", BASE,
+                            why="w")
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert "browse" in env.detail and "manual" in env.detail

@@ -110,11 +110,59 @@ class ToolContext:
     session: Any = None
     actor: str = "agent"
     _bound_run_id: str | None = dataclasses.field(default=None, repr=False)
+    #: `None` means "not resolved for this call yet", never "resolved to
+    #: zero open runs" -- `hx.run.open_runs` returns a `list`, so the
+    #: sentinel and a genuine empty answer cannot collide. Reset by
+    #: `dispatch()`; see `open_runs()`.
+    _open_runs_cache: list[tuple[str, str]] | None = dataclasses.field(
+        default=None, repr=False)
+
+    def open_runs(self) -> list[tuple[str, str]]:
+        """`(id, kind)` for every run of this engagement still open --
+        resolved from the store AT MOST ONCE PER `dispatch()` CALL, memoised
+        here and reused by every reader inside it, `run_id` included.
+
+        A SECOND FINDING OF THE FINAL REVIEW, IN THE FIRST FINDING'S OWN FIX.
+        Before this, `run_id` queried live on EVERY access, and a handler
+        that reads it more than once -- `finding.record` does, at its guard
+        and again at each of two writes -- could see two different answers
+        to the same question inside one call. MEASURED: one `manual` run
+        open, the guard at `finding.record`'s top passes; before the writes
+        run, a concurrent actor (an operator's `hx scan`, a second agent's
+        `run.start`) opens a run of a DIFFERENT kind -- ordinary concurrent
+        use, the exact case `hx.run.current_run`'s docstring blesses ("a
+        crawl running while you browse is two runs"). The now-ambiguous
+        resolution turns `None` between the guard and the write, and
+        `finding_observation.run_id` (`NOT NULL`) raises `IntegrityError`,
+        rolling the transaction back -- the agent's finding and its evidence
+        are lost, and it is told hx is broken (`error/internal`) rather than
+        given a clean disambiguation.
+
+        `dispatch()` clears this cache at the TOP of every call, before the
+        first guard runs -- so the four call-shape refusals, the handler
+        (whatever it reads and however many times), and `_journalled`'s own
+        trailing read afterward all see ONE snapshot, taken at the first
+        access within this call. `run.finish` reads it directly too (for its
+        `kind` branch and its ambiguous-refusal message) rather than issuing
+        its own live query, for the same reason `finding.record`'s two later
+        reads must agree with its first: one resolution, not three.
+
+        EXPLICIT BINDING STILL WINS. This cache backs only the UNBOUND path
+        -- `run_id`'s bound check runs first and returns immediately when
+        `run.start` (or a caller) has set `_bound_run_id`, so a `ctx.run_id =
+        ...` assignment mid-handler is never shadowed by a snapshot taken
+        before it.
+        """
+        if self._open_runs_cache is None:
+            self._open_runs_cache = run_mod.open_runs(
+                self.conn, engagement_id=self.engagement.id)
+        return self._open_runs_cache
 
     @property
     def run_id(self) -> str | None:
         """The open run -- BOUND if `run.start` (or a caller) set one on this
-        context, else RESOLVED FROM THE STORE.
+        context, else RESOLVED FROM THE STORE (see `open_runs()` for the
+        per-call memoisation that makes repeated reads agree).
 
         THE OPEN RUN IS A PROPERTY OF THE ENGAGEMENT, NOT OF THE PROCESS. The
         CLI adapter builds a fresh `ToolContext` -- nothing bound -- for every
@@ -131,9 +179,9 @@ class ToolContext:
         browse is two runs" (`hx.run.current_run`'s docstring gives the
         rule). So this resolves to a run only when exactly one is open; zero
         or several both come back `None` rather than picking one. A caller
-        that must tell two open runs apart -- `run.finish`'s `kind` argument
-        -- queries `hx.run.open_runs` itself rather than trusting this
-        property to guess.
+        that must tell two open runs apart -- `run.finish`'s `kind` argument,
+        `finding.record`'s ambiguous-refusal message -- reads `open_runs()`
+        itself rather than trusting this property to guess.
 
         NOT `hx.run.current_run`. That function auto-opens a run, which is
         right for `hx capture start` -- a forgotten command should not cost
@@ -144,20 +192,29 @@ class ToolContext:
         """
         if self._bound_run_id is not None:
             return self._bound_run_id
-        rows = run_mod.open_runs(self.conn, engagement_id=self.engagement.id)
+        rows = self.open_runs()
         return rows[0][0] if len(rows) == 1 else None
 
     @run_id.setter
     def run_id(self, value: str | None) -> None:
         # `run.start` binds with this; `run.finish` clears with it -- both are
         # a plain `ctx.run_id = ...` at the call site, unchanged by this
-        # property existing.
+        # property existing. Checked FIRST by the getter above, so this
+        # always wins over whatever `open_runs()` cached earlier in the call.
         self._bound_run_id = value
 
 
 def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
              *, why: str | None = None) -> envelope.Envelope:
     """Validate, authorise, call, journal. Never raises."""
+    # ONE run-resolution snapshot per call, taken lazily on first read and
+    # reused by everything below -- the guards, the handler (however many
+    # times IT reads `ctx.run_id` or `ctx.open_runs()`), and `_journalled`'s
+    # own trailing read. Without this reset a context left over from a prior
+    # dispatch would hand a NEW call the OLD call's snapshot; see
+    # `ToolContext.open_runs` for the defect this closes.
+    ctx._open_runs_cache = None
+
     # A malformed `why` is never written to `agent_action.why`, in any of the
     # rows the four guards below produce -- refused or not. `str(123)` there
     # would read as an operator's reason for a state change nobody gave, so a
