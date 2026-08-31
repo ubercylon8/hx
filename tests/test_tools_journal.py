@@ -55,8 +55,11 @@ def test_a_page_result_summarises_as_counts_not_as_rows(engagement):
 
 
 def test_a_summary_is_capped(engagement):
-    env = envelope.answered("report.render", "x" * 5000)
-    assert len(journal.summarise(env)) <= journal.SUMMARY_MAX
+    # The "id" branch produces a summary; exercise truncation there.
+    env = envelope.answered("report.render", {"id": "x" * 5000})
+    summary = journal.summarise(env)
+    assert len(summary) == journal.SUMMARY_MAX
+    assert summary.startswith("ok: ")
 
 
 def test_the_why_is_stored_verbatim(engagement):

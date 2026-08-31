@@ -1365,8 +1365,11 @@ def test_a_page_result_summarises_as_counts_not_as_rows(engagement):
 
 
 def test_a_summary_is_capped(engagement):
-    env = envelope.answered("report.render", "x" * 5000)
-    assert len(journal.summarise(env)) <= journal.SUMMARY_MAX
+    # The "id" branch produces a summary; exercise truncation there.
+    env = envelope.answered("report.render", {"id": "x" * 5000})
+    summary = journal.summarise(env)
+    assert len(summary) == journal.SUMMARY_MAX
+    assert summary.startswith("ok: ")
 
 
 def test_the_why_is_stored_verbatim(engagement):
@@ -1435,9 +1438,10 @@ column, which a bare digest would not.
 
 STORING ARGUMENTS VERBATIM IS SAFE ONLY BECAUSE PRINCIPLE 5 HOLDS: the agent
 passes identity BY NAME, `hx.identity.resolve` runs below this layer, and no
-tool returns a `Resolved`. If a tool ever accepted a credential value, this
-column becomes the place credentials are written to disk in the clear.
-`tests/test_credentials_never_reach_the_store.py` carries the case.
+tool returns a `Resolved`. The safety of this choice rests on Principle 5
+keeping credentials out of the tool layer; it holds for the registered tools'
+schemas, and nothing in this layer filters arguments. `record` serialises
+whatever dict it is handed. Task 11 adds the schema-level assertion.
 """
 from __future__ import annotations
 
@@ -1468,6 +1472,10 @@ def encode_args(args: dict[str, Any], blobs) -> str | None:
     Sorted keys, so two identical calls produce two identical strings and a
     reader comparing journal rows is comparing arguments rather than dict
     ordering.
+
+    May raise `TypeError` or `ValueError` if `json.dumps` encounters a
+    non-serialisable value or circular reference; the raise happens before
+    the `INSERT`, so no partial row is written.
     """
     if not args:
         return None
@@ -1488,8 +1496,11 @@ def summarise(env: Envelope) -> str:
     """
     if not env.ran:
         line = f"{env.outcome}: {env.reason}"
-    elif (isinstance(env.result, dict) and "returned" in env.result
-          and "total" in env.result):
+        if env.detail:
+            line = f"{line} — {env.detail}"
+    elif (isinstance(env.result, dict)
+          and set(env.result.keys()) == {"rows", "returned", "total",
+                                         "truncated", "next_cursor", "facets"}):
         line = f"{env.outcome}: {env.result['returned']} of {env.result['total']} rows"
     elif isinstance(env.result, dict) and "id" in env.result:
         line = f"{env.outcome}: {env.result['id']}"
