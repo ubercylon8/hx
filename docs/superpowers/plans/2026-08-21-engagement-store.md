@@ -6165,6 +6165,30 @@ def report(root, out) -> None:
         click.echo(f"wrote {target}")
     finally:
         eng.db.close()
+
+
+@main.command("tool")
+@click.argument("name", required=False)
+@click.option("--json", "args_json", default=None,
+              help="Arguments as a JSON object.")
+@click.option("--why", default=None,
+              help="Why you are doing this. Required by state-changing tools; "
+                   "written to agent_action.")
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--list", "list_only", is_flag=True,
+              help="List every tool and exit.")
+def tool(name, args_json, why, root, list_only) -> None:
+    """Call one agent tool and print its envelope as JSON."""
+    from hx.tools.adapters import cli as tool_cli
+
+    if list_only or not name:
+        click.echo(tool_cli.render_listing())
+        return
+    eng = _open_engagement(root or default_root())
+    text, status = tool_cli.run_tool(eng, name, args_json, why)
+    click.echo(text)
+    if status:
+        raise SystemExit(status)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**

@@ -351,3 +351,21 @@ def test_a_denial_row_never_holds_a_credential_parameter(conn):
     stored = conn.execute("SELECT url FROM denial").fetchone()["url"]
     assert token not in stored
     assert stored == "http://offside.example.test/x?api_key={{observed:param}}"
+
+
+def test_a_credential_never_reaches_agent_action(engagement):
+    """Principle 5 is what makes `args_blob` safe to store verbatim: identity
+    is passed by NAME and resolved below the tool layer. If a tool ever took a
+    credential value, this column becomes the place credentials are written to
+    disk in the clear."""
+    from hx.tools import registry
+    from hx.tools import impl  # noqa: F401
+
+    # No tool declares a property that could carry a secret. Checked against
+    # the SCHEMAS rather than against a run, so it holds for arguments nobody
+    # has thought to pass yet.
+    for name, tool in registry.TOOLS.items():
+        for prop in (tool.params.get("properties") or {}):
+            assert not any(w in prop.lower() for w in
+                           ("cookie", "authorization", "token", "password",
+                            "secret", "credential")), f"{name}.{prop}"
