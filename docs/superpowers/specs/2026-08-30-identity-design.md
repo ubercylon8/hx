@@ -105,6 +105,13 @@ scan_identity: user                   # which identity `hx scan` probes under; o
 - `scan_identity`, if present, must name a declared identity.
 - A `static` identity may not declare `refresh`; a `programmatic` one must.
 
+**Amended 2026-08-30, after the whole-branch review:** an identity may also declare
+`origins`, an optional non-empty list of hosts or URL prefixes bounding where its
+credential may be applied. Omitted — the ordinary case — it defaults to the single host
+the liveness canary proves. The loader refuses an entry the extension's `Sender.hostOf`
+would read as no host (a glob, a bare path), because it would bound the credential to
+nothing. See §5 for the argument and for what widening does and does not buy.
+
 ## 5. The bridge: `identity` is its own frame
 
 Identity is **not** a `configure` key.
@@ -131,6 +138,41 @@ A new frame type, `identity`, carrying:
 - **`origins` bounds where the credential may be applied.** An identity is scoped to the
   hosts it belongs to, so a probe against a third-party host in scope never carries the
   target's session. Defaults to the hosts in `scope.include`.
+
+  **Amended 2026-08-30, after the whole-branch review: the second sentence defeats the
+  first, and the implementation was correct against the spec.** A `scope.include` naming
+  the app, an API, an SSO provider and a CDN is the ordinary shape of a multi-host
+  engagement — every one of those hosts is authorised for *scanning*, and exactly one of
+  them is where the operator's session belongs. Defaulting `origins` to that list means
+  the bound equals the thing it exists to bound, so the client's live session cookie is
+  registered for a third party's server. That is an incident, not a coverage gap, and it
+  is the more serious of F1's two halves.
+
+  **`origins` therefore defaults to the ONE host the liveness canary proves** — the
+  scheme/host/port of the run's first surface, which is where the canary is addressed
+  (`hx.scan._identity_bracket`). Not `scope.include`, and not a list this file can name at
+  all: it is a fact about the run's surfaces, so it is derived per run rather than
+  written down.
+
+  **An operator may widen it, per identity, with an `identities.<id>.origins` list in
+  §4's config.** A session that genuinely spans two hosts is a fact only the operator
+  knows, and §4's shape for anything that increases blast radius is a decision recorded in
+  `config.yaml` rather than a default. The loader validates it like the other list fields
+  and refuses an entry the extension's `Sender.hostOf` would read as no host at all — a
+  glob, a bare path — because such an entry bounds the credential to nothing and turns
+  every probe of the run into an `identity_origin` refusal.
+
+  **Widening `origins` does not widen the proof.** §9's gate is amended with it: an active
+  check's `considered` is honoured only for a run that proved its session *and* only for
+  the origin the canary actually reached. The two are different questions — where a
+  credential may be applied, and what a run may claim to have re-tested — and they are
+  asked in different places.
+
+  **The cost is a visible refusal rather than a silent send.** On a multi-host engagement
+  that widened nothing, every probe to a second host is refused `identity_origin`, its row
+  reads `inconclusive`, and `hx scan` prints `refused N (identity_origin)`. The
+  alternative — issuing anonymously at those hosts — is what §7 step 3 forbids by name,
+  and it would hand active checks a logged-out view to read as an answer.
 - The frame is refused unless the extension is `configured` and not halted, exactly as
   `send` is.
 - **The frame carries a live credential, so it is never logged on either side.** The
@@ -266,6 +308,23 @@ that. The runner decides, exactly as it decides the surface.
 
 Anonymous probes, `assumed` probes and `dead` identities retire nothing — identical to
 today's behaviour. Passive retirement is untouched.
+
+**Amended 2026-08-30, after the whole-branch review: `proven` is a claim about one
+origin, and the rule above does not say so.** A run's canaries all go to
+`_IdentityBracket._target`, the origin of the run's first surface, because an identity
+declares ONE `liveness` block (§4) and its proof is per identity rather than per host.
+Probes go to each surface's own origin. So a run whose canary passed on `api.acme.test`
+read `proven` for probes issued at `app.acme.test` and honoured their offer — and if the
+session is not honoured on that second host and it answers 2xx, the check reads a
+logged-out view as an answer, says `clean`, and the client is told the finding "appears
+fixed" and that it "was re-tested under a session proved live". That sentence is false
+for that host, and it was the ninth way a probe could retire a finding without proof.
+
+The gate is therefore: honoured only if the run's settled state is `proven` **and** the
+row's origin is the origin the canary reached — the full `(scheme, host, port)`, not the
+host alone. `Sender.appliesTo` compares hosts and ignores ports, deliberately, so a
+credential may legitimately be *applied* at a second port on a proved host; retirement is
+the narrower claim of the two and gets the narrower rule.
 
 The report's Limits section must change with it: the current text states flatly that an
 active finding is never automatically marked as fixed. That becomes conditional, and the
