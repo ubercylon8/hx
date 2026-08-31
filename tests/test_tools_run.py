@@ -115,3 +115,35 @@ def test_starting_the_same_kind_from_a_new_context_is_refused(tool_ctx, engageme
         halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
     env2 = dispatch.dispatch(new_ctx, "run.start", {"kind": "manual"}, why="second")
     assert (env2.outcome, env2.reason) == ("refused", "run_open")
+
+
+def test_resume_answers_the_four_questions_a_compacted_agent_has(tool_ctx):
+    dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="mapping")
+    env = dispatch.dispatch(tool_ctx, "run.resume", {})
+    brief = env.result
+    assert set(brief) == {"engagement", "halt", "run", "surfaces",
+                          "findings", "recent"}
+    assert brief["run"]["id"] == tool_ctx.run_id
+    assert brief["halt"]["armed"] is False
+
+
+def test_resume_reports_a_halt_because_that_is_why_nothing_is_working(tool_ctx):
+    tool_ctx.halt.halt("client asked us to stop")
+    brief = dispatch.dispatch(tool_ctx, "run.resume", {}).result
+    assert brief["halt"] == {"armed": True, "reason": "client asked us to stop"}
+
+
+def test_resume_says_there_is_no_run_rather_than_omitting_the_key(tool_ctx):
+    assert dispatch.dispatch(tool_ctx, "run.resume", {}).result["run"] is None
+
+
+def test_the_brief_is_bounded(tool_ctx):
+    for _ in range(run_tools.RECENT_LIMIT + 5):
+        dispatch.dispatch(tool_ctx, "run.journal", {})
+    brief = dispatch.dispatch(tool_ctx, "run.resume", {}).result
+    assert len(brief["recent"]) == run_tools.RECENT_LIMIT
+
+
+def test_resume_is_a_read_and_survives_a_halt(tool_ctx):
+    tool_ctx.halt.halt("stop")
+    assert dispatch.dispatch(tool_ctx, "run.resume", {}).outcome == "ok"

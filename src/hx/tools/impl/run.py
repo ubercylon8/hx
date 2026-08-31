@@ -128,3 +128,64 @@ registry.register(spec.ToolSpec(
                    "description": f"how many, default {JOURNAL_DEFAULT}"},
         "tool": {"type": "string", "maxLength": 64,
                  "description": "only this tool's actions"}}}))
+
+RECENT_LIMIT = 20
+
+
+def resume(ctx) -> dict:
+    """The purpose-built recovery brief, section 8.
+
+    `RECENT_LIMIT` caps this brief rather than letting it grow with the
+    engagement. It is read when a context window is already under pressure, so
+    everything except the recent actions is a COUNT: a brief proportional to
+    the store would be unreadable in exactly the situation it exists for.
+
+    "`run.journal` and `run.resume` exist because a long run compacts. Without
+    them the agent re-scans surfaces it already covered and cannot tell what it
+    has done. This is the loop-prevention hole and the compaction-recovery
+    hole, and they are the same hole."
+
+    THE HALT COMES BEFORE THE WORK. An agent resuming into a halted engagement
+    will otherwise read a run that is open, surfaces that are untested and
+    findings that are thin, and conclude it has work to do -- when the true
+    answer is that an operator stopped it. That is one refusal repeated until
+    the budget is gone.
+    """
+    conn, eid = ctx.conn, ctx.engagement.id
+    run = None
+    if ctx.run_id is not None:
+        row = conn.execute(
+            "SELECT id, kind, status, started_us, requests_issued FROM run"
+            " WHERE id=?", (ctx.run_id,)).fetchone()
+        if row is not None:
+            run = {"id": row[0], "kind": row[1], "status": row[2],
+                   "started_us": row[3], "requests_issued": row[4]}
+    surfaces = conn.execute(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE id NOT IN"
+        " (SELECT surface_id FROM check_run WHERE surface_id IS NOT NULL))"
+        " FROM surface WHERE engagement_id=?", (eid,)).fetchone()
+    findings = dict(conn.execute(
+        "SELECT severity, COUNT(*) FROM finding WHERE engagement_id=?"
+        " GROUP BY severity", (eid,)).fetchall())
+    recent = conn.execute(
+        "SELECT ts_us, tool, why, result_summary FROM agent_action"
+        " WHERE engagement_id=? AND actor=? ORDER BY ts_us DESC, rowid DESC"
+        " LIMIT ?", (eid, ctx.actor, RECENT_LIMIT)).fetchall()
+    return {
+        "engagement": {"id": eid, "name": ctx.config.name,
+                       "client": ctx.config.client,
+                       "safety_profile": ctx.config.safety_profile},
+        "halt": {"armed": ctx.halt.halted, "reason": ctx.halt.reason},
+        "run": run,
+        "surfaces": {"total": surfaces[0], "untested": surfaces[1]},
+        "findings": findings,
+        "recent": [{"ts_us": r[0], "tool": r[1], "why": r[2], "result": r[3]}
+                   for r in recent],
+    }
+
+
+registry.register(spec.ToolSpec(
+    name="run.resume", handler=resume,
+    summary="Where you are: the halt, the open run, coverage, findings, and "
+            "the last few things you tried. Read this first after a compaction.",
+    params={"type": "object", "additionalProperties": False, "properties": {}}))
