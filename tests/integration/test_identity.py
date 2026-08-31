@@ -19,9 +19,11 @@ EVERY BYTE STAYS ON THIS MACHINE, and the identity makes that rule sharper
 rather than looser. The credential below is `target_server`'s own constant, the
 only host any surface here can name is the fixture's loopback target (its
 constructor refuses anything outside 127.0.0.0/8), and `origins` on the
-registered identity is the engagement's `scope.include` -- which is that target
-and nothing else, so the extension refuses to apply the credential anywhere
-else even if a surface for it somehow existed.
+registered identity is narrower still since the 2026-08-30 amendment to spec
+section 5: the single host the liveness canary is addressed to, taken from the
+run's own first surface, which is that same loopback target. So the extension
+refuses to apply the credential anywhere else even if a surface for it somehow
+existed.
 """
 from __future__ import annotations
 

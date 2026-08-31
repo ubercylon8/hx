@@ -718,10 +718,14 @@ public final class Sender {
      * Host line, for the reason {@link #parse} gives: deciding on a Host header
      * would let a request authorised for one service open a connection
      * somewhere else. An origin written as a URL -- the shape spec s5's own
-     * example uses, and the shape a `scope.include` pattern has, which is
-     * where s5 says the default comes from --
-     * contributes its authority's host; one written as a bare host
-     * contributes itself. A PORT in the origin is ignored: this compares hosts,
+     * example uses, and the shape an operator's widened
+     * `identities.<id>.origins` entry may take -- contributes its authority's
+     * host; one written as a bare host contributes itself, which is the shape
+     * the DEFAULT takes: since the 2026-08-30 amendment to s5, `hx.scan.
+     * _identity_bracket` sends the bare host of the surface the liveness
+     * canary is addressed to, and not (as it did until then) the engagement's
+     * `scope.include` patterns, which made the bound equal the thing it
+     * bounds. A PORT in the origin is ignored: this compares hosts,
      * and the port a send goes to is settled by the frame and by scope.
      *
      * Case-insensitive, because host names are (RFC 9110 s4.2.3), and exact
