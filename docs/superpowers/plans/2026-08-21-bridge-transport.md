@@ -5480,7 +5480,6 @@ class BridgeServer:
                 "start rather than adopt a path another process may own."
             )
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        # nosemgrep: python.lang.security.audit.insecure-file-permissions
         # Semgrep's `insecure-file-permissions` calls 0o700 "widely permissive"
         # and recommends 0o644. That advice is a FILE heuristic applied to a
         # DIRECTORY, and following it would be a real regression twice over:
@@ -5489,6 +5488,12 @@ class BridgeServer:
         # directory is traverse -- so the socket inside would be unreachable.
         # 0o700 is the least permission that works. Suppressed at the site
         # rather than by dropping the rule, which still guards everything else.
+        #
+        # THE MARKER MUST BE THE LINE DIRECTLY ABOVE THE CODE. Placed at the
+        # top of this block it is nine lines away and semgrep ignores it --
+        # which is how the first attempt at this suppression reached CI and
+        # failed there rather than here.
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         os.chmod(self.socket_path.parent, 0o700)
 
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
