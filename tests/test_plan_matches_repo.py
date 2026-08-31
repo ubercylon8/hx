@@ -82,6 +82,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import yaml
+
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -440,3 +442,56 @@ def test_a_file_whose_first_line_is_its_own_path_marker_is_compared_whole(tmp_pa
 
     # A file that does not: the marker is scaffolding and must be dropped.
     assert not body.startswith(marker + "\n")
+
+
+def test_every_workflow_is_a_workflow():
+    """Six of eleven workflows shipped unparseable, and every check I ran passed.
+
+    `gh api ... > file` captured mise's tool-activation banner as the FIRST
+    LINE of each file it fetched, so six workflows began `mise
+    ~/.config/mise/config.toml tools: gh@2.98.0` and GitHub answered "this run
+    likely failed because of a workflow file issue" for every one of them.
+
+    WHAT MAKES THIS WORTH A TEST is what it survived. zizmor reported no
+    findings on all eleven; a grep confirmed none still said `branches:
+    [main]`; another counted `branches: [master]` in nine. Every one of those
+    passed because it searched for CONTENT, and the content was all there --
+    one junk line above it. Nothing asked the only question that mattered:
+    does this file parse as a workflow?
+
+    AND THE FIRST VERSION OF THIS TEST DID NOT CATCH IT EITHER. Asserting
+    "parses as a mapping with `jobs` and a `name`" passes with the banner in
+    place, because YAML reads `mise ~/.config/mise/config.toml tools:
+    gh@2.98.0` as a perfectly ordinary KEY AND VALUE. The file is still a
+    mapping; it just has one key GitHub has never heard of. A test written for
+    a bug, that the bug walks straight through, is the same failure one level
+    up -- so this asserts the TOP-LEVEL KEY SET instead, which is the thing
+    the junk line actually changes.
+
+    `on` is read via both spellings because PyYAML resolves the bare word `on`
+    to the boolean True (the Norway-problem family), which is itself the kind
+    of thing a content grep cannot see.
+    """
+    root = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    files = sorted(root.glob("*.yml"))
+    assert len(files) >= 11, f"expected the eleven workflows, found {len(files)}"
+    for path in files:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert isinstance(doc, dict), (
+            f"{path.name} is not a YAML mapping -- a stray first line (a shell "
+            f"banner, a fetch artefact) turns the whole file into a scalar")
+        assert "jobs" in doc, f"{path.name} declares no jobs"
+        assert "on" in doc or True in doc, f"{path.name} declares no trigger"
+        assert doc.get("name"), f"{path.name} has no name"
+        # The set GitHub accepts at the top of a workflow. `True` is `on`
+        # after PyYAML has resolved it. Anything else means a line that is not
+        # part of the workflow got into the file -- which is precisely what
+        # happened, and what "is it a mapping" could not see.
+        allowed = {"name", "run-name", "on", True, "permissions", "env",
+                   "defaults", "concurrency", "jobs"}
+        stray = sorted(str(k) for k in doc if k not in allowed)
+        assert not stray, (
+            f"{path.name} has top-level key(s) GitHub does not accept: "
+            f"{stray}. A stray first line -- a shell banner, a fetch artefact "
+            f"-- parses as an ordinary key and leaves the file a valid "
+            f"mapping, so it reaches GitHub as 'a workflow file issue'")
