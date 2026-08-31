@@ -623,9 +623,17 @@ def _identity(conn, engagement_id, config) -> list[str]:
             f"{state} ({sum(1 for r in mine if r[6] == state)})"
             for state in ("proven", "assumed", "dead")
             if any(r[6] == state for r in mine)) or "never used"
+        # `len(mine)` and `outcome` are composed here out of an int and this
+        # function's own literals and cannot break a row. The other three come
+        # from the store or the config and go through `_cell`, including the
+        # generation: SQLite gives that column INTEGER AFFINITY, not an
+        # integer TYPE, so a hand-written row can leave a string in it and
+        # `_cell` is what stops a `|` in one ending the table. Nothing this
+        # build can write puts anything but an int there -- `run.
+        # record_identity` takes `Resolved.generation`.
         out.append(f"| {_cell(_code(_redact(ident)))} |"
                    f" {_cell(_redact(strategy))} | {len(mine)} |"
-                   f" {max(gens) if gens else 0} | {outcome} |")
+                   f" {_cell(max(gens) if gens else 0)} | {outcome} |")
     out.append("")
 
     out.append("**`proven` means the session was proved live at both ends of "
