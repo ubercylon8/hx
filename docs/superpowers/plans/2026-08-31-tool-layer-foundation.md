@@ -3386,6 +3386,36 @@ def test_no_plan_a_tool_needs_egress():
     assert not any(t.needs_egress for t in registry.TOOLS.values())
 
 
+def test_every_tool_schema_matches_its_handlers_signature():
+    """A schema property the handler has no parameter for is a `TypeError` at
+    call time, which `dispatch` reports as `error / internal` -- an hx defect
+    surfaced to the agent mid-engagement, for what is really a wrong tool
+    definition.
+
+    Task 5's review proposed catching it inside `registry.register` with
+    `inspect`. It lives here instead: the registry should not need to
+    introspect a callable to do its job, and a test covers tools added after
+    this plan exactly as well -- Plan B's six included.
+    """
+    import inspect
+
+    for name, tool in registry.TOOLS.items():
+        params = inspect.signature(tool.handler).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            # `checks.list` takes **kw because its argument is spelled `class`
+            # on the wire, which is a Python keyword. Nothing to check.
+            continue
+        declared = set(tool.params.get("properties") or {})
+        missing = declared - (set(params) - {"ctx"})
+        assert not missing, (
+            f"{name}: the schema declares {sorted(missing)} and the handler "
+            "takes no such parameter; dispatch would raise TypeError")
+        for optional in declared - set(tool.params.get("required") or ()):
+            assert params[optional].default is not inspect.Parameter.empty, (
+                f"{name}: {optional} is optional in the schema but the handler "
+                "gives it no default, so omitting it raises")
+
+
 def test_the_agent_cannot_confirm_its_own_finding_two_ways_over(engagement):
     # Property 4. The registry has no finding.set_status, so there is no path;
     # and the trigger is what survives someone adding the tool back.
