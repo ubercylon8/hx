@@ -91,7 +91,7 @@ def test_every_constraint_keyword_is_actually_implemented():
     # accepted and ignored -- the exact hole check_schema exists to close.
     cases = {
         "type": ({"type": "string"}, 1),
-        "enum": ({"enum": ["a"]}, "b"),
+        "enum": ({"type": "string", "enum": ["a"]}, "b"),
         "minimum": ({"type": "integer", "minimum": 1}, 0),
         "maximum": ({"type": "integer", "maximum": 1}, 2),
         "minLength": ({"type": "string", "minLength": 2}, "a"),
@@ -104,3 +104,30 @@ def test_every_constraint_keyword_is_actually_implemented():
     assert set(cases) == schema.CONSTRAINTS
     for keyword, (sch, bad) in cases.items():
         assert schema.validate(sch, bad), f"{keyword} accepted a bad value"
+
+
+def test_a_schema_without_a_type_is_refused():
+    with pytest.raises(schema.SchemaError, match="must declare a type"):
+        schema.check_schema({"properties": {"name": {"type": "string"}},
+                             "required": ["name"]})
+
+
+def test_a_mixed_type_enum_is_refused():
+    with pytest.raises(schema.SchemaError, match="not of type"):
+        schema.check_schema({"type": "integer", "enum": [1, "two"]})
+
+
+def test_enum_on_an_array_is_refused():
+    with pytest.raises(schema.SchemaError, match="not meaningful"):
+        schema.check_schema({"type": "array", "items": {"type": "string"},
+                             "enum": []})
+
+
+def test_an_empty_enum_is_refused():
+    with pytest.raises(schema.SchemaError, match="non-empty"):
+        schema.check_schema({"type": "string", "enum": []})
+
+
+def test_an_integer_enum_rejects_a_boolean():
+    with pytest.raises(schema.SchemaError, match="not of type"):
+        schema.check_schema({"type": "integer", "enum": [1, True]})
