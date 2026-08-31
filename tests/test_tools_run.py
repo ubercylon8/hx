@@ -121,9 +121,10 @@ def test_resume_answers_the_four_questions_a_compacted_agent_has(tool_ctx):
     dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="mapping")
     env = dispatch.dispatch(tool_ctx, "run.resume", {})
     brief = env.result
-    assert set(brief) == {"engagement", "halt", "run", "surfaces",
-                          "findings", "recent"}
+    assert set(brief) == {"engagement", "halt", "run", "open_runs",
+                          "surfaces", "findings", "recent"}
     assert brief["run"]["id"] == tool_ctx.run_id
+    assert brief["open_runs"] == [{"id": tool_ctx.run_id, "kind": "manual"}]
     assert brief["halt"]["armed"] is False
 
 
@@ -166,3 +167,88 @@ def test_the_brief_size_is_bounded_even_with_maximum_length_values(tool_ctx):
 def test_resume_is_a_read_and_survives_a_halt(tool_ctx):
     tool_ctx.halt.halt("stop")
     assert dispatch.dispatch(tool_ctx, "run.resume", {}).outcome == "ok"
+
+
+# ---- Finding 1 of the final whole-branch review: the CLI adapter builds a
+# fresh `ToolContext` per `hx tool` invocation, and before this fix
+# `ctx.run_id` was a plain field that only ever held what THAT process set --
+# so `run.finish` and every run-scoped tool were permanently unreachable
+# through it. The tests below drive the reported sequence exactly: a fresh
+# context per step, never one carried between them, the way separate `hx
+# tool` processes actually are. ---------------------------------------------
+
+
+def _fresh_ctx(engagement):
+    """A brand-new `ToolContext` -- nothing bound -- the way
+    `adapters.cli.build_context` makes one for every `hx tool` invocation."""
+    from hx import halt as halt_mod
+    from hx.tools import dispatch as dispatch_mod
+    return dispatch_mod.ToolContext(
+        engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
+        config=engagement.config,
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+
+
+def test_start_resume_finish_start_round_trips_across_fresh_contexts(engagement):
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                            {"kind": "scan"}, why="mapping")
+    assert env.outcome == "ok"
+    run_id = env.result["id"]
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.resume", {})
+    assert env.outcome == "ok"
+    assert env.result["run"]["id"] == run_id
+    assert env.result["run"]["kind"] == "scan"
+    assert env.result["open_runs"] == [{"id": run_id, "kind": "scan"}]
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.finish",
+                            {"status": "completed"}, why="done")
+    assert env.outcome == "ok"
+    assert env.result["id"] == run_id
+
+    # `no_run` now, not the same run again: a fresh context resolves the
+    # store, and the store says nothing is open.
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.finish",
+                            {"status": "completed"}, why="done again")
+    assert (env.outcome, env.reason) == ("unavailable", "no_run")
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                            {"kind": "scan"}, why="mapping again")
+    assert env.outcome == "ok"
+    assert env.result["id"] != run_id
+
+
+def test_finish_with_two_kinds_open_is_ambiguous_without_kind(engagement):
+    # Two runs of different kinds, opened by two different (fresh) contexts,
+    # exactly as `run.start`'s own docstring says is legitimate: "a crawl
+    # running while you browse is two runs".
+    manual_id = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                                  {"kind": "manual"}, why="w").result["id"]
+    browse_id = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                                  {"kind": "browse"}, why="w").result["id"]
+
+    resumed = dispatch.dispatch(_fresh_ctx(engagement), "run.resume", {}).result
+    assert resumed["run"] is None  # ambiguous -- never guessed
+    assert sorted(resumed["open_runs"], key=lambda r: r["kind"]) == [
+        {"id": browse_id, "kind": "browse"}, {"id": manual_id, "kind": "manual"}]
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.finish",
+                            {"status": "completed"}, why="w")
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert "browse" in env.detail and "manual" in env.detail
+
+    # Both runs are still open -- the refusal above closed neither.
+    still_open = dispatch.dispatch(_fresh_ctx(engagement), "run.resume", {}).result
+    assert len(still_open["open_runs"]) == 2
+
+    # `kind` picks one; the other is untouched.
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.finish",
+                            {"status": "completed", "kind": "manual"}, why="w")
+    assert env.outcome == "ok" and env.result["id"] == manual_id
+
+    after = dispatch.dispatch(_fresh_ctx(engagement), "run.resume", {}).result
+    assert after["run"] == {"id": browse_id, "kind": "browse",
+                            "status": "running",
+                            "started_us": after["run"]["started_us"],
+                            "requests_issued": 0}
+    assert after["open_runs"] == [{"id": browse_id, "kind": "browse"}]

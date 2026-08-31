@@ -2013,6 +2013,28 @@ def record_identity(conn: sqlite3.Connection, *, run_id: str,
         " WHERE id=?", (identity_id, generation, state, run_id))
 
 
+def open_runs(conn: sqlite3.Connection, *,
+              engagement_id: str) -> list[tuple[str, str]]:
+    """`(id, kind)` for every run of this engagement still `status='running'`.
+
+    THE ONE PLACE THAT ANSWERS "WHAT IS OPEN". `dispatch.ToolContext.run_id`
+    resolves an unbound context through this query rather than each of its
+    callers running its own -- the tool layer's own review put it plainly:
+    "do not make the tools query the store one at a time; the resolution
+    belongs in one place." `run.finish`'s `kind` disambiguation and
+    `run.resume`'s `open_runs` brief both read it too, so a run opened by one
+    process and found by another (the CLI's `hx tool` is a fresh process per
+    invocation) see the same list.
+
+    Ordered by `started_us` so a caller that wants "the" open run when there
+    is exactly one gets it without sorting, and a caller listing all of them
+    lists them in the order they were opened.
+    """
+    return conn.execute(
+        "SELECT id, kind FROM run WHERE engagement_id=? AND status='running'"
+        " ORDER BY started_us", (engagement_id,)).fetchall()
+
+
 def current_run(conn: sqlite3.Connection, *, engagement_id: str, kind: str,
                 safety_profile: str, now_us: int | None = None) -> str:
     """The live run of this kind, opening one if there is none.

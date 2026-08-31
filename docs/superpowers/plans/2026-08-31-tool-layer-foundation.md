@@ -191,11 +191,11 @@ def test_bounds_and_lengths_and_enums_are_enforced():
         "s": {"type": "string", "minLength": 1, "maxLength": 3},
         "k": {"type": "string", "enum": ["a", "b"]},
     }}
-    assert schema.validate(s, {"n": 0}) == ["args.n: 0 is below the minimum 1"]
-    assert schema.validate(s, {"n": 11}) == ["args.n: 11 is above the maximum 10"]
+    assert schema.validate(s, {"n": 0}) == ["args.n: below the minimum 1"]
+    assert schema.validate(s, {"n": 11}) == ["args.n: above the maximum 10"]
     assert schema.validate(s, {"s": ""}) == ["args.s: shorter than 1 characters"]
     assert schema.validate(s, {"s": "abcd"}) == ["args.s: longer than 3 characters"]
-    assert schema.validate(s, {"k": "c"}) == ["args.k: 'c' is not one of ['a', 'b']"]
+    assert schema.validate(s, {"k": "c"}) == ["args.k: not one of ['a', 'b']"]
 
 
 def test_array_items_are_validated_by_position():
@@ -374,6 +374,42 @@ def test_property_names_and_required_members_must_be_strings():
     with pytest.raises(schema.SchemaError, match="must be a string"):
         schema.check_schema({"type": "object", "additionalProperties": False,
                              "properties": {}, "required": [1]})
+
+
+def test_no_problem_message_echoes_the_value_it_rejected():
+    """The final review's third finding: `schema._validate` used to write the
+    rejected VALUE into the problem string (`'Bearer eyJ...secret' is not one
+    of [...]`), and `dispatch` puts that string straight into a refusal's
+    `detail`, which `journal.summarise` appends to `agent_action.
+    result_summary` regardless of whether the call's arguments were
+    journalled in full. A message naming the property and the constraint is
+    what makes a refusal actionable; the rejected value is the one thing the
+    caller already knows.
+
+    Driven from the validator directly, not through dispatch -- this is the
+    property the fix promises, and it should hold for values this test never
+    thought to name, not only the secret-shaped one below.
+    """
+    secret = "Bearer eyJhbGciOiJIUzI1NiJ9.THIS_IS_THE_SECRET.sig"
+    cases = [
+        ({"type": "string", "enum": ["Critical", "High", "Low"]}, secret),
+        ({"type": "integer", "minimum": 1}, -999999),
+        ({"type": "integer", "maximum": 1}, 999999),
+        ({"type": "number", "minimum": 1.0}, -999999.5),
+    ]
+    for sch, bad in cases:
+        problems = schema.validate(sch, bad)
+        assert problems, f"{sch} accepted {bad!r}"
+        for p in problems:
+            assert str(bad) not in p, f"{p!r} echoes the rejected value {bad!r}"
+            assert repr(bad) not in p, f"{p!r} echoes the rejected value {bad!r}"
+
+    # The exact reproduction from the review, end to end through `validate`.
+    problems = schema.validate(
+        {"type": "string", "enum": ["Critical", "High", "Medium", "Low", "Info"]},
+        secret)
+    assert problems == ["args: not one of "
+                        "['Critical', 'High', 'Info', 'Low', 'Medium']"]
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -584,13 +620,37 @@ def _validate(obj, value, where, out) -> None:
             out.append(f"{where}: expected {type_}, got {type(value).__name__}")
             return
     if "enum" in obj and value not in obj["enum"]:
-        out.append(f"{where}: {value!r} is not one of {sorted(obj['enum'])}")
+        # NEVER `{value!r}`. `dispatch._journalled` only journals a call's
+        # arguments in full once they have passed this validator -- an
+        # unvalidated call gets its sorted argument NAMES and nothing else
+        # (see `_shape` there). This message is the loophole that made that
+        # protection pointless: `dispatch` puts the joined problem strings
+        # straight into the refusal `detail`, and `journal.summarise` appends
+        # `detail` to `agent_action.result_summary` regardless of whether the
+        # arguments themselves were journalled. `args.severity: 'Bearer
+        # eyJ...secret' is not one of [...]` wrote the rejected value to disk
+        # exactly where the args-blob guard was supposed to keep it from
+        # reaching. A property name and the constraint are what make a
+        # refusal actionable, and the value is the one thing the caller
+        # already knows -- it does not need to be told what it just sent.
+        out.append(f"{where}: not one of {sorted(obj['enum'])}")
     if type_ == "object":
         props = obj.get("properties") or {}
         for key in obj.get("required") or ():
+            # `key` here is a NAME from the schema's own `required` list, not
+            # anything the caller supplied -- there is nothing of the
+            # caller's to echo.
             if key not in value:
                 out.append(f"{where}: {key} is required")
         for key in sorted(set(value) - set(props)):
+            # `key` here IS caller-supplied -- an argument NAME the caller
+            # invented, not one the schema declares. Still fine to echo:
+            # `dispatch._shape` already treats argument names as safe to
+            # journal even for a call this validator never reaches ("the
+            # whole loop-prevention signal... it needs no value to say it"),
+            # and Principle 5 is the same argument one layer up -- identity
+            # and anything else worth hiding is passed BY NAME, so a name
+            # itself carries nothing that value-echoing put on disk.
             out.append(f"{where}: {key} is not an argument of this tool")
         for key, sub in props.items():
             if key in value:
@@ -599,10 +659,16 @@ def _validate(obj, value, where, out) -> None:
         for i, item in enumerate(value):
             _validate(obj["items"], item, f"{where}[{i}]", out)
     elif type_ in ("integer", "number"):
+        # Same rule as `enum` above: the constraint, never the value. A
+        # number is a far less likely secret carrier than the enum case this
+        # was measured against, but the rule this validator enforces is "does
+        # not echo values it was given", not "does not echo values shaped
+        # like a credential" -- the second is a guess about what a secret
+        # looks like, and the first needs no guessing.
         if "minimum" in obj and value < obj["minimum"]:
-            out.append(f"{where}: {value} is below the minimum {obj['minimum']}")
+            out.append(f"{where}: below the minimum {obj['minimum']}")
         if "maximum" in obj and value > obj["maximum"]:
-            out.append(f"{where}: {value} is above the maximum {obj['maximum']}")
+            out.append(f"{where}: above the maximum {obj['maximum']}")
     elif type_ == "string":
         if "minLength" in obj and len(value) < obj["minLength"]:
             out.append(f"{where}: shorter than {obj['minLength']} characters")
@@ -1872,6 +1938,7 @@ import dataclasses
 import logging
 from typing import Any
 
+from .. import run as run_mod
 from . import envelope, journal, registry, schema
 from .errors import ToolError
 
@@ -1900,9 +1967,52 @@ class ToolContext:
     blobs: Any
     config: Any
     halt: Any
-    run_id: str | None = None
     session: Any = None
     actor: str = "agent"
+    _bound_run_id: str | None = dataclasses.field(default=None, repr=False)
+
+    @property
+    def run_id(self) -> str | None:
+        """The open run -- BOUND if `run.start` (or a caller) set one on this
+        context, else RESOLVED FROM THE STORE.
+
+        THE OPEN RUN IS A PROPERTY OF THE ENGAGEMENT, NOT OF THE PROCESS. The
+        CLI adapter builds a fresh `ToolContext` -- nothing bound -- for every
+        `hx tool` invocation, so a plain field that only ever held what THIS
+        process set would leave `run.finish` and every run-scoped tool
+        permanently unreachable through it: `run.start` binds a run in one
+        process and exits, and the next process's context has never heard of
+        it. Resolving from `hx.run.open_runs` instead means a run a prior
+        `run.start` opened is still findable.
+
+        AMBIGUITY IS NEVER GUESSED. Two runs of different kinds may
+        legitimately be open at once -- `run.start`'s own refusal only blocks
+        a second run of the SAME kind, because "a crawl running while you
+        browse is two runs" (`hx.run.current_run`'s docstring gives the
+        rule). So this resolves to a run only when exactly one is open; zero
+        or several both come back `None` rather than picking one. A caller
+        that must tell two open runs apart -- `run.finish`'s `kind` argument
+        -- queries `hx.run.open_runs` itself rather than trusting this
+        property to guess.
+
+        NOT `hx.run.current_run`. That function auto-opens a run, which is
+        right for `hx capture start` -- a forgotten command should not cost
+        an hour of unrecorded browsing -- and wrong here: silently handing
+        back some OTHER run's id would make `run.start`'s `run_open` refusal
+        a lie about which run is open, and would make `run.finish` close a
+        run nobody asked it to.
+        """
+        if self._bound_run_id is not None:
+            return self._bound_run_id
+        rows = run_mod.open_runs(self.conn, engagement_id=self.engagement.id)
+        return rows[0][0] if len(rows) == 1 else None
+
+    @run_id.setter
+    def run_id(self, value: str | None) -> None:
+        # `run.start` binds with this; `run.finish` clears with it -- both are
+        # a plain `ctx.run_id = ...` at the call site, unchanged by this
+        # property existing.
+        self._bound_run_id = value
 
 
 def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,
@@ -2268,18 +2378,51 @@ def start(ctx, kind: str) -> dict:
             "safety_profile": ctx.config.safety_profile}
 
 
-def finish(ctx, status: str, note: str | None = None) -> dict:
-    """Close the bound run.
+def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -> dict:
+    """Close a run.
 
     `no_run` rather than a refusal: nothing said no, there was simply nothing
     to close. Section 12's distinction, one tool down.
+
+    `kind` DISAMBIGUATES WHEN MORE THAN ONE RUN IS OPEN. Two runs of
+    different kinds may legitimately be running at once -- `start`'s own
+    refusal above only blocks a second run of the SAME kind -- so with no
+    `kind` given, `ctx.run_id` already tells "one open run" from "zero or
+    several" (it resolves to a run only when exactly one is open); this only
+    re-queries the store when it comes back `None`, to say WHICH of those two
+    -- none open, or several and ambiguous -- is the case. With `kind` given,
+    the run of that kind closes -- there can be at most one, by the rule
+    `start` enforces -- regardless of what (if anything) this context has
+    bound.
     """
-    if ctx.run_id is None:
-        raise ToolUnavailable(
-            "no_run", "no run is open on this context; run.start opens one")
-    closed = ctx.run_id
+    if kind is not None:
+        running = run_mod.open_runs(ctx.conn, engagement_id=ctx.engagement.id)
+        matches = [rid for rid, k in running if k == kind]
+        if not matches:
+            raise ToolUnavailable(
+                "no_run",
+                f"no {kind} run is open on this context; run.start opens one")
+        closed = matches[0]
+    else:
+        closed = ctx.run_id
+        if closed is None:
+            running = run_mod.open_runs(ctx.conn, engagement_id=ctx.engagement.id)
+            if len(running) > 1:
+                kinds = sorted(k for _, k in running)
+                raise ToolRefused(
+                    "bad_args",
+                    f"{len(running)} runs are open ({', '.join(kinds)}); "
+                    "run.finish needs kind to say which one")
+            raise ToolUnavailable(
+                "no_run", "no run is open on this context; run.start opens one")
+
     run_mod.close_run(ctx.conn, run_id=closed, status=status, stop_reason=note)
-    ctx.run_id = None
+    # Only clear what THIS context bound, and only if it is the run just
+    # closed -- `kind` may have closed a run this context never bound (one
+    # opened by a different context on the same engagement), and clearing an
+    # unrelated binding would forget a run that is still open.
+    if ctx.run_id == closed:
+        ctx.run_id = None
     return {"id": closed, "status": status}
 
 
@@ -2331,7 +2474,7 @@ registry.register(spec.ToolSpec(
 
 registry.register(spec.ToolSpec(
     name="run.finish", handler=finish, mutates=True,
-    summary="Close the open run.",
+    summary="Close a run.",
     params={"type": "object", "additionalProperties": False,
             "required": ["status"],
             "properties": {
@@ -2339,7 +2482,10 @@ registry.register(spec.ToolSpec(
                            "description": "completed, or aborted if you "
                                           "stopped it, or error"},
                 "note": {"type": "string", "maxLength": 500,
-                         "description": "why it ended this way"}}}))
+                         "description": "why it ended this way"},
+                "kind": {"type": "string", "enum": sorted(run_mod.RUN_KINDS),
+                         "description": "which run to close, if more than "
+                                        "one is open at once"}}}))
 
 registry.register(spec.ToolSpec(
     name="run.journal", handler=journal,
@@ -3705,11 +3851,16 @@ from .. import registry
 def build_context(engagement) -> dispatch_mod.ToolContext:
     """A context over an open engagement.
 
-    `run_id` starts None: a fresh process has no open run, and `run.start` is
-    how one is bound. That is also why the CLI adapter cannot hold a run across
-    invocations -- each `hx tool` is its own process. An agent that needs a run
-    to persist wants the MCP adapter, which is one long-lived process; that is
-    Plan B, and it is the reason Plan B and not this task carries the session.
+    NOTHING IS BOUND HERE, and that is fine: each `hx tool` invocation is its
+    own process, so a context built here has never seen a `run.start` this
+    process ran. `ToolContext.run_id` does not need it to have -- unbound, it
+    resolves the open run from the store, and a run `run.start` opened in an
+    EARLIER `hx tool` process is still there to find. What this adapter
+    cannot do is hold a run across invocations in the FIELD -- there is no
+    long-lived object here for `run.start` to bind onto that a later call
+    would see -- which is exactly why the resolution had to move to the
+    store rather than staying a process-local field. Plan B's MCP adapter is
+    one long-lived process, and can bind for real; that is not this task.
     """
     return dispatch_mod.ToolContext(
         engagement=engagement, conn=engagement.db, blobs=engagement.blobs,

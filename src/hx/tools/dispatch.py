@@ -46,6 +46,7 @@ import dataclasses
 import logging
 from typing import Any
 
+from .. import run as run_mod
 from . import envelope, journal, registry, schema
 from .errors import ToolError
 
@@ -74,9 +75,52 @@ class ToolContext:
     blobs: Any
     config: Any
     halt: Any
-    run_id: str | None = None
     session: Any = None
     actor: str = "agent"
+    _bound_run_id: str | None = dataclasses.field(default=None, repr=False)
+
+    @property
+    def run_id(self) -> str | None:
+        """The open run -- BOUND if `run.start` (or a caller) set one on this
+        context, else RESOLVED FROM THE STORE.
+
+        THE OPEN RUN IS A PROPERTY OF THE ENGAGEMENT, NOT OF THE PROCESS. The
+        CLI adapter builds a fresh `ToolContext` -- nothing bound -- for every
+        `hx tool` invocation, so a plain field that only ever held what THIS
+        process set would leave `run.finish` and every run-scoped tool
+        permanently unreachable through it: `run.start` binds a run in one
+        process and exits, and the next process's context has never heard of
+        it. Resolving from `hx.run.open_runs` instead means a run a prior
+        `run.start` opened is still findable.
+
+        AMBIGUITY IS NEVER GUESSED. Two runs of different kinds may
+        legitimately be open at once -- `run.start`'s own refusal only blocks
+        a second run of the SAME kind, because "a crawl running while you
+        browse is two runs" (`hx.run.current_run`'s docstring gives the
+        rule). So this resolves to a run only when exactly one is open; zero
+        or several both come back `None` rather than picking one. A caller
+        that must tell two open runs apart -- `run.finish`'s `kind` argument
+        -- queries `hx.run.open_runs` itself rather than trusting this
+        property to guess.
+
+        NOT `hx.run.current_run`. That function auto-opens a run, which is
+        right for `hx capture start` -- a forgotten command should not cost
+        an hour of unrecorded browsing -- and wrong here: silently handing
+        back some OTHER run's id would make `run.start`'s `run_open` refusal
+        a lie about which run is open, and would make `run.finish` close a
+        run nobody asked it to.
+        """
+        if self._bound_run_id is not None:
+            return self._bound_run_id
+        rows = run_mod.open_runs(self.conn, engagement_id=self.engagement.id)
+        return rows[0][0] if len(rows) == 1 else None
+
+    @run_id.setter
+    def run_id(self, value: str | None) -> None:
+        # `run.start` binds with this; `run.finish` clears with it -- both are
+        # a plain `ctx.run_id = ...` at the call site, unchanged by this
+        # property existing.
+        self._bound_run_id = value
 
 
 def dispatch(ctx: ToolContext, name: str, args: dict[str, Any] | None = None,

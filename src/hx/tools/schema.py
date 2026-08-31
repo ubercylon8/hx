@@ -181,13 +181,37 @@ def _validate(obj, value, where, out) -> None:
             out.append(f"{where}: expected {type_}, got {type(value).__name__}")
             return
     if "enum" in obj and value not in obj["enum"]:
-        out.append(f"{where}: {value!r} is not one of {sorted(obj['enum'])}")
+        # NEVER `{value!r}`. `dispatch._journalled` only journals a call's
+        # arguments in full once they have passed this validator -- an
+        # unvalidated call gets its sorted argument NAMES and nothing else
+        # (see `_shape` there). This message is the loophole that made that
+        # protection pointless: `dispatch` puts the joined problem strings
+        # straight into the refusal `detail`, and `journal.summarise` appends
+        # `detail` to `agent_action.result_summary` regardless of whether the
+        # arguments themselves were journalled. `args.severity: 'Bearer
+        # eyJ...secret' is not one of [...]` wrote the rejected value to disk
+        # exactly where the args-blob guard was supposed to keep it from
+        # reaching. A property name and the constraint are what make a
+        # refusal actionable, and the value is the one thing the caller
+        # already knows -- it does not need to be told what it just sent.
+        out.append(f"{where}: not one of {sorted(obj['enum'])}")
     if type_ == "object":
         props = obj.get("properties") or {}
         for key in obj.get("required") or ():
+            # `key` here is a NAME from the schema's own `required` list, not
+            # anything the caller supplied -- there is nothing of the
+            # caller's to echo.
             if key not in value:
                 out.append(f"{where}: {key} is required")
         for key in sorted(set(value) - set(props)):
+            # `key` here IS caller-supplied -- an argument NAME the caller
+            # invented, not one the schema declares. Still fine to echo:
+            # `dispatch._shape` already treats argument names as safe to
+            # journal even for a call this validator never reaches ("the
+            # whole loop-prevention signal... it needs no value to say it"),
+            # and Principle 5 is the same argument one layer up -- identity
+            # and anything else worth hiding is passed BY NAME, so a name
+            # itself carries nothing that value-echoing put on disk.
             out.append(f"{where}: {key} is not an argument of this tool")
         for key, sub in props.items():
             if key in value:
@@ -196,10 +220,16 @@ def _validate(obj, value, where, out) -> None:
         for i, item in enumerate(value):
             _validate(obj["items"], item, f"{where}[{i}]", out)
     elif type_ in ("integer", "number"):
+        # Same rule as `enum` above: the constraint, never the value. A
+        # number is a far less likely secret carrier than the enum case this
+        # was measured against, but the rule this validator enforces is "does
+        # not echo values it was given", not "does not echo values shaped
+        # like a credential" -- the second is a guess about what a secret
+        # looks like, and the first needs no guessing.
         if "minimum" in obj and value < obj["minimum"]:
-            out.append(f"{where}: {value} is below the minimum {obj['minimum']}")
+            out.append(f"{where}: below the minimum {obj['minimum']}")
         if "maximum" in obj and value > obj["maximum"]:
-            out.append(f"{where}: {value} is above the maximum {obj['maximum']}")
+            out.append(f"{where}: above the maximum {obj['maximum']}")
     elif type_ == "string":
         if "minLength" in obj and len(value) < obj["minLength"]:
             out.append(f"{where}: shorter than {obj['minLength']} characters")

@@ -24,11 +24,16 @@ from .. import registry
 def build_context(engagement) -> dispatch_mod.ToolContext:
     """A context over an open engagement.
 
-    `run_id` starts None: a fresh process has no open run, and `run.start` is
-    how one is bound. That is also why the CLI adapter cannot hold a run across
-    invocations -- each `hx tool` is its own process. An agent that needs a run
-    to persist wants the MCP adapter, which is one long-lived process; that is
-    Plan B, and it is the reason Plan B and not this task carries the session.
+    NOTHING IS BOUND HERE, and that is fine: each `hx tool` invocation is its
+    own process, so a context built here has never seen a `run.start` this
+    process ran. `ToolContext.run_id` does not need it to have -- unbound, it
+    resolves the open run from the store, and a run `run.start` opened in an
+    EARLIER `hx tool` process is still there to find. What this adapter
+    cannot do is hold a run across invocations in the FIELD -- there is no
+    long-lived object here for `run.start` to bind onto that a later call
+    would see -- which is exactly why the resolution had to move to the
+    store rather than staying a process-local field. Plan B's MCP adapter is
+    one long-lived process, and can bind for real; that is not this task.
     """
     return dispatch_mod.ToolContext(
         engagement=engagement, conn=engagement.db, blobs=engagement.blobs,

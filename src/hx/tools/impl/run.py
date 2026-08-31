@@ -44,18 +44,51 @@ def start(ctx, kind: str) -> dict:
             "safety_profile": ctx.config.safety_profile}
 
 
-def finish(ctx, status: str, note: str | None = None) -> dict:
-    """Close the bound run.
+def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -> dict:
+    """Close a run.
 
     `no_run` rather than a refusal: nothing said no, there was simply nothing
     to close. Section 12's distinction, one tool down.
+
+    `kind` DISAMBIGUATES WHEN MORE THAN ONE RUN IS OPEN. Two runs of
+    different kinds may legitimately be running at once -- `start`'s own
+    refusal above only blocks a second run of the SAME kind -- so with no
+    `kind` given, `ctx.run_id` already tells "one open run" from "zero or
+    several" (it resolves to a run only when exactly one is open); this only
+    re-queries the store when it comes back `None`, to say WHICH of those two
+    -- none open, or several and ambiguous -- is the case. With `kind` given,
+    the run of that kind closes -- there can be at most one, by the rule
+    `start` enforces -- regardless of what (if anything) this context has
+    bound.
     """
-    if ctx.run_id is None:
-        raise ToolUnavailable(
-            "no_run", "no run is open on this context; run.start opens one")
-    closed = ctx.run_id
+    if kind is not None:
+        running = run_mod.open_runs(ctx.conn, engagement_id=ctx.engagement.id)
+        matches = [rid for rid, k in running if k == kind]
+        if not matches:
+            raise ToolUnavailable(
+                "no_run",
+                f"no {kind} run is open on this context; run.start opens one")
+        closed = matches[0]
+    else:
+        closed = ctx.run_id
+        if closed is None:
+            running = run_mod.open_runs(ctx.conn, engagement_id=ctx.engagement.id)
+            if len(running) > 1:
+                kinds = sorted(k for _, k in running)
+                raise ToolRefused(
+                    "bad_args",
+                    f"{len(running)} runs are open ({', '.join(kinds)}); "
+                    "run.finish needs kind to say which one")
+            raise ToolUnavailable(
+                "no_run", "no run is open on this context; run.start opens one")
+
     run_mod.close_run(ctx.conn, run_id=closed, status=status, stop_reason=note)
-    ctx.run_id = None
+    # Only clear what THIS context bound, and only if it is the run just
+    # closed -- `kind` may have closed a run this context never bound (one
+    # opened by a different context on the same engagement), and clearing an
+    # unrelated binding would forget a run that is still open.
+    if ctx.run_id == closed:
+        ctx.run_id = None
     return {"id": closed, "status": status}
 
 
@@ -107,7 +140,7 @@ registry.register(spec.ToolSpec(
 
 registry.register(spec.ToolSpec(
     name="run.finish", handler=finish, mutates=True,
-    summary="Close the open run.",
+    summary="Close a run.",
     params={"type": "object", "additionalProperties": False,
             "required": ["status"],
             "properties": {
@@ -115,7 +148,10 @@ registry.register(spec.ToolSpec(
                            "description": "completed, or aborted if you "
                                           "stopped it, or error"},
                 "note": {"type": "string", "maxLength": 500,
-                         "description": "why it ended this way"}}}))
+                         "description": "why it ended this way"},
+                "kind": {"type": "string", "enum": sorted(run_mod.RUN_KINDS),
+                         "description": "which run to close, if more than "
+                                        "one is open at once"}}}))
 
 registry.register(spec.ToolSpec(
     name="run.journal", handler=journal,
@@ -156,8 +192,19 @@ def resume(ctx) -> dict:
     findings that are thin, and conclude it has work to do -- when the true
     answer is that an operator stopped it. That is one refusal repeated until
     the budget is gone.
+
+    `open_runs` IS THE AMBIGUITY MADE VISIBLE. `ctx.run_id` collapses "zero
+    open" and "several open" to the same `None`, which is right for a getter
+    that must never guess but wrong for a brief whose whole job is to orient
+    an agent -- `run` alone would leave it unable to tell "nothing is open,
+    call run.start" from "two things are open, one of which is probably
+    yours". `run` stays the single resolved run (or `None` when there is
+    none, or more than one); `open_runs` lists every running run beside it,
+    kind included, so the second case reads as what it is instead of as the
+    first.
     """
     conn, eid = ctx.conn, ctx.engagement.id
+    running = run_mod.open_runs(conn, engagement_id=eid)
     run = None
     if ctx.run_id is not None:
         row = conn.execute(
@@ -187,6 +234,7 @@ def resume(ctx) -> dict:
                  "reason": halt_reason[:OPERATOR_FIELD_LIMIT]
                            if halt_reason is not None else None},
         "run": run,
+        "open_runs": [{"id": rid, "kind": k} for rid, k in running],
         "surfaces": {"total": surfaces[0], "untested": surfaces[1]},
         "findings": findings,
         "recent": [{"ts_us": r[0], "tool": r[1], "why": r[2], "result": r[3]}

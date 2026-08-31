@@ -73,11 +73,11 @@ def test_bounds_and_lengths_and_enums_are_enforced():
         "s": {"type": "string", "minLength": 1, "maxLength": 3},
         "k": {"type": "string", "enum": ["a", "b"]},
     }}
-    assert schema.validate(s, {"n": 0}) == ["args.n: 0 is below the minimum 1"]
-    assert schema.validate(s, {"n": 11}) == ["args.n: 11 is above the maximum 10"]
+    assert schema.validate(s, {"n": 0}) == ["args.n: below the minimum 1"]
+    assert schema.validate(s, {"n": 11}) == ["args.n: above the maximum 10"]
     assert schema.validate(s, {"s": ""}) == ["args.s: shorter than 1 characters"]
     assert schema.validate(s, {"s": "abcd"}) == ["args.s: longer than 3 characters"]
-    assert schema.validate(s, {"k": "c"}) == ["args.k: 'c' is not one of ['a', 'b']"]
+    assert schema.validate(s, {"k": "c"}) == ["args.k: not one of ['a', 'b']"]
 
 
 def test_array_items_are_validated_by_position():
@@ -256,3 +256,39 @@ def test_property_names_and_required_members_must_be_strings():
     with pytest.raises(schema.SchemaError, match="must be a string"):
         schema.check_schema({"type": "object", "additionalProperties": False,
                              "properties": {}, "required": [1]})
+
+
+def test_no_problem_message_echoes_the_value_it_rejected():
+    """The final review's third finding: `schema._validate` used to write the
+    rejected VALUE into the problem string (`'Bearer eyJ...secret' is not one
+    of [...]`), and `dispatch` puts that string straight into a refusal's
+    `detail`, which `journal.summarise` appends to `agent_action.
+    result_summary` regardless of whether the call's arguments were
+    journalled in full. A message naming the property and the constraint is
+    what makes a refusal actionable; the rejected value is the one thing the
+    caller already knows.
+
+    Driven from the validator directly, not through dispatch -- this is the
+    property the fix promises, and it should hold for values this test never
+    thought to name, not only the secret-shaped one below.
+    """
+    secret = "Bearer eyJhbGciOiJIUzI1NiJ9.THIS_IS_THE_SECRET.sig"
+    cases = [
+        ({"type": "string", "enum": ["Critical", "High", "Low"]}, secret),
+        ({"type": "integer", "minimum": 1}, -999999),
+        ({"type": "integer", "maximum": 1}, 999999),
+        ({"type": "number", "minimum": 1.0}, -999999.5),
+    ]
+    for sch, bad in cases:
+        problems = schema.validate(sch, bad)
+        assert problems, f"{sch} accepted {bad!r}"
+        for p in problems:
+            assert str(bad) not in p, f"{p!r} echoes the rejected value {bad!r}"
+            assert repr(bad) not in p, f"{p!r} echoes the rejected value {bad!r}"
+
+    # The exact reproduction from the review, end to end through `validate`.
+    problems = schema.validate(
+        {"type": "string", "enum": ["Critical", "High", "Medium", "Low", "Info"]},
+        secret)
+    assert problems == ["args: not one of "
+                        "['Critical', 'High', 'Info', 'Low', 'Medium']"]
