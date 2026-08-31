@@ -157,12 +157,18 @@ class ScanSummary:
     # None for one that did not -- `hx.identity.IdentityWindow.state_for_run`,
     # settled by the closing canary.
     #
-    # THE ONE PLACE THIS BUILD CAN PUT IT. Spec section 6 writes the state on
-    # `exchange`, and that same section's 2026-08-30 amendment records why the
-    # column cannot be written yet: `Capture.java` delivers `via: proxy` and
-    # nothing else, so this build stores no send-path exchange row for a probe
-    # at all. The `run` table has no identity column either. So the run's own
-    # summary object is what carries the fact out to its caller.
+    # NOT THE ONLY PLACE IT GOES ANY MORE, and this comment said it was. Task
+    # 8 gave `run` its own `identity`, `identity_generation` and
+    # `identity_state` (SCHEMA_VERSION 9), written by `_record_identity` on
+    # every path a run can end by, because `report._limits` is handed a
+    # connection and an engagement id and a return value reaches it never.
+    # This field is the same fact on its way to the CALLER -- `hx scan` and
+    # the tests -- and the two are written from one value a line apart.
+    #
+    # Spec section 6 writes the state on `exchange`, and that section's
+    # 2026-08-30 amendment records why THAT column still cannot be:
+    # `Capture.java` delivers `via: proxy` and nothing else, so this build
+    # stores no send-path exchange row for a probe at all.
     #
     # A RUN-LEVEL FACT AND NOT A PER-PROBE ONE, because `IdentityWindow`
     # collapses to the worst window in the run: one failed canary anywhere
@@ -173,8 +179,11 @@ class ScanSummary:
     # this from above rather than from below: a run that is `proven` had every
     # window in it proven.
     #
-    # Nothing prints it today: `hx scan` (cli.py) echoes surfaces, checks,
-    # findings, skips and refusals, and this is not one of them.
+    # `hx scan` (cli.py) still does not PRINT it -- it echoes surfaces,
+    # checks, findings, skips, refusals and canaries, and this is not one of
+    # them -- but it is no longer a field nothing reads: the run row carries
+    # it to the report, and `hx scan`'s `except IdentityDead` prints the halt
+    # that produced a `dead` one.
     identity_state: str | None = None
     # The canaries' OWN requests. Section 6: the canary "is counted in
     # `requests_sent` for the run, because it is a request `hx` put on the
