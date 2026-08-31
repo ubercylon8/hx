@@ -725,15 +725,24 @@ def run(conn, *, engagement_id, blobs, config, checks=None,
         }
         _mark_unobserved(conn, engagement_id, run_id, seen_findings, considered)
     except BaseException as exc:
-        # THE IDENTITY GOES ON THE ROW EVEN HERE, and never as `proven`. A
-        # run that stopped short never ran its closing canary, and section 6
-        # is explicit that a window is proof only once BOTH its canaries have
-        # passed -- so `bracket.state` may still read `proven` at this point
-        # and would be over-claiming if it were stored. `IdentityDead` IS the
-        # session being dead, by name; anything else that ended the run
-        # leaves the window unclosed, which is `assumed`. `report._limits`
-        # and the identity section both read this column, so a halted run
-        # must not leave it NULL and read as an anonymous one.
+        # THE IDENTITY GOES ON THE ROW EVEN HERE, and never as `proven`.
+        # Almost every way of reaching this handler stops the run BEFORE
+        # `bracket.finish()`, and section 6 is explicit that a window is
+        # proof only once both its canaries have passed -- so `bracket.state`
+        # can still read `proven` here on the strength of an opening canary
+        # alone, and storing it would be over-claiming. `IdentityDead` IS the
+        # session being dead, by name; everything else settles as `assumed`.
+        #
+        # ONE PATH REACHES THIS WITH THE WINDOW ALREADY CLOSED -- a raise out
+        # of the gate or `_mark_unobserved` above -- and it is written down
+        # to `assumed` too. That under-claims by exactly one state for a run
+        # whose retirement pass crashed, which is the safe direction and
+        # cheaper than a flag whose only reader would be this line.
+        #
+        # `report._limits` and the report's identity section both read this
+        # column, so a halted run must not leave it NULL: NULL is how a
+        # report tells an anonymous run from one that carried a session, and
+        # a halt is emphatically the second.
         if bracket is not None:
             state = "dead" if isinstance(exc, IdentityDead) else "assumed"
             summary.identity_state = state
