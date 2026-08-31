@@ -562,8 +562,9 @@ public class IdentityInjectionTest {
                                     request("app.example.test"));
         // An origin written as a URL contributes its authority's host; one
         // written as a bare host contributes itself. Both spellings reach this
-        // rule: spec s5's example is a URL, and `scope.include` hosts are what
-        // the default is built from.
+        // rule: spec s5's example is a URL, and a bare host is what
+        // `hx.scan._identity_bracket` registers by default -- the single host
+        // its liveness canary is addressed to, not `scope.include`.
         check("a URL origin matches its host",
               Sender.appliesTo(entry("https://app.example.test"), at));
         check("a URL origin with a path matches too",

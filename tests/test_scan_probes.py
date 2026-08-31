@@ -2402,16 +2402,22 @@ def test_every_other_exception_still_reaches_the_run_row_intact(tmp_path):
 # --- a refused canary and a wrongly answered one are different facts -------
 #
 # F2 OF FIX ROUND A (HIGH). The halt message asserted a cause the code never
-# established: a canary refused `identity_origin` -- the fail-closed outcome
-# `_IdentityBracket.__init__` predicts for a `scope_include` written as a
-# bare glob -- reported that `/account` "did not answer with the signature
-# this identity is declared to prove itself by", about a request that never
-# left the JVM. The class was sitting in `sender.refused` at that moment and
-# `_canary` discarded it. Compounded twice over: on a halt `summary.refused`
-# reached the store nowhere either (the `truncated:` string was built only on
-# the success path), and `hx scan` still has no `except IdentityDead`, so an
-# operator whose scope is a glob re-authenticates for ever against a message
-# blaming their credentials.
+# established: a canary refused `identity_origin` -- at the time, the
+# fail-closed outcome of registering `origins` as a whole `scope_include`
+# written as a bare glob -- reported that `/account` "did not answer with the
+# signature this identity is declared to prove itself by", about a request
+# that never left the JVM. The class was sitting in `sender.refused` at that
+# moment and `_canary` discarded it. Compounded twice over: on a halt
+# `summary.refused` reached the store nowhere either (the `truncated:` string
+# was built only on the success path), and `hx scan` had no `except
+# IdentityDead` yet either, so an operator whose scope was a glob
+# re-authenticated for ever against a message blaming their credentials.
+#
+# BOTH CAUSES ARE HISTORICAL. `ba56ba6` (2026-08-30) stopped registering
+# `origins` as `scope_include`, and Task 8 gave `hx scan` its `except
+# IdentityDead`. A canary can still be refused `identity_origin` today, by an
+# operator who declares `identities.<id>.origins` omitting the run's first
+# surface host -- see `scan._unproved`.
 
 
 def _refusing_bridge(cls="identity_origin"):

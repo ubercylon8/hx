@@ -1372,10 +1372,10 @@ class _IdentityBracket:
         A CANARY THAT WAS REFUSED AND A CANARY THAT WAS ANSWERED WRONGLY ARE
         DIFFERENT FACTS, and until F2 of fix round A both read as the second.
         Measured by the review, with a bridge refusing every send
-        `identity_origin` -- the exact fail-closed outcome `__init__`'s own
-        comment predicts for a `scope_include` written as a bare glob, which
-        is the shape `tests/conftest.py` and `_env` actually use -- the halt
-        said
+        `identity_origin` -- at the time, the fail-closed outcome of
+        registering `origins` as a whole `scope_include` written as a bare
+        glob, the shape `tests/conftest.py` and `_env` actually used -- the
+        halt said
 
             identity 'user' could not be proved live before the first probe:
             /account did not answer with the signature this identity is
@@ -1383,12 +1383,20 @@ class _IdentityBracket:
 
         and `/account` never left the JVM. That sends an operator to
         re-authenticate against a message blaming their credential when the
-        fault is the origins their scope produced, and no credential they can
-        mint will ever fix it. It was compounded, at the time, by `hx scan`
-        having no `except IdentityDead`: they read that sentence at the foot
-        of a traceback and re-ran for ever. Task 8 added the handler, so this
-        string is now the whole of what an operator sees -- which raises
-        rather than lowers what it has to be right about.
+        fault lay elsewhere, and no credential they can mint will ever fix
+        it. It was compounded, at the time, by `hx scan` having no `except
+        IdentityDead`: they read that sentence at the foot of a traceback and
+        re-ran for ever. Task 8 added the handler, so this string is now the
+        whole of what an operator sees -- which raises rather than lowers
+        what it has to be right about.
+
+        THE SCENARIO OUTLIVED ITS ORIGINAL CAUSE. `ba56ba6` (2026-08-30)
+        stopped registering `origins` as `scope_include` and rewrote
+        `_identity_bracket`'s own comment, so neither half of the paragraph
+        above is true of the tree today. A canary can still be refused
+        `identity_origin`, though: an operator who declares
+        `identities.<id>.origins` omitting the run's first surface host gets
+        exactly this halt, and this is still the whole of what they read.
 
         THE CLASS IS A CODE-AUTHORED WORD, never free text, which is why it
         is safe to put in a stored `stop_reason` when `_halt_reason` will not

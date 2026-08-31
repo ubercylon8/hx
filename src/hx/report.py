@@ -1408,7 +1408,7 @@ def _identity_counts(conn, engagement_id) -> tuple[int, int, int]:
 
 
 def _origin_refused_scans(conn, engagement_id) -> int:
-    """How many scans recorded here had at least one probe refused
+    """How many scans recorded here had at least one PROBE refused
     `identity_origin` -- the extension's refusal for a request addressed to a
     host outside the identity's bound origins.
 
@@ -1436,10 +1436,43 @@ def _origin_refused_scans(conn, engagement_id) -> int:
     built from the uncapped dict, and it is the one place this fact is
     guaranteed to be spelled out.
 
+    THE SECOND `NOT LIKE` IS N4 OF THE SCOPED RE-REVIEW (LOW). `_spent`
+    folds `sender.refused` into `summary.refused` for EVERY `ProbeSender`
+    including the canary's own (`_IdentityBracket._canary`,
+    `scan.py:1356-1361`) -- so a canary refused `identity_origin` lands in
+    the same tally a probe refusal would, and `_unproved`'s stored half for
+    that canary is literally `its canary was refused identity_origin`
+    (`scan.py:1414`), which also matches the first `LIKE`. Left alone, a run
+    whose canary -- and no probe -- was refused would be counted here and
+    then described to a client as a refused probe.
+
+    A CANARY REFUSED `identity_origin` HALTS BEFORE THE FIRST PROBE, ALWAYS,
+    which is what makes the second `LIKE` exact rather than a heuristic.
+    `_target` -- what every canary in one bracket's life is addressed to --
+    and `origins` are both fixed once, at construction (`_identity_bracket`,
+    `scan.py:999-1002`), and the extension's refusal is a pure function of
+    that pair against a fixed host: if the opening canary is not refused
+    `identity_origin`, no later canary on the same bracket can be either,
+    refresh or no refresh (refresh mints a new credential, not new origins).
+    So the only route to this refusal is `_IdentityBracket.start`, called
+    before the per-surface loop begins (`scan.py:307-310`), and it halts
+    there -- before a single `check_run` row has been opened -- with the
+    one `stop_reason` naming
+    "could not be proved live before the first probe". The other two halt
+    sites (`canary_if_due`'s own failure and the refresh failure inside it)
+    are reachable only through `canary_if_due`, which returns immediately
+    unless a previous row has already closed and counted a probe toward it
+    (`note`, called from `_spent`, `scan.py:1801`) -- so an `identity_origin`
+    surviving on either of those halts, or on a `completed` run's tally,
+    names an actual probe every time.
+
     `identity_origin` NEVER APPEARS BY ACCIDENT: it is a wire class
     (`hx.checks.probe._NOT_ISSUED`, `Sender.java:331`) and no other class or
     English sentence this build writes shares that substring --
     `unknown_identity` is the pair it sits beside and does not contain it.
+    Nor does "could not be proved live before the first probe": `_unproved`
+    is its only writer, and it is a literal string with nothing interpolated
+    ahead of it.
 
     DERIVED FROM THE RUNS, LIKE `_identity_counts` -- never from
     `config._origins` or `config.scan_identity`: a config says what was
@@ -1447,7 +1480,9 @@ def _origin_refused_scans(conn, engagement_id) -> int:
     """
     return conn.execute(
         "SELECT COUNT(*) FROM run WHERE engagement_id=? AND kind='scan'"
-        " AND stop_reason LIKE '%identity_origin%'",
+        " AND stop_reason LIKE '%identity_origin%'"
+        " AND stop_reason NOT LIKE"
+        " '%could not be proved live before the first probe%'",
         (engagement_id,)).fetchone()[0]
 
 

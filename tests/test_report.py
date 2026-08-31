@@ -2926,6 +2926,34 @@ def test_the_origin_refusal_bullet_does_not_render_for_an_anonymous_run(
     assert "probe refused `identity_origin`" not in out
 
 
+def test_a_refused_canary_is_not_counted_as_a_refused_probe(
+        report_env_proven):
+    """N4 of the scoped re-review. `_origin_refused_scans` matched
+    `stop_reason LIKE '%identity_origin%'`, and `_unproved`'s stored half for
+    a refused canary is literally `its canary was refused identity_origin`
+    (`scan.py:1414`) -- the same substring `_halt_reason` folds into
+    `run.stop_reason` for the halt `_IdentityBracket.start` raises when the
+    opening canary is refused before a single probe is sent (`scan.py:
+    1150-1160`). No `check_run` row is ever opened on that path, so a run
+    that halted there had zero probes refused, and the bullet's claim ("had
+    at least one probe refused `identity_origin`") would be false of it.
+
+    RED WITHOUT THE FIX: the old predicate matched the bare substring and
+    counted r-1 alongside r-2, rendering "1 of the 2 scan(s)...".
+    """
+    conn = report_env_proven["conn"]
+    conn.execute(
+        "UPDATE run SET status='error', identity_state='dead', stop_reason=?"
+        " WHERE id='r-1'",
+        ("scan.run raised: IdentityDead: identity 'user' could not be "
+         "proved live before the first probe: its canary was refused "
+         "identity_origin; probes refused identity_origin=1",))
+    out = report.render(**report_env_proven)
+    assert "probe refused `identity_origin`" not in out, (
+        "r-1 halted before its first probe -- it cannot have had a probe "
+        "refused identity_origin, only its canary")
+
+
 def test_the_identity_section_is_derived_from_the_runs(report_env_proven):
     """Section 10's first requirement: which identities were declared, by
     which strategy, how many generations each reached, and what the runs
