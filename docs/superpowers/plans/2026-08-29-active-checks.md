@@ -733,8 +733,8 @@ Expected: the body test FAILS on an empty body; the header test FAILS with `[]`.
 Add to `_http.py`:
 
 ```python
-# src/hx/checks/passive/_http.py -- Task 5: the split, and the header lines it feeds
-def _split_head_body(raw: bytes) -> tuple[bytes, bytes]:
+# src/hx/http_text.py -- Task 5: the split, and the header lines it feeds
+def split_head_body(raw: bytes) -> tuple[bytes, bytes]:
     """Head and body, accepting either line terminator.
 
     RFC 9112 s2.2 requires a recipient to accept a bare LF as a line
@@ -757,7 +757,7 @@ def _split_head_body(raw: bytes) -> tuple[bytes, bytes]:
     return raw[:lf], raw[lf + 2:]
 
 
-def _header_lines(head: bytes) -> list[bytes]:
+def header_lines(head: bytes) -> list[bytes]:
     """Header lines, minus the status line, for either terminator.
 
     Splits on LF and strips at most one trailing CR per line, rather than
@@ -791,10 +791,10 @@ def responses(ctx, exchanges) -> Evidence:
 `verdict()` and `_detail()` sit between those and the header readers in the file, so the other two consumers are a second excerpt:
 
 ```python
-# src/hx/checks/passive/_http.py -- Task 5: the two header readers
+# src/hx/http_text.py -- Task 5: the two header readers
 def header_names(head: bytes) -> list[str]:
     return [line.partition(b":")[0].decode("latin-1").strip()
-            for line in _header_lines(head) if b":" in line]
+            for line in header_lines(head) if b":" in line]
 
 
 def header_values(head: bytes, name: str) -> list[str]:
@@ -806,7 +806,7 @@ def header_values(head: bytes, name: str) -> list[str]:
     """
     want = name.lower()
     out = []
-    for line in _header_lines(head):
+    for line in header_lines(head):
         key, sep, value = line.partition(b":")
         if sep and key.decode("latin-1").strip().lower() == want:
             out.append(value.decode("latin-1").strip())

@@ -263,8 +263,8 @@ def header_values(head: bytes, name: str) -> list[str]:
     want = name.lower()
     out = []
     for line in header_lines(head):
-        field, sep, value = line.partition(b":")
-        if sep and field.decode("latin-1").strip().lower() == want:
+        key, sep, value = line.partition(b":")
+        if sep and key.decode("latin-1").strip().lower() == want:
             out.append(value.decode("latin-1").strip())
     return out
 ```

@@ -26,6 +26,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from hx.checks import base
+from ...http_text import (  # noqa: F401
+    # PROMOTED FOR PLAN B. `hx.issue` needs the same parsing one layer down,
+    # and a core module importing from `hx.checks.passive` would invert the
+    # dependency. Re-exported under the names this module already used, so
+    # nothing in `hx/checks/` changes and the behavioural tests that earned
+    # these rules stay where they are. `header_names` and `header_values` are
+    # re-exports for this module's importers rather than for its own body,
+    # hence the noqa.
+    header_lines as _header_lines,
+    header_names,
+    header_values,
+    split_head_body as _split_head_body,
+)
 
 # The one `exchange.outcome` value meaning a COMPLETE response is on file.
 #
@@ -76,40 +89,6 @@ def _fetch(ctx, exchanges) -> Evidence:
         if gap is not None:
             gaps.append(gap)
     return Evidence(tuple(entries), tuple(gaps))
-
-
-def _split_head_body(raw: bytes) -> tuple[bytes, bytes]:
-    """Head and body, accepting either line terminator.
-
-    RFC 9112 s2.2 requires a recipient to accept a bare LF as a line
-    terminator. `partition(b"\\r\\n\\r\\n")` on a bare-LF response matches
-    nothing and returns `(raw, b"", b"")`, which hands every body-searching
-    check an EMPTY body and every header-reading check the whole response as
-    one unsplit head. The tool then answers `clean` because it failed to
-    read, which is the one direction an assessment must never be wrong in.
-
-    Whichever terminator appears FIRST is the real one, so a body that
-    happens to contain `\\r\\n\\r\\n` cannot pull the boundary backwards past
-    a head that actually ended with a bare `\\n\\n`.
-    """
-    crlf = raw.find(b"\r\n\r\n")
-    lf = raw.find(b"\n\n")
-    if crlf == -1 and lf == -1:
-        return raw, b""
-    if crlf != -1 and (lf == -1 or crlf <= lf):
-        return raw[:crlf], raw[crlf + 4:]
-    return raw[:lf], raw[lf + 2:]
-
-
-def _header_lines(head: bytes) -> list[bytes]:
-    """Header lines, minus the status line, for either terminator.
-
-    Splits on LF and strips at most one trailing CR per line, rather than
-    also splitting on a bare CR: a lone CR inside a header value is data, and
-    splitting on it would invent a header boundary the wire did not carry.
-    """
-    return [line[:-1] if line.endswith(b"\r") else line
-            for line in head.split(b"\n")[1:]]
 
 
 def bodies(ctx, exchanges) -> Evidence:
@@ -196,24 +175,3 @@ def _detail(gaps: tuple[str, ...]) -> str:
     if hidden > 0:
         shown.append(f"and {hidden} more")
     return ": " + "; ".join(shown)
-
-
-def header_names(head: bytes) -> list[str]:
-    return [line.partition(b":")[0].decode("latin-1").strip()
-            for line in _header_lines(head) if b":" in line]
-
-
-def header_values(head: bytes, name: str) -> list[str]:
-    """Every value for one header name, ASCII-case-insensitively.
-
-    A list, not a value: `Set-Cookie` legitimately repeats, and a parser that
-    returned the first would check one cookie of five and report the surface
-    clean.
-    """
-    want = name.lower()
-    out = []
-    for line in _header_lines(head):
-        key, sep, value = line.partition(b":")
-        if sep and key.decode("latin-1").strip().lower() == want:
-            out.append(value.decode("latin-1").strip())
-    return out
