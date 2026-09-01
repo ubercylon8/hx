@@ -1324,7 +1324,7 @@ def against(baseline_status, baseline_body: bytes,
     return out
 
 
-def baseline_for(conn, blobs, surface_id):
+def baseline_for(conn, blobs, surface_id, *, exclude_exchange_id=None):
     """`(status, body_bytes)` for a surface's exemplar, or None.
 
     None for every way there is not one: no surface row, no exemplar, an
@@ -1337,11 +1337,25 @@ def baseline_for(conn, blobs, surface_id):
     fills with `Date` and `Set-Cookie` noise, which is the signal section 8
     built the digest for being drowned out by the transport that carried it,
     not by the application.
+
+    `exclude_exchange_id`, WHEN GIVEN, treats an exemplar equal to it as no
+    baseline at all. `hx.issue.issue` makes a brand-new surface's exemplar
+    the very exchange that just created it, inside its own transaction,
+    before it ever returns `Issued` -- so a caller diffing that first
+    exchange's response against "the baseline" would be diffing it against
+    itself: a zero delta reporting a comparison that was never made. This is
+    the caller's guard against exactly that, pushed into the query rather
+    than a second round trip at the call site (`hx.tools.impl.http._digest`
+    is the one caller). `x.id IS NOT ?` rather than `!=` because SQLite's
+    `!=` against a NULL parameter is NULL -- neither true nor false -- and
+    would silently match no row at all for every caller that passes nothing;
+    `IS NOT` is NULL-safe, so a `None` here is simply "exclude nothing".
     """
     row = conn.execute(
         "SELECT x.status, x.resp_blob, x.resp_len FROM surface s"
         " JOIN exchange x ON x.id = s.exemplar_exchange_id"
-        " WHERE s.id = ?", (surface_id,)).fetchone()
+        " WHERE s.id = ? AND x.id IS NOT ?",
+        (surface_id, exclude_exchange_id)).fetchone()
     if row is None or row[1] is None:
         return None
     _head, body = http_text.split_head_body(blobs.get(row[1], row[2]))
@@ -2499,6 +2513,25 @@ def test_a_second_send_to_the_same_surface_gets_a_delta(tool_run):
     got = env.result["delta_vs_baseline"]
     assert got is not None
     assert got["new_tokens"] == ["hZq9xK"]
+
+
+def _refusing(cls: str):
+    """One `BridgeError` of a class no `REASON_FOR_CLASS` entry names."""
+    return [BridgeError(f"{cls}: mystery", error_class=cls)]
+
+
+def test_an_unknown_wire_class_does_not_escape_dispatch(tool_run):
+    """`dispatch` NEVER RAISES, and an unmapped reason is the one way left
+    to make it. MEASURED: `Envelope.__post_init__` raises ValueError for a
+    reason outside the closed set, and that raise lands inside `except
+    ToolError` where the `except Exception` beside it cannot catch it."""
+    ctx = _with_session(tool_run, _refusing("nova_class_from_2027"))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a"},
+                                why="unknown class")
+    assert env.outcome in ("refused", "unavailable")
+    assert "nova_class_from_2027" in (env.detail or "")
 ```
 
 - [ ] **Step 2: Run to watch it fail**
@@ -2532,10 +2565,9 @@ exact moment hx worked as designed.
 from __future__ import annotations
 
 from ... import delta as delta_mod
-from ... import http_text
 from ... import issue as issue_mod
-from .. import envelope, live, registry, spec
-from ..errors import ToolRefused
+from .. import live, registry, spec
+from ..errors import ToolRefused, ToolUnavailable
 
 #: Latin-1 everywhere bytes become text in a return value, and it is a
 #: deliberate choice rather than a default. It is the only codec that maps
@@ -2555,6 +2587,53 @@ METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 #: `agent_action` row -- this cap is about the WIRE, not the journal.
 MAX_BODY = 1024 * 1024
 
+#: The extension's error classes, placed in the envelope's closed vocabulary.
+#: A class this build has never seen must NOT reach `Envelope` unmapped: the
+#: constructor raises for an unknown reason, and that raise lands inside
+#: `dispatch`'s `except ToolError` handler where the `except Exception` beside
+#: it cannot catch it -- so it escapes `dispatch`, which never raises. A new
+#: class from a future extension would take the call out with a traceback and
+#: write no journal row, which is the one failure this layer is built to make
+#: impossible. The fallback keeps the raw class in `detail`, so nothing is
+#: lost and nothing crashes.
+REASON_FOR_CLASS = {
+    "scope_denied": ("refused", "scope_denied"),
+    "method_denied": ("refused", "method_denied"),
+    "dangerous_denied": ("refused", "dangerous_denied"),
+    "rate_limited": ("refused", "rate_limited"),
+    "budget_exhausted": ("refused", "budget_exhausted"),
+    "bad_frame": ("refused", "bad_frame"),
+    "halted": ("refused", "halted"),
+    "not_configured": ("unavailable", "not_configured"),
+    "bridge_lost": ("unavailable", "bridge_lost"),
+    "transport_error": ("unavailable", "transport_error"),
+    "timeout": ("unavailable", "timeout"),
+}
+UNKNOWN_CLASS = ("unavailable", "transport_error")
+
+
+def _raise_for_refusal(exc: issue_mod.IssueRefused) -> None:
+    """Turn an `IssueRefused` into the right `ToolError` subclass.
+
+    PRINCIPLE 6: the class is the wire's, unchanged, so an agent that gets
+    `dangerous_denied` learns the profile refused it and one that gets
+    `rate_limited` learns to slow down -- two different next actions that a
+    single `error` would have made one.
+
+    A CLASS NOT IN `REASON_FOR_CLASS` falls back to `UNKNOWN_CLASS` rather
+    than raising `ValueError` out of `Envelope.__post_init__` -- see this
+    module's own comment on the table above. The raw class is prefixed onto
+    the detail whenever the fallback fires, so an operator reading the
+    journal can still see what the extension actually said even though this
+    build has no name for it.
+    """
+    outcome, reason = REASON_FOR_CLASS.get(exc.reason, UNKNOWN_CLASS)
+    detail = exc.detail or ""
+    if exc.reason not in REASON_FOR_CLASS:
+        detail = f"[unmapped class {exc.reason!r}] {detail}".rstrip()
+    cls = ToolRefused if outcome == "refused" else ToolUnavailable
+    raise cls(reason, detail) from exc
+
 
 def _digest(ctx, issued) -> dict:
     """Section 8's digest for one `Issued`, including its delta.
@@ -2562,23 +2641,25 @@ def _digest(ctx, issued) -> dict:
     The bytes never appear. `issued.body` exists so this function can diff
     against the baseline's body without a round trip to the blob store
     `issue` just wrote, and it stops here.
+
+    ONE SURFACE LOOKUP, THEN `delta.baseline_for` DOES THE REST. A first
+    version of this function ran a second query here to find the surface's
+    `exemplar_exchange_id` and compare it in Python against `issued.
+    exchange_id`, to stop a brand-new surface's first exchange from being
+    diffed against itself. `hx.issue.issue` sets that exemplar to exactly
+    this exchange, inside its own transaction, before it returns -- so the
+    guard is real, but the second query was a call-site workaround for
+    something `baseline_for` can rule out in the query it already runs. It
+    now takes `exclude_exchange_id` and does that itself.
     """
-    surface_id = ctx.conn.execute(
+    row = ctx.conn.execute(
         "SELECT surface_id FROM exchange WHERE id=?",
         (issued.exchange_id,)).fetchone()
     base = None
-    if surface_id is not None and surface_id[0] is not None:
-        base = delta_mod.baseline_for(ctx.conn, ctx.blobs, surface_id[0])
-    # THE EXEMPLAR MAY BE THIS VERY EXCHANGE. A first request to a new
-    # surface becomes that surface's exemplar inside `issue`, so comparing
-    # against it would report a zero delta against itself -- which reads as
-    # "identical to normal" about a comparison that never happened. `None` is
-    # the honest answer for a first sight of a surface.
-    exemplar = ctx.conn.execute(
-        "SELECT exemplar_exchange_id FROM surface WHERE id=?",
-        (surface_id[0],)).fetchone() if base is not None else None
-    if exemplar is not None and exemplar[0] == issued.exchange_id:
-        base = None
+    if row is not None and row[0] is not None:
+        base = delta_mod.baseline_for(
+            ctx.conn, ctx.blobs, row[0],
+            exclude_exchange_id=issued.exchange_id)
     return {
         "exchange_id": issued.exchange_id,
         "status": issued.status,
@@ -2621,11 +2702,7 @@ def send(ctx, *, host: str, method: str, path: str, port: int = 80,
         # the schema cannot catch it: a CR inside a string is a valid string.
         raise ToolRefused("bad_args", str(exc)) from exc
     except issue_mod.IssueRefused as exc:
-        # PRINCIPLE 6. The class is the wire's, unchanged, so an agent that
-        # gets `dangerous_denied` learns the profile refused it and one that
-        # gets `rate_limited` learns to slow down -- two different next
-        # actions that a single `error` would have made one.
-        raise ToolRefused(exc.reason, exc.detail) from exc
+        _raise_for_refusal(exc)
     return _digest(ctx, issued)
 
 
@@ -2786,10 +2863,14 @@ from hx.tools import impl  # noqa: F401
 @pytest.mark.integration
 def test_send_reaches_a_loopback_target_and_records_a_readable_exchange(
         tool_session, target):
+    # `/health` rather than the brief's `/`: `TargetServer` answers `/` with
+    # a bare 404 (`tests/test_target_server.py` pins it -- "a 404 here would
+    # leave the integration [...] this suite relies on") and this test wants
+    # a 200 to assert on. `/health` is the route built for exactly that.
     env = dispatch_mod.dispatch(
         tool_session, "http.send",
         {"host": target.host, "port": target.port, "method": "GET",
-         "path": "/"},
+         "path": "/health"},
         why="prove the composed request survives the extension")
     assert env.outcome == "ok", env.as_dict()
     assert env.result["status"] == 200

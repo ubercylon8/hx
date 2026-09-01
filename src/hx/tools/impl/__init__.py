@@ -5,4 +5,4 @@ tools in `hx.tools.registry.TOOLS`. Adapters import THIS; nothing imports the
 handler modules one at a time except their own tests.
 """
 
-from . import checks, finding, report, run, surface  # noqa: F401
+from . import checks, finding, http, report, run, surface  # noqa: F401

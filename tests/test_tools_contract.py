@@ -19,12 +19,20 @@ PLAN_A = {
 PLAN_B = {"http.send", "http.grep", "http.body", "http.replay_as",
           "scan.run", "crawl.run"}
 
+#: Which of PLAN_B is actually registered so far. Each Plan B task adds its
+#: tool's name here in the same commit that registers it -- the discipline
+#: PLAN_A already kept as a fixed set, now split in two because PLAN_A no
+#: longer describes the whole registry once ANY Plan B tool lands. Task 4
+#: (`http.send`) is the first.
+PLAN_B_BUILT = {"http.send"}
 
-def test_the_registry_is_exactly_plan_as_eleven():
+
+def test_the_registry_is_exactly_the_tools_built_so_far():
     # Property 1, half of it. Adding a tool without spec'ing it fails here,
-    # and so does spec'ing one without building it. Plan B flips this to the
+    # and so does spec'ing one without building it. PLAN_B_BUILT grows to
+    # match PLAN_B as the rest of Plan B lands, at which point this is the
     # full seventeen.
-    assert set(registry.TOOLS) == PLAN_A
+    assert set(registry.TOOLS) == PLAN_A | PLAN_B_BUILT
 
 
 def test_plan_a_and_plan_b_together_are_section_eights_seventeen():
@@ -47,12 +55,20 @@ def test_every_registered_tool_has_an_enforceable_schema_and_a_summary():
 
 
 def test_mutating_tools_are_exactly_the_ones_that_write():
-    writes = {"run.start", "run.finish", "finding.record", "evidence.attach"}
+    writes = {"run.start", "run.finish", "finding.record", "evidence.attach",
+              "http.send"}
     assert {n for n, t in registry.TOOLS.items() if t.mutates} == writes
 
 
 def test_no_plan_a_tool_needs_egress():
-    assert not any(t.needs_egress for t in registry.TOOLS.values())
+    # The claim is about PLAN_A specifically, not about the registry as a
+    # whole: PLAN_B's whole reason to exist is the six tools that DO carry
+    # `needs_egress` (spec section 8), and `http.send` is the first of them
+    # to be built. Filtered to PLAN_A so this keeps meaning what it always
+    # meant rather than becoming vacuously true or falsely red the moment
+    # any Plan B tool lands.
+    assert not any(t.needs_egress for n, t in registry.TOOLS.items()
+                   if n in PLAN_A)
 
 
 def test_every_tool_schema_matches_its_handlers_signature():

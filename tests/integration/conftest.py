@@ -33,6 +33,8 @@ import pytest
 from hx import config, engagement, session
 from hx.bridge import server
 from hx.halt import OperatorHalt
+from hx.tools import dispatch as dispatch_mod
+from hx.tools import impl as tools_impl  # noqa: F401 -- registers every tool
 from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer
 
@@ -577,3 +579,85 @@ def rig(tmp_path):
         yield Rig(eng=eng, srv=srv, proc=proc, target=target, offside=offside,
                   halt=operator_halt, run_id=run_id, workdir=tmp_path,
                   proxy_port=ports[0], crawler_port=ports[1])
+
+
+@pytest.fixture
+def target():
+    """One loopback `TargetServer`, for a test that needs a real peer and
+    nothing else about `rig` -- no engagement, no bridge, no Burp.
+
+    `tool_session` below depends on this fixture rather than building its own
+    `TargetServer`, so the two agree on which loopback address and port a
+    test's `config.scope_include` was built from.
+    """
+    srv = TargetServer("127.0.0.1")
+    srv.start()
+    try:
+        yield srv
+    finally:
+        srv.stop()
+
+
+@pytest.fixture
+def tool_session(tmp_path, target, monkeypatch):
+    """A `ToolContext` with a real, live Burp bracketed around a `manual` run.
+
+    `tests/integration/test_tool_session.py` already proves the bracket
+    itself -- `run.start` brings up a CONFIGURED Burp, `run.finish` takes it
+    away. This fixture exists for `http.send`'s own integration test, which
+    needs the same bracket sitting in front of a real target rather than
+    `FakeBridge`.
+
+    THE BRACKET IS THE PRODUCT'S, not `bf.launch_burp` called directly the
+    way `rig` calls it. `dispatch(ctx, "run.start", ...)` is what an agent
+    actually invokes, so proving `http.send` here through anything else would
+    prove a different code path than the one this task built.
+
+    THE SEED HOME IS NOT THE OPERATOR'S, for the same reason
+    `test_tool_session.py`'s own docstring gives: `hx.tools.live.open_for`
+    calls `session()` with no `seed`, deliberately, because a tool layer has
+    no business choosing which Burp home a consultant's licence lives in. So
+    this fixture says so the way an operator would, through
+    `$HX_BURP_SEED_HOME` -- copied here rather than imported, because it is
+    exactly the lever that file already documents and there is no third
+    reason to invent.
+
+    THE UNBUILT/MISSING GUARD ORDER MATCHES `rig`'S: an unbuilt jar is a
+    FAILURE (a forgotten `extension/build.sh` must not read as "no Burp
+    here"), and only once that is ruled out does a missing Burp install
+    become a SKIP.
+    """
+    if bf.unbuilt():
+        pytest.fail("unbuilt: " + ", ".join(bf.unbuilt()))
+    if bf.missing():
+        pytest.skip("missing: " + ", ".join(bf.missing()))
+    monkeypatch.setenv("HX_BURP_SEED_HOME", str(bf.SEED_HOME))
+
+    cfg = config.Config(name="tool-session", client="loopback",
+                        scope_include=[f"{target.origin}/*"])
+    eng = engagement.create(tmp_path / "engagement", cfg,
+                            author="integration-tool-session")
+    with contextlib.ExitStack() as stack:
+        # BEFORE anything that can fail below it, so a `run.start` that
+        # raises still closes the database this fixture opened -- the same
+        # ordering discipline `rig` uses for `target.stop`/`offside.stop`.
+        stack.callback(eng.db.close)
+        ctx = dispatch_mod.ToolContext(
+            engagement=eng, conn=eng.db, blobs=eng.blobs, config=eng.config,
+            halt=OperatorHalt(eng.root, eng.db), stack=stack)
+        env = dispatch_mod.dispatch(
+            ctx, "run.start", {"kind": "manual"},
+            why="integration fixture: bracket a Burp for http.send")
+        if env.outcome != "ok":
+            pytest.fail(f"run.start did not open a session: {env.as_dict()}")
+        try:
+            yield ctx
+        finally:
+            # THE OWNER CLOSES IT. `hx.tools.live.close_for` only tears down
+            # a session this run opened, and this fixture's `run.start`
+            # above is that run -- see its own docstring for why a second
+            # run helping itself to another run's teardown is not the shape
+            # to invite even in a fixture.
+            dispatch_mod.dispatch(
+                ctx, "run.finish", {"status": "completed"},
+                why="integration fixture: close the bracket")

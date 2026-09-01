@@ -83,7 +83,7 @@ def against(baseline_status, baseline_body: bytes,
     return out
 
 
-def baseline_for(conn, blobs, surface_id):
+def baseline_for(conn, blobs, surface_id, *, exclude_exchange_id=None):
     """`(status, body_bytes)` for a surface's exemplar, or None.
 
     None for every way there is not one: no surface row, no exemplar, an
@@ -96,11 +96,25 @@ def baseline_for(conn, blobs, surface_id):
     fills with `Date` and `Set-Cookie` noise, which is the signal section 8
     built the digest for being drowned out by the transport that carried it,
     not by the application.
+
+    `exclude_exchange_id`, WHEN GIVEN, treats an exemplar equal to it as no
+    baseline at all. `hx.issue.issue` makes a brand-new surface's exemplar
+    the very exchange that just created it, inside its own transaction,
+    before it ever returns `Issued` -- so a caller diffing that first
+    exchange's response against "the baseline" would be diffing it against
+    itself: a zero delta reporting a comparison that was never made. This is
+    the caller's guard against exactly that, pushed into the query rather
+    than a second round trip at the call site (`hx.tools.impl.http._digest`
+    is the one caller). `x.id IS NOT ?` rather than `!=` because SQLite's
+    `!=` against a NULL parameter is NULL -- neither true nor false -- and
+    would silently match no row at all for every caller that passes nothing;
+    `IS NOT` is NULL-safe, so a `None` here is simply "exclude nothing".
     """
     row = conn.execute(
         "SELECT x.status, x.resp_blob, x.resp_len FROM surface s"
         " JOIN exchange x ON x.id = s.exemplar_exchange_id"
-        " WHERE s.id = ?", (surface_id,)).fetchone()
+        " WHERE s.id = ? AND x.id IS NOT ?",
+        (surface_id, exclude_exchange_id)).fetchone()
     if row is None or row[1] is None:
         return None
     _head, body = http_text.split_head_body(blobs.get(row[1], row[2]))
