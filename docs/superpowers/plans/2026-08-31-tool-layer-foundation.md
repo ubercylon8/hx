@@ -2222,6 +2222,20 @@ class ToolContext:
     #: The run that launched the session on `stack`. At most one session at a
     #: time -- see `hx.tools.live`.
     _session_run_id: str | None = dataclasses.field(default=None, repr=False)
+    #: An ExitStack NESTED inside `stack`, holding the session and nothing
+    #: else, so that `run.finish` can tear down the session WITHOUT tearing
+    #: down whatever else the adapter registered on its own stack. Closing an
+    #: inner stack unwinds only what the inner stack holds and leaves it
+    #: reusable; closing the outer one still unwinds the inner, so a crash
+    #: kills the JVM exactly as before.
+    #:
+    #: CREATED ONCE AND REUSED, deliberately. Entering a fresh inner stack per
+    #: session would leave one spent `__exit__` callback on the adapter's
+    #: stack per session -- a no-op each, and unbounded growth across an
+    #: `hx mcp` conversation that opens and closes runs all day. `ExitStack.
+    #: close()` leaves the stack usable, so one is enough for every session
+    #: this context will ever hold.
+    _session_stack: Any = dataclasses.field(default=None, repr=False)
     #: `(identity_id, generation)` already registered on THIS session's
     #: extension. `BridgeServer.register_identity` refuses a generation that
     #: does not advance what the extension holds (`stale_generation`), so a

@@ -445,9 +445,23 @@ class Rig:
 # copied real client project state into a temporary directory, and reported
 # green. It is a guard now rather than a warning: the same env dict also sets
 # `HOME` to a directory that does not exist, so a seed variable that goes
-# missing fails loudly, in that test, naming the fake home. What is true here
-# is the narrow claim: no fixture in this directory sets that variable, and no
-# launcher in this file needs it, because they say the seed in code.
+# missing fails loudly, in that test, naming the fake home.
+#
+# A SECOND TEST DEPENDS ON IT, AND FROM A FIXTURE. `tests/integration/
+# test_tool_session.py` drives `hx.tools.live.open_for`, which calls
+# `session()` with NO `seed` on purpose -- a tool layer has no business
+# choosing which Burp home a consultant's licence lives in -- so the
+# environment variable is the only lever that test has, and its module-scoped
+# autouse `_prerequisites` fixture sets it beside the unbuilt/missing guards.
+# That is the correct lever rather than a shortcut past this paragraph: the
+# alternative would be a `seed=` argument threaded from `run.start` through
+# `open_for` into the product, existing for the benefit of one test.
+#
+# What is true here is the narrow claim, and it is now about THIS file: no
+# fixture in `tests/integration/conftest.py` sets that variable, and no
+# launcher in this file needs it, because they say the seed in code. A
+# fixture in a test MODULE that sets it -- scoped to that module, never
+# autouse across the directory -- is the documented override doing its job.
 
 
 @pytest.fixture

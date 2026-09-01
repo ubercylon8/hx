@@ -1454,18 +1454,31 @@ def test_without_a_host_stack_it_names_the_adapter_and_the_fix(tool_ctx):
     assert "hx mcp" in got["detail"]
 
 
+#: A string no real `SessionError` can carry. The obvious message for the
+#: test below -- "no burp jar under ~/F0RT1KA/burp-lab" -- is very close to
+#: what `find_burp_jar` really says on a machine with no Burp, so the test
+#: would have passed against an UNPATCHED `session()` and proved nothing
+#: about the seam it names. The sentinel makes only the patched function able
+#: to satisfy it.
+LAUNCH_SENTINEL = "hx-test-sentinel-4f21a9"
+
+
 def test_a_launch_failure_is_reported_not_raised(tool_ctx, monkeypatch):
     """`run.start` must still open the run: refusing outright would leave no
     run row and no agent_action row -- no trace that the instrument failed."""
     def boom(eng, **kw):
-        raise session_mod.SessionError("no burp jar under ~/F0RT1KA/burp-lab")
+        raise session_mod.SessionError(
+            f"no burp jar under ~/F0RT1KA/burp-lab [{LAUNCH_SENTINEL}]")
 
     monkeypatch.setattr(session_mod, "session", boom)
     tool_ctx.stack = contextlib.ExitStack()
     got = live.open_for(tool_ctx, "run-1", "manual")
     assert got["live"] is False
     assert got["reason"] == "launch_failed"
+    # The operator's own sentence, intact -- and the sentinel, which says the
+    # sentence came from the patched `session()` and not from a real one.
     assert "burp-lab" in got["detail"]
+    assert LAUNCH_SENTINEL in got["detail"]
 
 
 def test_a_successful_launch_binds_the_session_and_reports_its_ports(
@@ -1500,7 +1513,38 @@ def test_a_second_egress_run_is_told_who_holds_the_session(
     got = live.open_for(tool_ctx, "run-2", "scan")
     assert got["live"] is False
     assert got["reason"] == "session_held"
+    assert got["owner_alive"] is True
     assert "run-1" in got["detail"]
+
+
+def test_a_session_held_by_a_corpse_says_so_and_names_the_fix(
+        tool_ctx, monkeypatch):
+    """Section 12 once more: "blocked by a live session" and "blocked by a
+    corpse" are different facts, and only one of them means wait. A JVM that
+    died mid-run leaves `ctx.session` set, so every later egress run is
+    refused -- and an agent told only `session_held` would go on waiting for
+    a run that will never give the instrument back on its own.
+
+    OWNERSHIP IS NOT TAKEN HERE. The dead session is not torn down and not
+    stolen: `run.finish` on the owning run is the fix, and the detail says
+    so, because a run helping itself to another run's teardown is how two
+    runs come to share one instrument.
+    """
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    live.open_for(tool_ctx, "run-1", "manual")
+    held = tool_ctx.session
+    tool_ctx.session = type(
+        "Corpse", (), {"gone": lambda self: "Burp exited (status 137)"})()
+
+    got = live.open_for(tool_ctx, "run-2", "scan")
+    assert got["reason"] == "session_held"
+    assert got["owner_alive"] is False
+    assert "run.finish" in got["detail"] and "run-1" in got["detail"]
+    assert "status 137" in got["detail"]
+    # Not stolen and not torn down: the owner still holds what it held.
+    assert tool_ctx._session_run_id == "run-1"
+    assert held is not None
 
 
 def test_only_the_owning_run_can_close_the_session(tool_ctx, monkeypatch):
@@ -1599,14 +1643,22 @@ def test_the_credential_never_leaves_this_function(
         tool_ctx, monkeypatch, staff_identity_config):
     """Principle 5. What comes back is a name and a number -- an exchange
     row's worth -- and never a `Resolved`, which a journalled return value
-    would put the secret into."""
+    would put the secret into.
+
+    THE EQUALITY IS THE WHOLE CLAIM. This test used to add
+    `assert "s3cret" not in repr(got)` under it, which the line above had
+    already settled -- a pair that IS `("staff", 1)` cannot contain anything
+    else -- so it read as credential-containment coverage that was not there.
+    Containment on the OTHER side of the call, where the credential really
+    does travel, is `test_the_declared_origins_bound_the_credential`: it
+    reads what reached the bridge and pins it to the id, the generation and
+    the declared origins.
+    """
     monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
     tool_ctx.config = staff_identity_config
     tool_ctx.session = type("S", (), {"bridge": FakeBridge()})()
     tool_ctx._registered = set()
-    got = live.ensure_identity(tool_ctx, "staff")
-    assert got == ("staff", 1)
-    assert "s3cret" not in repr(got)
+    assert live.ensure_identity(tool_ctx, "staff") == ("staff", 1)
 
 
 def test_the_declared_origins_bound_the_credential(
@@ -1645,6 +1697,119 @@ def test_an_undeclared_identity_names_what_is_declared(
     tool_ctx.config = staff_identity_config
     with pytest.raises(ValueError, match="staff"):
         live.ensure_identity(tool_ctx, "nope")
+
+
+def test_close_for_tears_down_the_session_and_nothing_else_on_the_stack(
+        tool_ctx, monkeypatch):
+    """WHAT THE NESTING BUYS. Task 8 hands `hx mcp`'s own long-lived
+    ExitStack straight to `build_context`, so anything that adapter registers
+    on it must survive an ordinary `run.finish`. The session goes onto an
+    INNER stack for exactly that reason; closing the outer one still unwinds
+    the inner, so a crash kills the JVM either way."""
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    adapters_own = []
+    with contextlib.ExitStack() as stack:
+        stack.callback(adapters_own.append, "the adapter's own clean-up")
+        tool_ctx.stack = stack
+        live.open_for(tool_ctx, "run-1", "manual")
+        assert live.close_for(tool_ctx, "run-1") is True
+        assert adapters_own == [], (
+            "run.finish tore down the adapter's own stack entries")
+    assert adapters_own == ["the adapter's own clean-up"]
+
+
+def test_the_inner_stack_is_made_once_and_reused(tool_ctx, monkeypatch):
+    """A fresh inner stack per session would leave one spent `__exit__`
+    callback on the adapter's stack per session -- a no-op each, and unbounded
+    growth across an `hx mcp` conversation that opens and closes runs all
+    day."""
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    live.open_for(tool_ctx, "run-1", "manual")
+    first = tool_ctx._session_stack
+    live.close_for(tool_ctx, "run-1")
+    live.open_for(tool_ctx, "run-2", "manual")
+    assert tool_ctx._session_stack is first
+
+
+def test_a_teardown_that_raises_still_clears_the_bookkeeping(
+        tool_ctx, monkeypatch):
+    """The failure mode this guards is a tool layer that can never open a
+    session again. With `ctx.session` left set for a session that is gone,
+    every later egress run is told `session_held` naming a run that is
+    already closed -- recoverable only by restarting `hx mcp`. The raise is
+    still allowed out; what it may not do is take the context with it."""
+    @contextlib.contextmanager
+    def brittle_session(eng, **kw):
+        yield FakeLive()
+        raise RuntimeError("the JVM would not die")
+
+    monkeypatch.setattr(session_mod, "session", brittle_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    live.open_for(tool_ctx, "run-1", "manual")
+    with pytest.raises(RuntimeError, match="would not die"):
+        live.close_for(tool_ctx, "run-1")
+    assert tool_ctx.session is None
+    assert tool_ctx._session_run_id is None
+    assert tool_ctx._registered == set()
+
+    # And the proof that it matters: the next egress run gets a session
+    # rather than being told `session_held` by a run that is already closed.
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    assert live.open_for(tool_ctx, "run-2", "manual")["live"] is True
+
+
+def test_a_gone_that_cannot_answer_is_not_read_as_a_live_session(
+        tool_ctx, monkeypatch):
+    """`open_for` NEVER RAISES, and the liveness read is inside that promise.
+    A `gone()` that throws is not evidence that the holder is alive, so it is
+    reported as `owner_alive: False` with the reason in the detail."""
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    live.open_for(tool_ctx, "run-1", "manual")
+
+    def explode(self):
+        raise OSError("no such process")
+
+    tool_ctx.session = type("Broken", (), {"gone": explode})()
+    got = live.open_for(tool_ctx, "run-2", "manual")
+    assert got["reason"] == "session_held"
+    assert got["owner_alive"] is False
+    assert "no such process" in got["detail"]
+
+
+def test_a_launch_that_arrives_dead_reports_rather_than_raising_from_gone(
+        tool_ctx, monkeypatch):
+    """The dead-session check is guarded, because "NEVER RAISES" is stated
+    without qualification and a reader will rely on it -- not on an argument
+    that `gone()` happens not to raise.
+
+    AND THE JVM STILL GOES. By the time `gone()` is called the session is
+    already on the inner stack, so a guard that only turned the raise into a
+    `launch_failed` would leave a live Burp held by a stack nothing closes
+    until the adapter exits, with the next `open_for` entering a SECOND
+    session beside it.
+    """
+    torn_down = []
+
+    @contextlib.contextmanager
+    def unreadable_session(eng, **kw):
+        class Unreadable(FakeLive):
+            def gone(self):
+                raise OSError("proc table went away")
+        try:
+            yield Unreadable()
+        finally:
+            torn_down.append(True)
+
+    monkeypatch.setattr(session_mod, "session", unreadable_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    got = live.open_for(tool_ctx, "run-1", "manual")
+    assert got["live"] is False
+    assert got["reason"] == "launch_failed"
+    assert "proc table went away" in got["detail"]
+    assert tool_ctx.session is None
+    assert torn_down == [True], "a session whose liveness is unreadable was left"
 ```
 
 - [ ] **Step 2: Run to watch it fail**
@@ -1716,6 +1881,7 @@ false can be concluded from it.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 
 from .. import identity as identity_mod
@@ -1755,13 +1921,18 @@ def open_for(ctx, run_id: str, kind: str) -> dict:
                           "tool layer under `hx mcp`, which is one long-lived "
                           "process, or use the 11 tools that need no session."}
     if ctx.session is not None:
-        return {"live": False, "reason": "session_held",
-                "detail": f"run {ctx._session_run_id} holds this engagement's "
-                          "Burp; one session at a time. Finish that run first "
-                          "-- a scan and a manual pass are different runs and "
-                          "should not share an instrument."}
+        return _held(ctx)
     try:
-        live = ctx.stack.enter_context(
+        # NESTED, so that `close_for` can unwind the session and NOTHING
+        # ELSE. `ctx.stack` is the ADAPTER'S, and Task 8 hands `hx mcp`'s own
+        # long-lived stack straight to `build_context` -- anything that
+        # adapter ever registers there would otherwise be torn down by an
+        # ordinary `run.finish`. Created once per context and reused (see
+        # `ToolContext._session_stack`), because a fresh inner stack per
+        # session leaves a spent callback on the adapter's stack per session.
+        if ctx._session_stack is None:
+            ctx._session_stack = ctx.stack.enter_context(contextlib.ExitStack())
+        live = ctx._session_stack.enter_context(
             session_mod.session(ctx.engagement, instance=INSTANCE))
     except Exception as exc:            # noqa: BLE001 -- see the docstring
         return {"live": False, "reason": "launch_failed",
@@ -1771,9 +1942,30 @@ def open_for(ctx, run_id: str, kind: str) -> dict:
     # bridge reconnects at DENY-ALL, which is a Burp that is up, proxies
     # nothing and records nothing. Handing that back as `live` would give
     # every later tool a session object whose every send is refused.
-    dead = live.gone()
+    #
+    # GUARDED, because this function's contract is "NEVER RAISES" without
+    # qualification and a reader relies on that rather than on an argument
+    # that `gone()` and `close()` happen not to raise today. NOT folded into
+    # the `try` above, though, which is the shape that first suggests itself:
+    # by this line the session is already ON the inner stack, so a single
+    # wide `try` would answer `launch_failed` while leaving a live JVM held
+    # by a stack nothing will close until the adapter exits -- and the next
+    # `open_for` would enter a SECOND session onto the same stack.
+    try:
+        dead = live.gone()
+    except Exception as exc:            # noqa: BLE001
+        # A `gone()` that cannot answer is not evidence of a live session.
+        dead = f"its liveness could not be read: {type(exc).__name__}: {exc}"
     if dead is not None:
-        ctx.stack.close()
+        try:
+            ctx._session_stack.close()
+        except Exception as exc:        # noqa: BLE001
+            # Reported, not raised, and not hidden either: the teardown of a
+            # session that was never handed out is exactly the kind of
+            # failure that leaves a JVM behind, so it belongs in the detail
+            # an operator reads.
+            dead = (f"{dead}; and tearing it down failed too: "
+                    f"{type(exc).__name__}: {exc}")
         return {"live": False, "reason": "launch_failed", "detail": dead}
     ctx.session = live
     ctx._session_run_id = run_id
@@ -1782,19 +1974,67 @@ def open_for(ctx, run_id: str, kind: str) -> dict:
             "crawler_port": live.crawler_port, "epoch": live.epoch}
 
 
+def _held(ctx) -> dict:
+    """`session_held`, and WHETHER THE HOLDER IS STILL ALIVE.
+
+    "Blocked by a live session" and "blocked by a corpse" are different facts
+    and only one of them means wait. A JVM that died mid-run leaves
+    `ctx.session` set, so every later egress run is refused -- and an agent
+    told only `session_held` would keep waiting for a run that will never
+    give the instrument back on its own.
+
+    OWNERSHIP IS NOT TAKEN HERE, alive or dead. The run that opened a session
+    is the run that closes it; `run.finish` on the owner tears down a corpse
+    exactly as it tears down a live one, and a second run helping itself to
+    another run's teardown is how two runs come to share an instrument.
+    """
+    try:
+        dead = ctx.session.gone()
+    except Exception as exc:            # noqa: BLE001 -- open_for never raises
+        # A `gone()` that cannot answer is not evidence of a live session.
+        dead = f"its liveness could not be read ({type(exc).__name__}: {exc})."
+    owner = ctx._session_run_id
+    if dead is None:
+        detail = (f"run {owner} holds this engagement's Burp; one session at "
+                  "a time. Finish that run first -- a scan and a manual pass "
+                  "are different runs and should not share an instrument.")
+    else:
+        detail = (f"run {owner} holds this engagement's Burp and it is no "
+                  f"longer live: {dead} Waiting will not free it -- run.finish "
+                  f"on {owner} tears the dead session down, and only the run "
+                  "that opened a session may close it.")
+    return {"live": False, "reason": "session_held",
+            "owner_alive": dead is None, "detail": detail}
+
+
 def close_for(ctx, run_id: str) -> bool:
     """Tear down the session if this run owns it. True if it did.
 
-    `ExitStack.close()` unwinds everything on the stack and leaves it
-    reusable, which is what makes one stack enough for a session that opens
-    and closes many times across one `hx mcp` conversation.
+    THE SESSION AND ONLY THE SESSION. The stack closed here is
+    `_session_stack`, nested inside the adapter's own `ctx.stack` -- because
+    Task 8 hands `hx mcp`'s long-lived stack to `build_context`, and anything
+    that adapter registers on it (its store, its serve loop's own clean-up)
+    must survive an ordinary `run.finish`. Closing the OUTER stack still
+    unwinds this one, so a crash kills the JVM either way; what the nesting
+    buys is that a routine close does not.
+
+    THE BOOKKEEPING IS CLEARED WHATEVER THE TEARDOWN DOES. If `close()`
+    raised and the three assignments below it were skipped, `ctx.session`
+    would stay set for a session that is gone, and every later egress run
+    would be told `session_held` naming a run that is already closed -- a
+    tool layer permanently unable to open a session again, recoverable only
+    by restarting `hx mcp`. The raise is still allowed out (`dispatch` renders
+    it, and a teardown that failed is worth an `error`); what is not allowed
+    is for it to take the context with it.
     """
     if ctx.session is None or ctx._session_run_id != run_id:
         return False
-    ctx.stack.close()
-    ctx.session = None
-    ctx._session_run_id = None
-    ctx._registered = set()
+    try:
+        ctx._session_stack.close()
+    finally:
+        ctx.session = None
+        ctx._session_run_id = None
+        ctx._registered = set()
     return True
 
 
