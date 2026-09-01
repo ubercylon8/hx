@@ -1140,7 +1140,9 @@ The digest exists because twelve payload variants against one endpoint return
 twelve identical tuples without it. So the test that matters most here is the
 one where a reflected token appears in `new_tokens` and nothing else does.
 """
-from hx import delta
+from hx import delta, issue
+
+from tests.test_probe import FakeBridge, sent_result
 
 
 def test_a_reflected_payload_shows_up_as_a_new_token():
@@ -1196,6 +1198,34 @@ def test_an_oversized_body_reports_null_tokens_rather_than_scanning_it():
 
 def test_a_surface_with_no_exemplar_has_no_baseline(tool_ctx):
     assert delta.baseline_for(tool_ctx.conn, tool_ctx.blobs, "no-such") is None
+
+
+def test_baseline_for_returns_the_exemplars_body_not_its_whole_response(
+        tool_run):
+    """The row is built by `hx.issue.issue`, the one writer of `via='send'`
+    exchange rows -- a fixture that wrote the surface/exchange rows itself
+    would pass while the real writer wrote something else. The exemplar
+    response here carries a `Date` header the body does not, so a
+    `baseline_for` that returned the whole response rather than the body
+    would fail the equality assertion below by leaking that header in.
+    """
+    bridge = FakeBridge()
+    body = b"<html><body>Hello visitor</body></html>"
+    resp = (b"HTTP/1.1 200 OK\r\nDate: Mon, 01 Jan 2001 00:00:00 GMT\r\n"
+            b"Content-Type: text/html\r\n\r\n" + body)
+    bridge.replies([sent_result(resp, status=200)])
+    got = issue.issue(
+        bridge, tool_run.conn, tool_run.blobs, tool_run.config,
+        engagement_id=tool_run.engagement.id, run_id=tool_run.run_id,
+        scheme="http", host="127.0.0.1", port=8080, method="GET", path="/a")
+
+    row = tool_run.conn.execute(
+        "SELECT surface_id FROM exchange WHERE id=?",
+        (got.exchange_id,)).fetchone()
+    surface_id = row[0]
+
+    baseline = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id)
+    assert baseline == (200, body)
 ```
 
 Add one more test once Task 1 is in: `baseline_for` over a surface whose exemplar exchange has a `resp_blob`, asserting it returns `(status, body_bytes)` -- the BODY, not the whole stored response. Build the row with `hx.issue.issue` and a `FakeBridge` rather than by hand — a fixture that writes the row itself would pass while the real writer wrote something else.
@@ -1230,6 +1260,16 @@ found"; `null` is "not computed, the bodies were too large to diff". Section
 12's rule is that a report which cannot distinguish tested-clean from
 never-reached is worse than no report, and a field that spells both `[]` is
 that rule broken inside one key.
+
+`baseline_for` RETURNS THE EXEMPLAR'S BODY, NEVER ITS WHOLE STORED RESPONSE.
+A review of Task 1's `hx.issue` established why: two responses with
+byte-identical content still differ in their `Date:` header and their
+per-session `Set-Cookie`, so a delta computed over whole responses counts
+that header churn as change -- `new_tokens` fills with `Date`, `ETag` and
+cookie-value tokens that have nothing to do with the request under test,
+drowning the one signal section 8 built the digest for and potentially
+pushing the real reflected payload past `MAX_TOKENS` before it is ever
+reported.
 """
 from __future__ import annotations
 
@@ -1252,7 +1292,7 @@ MAX_TOKENS = 20
 
 #: Above this, tokens are not computed and the field says so. Two 8 MB bodies
 #: tokenised into sets is tens of megabytes of transient allocation inside the
-#: one long-lived process that also holds the Burp.
+#: one long-lived process that also holds the Burp bridge connection.
 MAX_DIFF_BYTES = 2 * 1024 * 1024
 
 
@@ -1292,10 +1332,11 @@ def baseline_for(conn, blobs, surface_id):
     to compare against", and a caller that told them apart would be reporting
     on its own bookkeeping rather than on the application.
 
-    BODY, NOT THE WHOLE STORED RESPONSE. A delta over whole responses counts
-    header churn as change: `new_tokens` fills with `Date` and `Set-Cookie`
-    noise, which is the signal section 8 built the digest for being drowned
-    out by the transport that carried it, not by the application.
+    BODY, NOT THE WHOLE STORED RESPONSE -- see this module's docstring. A
+    delta over whole responses counts header churn as change: `new_tokens`
+    fills with `Date` and `Set-Cookie` noise, which is the signal section 8
+    built the digest for being drowned out by the transport that carried it,
+    not by the application.
     """
     row = conn.execute(
         "SELECT x.status, x.resp_blob, x.resp_len FROM surface s"
