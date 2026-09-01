@@ -3629,44 +3629,6 @@ def test_grep_with_an_empty_exchange_list_is_refused_not_answered_empty(
     assert "items" in (env.detail or "")
 
 
-@pytest.mark.parametrize("include_anonymous", [False, True])
-def test_replay_with_an_empty_identity_list_is_refused(
-        tool_run, staff_identity_config, monkeypatch, include_anonymous):
-    """The same rule, and THE EXCHANGE IS REAL so the empty list is the only
-    thing wrong with the call. A first version of this test passed a made-up
-    `exchange_id`, and `replay_as` refuses THAT before it ever looks at the
-    identities -- so it stayed green with `minItems` removed. Measured, and
-    the reason this test stages an exchange it does not otherwise need.
-
-    `include_anonymous: true` is covered deliberately rather than
-    incidentally, and it is the case where `minItems` takes something away:
-    MEASURED before the fix, `identities: []` answered `empty` on its own and
-    `ok` with `include_anonymous`, so the anonymous-only replay WORKED. The
-    reply queue below carries a second `sent_result` for exactly that reason
-    -- without it the shape crashes on an exhausted double rather than on
-    the product, and the measurement would be about the fixture. Closing it
-    is the ruling's call and it is consistent with the tool: this one asks
-    "does this identity see what that one saw", `include_anonymous` is the
-    COMPARISON row, and a replay naming no identity is `http.send`'s
-    question."""
-    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
-    tool_run.config = staff_identity_config
-    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
-    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
-    xid = _one_exchange_on(ctx, ok, path="/admin")
-    sent_before = len(ctx.session.bridge.requests)
-
-    env = dispatch_mod.dispatch(
-        ctx, "http.replay_as",
-        {"exchange_id": xid, "identities": [],
-         "include_anonymous": include_anonymous},
-        why="an empty identity list")
-    assert env.outcome == "refused"
-    assert env.reason == "bad_args"
-    assert "items" in (env.detail or "")
-    assert len(ctx.session.bridge.requests) == sent_before
-
-
 def test_more_identities_than_the_bound_is_refused_not_silently_truncated(
         tool_run, staff_identity_config, monkeypatch):
     """The schema's `maxItems` already holds this, so the handler's own guard
@@ -3690,6 +3652,56 @@ def test_more_identities_than_the_bound_is_refused_not_silently_truncated(
             identities=["staff"] * (http_mod.MAX_IDENTITIES + 1))
     assert caught.value.reason == "bad_args"
     assert len(ctx.session.bridge.requests) == sent_before
+
+
+def test_an_anonymous_only_replay_is_a_real_call_not_a_mistake(
+        tool_run, staff_identity_config):
+    """CORRECTING RULING 23. `minItems: 1` on `identities` was ruled and then
+    withdrawn: `identities=[]` with `include_anonymous=True` asks a question
+    only this tool can answer -- re-issue this CAPTURED request carrying no
+    session, and diff it against what the original saw. `http.send` takes a
+    host and a path; this takes an `exchange_id`, and rebuilding the request
+    by hand out of `http.body` would be a different request."""
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    denied = b"HTTP/1.1 403 Forbidden\r\n\r\nno"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(denied,
+                                                               status=403)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": [], "include_anonymous": True},
+        why="does /admin answer with no session at all")
+    assert env.outcome == "ok", env.as_dict()
+    rows = env.result["rows"]
+    assert [r["identity"] for r in rows] == [None]
+    assert rows[0]["digest"]["status"] == 403
+
+
+def test_neither_identities_nor_anonymous_is_refused_before_any_send(
+        tool_run, staff_identity_config):
+    """The empty case that IS a mistake. Refused rather than answered
+    `empty`, which would say "I replayed it and found no difference" about a
+    call that issued nothing.
+
+    THE EXCHANGE IS REAL, and that is load-bearing rather than setup. The
+    version of this test that this one replaces passed a MADE-UP
+    `exchange_id`, and `replay_as` refuses that before it ever looks at the
+    identities -- so the test stayed green with the guard removed. Measured
+    by a surviving mutation, which is why an exchange the assertion does not
+    otherwise need is staged here."""
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    before = len(ctx.session.bridge.requests)
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": [], "include_anonymous": False},
+        why="nothing to replay")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert len(ctx.session.bridge.requests) == before
 ```
 
 - [ ] **Step 2: Run to watch it fail**
@@ -4494,6 +4506,17 @@ def replay_as(ctx, *, exchange_id: str, identities,
     # the schema and it would silently drop the identities past the eighth
     # and report a complete-looking table that never asked about them.
     wanted = list(identities)
+    # NOTHING TO REPLAY IS A MISTAKE; AN ANONYMOUS-ONLY REPLAY IS NOT. The
+    # schema cannot draw this line -- it constrains one field at a time and
+    # this is a fact about two of them -- so it is drawn here. Refused rather
+    # than answered `empty`, which would say "I replayed it and found no
+    # difference" about a call that issued nothing.
+    if not wanted and not include_anonymous:
+        raise ToolRefused(
+            "bad_args",
+            "no identities and include_anonymous is false, so there is "
+            "nothing to replay. Name at least one declared identity, or set "
+            "include_anonymous to compare against no session at all.")
     if len(wanted) > MAX_IDENTITIES:
         raise ToolRefused(
             "bad_args",
@@ -4592,13 +4615,18 @@ registry.register(spec.ToolSpec(
             "required": ["exchange_id", "identities"], "properties": {
                 "exchange_id": {"type": "string", "maxLength": 64},
                 # RULING 23, the same rule: `identities: []` replayed
-                # nothing and answered `empty`. This also settles the
-                # anonymous-only shape, and settling it is deliberate rather
-                # than incidental: `include_anonymous` is the COMPARISON row,
-                # and this tool's question is "does this identity see what
-                # that one saw". A call naming no identity is asking a
-                # different question, and `http.send` answers that one.
-                "identities": {"type": "array", "minItems": 1,
+                # nothing and answered `empty`. NO `minItems` HERE, though,
+                # and that is a correction to Ruling 23 rather than an
+                # oversight: an empty `identities` with
+                # `include_anonymous: true` is a REAL call -- re-issue this
+                # captured request carrying no session at all, and diff it
+                # against what the original saw. `http.send` cannot answer
+                # that one, because it takes a host and a path and this takes
+                # an `exchange_id`; reconstructing the request by hand out of
+                # `http.body` would be a different request. The empty case
+                # that IS a mistake -- no identities AND no anonymous row --
+                # is refused in the handler, where both fields are visible.
+                "identities": {"type": "array",
                                "maxItems": MAX_IDENTITIES,
                                "items": {"type": "string", "maxLength": 64},
                                "description": "NAMES declared in config.yaml"},

@@ -792,6 +792,17 @@ def replay_as(ctx, *, exchange_id: str, identities,
     # the schema and it would silently drop the identities past the eighth
     # and report a complete-looking table that never asked about them.
     wanted = list(identities)
+    # NOTHING TO REPLAY IS A MISTAKE; AN ANONYMOUS-ONLY REPLAY IS NOT. The
+    # schema cannot draw this line -- it constrains one field at a time and
+    # this is a fact about two of them -- so it is drawn here. Refused rather
+    # than answered `empty`, which would say "I replayed it and found no
+    # difference" about a call that issued nothing.
+    if not wanted and not include_anonymous:
+        raise ToolRefused(
+            "bad_args",
+            "no identities and include_anonymous is false, so there is "
+            "nothing to replay. Name at least one declared identity, or set "
+            "include_anonymous to compare against no session at all.")
     if len(wanted) > MAX_IDENTITIES:
         raise ToolRefused(
             "bad_args",
@@ -890,13 +901,18 @@ registry.register(spec.ToolSpec(
             "required": ["exchange_id", "identities"], "properties": {
                 "exchange_id": {"type": "string", "maxLength": 64},
                 # RULING 23, the same rule: `identities: []` replayed
-                # nothing and answered `empty`. This also settles the
-                # anonymous-only shape, and settling it is deliberate rather
-                # than incidental: `include_anonymous` is the COMPARISON row,
-                # and this tool's question is "does this identity see what
-                # that one saw". A call naming no identity is asking a
-                # different question, and `http.send` answers that one.
-                "identities": {"type": "array", "minItems": 1,
+                # nothing and answered `empty`. NO `minItems` HERE, though,
+                # and that is a correction to Ruling 23 rather than an
+                # oversight: an empty `identities` with
+                # `include_anonymous: true` is a REAL call -- re-issue this
+                # captured request carrying no session at all, and diff it
+                # against what the original saw. `http.send` cannot answer
+                # that one, because it takes a host and a path and this takes
+                # an `exchange_id`; reconstructing the request by hand out of
+                # `http.body` would be a different request. The empty case
+                # that IS a mistake -- no identities AND no anonymous row --
+                # is refused in the handler, where both fields are visible.
+                "identities": {"type": "array",
                                "maxItems": MAX_IDENTITIES,
                                "items": {"type": "string", "maxLength": 64},
                                "description": "NAMES declared in config.yaml"},
