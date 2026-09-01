@@ -5352,6 +5352,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from hx.tools import registry
 from hx.tools.adapters import mcp
 
@@ -5422,6 +5424,110 @@ def test_a_refused_tool_is_isError_but_still_a_jsonrpc_result(tool_ctx):
     assert got["result"]["isError"] is True
     payload = json.loads(got["result"]["content"][0]["text"])
     assert payload["reason"] == "missing_why"
+
+
+def _rows(ctx):
+    return ctx.conn.execute("SELECT COUNT(*) FROM agent_action").fetchone()[0]
+
+
+# `[["a","b"]]` is here because the ruling names it, not because it
+# discriminates: `dict()` coerces it to `{"a": "b"}`, which `surface.query`
+# refuses as bad_args anyway, so this row stays green under the coercing
+# version. The coercion itself is owned by
+# test_a_nested_arguments_list_is_not_coerced_into_an_object below, where the
+# coerced object is one the tool ACCEPTS. Measured, not assumed.
+@pytest.mark.parametrize("arguments", ["oops", 5, ["a", "b"], [["a", "b"]]])
+def test_malformed_arguments_are_refused_and_journalled(tool_ctx, arguments):
+    """RULING 20. `dispatch`'s own docstring names THIS adapter as the reason
+    its untrusted-argument guards exist -- "an `args` that is a string...
+    Each is a `bad_args` refusal, journalled like any other" -- and
+    `dict(params.get("arguments") or {})` made every one of them unreachable.
+
+    MEASURED before the fix: "oops", 5 and ["a","b"] each raised inside
+    `handle`, surfaced as JSON-RPC -32603, and wrote ZERO journal rows. The
+    -32603 is what this file's own docstring says must never be how a bad
+    call is rendered: it says the SERVER failed. `[["a","b"]]` was worse
+    still -- `dict()` coerced it into `{"a": "b"}` and the tool was called
+    with an arguments object the client never sent.
+
+    THE JOURNAL ROW IS THE ASSERTION THAT MATTERS. An agent looping on a
+    malformed call is exactly what `agent_action` exists to make visible, and
+    a crash erases it."""
+    before = _rows(tool_ctx)
+    got = mcp.handle(tool_ctx, {
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": {"name": "surface.query", "arguments": arguments}})
+    assert "error" not in got, "a bad call was rendered as a server failure"
+    assert got["result"]["isError"] is True
+    payload = json.loads(got["result"]["content"][0]["text"])
+    assert payload["outcome"] == "refused"
+    assert payload["reason"] == "bad_args"
+    assert _rows(tool_ctx) == before + 1, "the malformed call was not recorded"
+    tool, = tool_ctx.conn.execute(
+        "SELECT tool FROM agent_action ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert tool == "surface.query"
+
+
+@pytest.mark.parametrize("params", ["oops", 5, ["name", "surface.query"]])
+def test_a_malformed_params_is_refused_and_journalled_too(tool_ctx, params):
+    """The same guard one level out. `msg.get("params") or {}` answered a
+    non-dict truthy `params` with an `AttributeError` two lines later --
+    -32603 again, and again no row."""
+    before = _rows(tool_ctx)
+    got = mcp.handle(tool_ctx, {"jsonrpc": "2.0", "id": 10,
+                                "method": "tools/call", "params": params})
+    assert "error" not in got
+    assert got["result"]["isError"] is True
+    payload = json.loads(got["result"]["content"][0]["text"])
+    assert payload["outcome"] == "refused"
+    assert payload["reason"] == "bad_args"
+    assert _rows(tool_ctx) == before + 1, "the malformed call was not recorded"
+
+
+def test_a_nested_arguments_list_is_not_coerced_into_an_object(tool_ctx):
+    """The silent half of Ruling 20, and the one no outcome assertion would
+    have caught on its own: `dict([["kind", "manual"]])` is `{"kind":
+    "manual"}`, so `run.start` would have RUN -- opening a real run -- on an
+    arguments object the client never sent. `ok` was the answer, which is why
+    this needs its own test rather than a row in the table above."""
+    before = _rows(tool_ctx)
+    got = mcp.handle(tool_ctx, {
+        "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+        "params": {"name": "run.start",
+                   "arguments": [["kind", "manual"], ["why", "coerced"]]}})
+    payload = json.loads(got["result"]["content"][0]["text"])
+    assert payload["outcome"] == "refused"
+    assert payload["reason"] == "bad_args"
+    assert _rows(tool_ctx) == before + 1
+    assert tool_ctx.conn.execute(
+        "SELECT COUNT(*) FROM run").fetchone()[0] == 0, \
+        "a coerced arguments list opened a run"
+
+
+def test_a_malformed_call_through_the_loop_is_not_a_transport_error(tool_ctx):
+    """RULING 20 through `serve_streams`, which is where the -32603 actually
+    appeared: `handle` raised, the loop's `except Exception` rendered it as
+    INTERNAL_ERROR, and the client was told the SERVER failed for a message
+    IT had malformed. MEASURED before the fix, byte for byte:
+
+        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message":
+         "ValueError: dictionary update sequence element #0 has length 1;
+          2 is required"}}
+
+    with `SELECT COUNT(*) FROM agent_action` still 0."""
+    before = _rows(tool_ctx)
+    out = io.StringIO()
+    mcp.serve_streams(tool_ctx, io.StringIO(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+        '{"name":"surface.query","arguments":"oops"}}\n'), out)
+    reply = json.loads(out.getvalue())
+    assert "error" not in reply, (
+        "a malformed call came back as a JSON-RPC error, which says the "
+        "SERVER failed")
+    assert reply["result"]["isError"] is True
+    assert json.loads(reply["result"]["content"][0]["text"])["reason"] \
+        == "bad_args"
+    assert _rows(tool_ctx) == before + 1
 
 
 def test_an_unknown_method_is_a_jsonrpc_error(tool_ctx):
@@ -5572,6 +5678,16 @@ worth saying out loud: `tool_schema` builds the published one from the
 enforced one, and a test runs `check_schema` over the result so the extra
 property cannot become a constraint nothing applies.
 
+A MALFORMED CALL IS `dispatch`'s TO REFUSE, NOT THIS FILE'S TO CRASH ON.
+Everything here arrives over a pipe from another process: `params` may be a
+string, `arguments` may be a list, a number or absent. `dispatch` has guards
+for every one of those shapes and its docstring names this adapter as the
+reason they exist -- so `tools/call` passes both through as they arrived
+rather than coercing them into the shapes it prefers. The one adapter that
+speaks JSON-RPC must not be the one that makes those guards unreachable: a
+coercion here costs a journal row, and a journal row is how an agent looping
+on a malformed call becomes visible at all.
+
 STDOUT IS THE PROTOCOL. Nothing else may be written to it -- not a print, not
 a warning, not a traceback. A newline-delimited protocol has no
 resynchronisation point, so one stray line desynchronises the client for the
@@ -5655,13 +5771,37 @@ def handle(ctx, msg) -> dict | None:
         return _ok(msg_id, {"tools": [tool_schema(registry.TOOLS[n])
                                       for n in sorted(registry.TOOLS)]})
     if method == "tools/call":
-        params = msg.get("params") or {}
-        args = dict(params.get("arguments") or {})
-        # POPPED, not passed through. `ToolSpec.params` is
-        # additionalProperties: false, so a `why` left in here would be
-        # refused as bad_args -- and Principle 5's reason belongs in
-        # agent_action, which is where `dispatch`'s keyword puts it.
-        why = args.pop("why", None)
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            # A `params` that is a string, a number or a list. `{}` here
+            # hands `dispatch` a `name` of None, which it refuses as
+            # `bad_args` and journals -- the same treatment every other
+            # malformed call gets, and the reason this is not `.get` on
+            # whatever arrived is that `.get` on a string raises.
+            params = {}
+        args = params.get("arguments")
+        why = None
+        if isinstance(args, dict):
+            # POPPED, not passed through, and only from a real object.
+            # `ToolSpec.params` is additionalProperties: false, so a `why`
+            # left in here would be refused as bad_args -- and Principle 5's
+            # reason belongs in agent_action, which is where `dispatch`'s
+            # keyword puts it. The copy is so a caller's message is not
+            # mutated by being answered.
+            args = dict(args)
+            why = args.pop("why", None)
+        # RULING 20 -- `arguments` GOES TO `dispatch` UNCHANGED. This line
+        # was `dict(params.get("arguments") or {})`, and `dispatch`'s own
+        # docstring names THIS adapter as the reason its untrusted-argument
+        # guards exist: "an `args` that is a string... Each is a `bad_args`
+        # refusal, journalled like any other -- a malformed call is exactly
+        # what `agent_action` exists to make visible, not a crash that erases
+        # it." The `dict()` made those guards unreachable. MEASURED: an
+        # `arguments` of "oops", of 5, or of ["a","b"] raised inside `handle`
+        # and came back as JSON-RPC -32603 -- which this module's own
+        # docstring says must never be how a bad call is rendered -- with
+        # ZERO journal rows; and `[["a","b"]]` was silently coerced into
+        # `{"a": "b"}`, an arguments object the client never sent.
         env = dispatch_mod.dispatch(ctx, params.get("name"), args, why=why)
         # A REFUSAL IS A RESULT, NOT A TRANSPORT ERROR. `isError` is MCP's
         # way of saying the tool answered badly; a JSON-RPC `error` would say

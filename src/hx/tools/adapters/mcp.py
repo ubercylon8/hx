@@ -29,6 +29,16 @@ worth saying out loud: `tool_schema` builds the published one from the
 enforced one, and a test runs `check_schema` over the result so the extra
 property cannot become a constraint nothing applies.
 
+A MALFORMED CALL IS `dispatch`'s TO REFUSE, NOT THIS FILE'S TO CRASH ON.
+Everything here arrives over a pipe from another process: `params` may be a
+string, `arguments` may be a list, a number or absent. `dispatch` has guards
+for every one of those shapes and its docstring names this adapter as the
+reason they exist -- so `tools/call` passes both through as they arrived
+rather than coercing them into the shapes it prefers. The one adapter that
+speaks JSON-RPC must not be the one that makes those guards unreachable: a
+coercion here costs a journal row, and a journal row is how an agent looping
+on a malformed call becomes visible at all.
+
 STDOUT IS THE PROTOCOL. Nothing else may be written to it -- not a print, not
 a warning, not a traceback. A newline-delimited protocol has no
 resynchronisation point, so one stray line desynchronises the client for the
@@ -112,13 +122,37 @@ def handle(ctx, msg) -> dict | None:
         return _ok(msg_id, {"tools": [tool_schema(registry.TOOLS[n])
                                       for n in sorted(registry.TOOLS)]})
     if method == "tools/call":
-        params = msg.get("params") or {}
-        args = dict(params.get("arguments") or {})
-        # POPPED, not passed through. `ToolSpec.params` is
-        # additionalProperties: false, so a `why` left in here would be
-        # refused as bad_args -- and Principle 5's reason belongs in
-        # agent_action, which is where `dispatch`'s keyword puts it.
-        why = args.pop("why", None)
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            # A `params` that is a string, a number or a list. `{}` here
+            # hands `dispatch` a `name` of None, which it refuses as
+            # `bad_args` and journals -- the same treatment every other
+            # malformed call gets, and the reason this is not `.get` on
+            # whatever arrived is that `.get` on a string raises.
+            params = {}
+        args = params.get("arguments")
+        why = None
+        if isinstance(args, dict):
+            # POPPED, not passed through, and only from a real object.
+            # `ToolSpec.params` is additionalProperties: false, so a `why`
+            # left in here would be refused as bad_args -- and Principle 5's
+            # reason belongs in agent_action, which is where `dispatch`'s
+            # keyword puts it. The copy is so a caller's message is not
+            # mutated by being answered.
+            args = dict(args)
+            why = args.pop("why", None)
+        # RULING 20 -- `arguments` GOES TO `dispatch` UNCHANGED. This line
+        # was `dict(params.get("arguments") or {})`, and `dispatch`'s own
+        # docstring names THIS adapter as the reason its untrusted-argument
+        # guards exist: "an `args` that is a string... Each is a `bad_args`
+        # refusal, journalled like any other -- a malformed call is exactly
+        # what `agent_action` exists to make visible, not a crash that erases
+        # it." The `dict()` made those guards unreachable. MEASURED: an
+        # `arguments` of "oops", of 5, or of ["a","b"] raised inside `handle`
+        # and came back as JSON-RPC -32603 -- which this module's own
+        # docstring says must never be how a bad call is rendered -- with
+        # ZERO journal rows; and `[["a","b"]]` was silently coerced into
+        # `{"a": "b"}`, an arguments object the client never sent.
         env = dispatch_mod.dispatch(ctx, params.get("name"), args, why=why)
         # A REFUSAL IS A RESULT, NOT A TRANSPORT ERROR. `isError` is MCP's
         # way of saying the tool answered badly; a JSON-RPC `error` would say
