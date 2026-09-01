@@ -170,3 +170,29 @@ def test_exclude_exchange_id_of_none_leaves_the_baseline_intact(tool_run):
     got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id,
                              exclude_exchange_id=None)
     assert got == (first.status, payload)
+
+
+def test_a_corrupt_exemplar_blob_is_no_baseline_rather_than_a_raise(tool_run):
+    """RULING 18. The third read site of this blob and the only one that did
+    not guard it -- `hx.tools.impl.http._blobs_for` and `replay_as`'s read of
+    the original response both catch `CorruptBlob` by explicit ruling.
+
+    None is the answer this function already gives for a missing surface, a
+    missing exemplar and an unstored response. All four are "there is nothing
+    to compare against", and a caller that told them apart would be reporting
+    on hx's bookkeeping rather than on the application."""
+    from hx.store.blobs import CorruptBlob
+
+    _first, _second, surface_id, _payload = _two_exchanges_on_one_surface(
+        tool_run)
+    real_get = tool_run.blobs.get
+
+    def _corrupt(digest, expected_len=None):
+        raise CorruptBlob(f"blob {digest} failed digest verification")
+
+    tool_run.blobs.get = _corrupt
+    try:
+        got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id)
+    finally:
+        tool_run.blobs.get = real_get
+    assert got is None

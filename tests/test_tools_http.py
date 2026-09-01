@@ -229,6 +229,43 @@ def test_a_second_send_to_the_same_surface_gets_a_delta(tool_run):
     assert got["new_tokens"] == ["hZq9xK"]
 
 
+def test_a_corrupt_exemplar_blob_still_answers_with_the_exchange_id(tool_run):
+    """RULING 18, end to end and on the send path, which is where it bites.
+
+    The request has ALREADY GONE OUT by the time the digest is composed: the
+    exchange row is written and `requests_issued` is incremented. Before the
+    fix, `delta.baseline_for`'s unguarded `blobs.get` raised `CorruptBlob`
+    from there and the whole call answered `error / internal` -- so the agent
+    never learned the `exchange_id` of a request the client's application had
+    already served, could not read the response it had just paid for, and its
+    natural next move was to send the same request again.
+
+    `delta_vs_baseline: null` is the honest answer: nothing was compared. The
+    `exchange_id` assertion is the load-bearing one -- an `outcome == "ok"`
+    on its own would pass for a digest that carried no handle."""
+    from hx.store.blobs import CorruptBlob
+
+    first = b"HTTP/1.1 200 OK\r\n\r\nHello visitor"
+    second = b"HTTP/1.1 200 OK\r\n\r\nHello hZq9xK"
+    ctx = _with_session(tool_run, [sent_result(first), sent_result(second)])
+    args = {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/x"}
+    dispatch_mod.dispatch(ctx, "http.send", args, why="baseline")
+
+    real_get = ctx.blobs.get
+
+    def _corrupt(digest, expected_len=None):
+        raise CorruptBlob(f"blob {digest} failed digest verification")
+
+    ctx.blobs.get = _corrupt
+    try:
+        env = dispatch_mod.dispatch(ctx, "http.send", args, why="payload")
+    finally:
+        ctx.blobs.get = real_get
+    assert env.outcome == "ok"
+    assert env.result["exchange_id"]
+    assert env.result["delta_vs_baseline"] is None
+
+
 def _refusing(cls: str):
     """One `BridgeError` of a class no `REASON_FOR_CLASS` entry names."""
     return [BridgeError(f"{cls}: mystery", error_class=cls)]
