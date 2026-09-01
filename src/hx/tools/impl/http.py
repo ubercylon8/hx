@@ -57,19 +57,59 @@ MAX_BODY = 1024 * 1024
 #: write no journal row, which is the one failure this layer is built to make
 #: impossible. The fallback keeps the raw class in `detail`, so nothing is
 #: lost and nothing crashes.
+#:
+#: RULING 19 -- ALL TWENTY, NOT ELEVEN. `UNKNOWN_CLASS` is for a class this
+#: build has NEVER SEEN, and it was catching nine this build's own suite
+#: enumerates: `tests/test_records.py` derives the authoritative list from the
+#: Java emit sites, and three of the nine are ordinary policy denials an agent
+#: reaches straight off these tools -- `unmanaged_credential` on any
+#: `http.send` whose `headers` carry a Cookie or an Authorization,
+#: `unknown_identity` and `identity_origin` on a send bound to an identity the
+#: extension will not use for that host. Answering `unavailable /
+#: transport_error` for those counted a policy denial as network weather,
+#: which is the whole subject of Ruling 3.
+#:
+#: THE SPLIT IS RULING 3's, UNCHANGED. Something DECIDED NO is `refused`; NO
+#: ANSWER CAME BACK is `unavailable`. Every frame-level refusal below got an
+#: answer -- the extension read the frame and said no, exactly as it does for
+#: `bad_frame`, which was already on that side -- so a stale identity
+#: generation, a mismatched engagement and an unparseable configure are all
+#: decisions. Only the four that decided NOTHING, plus `identity_dead`, are
+#: `unavailable`.
 REASON_FOR_CLASS = {
+    # The Gate and the limits: policy answering, which is what a client-facing
+    # refusal count is a statement about.
     "scope_denied": ("refused", "scope_denied"),
     "method_denied": ("refused", "method_denied"),
     "dangerous_denied": ("refused", "dangerous_denied"),
     "rate_limited": ("refused", "rate_limited"),
     "budget_exhausted": ("refused", "budget_exhausted"),
-    "bad_frame": ("refused", "bad_frame"),
     "halted": ("refused", "halted"),
+    # `Sender.java`'s three, and the reason Ruling 19 is not cosmetic: all
+    # three are reachable from `http.send`'s own arguments. The first fires
+    # BEFORE the Gate, on a request carrying a credential header the
+    # extension did not itself inject; `http.send` now refuses that shape on
+    # this side too (Ruling 21), so a wire answer of it means a credential
+    # arrived some other way and the agent needs to hear so.
+    "unmanaged_credential": ("refused", "unmanaged_credential"),
+    "unknown_identity": ("refused", "unknown_identity"),
+    "identity_origin": ("refused", "identity_origin"),
+    # `BridgeClient.java`'s frame-level refusals. The peer read the frame and
+    # said no, which is a decision however far it is from the application:
+    # `bad_frame` has always been `refused` and these are its neighbours.
+    "bad_frame": ("refused", "bad_frame"),
+    "unknown_frame": ("refused", "unknown_frame"),
+    "protocol_mismatch": ("refused", "protocol_mismatch"),
+    "engagement_mismatch": ("refused", "engagement_mismatch"),
+    "bad_config": ("refused", "bad_config"),
+    "bad_identity": ("refused", "bad_identity"),
+    "stale_generation": ("refused", "stale_generation"),
     # An identity the extension's own liveness canary has declared dead: a
     # `register_identity` refusal, not a send refusal -- the one class this
     # table maps that never comes off `issue()`. See `send`'s
     # `except BridgeError` below.
     "identity_dead": ("unavailable", "identity_dead"),
+    # Nothing decided anything: no extension, no channel, no answer, no time.
     "not_configured": ("unavailable", "not_configured"),
     "bridge_lost": ("unavailable", "bridge_lost"),
     "transport_error": ("unavailable", "transport_error"),

@@ -1276,7 +1276,17 @@ REASONS_FOR = {
     "refused": frozenset({
         "not_registered", "halted", "missing_why", "bad_args", "run_open",
         "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
-        "budget_exhausted", "bad_frame", "wrong_run_kind"}),
+        "budget_exhausted", "bad_frame", "wrong_run_kind",
+        # WIDENED AGAIN BY RULING 19, and for the same reason as the first
+        # widening: these are the rest of what the extension can put on an
+        # `error` frame, and nine of them were falling through to
+        # `unavailable / transport_error` -- a policy denial counted as
+        # network weather in the one number an operator reads as scope
+        # discipline. `tests/test_tools_http.py` compares this side against
+        # the emit sites the Java actually carries.
+        "unmanaged_credential", "unknown_identity", "identity_origin",
+        "unknown_frame", "protocol_mismatch", "engagement_mismatch",
+        "bad_config", "bad_identity", "stale_generation"}),
     "unavailable": frozenset({
         "no_session", "no_run", "not_implemented", "identity_dead",
         "identity_unresolved", "transport_error", "timeout", "bridge_lost",

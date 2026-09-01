@@ -2767,6 +2767,97 @@ def test_an_unknown_wire_class_does_not_escape_dispatch(tool_run):
     assert "nova_class_from_2027" in (env.detail or "")
 
 
+#: The one entry in `REASON_FOR_CLASS` that no Java site spells, with the
+#: reason it is there anyway. Named rather than filtered out by a rule,
+#: because a rule would go on silently absorbing whatever else stopped being
+#: reachable -- and "a dead reason is evidence of a broken path" is this
+#: project's most productive heuristic (Task 4 found a real Principle 6
+#: violation that way).
+MAPPED_BUT_NOT_EMITTED_BY_THE_JVM = {
+    "identity_dead":
+        "Rulings 3 and 13: the extension's liveness canary having already "
+        "declared an identity dead. It arrives as a `BridgeError` off "
+        "`register_identity` rather than off an `error` frame, which is why "
+        "test_records' emit-site scan cannot see it, and "
+        "test_an_identity_registration_refused_by_the_wire_carries_its_class "
+        "drives it end to end.",
+}
+
+
+def test_every_wire_class_the_extension_emits_has_a_mapping():
+    """RULING 19. `UNKNOWN_CLASS` is for a class this build has NEVER SEEN,
+    and it was catching nine that this build's own suite enumerates -- three
+    of them ordinary policy denials reachable straight off these tools. A
+    policy denial answered `unavailable / transport_error` is network weather
+    in the number an operator reads as scope discipline, which is exactly
+    what Ruling 3 exists to stop.
+
+    DERIVED, NOT RESTATED. `tests/test_records.ERROR_CLASSES` is read off the
+    Java emit sites, so this goes red when the extension gains a class
+    nothing here maps. A second hand-written list of wire classes would be a
+    second thing to keep in sync with the Java, which is the defect
+    `_emitted_error_classes` was written to remove.
+
+    The second half is the raise Ruling 3 measured: a mapped reason that is
+    not in its outcome's closed set makes `Envelope.__post_init__` raise
+    INSIDE `dispatch`'s `except ToolError` handler, where the `except
+    Exception` beside it cannot catch it -- so it escapes `dispatch`, which
+    never raises, and writes no journal row.
+    """
+    from hx.tools import envelope
+    from hx.tools.impl import http as http_mod
+    from tests.test_records import ERROR_CLASSES
+
+    assert len(ERROR_CLASSES) >= 20, (
+        f"the emit-site scan found only {len(ERROR_CLASSES)} classes; a "
+        "scan that stopped matching would make this test vacuous")
+    unmapped = sorted(set(ERROR_CLASSES) - set(http_mod.REASON_FOR_CLASS))
+    assert unmapped == [], (
+        f"{unmapped} fall back to {http_mod.UNKNOWN_CLASS}, which is for a "
+        "class this build has never seen. Map each one under Ruling 3's "
+        "split: something decided no is refused; no answer came back is "
+        "unavailable.")
+    for cls, (outcome, reason) in http_mod.REASON_FOR_CLASS.items():
+        assert reason in envelope.REASONS_FOR[outcome], (
+            f"{cls} maps to {outcome}/{reason}, which Envelope refuses to "
+            "construct -- and that raise escapes dispatch")
+
+
+def test_the_class_table_carries_nothing_the_wire_cannot_say():
+    """The other direction, and it is not symmetry for its own sake: an entry
+    nothing can produce is how Task 4 found a real Principle 6 violation --
+    `identity_dead` was in the vocabulary and unreachable, and the reason was
+    that `send` guarded only `ValueError` while the path also raised
+    `BridgeError`. Anything mapped here that the Java does not emit is either
+    a live exception with a written reason or a dead branch."""
+    from hx.tools.impl import http as http_mod
+    from tests.test_records import ERROR_CLASSES
+
+    extra = set(http_mod.REASON_FOR_CLASS) - set(ERROR_CLASSES)
+    assert extra <= set(MAPPED_BUT_NOT_EMITTED_BY_THE_JVM), (
+        f"{sorted(extra - set(MAPPED_BUT_NOT_EMITTED_BY_THE_JVM))} is mapped "
+        "but nothing emits it. Either a path that should produce it is "
+        "broken, or the entry is dead -- say which in "
+        "MAPPED_BUT_NOT_EMITTED_BY_THE_JVM.")
+
+
+@pytest.mark.parametrize("cls", ["unmanaged_credential", "unknown_identity",
+                                 "identity_origin"])
+def test_a_policy_denial_from_the_wire_is_refused_not_unavailable(
+        tool_run, cls):
+    """The three of Ruling 19's nine that `Sender.java` answers for a send an
+    agent can compose out of `http.send`'s own arguments. `unavailable` here
+    would tell the agent to retry a request policy has already declined, and
+    would put the denial in the wrong column of the report."""
+    ctx = _with_session(tool_run, _refusing(cls))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a"},
+                                why="a denial the extension decided on")
+    assert env.outcome == "refused"
+    assert env.reason == cls
+
+
 def _one_exchange_on(ctx, body, *, path):
     """One stored exchange at `path`, sent through a fake bridge; its id.
 
@@ -3459,19 +3550,59 @@ MAX_BODY = 1024 * 1024
 #: write no journal row, which is the one failure this layer is built to make
 #: impossible. The fallback keeps the raw class in `detail`, so nothing is
 #: lost and nothing crashes.
+#:
+#: RULING 19 -- ALL TWENTY, NOT ELEVEN. `UNKNOWN_CLASS` is for a class this
+#: build has NEVER SEEN, and it was catching nine this build's own suite
+#: enumerates: `tests/test_records.py` derives the authoritative list from the
+#: Java emit sites, and three of the nine are ordinary policy denials an agent
+#: reaches straight off these tools -- `unmanaged_credential` on any
+#: `http.send` whose `headers` carry a Cookie or an Authorization,
+#: `unknown_identity` and `identity_origin` on a send bound to an identity the
+#: extension will not use for that host. Answering `unavailable /
+#: transport_error` for those counted a policy denial as network weather,
+#: which is the whole subject of Ruling 3.
+#:
+#: THE SPLIT IS RULING 3's, UNCHANGED. Something DECIDED NO is `refused`; NO
+#: ANSWER CAME BACK is `unavailable`. Every frame-level refusal below got an
+#: answer -- the extension read the frame and said no, exactly as it does for
+#: `bad_frame`, which was already on that side -- so a stale identity
+#: generation, a mismatched engagement and an unparseable configure are all
+#: decisions. Only the four that decided NOTHING, plus `identity_dead`, are
+#: `unavailable`.
 REASON_FOR_CLASS = {
+    # The Gate and the limits: policy answering, which is what a client-facing
+    # refusal count is a statement about.
     "scope_denied": ("refused", "scope_denied"),
     "method_denied": ("refused", "method_denied"),
     "dangerous_denied": ("refused", "dangerous_denied"),
     "rate_limited": ("refused", "rate_limited"),
     "budget_exhausted": ("refused", "budget_exhausted"),
-    "bad_frame": ("refused", "bad_frame"),
     "halted": ("refused", "halted"),
+    # `Sender.java`'s three, and the reason Ruling 19 is not cosmetic: all
+    # three are reachable from `http.send`'s own arguments. The first fires
+    # BEFORE the Gate, on a request carrying a credential header the
+    # extension did not itself inject; `http.send` now refuses that shape on
+    # this side too (Ruling 21), so a wire answer of it means a credential
+    # arrived some other way and the agent needs to hear so.
+    "unmanaged_credential": ("refused", "unmanaged_credential"),
+    "unknown_identity": ("refused", "unknown_identity"),
+    "identity_origin": ("refused", "identity_origin"),
+    # `BridgeClient.java`'s frame-level refusals. The peer read the frame and
+    # said no, which is a decision however far it is from the application:
+    # `bad_frame` has always been `refused` and these are its neighbours.
+    "bad_frame": ("refused", "bad_frame"),
+    "unknown_frame": ("refused", "unknown_frame"),
+    "protocol_mismatch": ("refused", "protocol_mismatch"),
+    "engagement_mismatch": ("refused", "engagement_mismatch"),
+    "bad_config": ("refused", "bad_config"),
+    "bad_identity": ("refused", "bad_identity"),
+    "stale_generation": ("refused", "stale_generation"),
     # An identity the extension's own liveness canary has declared dead: a
     # `register_identity` refusal, not a send refusal -- the one class this
     # table maps that never comes off `issue()`. See `send`'s
     # `except BridgeError` below.
     "identity_dead": ("unavailable", "identity_dead"),
+    # Nothing decided anything: no extension, no channel, no answer, no time.
     "not_configured": ("unavailable", "not_configured"),
     "bridge_lost": ("unavailable", "bridge_lost"),
     "transport_error": ("unavailable", "transport_error"),
