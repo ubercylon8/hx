@@ -2085,6 +2085,7 @@ exact moment hx worked as designed.
 from __future__ import annotations
 
 from ... import delta as delta_mod
+from ... import http_text
 from ... import issue as issue_mod
 from .. import envelope, live, registry, spec
 from ..errors import ToolRefused
@@ -2831,7 +2832,14 @@ def replay_as(ctx, *, exchange_id: str, identities,
             "surface.detail lists the exchanges this engagement holds.")
     req_blob, resp_blob, resp_len, status, method, url = row
     raw = ctx.blobs.get(req_blob)
-    base_body = ctx.blobs.get(resp_blob, resp_len) if resp_blob else b""
+    # THE BODY, NOT THE WHOLE RESPONSE, and the same rule `delta.baseline_for`
+    # follows for the same reason. Two replays of one request differ in their
+    # `Date:` and their per-session `Set-Cookie` even when the application
+    # returned byte-identical content -- so a comparison over whole responses
+    # reports an authorisation difference on every single call, which is the
+    # one answer this tool must never give wrongly.
+    base_raw = ctx.blobs.get(resp_blob, resp_len) if resp_blob else b""
+    _head, base_body = http_text.split_head_body(base_raw)
 
     scheme, host, port, path = _parts_of(url, raw)
 
@@ -2864,9 +2872,9 @@ def replay_as(ctx, *, exchange_id: str, identities,
         rows.append({
             "identity": name, "digest": _digest(ctx, issued), "refused": None,
             "diff_vs_original": delta_mod.against(
-                status, base_body, issued.status, issued.response),
+                status, base_body, issued.status, issued.body),
             "differs": (status != issued.status
-                        or base_body != issued.response),
+                        or base_body != issued.body),
         })
     return envelope.page(rows, total=len(rows), limit=envelope.MAX_LIMIT,
                          facets={"original": exchange_id,
