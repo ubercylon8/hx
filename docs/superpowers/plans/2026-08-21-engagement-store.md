@@ -6207,7 +6207,23 @@ def mcp(root) -> None:
     from hx.tools.adapters import mcp as mcp_adapter
 
     eng = _open_engagement(root or default_root())
-    mcp_adapter.serve(eng)
+    # S7 AGAIN, AND THIS COMMAND NEEDS IT MOST. `serve` holds the session on an
+    # `ExitStack`, which unwinds on a return, an exception, or the agent closing
+    # the pipe -- but NOT on SIGTERM, whose default disposition ends the process
+    # without running a single `__exit__`. `hx mcp` is the one command built to
+    # hold a Burp open for a whole conversation, so it is the one most likely to
+    # be running under a service manager or a container and the one most likely
+    # to be stopped by `docker stop` or a redeploy: exactly the signal that
+    # leaves a 900 MB JVM and a bridge socket behind.
+    #
+    # `run.reap_stale` does not save this. It marks run rows stale; it never
+    # kills a process, so nothing downstream recovers the orphan.
+    #
+    # `capture_start` has carried this wrapper since S7 was written. Its absence
+    # here made `mcp.py`'s own docstring -- "ANY exit from `serve` ... unwinds
+    # [the stack]" -- false for the single exit that matters in production.
+    with _sigterm_ends_the_session():
+        mcp_adapter.serve(eng)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**

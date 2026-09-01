@@ -10,6 +10,7 @@ Those are questions about this layer and not about `hx.issue`.
 import pytest
 
 from hx.tools import dispatch as dispatch_mod
+from hx.tools import envelope
 from hx.tools import impl  # noqa: F401 -- registers every tool
 from hx.bridge.server import BridgeError
 
@@ -1220,3 +1221,45 @@ def test_neither_identities_nor_anonymous_is_refused_before_any_send(
     assert env.outcome == "refused"
     assert env.reason == "bad_args"
     assert len(ctx.session.bridge.requests) == before
+
+
+def test_grep_hands_page_at_most_one_page_of_rows(tool_run, monkeypatch):
+    """THE OBSERVABLE PROPERTY IS HOW MANY ROWS ARE BUILT, not how many come
+    back -- and the first version of this test missed exactly that.
+
+    It asserted `returned <= MAX_LIMIT` and `truncated is True`, which
+    `envelope.page` guarantees whether or not the loop is bounded: it
+    truncates AFTER being handed the list. MEASURED -- with the bound removed
+    the whole file stayed green, so the test was pinning `page`'s behaviour
+    and not this function's. The list handed TO `page` is the thing that grows
+    with the traffic, so that is what this intercepts.
+
+    Why it matters: a one-character literal against a large stored body is
+    millions of dicts, each carrying up to 2 x context_bytes of decoded text,
+    assembled in the single long-lived process that also holds this
+    engagement's Burp, its run state and the operator's halt path. Same
+    resource-exhaustion class that banned regex here, reached through match
+    COUNT rather than backtracking."""
+    body = b"HTTP/1.1 200 OK\r\n\r\n" + (b"x" * 2000)
+    ctx = _with_session(tool_run, [sent_result(body)])
+    xid = _one_exchange_on(ctx, body, path="/many")
+
+    handed = {}
+    real_page = envelope.page
+
+    def spy(rows, **kw):
+        handed["rows"] = len(rows)
+        handed["total"] = kw.get("total")
+        return real_page(rows, **kw)
+
+    monkeypatch.setattr("hx.tools.impl.http.envelope.page", spy)
+    env = dispatch_mod.dispatch(ctx, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "x"})
+    assert env.outcome == "ok"
+    # AT MOST one page plus the single extra row `page` uses to know there is
+    # more. Unbounded, this is the 2000+ matches in the body.
+    assert handed["rows"] <= envelope.MAX_LIMIT + 1, handed
+    # ...and the count is still exact, because counting is an integer. A
+    # truncated page under-reporting its total would tell an agent it had seen
+    # everything.
+    assert handed["total"] >= 2000, handed

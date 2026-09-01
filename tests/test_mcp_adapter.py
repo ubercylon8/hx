@@ -301,3 +301,48 @@ def test_hx_mcp_subprocess_writes_only_two_json_rpc_lines_to_real_stdout(
     assert first["result"]["protocolVersion"] == mcp.PROTOCOL_VERSION
     assert second["jsonrpc"] == "2.0" and second["id"] == 2
     assert len(second["result"]["tools"]) == 17
+
+
+def test_hx_mcp_installs_the_sigterm_handler_before_it_serves(tmp_path,
+                                                              monkeypatch):
+    """S7: a Burp process is never orphaned -- and `hx mcp` is the command
+    most exposed to the signal that orphans one.
+
+    `serve` holds the session on an `ExitStack`, which unwinds on a return, an
+    exception, or the agent closing the pipe. SIGTERM runs none of those: its
+    default disposition ends the process without a single `__exit__`. This is
+    the one command built to hold a Burp open for a whole conversation, so it
+    is the one most likely to be under a service manager and the one most
+    likely to be stopped by `docker stop` or a redeploy.
+
+    `run.reap_stale` does not cover it -- it marks run rows stale and never
+    kills a process. `capture_start` has carried the wrapper since S7 was
+    written; this asserts `mcp` does too, by observing the handler that is
+    installed AT THE MOMENT `serve` runs rather than by reading the source.
+    """
+    import signal
+    from click.testing import CliRunner
+
+    from hx import cli
+    from hx.tools.adapters import mcp as mcp_adapter
+
+    seen = {}
+
+    def fake_serve(engagement):
+        seen["handler"] = signal.getsignal(signal.SIGTERM)
+
+    monkeypatch.setattr(mcp_adapter, "serve", fake_serve)
+    made = CliRunner().invoke(cli.main, [
+        "new", "acme-2026-09", "--client", "Acme Corp",
+        "--scope", "https://app.acme.com/*", "--root", str(tmp_path)])
+    assert made.exit_code == 0, made.output
+    result = CliRunner().invoke(
+        cli.main, ["mcp", "--root", str(tmp_path / "acme-2026-09")])
+    assert result.exit_code == 0, result.output
+
+    installed = seen.get("handler")
+    assert installed is not None, "serve was never reached"
+    # NOT the default, and not "ignore" either: something of this process's own
+    # must be standing between a SIGTERM and an orphaned JVM.
+    assert installed not in (signal.SIG_DFL, signal.SIG_IGN), installed
+    assert callable(installed)

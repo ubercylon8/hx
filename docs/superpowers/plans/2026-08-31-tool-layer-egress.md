@@ -2538,6 +2538,7 @@ Those are questions about this layer and not about `hx.issue`.
 import pytest
 
 from hx.tools import dispatch as dispatch_mod
+from hx.tools import envelope
 from hx.tools import impl  # noqa: F401 -- registers every tool
 from hx.bridge.server import BridgeError
 
@@ -3748,6 +3749,48 @@ def test_neither_identities_nor_anonymous_is_refused_before_any_send(
     assert env.outcome == "refused"
     assert env.reason == "bad_args"
     assert len(ctx.session.bridge.requests) == before
+
+
+def test_grep_hands_page_at_most_one_page_of_rows(tool_run, monkeypatch):
+    """THE OBSERVABLE PROPERTY IS HOW MANY ROWS ARE BUILT, not how many come
+    back -- and the first version of this test missed exactly that.
+
+    It asserted `returned <= MAX_LIMIT` and `truncated is True`, which
+    `envelope.page` guarantees whether or not the loop is bounded: it
+    truncates AFTER being handed the list. MEASURED -- with the bound removed
+    the whole file stayed green, so the test was pinning `page`'s behaviour
+    and not this function's. The list handed TO `page` is the thing that grows
+    with the traffic, so that is what this intercepts.
+
+    Why it matters: a one-character literal against a large stored body is
+    millions of dicts, each carrying up to 2 x context_bytes of decoded text,
+    assembled in the single long-lived process that also holds this
+    engagement's Burp, its run state and the operator's halt path. Same
+    resource-exhaustion class that banned regex here, reached through match
+    COUNT rather than backtracking."""
+    body = b"HTTP/1.1 200 OK\r\n\r\n" + (b"x" * 2000)
+    ctx = _with_session(tool_run, [sent_result(body)])
+    xid = _one_exchange_on(ctx, body, path="/many")
+
+    handed = {}
+    real_page = envelope.page
+
+    def spy(rows, **kw):
+        handed["rows"] = len(rows)
+        handed["total"] = kw.get("total")
+        return real_page(rows, **kw)
+
+    monkeypatch.setattr("hx.tools.impl.http.envelope.page", spy)
+    env = dispatch_mod.dispatch(ctx, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "x"})
+    assert env.outcome == "ok"
+    # AT MOST one page plus the single extra row `page` uses to know there is
+    # more. Unbounded, this is the 2000+ matches in the body.
+    assert handed["rows"] <= envelope.MAX_LIMIT + 1, handed
+    # ...and the count is still exact, because counting is an integer. A
+    # truncated page under-reporting its total would tell an agent it had seen
+    # everything.
+    assert handed["total"] >= 2000, handed
 ```
 
 - [ ] **Step 2: Run to watch it fail**
@@ -4193,6 +4236,19 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
     considered = exchange_ids[:MAX_EXCHANGES]
     rows, unreadable = [], []
     any_readable = False
+    # COUNTED IN FULL, MATERIALISED UP TO ONE PAGE. `page` truncates AFTER
+    # being handed the list, so building every match first made the row list a
+    # function of the traffic rather than of the limit: a one-character
+    # literal against fifty stored bodies is millions of dicts, each carrying
+    # up to 2 x `context_bytes` of decoded text, assembled in the single
+    # long-lived process that also holds this engagement's Burp, its run state
+    # and the operator's halt path.
+    #
+    # THE SAME HAZARD CLASS THAT BANNED REGEX HERE, reached through match
+    # COUNT rather than through backtracking -- so it deserves the same
+    # answer rather than a second argument. `total` stays exact because
+    # counting is an integer; only the row bodies stop.
+    total = 0
     for xid in considered:
         found = _blobs_for(ctx, xid, part)
         if found is None:
@@ -4203,14 +4259,19 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
             hay = data.lower() if ignore_case else data
             at = hay.find(needle)
             while at != -1:
-                start = max(0, at - context_bytes)
-                end = min(len(data), at + len(needle) + context_bytes)
-                rows.append({
-                    "exchange_id": xid, "part": part_name, "offset": at,
-                    "before": data[start:at].decode(TEXT),
-                    "match": data[at:at + len(needle)].decode(TEXT),
-                    "after": data[at + len(needle):end].decode(TEXT),
-                })
+                total += 1
+                # One past the limit: that extra row is how `page` knows there
+                # is more, and it is the only reason to keep collecting after
+                # `MAX_LIMIT`.
+                if len(rows) <= envelope.MAX_LIMIT:
+                    start = max(0, at - context_bytes)
+                    end = min(len(data), at + len(needle) + context_bytes)
+                    rows.append({
+                        "exchange_id": xid, "part": part_name, "offset": at,
+                        "before": data[start:at].decode(TEXT),
+                        "match": data[at:at + len(needle)].decode(TEXT),
+                        "after": data[at + len(needle):end].decode(TEXT),
+                    })
                 at = hay.find(needle, at + len(needle))
     if considered and not any_readable:
         raise ToolUnavailable(
@@ -4222,7 +4283,7 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
     # is not an exchange with no matches, and section 12's rule -- a report
     # that cannot tell "tested, clean" from "never reached" is worse than no
     # report -- is exactly as true of one envelope as of a whole engagement.
-    return envelope.page(rows, total=len(rows), limit=envelope.MAX_LIMIT,
+    return envelope.page(rows, total=total, limit=envelope.MAX_LIMIT,
                          facets={"unreadable": unreadable,
                                  "searched": len(considered)})
 
@@ -6048,6 +6109,51 @@ def test_hx_mcp_subprocess_writes_only_two_json_rpc_lines_to_real_stdout(
     assert first["result"]["protocolVersion"] == mcp.PROTOCOL_VERSION
     assert second["jsonrpc"] == "2.0" and second["id"] == 2
     assert len(second["result"]["tools"]) == 17
+
+
+def test_hx_mcp_installs_the_sigterm_handler_before_it_serves(tmp_path,
+                                                              monkeypatch):
+    """S7: a Burp process is never orphaned -- and `hx mcp` is the command
+    most exposed to the signal that orphans one.
+
+    `serve` holds the session on an `ExitStack`, which unwinds on a return, an
+    exception, or the agent closing the pipe. SIGTERM runs none of those: its
+    default disposition ends the process without a single `__exit__`. This is
+    the one command built to hold a Burp open for a whole conversation, so it
+    is the one most likely to be under a service manager and the one most
+    likely to be stopped by `docker stop` or a redeploy.
+
+    `run.reap_stale` does not cover it -- it marks run rows stale and never
+    kills a process. `capture_start` has carried the wrapper since S7 was
+    written; this asserts `mcp` does too, by observing the handler that is
+    installed AT THE MOMENT `serve` runs rather than by reading the source.
+    """
+    import signal
+    from click.testing import CliRunner
+
+    from hx import cli
+    from hx.tools.adapters import mcp as mcp_adapter
+
+    seen = {}
+
+    def fake_serve(engagement):
+        seen["handler"] = signal.getsignal(signal.SIGTERM)
+
+    monkeypatch.setattr(mcp_adapter, "serve", fake_serve)
+    made = CliRunner().invoke(cli.main, [
+        "new", "acme-2026-09", "--client", "Acme Corp",
+        "--scope", "https://app.acme.com/*", "--root", str(tmp_path)])
+    assert made.exit_code == 0, made.output
+    result = CliRunner().invoke(
+        cli.main, ["mcp", "--root", str(tmp_path / "acme-2026-09")])
+    assert result.exit_code == 0, result.output
+
+    installed = seen.get("handler")
+    assert installed is not None, "serve was never reached"
+    # NOT the default, and not "ignore" either: something of this process's own
+    # must be standing between a SIGTERM and an orphaned JVM.
+    assert installed not in (signal.SIG_DFL, signal.SIG_IGN), installed
+    assert callable(installed)
 ```
 
 - [ ] **Step 2: Run to watch it fail**

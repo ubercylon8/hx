@@ -99,3 +99,34 @@ def test_redaction_leaves_ordinary_strings_alone():
     would corrupt the journal's account of what was tried."""
     for benign in ["needle", "/a?b=c", "GET", "", "not a url, just prose"]:
         assert journal._redacted(benign) == benign
+
+
+@pytest.mark.parametrize("raw,secret", [
+    ("field=1\r\nCookie: session=SEKRIT\r\nother=3", "SEKRIT"),
+    ("a=1\nAuthorization: Bearer SEKRIT", "SEKRIT"),
+    ("x=1\r\nProxy-Authorization: Basic SEKRIT\r\ny=2", "SEKRIT"),
+])
+def test_a_credential_on_a_later_line_is_redacted(raw, secret):
+    """THE ANCHORED VERSION MISSED THE SHAPE `http.send` ALREADY SHIPS.
+    `headers` arrives as separate array items, so line one was always the
+    whole string and `.match` sufficed. A `body` is one free string, and an
+    agent replaying a captured request by hand puts a whole request in it --
+    credential on line two, nothing looking past line one.
+
+    This was recorded in DECISIONS.md as debt against a hypothetical FUTURE
+    tool taking a raw request string. The tool exists; it is `http.send`."""
+    got = journal._redacted(raw)
+    assert secret not in got
+    assert "{{observed:" in got
+
+
+def test_redaction_keeps_the_lines_around_a_credential():
+    """Only the matched LINES go. A journal that dropped the rest of a body
+    would answer "what did I already try" with a request that was never
+    made."""
+    got = journal._redacted("field=1\r\nCookie: session=SEKRIT\r\nother=3")
+    assert "field=1" in got and "other=3" in got
+    # And no stray CR left inside the value that replaced the line: MULTILINE's
+    # `$` matches before the `\n` but not before the `\r`.
+    assert "\r\r" not in got
+    assert got.count("\r\n") == 2

@@ -1767,9 +1767,20 @@ SUMMARY_MAX = 300
 #: tuple: it is already pinned byte for byte against the extension's own
 #: `Redactor.CREDENTIAL_HEADERS`, and a second copy is a second thing to keep
 #: in sync with the JVM.
+#: PER LINE, ANYWHERE IN THE STRING -- not anchored at position 0. The
+#: anchored `.match` version covered `headers` (whose lines arrive as separate
+#: array items) and missed the shape `http.send` ALREADY SHIPS: a `body` is a
+#: free string, and an agent replaying a captured request by hand puts a whole
+#: request in one -- `"field=1\r\nCookie: session=<real>"` -- where the
+#: credential is on line two and nothing looked past line one. That was
+#: recorded as debt against a hypothetical FUTURE tool; the tool exists.
+#:
+#: `[^\r\n]*` rather than `.*`: MULTILINE's `$` matches before the `\n` but
+#: not before the `\r`, so `.*` would keep a trailing CR inside the value it
+#: was replacing and leave a stray one in the row.
 _CREDENTIAL_LINE = re.compile(
-    r"[ \t]*(" + "|".join(re.escape(h) for h in CREDENTIAL_HEADERS)
-    + r")[ \t]*:", re.IGNORECASE)
+    r"^[ \t]*(" + "|".join(re.escape(h) for h in CREDENTIAL_HEADERS)
+    + r")[ \t]*:[^\r\n]*", re.IGNORECASE | re.MULTILINE)
 
 def _placeholder(name: str) -> str:
     """What replaces a credential header's VALUE.
@@ -1815,10 +1826,13 @@ def _redacted(value: Any) -> Any:
     URLs. Found by the first automated review this repository completed.
     """
     if isinstance(value, str):
-        found = _CREDENTIAL_LINE.match(value)
-        if found is None:
-            return redact_url(value)
-        return f"{found.group(1)}: {_placeholder(found.group(1))}"
+        # `sub`, not `match`: one string can carry several credential lines and
+        # can carry them beside content worth keeping. Replacing only the
+        # matched LINES leaves the rest of a body intact, so the journal still
+        # answers "what did I already try" with the request that was made.
+        redacted = _CREDENTIAL_LINE.sub(
+            lambda m: f"{m.group(1)}: {_placeholder(m.group(1))}", value)
+        return redact_url(redacted)
     if isinstance(value, dict):
         return {key: _redacted(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

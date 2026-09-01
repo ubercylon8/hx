@@ -433,6 +433,19 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
     considered = exchange_ids[:MAX_EXCHANGES]
     rows, unreadable = [], []
     any_readable = False
+    # COUNTED IN FULL, MATERIALISED UP TO ONE PAGE. `page` truncates AFTER
+    # being handed the list, so building every match first made the row list a
+    # function of the traffic rather than of the limit: a one-character
+    # literal against fifty stored bodies is millions of dicts, each carrying
+    # up to 2 x `context_bytes` of decoded text, assembled in the single
+    # long-lived process that also holds this engagement's Burp, its run state
+    # and the operator's halt path.
+    #
+    # THE SAME HAZARD CLASS THAT BANNED REGEX HERE, reached through match
+    # COUNT rather than through backtracking -- so it deserves the same
+    # answer rather than a second argument. `total` stays exact because
+    # counting is an integer; only the row bodies stop.
+    total = 0
     for xid in considered:
         found = _blobs_for(ctx, xid, part)
         if found is None:
@@ -443,14 +456,19 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
             hay = data.lower() if ignore_case else data
             at = hay.find(needle)
             while at != -1:
-                start = max(0, at - context_bytes)
-                end = min(len(data), at + len(needle) + context_bytes)
-                rows.append({
-                    "exchange_id": xid, "part": part_name, "offset": at,
-                    "before": data[start:at].decode(TEXT),
-                    "match": data[at:at + len(needle)].decode(TEXT),
-                    "after": data[at + len(needle):end].decode(TEXT),
-                })
+                total += 1
+                # One past the limit: that extra row is how `page` knows there
+                # is more, and it is the only reason to keep collecting after
+                # `MAX_LIMIT`.
+                if len(rows) <= envelope.MAX_LIMIT:
+                    start = max(0, at - context_bytes)
+                    end = min(len(data), at + len(needle) + context_bytes)
+                    rows.append({
+                        "exchange_id": xid, "part": part_name, "offset": at,
+                        "before": data[start:at].decode(TEXT),
+                        "match": data[at:at + len(needle)].decode(TEXT),
+                        "after": data[at + len(needle):end].decode(TEXT),
+                    })
                 at = hay.find(needle, at + len(needle))
     if considered and not any_readable:
         raise ToolUnavailable(
@@ -462,7 +480,7 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
     # is not an exchange with no matches, and section 12's rule -- a report
     # that cannot tell "tested, clean" from "never reached" is worse than no
     # report -- is exactly as true of one envelope as of a whole engagement.
-    return envelope.page(rows, total=len(rows), limit=envelope.MAX_LIMIT,
+    return envelope.page(rows, total=total, limit=envelope.MAX_LIMIT,
                          facets={"unreadable": unreadable,
                                  "searched": len(considered)})
 
