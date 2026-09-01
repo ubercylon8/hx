@@ -430,7 +430,26 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
         raise ToolRefused("bad_args", str(exc)) from exc
     if ignore_case:
         needle = needle.lower()
-    considered = exchange_ids[:MAX_EXCHANGES]
+    # REFUSES RATHER THAN SLICING, the same shape `replay_as` uses one
+    # function below and for the same reason. The schema's `maxItems` already
+    # holds this, so the guard is unreachable through `dispatch` -- but a
+    # SLICE is the wrong shape for a bound in a layer whose envelopes may not
+    # truncate silently: it would search the first fifty, report on those, and
+    # return a complete-looking answer that never looked at the rest.
+    #
+    # A review asked for a test of the slice instead, noting that deleting it
+    # kept the suite green. It did -- and a test driving it would have been
+    # pinning dead code, because the schema refuses first. A constants test
+    # was tried and was VACUOUS: `maxItems` IS `MAX_EXCHANGES`, so it asserted
+    # a constant equals itself. Making the guard refuse gives it a reachable
+    # behaviour worth asserting, against the handler directly.
+    if len(exchange_ids) > MAX_EXCHANGES:
+        raise ToolRefused(
+            "bad_args",
+            f"{len(exchange_ids)} exchanges is more than the "
+            f"{MAX_EXCHANGES} one grep reads into memory at once. Split the "
+            "call.")
+    considered = list(exchange_ids)
     rows, unreadable = [], []
     any_readable = False
     # COUNTED IN FULL, MATERIALISED UP TO ONE PAGE. `page` truncates AFTER

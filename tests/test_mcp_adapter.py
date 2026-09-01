@@ -346,3 +346,57 @@ def test_hx_mcp_installs_the_sigterm_handler_before_it_serves(tmp_path,
     # must be standing between a SIGTERM and an orphaned JVM.
     assert installed not in (signal.SIG_DFL, signal.SIG_IGN), installed
     assert callable(installed)
+
+
+def test_a_real_sigterm_unwinds_what_serve_was_holding(tmp_path, monkeypatch):
+    """THE TEST ABOVE PROVES A HANDLER IS INSTALLED; THIS ONE PROVES IT WORKS.
+
+    A review made the distinction and it is a fair one: installation is not
+    teardown, and a regression that broke propagation -- a bare `except
+    BaseException` swallowing the KeyboardInterrupt inside the loop, say --
+    would leave the first test green and a JVM running.
+
+    So this fires an actual SIGTERM at this process from inside the wrapped
+    call, out of a stand-in shaped like `serve`'s own body: an `ExitStack`
+    holding a cleanup, exactly where `serve` holds the Burp session. The
+    assertion is that the cleanup RAN. What is under test is the chain --
+    signal -> KeyboardInterrupt -> `with` unwinds -- rather than any part of
+    it in isolation.
+    """
+    import os
+    import contextlib
+    import signal
+    from click.testing import CliRunner
+
+    from hx import cli
+    from hx.tools.adapters import mcp as mcp_adapter
+
+    torn_down = []
+
+    def fake_serve(engagement):
+        # `serve`'s shape: a stack holding what must not outlive this call.
+        with contextlib.ExitStack() as stack:
+            stack.callback(torn_down.append, "the session")
+            os.kill(os.getpid(), signal.SIGTERM)
+            # Reached only if the signal did NOT become an exception, which
+            # is the regression this test exists to catch.
+            torn_down.append("SIGTERM DID NOT INTERRUPT")
+
+    monkeypatch.setattr(mcp_adapter, "serve", fake_serve)
+    made = CliRunner().invoke(cli.main, [
+        "new", "acme-2026-09", "--client", "Acme Corp",
+        "--scope", "https://app.acme.com/*", "--root", str(tmp_path)])
+    assert made.exit_code == 0, made.output
+
+    before = signal.getsignal(signal.SIGTERM)
+    CliRunner().invoke(cli.main, ["mcp", "--root", str(tmp_path / "acme-2026-09")])
+
+    assert "SIGTERM DID NOT INTERRUPT" not in torn_down, torn_down
+    assert torn_down == ["the session"], torn_down
+    # AND THE HANDLER IS RESTORED, asserted against the one that was there
+    # BEFORE rather than against a shape. `callable(getsignal(...))` was the
+    # first spelling and proves nothing -- almost anything satisfies it,
+    # including the handler this command installed and failed to remove.
+    assert signal.getsignal(signal.SIGTERM) is before, (
+        "hx mcp left its own SIGTERM handler installed; a later signal is the "
+        "operator's to handle, not this command's")

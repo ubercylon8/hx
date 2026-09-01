@@ -82,8 +82,24 @@ SUMMARY_MAX = 300
 #: `[^\r\n]*` rather than `.*`: MULTILINE's `$` matches before the `\n` but
 #: not before the `\r`, so `.*` would keep a trailing CR inside the value it
 #: was replacing and leave a stray one in the row.
+#: `(?:^|(?<=\r))` rather than `^` alone: Python's MULTILINE `^` treats only
+#: `\n` as a line boundary, and CR is a line terminator in HTTP. A request
+#: split on bare CR -- which RFC 9112 s2.2 requires a recipient to tolerate,
+#: and which `hx.http_text.split_head_body` tolerates for exactly that reason
+#: -- puts a credential at a real line start that `^` does not recognise.
+#: MEASURED: `"field=1\rCookie: session=<real>"` reached `args_blob` intact.
+#: `\r\n` cannot double-match: after the CR sits the LF, which `[ \t]*` will
+#: not cross, so only the MULTILINE `^` after the LF fires.
+#:
+#: MID-LINE OCCURRENCES ARE DELIBERATELY NOT MATCHED, and that is a decision
+#: rather than the same gap unfixed. `"the Cookie: header was odd"` is prose,
+#: `"a=1; Cookie: b"` is a form field, and neither is a header line; a
+#: redactor that fired on either would corrupt the journal's account of what
+#: was tried, which is the one thing it exists to preserve. A test pins that
+#: inertness. What is guarded is a credential at a LINE START, in any of the
+#: three spellings a line can start with.
 _CREDENTIAL_LINE = re.compile(
-    r"^[ \t]*(" + "|".join(re.escape(h) for h in CREDENTIAL_HEADERS)
+    r"(?:^|(?<=\r))[ \t]*(" + "|".join(re.escape(h) for h in CREDENTIAL_HEADERS)
     + r")[ \t]*:[^\r\n]*", re.IGNORECASE | re.MULTILINE)
 
 def _placeholder(name: str) -> str:

@@ -1263,3 +1263,25 @@ def test_grep_hands_page_at_most_one_page_of_rows(tool_run, monkeypatch):
     # truncated page under-reporting its total would tell an agent it had seen
     # everything.
     assert handed["total"] >= 2000, handed
+
+
+def test_more_exchanges_than_the_bound_is_refused_not_silently_truncated(
+        tool_run):
+    """The schema's `maxItems` already holds this, so the handler's own guard
+    is unreachable through `dispatch` -- which is why it is asserted against
+    the handler directly, exactly as `replay_as`'s bound is.
+
+    A SLICE was the wrong shape: it would search the first fifty, report on
+    those, and return a complete-looking answer that never looked at the rest
+    -- silent truncation, in a layer whose envelopes are not allowed it. The
+    constants test tried first was vacuous (`maxItems` IS `MAX_EXCHANGES`, so
+    it asserted a constant equals itself); a reachable refusal is what makes
+    this assertable at all."""
+    from hx.tools.errors import ToolRefused
+    from hx.tools.impl import http as http_impl
+
+    too_many = [f"x-{i:04d}" for i in range(http_impl.MAX_EXCHANGES + 1)]
+    with pytest.raises(ToolRefused) as exc:
+        http_impl.grep(tool_run, exchange_ids=too_many, pattern="needle")
+    assert exc.value.reason == "bad_args"
+    assert str(http_impl.MAX_EXCHANGES) in str(exc.value)

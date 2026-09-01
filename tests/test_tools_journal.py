@@ -130,3 +130,33 @@ def test_redaction_keeps_the_lines_around_a_credential():
     # `$` matches before the `\n` but not before the `\r`.
     assert "\r\r" not in got
     assert got.count("\r\n") == 2
+
+
+@pytest.mark.parametrize("sep,label", [
+    ("\r", "bare CR -- a line terminator RFC 9112 s2.2 requires tolerating"),
+    ("\r\n", "CRLF"),
+    ("\n", "bare LF"),
+])
+def test_a_credential_after_any_line_terminator_is_redacted(sep, label):
+    """MULTILINE's `^` treats only `\\n` as a boundary, and CR ends a line in
+    HTTP. `hx.http_text.split_head_body` tolerates a bare CR for exactly that
+    reason, so a request split on one puts a credential at a real line start
+    that `^` alone does not see. MEASURED before the fix:
+    `"field=1\\rCookie: session=<real>"` reached args_blob intact."""
+    got = journal._redacted(f"field=1{sep}Cookie: session=SEKRIT")
+    assert "SEKRIT" not in got, label
+    assert "{{observed:cookie}}" in got
+
+
+@pytest.mark.parametrize("raw", [
+    "the Cookie: header was odd",
+    "a=1; Cookie: b",
+    "explaining why Authorization: matters",
+])
+def test_a_credential_name_that_does_not_start_a_line_is_left_alone(raw):
+    """NOT THE SAME GAP UNFIXED -- a decision. None of these is a header
+    line: they are prose and a form field. A redactor firing on them would
+    corrupt the journal's account of what was tried, which is the one thing
+    it exists to preserve. What is guarded is a credential at a LINE START,
+    in every spelling a line can start with."""
+    assert journal._redacted(raw) == raw
