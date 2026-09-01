@@ -63,19 +63,46 @@ jobs:
           # run was sandboxed in CI (heavy tool-permission denials, no comments posted);
           # the plain-prompt mode — the same one the @claude responder uses successfully —
           # gets the tool access it needs to read the diff and post findings.
+          # THIS PROMPT DESCRIBED A DIFFERENT PROJECT UNTIL 2026-09-01. These
+          # workflows were copied wholesale from ubercylon8/f0_sectools, which
+          # was the point -- the CI was meant to match it -- and the review
+          # prompt came with them, still naming f0_sectools' architecture and
+          # its CLAUDE.md rules. hx has no MCP servers, no agentskills.io
+          # skills and no core/gating, so every review since was grounded in
+          # invariants this repo does not have. Copying a workflow is safe;
+          # copying a PROMPT carries the other project's model of the world.
           prompt: |
             Do a security-focused code review of PR #${{ github.event.pull_request.number }}
-            in ${{ github.repository }}. This is f0_sectools: thin MCP servers + agentskills.io
-            skills that connect AI agents (esp. small local models) to security platforms.
-            Ground the review in the repo's CLAUDE.md Critical Rules:
-            - read-only by default; any state-changing (write) action must be gated
-              (config flag + per-action human confirmation + audit) and live in core/gating;
-            - secrets never leave the host or reach the model; redact before returning,
-              including error/exception paths;
-            - every tool returns the structured findings schema;
-            - tools must be small-model-safe (flat scalar args, short closed enums,
-              bounded/paginated output);
-            - correctness and test coverage of the changed logic.
+            in ${{ github.repository }}. hx is an agent-driven web application
+            security assessment harness that drives Burp Suite Community as an
+            engine. It runs against real client estates, so a defect here reaches
+            somebody's production application.
+            Ground the review in docs/DECISIONS.md and the master spec at
+            docs/superpowers/specs/2026-08-21-hx-design.md:
+            - EVERY BYTE that leaves this machine crosses one of two enforcement
+              points inside the JVM (spec section 4). Scope, rate, budget,
+              dangerous-path, method allowlist and credential redaction live in
+              the Java extension. Python must never gain an egress path or a
+              second place that decides any of them.
+            - DENY-ALL is the default and a halt is terminal. A change that makes
+              an unconfigured extension send, or a halt liftable from Python, is
+              the most serious thing you can find.
+            - A report that cannot distinguish "tested, clean" from "never
+              reached" is worse than no report (section 12). Anything that
+              collapses those two -- an outcome, a verdict, a count, a coverage
+              claim -- is a finding.
+            - A credential value never appears in config.yaml, in a rendered
+              report, in agent_action, or in any log or exception message.
+            - The agent may never write finding status confirmed or reported, and
+              the tool registry is an allowlist: what is not in it has no path.
+            - Engagement directories stay 0700 and blobs and the database 0600.
+            - hx never bundles or redistributes Burp.
+            - Correctness and test coverage of the changed logic -- and in
+              particular, A TEST THAT WOULD PASS WITH THE BUG PRESENT. This repo
+              has shipped several: a cap asserted against a value that never
+              reached it, a listing test asserting the opposite of its comment,
+              a wiring test blind to the argument it existed to check. Prefer
+              probing behaviour over reading assertions.
             Post findings as PR comments — a concise top-level summary plus inline comments
             where a specific line is at fault. If nothing significant, say so briefly.
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
