@@ -3214,6 +3214,43 @@ public class PolicyTest {
         //
         // The absolute figures are still PRINTED, because a reader chasing a
         // slow suite wants the milliseconds even when the ratio is fine.
+        //
+        // THE CEILING IS CALIBRATED TO THE SLOWEST MACHINE THIS SUITE RUNS ON,
+        // amended 2026-09-01, and 100 was calibrated to the fastest. The
+        // paragraphs above measured 54 on a 24-core desktop and set the
+        // ceiling at roughly 2x that -- but the suite also runs on GitHub's
+        // shared 2-4 vCPU runners, where it read 107 and 112 and went red on
+        // 3 of 12 runs with no Java change in the branch at all. That is the
+        // third time this check has been red for the machine rather than the
+        // code, and the paragraph above already names the cost: a reader
+        // trained to look past a red line looks past the one that matters.
+        //
+        // MEASURED THIS ROUND, all three machine classes:
+        //   24-core desktop, quiescent        55, 55, 56
+        //   the same, 24 busy threads         56, 77   (absolute 170-219 ms)
+        //   GitHub shared runner              107, 112
+        // The ratio is NOT machine-independent, which the earlier round hoped
+        // it would be: the costly path does 16 readings over 8 KB and a weak
+        // shared vCPU punishes it harder than it punishes the short reference,
+        // so the ratio rises as the machine gets worse. 250 is ~2.2x the worst
+        // figure observed anywhere, keeping the author's original 2x rule
+        // while applying it to the machine that actually fails.
+        //
+        // AND A MIN-OF-N ESTIMATOR WAS TRIED FIRST, because "use the least
+        // contended sample" is the obvious answer and it does not work here:
+        // measured under 24-thread load, min read 77 and 74 where the median
+        // read 75 and 56 -- sometimes worse, never better. Recorded so the
+        // next person reaching for it can skip the experiment.
+        //
+        // WHAT THIS CHECK IS WORTH, restated because a looser ceiling makes it
+        // fair to ask. It does not catch the defect it was written for -- the
+        // paragraph above measured the ratio UNCHANGED at 54 with the reading
+        // bound removed, and the deterministic `readingBudget` assertions
+        // earlier in this file are where that guarantee lives. What it catches
+        // is a change making the EXPENSIVE path disproportionately worse, and
+        // it catches that at 250 as well as at 100 for any regression worth a
+        // red line: a doubling of the costly path alone reads 220 on a desktop
+        // and over 250 on CI.
         String costly = "/\u2215\u2170\ufe52/D\uff0f2\u2216;%c2/.\u2170\u29f89\u0269/\uff05";
         StringBuilder costlyTiled = new StringBuilder();
         while (costlyTiled.length() + costly.length() <= Policy.MAX_TARGET_CHARS)
@@ -3252,8 +3289,8 @@ public class PolicyTest {
               + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath.length())).size()
               + " readings) is answered " + (cVerdict.allowed() ? "allow" : cVerdict.errorClass())
               + " at " + ratio + "x the cost of the same volume read cheaply ("
-              + (cNs / 1_000_000) + " ms vs " + (rNs / 1_000_000) + " ms)",
-              ratio < 100 && cVerdict != null);
+              + (cNs / 1_000) + " us vs " + (rNs / 1_000) + " us)",
+              ratio < 250 && cVerdict != null);
 
         // ...while a long BENIGN target is decided rather than refused: the
         // size bound must not turn into a length bound of its own.
