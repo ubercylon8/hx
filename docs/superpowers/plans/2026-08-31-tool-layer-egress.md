@@ -1724,7 +1724,7 @@ def test_an_identity_is_registered_once_per_generation(
     every send would fail on its second one."""
     monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
     tool_ctx.config = staff_identity_config
-    tool_ctx.session = type("S", (), {"bridge": FakeBridge([])})()
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge()})()
     tool_ctx._registered = set()
 
     first = live.ensure_identity(tool_ctx, "staff")
@@ -1740,7 +1740,7 @@ def test_the_credential_never_leaves_this_function(
     would put the secret into."""
     monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
     tool_ctx.config = staff_identity_config
-    tool_ctx.session = type("S", (), {"bridge": FakeBridge([])})()
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge()})()
     tool_ctx._registered = set()
     got = live.ensure_identity(tool_ctx, "staff")
     assert got == ("staff", 1)
@@ -1932,27 +1932,33 @@ from hx.tools import dispatch as dispatch_mod
 from hx.tools import impl  # noqa: F401 -- registers every tool
 from hx.bridge.server import BridgeError
 
-from .conftest import FakeBridge, fake_result
+from tests.test_probe import FakeBridge, sent_result
 
 
-def _with_session(ctx, bridge):
+def _with_session(ctx, replies=()):
     """A context whose session is a bridge and nothing else.
 
     The tools reach `ctx.session.bridge` and never anything else on the
     session, which is worth knowing when reading these: a `LiveSession`'s
     ports, workdir and `proc` belong to the bracket, not to a send.
+
+    `replies` is the queue `FakeBridge.replies` consumes, one per send. The
+    double is `tests/test_probe.py`'s -- the project has ONE, and a second
+    would be a second idea of what `BridgeServer.send` does.
     """
+    bridge = FakeBridge()
+    bridge.replies(list(replies))
     ctx.session = type("S", (), {"bridge": bridge})()
     return ctx
 
 
-def test_send_returns_the_digest_and_not_the_body(tool_ctx):
+def test_send_returns_the_digest_and_not_the_body(tool_run):
     """Principle 1, and the one assertion in this file that is about the
     product's shape rather than its plumbing. A body in the envelope would be
     journalled into `agent_action.result_summary` and would put a client's
     response bytes in a table that is read by whoever asks what the run did."""
     body = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>secret</h1>"
-    ctx = _with_session(tool_ctx, FakeBridge([fake_result(body)]))
+    ctx = _with_session(tool_run, [sent_result(body)])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
                                  "method": "GET", "path": "/a"},
@@ -1964,12 +1970,13 @@ def test_send_returns_the_digest_and_not_the_body(tool_ctx):
     assert b"secret" not in repr(env.result).encode()
 
 
-def test_a_scope_denial_is_refused_with_the_wires_own_class(tool_ctx):
+def test_a_scope_denial_is_refused_with_the_wires_own_class(tool_run):
     """Principle 6: the safety profile is enforced in the extension and the
     tool layer merely REPORTS what was refused. `error / internal` here would
     tell the agent hx is broken when in fact hx worked exactly as designed."""
-    ctx = _with_session(tool_ctx, FakeBridge(
-        [BridgeError("scope_denied: not in scope", error_class="scope_denied")]))
+    ctx = _with_session(tool_run,
+                        [BridgeError("scope_denied: not in scope",
+                                     error_class="scope_denied")])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "evil.test", "port": 80,
                                  "method": "GET", "path": "/a"},
@@ -1978,12 +1985,12 @@ def test_a_scope_denial_is_refused_with_the_wires_own_class(tool_ctx):
     assert env.reason == "scope_denied"
 
 
-def test_without_a_session_it_is_unavailable_not_an_error(tool_ctx):
+def test_without_a_session_it_is_unavailable_not_an_error(tool_run):
     """The dispatcher's own `needs_egress` guard, which Plan A shipped and
     nothing has ever reached until now: `http.send` is the first registered
     tool with the bit set."""
-    tool_ctx.session = None
-    env = dispatch_mod.dispatch(tool_ctx, "http.send",
+    tool_run.session = None
+    env = dispatch_mod.dispatch(tool_run, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
                                  "method": "GET", "path": "/a"},
                                 why="no session on purpose")
@@ -1991,30 +1998,30 @@ def test_without_a_session_it_is_unavailable_not_an_error(tool_ctx):
     assert env.reason == "no_session"
 
 
-def test_send_without_a_why_is_refused(tool_ctx):
+def test_send_without_a_why_is_refused(tool_run):
     """Principle 5. `http.send` mutates -- it puts bytes on a client's
     network -- so `missing_why` fires before anything reaches the wire."""
-    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    ctx = _with_session(tool_run, [sent_result()])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
                                  "method": "GET", "path": "/a"})
     assert env.outcome == "refused"
     assert env.reason == "missing_why"
-    assert ctx.session.bridge.sent == [], "a why-less send reached the wire"
+    assert ctx.session.bridge.requests == [], "a why-less send reached the wire"
 
 
-def test_send_is_refused_while_the_engagement_is_halted(tool_ctx):
+def test_send_is_refused_while_the_engagement_is_halted(tool_run):
     """An operator has hit STOP. `http.send` mutates and is not in
     HALT_EXEMPT, so the dispatcher refuses before the handler runs."""
-    tool_ctx.halt.halt("operator stopped the run")
-    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    tool_run.halt.halt("operator stopped the run")
+    ctx = _with_session(tool_run, [sent_result()])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
                                  "method": "GET", "path": "/a"},
                                 why="should never reach the wire")
     assert env.outcome == "refused"
     assert env.reason == "halted"
-    assert ctx.session.bridge.sent == []
+    assert ctx.session.bridge.requests == []
 
 
 @pytest.mark.parametrize("args", [
@@ -2031,32 +2038,32 @@ def test_send_is_refused_while_the_engagement_is_halted(tool_ctx):
     {"host": "127.0.0.1", "method": "GET", "path": "/a",
      "nonsense": 1},                                            # additionalProperties
 ])
-def test_bad_arguments_never_reach_the_wire(tool_ctx, args):
-    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+def test_bad_arguments_never_reach_the_wire(tool_run, args):
+    ctx = _with_session(tool_run, [sent_result()])
     env = dispatch_mod.dispatch(ctx, "http.send", args, why="malformed")
     assert env.outcome == "refused"
     assert env.reason == "bad_args"
-    assert ctx.session.bridge.sent == []
+    assert ctx.session.bridge.requests == []
 
 
-def test_a_path_carrying_crlf_is_refused_as_bad_args(tool_ctx):
+def test_a_path_carrying_crlf_is_refused_as_bad_args(tool_run):
     """`issue.request_bytes` raises ValueError for this, and the handler must
     turn it into `bad_args` rather than letting it become `error / internal`.
     An agent told hx is broken retries; one told its path is malformed fixes
     the path."""
-    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    ctx = _with_session(tool_run, [sent_result()])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
                                  "method": "GET", "path": "/a\r\nX: 1"},
                                 why="attempt a split")
     assert env.outcome == "refused"
     assert env.reason == "bad_args"
-    assert ctx.session.bridge.sent == []
+    assert ctx.session.bridge.requests == []
 
 
 def test_an_undeclared_identity_is_refused_and_names_the_declared_ones(
-        tool_ctx):
-    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+        tool_run):
+    ctx = _with_session(tool_run, [sent_result()])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
                                  "method": "GET", "path": "/a",
@@ -2065,13 +2072,13 @@ def test_an_undeclared_identity_is_refused_and_names_the_declared_ones(
     assert env.outcome == "refused"
     assert env.reason == "bad_args"
     assert "ghost" in (env.detail or "")
-    assert ctx.session.bridge.sent == []
+    assert ctx.session.bridge.requests == []
 
 
-def test_the_delta_is_null_when_the_surface_has_no_exemplar_yet(tool_ctx):
+def test_the_delta_is_null_when_the_surface_has_no_exemplar_yet(tool_run):
     """`null` and not a zero delta: nothing was compared, and a zero delta
     would read as 'identical to normal' about a comparison never made."""
-    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    ctx = _with_session(tool_run, [sent_result()])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
                                  "method": "GET", "path": "/brand-new"},
@@ -2079,14 +2086,14 @@ def test_the_delta_is_null_when_the_surface_has_no_exemplar_yet(tool_ctx):
     assert env.result["delta_vs_baseline"] is None
 
 
-def test_a_second_send_to_the_same_surface_gets_a_delta(tool_ctx):
+def test_a_second_send_to_the_same_surface_gets_a_delta(tool_run):
     """The first send becomes the surface's exemplar; the second is compared
     against it. This is the shape an agent actually uses: baseline, then
     payload."""
     first = b"HTTP/1.1 200 OK\r\n\r\nHello visitor"
     second = b"HTTP/1.1 200 OK\r\n\r\nHello hZq9xK"
-    ctx = _with_session(tool_ctx, FakeBridge(
-        [fake_result(first), fake_result(second)]))
+    ctx = _with_session(tool_run,
+                        [sent_result(first), sent_result(second)])
     args = {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/x"}
     dispatch_mod.dispatch(ctx, "http.send", args, why="baseline")
     env = dispatch_mod.dispatch(ctx, "http.send", args, why="payload")
@@ -2443,7 +2450,7 @@ Append to `tests/test_tools_http.py`:
 ```python
 def _one_exchange(ctx, body=b"HTTP/1.1 200 OK\r\n\r\nneedle in a haystack"):
     """Send one request through a fake bridge and return its exchange id."""
-    ctx = _with_session(ctx, FakeBridge([fake_result(body)]))
+    ctx = _with_session(ctx, [sent_result(body)])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
                                  "method": "GET", "path": "/hay"},
@@ -2451,11 +2458,11 @@ def _one_exchange(ctx, body=b"HTTP/1.1 200 OK\r\n\r\nneedle in a haystack"):
     return env.result["exchange_id"]
 
 
-def test_grep_finds_a_literal_and_reports_its_offset(tool_ctx):
+def test_grep_finds_a_literal_and_reports_its_offset(tool_run):
     """The offset is the whole point: `http.body(range)` is the escape hatch
     used AFTER a match yields one."""
-    xid = _one_exchange(tool_ctx)
-    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
                                 {"exchange_ids": [xid], "pattern": "needle"})
     assert env.outcome == "ok"
     row = env.result["rows"][0]
@@ -2465,49 +2472,49 @@ def test_grep_finds_a_literal_and_reports_its_offset(tool_ctx):
     assert "needle" in row["match"]
 
 
-def test_grep_that_matches_nothing_is_empty_not_ok(tool_ctx):
+def test_grep_that_matches_nothing_is_empty_not_ok(tool_run):
     """Principle 4. `empty` says the search ran and found nothing; `ok` with
     zero rows would be indistinguishable from a search that never ran."""
-    xid = _one_exchange(tool_ctx)
-    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
                                 {"exchange_ids": [xid], "pattern": "absent"})
     assert env.outcome == "empty"
 
 
-def test_grep_searches_the_request_when_asked(tool_ctx):
-    xid = _one_exchange(tool_ctx)
-    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+def test_grep_searches_the_request_when_asked(tool_run):
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
                                 {"exchange_ids": [xid], "pattern": "/hay",
                                  "part": "request"})
     assert env.outcome == "ok"
     assert env.result["rows"][0]["part"] == "request"
 
 
-def test_grep_needs_no_session(tool_ctx):
+def test_grep_needs_no_session(tool_run):
     """It reads the blob store, which is on this side. An agent that has
     finished its run can still read what it captured -- and a tool marked
     needs_egress would have refused that."""
-    xid = _one_exchange(tool_ctx)
-    tool_ctx.session = None
-    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+    xid = _one_exchange(tool_run)
+    tool_run.session = None
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
                                 {"exchange_ids": [xid], "pattern": "needle"})
     assert env.outcome == "ok"
 
 
-def test_grep_reports_which_exchanges_it_could_not_read(tool_ctx):
+def test_grep_reports_which_exchanges_it_could_not_read(tool_run):
     """Section 12 inside one envelope. An exchange whose blob is missing is
     not an exchange with no matches, and a facet that said `0 matches` about
     both would be the report that cannot distinguish tested from unreached."""
-    xid = _one_exchange(tool_ctx)
-    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
                                 {"exchange_ids": [xid, "x-nonexistent"],
                                  "pattern": "needle"})
     assert env.result["facets"]["unreadable"] == ["x-nonexistent"]
 
 
-def test_body_returns_a_bounded_range_and_the_total(tool_ctx):
-    xid = _one_exchange(tool_ctx)
-    env = dispatch_mod.dispatch(tool_ctx, "http.body",
+def test_body_returns_a_bounded_range_and_the_total(tool_run):
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.body",
                                 {"exchange_id": xid, "start": 0, "length": 8})
     assert env.outcome == "ok"
     assert len(env.result["bytes"]) == 8
@@ -2537,8 +2544,8 @@ def test_body_past_the_end_answers_ok_with_zero_length_and_the_real_total(
     assert env.result["total"] > 0
 
 
-def test_body_of_an_unknown_exchange_is_refused(tool_ctx):
-    env = dispatch_mod.dispatch(tool_ctx, "http.body",
+def test_body_of_an_unknown_exchange_is_refused(tool_run):
+    env = dispatch_mod.dispatch(tool_run, "http.body",
                                 {"exchange_id": "x-nope", "start": 0,
                                  "length": 8})
     assert env.outcome == "refused"
@@ -2546,14 +2553,14 @@ def test_body_of_an_unknown_exchange_is_refused(tool_ctx):
 
 
 def test_a_binary_body_round_trips_rather_than_becoming_question_marks(
-        tool_ctx):
+        tool_run):
     """Latin-1 is chosen for exactly this: every byte maps to one character
     and back. A UTF-8 decode with `errors='replace'` would turn a binary
     body into a string of U+FFFD an agent then greps for a payload it can
     never find."""
     raw = b"HTTP/1.1 200 OK\r\n\r\n\x00\x80\xff\xfe"
-    xid = _one_exchange(tool_ctx, raw)
-    env = dispatch_mod.dispatch(tool_ctx, "http.body",
+    xid = _one_exchange(tool_run, raw)
+    env = dispatch_mod.dispatch(tool_run, "http.body",
                                 {"exchange_id": xid, "start": 0,
                                  "length": 64, "part": "response"})
     assert env.result["bytes"].encode("latin-1") == raw
@@ -2758,15 +2765,15 @@ Append to `tests/test_tools_http.py`:
 
 ```python
 def test_replay_as_returns_one_row_per_identity_plus_the_baseline(
-        tool_ctx, staff_identity_config, monkeypatch):
+        tool_run, staff_identity_config, monkeypatch):
     """The shape an authz finding is written from: same request, several
     sessions, one column of differences."""
     monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
-    tool_ctx.config = staff_identity_config
+    tool_run.config = staff_identity_config
     ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
     denied = b"HTTP/1.1 403 Forbidden\r\n\r\nno"
-    ctx = _with_session(tool_ctx, FakeBridge(
-        [fake_result(ok), fake_result(denied, status=403)]))
+    ctx = _with_session(tool_run,
+                        [sent_result(ok), sent_result(denied, status=403)])
     xid = _one_exchange_on(ctx, ok, path="/admin")
 
     env = dispatch_mod.dispatch(
@@ -2781,12 +2788,12 @@ def test_replay_as_returns_one_row_per_identity_plus_the_baseline(
 
 
 def test_include_anonymous_adds_an_unauthenticated_row(
-        tool_ctx, staff_identity_config, monkeypatch):
+        tool_run, staff_identity_config, monkeypatch):
     """Its own boolean, not a magic identity name. The unauthenticated
     comparison is the single most valuable row in an authz table, and a
     reserved string could collide with a name an operator declared."""
     monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
-    tool_ctx.config = staff_identity_config
+    tool_run.config = staff_identity_config
     ...
     env = dispatch_mod.dispatch(
         ctx, "http.replay_as",
@@ -2796,19 +2803,19 @@ def test_include_anonymous_adds_an_unauthenticated_row(
     assert [r["identity"] for r in env.result["rows"]] == ["staff", None]
 
 
-def test_replay_of_an_unknown_exchange_is_refused_before_any_send(tool_ctx):
-    ctx = _with_session(tool_ctx, FakeBridge([]))
+def test_replay_of_an_unknown_exchange_is_refused_before_any_send(tool_run):
+    ctx = _with_session(tool_run, [])
     env = dispatch_mod.dispatch(ctx, "http.replay_as",
                                 {"exchange_id": "x-nope",
                                  "identities": ["staff"]},
                                 why="replay something that is not there")
     assert env.outcome == "refused"
     assert env.reason == "bad_args"
-    assert ctx.session.bridge.sent == []
+    assert ctx.session.bridge.requests == []
 
 
 def test_one_identitys_refusal_does_not_lose_the_others(
-        tool_ctx, staff_identity_config, monkeypatch):
+        tool_run, staff_identity_config, monkeypatch):
     """A rate limit on the second identity must not discard the first
     identity's answer. Section 12 again: 'two identities, one answer, one
     refusal' and 'two identities, one answer' are different facts."""
@@ -2819,7 +2826,7 @@ def test_one_identitys_refusal_does_not_lose_the_others(
     assert rows[1]["refused"] == "rate_limited"
 
 
-def test_replay_needs_a_why_and_a_session(tool_ctx):
+def test_replay_needs_a_why_and_a_session(tool_run):
     """It mutates -- it puts N more requests on a client's network -- and it
     needs egress."""
     ...
