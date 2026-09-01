@@ -159,3 +159,21 @@ def tool_ctx(engagement):
         engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
         config=engagement.config,
         halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+
+
+@pytest.fixture
+def tool_run(tool_ctx):
+    """A `tool_ctx` with a manual run already open.
+
+    EVERY EGRESS TEST NEEDS ONE and the reason is not bookkeeping: `run_id`
+    is what `record_exchange` attributes an exchange to and what
+    `run.requests_issued` counts on. A context with no run open resolves
+    `run_id` to None, writes an orphan exchange row, and silently counts
+    nothing -- which is a coverage figure of zero for traffic that happened.
+    """
+    from hx import run as run_mod
+
+    tool_ctx.run_id = run_mod.open_run(
+        tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="manual",
+        safety_profile=tool_ctx.config.safety_profile)
+    return tool_ctx

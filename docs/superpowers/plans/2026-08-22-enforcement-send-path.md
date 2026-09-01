@@ -23192,17 +23192,19 @@ def test_the_module_docstrings_counts_are_the_counts():
     """The docstring said "twenty-one columns, six of which are nullable ids".
     Both numbers were wrong, and neither was checkable by reading.
 
-    MEASURED: the two INSERTs name 26 columns (10 + 16). Twenty-three is the
-    number of keyword parameters (9 + 14) -- a different thing, and the likely
+    MEASURED: the two INSERTs name 29 columns (10 + 19). Twenty-six is the
+    number of keyword parameters (9 + 17) -- a different thing, and the likely
     source of the error, so it is derived here too and named as itself. Five
     keyword parameters are nullable ids; `req_blob` and `resp_blob` are `str |
     None` as well and are deliberately excluded, because a blob digest is not
     a row id.
 
     The numbers were 25 and 21 until Plan 4 gave both writers a `via` and
-    `denial` the column to put it in. That they MOVED is the demonstration:
-    the docstring they pin was updated because this went red, which is the
-    opposite of the comment that carried a stale number for two plans.
+    `denial` the column to put it in, then 26 and 23 until Plan B gave
+    `record_exchange` the identity triple. That they keep MOVING is the
+    demonstration: the docstring they pin was updated because this went red,
+    which is the opposite of the comment that carried a stale number for two
+    plans.
 
     Derived rather than transcribed. A comment carrying a number nothing
     computes is a comment that goes stale on the next column.
@@ -23227,8 +23229,8 @@ def test_the_module_docstrings_counts_are_the_counts():
             if annotation == "str | None" and param.name.endswith("_id"):
                 nullable_ids.append(f"{name}.{param.name}")
 
-    assert columns == 26, columns
-    assert keywords == 23, keywords
+    assert columns == 29, columns
+    assert keywords == 26, keywords
     assert nullable_ids == [
         "record_denial.run_id", "record_denial.scope_version_id",
         "record_exchange.run_id", "record_exchange.surface_id",
@@ -23237,8 +23239,8 @@ def test_the_module_docstrings_counts_are_the_counts():
 
     # ...and the docstring says the numbers this just computed.
     doc = records.__doc__
-    assert "**26** columns" in doc, doc
-    assert "10 on `denial`, 16 on `exchange`" in doc, doc
+    assert "**29** columns" in doc, doc
+    assert "10 on `denial`, 19 on `exchange`" in doc, doc
     assert "**five**" in doc, doc
 
 
@@ -23566,6 +23568,32 @@ def test_ids_have_the_shape_the_rest_of_the_store_uses():
     assert re.fullmatch(r"d-[0-9a-f]{12}", records.new_id("d"))
     assert re.fullmatch(r"d-[0-9a-f]{12}", engagement_mod._new_id("d"))
     assert len({records.new_id("d") for _ in range(1000)}) == 1000
+
+
+def test_record_exchange_carries_the_identity_triple(conn):
+    """The three columns have existed since SCHEMA_VERSION 9 and nothing has
+    ever filled them. A send issued under a named identity is the first
+    traffic in this build that HAS an identity to record."""
+    row_id = records.record_exchange(
+        conn, run_id="r-1", method="GET", url="http://127.0.0.1:8080/a",
+        status=200, req_blob=None, resp_blob=None, ms=5, at_us=1,
+        identity="staff", identity_generation=3, identity_state="assumed")
+    got = conn.execute(
+        "SELECT identity, identity_generation, identity_state"
+        " FROM exchange WHERE id=?", (row_id,)).fetchone()
+    assert tuple(got) == ("staff", 3, "assumed")
+
+
+def test_record_exchange_still_defaults_the_triple_to_null(conn):
+    """Every existing call site passes none of the three, and an anonymous
+    send has none to pass. NULL is the fact, not a gap."""
+    row_id = records.record_exchange(
+        conn, run_id="r-1", method="GET", url="http://127.0.0.1:8080/a",
+        status=200, req_blob=None, resp_blob=None, ms=5, at_us=1)
+    got = conn.execute(
+        "SELECT identity, identity_generation, identity_state"
+        " FROM exchange WHERE id=?", (row_id,)).fetchone()
+    assert tuple(got) == (None, None, None)
 ```
 
 
@@ -23593,11 +23621,12 @@ argument would file evidence against the wrong run without any type error to
 show for it.
 
 COUNTED, because this paragraph had both numbers wrong. The two INSERTs name
-**26** columns -- 10 on `denial`, 16 on `exchange` -- not twenty-one; 23 is the
-number of KEYWORD PARAMETERS the two writers take between them (9 and 14),
+**29** columns -- 10 on `denial`, 19 on `exchange` -- not twenty-one; 26 is the
+number of KEYWORD PARAMETERS the two writers take between them (9 and 17),
 which is a different thing and the likely source of the error. (25/21/8/13
-until Plan 4 gave both writers a `via`, and `denial` the column to put it in.
-The numbers move; that they are DERIVED rather than transcribed is the point.)
+until Plan 4 gave both writers a `via`, and `denial` the column to put it in;
+26/23/9/14 until Plan B gave `record_exchange` the identity triple. The
+numbers move; that they are DERIVED rather than transcribed is the point.)
 And **five** of
 those parameters are nullable ids of the same shape, not six:
 `record_denial.run_id`, `record_denial.scope_version_id`,
@@ -24195,7 +24224,10 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
                     resp_len: int | None = None,
                     surface_id: str | None = None,
                     scope_version_id: str | None = None,
-                    seq: int | None = None) -> str:
+                    seq: int | None = None,
+                    identity: str | None = None,
+                    identity_generation: int | None = None,
+                    identity_state: str | None = None) -> str:
     """Record one request that was issued. Returns the row id.
 
     `req_blob` and `resp_blob` are blob-store digests of the REDACTED bytes.
@@ -24216,9 +24248,15 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     proxy's egress point and passed 'proxy'. It still DEFAULTS to 'send', so
     every send-path call site is unchanged; `crawl` has no caller yet.
 
-    `identity`, `identity_generation` and `identity_state` stay NULL. Identity
-    injection ships in Plan 5; writing 'assumed' now would be a claim about
-    authentication that nothing in this plan can support.
+    THE IDENTITY TRIPLE IS NULL FOR EVERYTHING THIS BUILD HAD UNTIL PLAN B.
+    The three columns arrived with SCHEMA_VERSION 9 and nothing filled them:
+    proxy traffic carries the operator's own browser session, which the
+    identity design puts out of scope, and no send path recorded a row at
+    all. `hx.issue` is the first caller with an answer, and it writes
+    `identity_state='assumed'` -- never `proven`. A canary bracket proves a
+    RUN (spec section 6); one send has no bracket, so `assumed` is the whole
+    of what is known and `proven` here would be a claim no canary backs.
+    Defaulted to None so every existing call site is byte-for-byte unchanged.
     """
     if via not in VIA_VALUES:
         raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
@@ -24275,15 +24313,17 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
         " recv_us, method, url, status, req_blob, resp_blob, resp_len,"
-        " body_shed, scope_version_id, seq)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " body_shed, scope_version_id, seq, identity, identity_generation,"
+        " identity_state)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (row_id, run_id, surface_id, via, outcome, at_us,
          at_us + ms * 1000, method, url, status, req_blob, resp_blob,
          resp_len,
          # S6: solicited exchanges are NEVER shed -- they are about to become
          # evidence. Only unsolicited proxy observations may set this.
          0,
-         scope_version_id, seq),
+         scope_version_id, seq, identity, identity_generation,
+         identity_state),
     )
     return row_id
 
