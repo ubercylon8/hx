@@ -13,6 +13,9 @@ four lines of framing; the protocol is the part that can be wrong.
 """
 import io
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 from hx.tools import registry
 from hx.tools.adapters import mcp
@@ -126,3 +129,69 @@ def test_every_published_schema_is_one_this_validator_can_enforce():
     for tool in registry.TOOLS.values():
         schema.check_schema(mcp.tool_schema(tool)["inputSchema"],
                             where=tool.name)
+
+
+def test_hx_mcp_subprocess_writes_only_two_json_rpc_lines_to_real_stdout(
+        tmp_path):
+    """THE ONE TEST THAT INSPECTS THE REAL OS-LEVEL FILE DESCRIPTOR.
+
+    Every test above drives `handle`/`serve_streams` with an injected
+    `io.StringIO`, which proves `serve_streams` writes only valid JSON-RPC
+    into the stream IT IS GIVEN. That cannot see a stray `print`, a library's
+    deprecation warning, or any other write that lands on file descriptor 1
+    directly -- and it does not: a mutation that put `print("noise")` at the
+    top of `serve_streams` left `test_nothing_but_json_rpc_reaches_stdout`
+    green, because that test's `stdout` was never real. Deleting this test as
+    "redundant with" that one is exactly the mistake that lets a stray line
+    back in -- a newline-delimited protocol has no resynchronisation point,
+    so ONE such line desynchronises the client for the rest of the
+    conversation, which is the single highest-value property in this file.
+
+    A REAL SUBPROCESS rather than `capfd` around an in-process `mcp.serve`,
+    per Ruling 17: the two catch the same fd-1 writes, but the subprocess
+    also exercises the actual `hx mcp` Click command -- the lines added to
+    `cli.py`, which nothing else in the suite drives. One test proving two
+    things beats one test plus an untested command.
+
+    stderr is read but INTENTIONALLY NOT ASSERTED ON: diagnostics belong
+    there by design, and pinning its shape would make this test brittle
+    against any future logging line.
+    """
+    from hx import config as config_mod
+    from hx import engagement as eng_mod
+
+    cfg = config_mod.Config(name="t", client="T", safety_profile="staging",
+                            scope_include=["https://app.test/*"])
+    eng = eng_mod.create(tmp_path / "e", cfg, author="test")
+    eng.db.close()
+
+    # The console script `pyproject.toml` installs, not `python -m` or an
+    # import -- `hx mcp` is the command an operator's MCP client actually
+    # spawns, matching `tests/integration/test_cli_session.py`'s own `HX`.
+    hx_bin = Path(sys.executable).with_name("hx")
+    assert hx_bin.is_file(), (
+        f"{hx_bin} is not there -- the console script `pyproject.toml` "
+        "installs. `pip install -e .`")
+
+    messages = (
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+        '{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n')
+
+    # `input=` writes the three messages and then closes stdin, giving
+    # `serve_streams`'s `for line in stdin` its EOF -- without that the loop
+    # blocks on a read that never returns and the timeout below is what
+    # fails the suite instead of wedging it.
+    proc = subprocess.run(
+        [str(hx_bin), "mcp", "--root", str(eng.root)],
+        input=messages, capture_output=True, text=True, timeout=20)
+
+    lines = proc.stdout.splitlines()
+    assert len(lines) == 2, (
+        f"expected exactly two JSON-RPC lines, got {len(lines)}:\n"
+        f"{proc.stdout!r}\nstderr: {proc.stderr!r}")
+    first, second = (json.loads(line) for line in lines)
+    assert first["jsonrpc"] == "2.0" and first["id"] == 1
+    assert first["result"]["protocolVersion"] == mcp.PROTOCOL_VERSION
+    assert second["jsonrpc"] == "2.0" and second["id"] == 2
+    assert len(second["result"]["tools"]) == 17
