@@ -302,14 +302,40 @@ def test_grep_needs_no_session(tool_run):
 
 
 def test_grep_reports_which_exchanges_it_could_not_read(tool_run):
-    """Section 12 inside one envelope. An exchange whose blob is missing is
-    not an exchange with no matches, and a facet that said `0 matches` about
-    both would be the report that cannot distinguish tested from unreached."""
+    """Section 12 inside one envelope, AND Ruling 14's partial case.
+
+    One exchange is readable and one is not, so the search RAN -- `ok`, not
+    `unavailable` -- and both halves must be true at once: the readable
+    exchange's match still surfaces in `rows`, and the unreadable one is
+    named in the facet rather than silently folded into "no matches". A
+    facet that said `0 matches` about both would be the report that cannot
+    distinguish tested from unreached, and a test that checked only the
+    facet -- as this one used to -- would not catch a regression that
+    dropped the real match while still populating `unreadable`."""
     xid = _one_exchange(tool_run)
     env = dispatch_mod.dispatch(tool_run, "http.grep",
                                 {"exchange_ids": [xid, "x-nonexistent"],
                                  "pattern": "needle"})
+    assert env.outcome == "ok"
+    assert env.result["rows"][0]["exchange_id"] == xid
+    assert env.result["rows"][0]["match"] == "needle"
     assert env.result["facets"]["unreadable"] == ["x-nonexistent"]
+
+
+def test_grep_over_only_unreadable_exchanges_is_unavailable_not_empty(
+        tool_run):
+    """Ruling 14. `empty` is `envelope.answered`'s reading of a zero-row
+    page and means "I searched and found nothing" -- an agent told `empty`
+    moves on, which is exactly wrong when nothing was searchable at all.
+    `unavailable` is the outcome whose job is to say the tool could not run,
+    and that is precisely what happened when every requested exchange is
+    unreadable. The `unreadable` facet alone is not enough: it is not the
+    field an agent branches on."""
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                {"exchange_ids": ["x-nope1", "x-nope2"],
+                                 "pattern": "needle"})
+    assert env.outcome == "unavailable"
+    assert env.reason == "unreadable"
 
 
 def test_body_returns_a_bounded_range_and_the_total(tool_run):
@@ -366,13 +392,18 @@ def test_a_binary_body_round_trips_rather_than_becoming_question_marks(
     assert env.result["bytes"].encode("latin-1") == raw
 
 
-def test_grep_reports_a_corrupt_blob_as_unreadable_not_internal_error(
+def test_grep_reports_a_corrupt_blob_as_unavailable_not_internal_error(
         tool_run):
     """`_blobs_for`'s own docstring says a blob the store cannot return is
     covered by the same None it returns for a missing row -- so a corrupt
     blob must land the exchange in `unreadable`, not blow up as
     `error / internal`. `error / internal` here would tell an agent hx is
-    broken when in fact one stored blob failed its digest check."""
+    broken when in fact one stored blob failed its digest check.
+
+    The one exchange requested is the one that is corrupt, so by Ruling 14
+    this is the all-unreadable case: `unavailable / unreadable`, not
+    `empty` -- the tool could not run, which is a different fact from
+    running and finding nothing."""
     from hx.store.blobs import CorruptBlob
 
     xid = _one_exchange(tool_run)
@@ -388,5 +419,5 @@ def test_grep_reports_a_corrupt_blob_as_unreadable_not_internal_error(
                                      "pattern": "needle"})
     finally:
         tool_run.blobs.get = real_get
-    assert env.outcome == "empty"
-    assert env.result["facets"]["unreadable"] == [xid]
+    assert env.outcome == "unavailable"
+    assert env.reason == "unreadable"

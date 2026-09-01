@@ -1280,7 +1280,7 @@ REASONS_FOR = {
     "unavailable": frozenset({
         "no_session", "no_run", "not_implemented", "identity_dead",
         "identity_unresolved", "transport_error", "timeout", "bridge_lost",
-        "not_configured"}),
+        "not_configured", "unreadable"}),
     "error": frozenset({"internal"}),
 }
 

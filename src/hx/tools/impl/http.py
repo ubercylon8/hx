@@ -293,16 +293,30 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
     already tells you which tokens are new. Anything a literal cannot express
     is `http.body(range)`'s job, or a passive check's. Recorded as known debt
     in `docs/DECISIONS.md`.
+
+    RULING 14 -- WHERE `unavailable` AND `empty` SPLIT. `unavailable` means
+    the tool could not run at all; having searched even one exchange, it
+    ran. If EVERY requested exchange is unreadable, this raises
+    `ToolUnavailable("unreadable", ...)` rather than answering `empty`:
+    `empty` is `envelope.answered`'s reading of a zero-row page, and to an
+    agent it means "I searched and found nothing" -- which is exactly wrong
+    when nothing was searchable. If even ONE exchange is readable, the
+    search ran, and `ok` or `empty` plus the `unreadable` facet is honest --
+    the facet names precisely which exchanges were skipped, and the agent
+    can see it searched a subset rather than nothing.
     """
     needle = pattern.encode(TEXT)
     if ignore_case:
         needle = needle.lower()
+    considered = exchange_ids[:MAX_EXCHANGES]
     rows, unreadable = [], []
-    for xid in exchange_ids[:MAX_EXCHANGES]:
+    any_readable = False
+    for xid in considered:
         found = _blobs_for(ctx, xid, part)
         if found is None:
             unreadable.append(xid)
             continue
+        any_readable = True
         for part_name, data in found:
             hay = data.lower() if ignore_case else data
             at = hay.find(needle)
@@ -316,13 +330,19 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
                     "after": data[at + len(needle):end].decode(TEXT),
                 })
                 at = hay.find(needle, at + len(needle))
+    if considered and not any_readable:
+        raise ToolUnavailable(
+            "unreadable",
+            f"none of the {len(considered)} requested exchange(s) could be "
+            "read -- surface.detail lists what this engagement actually "
+            "holds.")
     # UNREADABLE IS A FACET AND NOT A SILENCE. An exchange whose blob is gone
     # is not an exchange with no matches, and section 12's rule -- a report
     # that cannot tell "tested, clean" from "never reached" is worse than no
     # report -- is exactly as true of one envelope as of a whole engagement.
     return envelope.page(rows, total=len(rows), limit=envelope.MAX_LIMIT,
                          facets={"unreadable": unreadable,
-                                 "searched": len(exchange_ids[:MAX_EXCHANGES])})
+                                 "searched": len(considered)})
 
 
 def body(ctx, *, exchange_id: str, start: int = 0,
