@@ -568,12 +568,50 @@ def test_body_past_the_end_answers_ok_with_zero_length_and_the_real_total(
     assert env.result["total"] > 0
 
 
-def test_body_of_an_unknown_exchange_is_refused(tool_run):
-    env = dispatch_mod.dispatch(tool_run, "http.body",
-                                {"exchange_id": "x-nope", "start": 0,
-                                 "length": 8})
-    assert env.outcome == "refused"
-    assert env.reason == "bad_args"
+def test_body_of_an_unreadable_exchange_is_unavailable_like_greps(tool_run):
+    """RULING 22, and the assertion is that the TWO TOOLS AGREE. `http.body`
+    answered `refused / bad_args` where `http.grep` over the same exchange
+    answered `unavailable / unreadable`, and `replay_as`'s own comment
+    already names grep's as the correct answer for this condition.
+
+    `bad_args` tells an agent to fix an argument that is not wrong: two of
+    the three ways `_blobs_for` returns None -- a NULL blob and a blob the
+    store will not return -- are not about the id it was handed, and it is an
+    id `surface.detail` gave it, so it will send the same one again."""
+    args = {"exchange_id": "x-nope", "start": 0, "length": 8}
+    env = dispatch_mod.dispatch(tool_run, "http.body", args)
+    assert env.outcome == "unavailable"
+    assert env.reason == "unreadable"
+
+    grepped = dispatch_mod.dispatch(tool_run, "http.grep",
+                                    {"exchange_ids": ["x-nope"],
+                                     "pattern": "needle"})
+    assert (env.outcome, env.reason) == (grepped.outcome, grepped.reason)
+
+
+def test_a_pattern_latin_1_cannot_spell_is_bad_args_not_an_internal_error(
+        tool_run):
+    """RULING 22's other half. `pattern.encode(TEXT)` sat outside every
+    guard while `send`'s identical `body.encode(TEXT)` sat inside one, so
+    the same input class got opposite answers from two tools -- and grep's
+    was the one that says hx is broken.
+
+    The pair is asserted together: one tool's answer alone would not show
+    that the two agree, which is the whole subject of the ruling. MEASURED
+    before the fix: grep answered `error / internal` with a
+    `UnicodeEncodeError` in the detail."""
+    cjk = "\u65e5\u672c\u8a9e"
+    xid = _one_exchange(tool_run)
+    ctx = _with_session(tool_run, [sent_result()])
+    grepped = dispatch_mod.dispatch(ctx, "http.grep",
+                                    {"exchange_ids": [xid], "pattern": cjk})
+    sent = dispatch_mod.dispatch(ctx, "http.send",
+                                 {"host": "127.0.0.1", "port": 8080,
+                                  "method": "GET", "path": "/a", "body": cjk},
+                                 why="the same string as a body")
+    assert grepped.outcome == "refused"
+    assert grepped.reason == "bad_args"
+    assert (grepped.outcome, grepped.reason) == (sent.outcome, sent.reason)
 
 
 def test_a_binary_body_round_trips_rather_than_becoming_question_marks(

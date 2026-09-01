@@ -398,7 +398,21 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
     the facet names precisely which exchanges were skipped, and the agent
     can see it searched a subset rather than nothing.
     """
-    needle = pattern.encode(TEXT)
+    try:
+        needle = pattern.encode(TEXT)
+    except UnicodeEncodeError as exc:
+        # RULING 22, AND THE ASYMMETRY IS THE DEFECT RATHER THAN THE CODEC.
+        # `send` runs the identical `.encode(TEXT)` on its `body` and answers
+        # `refused / bad_args`, because that call happens to sit inside a
+        # `try`. MEASURED with a three-character CJK string: `http.grep`
+        # answered `error / internal` for it as a `pattern`, while
+        # `http.send` answered `refused / bad_args` for the same string as a
+        # `body` -- the same input class, the same codec, opposite answers,
+        # and grep's is the one that tells the agent hx is broken when its
+        # pattern is merely unrepresentable in the codec this layer stores
+        # bytes as. A latin-1 haystack cannot contain a character latin-1
+        # cannot spell, so the pattern is genuinely the thing to fix.
+        raise ToolRefused("bad_args", str(exc)) from exc
     if ignore_case:
         needle = needle.lower()
     considered = exchange_ids[:MAX_EXCHANGES]
@@ -447,8 +461,17 @@ def body(ctx, *, exchange_id: str, start: int = 0,
                         "not a range this tool can return")
     found = _blobs_for(ctx, exchange_id, part)
     if found is None:
-        raise ToolRefused(
-            "bad_args",
+        # RULING 22: `unavailable / unreadable`, THE ANSWER `http.grep` GIVES
+        # FOR THE SAME CONDITION, and `replay_as`'s own comment already names
+        # grep's as the correct one. `_blobs_for` returns None for all three
+        # of "no such row", "the blob is NULL" and "the store will not return
+        # it", and two of those three are not an argument the agent got
+        # wrong: `bad_args` tells it to fix an argument that is not wrong,
+        # and the exchange id it was handed by `surface.detail` is the one it
+        # will send again. `unavailable` says the tool could not run over
+        # this exchange, which is what happened.
+        raise ToolUnavailable(
+            "unreadable",
             f"no readable {part} for exchange {exchange_id!r}. It may not "
             "exist, or its body may never have been stored -- surface.detail "
             "lists the exchanges this engagement holds.")

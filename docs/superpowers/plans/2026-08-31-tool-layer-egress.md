@@ -3050,12 +3050,50 @@ def test_body_past_the_end_answers_ok_with_zero_length_and_the_real_total(
     assert env.result["total"] > 0
 
 
-def test_body_of_an_unknown_exchange_is_refused(tool_run):
-    env = dispatch_mod.dispatch(tool_run, "http.body",
-                                {"exchange_id": "x-nope", "start": 0,
-                                 "length": 8})
-    assert env.outcome == "refused"
-    assert env.reason == "bad_args"
+def test_body_of_an_unreadable_exchange_is_unavailable_like_greps(tool_run):
+    """RULING 22, and the assertion is that the TWO TOOLS AGREE. `http.body`
+    answered `refused / bad_args` where `http.grep` over the same exchange
+    answered `unavailable / unreadable`, and `replay_as`'s own comment
+    already names grep's as the correct answer for this condition.
+
+    `bad_args` tells an agent to fix an argument that is not wrong: two of
+    the three ways `_blobs_for` returns None -- a NULL blob and a blob the
+    store will not return -- are not about the id it was handed, and it is an
+    id `surface.detail` gave it, so it will send the same one again."""
+    args = {"exchange_id": "x-nope", "start": 0, "length": 8}
+    env = dispatch_mod.dispatch(tool_run, "http.body", args)
+    assert env.outcome == "unavailable"
+    assert env.reason == "unreadable"
+
+    grepped = dispatch_mod.dispatch(tool_run, "http.grep",
+                                    {"exchange_ids": ["x-nope"],
+                                     "pattern": "needle"})
+    assert (env.outcome, env.reason) == (grepped.outcome, grepped.reason)
+
+
+def test_a_pattern_latin_1_cannot_spell_is_bad_args_not_an_internal_error(
+        tool_run):
+    """RULING 22's other half. `pattern.encode(TEXT)` sat outside every
+    guard while `send`'s identical `body.encode(TEXT)` sat inside one, so
+    the same input class got opposite answers from two tools -- and grep's
+    was the one that says hx is broken.
+
+    The pair is asserted together: one tool's answer alone would not show
+    that the two agree, which is the whole subject of the ruling. MEASURED
+    before the fix: grep answered `error / internal` with a
+    `UnicodeEncodeError` in the detail."""
+    cjk = "\u65e5\u672c\u8a9e"
+    xid = _one_exchange(tool_run)
+    ctx = _with_session(tool_run, [sent_result()])
+    grepped = dispatch_mod.dispatch(ctx, "http.grep",
+                                    {"exchange_ids": [xid], "pattern": cjk})
+    sent = dispatch_mod.dispatch(ctx, "http.send",
+                                 {"host": "127.0.0.1", "port": 8080,
+                                  "method": "GET", "path": "/a", "body": cjk},
+                                 why="the same string as a body")
+    assert grepped.outcome == "refused"
+    assert grepped.reason == "bad_args"
+    assert (grepped.outcome, grepped.reason) == (sent.outcome, sent.reason)
 
 
 def test_a_binary_body_round_trips_rather_than_becoming_question_marks(
@@ -3972,7 +4010,21 @@ def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
     the facet names precisely which exchanges were skipped, and the agent
     can see it searched a subset rather than nothing.
     """
-    needle = pattern.encode(TEXT)
+    try:
+        needle = pattern.encode(TEXT)
+    except UnicodeEncodeError as exc:
+        # RULING 22, AND THE ASYMMETRY IS THE DEFECT RATHER THAN THE CODEC.
+        # `send` runs the identical `.encode(TEXT)` on its `body` and answers
+        # `refused / bad_args`, because that call happens to sit inside a
+        # `try`. MEASURED with a three-character CJK string: `http.grep`
+        # answered `error / internal` for it as a `pattern`, while
+        # `http.send` answered `refused / bad_args` for the same string as a
+        # `body` -- the same input class, the same codec, opposite answers,
+        # and grep's is the one that tells the agent hx is broken when its
+        # pattern is merely unrepresentable in the codec this layer stores
+        # bytes as. A latin-1 haystack cannot contain a character latin-1
+        # cannot spell, so the pattern is genuinely the thing to fix.
+        raise ToolRefused("bad_args", str(exc)) from exc
     if ignore_case:
         needle = needle.lower()
     considered = exchange_ids[:MAX_EXCHANGES]
@@ -4021,8 +4073,17 @@ def body(ctx, *, exchange_id: str, start: int = 0,
                         "not a range this tool can return")
     found = _blobs_for(ctx, exchange_id, part)
     if found is None:
-        raise ToolRefused(
-            "bad_args",
+        # RULING 22: `unavailable / unreadable`, THE ANSWER `http.grep` GIVES
+        # FOR THE SAME CONDITION, and `replay_as`'s own comment already names
+        # grep's as the correct one. `_blobs_for` returns None for all three
+        # of "no such row", "the blob is NULL" and "the store will not return
+        # it", and two of those three are not an argument the agent got
+        # wrong: `bad_args` tells it to fix an argument that is not wrong,
+        # and the exchange id it was handed by `surface.detail` is the one it
+        # will send again. `unavailable` says the tool could not run over
+        # this exchange, which is what happened.
+        raise ToolUnavailable(
+            "unreadable",
             f"no readable {part} for exchange {exchange_id!r}. It may not "
             "exist, or its body may never have been stored -- surface.detail "
             "lists the exchanges this engagement holds.")
