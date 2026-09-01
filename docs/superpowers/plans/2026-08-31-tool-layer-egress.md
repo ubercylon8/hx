@@ -405,66 +405,89 @@ INSERT, replacing the existing one:
 Run: `.venv/bin/pytest tests/test_records.py -q`
 Expected: PASS, with two more tests than before.
 
-- [ ] **Step 11: Add the shared `FakeBridge` fixture**
+- [ ] **Step 11: Extend the `FakeBridge` that already exists**
 
-Every egress test in Tasks 1, 4, 6 and 7 needs a bridge that answers without a JVM. One fake, in `tests/conftest.py`, so the six tools are tested against one idea of what `BridgeServer.send` does. **No marker** — `conftest.py` exists.
+**DO NOT WRITE A NEW ONE.** `tests/test_probe.py` already holds a `FakeBridge`
+that reproduces the real send shape -- a dict back on success, a raised
+`BridgeError` on every refusal, never a dict with a class key -- and
+`tests/test_scan_probes.py` already imports it with
+`from tests.test_probe import FakeBridge`. A second double is a second idea of
+what `BridgeServer.send` does, and the two would drift on the first protocol
+change. Every test file in this plan imports that one.
+
+It needs two additions, both additive:
 
 ```python
-class FakeBridge:
-    """A `BridgeServer` that answers from a script instead of a JVM.
+    def register_identity(self, resolved, *, origins) -> None:
+        """Recorded, never asserted-on by this class. `hx.tools.live` must
+        register an identity exactly once per generation -- the real
+        extension refuses a repeat with `stale_generation` -- so a test needs
+        to be able to COUNT registrations, and the credential must be
+        countable without being printed."""
+        self.identities.append((resolved.id, resolved.generation, origins))
 
-    IT IS NOT A CONVENIENCE. `hx.issue` translates a raised `BridgeError`
-    into a raised `IssueRefused` and turns a `result` dict into a stored row,
-    and both halves of that are behaviour a test must be able to drive
-    without a five-second Burp launch. The integration suite proves the same
-    code against a real extension; this proves it against every refusal class
-    the extension can answer with, including the ones a loopback target will
-    never produce.
+    def replies(self, seq) -> None:
+        """Queue successive answers for successive sends.
 
-    `replies` is consumed in order. A reply that is a `BridgeError` is
-    RAISED, because that is what the real `send` does with every refusal --
-    it never returns one as a dict, and a fake that returned them would let
-    `issue` pass a test it would fail in production.
-    """
-
-    BODY_KEY = "__body__"
-
-    def __init__(self, replies):
-        self.replies = list(replies)
-        self.sent = []          # (req, raw) per call, in order
-        self.identities = []    # (resolved, origins) per registration
-
-    def send(self, req, body=b"", timeout=30.0, *, enforce_locally=True):
-        self.sent.append((dict(req), bytes(body)))
-        if not self.replies:
-            raise AssertionError(
-                f"FakeBridge ran out of replies on send #{len(self.sent)}; "
-                "the test scripted fewer answers than the code asks for")
-        reply = self.replies.pop(0)
-        if isinstance(reply, Exception):
-            raise reply
-        return reply
-
-    def register_identity(self, resolved, *, origins):
-        self.identities.append((resolved, origins))
-
-
-def fake_result(body=b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nhi",
-                *, status=200, ms=7, outcome="ok", epoch=1):
-    """One `result` frame, shaped exactly as `Sender.decideAndIssue` builds
-    it: status, bytes, ms, outcome, config_epoch, and the REDACTED response
-    bytes under the body key."""
-    return {"v": 1, "t": "result", "id": 1, "status": status,
-            "bytes": len(body), "ms": ms, "outcome": outcome,
-            "config_epoch": epoch, FakeBridge.BODY_KEY: body}
-
-
-@pytest.fixture
-def fake_bridge():
-    return FakeBridge
+        `reply()` sets ONE answer that every send gets, which is right for a
+        probe loop asking the same question. `http.replay_as` sends N times
+        inside ONE tool call and the whole point is that the answers DIFFER --
+        a single reply would make an authz test pass against a bridge that
+        cannot tell two identities apart.
+        """
+        self._queue = list(seq)
 ```
 
-**Check first:** `FakeBridge.BODY_KEY` must equal the real `BridgeServer.BODY_KEY`. Find the real constant (`command grep -n "BODY_KEY" src/hx/bridge/server.py`) and use it directly — `BODY_KEY = BridgeServer.BODY_KEY` — rather than hard-coding a string that could drift.
+with `self.identities: list = []` and `self._queue: list | None = None` added
+to `__init__`, and `send` consuming `self._queue` before falling back to
+`self._header`. Keep `reply()` and `refuse()` working exactly as they do --
+`test_probe.py` and `test_scan_probes.py` depend on them, and this plan's
+blocks are byte-compared against the file.
+
+Add one helper beside it for the result frames this plan needs:
+
+```python
+def sent_result(body=b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nhi",
+                *, status=200, ms=7, outcome="ok", epoch=1):
+    """One `result` frame, shaped as `Sender.decideAndIssue` builds it."""
+    return ({"status": status, "bytes": len(body), "ms": ms,
+             "outcome": outcome, "config_epoch": epoch}, body)
+```
+
+**Every test in this plan therefore opens with**
+`from tests.test_probe import FakeBridge, sent_result` -- absolute, because
+`tests/` is a package and that is the import shape the repo already uses.
+
+- [ ] **Step 11b: A run must be open before anything sends**
+
+`tool_ctx.run_id` resolves from `hx.run.open_runs` and is **None** when no run
+is open. `issue()` would then write `record_exchange(run_id=None)` -- legal,
+the column is nullable -- and its `UPDATE run SET requests_issued = ... WHERE
+id = NULL` would match nothing, so `test_requests_issued_counts_the_send`
+reads `SELECT ... WHERE id = NULL`, gets no row, and raises `TypeError` on a
+`None` subscript. That failure would look like a bug in `issue` and would not
+be one.
+
+Add a fixture to `tests/conftest.py` beside `tool_ctx`:
+
+```python
+@pytest.fixture
+def tool_run(tool_ctx):
+    """A `tool_ctx` with a manual run already open.
+
+    EVERY EGRESS TEST NEEDS ONE and the reason is not bookkeeping: `run_id`
+    is what `record_exchange` attributes an exchange to and what
+    `run.requests_issued` counts on. A context with no run open resolves
+    `run_id` to None, writes an orphan exchange row, and silently counts
+    nothing -- which is a coverage figure of zero for traffic that happened.
+    """
+    tool_ctx.run_id = run_mod.open_run(
+        tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="manual",
+        safety_profile=tool_ctx.config.safety_profile)
+    return tool_ctx
+```
+
+and use `tool_run` rather than `tool_ctx` in every test below that sends.
 
 - [ ] **Step 12: Write the failing tests for `hx.issue`**
 
@@ -2015,7 +2038,97 @@ registry.register(spec.ToolSpec(
             }}))
 ```
 
-**Check `hx.tools.errors` first:** confirm `ToolRefused(reason, detail)`'s exact signature and that `bad_args` is in `envelope.REASONS_FOR["refused"]`. Every reason used here must be in that mapping or the `Envelope` constructor will reject it — see Plan A's Task 3 finding, where reasons were partitioned by *comment* and two classes could construct the wrong pairing. **Wire classes such as `scope_denied`, `rate_limited`, `dangerous_denied`, `budget_exhausted`, `method_denied` and `transport_error` must be added to `REASONS_FOR["refused"]`** if they are not already there; check before writing the handler, and add them with a comment naming the extension as their source.
+- [ ] **Step 3b: Widen the closed reason vocabulary — MEASURED, NOT OPTIONAL**
+
+`envelope.REASONS_FOR` is a **closed** vocabulary and `Envelope.__post_init__`
+raises `ValueError` for a reason outside it. Read where that raise lands:
+
+```
+    except ToolError as exc:
+        env = envelope.Envelope(tool=name, outcome=exc.outcome,
+                                reason=exc.reason, detail=exc.detail)
+    except Exception as exc:
+        env = envelope.failed(name, ...)
+```
+
+A `ValueError` raised **inside** the `except ToolError` handler is not caught
+by the `except Exception` beside it — handlers do not chain. It propagates
+straight out of `dispatch()`, which the module docstring promises **never
+raises**. So an unknown reason is not a cosmetic problem: the first
+`scope_denied` from a real extension would take the whole call out with a
+traceback, and the journal row would never be written.
+
+Two changes, together:
+
+**1. Widen the sets.** In `src/hx/tools/envelope.py`:
+
+```
+    "refused": {..., "scope_denied", "method_denied", "dangerous_denied",
+                "rate_limited", "budget_exhausted", "bad_frame",
+                "wrong_run_kind"},
+    "unavailable": {..., "identity_dead", "transport_error", "timeout",
+                    "bridge_lost", "not_configured"},
+```
+
+The split is not arbitrary and belongs in a comment where it lands. **Refused
+is "something decided no"** — scope, method, dangerous-path, rate and budget
+are the extension's policy answering, and a client-facing count of refusals is
+a statement about scope discipline. **Unavailable is "no answer came back"** —
+a timeout, a dropped bridge or an unconfigured extension decided nothing, and
+counting those as refusals would put network weather into a number an operator
+reads as policy. Both are `ran=False`, so neither can be misread as a clean
+result; what differs is what the report is entitled to say about them.
+
+**2. Map the wire's classes through a table with a fallback**, in
+`src/hx/tools/impl/http.py`:
+
+```python
+#: The extension's error classes, placed in the envelope's closed vocabulary.
+#: A class this build has never seen must NOT reach `Envelope` unmapped: the
+#: constructor raises for an unknown reason, and that raise lands inside
+#: `dispatch`'s `except ToolError` handler where the `except Exception` beside
+#: it cannot catch it -- so it escapes `dispatch`, which never raises. A new
+#: class from a future extension would take the call out with a traceback and
+#: write no journal row, which is the one failure this layer is built to make
+#: impossible. The fallback keeps the raw class in `detail`, so nothing is
+#: lost and nothing crashes.
+REASON_FOR_CLASS = {
+    "scope_denied": ("refused", "scope_denied"),
+    "method_denied": ("refused", "method_denied"),
+    "dangerous_denied": ("refused", "dangerous_denied"),
+    "rate_limited": ("refused", "rate_limited"),
+    "budget_exhausted": ("refused", "budget_exhausted"),
+    "bad_frame": ("refused", "bad_frame"),
+    "halted": ("refused", "halted"),
+    "not_configured": ("unavailable", "not_configured"),
+    "bridge_lost": ("unavailable", "bridge_lost"),
+    "transport_error": ("unavailable", "transport_error"),
+    "timeout": ("unavailable", "timeout"),
+}
+UNKNOWN_CLASS = ("unavailable", "transport_error")
+```
+
+and a helper that raises the right `ToolError` subclass from an
+`IssueRefused`, prefixing the detail with the raw class whenever the fallback
+is used so an operator can see what actually came back.
+
+**A test proves the fallback**, with a class no build has ever answered:
+
+```python
+def test_an_unknown_wire_class_does_not_escape_dispatch(tool_run):
+    """`dispatch` NEVER RAISES, and an unmapped reason is the one way left
+    to make it. MEASURED: `Envelope.__post_init__` raises ValueError for a
+    reason outside the closed set, and that raise lands inside `except
+    ToolError` where the `except Exception` beside it cannot catch it."""
+    ctx = _with_session(tool_run, _refusing("nova_class_from_2027"))
+    env = dispatch_mod.dispatch(ctx, "http.send", {...}, why="unknown class")
+    assert env.outcome in ("refused", "unavailable")
+    assert "nova_class_from_2027" in (env.detail or "")
+```
+
+**Also confirm `hx.tools.errors`:** `ToolRefused(reason, detail)` and
+`ToolUnavailable(reason, detail)` both exist and subclass `ToolError`, which
+carries `.outcome`.
 
 - [ ] **Step 4: Register the module**
 
@@ -2188,13 +2301,24 @@ def test_body_returns_a_bounded_range_and_the_total(tool_ctx):
     assert env.result["total"] > 8
 
 
-def test_body_past_the_end_is_empty_rather_than_an_error(tool_ctx):
-    """Reading past the end is a legitimate way to discover the end."""
-    xid = _one_exchange(tool_ctx)
-    env = dispatch_mod.dispatch(tool_ctx, "http.body",
+def test_body_past_the_end_answers_ok_with_zero_length_and_the_real_total(
+        tool_run):
+    """Reading past the end is a legitimate way to discover the end, so it is
+    not an error -- and it is not `empty` either.
+
+    `empty` IS PRINCIPLE 3's LIST VOCABULARY and `http.body` returns no list.
+    `envelope.answered` reads `empty` off a page envelope's `total == 0`, so
+    spelling this `empty` would mean reporting `total: 0` for a body that is
+    5 KB long -- a lie about the one number an agent needs in order to know
+    it has read the whole thing. `ok` with `length: 0` and the true `total`
+    says exactly what happened and where the end is."""
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.body",
                                 {"exchange_id": xid, "start": 99999,
                                  "length": 10})
-    assert env.outcome == "empty"
+    assert env.outcome == "ok"
+    assert env.result["length"] == 0
+    assert env.result["total"] > 0
 
 
 def test_body_of_an_unknown_exchange_is_refused(tool_ctx):
@@ -2326,12 +2450,14 @@ def body(ctx, *, exchange_id: str, start: int = 0,
             "lists the exchanges this engagement holds.")
     _name, data = found[0]
     window = data[start:start + min(length, RANGE_MAX)]
-    if not window:
-        # `empty`, via the zero-row page below: reading past the end is a
-        # legitimate way to find the end, and an error would make it a
-        # mistake.
-        return envelope.page([], total=len(data), limit=1,
-                             facets={"exchange_id": exchange_id, "part": part})
+    # ONE SHAPE, INCLUDING PAST THE END. Reading past the end is a legitimate
+    # way to find the end, so it is not an error -- and it is not `empty`
+    # either: `empty` is Principle 3's LIST vocabulary, and
+    # `envelope.answered` reads it off a page envelope's `total == 0`. To
+    # spell this `empty` would mean reporting `total: 0` for a body that is
+    # 5 KB long, which is a lie about the one number an agent needs to know
+    # whether it has the whole thing. `length: 0` beside the true `total`
+    # says where the end is.
     return {"exchange_id": exchange_id, "part": part, "start": start,
             "length": len(window), "total": len(data),
             "bytes": window.decode(TEXT)}
