@@ -248,6 +248,124 @@ explicitly per identity in `config.yaml` — where §4 wants blast-radius decisi
 but the proved one. Probes there are refused `identity_origin` and read `inconclusive`; the
 report's Limits section explains the pattern and names the fix.
 
+## The tool layer
+
+### The registry is an allowlist, so the forbidden names have no entry
+
+Spec §8 keeps `engagement.create`, `surface.add` and `finding.set_status` out of
+the agent's hands. `hx.tools.registry` enforces that by those three names
+**having no entry** — `register` refuses them, and `dispatch` can only reach
+what `lookup` returns. There is no check to forget on a future code path.
+
+The same move as §4's two enforcement points inside the JVM, and as
+`IdentityRegistry.register` keeping the three-name header allowlist at the one
+door rather than at each caller. **Make the unsafe thing unreachable rather
+than checked** is the rule this project keeps arriving at.
+
+`TOOLS` is a module dict, so a determined caller can still write to it
+directly. That is parked rather than fixed: Python has no private module state,
+and `tests/test_tools_contract.py` asserting the three names are absent *after
+every impl module has imported* catches a real bypass where encapsulation
+would be theatre.
+
+### `empty` and `unavailable` are different outcomes, at every layer
+
+§12's governing rule — a report that cannot tell "tested, clean" from "never
+reached" is worse than no report — is a claim about the whole stack, not about
+`check_run.verdict`. So the envelope carries five outcomes and never four:
+`ok · empty · unavailable · refused · error`. `empty` means the tool ran and
+matched nothing; `unavailable` means it could not run.
+
+This branch learned the same lesson in four separate places before it stuck:
+the envelope's two outcomes; a journal row that is missing versus one that was
+never written (`_journalled` logs rather than swallowing); `checks.list`
+listing a disabled class rather than omitting it; and `finding.record`
+distinguishing "no run is open" from "several are, I cannot tell which you
+mean". Each was found separately. The rule generalises; noticing that it
+generalises did not.
+
+### A refusal must say what to do next
+
+`not_registered`, `bad_args` and `run_open` all carry a `detail` that names the
+next action — the open run's id and the tool that closes it, the argument that
+was wrong, the tool list that exists. A bare reason sends an agent round the
+loop the journal exists to break, and `journal.summarise` therefore records the
+detail rather than the reason alone.
+
+The one thing a detail never carries is the **value** it rejected.
+`hx.tools.schema` names the property and the constraint; the rejected value is
+the one thing the agent already knows, and echoing it put a credential-shaped
+argument into `agent_action.result_summary` in the clear.
+
+### Argument values are journalled only for a call that passed a schema
+
+Principle 5 makes `args_blob` safe to store verbatim: identity is passed by
+name and resolved below this layer. That argument covers arguments a schema
+**accepted**, and nothing else. Every refusal at or before validation carries a
+dict nobody checked — and since every tool schema sets
+`additionalProperties: false`, sending `{"password": …}` to a real tool *is* a
+`bad_args` refusal.
+
+So `dispatch` journals sorted key **names** for an unvalidated call. The names
+stay because they are the whole loop-prevention signal: "I keep calling this
+with a password field" needs no value to say it.
+
+### A gate must state each keyword's applicable type and its value's type
+
+`hx.tools.schema` refuses any JSON Schema keyword it cannot enforce, because a
+subset that silently ignored `pattern` would publish a constraint to the agent
+that nothing applies. Getting that right took three rounds, all one bug class:
+the gate validated keyword **names** and nothing else, so `{"type": "string",
+"minimum": 5}` was accepted and inert, and `{"type": "integer", "minimum":
+"five"}` was accepted and then raised.
+
+`CONSTRAINTS` is now a table mapping each keyword to *(the types it applies to,
+the type its value must be)*, with the public frozenset derived from its keys.
+The test that ended the sequence is categorical rather than case-by-case: for
+every keyword crossed with every type, the pairing either fails `check_schema`
+or is enforced by `validate`. Adding `minItems`/`maxItems` two rounds later
+could not be done halfway, because that test iterates the table.
+
+### The open run belongs to the engagement, not to the process
+
+`ToolContext.run_id` resolves from the store, because every `hx tool`
+invocation is its own process and a field holding only what *this* process did
+left three of eleven tools unable to succeed — `run.finish` answering `no_run`
+forever, and `run.start` then refusing `run_open` forever.
+
+Resolution is **memoised per dispatch**, not per access. Re-resolving on every
+read let one `finding.record` call see two different answers when a concurrent
+actor opened a run of another kind mid-call, failing
+`finding_observation.run_id NOT NULL` and losing the finding under an
+`error/internal` the agent reads as an hx defect.
+
+When several runs are open, resolution refuses and names the kinds rather than
+guessing. `hx.run.current_run` is deliberately not used here: it auto-opens,
+which is right for `hx capture start` — where a forgotten command costs an hour
+of unrecorded browsing — and wrong for a tool whose contract is "open a run".
+
+### A halt stops the engagement doing more, so `run.finish` is exempt
+
+Mutating tools are refused while a halt is armed; reads are not, because an
+operator who has just hit STOP wants the agent able to explain itself.
+`dispatch.HALT_EXEMPT` holds exactly one name. Closing an open run does *less*,
+not more — and in Plan B `run.finish` is what stops the Burp JVM, so refusing
+it under a halt would orphan one, the outcome §8's bracket exists to prevent.
+
+A named set rather than a `ToolSpec` flag, so no future tool can opt itself
+out.
+
+### An agent-recorded finding must cite traffic, and does not spell its own key
+
+Both inherited from `checks.base.Candidate` rather than invented:
+`exchange_ids` is required, so a finding with nothing behind it cannot be
+built; and the dedupe key is computed in one place, because "two writers will
+spell the same finding two ways" is truer of an agent than of a check.
+
+`type_` is the literal `agent`, which also makes a check/agent collision
+unreachable — the two vocabularies cannot meet unless a check is ever named
+`agent`.
+
 ## Process decisions
 
 ### A plan is a historical argument, not live documentation
@@ -296,3 +414,6 @@ not run since the commit that added the second.
 | A surface carrying any finding retires nothing on that surface | The `finding` branch offers no `considered`, because it short-circuits above the gaps check the passive corpus relies on. Under-claims, and disclosed to the client |
 | `codec.identity_body` does not enforce the three-name header set | `hx.config` refuses a fourth name with a better message and `IdentityRegistry` refuses it inside the JVM, which is where §4 puts enforcement. A third copy would be a third place to drift |
 | `path_traversal` cannot probe a `path_segment` in practice | Its name filter wants a file-shaped name; the normaliser's vocabulary is `{id}/{uuid}/{hex}/{slug}`. A false negative, disclosed in the report |
+| `agent_action` has no index matching how it is read | `run.journal` and `run.resume` filter on `engagement_id + actor`; the only index is `idx_action_run(run_id, ts_us)`, and `run_id` is NULL on every CLI-adapter row. A table scan on the most-read tool in the set. |
+| `surface.query`'s `facets.host` is unbounded | 300 hosts repeat on every 50-row page — measured at 18 KB per envelope on 3,000 surfaces. Principle 3's spirit, uncapped. |
+| The report renders no `created_by` | A client cannot tell an agent-asserted finding from a check-verified one. The column records it; the renderer does not read it. A reporting decision, not a storage one. |

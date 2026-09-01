@@ -351,3 +351,51 @@ def test_a_denial_row_never_holds_a_credential_parameter(conn):
     stored = conn.execute("SELECT url FROM denial").fetchone()["url"]
     assert token not in stored
     assert stored == "http://offside.example.test/x?api_key={{observed:param}}"
+
+
+def test_a_credential_never_reaches_agent_action(engagement):
+    """Principle 5 is what makes `args_blob` safe to store verbatim: identity
+    is passed by NAME and resolved below the tool layer. If a tool ever took a
+    credential value, this column becomes the place credentials are written to
+    disk in the clear."""
+    from hx.tools import registry
+    from hx.tools import impl  # noqa: F401
+
+    # No tool declares a property that could carry a secret. Checked against
+    # the SCHEMAS rather than against a run, so it holds for arguments nobody
+    # has thought to pass yet.
+    for name, tool in registry.TOOLS.items():
+        for prop in (tool.params.get("properties") or {}):
+            assert not any(w in prop.lower() for w in
+                           ("cookie", "authorization", "token", "password",
+                            "secret", "credential")), f"{name}.{prop}"
+
+
+def test_a_secret_shaped_argument_value_never_reaches_agent_action(tool_ctx):
+    """The value half of the same guarantee, and the third finding of the
+    final whole-branch review, driven end to end.
+
+    Principle 5 (above) is why `args_blob` is safe to store verbatim: no tool
+    takes a credential-NAMED argument. It says nothing about a VALUE an agent
+    passes into an ordinary, innocently-named argument -- `finding.query`'s
+    `severity` -- that happens to be secret-shaped. `dispatch` already keeps
+    that safe on the `args_blob` side (a schema failure journals argument
+    NAMES only, never the values -- see `dispatch._shape`). The hole was
+    `schema._validate` echoing the rejected value into its problem string,
+    which `dispatch` puts in the refusal `detail` and `journal.summarise`
+    appends to `agent_action.result_summary` -- a second column, guarded by
+    neither rule.
+    """
+    from hx.tools import dispatch, impl  # noqa: F401  (registers every tool)
+
+    secret = "Bearer eyJhbGciOiJIUzI1NiJ9.THIS_IS_THE_SECRET.sig"
+    env = dispatch.dispatch(tool_ctx, "finding.query", {"severity": secret})
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert secret not in (env.detail or "")
+
+    row = tool_ctx.conn.execute(
+        "SELECT args_blob, result_summary FROM agent_action"
+        " WHERE tool='finding.query' ORDER BY ts_us DESC LIMIT 1").fetchone()
+    assert row is not None, "the refused call was not journalled at all"
+    assert secret not in (row[0] or "")
+    assert secret not in (row[1] or "")

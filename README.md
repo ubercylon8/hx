@@ -77,6 +77,52 @@ starts a new run rather than reviving the halted one. `hx info` prints engagemen
 
 ---
 
+## Tools
+
+The tool layer is the interface an *agent* drives, as opposed to `hx new` / `hx capture` /
+`hx scan` above, which are human acts. It is an allowlist (`hx.tools.registry.TOOLS`), a
+fail-closed JSON Schema validator, and one dispatcher every call goes through — `hx.tools
+.dispatch.dispatch(ctx, name, args, why=...)`. `hx tool` is the first transport over it; an
+MCP adapter over the same `dispatch` is future work.
+
+```bash
+hx tool --list
+hx tool surface.query --json '{"untested":true}' --root path/to/engagement
+```
+
+`hx tool --list` needs no engagement; every other call needs `--root` pointed at one.
+`--why` is required for any tool that changes state — it is written to `agent_action`, the
+journal `run.journal` and `run.resume` read back.
+
+Every call answers with an envelope carrying one of five outcomes:
+
+- **`ok`** — the tool ran and returned something.
+- **`empty`** — the tool ran and matched nothing; not the same as a broken tool.
+- **`unavailable`** — the tool could not run (no open run, no live session, ...).
+- **`refused`** — a gate said no (bad arguments, a halt, an unregistered name, ...).
+- **`error`** — a defect in `hx` itself, not a decision about the request.
+
+`hx tool`'s exit status follows whether the tool *ran* (`ok`/`empty` → 0), not the outcome
+itself — a query that matched nothing is not a shell failure.
+
+Every call is checked in a fixed order, and the first rule that matches wins:
+
+```
+not_registered -> halted -> missing_why -> bad_args -> no_session
+```
+
+**Eleven of the seventeen tools spec section 8 names are built**: `run.start`,
+`run.finish`, `run.journal`, `run.resume`, `surface.query`, `surface.detail`,
+`finding.record`, `finding.query`, `evidence.attach`, `checks.list`, `report.render`. The
+other six — `http.send`, `http.grep`, `http.body`, `http.replay_as`, `scan.run`,
+`crawl.run` — are not built yet; they are exactly the ones that need a live session
+(`needs_egress`), which arrives with the session bracket in a later plan. Three more —
+`engagement.create`, `surface.add`, `finding.set_status` — are deliberately never
+tools at all: creating an engagement and confirming a finding are human acts, and stay in
+the CLI and the (future) web app.
+
+---
+
 ## What it does today
 
 **Discovery is proxy-only.** `hx` sees the application as you browse it through Burp. It
@@ -119,7 +165,9 @@ Against the v1 scope in the design spec, five of nine items are done. Outstandin
   crawl.
 - **Identities** — `config.yaml` accepts an `identities` block and nothing applies it. This
   is the root of the unauthenticated-probe limitation above.
-- **The agent tool interface** — `hx` is CLI-driven today.
+- **The agent tool interface, partly.** `hx tool` (see [Tools](#tools) above) exposes eleven
+  of the seventeen tools over a shell; an MCP adapter over the same `dispatch`, and the six
+  tools that need a live session, are not built yet.
 - **The web app screens.**
 
 ---

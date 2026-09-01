@@ -1040,16 +1040,30 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
 
 def _evidence(conn, finding_id) -> list[str]:
     rows = conn.execute(
-        "SELECT e.seq, x.method, x.url, x.status FROM evidence e"
+        "SELECT e.seq, x.method, x.url, x.status, e.role, e.note FROM evidence e"
         " LEFT JOIN exchange x ON x.id = e.exchange_id"
-        " WHERE e.finding_id=? ORDER BY e.seq", (finding_id,)).fetchall()
+        " WHERE e.finding_id=?"
+        # PROOF FIRST, ALWAYS -- `seq` only breaks ties within a role. Task 9
+        # gave `evidence.attach` a `role` an agent chooses per call
+        # (`proof`/`baseline`/`context`), and `_EVIDENCE_LIMIT` below still
+        # caps what renders at five. Ordering by `seq` alone let a chain's
+        # `baseline` rows -- the control a finding is compared AGAINST, not
+        # what shows it -- fill those five slots ahead of the `proof` rows
+        # that came later, so a client could read a finding whose rendered
+        # evidence was entirely controls and no demonstration. `(e.role =
+        # 'proof') DESC` is 1-before-0 in SQLite, so every `proof` row sorts
+        # ahead of every `baseline`/`context` row regardless of when either
+        # was recorded; `e.seq` then keeps EACH role's own chain in the order
+        # it was captured, which is the only ordering `_EVIDENCE_LIMIT`'s
+        # "first N" caveat below is honest about.
+        " ORDER BY (e.role = 'proof') DESC, e.seq", (finding_id,)).fetchall()
     if not rows:
         return []
     out = ["**Evidence.**\n"]
     total = len(rows)
     shown = rows[:_EVIDENCE_LIMIT]
     unresolved = 0
-    for _seq, method, url, status in shown:
+    for _seq, method, url, status, role, note in shown:
         if url is None:
             # F6: `evidence.exchange_id` is nullable and the LEFT JOIN
             # anticipates a row this schema allows but no writer produces
@@ -1080,8 +1094,27 @@ def _evidence(conn, finding_id) -> list[str]:
         # `codec._check_header` admits as a `str`, and SQLite's INTEGER
         # affinity stores a non-numeric string as TEXT. It carries no URL, so
         # `_flat` and not `_redact`.
-        out.append(f"- {_code(f'{_flat(method)} {_redact(url)}')} → "
-                   f"{_flat(status_text)}")
+        #
+        # ROLE IS RENDERED ON EVERY BULLET, not only the ones that are not
+        # `proof`. §12's rule is that evidence which cannot distinguish "this
+        # shows it" from "this is what it differs from" is worse than no
+        # evidence, and a reader can only make that distinction from the
+        # label on the row in front of them -- an unlabelled bullet reads as
+        # proof by default, which is exactly the false reading this exists to
+        # remove. `role` is a closed vocabulary a schema enum enforces at the
+        # tool boundary (`finding.EVIDENCE_ROLES`) or a literal this
+        # codebase's own writers set, never free text off the wire, so it is
+        # rendered bare -- the same choice already made for `confidence` and
+        # `status` a few lines up in `_finding_body`, for the same reason.
+        # `note` IS free text an agent supplies (`evidence.attach`'s `note`),
+        # so it gets the same `_flat`+`_redact` treatment as `description`,
+        # `impact` and `remediation`: one line, and no URL smuggled through it
+        # unredacted.
+        line = (f"- {_code(f'{_flat(method)} {_redact(url)}')} → "
+               f"{_flat(status_text)} · *{_flat(role)}*")
+        if note:
+            line += f" — {_flat(_redact(note))}"
+        out.append(line)
     omitted = total - len(shown)
     caveats = []
     if omitted > 0:

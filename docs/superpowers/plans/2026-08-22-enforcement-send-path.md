@@ -24424,9 +24424,36 @@ def dedupe_key(*, type_: str, issue_type_id: str, scheme: str, host: str,
 
 def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
                    dedupe_key: str, run_id: str, surface_id: str | None = None,
-                   host: str | None = None,
-                   check_id: str | None = None) -> str:
+                   host: str | None = None, check_id: str | None = None,
+                   created_by: str = "check") -> str:
     """Insert the finding, or refresh it if it is already known.
+
+    `created_by` DEFAULTS TO `check` because that is what this function wrote
+    as a literal until Task 9 of the tool layer, when `finding.record` became
+    the second writer. The default leaves every check-runner call site
+    unchanged byte for byte -- the same widening `record_evidence` took for
+    `role` -- and the column has always admitted `agent`; nothing could reach
+    it. An agent finding is not a lesser one, but it is a differently-sourced
+    one, and the column records which writer asserted it.
+
+    NO REPORT RENDERS THAT DISTINCTION YET -- an earlier version of this
+    docstring said "section 12 renders the distinction", which was false:
+    `created_by` appears nowhere in `hx/report.py`. The column is written and
+    queryable (`finding.query`'s own `created_by` filter reads it back), but
+    whether a client deliverable should say "the agent found this" is a
+    reporting decision nobody has made, not a storage one this function
+    settles by writing the column.
+
+    `created_by` IS ALSO NOT IN THE `DO UPDATE` CLAUSE, and the Task 9 review
+    asked the obvious question: if a check and an agent produced the same
+    dedupe key, who would win? The first writer, since the clause names what
+    moves and this is not among it. But the question is moot by construction,
+    which is the better answer: `dedupe_key`'s first part is `type_`, which is
+    the CHECK'S ID for a check and the literal `agent` for an agent
+    (`hx.tools.impl.finding.AGENT_TYPE`, the one place that prefix is
+    spelled). The two vocabularies cannot meet unless a check is ever named
+    `agent` -- which is the single thing to refuse if the corpus grows a
+    naming rule, and until then the only way this could stop being true.
 
     WHAT AN UPSERT MUST NOT TOUCH: `status`, and `first_seen_run`. An operator
     who marked something `false_positive` has made a judgement the next scan
@@ -24535,6 +24562,16 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
     `dedupe_key`) and a second place deciding either would be the same class
     of drift that function's docstring warns about.
     """
+    # `human` IS NOT AVAILABLE HERE, and the omission is the point. The schema
+    # admits three writers; this function is the path a CHECK and an AGENT
+    # take, and a human's judgement reaches the store through
+    # `finding_status_event` and the web app, never by a caller declaring
+    # itself one. `status` stays the literal 'new' below for the same reason:
+    # neither a check nor an agent may open a finding in any other state.
+    if created_by not in ("check", "agent"):
+        raise ValueError(
+            f"created_by must be 'check' or 'agent', got {created_by!r}; "
+            "'human' is the web app's word and has no path through here")
     fid = new_id("f")
     conn.execute(
         "INSERT INTO finding(id, engagement_id, dedupe_key, issue_type_id,"
@@ -24542,7 +24579,7 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
         " impact, remediation, cwe, severity, confidence, created_by, status,"
         " insertion_name, insertion_kind, scope_level, payload, surface_id,"
         " host, check_id, first_seen_run, last_seen_run)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?, 'check', 'new', ?,?,?,?,?,?,?,?,?)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?, ?, 'new', ?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(engagement_id, dedupe_key) DO UPDATE SET"
         "   last_seen_run=excluded.last_seen_run,"
         "   title=excluded.title,"
@@ -24559,7 +24596,7 @@ def upsert_finding(conn: sqlite3.Connection, *, engagement_id: str, candidate,
         (fid, engagement_id, dedupe_key, candidate.issue_type_id,
          candidate.title, candidate.description,
          candidate.impact, candidate.remediation, candidate.cwe,
-         candidate.severity, candidate.confidence,
+         candidate.severity, candidate.confidence, created_by,
          candidate.insertion.name if candidate.insertion else None,
          candidate.insertion.kind if candidate.insertion else None,
          candidate.scope_level, candidate.payload, surface_id, host,
@@ -24604,7 +24641,8 @@ def record_observation(conn: sqlite3.Connection, *, finding_id: str,
 
 
 def record_evidence(conn: sqlite3.Connection, *, finding_id: str,
-                    exchange_ids, at_us: int) -> None:
+                    exchange_ids, at_us: int, role: str = "proof",
+                    note: str | None = None) -> None:
     """Append the given exchanges to this finding's evidence chain, `seq`
     continuing from what is already there. `seq` is the order S12 renders
     the chain in.
@@ -24617,22 +24655,37 @@ def record_evidence(conn: sqlite3.Connection, *, finding_id: str,
     `IntegrityError` on the second recording of any finding, measured, which
     is how the trigger was found. This function only ever appends.
 
-    THE SKIP BELOW DOES ONE THING: it records each EXCHANGE ID once per
-    finding, so calling this twice with the same ids -- a retry, a duplicate
-    dispatch inside one run -- does not double the chain. F1 of the task-5
-    review: an earlier version of this docstring claimed that property as "a
-    chain that does not grow on re-observation" and "a finding seen in three
-    runs would not carry its exchange three times". That is FALSE of the real
-    path. `record_exchange` mints a fresh `x-<random>` id per row
-    (`new_id("x")`), so a later run observing the same finding produces a
-    NEW exchange with a new id every time -- the skip never fires across
-    runs, and a finding seen in N runs genuinely accumulates N evidence rows,
-    one per observation. This function does not and cannot dedupe across
-    runs; it has no stable key to dedupe on that would not also be a claim
-    about identity this module does not own. Per-run persistence -- "how many
-    runs has this been seen in" -- is `finding_observation`'s job, whose
-    primary key is `(finding_id, run_id)`; that is the table that answers it,
-    not this one.
+    `role` AND `note` DEFAULT TO WHAT THIS FUNCTION ALWAYS WROTE. The columns
+    have existed since Plan 1; nothing before Task 9 ever passed anything but
+    the literal `'proof'` for the first or `None` for the second, so the
+    defaults exist so that every check-runner call site -- `_write_finding`,
+    the pattern this function's callers all follow -- is unchanged byte for
+    byte. `evidence.attach` is the first caller to pass either explicitly.
+    `kind` stays the hardcoded `'exchange'`: it is the only evidence kind
+    anything in this codebase can attach, so widening it to a parameter would
+    add a choice nothing exercises.
+
+    THE SKIP BELOW DOES ONE THING: it records each (EXCHANGE ID, ROLE) pair
+    once per finding, so calling this twice with the same ids and the same
+    role -- a retry, a duplicate dispatch inside one run -- does not double
+    the chain. The key is the PAIR, not the exchange id alone, because Task 9
+    gives `evidence.attach` a `role` an agent chooses per call: the same
+    exchange already cited as `proof` by a check can be cited again as
+    `baseline` by an agent showing what it differs from, and that second
+    citation is new information the finding did not have, not a retry of the
+    first. F1 of the task-5 review: an earlier version of this docstring
+    claimed a stronger property -- "a chain that does not grow on
+    re-observation" and "a finding seen in three runs would not carry its
+    exchange three times". That is FALSE of the real path. `record_exchange`
+    mints a fresh `x-<random>` id per row (`new_id("x")`), so a later run
+    observing the same finding produces a NEW exchange with a new id every
+    time -- the skip never fires across runs, and a finding seen in N runs
+    genuinely accumulates N evidence rows, one per observation. This function
+    does not and cannot dedupe across runs; it has no stable key to dedupe on
+    that would not also be a claim about identity this module does not own.
+    Per-run persistence -- "how many runs has this been seen in" -- is
+    `finding_observation`'s job, whose primary key is `(finding_id, run_id)`;
+    that is the table that answers it, not this one.
 
     UNBOUNDED GROWTH IS THE REAL CONSEQUENCE AND IS NOT FIXED HERE: a finding
     seen in fifty runs holds fifty evidence rows, and a report must not print
@@ -24646,20 +24699,20 @@ def record_evidence(conn: sqlite3.Connection, *, finding_id: str,
     chain that looks like the whole one until someone counts it.
     """
     with transaction(conn):
-        known = {row[0] for row in conn.execute(
-            "SELECT exchange_id FROM evidence WHERE finding_id=?",
+        known = {(row[0], row[1]) for row in conn.execute(
+            "SELECT exchange_id, role FROM evidence WHERE finding_id=?",
             (finding_id,))}
         seq = conn.execute(
             "SELECT COALESCE(MAX(seq) + 1, 0) FROM evidence WHERE finding_id=?",
             (finding_id,)).fetchone()[0]
         for exchange_id in exchange_ids:
-            if exchange_id in known:
+            if (exchange_id, role) in known:
                 continue
             conn.execute(
                 "INSERT INTO evidence(id, finding_id, seq, role, kind,"
-                " exchange_id, captured_us) VALUES(?,?,?,'proof','exchange',?,?)",
-                (new_id("ev"), finding_id, seq, exchange_id, at_us))
-            known.add(exchange_id)
+                " exchange_id, note, captured_us) VALUES(?,?,?,?,'exchange',?,?,?)",
+                (new_id("ev"), finding_id, seq, role, exchange_id, note, at_us))
+            known.add((exchange_id, role))
             seq += 1
 ```
 

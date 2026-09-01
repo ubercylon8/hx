@@ -456,3 +456,23 @@ def test_record_observation_refreshes_severity_and_confidence_together(engagemen
     row = engagement_conn.execute(
         "SELECT severity_at, confidence_at FROM finding_observation").fetchone()
     assert row == ("Critical", "Certain")
+
+
+def test_record_evidence_still_defaults_to_proof_and_can_be_told_otherwise(
+        engagement_conn):
+    """The default keeps every check-runner call site unchanged; the parameter
+    is what `evidence.attach` needs. Both, or neither is safe."""
+    c = base.Candidate(title="t", issue_type_id="t-issue", severity="Low",
+                       confidence="Firm", insertion=None,
+                       exchange_ids=("x-1", "x-2"))
+    fid = records.upsert_finding(engagement_conn, engagement_id="e-1",
+                                 candidate=c, dedupe_key=key(), run_id="r-1")
+    records.record_evidence(engagement_conn, finding_id=fid,
+                            exchange_ids=("x-1",), at_us=1)
+    records.record_evidence(engagement_conn, finding_id=fid,
+                            exchange_ids=("x-2",), at_us=2,
+                            role="baseline", note="unauthenticated control")
+    rows = engagement_conn.execute(
+        "SELECT role, note FROM evidence WHERE finding_id=? ORDER BY seq",
+        (fid,)).fetchall()
+    assert rows == [("proof", None), ("baseline", "unauthenticated control")]

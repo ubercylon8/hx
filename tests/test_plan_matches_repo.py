@@ -346,7 +346,7 @@ def test_a_stale_excerpt_is_caught_where_a_whole_file_compare_never_looked(tmp_p
 # written. The marker line is inside the fence, so any fenced Python whose
 # first line is a comment becomes a tracked block whether or not anyone meant
 # it to be.
-EXPECTED_BLOCKS = 141
+EXPECTED_BLOCKS = 167
 
 
 def test_the_check_actually_found_some_blocks():
