@@ -3979,6 +3979,14 @@ def replay_as(ctx, *, exchange_id: str, identities,
         # the same ruling: nothing goes on the wire until every identity has
         # a credential behind it.
         resolved = [live.ensure_identity(ctx, name) for name in wanted]
+    # CATCHING THE PASS ABOVE, AND STANDING GUARD OVER THE ONE BELOW.
+    # `declaration_of` raises this for an undeclared name, so the clause is
+    # reached in the ordinary way. It also covers `ensure_identity`'s own
+    # `ValueError` -- which the pre-pass has already made unreachable, and
+    # which is kept anyway: a future refactor that drops or reorders the
+    # declaration pass would otherwise turn an undeclared name into
+    # `error / internal` silently, and the agent would be told hx is broken
+    # for a typo it could fix.
     except ValueError as exc:
         raise ToolRefused("bad_args", str(exc)) from exc
     except identity_mod.IdentityError as exc:
