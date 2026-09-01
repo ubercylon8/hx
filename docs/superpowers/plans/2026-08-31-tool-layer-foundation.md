@@ -1279,7 +1279,8 @@ REASONS_FOR = {
         "budget_exhausted", "bad_frame", "wrong_run_kind"}),
     "unavailable": frozenset({
         "no_session", "no_run", "not_implemented", "identity_dead",
-        "transport_error", "timeout", "bridge_lost", "not_configured"}),
+        "identity_unresolved", "transport_error", "timeout", "bridge_lost",
+        "not_configured"}),
     "error": frozenset({"internal"}),
 }
 
@@ -4156,6 +4157,19 @@ def test_the_registry_is_exactly_the_tools_built_so_far():
     # match PLAN_B as the rest of Plan B lands, at which point this is the
     # full seventeen.
     assert set(registry.TOOLS) == PLAN_A | PLAN_B_BUILT
+
+
+def test_plan_b_built_is_a_subset_of_plan_b():
+    # Fix round 1's finding 3. `test_the_registry_is_exactly_the_tools_built_
+    # so_far` above is only as strong as `PLAN_B_BUILT` itself: without this,
+    # a tool registered under a name outside section 8's seventeen is
+    # admitted into the registry just by adding it to `PLAN_B_BUILT`, and
+    # `test_plan_a_and_plan_b_together_are_section_eights_seventeen` below
+    # would never see it -- it compares only `PLAN_A | PLAN_B`, which
+    # `PLAN_B_BUILT` does not appear in at all. This restores the half of
+    # property 1 that check was meant to cover: `PLAN_B_BUILT` may only ever
+    # name tools the plan already promised.
+    assert PLAN_B_BUILT <= PLAN_B
 
 
 def test_plan_a_and_plan_b_together_are_section_eights_seventeen():

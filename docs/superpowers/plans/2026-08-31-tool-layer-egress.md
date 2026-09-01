@@ -1226,6 +1226,86 @@ def test_baseline_for_returns_the_exemplars_body_not_its_whole_response(
 
     baseline = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id)
     assert baseline == (200, body)
+
+
+def _two_exchanges_on_one_surface(tool_run):
+    """Two `via='send'` exchanges against the same surface, through the real
+    writer (`hx.issue.issue`) rather than hand-built rows -- the same reason
+    `test_baseline_for_returns_the_exemplars_body_not_its_whole_response`
+    goes through it above. `first` becomes the surface's exemplar (`hx.
+    capture.Capture.upsert_surface`'s `INSERT ... ON CONFLICT DO UPDATE`
+    writes `exemplar_exchange_id` only on the INSERT branch); `second` does
+    not. Returns `(first, second, surface_id, first_payload)`.
+    """
+    bridge = FakeBridge()
+    first_payload = b"Hello visitor"
+    second_payload = b"Hello again"
+    bridge.replies([
+        sent_result(b"HTTP/1.1 200 OK\r\n\r\n" + first_payload),
+        sent_result(b"HTTP/1.1 200 OK\r\n\r\n" + second_payload),
+    ])
+    kw = dict(engagement_id=tool_run.engagement.id, run_id=tool_run.run_id,
+              scheme="http", host="127.0.0.1", port=8080, method="GET",
+              path="/x")
+    first = issue.issue(bridge, tool_run.conn, tool_run.blobs,
+                        tool_run.config, **kw)
+    second = issue.issue(bridge, tool_run.conn, tool_run.blobs,
+                         tool_run.config, **kw)
+    surface_id = tool_run.conn.execute(
+        "SELECT surface_id FROM exchange WHERE id=?",
+        (first.exchange_id,)).fetchone()[0]
+    return first, second, surface_id, first_payload
+
+
+# --- `exclude_exchange_id`, fix round 1's finding 4 -------------------------
+#
+# The NULL-safety contract lived only in a comment on `baseline_for`: `x.id
+# IS NOT ?` against a NULL parameter, not `!=`, which SQLite evaluates to
+# NULL -- neither true nor false -- and which would silently match NO row for
+# every caller that passes nothing. These four cases are the ones the
+# reviewer probed by hand.
+
+
+def test_no_exclusion_returns_the_baseline(tool_run):
+    first, _second, surface_id, payload = _two_exchanges_on_one_surface(
+        tool_run)
+    got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id)
+    assert got == (first.status, payload)
+
+
+def test_excluding_the_exemplar_itself_returns_no_baseline(tool_run):
+    """The guard `hx.tools.impl.http._digest` relies on: `hx.issue.issue`
+    makes a brand-new surface's exemplar the very exchange that just created
+    it, so a caller diffing THAT exchange's response against "the baseline"
+    must not diff it against itself -- a zero delta reporting a comparison
+    that was never made."""
+    first, _second, surface_id, _payload = _two_exchanges_on_one_surface(
+        tool_run)
+    got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id,
+                             exclude_exchange_id=first.exchange_id)
+    assert got is None
+
+
+def test_excluding_a_different_exchange_leaves_the_baseline_intact(tool_run):
+    """Only an exclusion naming the EXEMPLAR itself may suppress the
+    baseline. Excluding the second exchange -- which is not the exemplar --
+    must change nothing."""
+    first, second, surface_id, payload = _two_exchanges_on_one_surface(
+        tool_run)
+    got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id,
+                             exclude_exchange_id=second.exchange_id)
+    assert got == (first.status, payload)
+
+
+def test_exclude_exchange_id_of_none_leaves_the_baseline_intact(tool_run):
+    """`None` PASSED EXPLICITLY, not merely omitted -- pinning the same
+    NULL-safety contract as `test_no_exclusion_returns_the_baseline` against
+    the keyword itself rather than against its default."""
+    first, _second, surface_id, payload = _two_exchanges_on_one_surface(
+        tool_run)
+    got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id,
+                             exclude_exchange_id=None)
+    assert got == (first.status, payload)
 ```
 
 Add one more test once Task 1 is in: `baseline_for` over a surface whose exemplar exchange has a `resp_blob`, asserting it returns `(status, body_bytes)` -- the BODY, not the whole stored response. Build the row with `hx.issue.issue` and a `FakeBridge` rather than by hand — a fixture that writes the row itself would pass while the real writer wrote something else.
@@ -2488,6 +2568,52 @@ def test_an_undeclared_identity_is_refused_and_names_the_declared_ones(
     assert ctx.session.bridge.requests == []
 
 
+def test_an_identity_registration_refused_by_the_wire_carries_its_class(
+        tool_run, staff_identity_config, monkeypatch):
+    """RULING 13, fix round 1's finding 1. `hx.tools.live.ensure_identity`
+    can raise `BridgeError` -- the extension's own liveness canary already
+    having answered `identity_dead` for this identity, say -- and not only
+    `ValueError`. That must reach the agent as the wire's own class, exactly
+    like a send refusal, rather than `error / internal`: told hx is broken,
+    an agent would retry the identical send forever instead of re-opening
+    its session."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ctx = _with_session(tool_run, [sent_result()])
+    ctx.session.bridge.refuse_identity("identity_dead", "canary failed")
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a",
+                                 "identity": "staff"},
+                                why="identity registration is refused")
+    assert env.outcome == "unavailable"
+    assert env.reason == "identity_dead"
+    assert ctx.session.bridge.requests == [], "send reached the wire anyway"
+
+
+def test_a_declared_identity_whose_credential_will_not_resolve_is_unavailable(
+        tool_run, staff_identity_config, monkeypatch):
+    """RULING 13, fix round 1's finding 2. `identity: "staff"` is a perfectly
+    valid argument -- the operator's environment is what is missing, and no
+    argument the agent can write would fix it, so this is NOT `bad_args`
+    (that stays reserved for an UNDECLARED identity name, which the agent
+    does control). The detail names the environment variable and must never
+    carry its value -- moot here since none was set, but `hx.identity`'s own
+    messages are value-free by construction."""
+    monkeypatch.delenv("HX_STAFF_TOKEN", raising=False)
+    tool_run.config = staff_identity_config
+    ctx = _with_session(tool_run, [sent_result()])
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a",
+                                 "identity": "staff"},
+                                why="the credential is not in the environment")
+    assert env.outcome == "unavailable"
+    assert env.reason == "identity_unresolved"
+    assert "HX_STAFF_TOKEN" in (env.detail or "")
+    assert ctx.session.bridge.requests == [], "send reached the wire anyway"
+
+
 def test_the_delta_is_null_when_the_surface_has_no_exemplar_yet(tool_run):
     """`null` and not a zero delta: nothing was compared, and a zero delta
     would read as 'identical to normal' about a comparison never made."""
@@ -2565,7 +2691,9 @@ exact moment hx worked as designed.
 from __future__ import annotations
 
 from ... import delta as delta_mod
+from ... import identity as identity_mod
 from ... import issue as issue_mod
+from ...bridge.server import BridgeError
 from .. import live, registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
@@ -2604,6 +2732,11 @@ REASON_FOR_CLASS = {
     "budget_exhausted": ("refused", "budget_exhausted"),
     "bad_frame": ("refused", "bad_frame"),
     "halted": ("refused", "halted"),
+    # An identity the extension's own liveness canary has declared dead: a
+    # `register_identity` refusal, not a send refusal -- the one class this
+    # table maps that never comes off `issue()`. See `send`'s
+    # `except BridgeError` below.
+    "identity_dead": ("unavailable", "identity_dead"),
     "not_configured": ("unavailable", "not_configured"),
     "bridge_lost": ("unavailable", "bridge_lost"),
     "transport_error": ("unavailable", "transport_error"),
@@ -2612,13 +2745,23 @@ REASON_FOR_CLASS = {
 UNKNOWN_CLASS = ("unavailable", "transport_error")
 
 
-def _raise_for_refusal(exc: issue_mod.IssueRefused) -> None:
-    """Turn an `IssueRefused` into the right `ToolError` subclass.
+def _raise_for_class(reason: str, detail: str, cause: BaseException) -> None:
+    """Turn a wire error class into the right `ToolError` subclass.
+
+    SHARED by `send`'s two wire-refusal sites: `issue_mod.IssueRefused` for
+    the request itself, and `BridgeError` for an identity registration the
+    extension refused -- its liveness canary already having answered
+    `identity_dead` for this identity, for one. Both are "the wire decided
+    something", so both go through the same table.
 
     PRINCIPLE 6: the class is the wire's, unchanged, so an agent that gets
     `dangerous_denied` learns the profile refused it and one that gets
     `rate_limited` learns to slow down -- two different next actions that a
-    single `error` would have made one.
+    single `error` would have made one. An identity refusal told as `error /
+    internal` is the same defect from the other side: an agent that reads
+    "hx is broken" retries the identical send forever instead of re-opening
+    its session, and the report counts an instrument event -- the canary
+    tripping -- as an internal defect in hx.
 
     A CLASS NOT IN `REASON_FOR_CLASS` falls back to `UNKNOWN_CLASS` rather
     than raising `ValueError` out of `Envelope.__post_init__` -- see this
@@ -2627,12 +2770,11 @@ def _raise_for_refusal(exc: issue_mod.IssueRefused) -> None:
     journal can still see what the extension actually said even though this
     build has no name for it.
     """
-    outcome, reason = REASON_FOR_CLASS.get(exc.reason, UNKNOWN_CLASS)
-    detail = exc.detail or ""
-    if exc.reason not in REASON_FOR_CLASS:
-        detail = f"[unmapped class {exc.reason!r}] {detail}".rstrip()
+    outcome, mapped = REASON_FOR_CLASS.get(reason, UNKNOWN_CLASS)
+    if reason not in REASON_FOR_CLASS:
+        detail = f"[unmapped class {reason!r}] {detail}".rstrip()
     cls = ToolRefused if outcome == "refused" else ToolUnavailable
-    raise cls(reason, detail) from exc
+    raise cls(mapped, detail) from cause
 
 
 def _digest(ctx, issued) -> dict:
@@ -2688,8 +2830,30 @@ def send(ctx, *, host: str, method: str, path: str, port: int = 80,
             # AN UNDECLARED IDENTITY IS THE AGENT'S MISTAKE, not a defect.
             # `bad_args` puts it beside a malformed path, which is where an
             # agent will look for it; `error / internal` would put it beside
-            # a crash.
+            # a crash. Distinct from the two exceptions below: `identity:
+            # "ghost"` is an argument the agent wrote and can correct.
             raise ToolRefused("bad_args", str(exc)) from exc
+        except identity_mod.IdentityError as exc:
+            # RULING 13. A DECLARED identity whose credential will not
+            # resolve is a DIFFERENT mistake from an undeclared one:
+            # `identity: "staff"` is a perfectly valid argument, and no
+            # argument the agent can write fixes an operator's unset
+            # `HX_STAFF_TOKEN`. `refused` would say the agent's call was
+            # wrong; `unavailable` says the instrument -- the credential --
+            # was not there, which is what an operator who forgot an
+            # `export` needs to be told. `hx.identity`'s messages are
+            # already value-free (they name the environment variable, never
+            # its value), so the message is passed through rather than
+            # composed anew.
+            raise ToolUnavailable("identity_unresolved", str(exc)) from exc
+        except BridgeError as exc:
+            # The extension refused the REGISTRATION itself -- see
+            # `_raise_for_class`'s docstring for why this goes through the
+            # same table as a send refusal rather than becoming `error /
+            # internal`.
+            cls_ = exc.error_class or "transport_error"
+            detail = str(exc).removeprefix(f"{cls_}: ")
+            _raise_for_class(cls_, detail, exc)
     try:
         issued = issue_mod.issue(
             ctx.session.bridge, ctx.conn, ctx.blobs, ctx.config,
@@ -2702,7 +2866,7 @@ def send(ctx, *, host: str, method: str, path: str, port: int = 80,
         # the schema cannot catch it: a CR inside a string is a valid string.
         raise ToolRefused("bad_args", str(exc)) from exc
     except issue_mod.IssueRefused as exc:
-        _raise_for_refusal(exc)
+        _raise_for_class(exc.reason, exc.detail or "", exc)
     return _digest(ctx, issued)
 
 
@@ -2874,6 +3038,17 @@ def test_send_reaches_a_loopback_target_and_records_a_readable_exchange(
         why="prove the composed request survives the extension")
     assert env.outcome == "ok", env.as_dict()
     assert env.result["status"] == 200
+
+    # FIX ROUND 1'S FINDING 5. A 200 alone only proves SOMETHING answered --
+    # a Burp that, say, answered from a cached response or a different
+    # listener would still produce one. `target.hits` is the one witness on
+    # this side of the extension no state on the hx side can fake (the same
+    # argument `Rig.send_unguarded`'s own docstring makes for using it): it
+    # is what the loopback SERVER itself recorded, before it ever answered.
+    assert len(target.hits) == 1, "the target never received the request"
+    hit = target.hits[0]
+    assert hit.method == "GET"
+    assert hit.path == "/health"
 
     row = tool_session.conn.execute(
         "SELECT via, req_blob, resp_blob FROM exchange WHERE id=?",

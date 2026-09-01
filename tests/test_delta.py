@@ -90,3 +90,83 @@ def test_baseline_for_returns_the_exemplars_body_not_its_whole_response(
 
     baseline = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id)
     assert baseline == (200, body)
+
+
+def _two_exchanges_on_one_surface(tool_run):
+    """Two `via='send'` exchanges against the same surface, through the real
+    writer (`hx.issue.issue`) rather than hand-built rows -- the same reason
+    `test_baseline_for_returns_the_exemplars_body_not_its_whole_response`
+    goes through it above. `first` becomes the surface's exemplar (`hx.
+    capture.Capture.upsert_surface`'s `INSERT ... ON CONFLICT DO UPDATE`
+    writes `exemplar_exchange_id` only on the INSERT branch); `second` does
+    not. Returns `(first, second, surface_id, first_payload)`.
+    """
+    bridge = FakeBridge()
+    first_payload = b"Hello visitor"
+    second_payload = b"Hello again"
+    bridge.replies([
+        sent_result(b"HTTP/1.1 200 OK\r\n\r\n" + first_payload),
+        sent_result(b"HTTP/1.1 200 OK\r\n\r\n" + second_payload),
+    ])
+    kw = dict(engagement_id=tool_run.engagement.id, run_id=tool_run.run_id,
+              scheme="http", host="127.0.0.1", port=8080, method="GET",
+              path="/x")
+    first = issue.issue(bridge, tool_run.conn, tool_run.blobs,
+                        tool_run.config, **kw)
+    second = issue.issue(bridge, tool_run.conn, tool_run.blobs,
+                         tool_run.config, **kw)
+    surface_id = tool_run.conn.execute(
+        "SELECT surface_id FROM exchange WHERE id=?",
+        (first.exchange_id,)).fetchone()[0]
+    return first, second, surface_id, first_payload
+
+
+# --- `exclude_exchange_id`, fix round 1's finding 4 -------------------------
+#
+# The NULL-safety contract lived only in a comment on `baseline_for`: `x.id
+# IS NOT ?` against a NULL parameter, not `!=`, which SQLite evaluates to
+# NULL -- neither true nor false -- and which would silently match NO row for
+# every caller that passes nothing. These four cases are the ones the
+# reviewer probed by hand.
+
+
+def test_no_exclusion_returns_the_baseline(tool_run):
+    first, _second, surface_id, payload = _two_exchanges_on_one_surface(
+        tool_run)
+    got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id)
+    assert got == (first.status, payload)
+
+
+def test_excluding_the_exemplar_itself_returns_no_baseline(tool_run):
+    """The guard `hx.tools.impl.http._digest` relies on: `hx.issue.issue`
+    makes a brand-new surface's exemplar the very exchange that just created
+    it, so a caller diffing THAT exchange's response against "the baseline"
+    must not diff it against itself -- a zero delta reporting a comparison
+    that was never made."""
+    first, _second, surface_id, _payload = _two_exchanges_on_one_surface(
+        tool_run)
+    got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id,
+                             exclude_exchange_id=first.exchange_id)
+    assert got is None
+
+
+def test_excluding_a_different_exchange_leaves_the_baseline_intact(tool_run):
+    """Only an exclusion naming the EXEMPLAR itself may suppress the
+    baseline. Excluding the second exchange -- which is not the exemplar --
+    must change nothing."""
+    first, second, surface_id, payload = _two_exchanges_on_one_surface(
+        tool_run)
+    got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id,
+                             exclude_exchange_id=second.exchange_id)
+    assert got == (first.status, payload)
+
+
+def test_exclude_exchange_id_of_none_leaves_the_baseline_intact(tool_run):
+    """`None` PASSED EXPLICITLY, not merely omitted -- pinning the same
+    NULL-safety contract as `test_no_exclusion_returns_the_baseline` against
+    the keyword itself rather than against its default."""
+    first, _second, surface_id, payload = _two_exchanges_on_one_surface(
+        tool_run)
+    got = delta.baseline_for(tool_run.conn, tool_run.blobs, surface_id,
+                             exclude_exchange_id=None)
+    assert got == (first.status, payload)

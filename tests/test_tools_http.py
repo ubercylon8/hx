@@ -156,6 +156,52 @@ def test_an_undeclared_identity_is_refused_and_names_the_declared_ones(
     assert ctx.session.bridge.requests == []
 
 
+def test_an_identity_registration_refused_by_the_wire_carries_its_class(
+        tool_run, staff_identity_config, monkeypatch):
+    """RULING 13, fix round 1's finding 1. `hx.tools.live.ensure_identity`
+    can raise `BridgeError` -- the extension's own liveness canary already
+    having answered `identity_dead` for this identity, say -- and not only
+    `ValueError`. That must reach the agent as the wire's own class, exactly
+    like a send refusal, rather than `error / internal`: told hx is broken,
+    an agent would retry the identical send forever instead of re-opening
+    its session."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ctx = _with_session(tool_run, [sent_result()])
+    ctx.session.bridge.refuse_identity("identity_dead", "canary failed")
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a",
+                                 "identity": "staff"},
+                                why="identity registration is refused")
+    assert env.outcome == "unavailable"
+    assert env.reason == "identity_dead"
+    assert ctx.session.bridge.requests == [], "send reached the wire anyway"
+
+
+def test_a_declared_identity_whose_credential_will_not_resolve_is_unavailable(
+        tool_run, staff_identity_config, monkeypatch):
+    """RULING 13, fix round 1's finding 2. `identity: "staff"` is a perfectly
+    valid argument -- the operator's environment is what is missing, and no
+    argument the agent can write would fix it, so this is NOT `bad_args`
+    (that stays reserved for an UNDECLARED identity name, which the agent
+    does control). The detail names the environment variable and must never
+    carry its value -- moot here since none was set, but `hx.identity`'s own
+    messages are value-free by construction."""
+    monkeypatch.delenv("HX_STAFF_TOKEN", raising=False)
+    tool_run.config = staff_identity_config
+    ctx = _with_session(tool_run, [sent_result()])
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a",
+                                 "identity": "staff"},
+                                why="the credential is not in the environment")
+    assert env.outcome == "unavailable"
+    assert env.reason == "identity_unresolved"
+    assert "HX_STAFF_TOKEN" in (env.detail or "")
+    assert ctx.session.bridge.requests == [], "send reached the wire anyway"
+
+
 def test_the_delta_is_null_when_the_surface_has_no_exemplar_yet(tool_run):
     """`null` and not a zero delta: nothing was compared, and a zero delta
     would read as 'identical to normal' about a comparison never made."""

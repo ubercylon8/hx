@@ -21,7 +21,9 @@ exact moment hx worked as designed.
 from __future__ import annotations
 
 from ... import delta as delta_mod
+from ... import identity as identity_mod
 from ... import issue as issue_mod
+from ...bridge.server import BridgeError
 from .. import live, registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
@@ -60,6 +62,11 @@ REASON_FOR_CLASS = {
     "budget_exhausted": ("refused", "budget_exhausted"),
     "bad_frame": ("refused", "bad_frame"),
     "halted": ("refused", "halted"),
+    # An identity the extension's own liveness canary has declared dead: a
+    # `register_identity` refusal, not a send refusal -- the one class this
+    # table maps that never comes off `issue()`. See `send`'s
+    # `except BridgeError` below.
+    "identity_dead": ("unavailable", "identity_dead"),
     "not_configured": ("unavailable", "not_configured"),
     "bridge_lost": ("unavailable", "bridge_lost"),
     "transport_error": ("unavailable", "transport_error"),
@@ -68,13 +75,23 @@ REASON_FOR_CLASS = {
 UNKNOWN_CLASS = ("unavailable", "transport_error")
 
 
-def _raise_for_refusal(exc: issue_mod.IssueRefused) -> None:
-    """Turn an `IssueRefused` into the right `ToolError` subclass.
+def _raise_for_class(reason: str, detail: str, cause: BaseException) -> None:
+    """Turn a wire error class into the right `ToolError` subclass.
+
+    SHARED by `send`'s two wire-refusal sites: `issue_mod.IssueRefused` for
+    the request itself, and `BridgeError` for an identity registration the
+    extension refused -- its liveness canary already having answered
+    `identity_dead` for this identity, for one. Both are "the wire decided
+    something", so both go through the same table.
 
     PRINCIPLE 6: the class is the wire's, unchanged, so an agent that gets
     `dangerous_denied` learns the profile refused it and one that gets
     `rate_limited` learns to slow down -- two different next actions that a
-    single `error` would have made one.
+    single `error` would have made one. An identity refusal told as `error /
+    internal` is the same defect from the other side: an agent that reads
+    "hx is broken" retries the identical send forever instead of re-opening
+    its session, and the report counts an instrument event -- the canary
+    tripping -- as an internal defect in hx.
 
     A CLASS NOT IN `REASON_FOR_CLASS` falls back to `UNKNOWN_CLASS` rather
     than raising `ValueError` out of `Envelope.__post_init__` -- see this
@@ -83,12 +100,11 @@ def _raise_for_refusal(exc: issue_mod.IssueRefused) -> None:
     journal can still see what the extension actually said even though this
     build has no name for it.
     """
-    outcome, reason = REASON_FOR_CLASS.get(exc.reason, UNKNOWN_CLASS)
-    detail = exc.detail or ""
-    if exc.reason not in REASON_FOR_CLASS:
-        detail = f"[unmapped class {exc.reason!r}] {detail}".rstrip()
+    outcome, mapped = REASON_FOR_CLASS.get(reason, UNKNOWN_CLASS)
+    if reason not in REASON_FOR_CLASS:
+        detail = f"[unmapped class {reason!r}] {detail}".rstrip()
     cls = ToolRefused if outcome == "refused" else ToolUnavailable
-    raise cls(reason, detail) from exc
+    raise cls(mapped, detail) from cause
 
 
 def _digest(ctx, issued) -> dict:
@@ -144,8 +160,30 @@ def send(ctx, *, host: str, method: str, path: str, port: int = 80,
             # AN UNDECLARED IDENTITY IS THE AGENT'S MISTAKE, not a defect.
             # `bad_args` puts it beside a malformed path, which is where an
             # agent will look for it; `error / internal` would put it beside
-            # a crash.
+            # a crash. Distinct from the two exceptions below: `identity:
+            # "ghost"` is an argument the agent wrote and can correct.
             raise ToolRefused("bad_args", str(exc)) from exc
+        except identity_mod.IdentityError as exc:
+            # RULING 13. A DECLARED identity whose credential will not
+            # resolve is a DIFFERENT mistake from an undeclared one:
+            # `identity: "staff"` is a perfectly valid argument, and no
+            # argument the agent can write fixes an operator's unset
+            # `HX_STAFF_TOKEN`. `refused` would say the agent's call was
+            # wrong; `unavailable` says the instrument -- the credential --
+            # was not there, which is what an operator who forgot an
+            # `export` needs to be told. `hx.identity`'s messages are
+            # already value-free (they name the environment variable, never
+            # its value), so the message is passed through rather than
+            # composed anew.
+            raise ToolUnavailable("identity_unresolved", str(exc)) from exc
+        except BridgeError as exc:
+            # The extension refused the REGISTRATION itself -- see
+            # `_raise_for_class`'s docstring for why this goes through the
+            # same table as a send refusal rather than becoming `error /
+            # internal`.
+            cls_ = exc.error_class or "transport_error"
+            detail = str(exc).removeprefix(f"{cls_}: ")
+            _raise_for_class(cls_, detail, exc)
     try:
         issued = issue_mod.issue(
             ctx.session.bridge, ctx.conn, ctx.blobs, ctx.config,
@@ -158,7 +196,7 @@ def send(ctx, *, host: str, method: str, path: str, port: int = 80,
         # the schema cannot catch it: a CR inside a string is a valid string.
         raise ToolRefused("bad_args", str(exc)) from exc
     except issue_mod.IssueRefused as exc:
-        _raise_for_refusal(exc)
+        _raise_for_class(exc.reason, exc.detail or "", exc)
     return _digest(ctx, issued)
 
 

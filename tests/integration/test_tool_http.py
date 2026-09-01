@@ -27,6 +27,17 @@ def test_send_reaches_a_loopback_target_and_records_a_readable_exchange(
     assert env.outcome == "ok", env.as_dict()
     assert env.result["status"] == 200
 
+    # FIX ROUND 1'S FINDING 5. A 200 alone only proves SOMETHING answered --
+    # a Burp that, say, answered from a cached response or a different
+    # listener would still produce one. `target.hits` is the one witness on
+    # this side of the extension no state on the hx side can fake (the same
+    # argument `Rig.send_unguarded`'s own docstring makes for using it): it
+    # is what the loopback SERVER itself recorded, before it ever answered.
+    assert len(target.hits) == 1, "the target never received the request"
+    hit = target.hits[0]
+    assert hit.method == "GET"
+    assert hit.path == "/health"
+
     row = tool_session.conn.execute(
         "SELECT via, req_blob, resp_blob FROM exchange WHERE id=?",
         (env.result["exchange_id"],)).fetchone()

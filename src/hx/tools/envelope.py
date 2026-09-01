@@ -48,7 +48,8 @@ REASONS_FOR = {
         "budget_exhausted", "bad_frame", "wrong_run_kind"}),
     "unavailable": frozenset({
         "no_session", "no_run", "not_implemented", "identity_dead",
-        "transport_error", "timeout", "bridge_lost", "not_configured"}),
+        "identity_unresolved", "transport_error", "timeout", "bridge_lost",
+        "not_configured"}),
     "error": frozenset({"internal"}),
 }
 

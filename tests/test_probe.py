@@ -62,6 +62,12 @@ class FakeBridge:
         # not yet consumed. Both additive -- see the two methods below.
         self.identities: list = []
         self._queue: list | None = None
+        # Set by `refuse_identity`, read by `register_identity`. Separate
+        # from `_refusal`/`_refusals_left` above: those are `send`'s and a
+        # test proving `http.send` reports an identity REGISTRATION refusal
+        # (the extension's own liveness canary answering `identity_dead`,
+        # say) needs `send` itself to still be free to answer normally.
+        self._identity_refusal: tuple[str, str] | None = None
 
     def reply(self, header: dict, body: bytes = b"") -> None:
         self._header = header
@@ -79,8 +85,23 @@ class FakeBridge:
         register an identity exactly once per generation -- the real
         extension refuses a repeat with `stale_generation` -- so a test needs
         to be able to COUNT registrations, and the credential must be
-        countable without being printed."""
+        countable without being printed.
+
+        REFUSES INSTEAD, raising `BridgeError`, when `refuse_identity` was
+        called -- reproducing the real `BridgeServer.register_identity`'s own
+        contract (its docstring: "Raises BridgeError ... `error_class` set to
+        the peer's `class`") the same way `send` reproduces `BridgeServer.
+        send`'s.
+        """
+        if self._identity_refusal is not None:
+            cls, detail = self._identity_refusal
+            raise server.BridgeError(
+                f"{cls}: {detail}".rstrip(": "), error_class=cls)
         self.identities.append((resolved.id, resolved.generation, origins))
+
+    def refuse_identity(self, cls: str, detail: str = "") -> None:
+        """Every `register_identity` call after this one raises `cls`."""
+        self._identity_refusal = (cls, detail)
 
     def replies(self, seq) -> None:
         """Queue successive answers for successive sends.
