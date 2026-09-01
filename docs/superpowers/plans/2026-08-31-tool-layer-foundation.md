@@ -2205,6 +2205,29 @@ class ToolContext:
     config: Any
     halt: Any
     session: Any = None
+    #: The ADAPTER'S ExitStack, and the reason egress belongs to a long-lived
+    #: adapter rather than to `hx tool`. `hx.session.session()` tears Burp
+    #: down on EVERY exit, so a JVM launched inside a one-shot `hx tool`
+    #: process dies microseconds later -- there is no object in that adapter
+    #: for a session to outlive. `hx mcp` is one process for the whole
+    #: conversation, opens a stack around its serve loop, and hands it here;
+    #: `run.start` pushes the session onto it and `run.finish` pops it. A
+    #: crash unwinds the stack, which is spec section 8's "a crash must not
+    #: orphan a JVM" -- the FIRST of its three layers, the other two being
+    #: `run.reap_stale` and `session()`'s own teardown.
+    #:
+    #: None means this adapter cannot host a session, which is a different
+    #: fact from "no session is open" and is reported as its own reason.
+    stack: Any = None
+    #: The run that launched the session on `stack`. At most one session at a
+    #: time -- see `hx.tools.live`.
+    _session_run_id: str | None = dataclasses.field(default=None, repr=False)
+    #: `(identity_id, generation)` already registered on THIS session's
+    #: extension. `BridgeServer.register_identity` refuses a generation that
+    #: does not advance what the extension holds (`stale_generation`), so a
+    #: second registration of the same pair is an error, not a no-op. Cleared
+    #: with the session, because a new extension has heard of none of them.
+    _registered: set = dataclasses.field(default_factory=set, repr=False)
     actor: str = "agent"
     _bound_run_id: str | None = dataclasses.field(default=None, repr=False)
     #: `None` means "not resolved for this call yet", never "resolved to
@@ -2653,7 +2676,7 @@ puts the session here rather than in a tool of its own.
 from __future__ import annotations
 
 from ... import run as run_mod
-from .. import envelope, registry, spec
+from .. import envelope, live as live_mod, registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
 #: `killed` is absent DELIBERATELY. The run table admits five statuses; that
@@ -2668,7 +2691,9 @@ JOURNAL_DEFAULT = 20
 
 
 def start(ctx, kind: str) -> dict:
-    """Open a run and bind it to this context."""
+    """Open a run, bind it to this context, and bracket a Burp if the kind
+    needs one -- `session` in the result says whether it got one, and if not,
+    which of `hx.tools.live`'s four reasons applies."""
     # Check for existing running runs of the same kind for this engagement.
     # Per-kind, not per-engagement: a crawl running while you browse is two runs,
     # because the enforcement rules differ by exactly that distinction.
@@ -2684,8 +2709,13 @@ def start(ctx, kind: str) -> dict:
                               kind=kind,
                               safety_profile=ctx.config.safety_profile)
     ctx.run_id = run_id
+    # AFTER the run row, deliberately: `open_for` can fail, and a failure
+    # that had to be reported with no run to report it against would be a
+    # failure with no journal row and no run row -- the one call that was
+    # trying to set the instrument up, leaving no trace that it did not.
     return {"id": run_id, "kind": kind,
-            "safety_profile": ctx.config.safety_profile}
+            "safety_profile": ctx.config.safety_profile,
+            "session": live_mod.open_for(ctx, run_id, kind)}
 
 
 def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -> dict:
@@ -2734,13 +2764,24 @@ def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -
                 "no_run", "no run is open on this context; run.start opens one")
 
     run_mod.close_run(ctx.conn, run_id=closed, status=status, stop_reason=note)
+    # THE JVM GOES WITH THE RUN. `run.finish` is the one tool exempt from the
+    # halt refusal (`dispatch.HALT_EXEMPT`) precisely so that an operator who
+    # has hit STOP can still close the bracket -- and closing the bracket has
+    # to include tearing the Burp down, or a halt leaves a live JVM behind
+    # with nothing left that is allowed to stop it.
+    #
+    # `closed`, not `ctx.run_id`: `kind` may have named a run this context
+    # never bound, and the session belongs to whichever run LAUNCHED it --
+    # `close_for` answers False for any other, so a `finish` that closed one
+    # run cannot take away another run's instrument.
+    session_closed = live_mod.close_for(ctx, closed)
     # Only clear what THIS context bound, and only if it is the run just
     # closed -- `kind` may have closed a run this context never bound (one
     # opened by a different context on the same engagement), and clearing an
     # unrelated binding would forget a run that is still open.
     if ctx.run_id == closed:
         ctx.run_id = None
-    return {"id": closed, "status": status}
+    return {"id": closed, "status": status, "session_closed": session_closed}
 
 
 def journal(ctx, since: int | None = None, last_n: int | None = None,
@@ -4231,7 +4272,7 @@ from .. import impl  # noqa: F401  -- registers every tool
 from .. import registry
 
 
-def build_context(engagement) -> dispatch_mod.ToolContext:
+def build_context(engagement, *, stack=None) -> dispatch_mod.ToolContext:
     """A context over an open engagement.
 
     NOTHING IS BOUND HERE, and that is fine: each `hx tool` invocation is its
@@ -4242,13 +4283,21 @@ def build_context(engagement) -> dispatch_mod.ToolContext:
     cannot do is hold a run across invocations in the FIELD -- there is no
     long-lived object here for `run.start` to bind onto that a later call
     would see -- which is exactly why the resolution had to move to the
-    store rather than staying a process-local field. Plan B's MCP adapter is
-    one long-lived process, and can bind for real; that is not this task.
+    store rather than staying a process-local field.
+
+    `stack` IS NONE FROM THIS ADAPTER AND THAT IS THE HONEST ANSWER, not a
+    limitation waiting to be lifted. `hx.session.session()` tears Burp down on
+    every exit, so a JVM launched inside a one-shot `hx tool` process dies
+    with it -- there is no object here for a session to outlive. `run.start`
+    is told so and reports `session: {live: false, reason: "no_host"}`, which
+    names `hx mcp` as the adapter that can. The parameter exists because
+    `hx mcp` builds its context through this same function.
     """
     return dispatch_mod.ToolContext(
         engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
         config=engagement.config,
-        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db),
+        stack=stack)
 
 
 def render_listing() -> str:

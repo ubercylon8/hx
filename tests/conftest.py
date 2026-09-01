@@ -177,3 +177,37 @@ def tool_run(tool_ctx):
         tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="manual",
         safety_profile=tool_ctx.config.safety_profile)
     return tool_ctx
+
+
+@pytest.fixture
+def staff_identity_config(engagement):
+    """The engagement's config with one static identity, `staff`, declared.
+
+    HERE RATHER THAN IN ONE TEST MODULE because three of Plan B's tasks need
+    it: `hx.tools.live.ensure_identity` (Task 3), `http.replay_as` (Task 6)
+    and `scan.run`'s identity argument (Task 7) all have to resolve a name
+    against `Config.identities`, and a second hand-rolled declaration is a
+    second set of field values free to drift from this one.
+
+    BUILT BY `dataclasses.replace` OFF THE ENGAGEMENT'S OWN CONFIG, the way
+    `tests/test_scan_probes.py`'s `_declaring` builds one, so `scope_include`
+    still names the host the identity's `origins` bound the credential to --
+    a config whose scope and whose origins disagreed would be a fixture
+    testing something no operator could write.
+
+    `value_from_env` NAMES A VARIABLE AND HOLDS NO VALUE. `HX_STAFF_TOKEN` is
+    set by whichever test needs a credential to exist (`monkeypatch.setenv`),
+    which is also what proves `hx.identity.resolve` reads the environment
+    rather than the config -- spec principle 5, and the reason a `Config` can
+    be written to disk at all.
+    """
+    import dataclasses
+
+    staff = config_mod.Identity(
+        id="staff", strategy="static",
+        inject=config_mod.Inject(header="Cookie",
+                                 value_from_env="HX_STAFF_TOKEN"),
+        liveness=config_mod.Liveness(path="/account", expect_body="Sign out",
+                                     expect_absent="Sign in"),
+        origins=("https://app.test/",))
+    return dataclasses.replace(engagement.config, identities={"staff": staff})

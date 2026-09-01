@@ -1404,13 +1404,20 @@ never wanted one; one told `no_host` knows it is running under `hx tool` and
 should move to `hx mcp`; one told `launch_failed` has an operator problem; one
 told `session_held` knows which run to finish. A single `live: false` would
 collapse four different next actions into one shrug.
+
+NOTHING HERE LAUNCHES A JVM. `session.session` is monkeypatched in every test
+that gets past the first two branches, which is right for a suite about
+bookkeeping -- and `tests/integration/test_tool_session.py` proves the one
+claim a fake cannot, that a real Burp comes up configured and goes away again.
 """
 import contextlib
 
 import pytest
 
+from hx import identity as identity_mod
 from hx import session as session_mod
 from hx.tools import live
+from tests.test_probe import FakeBridge
 
 
 class FakeLive:
@@ -1473,6 +1480,15 @@ def test_a_successful_launch_binds_the_session_and_reports_its_ports(
     assert tool_ctx.session is not None
 
 
+def test_a_scan_run_gets_one_too(tool_ctx, monkeypatch):
+    """EGRESS_KINDS is two kinds, not one. `manual` alone would leave the
+    agent's own check pass -- the one thing in section 8 that certainly
+    sends -- reporting `not_needed` for a run that needs it most."""
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    assert live.open_for(tool_ctx, "run-1", "scan")["live"] is True
+
+
 def test_a_second_egress_run_is_told_who_holds_the_session(
         tool_ctx, monkeypatch):
     """One Burp at a time, owned by the run that launched it. The second run
@@ -1497,6 +1513,28 @@ def test_only_the_owning_run_can_close_the_session(tool_ctx, monkeypatch):
     assert tool_ctx.session is None
 
 
+def test_closing_with_no_session_at_all_is_false_not_a_raise(tool_ctx):
+    """`run.finish` calls this on every run it closes, egress or not: a
+    browse run, or a manual run whose launch failed, has no session and must
+    still be closeable."""
+    tool_ctx.stack = contextlib.ExitStack()
+    assert live.close_for(tool_ctx, "run-1") is False
+
+
+def test_the_stack_is_reusable_so_a_second_run_can_open_its_own(
+        tool_ctx, monkeypatch):
+    """One `hx mcp` conversation opens and closes many runs on ONE stack.
+    `ExitStack.close()` unwinds and leaves the stack usable, which is what
+    makes that true -- a stack that could only be closed once would give the
+    second egress run of a conversation `launch_failed` for ever."""
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    live.open_for(tool_ctx, "run-1", "manual")
+    live.close_for(tool_ctx, "run-1")
+    assert live.open_for(tool_ctx, "run-2", "manual")["live"] is True
+    assert tool_ctx._session_run_id == "run-2"
+
+
 def test_a_dead_session_is_not_handed_out_as_live(tool_ctx, monkeypatch):
     """`LiveSession.gone()` has two ways to be true and neither is 'the
     process exited': a JVM that is up while its extension dropped the bridge
@@ -1517,11 +1555,96 @@ def test_a_dead_session_is_not_handed_out_as_live(tool_ctx, monkeypatch):
     assert tool_ctx.session is None
 
 
-def test_an_identity_is_registered_once_per_generation(tool_ctx, monkeypatch):
-    """`register_identity` refuses a generation that does not advance
-    (`stale_generation`), so a second registration of the same generation is
-    an error rather than a no-op."""
-    ...  # see Step 5 -- needs a config with a declared identity
+def test_a_dead_session_is_torn_down_rather_than_left_running(
+        tool_ctx, monkeypatch):
+    """A Burp at DENY-ALL is a Burp that is UP. Reporting `launch_failed` and
+    leaving the context manager on the stack would leave a 900 MB JVM running
+    for a session nobody holds -- section 8's orphaned JVM, arrived at by the
+    one branch that knows the session is no good."""
+    torn_down = []
+
+    @contextlib.contextmanager
+    def dead_session(eng, **kw):
+        class Dead(FakeLive):
+            def gone(self):
+                return "Burp exited (status 1) while the session was live"
+        try:
+            yield Dead()
+        finally:
+            torn_down.append(True)
+
+    monkeypatch.setattr(session_mod, "session", dead_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    live.open_for(tool_ctx, "run-1", "manual")
+    assert torn_down == [True], "the dead session was left on the stack"
+
+
+def test_an_identity_is_registered_once_per_generation(
+        tool_ctx, monkeypatch, staff_identity_config):
+    """A second registration of the same generation would be refused
+    `stale_generation` by the extension, so a tool that re-registered on
+    every send would fail on its second one."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_ctx.config = staff_identity_config
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge()})()
+    tool_ctx._registered = set()
+
+    first = live.ensure_identity(tool_ctx, "staff")
+    second = live.ensure_identity(tool_ctx, "staff")
+    assert first == second == ("staff", 1)
+    assert len(tool_ctx.session.bridge.identities) == 1
+
+
+def test_the_credential_never_leaves_this_function(
+        tool_ctx, monkeypatch, staff_identity_config):
+    """Principle 5. What comes back is a name and a number -- an exchange
+    row's worth -- and never a `Resolved`, which a journalled return value
+    would put the secret into."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_ctx.config = staff_identity_config
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge()})()
+    tool_ctx._registered = set()
+    got = live.ensure_identity(tool_ctx, "staff")
+    assert got == ("staff", 1)
+    assert "s3cret" not in repr(got)
+
+
+def test_the_declared_origins_bound_the_credential(
+        tool_ctx, monkeypatch, staff_identity_config):
+    """`origins` is what the extension applies the credential within, and an
+    empty tuple is 'the operator did not widen it' rather than 'everywhere'.
+    Dropping it here would send a client's live session to every host in
+    scope, which is the widening `Identity.origins` exists to prevent."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_ctx.config = staff_identity_config
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge()})()
+    tool_ctx._registered = set()
+    live.ensure_identity(tool_ctx, "staff")
+    assert tool_ctx.session.bridge.identities == [
+        ("staff", 1, ("https://app.test/",))]
+
+
+def test_a_credential_that_is_not_in_the_environment_is_not_registered(
+        tool_ctx, monkeypatch, staff_identity_config):
+    """`resolve` refuses rather than issuing anonymously, and the refusal
+    must not leave a half-registration behind: an identity recorded here that
+    the extension never heard of would make the NEXT call believe it had
+    already registered and send unauthenticated under its name."""
+    monkeypatch.delenv("HX_STAFF_TOKEN", raising=False)
+    tool_ctx.config = staff_identity_config
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge()})()
+    tool_ctx._registered = set()
+    with pytest.raises(identity_mod.IdentityError, match="HX_STAFF_TOKEN"):
+        live.ensure_identity(tool_ctx, "staff")
+    assert tool_ctx._registered == set()
+    assert tool_ctx.session.bridge.identities == []
+
+
+def test_an_undeclared_identity_names_what_is_declared(
+        tool_ctx, staff_identity_config):
+    tool_ctx.config = staff_identity_config
+    with pytest.raises(ValueError, match="staff"):
+        live.ensure_identity(tool_ctx, "nope")
 ```
 
 - [ ] **Step 2: Run to watch it fail**
@@ -1597,8 +1720,6 @@ import os
 
 from .. import identity as identity_mod
 from .. import session as session_mod
-from ..bridge import codec
-from ..bridge.server import BridgeError
 
 #: Run kinds that imply traffic this side issues. `browse` is the operator's
 #: own browser through `hx capture start`, which owns its own Burp -- spec
@@ -1824,24 +1945,61 @@ Everything else about the bracket is proved with a monkeypatched
 file proves the one thing a fake cannot: that `run.start` on a manual run
 brings up a JVM whose extension is CONFIGURED, and that `run.finish` takes it
 away again.
+
+THE EXITSTACK IS THE TEST'S OWN SAFETY NET AS WELL AS THE PRODUCT'S. It is
+the same object `hx mcp` will hand `build_context`, and it is what section 8's
+"a crash must not orphan a JVM" rests on first: an assertion that fails
+between `run.start` and `run.finish` unwinds it on the way out, which is why
+the JVM here cannot outlive a red test. `tests/integration/conftest.py`
+records what happens without that discipline -- "a 900 MB JVM per debugging
+attempt".
+
+THE SEED HOME IS NOT THE OPERATOR'S. `hx.tools.live.open_for` calls
+`session()` with no `seed`, deliberately: a tool layer has no business
+choosing which Burp home a consultant's licence lives in. So this test says so
+the way an operator would, through `$HX_BURP_SEED_HOME` -- the same override
+`tests/integration/test_cli_session.py` gives the `hx capture start`
+subprocess, and for the same reason. Without it `make_home` would copy the
+developer's real `$HOME`, which on a consultant's machine is live client
+project state.
 """
+from __future__ import annotations
+
 import contextlib
 
 import pytest
 
+from hx import halt as halt_mod
 from hx.tools import dispatch as dispatch_mod
 from hx.tools import impl  # noqa: F401 -- registers every tool
+from tests.integration import burp_fixture as bf
+
+pytestmark = pytest.mark.integration
 
 
-@pytest.mark.integration
+@pytest.fixture(autouse=True)
+def _prerequisites(monkeypatch):
+    """The rig's order: an unbuilt jar FAILS, a missing Burp SKIPS.
+
+    Asking the skip question first would turn a forgotten `extension/build.sh`
+    into a silently skipped suite, which is how this project's tests have
+    twice gone dark while reporting green.
+    """
+    if bf.unbuilt():
+        pytest.fail("unbuilt: " + ", ".join(bf.unbuilt()))
+    if bf.missing():
+        pytest.skip("missing: " + ", ".join(bf.missing()))
+    monkeypatch.setenv("HX_BURP_SEED_HOME", str(bf.SEED_HOME))
+
+
 def test_run_start_brings_up_a_configured_burp_and_run_finish_stops_it(
-        engagement, burp_fixture):
+        engagement):
     with contextlib.ExitStack() as stack:
         ctx = dispatch_mod.ToolContext(
             engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
             config=engagement.config,
-            halt=..., stack=stack)          # halt: follow the conftest's own
-                                            # construction of OperatorHalt
+            halt=halt_mod.OperatorHalt(engagement.root, engagement.db),
+            stack=stack)
         env = dispatch_mod.dispatch(ctx, "run.start", {"kind": "manual"},
                                     why="prove the bracket brings up a JVM")
         assert env.outcome == "ok"
@@ -1854,6 +2012,7 @@ def test_run_start_brings_up_a_configured_burp_and_run_finish_stops_it(
         assert sess["epoch"] != 0
         assert ctx.session is not None
         proc = ctx.session.proc
+        assert proc.poll() is None, "run.start reported a JVM that is not there"
 
         env = dispatch_mod.dispatch(ctx, "run.finish", {"status": "completed"},
                                     why="close the bracket")

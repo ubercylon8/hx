@@ -330,3 +330,45 @@ def test_finish_with_two_kinds_open_is_ambiguous_without_kind(engagement):
                             "started_us": after["run"]["started_us"],
                             "requests_issued": 0}
     assert after["open_runs"] == [{"id": browse_id, "kind": "browse"}]
+
+
+# --- Plan B: the session bracket, as `run.start` and `run.finish` report it.
+# The four `open_for` branches are `tests/test_tools_live.py`'s; what is
+# pinned here is that the pair CARRIES the answer, in the result an agent
+# reads and the journal keeps. ---------------------------------------------
+
+
+def test_start_still_opens_the_run_when_this_adapter_cannot_host_a_session(
+        tool_ctx):
+    """`hx tool` is one process per call, so `tool_ctx.stack` is None. The
+    run must open anyway: a `run.start` that refused would leave no run row
+    and no `agent_action` row -- no trace, on the one call that was trying to
+    set the instrument up, that it could not be."""
+    assert tool_ctx.stack is None
+    env = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"},
+                            why="mapping")
+    assert env.outcome == "ok"
+    assert env.result["id"].startswith("r-")
+    assert env.result["session"]["live"] is False
+    assert env.result["session"]["reason"] == "no_host"
+
+
+def test_a_browse_run_is_told_it_never_needed_a_session(tool_ctx):
+    """`browse` is the operator's own browser through `hx capture start`,
+    which owns its own Burp. `not_needed` and `no_host` are different next
+    actions, and this pair proves the kind is what chooses between them."""
+    env = dispatch.dispatch(tool_ctx, "run.start", {"kind": "browse"},
+                            why="watching")
+    assert env.result["session"]["reason"] == "not_needed"
+
+
+def test_finish_says_there_was_no_session_to_close_rather_than_omitting_it(
+        tool_ctx):
+    """Section 12's rule, one key down: a `finish` that dropped the field
+    when there was nothing to tear down would make "no JVM was running" and
+    "a JVM was running and nobody stopped it" the same result."""
+    dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="mapping")
+    env = dispatch.dispatch(tool_ctx, "run.finish", {"status": "completed"},
+                            why="done")
+    assert env.outcome == "ok"
+    assert env.result["session_closed"] is False

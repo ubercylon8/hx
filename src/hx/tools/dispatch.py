@@ -108,6 +108,29 @@ class ToolContext:
     config: Any
     halt: Any
     session: Any = None
+    #: The ADAPTER'S ExitStack, and the reason egress belongs to a long-lived
+    #: adapter rather than to `hx tool`. `hx.session.session()` tears Burp
+    #: down on EVERY exit, so a JVM launched inside a one-shot `hx tool`
+    #: process dies microseconds later -- there is no object in that adapter
+    #: for a session to outlive. `hx mcp` is one process for the whole
+    #: conversation, opens a stack around its serve loop, and hands it here;
+    #: `run.start` pushes the session onto it and `run.finish` pops it. A
+    #: crash unwinds the stack, which is spec section 8's "a crash must not
+    #: orphan a JVM" -- the FIRST of its three layers, the other two being
+    #: `run.reap_stale` and `session()`'s own teardown.
+    #:
+    #: None means this adapter cannot host a session, which is a different
+    #: fact from "no session is open" and is reported as its own reason.
+    stack: Any = None
+    #: The run that launched the session on `stack`. At most one session at a
+    #: time -- see `hx.tools.live`.
+    _session_run_id: str | None = dataclasses.field(default=None, repr=False)
+    #: `(identity_id, generation)` already registered on THIS session's
+    #: extension. `BridgeServer.register_identity` refuses a generation that
+    #: does not advance what the extension holds (`stale_generation`), so a
+    #: second registration of the same pair is an error, not a no-op. Cleared
+    #: with the session, because a new extension has heard of none of them.
+    _registered: set = dataclasses.field(default_factory=set, repr=False)
     actor: str = "agent"
     _bound_run_id: str | None = dataclasses.field(default=None, repr=False)
     #: `None` means "not resolved for this call yet", never "resolved to
