@@ -871,3 +871,22 @@ def tool(name, args_json, why, root, list_only) -> None:
     click.echo(text)
     if status:
         raise SystemExit(status)
+
+
+@main.command("mcp")
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def mcp(root) -> None:
+    """Serve the tool layer over MCP on stdio.
+
+    THE ADAPTER THAT CAN HOLD A BURP. `hx tool` is one process per call and
+    `hx.session.session()` tears Burp down on every exit, so egress tools
+    there answer `no_host`. This command is one process for the whole
+    conversation: `run.start` brings a session up and `run.finish` -- or any
+    exit from this command -- takes it down.
+
+    NOTHING BUT JSON-RPC MAY REACH STDOUT while this runs.
+    """
+    from hx.tools.adapters import mcp as mcp_adapter
+
+    eng = _open_engagement(root or default_root())
+    mcp_adapter.serve(eng)
