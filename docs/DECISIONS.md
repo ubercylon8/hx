@@ -366,6 +366,124 @@ spell the same finding two ways" is truer of an agent than of a check.
 unreachable — the two vocabularies cannot meet unless a check is ever named
 `agent`.
 
+## The egress tools
+
+### The send path records its own exchange, from Python
+
+Nothing in this build stored a `via='send'` exchange row. `store/schema.sql`
+said so in as many words, and the Java confirmed it: `via` is written in
+exactly two places, both in `proxy/Capture.java`. Meanwhile §8's digest opens
+with `exchange_id`, and `http.grep`, `http.body` and `evidence.attach` are each
+defined as a read keyed on one. Six tools rested on a row nothing wrote.
+
+`hx.issue` writes it from this side rather than from the JVM, because the
+result frame already carries the redacted response, the status, the timing and
+the outcome, and `records.record_exchange` had defaulted `via="send"` since the
+store was built, waiting for a caller. What a Java change would add is the
+post-injection request bytes and the resolved IP, at the cost of a second
+writer into a table whose proxy writer took a plan to get right.
+
+So `req_blob` on a send row is the request hx *asked* to be sent, not the bytes
+that left the JVM — they differ by the identity header the extension injects.
+That difference is in the safe direction and is why this is tolerable rather
+than merely cheap: the credential is injected inside the JVM, so it cannot be
+in the bytes this side hashes, and the blob store is content-addressed.
+
+### `hx tool` cannot hold a session, and says so by name
+
+`hx.session.session()` tears Burp down on every exit and each `hx tool` call is
+its own process, so there is no object there for a session to outlive. That is
+not a limitation waiting to be lifted; it is what the CLI adapter *is*.
+`run.start` therefore reports `session: {live: false, reason: "no_host"}` and
+names `hx mcp`, rather than letting six tools answer a generic `no_session`
+that reads as "start a run first" — advice that would never work.
+
+Four ways to have no session, and they are four different next actions:
+`not_needed` (this run kind never wanted one), `no_host` (this adapter cannot
+hold one), `launch_failed` (Burp would not start, or started dead), and
+`session_held` (another run has it — with `owner_alive`, because "blocked by a
+live session" and "blocked by a corpse" are different facts and only one means
+wait). A single `live: false` would collapse all four into one shrug.
+
+### A comparison is between bodies, never between whole responses
+
+Two replays of one request differ in their `Date:` and their per-session
+`Set-Cookie` even when the application returned byte-identical content. So a
+delta over whole responses reports a difference on every call — which in
+`http.replay_as` means **manufacturing** an authorisation finding rather than
+missing one, and in `delta.new_tokens` means drowning the reflected-payload
+signal §8 built the digest for.
+
+One root cause, three sites: `delta.baseline_for`, `_digest`, and
+`replay_as`'s own comparison. The trap has a fourth door — an original with no
+stored response body would diff against `b""` and differ from everything — and
+that one answers `differs: null` plus an `original_body_stored` facet.
+
+### A replayed request drops every credential it is carrying
+
+`http.replay_as` drops `config.CREDENTIAL_HEADERS` **union** every declared
+identity's `inject.header`. The declared half is the load-bearing one: an
+identity header replayed verbatim under a different identity would send
+identity A's credential wearing B's name, and the tool would report "no
+difference" for two sessions that were never two sessions.
+
+The standing half covers a credential the captured request carried that no
+identity here declares. Without it the tool fails on its most likely real
+input — the extension answers `unmanaged_credential` and every row comes back
+refused, on precisely what `Sender.java`'s own comment names as "the natural
+agent action … replaying a request lifted from Burp's history".
+
+### The wire's error class survives into the envelope, all twenty of them
+
+Principle 6 says the tool layer reports what the extension refused and decides
+nothing. That means `scope_denied` and `rate_limited` reach the agent as
+themselves: they are different next actions, and one generic `error` makes them
+one. The split follows what actually happened — *something decided no* is
+`refused`; *no answer came back* is `unavailable` — so a client-facing count of
+refusals stays a statement about scope discipline rather than about network
+weather.
+
+The mapping is **derived** from `tests/test_records.py::ERROR_CLASSES`, which
+already reads the authoritative list off the Java emit sites. A second
+hand-maintained list of wire classes would be a second thing to keep in sync
+with the extension, and the first eleven-of-twenty version of this table is
+what that costs.
+
+### A reason nothing can produce is evidence of a broken path
+
+`identity_dead` sat in the closed vocabulary with nothing able to reach it —
+which was the tell for a real Principle 6 violation: `http.send` guarded
+`except ValueError` while `ensure_identity` also raises `BridgeError`, so an
+extension refusing an identity landed as `error / internal`. An agent told
+`identity_dead` re-opens its session; one told `internal` retries the identical
+send forever.
+
+The heuristic generalises past this project: in any closed enum, a member
+nothing constructs is either dead weight or a missing path, and grepping for
+each member's constructors is a cheap audit with a high hit rate.
+
+### `hx mcp` is hand-rolled, and stdout is the protocol
+
+MCP's stdio transport is newline-delimited JSON-RPC 2.0 and a server needs
+`initialize`, `tools/list` and `tools/call`. The `mcp` SDK would be a third
+dependency plus its transitive closure inside the one process that holds this
+engagement's resolved credentials, its live Burp, and the operator's halt path.
+A security tool's dependency footprint is part of its argument.
+
+Nothing but JSON-RPC may reach stdout — not a print, not a warning, not a
+traceback — because a newline-delimited protocol has no resynchronisation
+point, so one stray line desynchronises the client for the rest of the
+conversation. The test that guards it runs `hx mcp` as a real subprocess and
+inspects the OS-level fd: the `StringIO` tests cannot see a `print`, and a
+surviving mutation proved it.
+
+`why` travels inside the arguments because MCP hands a tool one object, and is
+popped back out before `dispatch` validates — `ToolSpec.params` sets
+`additionalProperties: false`. The published schema and the enforced schema are
+therefore different objects, `tool_schema` deep-copies, and a test runs
+`check_schema` over every published one so the added property cannot become a
+constraint nothing enforces.
+
 ## Process decisions
 
 ### A plan is a historical argument, not live documentation
@@ -418,3 +536,6 @@ not run since the commit that added the second.
 | `surface.query`'s `facets.host` is unbounded | 300 hosts repeat on every 50-row page — measured at 18 KB per envelope on 3,000 surfaces. Principle 3's spirit, uncapped. |
 | The report renders no `created_by` | A client cannot tell an agent-asserted finding from a check-verified one. The column records it; the renderer does not read it. A reporting decision, not a storage one. |
 | `http.grep` matches literal bytes, not regular expressions | Python's `re` has no timeout and the pattern is agent-authored; a catastrophic backtrack would hang the one long-lived process that also holds this engagement's Burp, taking the session, the run and the operator's halt path with it. A literal match cannot backtrack. Finding a *class* of thing (every `Set-Cookie` without `Secure`) needs several literal greps or a passive check instead of one regex. |
+| `journal.encode_args`'s credential redactor is line-anchored | `_CREDENTIAL_LINE` is `.match`-anchored and non-MULTILINE, and `why` goes to its own column without passing through it. Covers every credential shape the seventeen registered tools can produce; a future tool taking a raw request string or a multi-line header argument would fall outside it. |
+| One mapped wire class no Java site emits | `identity_dead` is kept — removing it would contradict the refused/unavailable split — as a named `MAPPED_BUT_NOT_EMITTED_BY_THE_JVM` exception, so the *next* unreachable entry fails a test. The assertion is `extra <= set(...)`, so an exception that later becomes emitted goes stale silently. |
+| `hx tool` cannot reach the six egress tools | Structural, not a defect: `session()` tears Burp down on every exit and each call is its own process. Reported as `no_host` naming `hx mcp`, rather than left to look like a bug. |
