@@ -324,13 +324,17 @@ shell can use with no MCP wiring at all.
 Schema, so `tools/list` is a projection of the registry and `tools/call`
 is one dispatch.
 
-**Open question, settled in Plan B:** whether to depend on the `mcp` Python
-SDK or hand-roll the stdio transport. MCP stdio is newline-delimited
+**Settled 2026-08-31 — hand-rolled.** The question was whether to depend on
+the `mcp` Python SDK or write the stdio transport. MCP stdio is newline-delimited
 JSON-RPC 2.0 and the server side needs `initialize`, `tools/list` and
 `tools/call` — roughly 150 lines with no dependency. This project runs on
 two Python dependencies and a Java extension with none, and a security
-tool's dependency footprint is part of its argument. **Recommendation:
-hand-roll, and revisit if MCP's transport requirements grow.**
+tool's dependency footprint is part of its argument. **Decision: hand-roll, and
+revisit if MCP's transport requirements grow past three methods and a line of
+JSON.** The deciding argument is where the dependency would sit: `hx mcp` is
+the one process that holds the engagement's resolved credentials, its live
+Burp and the operator's halt path, and an SDK there is that closure inside
+that process.
 
 ---
 
@@ -402,7 +406,9 @@ web app, per §8.
    compaction, so it must fit in a context window that is by definition
    under pressure. A cap belongs in Plan A; the number needs a real
    engagement to set.
-3. **MCP SDK versus hand-rolled stdio** — §9, settled in Plan B.
+3. ~~**MCP SDK versus hand-rolled stdio**~~ — §9. **Settled 2026-08-31:
+   hand-rolled.** The plan is
+   `docs/superpowers/plans/2026-08-31-tool-layer-egress.md`, Task 8.
 
 ---
 

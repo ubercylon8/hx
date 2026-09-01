@@ -346,7 +346,23 @@ def test_a_stale_excerpt_is_caught_where_a_whole_file_compare_never_looked(tmp_p
 # written. The marker line is inside the fence, so any fenced Python whose
 # first line is a comment becomes a tracked block whether or not anyone meant
 # it to be.
-EXPECTED_BLOCKS = 167
+# 183 = 167 plus the SIXTEEN the egress plan contributes on 2026-08-31, the day
+# it was written and before any of it was built. Every one of the sixteen names
+# a file that plan CREATES -- `src/hx/issue.py`, `src/hx/delta.py`,
+# `src/hx/tools/live.py`, `src/hx/tools/impl/http.py`, `.../impl/scan.py`,
+# `.../adapters/mcp.py`, `src/hx/http_text.py` and their nine test files -- so
+# all sixteen are SKIPPED here today and arm themselves one at a time as the
+# tasks land. That is the same shape the tool-layer plan had (29 skips falling
+# back to 1) and it is why marking a creation block early is safe where marking
+# a MODIFICATION block early is not: a block for a file that does not exist is
+# skipped, and a block for a file that does is compared against the version
+# before the change and fails.
+#
+# The number moves HERE, in the commit that adds the plan, precisely because
+# the paragraph above says the active-checks plan turned this suite red by
+# adding fourteen markers without moving it. Moving it deliberately is the
+# decision this constant exists to make somebody write down.
+EXPECTED_BLOCKS = 183
 
 
 def test_the_check_actually_found_some_blocks():

@@ -1,0 +1,3354 @@
+# Tool Layer Plan B — Egress Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Ship the six egress tools (`http.send`, `http.grep`, `http.body`, `http.replay_as`, `scan.run`, `crawl.run`), the session bracket that gives them a live Burp, and the MCP adapter that hosts them — completing the 17-tool v1 surface.
+
+**Architecture:** Plan A built the definition (registry, envelope, dispatcher, journal) and left two seams: `ToolContext.session`, which is `None` throughout, and `ToolSpec.needs_egress`, which the dispatcher already refuses against. Plan B fills the first and exercises the second. Underneath the tools, a new `hx.issue` module becomes the one writer of `via='send'` exchange rows — the record that `http.grep`, `http.body` and `evidence.attach` all read and that nothing in this build has ever produced. Above them, `hx mcp` is a hand-rolled newline-delimited JSON-RPC 2.0 server over stdio, one long-lived process that can hold a Burp open across calls in a way `hx tool` structurally cannot.
+
+**Tech Stack:** Python 3.12, click, PyYAML (no new dependencies — see Global Constraints). SQLite via `hx.store`. Burp Suite Community 2026.7.3 via the existing Java extension, unmodified by this plan.
+
+**Spec:** `docs/superpowers/specs/2026-08-31-tool-layer-design.md` (§7 the tool catalogue, §8 session lifecycle, §9 adapters, §10 the two-plan split). Master spec: `docs/superpowers/specs/2026-08-21-hx-design.md` (§4 the enforcement invariant, §5 the data model, §8 the tool layer's six principles and the digest, §12 reporting).
+
+**Base:** master at `1f59054` (PR #12 merged). Baseline: 1830 passed / 1 skipped / 44 deselected; 44 integration passed; Java 13 suites ALL PASS.
+
+---
+
+## Global Constraints
+
+Every task's requirements implicitly include this section.
+
+**Security — these are the invariants the product exists to hold.**
+
+- **§4, unchanged and untouched by this plan:** every byte that leaves this machine crosses one of two points inside the JVM. Nothing in Plan B adds a third. `hx.issue` sends through `BridgeServer.send` and by no other route.
+- **DENY-ALL is terminal.** An unconfigured or halted extension refuses everything; nothing on the Python side may talk its way past that.
+- **A credential value never appears in `config.yaml`**, in a tool's arguments, in a return value, in `agent_action`, in a log line, or in a rendered report. Identity is passed **by name**; resolution happens below the tool layer (Principle 5).
+- **Redaction runs before hashing.** The extension redacts the response before the bytes cross the bridge, because the blob store is content-addressed. Nothing here may hash a raw response.
+- **All test targets are loopback only.** The `TargetServer` fixture refuses any host outside `127.0.0.0/8`, and that refusal is load-bearing — do not weaken it, and do not add a test that would need it weakened.
+- **Never run Burp against the real `$HOME`.** The integration fixture builds a private Burp home per run.
+- **Engagement directories are `0o700`; blob and DB files are `0o600`.** Never looser, never widened.
+- **The agent may never write finding status `confirmed` or `reported`** (enforced by a DB trigger).
+- **`hx` never bundles or redistributes Burp.**
+
+**Dependencies.**
+
+- **No new Python dependencies.** The MCP adapter is hand-rolled. This was §13's open question and it is now settled: MCP stdio is newline-delimited JSON-RPC 2.0 and a server needs `initialize`, `tools/list` and `tools/call`. This project runs on two Python dependencies and a Java extension with none, and a security tool's dependency footprint is part of its argument. Revisit only if MCP's transport requirements grow.
+- **No Java changes.** Plan B is Python-only. If a task appears to need one, that is a finding to raise, not a change to make.
+
+**The plan-drift gate (`tests/test_plan_matches_repo.py`).**
+
+- Code blocks are matched by a first-line `# path` marker and byte-compared against the file. **A block for a file that does not exist yet is skipped**; a block for a file that already exists is compared immediately.
+- **Therefore: a block describing a modification to a file that already exists must NOT carry a `# path` marker** until the modification has shipped. Markers for such blocks go on in the task's final commit, or at the end of the plan. A block describing a file this plan *creates* may carry its marker from the start.
+- `EXPECTED_BLOCKS` in `tests/test_plan_matches_repo.py` must be updated **in the same commit** that adds or removes a marked block, and the commit message must name the block.
+- **This plan must not be marked `<!-- plan-drift: pending -->`.** `2026-08-27-checks-and-reporting.md` already carries that marker and at most one plan may.
+
+**Style, matching what the repo already does.**
+
+- Comments carry the reasoning. Where a decision could plausibly have gone the other way, the code says why it did not — and says what was *measured*, not what was assumed.
+- Line length ≤ 88. `ruff check` must stay clean (`select = ["E4", "E7", "E9", "F"]`).
+- Tests are `pytest`, run with `.venv/bin/pytest`. Integration tests carry `@pytest.mark.integration` and are deselected by default.
+- **A red suite is never DONE, and never commit red.** If the suite is red and you cannot make it green within the task, report BLOCKED with the failing output.
+- **A test that asserts nothing is a defect**, not a placeholder. Four vacuous tests were found in Plan A's reviews; do not add a fifth.
+
+---
+
+## File Structure
+
+**Created:**
+
+| File | Responsibility |
+|---|---|
+| `src/hx/http_text.py` | Reading an HTTP message off raw bytes: head/body split, header lookup. Promoted out of `checks/passive/_http.py` so a core module need not import from `checks/`. |
+| `src/hx/issue.py` | The one route from the tool layer to the wire, and the **only** writer of `via='send'` exchange rows. |
+| `src/hx/delta.py` | `delta_vs_baseline` — what changed between a response and its surface's exemplar. Pure. |
+| `src/hx/tools/live.py` | The session bracket: which run kinds imply egress, launching, holding, tearing down, and registering identities on the live bridge. |
+| `src/hx/tools/impl/http.py` | `http.send`, `http.grep`, `http.body`, `http.replay_as`. |
+| `src/hx/tools/impl/scan.py` | `scan.run` and `crawl.run`. |
+| `src/hx/tools/adapters/mcp.py` | `hx mcp` — newline-delimited JSON-RPC 2.0 over stdio. |
+
+**Modified:**
+
+| File | Change |
+|---|---|
+| `src/hx/checks/passive/_http.py` | Re-export the four parsing helpers from `hx.http_text`. No call site changes. |
+| `src/hx/store/records.py` | `record_exchange` gains `identity`, `identity_generation`, `identity_state`. |
+| `src/hx/tools/dispatch.py` | `ToolContext` gains `stack` and `_registered`. |
+| `src/hx/tools/impl/run.py` | `run.start` opens the session bracket; `run.finish` closes it. |
+| `src/hx/tools/impl/__init__.py` | Import the two new handler modules. |
+| `src/hx/tools/adapters/cli.py` | `build_context` takes an optional `stack`. |
+| `src/hx/cli.py` | The `hx mcp` command. |
+| `tests/conftest.py` | A `FakeBridge` fixture the egress tests share. |
+
+---
+
+## The rulings this plan makes
+
+Recorded here because each could plausibly have gone the other way, and an implementer who disagrees should raise it rather than quietly re-decide it.
+
+1. **The send path records exchanges from Python, not from Java.** The extension's `result` frame already carries the redacted response bytes, the status, the timing and the outcome; the request bytes are the ones this side composed. That is everything an `exchange` row needs. A Java change would give two things Python cannot get — the post-injection request bytes and the resolved IP — and cost a second write path into a table whose proxy writer took a plan to get right. **What this costs if wrong:** `exchange.req_blob` on a `via='send'` row is the request hx *asked* to be sent, not the bytes that left the JVM; they differ by the identity header the extension injects. That difference is documented at the writer, and it is the *safe* direction — the credential is injected inside the JVM and so cannot be in the bytes this side hashes.
+
+2. **`resolved_ip` and `scope_version_id` stay NULL on send-path rows.** The proxy writer leaves both NULL too. Filling one and not the other would make `via` the thing that decides how much a row knows.
+
+3. **A send's `identity_state` is `assumed`, never `proven`.** A canary bracket proves a *run*; a single send has none. `assumed` is exactly the word for it, the CHECK constraint already admits it, and `scan.run` keeps its own proven/assumed logic untouched.
+
+4. **Egress kinds are `manual` and `scan`.** `browse` is the operator's own browser through `hx capture start`, which owns its own Burp — §8 says a browse run never needed the tool layer to launch anything. `crawl.run` is permanently unavailable, so a `crawl` run has nothing to send.
+
+5. **The tool layer holds at most one session, owned by the run that launched it.** A second egress run opens normally and is told, in its own result, that the session is held and by which run. **What this costs if wrong:** an agent that wants to scan mid-manual must `run.finish` first. That is one extra call and it makes every scan run bracketed.
+
+6. **A session that will not start does not stop the run from opening.** `run.start` returns the run *and* a `session` object saying `live: false` with a reason. Refusing outright would leave no `run` row and no `agent_action` row — no trace of the failure. The agent learns immediately, non-egress work still proceeds, and every egress tool then answers `unavailable / no_session` on its own. This is §12's rule applied to the agent's knowledge of its own instrument, the same argument that registers `crawl.run`.
+
+7. **`http.grep` matches literal bytes, not regular expressions.** Python's `re` has no timeout, the pattern is agent-authored, and a catastrophic backtrack would hang the one long-lived process that holds the Burp. A literal match cannot hang, needs no scanned-byte games, and serves Principle 2's actual purpose: you search for the payload token you just sent. `http.body(range)` remains the escape hatch. **What this costs if wrong:** finding a *class* of thing (every `Set-Cookie` without `Secure`) needs several literal greps or a passive check. Record this in `docs/DECISIONS.md` as known debt with the reason, so a later regex design starts from why this one said no.
+
+8. **`http.replay_as` takes `include_anonymous` as its own boolean**, not a magic identity name. The unauthenticated comparison is the single most valuable row in an authz table and deserves a named flag rather than a string an operator could collide with.
+
+9. **`scan.run` refuses unless the current run is a `scan` run.** `hx.scan.run` calls `run.current_run(kind="scan")`, which *auto-opens* a run when none is open — and a run the tool layer did not open is a run nothing will close, which would make the next `run.start(kind='scan')` refuse with `run_open` forever. Requiring the bracket keeps `current_run` in its finding role and never in its opening one.
+
+---
+
+## Task 1: The send-path exchange writer
+
+Nothing in this build stores a `via='send'` exchange row. `src/hx/store/schema.sql:79` says so in as many words, and the Java confirms it: `via` is written in exactly two places, both in `proxy/Capture.java`. Every tool in Plan B rests on that row — §8's digest opens with `exchange_id`, and `http.grep` and `http.body` are defined as reads keyed on one. This task writes it.
+
+**Files:**
+- Create: `src/hx/http_text.py`
+- Modify: `src/hx/checks/passive/_http.py` (delete four definitions, import them instead)
+- Modify: `src/hx/store/records.py` (`record_exchange`, the identity triple)
+- Create: `src/hx/issue.py`
+- Test: `tests/test_http_text.py`, `tests/test_issue.py`
+- Modify: `tests/conftest.py` (a shared `FakeBridge`)
+
+**Interfaces:**
+- Consumes: `hx.bridge.server.BridgeServer.send(req, body, timeout=…) -> dict` raising `BridgeError`; `hx.store.blobs.BlobStore.put(bytes) -> (digest, length)`; `hx.capture.Capture(conn, blobs, engagement_id, config).upsert_surface(norm, exchange_id=…, run_id=…, via=…)`; `hx.surface.normalise(method, url, preserve=…, slug_threshold=…)`.
+- Produces, and later tasks depend on these exact names:
+  - `hx.http_text.split_head_body(raw) -> (head, body)`, `header_lines(head) -> list[bytes]`, `header_names(head) -> list[str]`, `header_values(head, name) -> list[str]`
+  - `hx.issue.Issued` — frozen dataclass with `exchange_id, status, bytes, ms, outcome, content_type, body_sha256, first_line, response`
+  - `hx.issue.IssueRefused(Exception)` with `.reason` and `.detail`
+  - `hx.issue.request_bytes(method, path, host, headers, body=b"") -> bytes`
+  - `hx.issue.issue(bridge, conn, blobs, config, *, engagement_id, run_id, scheme, host, port, method, path, headers=(), body=b"", identity=None, timeout=30.0) -> Issued`
+
+---
+
+- [ ] **Step 1: Write the failing test for the promoted parsers**
+
+```python
+# tests/test_http_text.py
+"""The parsers, at their new address.
+
+These four moved out of `hx.checks.passive._http` so `hx.issue` could read a
+content type without a core module importing from `hx.checks`. The tests that
+prove their BEHAVIOUR still live in the passive-check suites, which is right --
+they were earned there. What is proved here is the move itself: one
+implementation, reachable from both names, with the bare-LF and repeated-header
+rules intact at the new address.
+"""
+from hx import http_text
+from hx.checks.passive import _http
+
+
+def test_the_old_private_names_are_the_new_public_ones():
+    """A re-export, not a copy. `is` rather than `==`: two functions that
+    agree today and were edited separately tomorrow are exactly the drift
+    this move exists to prevent."""
+    assert _http._split_head_body is http_text.split_head_body
+    assert _http._header_lines is http_text.header_lines
+    assert _http.header_names is http_text.header_names
+    assert _http.header_values is http_text.header_values
+
+
+def test_a_bare_lf_response_still_splits():
+    """RFC 9112 s2.2. The version that only knew CRLF handed every
+    body-searching check an EMPTY body and answered `clean` because it failed
+    to read."""
+    head, body = http_text.split_head_body(b"HTTP/1.1 200 OK\nX: 1\n\nhello")
+    assert head == b"HTTP/1.1 200 OK\nX: 1"
+    assert body == b"hello"
+
+
+def test_the_first_terminator_wins():
+    """A body containing CRLFCRLF must not pull the boundary back past a head
+    that ended with a bare LF."""
+    raw = b"HTTP/1.1 200 OK\n\nbody with \r\n\r\n inside"
+    head, body = http_text.split_head_body(raw)
+    assert head == b"HTTP/1.1 200 OK"
+    assert body == b"body with \r\n\r\n inside"
+
+
+def test_repeated_headers_all_come_back():
+    """`Set-Cookie` legitimately repeats; a parser returning the first would
+    check one cookie of five and report the surface clean."""
+    head = b"HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2"
+    assert http_text.header_values(head, "set-cookie") == ["a=1", "b=2"]
+```
+
+- [ ] **Step 2: Run it to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_http_text.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'hx.http_text'`
+
+- [ ] **Step 3: Create `src/hx/http_text.py`**
+
+Move the four functions **verbatim** out of `src/hx/checks/passive/_http.py`, renaming `_split_head_body` to `split_head_body` and `_header_lines` to `header_lines`. Keep every docstring byte for byte — they carry the reasoning that earned each rule.
+
+```python
+# src/hx/http_text.py
+"""Reading an HTTP message off the wire, for anything holding raw bytes.
+
+These four were `hx.checks.passive._http`'s until Plan B needed them one layer
+down. `hx.issue` writes the exchange row a send produces, and has to read a
+status line and a content type out of the same kind of bytes a passive check
+reads.
+
+THE ALTERNATIVES WERE BOTH WORSE. A core module importing from
+`hx.checks.passive` inverts the dependency -- `checks` is built on the store
+and the wire, not the other way round -- and a second copy of
+`split_head_body` is the thing this repo keeps naming: a copy is what drifts.
+The rules below were each earned by a specific failure (a bare-LF response
+read as an empty body; a `Set-Cookie` parser that checked one cookie of five),
+and a second copy is a second place for the next such failure to be fixed
+only once.
+
+`_http` re-exports all four under the names it already used, so no call site
+in `hx/checks/` changes and the behavioural tests that earned these rules stay
+where they are.
+"""
+from __future__ import annotations
+
+
+def split_head_body(raw: bytes) -> tuple[bytes, bytes]:
+    """Head and body, accepting either line terminator.
+
+    RFC 9112 s2.2 requires a recipient to accept a bare LF as a line
+    terminator. `partition(b"\\r\\n\\r\\n")` on a bare-LF response matches
+    nothing and returns `(raw, b"", b"")`, which hands every body-searching
+    check an EMPTY body and every header-reading check the whole response as
+    one unsplit head. The tool then answers `clean` because it failed to
+    read, which is the one direction an assessment must never be wrong in.
+
+    Whichever terminator appears FIRST is the real one, so a body that
+    happens to contain `\\r\\n\\r\\n` cannot pull the boundary backwards past
+    a head that actually ended with a bare `\\n\\n`.
+    """
+    crlf = raw.find(b"\r\n\r\n")
+    lf = raw.find(b"\n\n")
+    if crlf == -1 and lf == -1:
+        return raw, b""
+    if crlf != -1 and (lf == -1 or crlf <= lf):
+        return raw[:crlf], raw[crlf + 4:]
+    return raw[:lf], raw[lf + 2:]
+
+
+def header_lines(head: bytes) -> list[bytes]:
+    """Header lines, minus the status line, for either terminator.
+
+    Splits on LF and strips at most one trailing CR per line, rather than
+    also splitting on a bare CR: a lone CR inside a header value is data, and
+    splitting on it would invent a header boundary the wire did not carry.
+    """
+    return [line[:-1] if line.endswith(b"\r") else line
+            for line in head.split(b"\n")[1:]]
+
+
+def header_names(head: bytes) -> list[str]:
+    return [line.partition(b":")[0].decode("latin-1").strip()
+            for line in header_lines(head) if b":" in line]
+
+
+def header_values(head: bytes, name: str) -> list[str]:
+    """Every value for one header name, ASCII-case-insensitively.
+
+    A list, not a value: `Set-Cookie` legitimately repeats, and a parser that
+    returned the first would check one cookie of five and report the surface
+    clean.
+    """
+    want = name.lower()
+    out = []
+    for line in header_lines(head):
+        field, sep, value = line.partition(b":")
+        if sep and field.decode("latin-1").strip().lower() == want:
+            out.append(value.decode("latin-1").strip())
+    return out
+```
+
+**Note:** copy `header_values`'s loop body from the current `_http.py` rather than trusting the reconstruction above — the file is the authority.
+
+- [ ] **Step 4: Make `_http.py` re-export**
+
+Delete the four definitions from `src/hx/checks/passive/_http.py` and add the import near the top, after the existing imports. **This block carries no marker** — `_http.py` already exists, so a marked block would be compared against the pre-change file and fail.
+
+```python
+from ...http_text import (  # noqa: F401
+    # PROMOTED FOR PLAN B. `hx.issue` needs the same parsing one layer down,
+    # and a core module importing from `hx.checks.passive` would invert the
+    # dependency. Re-exported under the names this module already used, so
+    # nothing in `hx/checks/` changes and the behavioural tests that earned
+    # these rules stay where they are. `header_names` and `header_values` are
+    # re-exports for this module's importers rather than for its own body,
+    # hence the noqa.
+    header_lines as _header_lines,
+    header_names,
+    header_values,
+    split_head_body as _split_head_body,
+)
+```
+
+**The comment goes inside the parentheses on purpose.** A fenced Python block whose *first* line is a `# ` comment is read by `tests/test_plan_matches_repo.py` as a path marker, and this one names no file — so a comment above the import turns that suite red. Same trap for every other block in this plan that opens with prose.
+
+- [ ] **Step 5: Run the parser tests and the whole passive suite**
+
+Run: `.venv/bin/pytest tests/test_http_text.py -q && .venv/bin/pytest -q -k "passive or checks" `
+Expected: PASS, and no change in the passive-check counts. If any passive test fails, the move dropped or altered something — fix the move, do not adjust the test.
+
+- [ ] **Step 6: Commit the move on its own**
+
+```bash
+git add src/hx/http_text.py src/hx/checks/passive/_http.py tests/test_http_text.py
+git commit -m "refactor: promote the HTTP parsers out of checks/passive
+
+hx.issue needs split_head_body and header_values one layer down, and a core
+module importing from hx.checks.passive would invert the dependency. Moved
+verbatim; _http re-exports all four under its old names, so no call site in
+hx/checks/ changes and the behavioural tests stay where they were earned."
+```
+
+- [ ] **Step 7: Write the failing test for the widened `record_exchange`**
+
+Append to `tests/test_records.py` (or the file that already covers `record_exchange` — find it with `.venv/bin/pytest --collect-only -q | command grep record_exchange`, and follow that file's existing fixtures).
+
+```python
+def test_record_exchange_carries_the_identity_triple(conn, run_row):
+    """The three columns have existed since SCHEMA_VERSION 9 and nothing has
+    ever filled them. A send issued under a named identity is the first
+    traffic in this build that HAS an identity to record."""
+    row_id = records.record_exchange(
+        conn, run_id=run_row, method="GET", url="http://127.0.0.1:8080/a",
+        status=200, req_blob=None, resp_blob=None, ms=5, at_us=1,
+        identity="staff", identity_generation=3, identity_state="assumed")
+    got = conn.execute(
+        "SELECT identity, identity_generation, identity_state"
+        " FROM exchange WHERE id=?", (row_id,)).fetchone()
+    assert tuple(got) == ("staff", 3, "assumed")
+
+
+def test_record_exchange_still_defaults_the_triple_to_null(conn, run_row):
+    """Every existing call site passes none of the three, and an anonymous
+    send has none to pass. NULL is the fact, not a gap."""
+    row_id = records.record_exchange(
+        conn, run_id=run_row, method="GET", url="http://127.0.0.1:8080/a",
+        status=200, req_blob=None, resp_blob=None, ms=5, at_us=1)
+    got = conn.execute(
+        "SELECT identity, identity_generation, identity_state"
+        " FROM exchange WHERE id=?", (row_id,)).fetchone()
+    assert tuple(got) == (None, None, None)
+```
+
+- [ ] **Step 8: Run it to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_records.py -q -k identity_triple`
+Expected: FAIL — `TypeError: record_exchange() got an unexpected keyword argument 'identity'`
+
+- [ ] **Step 9: Widen `record_exchange`**
+
+Three keyword arguments with `None` defaults, three columns on the INSERT. Add this paragraph to the docstring, and extend the signature and the INSERT. **No marker on these blocks** — `records.py` exists.
+
+Signature:
+
+```python
+def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
+                    method: str, url: str, status: int | None,
+                    req_blob: str | None, resp_blob: str | None, ms: int,
+                    at_us: int, outcome: str = "ok", via: str = "send",
+                    resp_len: int | None = None,
+                    surface_id: str | None = None,
+                    scope_version_id: str | None = None,
+                    seq: int | None = None,
+                    identity: str | None = None,
+                    identity_generation: int | None = None,
+                    identity_state: str | None = None) -> str:
+```
+
+Docstring paragraph, added at the end of the existing docstring:
+
+```
+    THE IDENTITY TRIPLE IS NULL FOR EVERYTHING THIS BUILD HAD UNTIL PLAN B.
+    The three columns arrived with SCHEMA_VERSION 9 and nothing filled them:
+    proxy traffic carries the operator's own browser session, which the
+    identity design puts out of scope, and no send path recorded a row at
+    all. `hx.issue` is the first caller with an answer, and it writes
+    `identity_state='assumed'` -- never `proven`. A canary bracket proves a
+    RUN (spec section 6); one send has no bracket, so `assumed` is the whole
+    of what is known and `proven` here would be a claim no canary backs.
+    Defaulted to None so every existing call site is byte-for-byte unchanged.
+```
+
+INSERT, replacing the existing one:
+
+```python
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " recv_us, method, url, status, req_blob, resp_blob, resp_len,"
+        " body_shed, scope_version_id, seq, identity, identity_generation,"
+        " identity_state)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (row_id, run_id, surface_id, via, outcome, at_us,
+         at_us + ms * 1000, method, url, status, req_blob, resp_blob,
+         resp_len,
+         # S6: solicited exchanges are NEVER shed -- they are about to become
+         # evidence. Only unsolicited proxy observations may set this.
+         0,
+         scope_version_id, seq, identity, identity_generation,
+         identity_state),
+    )
+```
+
+- [ ] **Step 10: Run the records suite**
+
+Run: `.venv/bin/pytest tests/test_records.py -q`
+Expected: PASS, with two more tests than before.
+
+- [ ] **Step 11: Add the shared `FakeBridge` fixture**
+
+Every egress test in Tasks 1, 4, 6 and 7 needs a bridge that answers without a JVM. One fake, in `tests/conftest.py`, so the six tools are tested against one idea of what `BridgeServer.send` does. **No marker** — `conftest.py` exists.
+
+```python
+class FakeBridge:
+    """A `BridgeServer` that answers from a script instead of a JVM.
+
+    IT IS NOT A CONVENIENCE. `hx.issue` translates a raised `BridgeError`
+    into a raised `IssueRefused` and turns a `result` dict into a stored row,
+    and both halves of that are behaviour a test must be able to drive
+    without a five-second Burp launch. The integration suite proves the same
+    code against a real extension; this proves it against every refusal class
+    the extension can answer with, including the ones a loopback target will
+    never produce.
+
+    `replies` is consumed in order. A reply that is a `BridgeError` is
+    RAISED, because that is what the real `send` does with every refusal --
+    it never returns one as a dict, and a fake that returned them would let
+    `issue` pass a test it would fail in production.
+    """
+
+    BODY_KEY = "__body__"
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.sent = []          # (req, raw) per call, in order
+        self.identities = []    # (resolved, origins) per registration
+
+    def send(self, req, body=b"", timeout=30.0, *, enforce_locally=True):
+        self.sent.append((dict(req), bytes(body)))
+        if not self.replies:
+            raise AssertionError(
+                f"FakeBridge ran out of replies on send #{len(self.sent)}; "
+                "the test scripted fewer answers than the code asks for")
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    def register_identity(self, resolved, *, origins):
+        self.identities.append((resolved, origins))
+
+
+def fake_result(body=b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nhi",
+                *, status=200, ms=7, outcome="ok", epoch=1):
+    """One `result` frame, shaped exactly as `Sender.decideAndIssue` builds
+    it: status, bytes, ms, outcome, config_epoch, and the REDACTED response
+    bytes under the body key."""
+    return {"v": 1, "t": "result", "id": 1, "status": status,
+            "bytes": len(body), "ms": ms, "outcome": outcome,
+            "config_epoch": epoch, FakeBridge.BODY_KEY: body}
+
+
+@pytest.fixture
+def fake_bridge():
+    return FakeBridge
+```
+
+**Check first:** `FakeBridge.BODY_KEY` must equal the real `BridgeServer.BODY_KEY`. Find the real constant (`command grep -n "BODY_KEY" src/hx/bridge/server.py`) and use it directly — `BODY_KEY = BridgeServer.BODY_KEY` — rather than hard-coding a string that could drift.
+
+- [ ] **Step 12: Write the failing tests for `hx.issue`**
+
+```python
+# tests/test_issue.py
+"""The only writer of `via='send'` exchange rows.
+
+WHY THIS MODULE EXISTS AT ALL is the first thing to know when reading these
+tests. `src/hx/store/schema.sql` records that `Capture.java` delivers
+`via: proxy` and nothing else, so until this module there was no send-path
+exchange row in this build -- and `http.grep`, `http.body` and
+`evidence.attach` are all defined as reads keyed on one. Every assertion below
+about a row, a blob or a surface is an assertion about whether those three
+tools have anything to read.
+"""
+import pytest
+
+from hx import issue
+from hx.bridge.server import BridgeError
+
+from .conftest import FakeBridge, fake_result
+
+
+def test_a_send_writes_an_exchange_row_a_later_tool_can_read(tool_ctx):
+    bridge = FakeBridge([fake_result()])
+    got = issue.issue(
+        bridge, tool_ctx.conn, tool_ctx.blobs, tool_ctx.config,
+        engagement_id=tool_ctx.engagement.id, run_id=tool_ctx.run_id,
+        scheme="http", host="127.0.0.1", port=8080, method="GET", path="/a")
+
+    row = tool_ctx.conn.execute(
+        "SELECT via, method, url, status, outcome, req_blob, resp_blob,"
+        " surface_id FROM exchange WHERE id=?", (got.exchange_id,)).fetchone()
+    via, method, url, status, outcome, req_blob, resp_blob, surface_id = row
+    assert via == "send"
+    assert (method, status, outcome) == ("GET", 200, "ok")
+    assert url == "http://127.0.0.1:8080/a"
+    # BOTH blobs, and the surface back-reference. A row with a NULL
+    # `resp_blob` is a row `http.grep` cannot read, and a row with a NULL
+    # `surface_id` is one `surface.detail` will never join to.
+    assert req_blob and resp_blob and surface_id
+
+
+def test_the_digest_is_section_8s_digest(tool_ctx):
+    body = b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{}"
+    bridge = FakeBridge([fake_result(body, status=201, ms=42)])
+    got = issue.issue(
+        bridge, tool_ctx.conn, tool_ctx.blobs, tool_ctx.config,
+        engagement_id=tool_ctx.engagement.id, run_id=tool_ctx.run_id,
+        scheme="http", host="127.0.0.1", port=8080, method="POST", path="/a")
+    assert got.status == 201
+    assert got.ms == 42
+    assert got.content_type == "application/json"
+    assert got.first_line == "HTTP/1.1 201 Created"
+    assert got.body_sha256.startswith("sha256:")
+    assert got.bytes == len(body)
+
+
+def test_the_surface_is_upserted_as_agent_discovered(tool_ctx):
+    """`capture.DISCOVERED_BY` maps `send` to `agent`, and nothing has ever
+    exercised that entry. A surface an agent found and a surface the operator
+    browsed are different facts and a report distinguishes them."""
+    bridge = FakeBridge([fake_result()])
+    got = issue.issue(
+        bridge, tool_ctx.conn, tool_ctx.blobs, tool_ctx.config,
+        engagement_id=tool_ctx.engagement.id, run_id=tool_ctx.run_id,
+        scheme="http", host="127.0.0.1", port=8080, method="GET", path="/a")
+    discovered_by = tool_ctx.conn.execute(
+        "SELECT s.discovered_by FROM surface s JOIN exchange x"
+        " ON x.surface_id = s.id WHERE x.id=?", (got.exchange_id,)).fetchone()
+    assert discovered_by[0] == "agent"
+
+
+def test_requests_issued_counts_the_send(tool_ctx):
+    """S5's coverage floor. The proxy writer bumps it and this one must too,
+    or a run that sent a hundred requests reports having issued none."""
+    before = tool_ctx.conn.execute(
+        "SELECT requests_issued FROM run WHERE id=?",
+        (tool_ctx.run_id,)).fetchone()[0]
+    issue.issue(FakeBridge([fake_result()]), tool_ctx.conn, tool_ctx.blobs,
+                tool_ctx.config, engagement_id=tool_ctx.engagement.id,
+                run_id=tool_ctx.run_id, scheme="http", host="127.0.0.1",
+                port=8080, method="GET", path="/a")
+    after = tool_ctx.conn.execute(
+        "SELECT requests_issued FROM run WHERE id=?",
+        (tool_ctx.run_id,)).fetchone()[0]
+    assert after == before + 1
+
+
+@pytest.mark.parametrize("cls", [
+    "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
+    "budget_exhausted", "halted", "not_configured", "transport_error",
+    "timeout", "bridge_lost",
+])
+def test_every_refusal_class_raises_rather_than_returning(tool_ctx, cls):
+    """`BridgeServer.send` NEVER returns a refusal as a dict, and the whole
+    of `hx.checks.probe`'s rule-one argument applies here with the same
+    force: a refusal that came back as a value is one a caller can read as a
+    response."""
+    bridge = FakeBridge([BridgeError(f"{cls}: no", error_class=cls)])
+    with pytest.raises(issue.IssueRefused) as exc:
+        issue.issue(bridge, tool_ctx.conn, tool_ctx.blobs, tool_ctx.config,
+                    engagement_id=tool_ctx.engagement.id,
+                    run_id=tool_ctx.run_id, scheme="http", host="127.0.0.1",
+                    port=8080, method="GET", path="/a")
+    assert exc.value.reason == cls
+    # AND NO ROW. A refused send put no bytes on the wire for most of these
+    # classes, and a row would make a denial indistinguishable from traffic.
+    assert tool_ctx.conn.execute(
+        "SELECT COUNT(*) FROM exchange").fetchone()[0] == 0
+
+
+def test_a_send_under_an_identity_records_it_as_assumed(tool_ctx):
+    """Never `proven`: a canary bracket proves a run, and one send has none."""
+    bridge = FakeBridge([fake_result()])
+    got = issue.issue(
+        bridge, tool_ctx.conn, tool_ctx.blobs, tool_ctx.config,
+        engagement_id=tool_ctx.engagement.id, run_id=tool_ctx.run_id,
+        scheme="http", host="127.0.0.1", port=8080, method="GET", path="/a",
+        identity=("staff", 3))
+    row = tool_ctx.conn.execute(
+        "SELECT identity, identity_generation, identity_state"
+        " FROM exchange WHERE id=?", (got.exchange_id,)).fetchone()
+    assert tuple(row) == ("staff", 3, "assumed")
+    # And the frame carried the id, so the EXTENSION does the injection.
+    assert bridge.sent[0][0]["identity_id"] == "staff"
+
+
+def test_an_anonymous_send_sends_no_identity_key_at_all(tool_ctx):
+    """An ABSENT key is anonymous; a null would leave the extension deciding
+    what a null means. `Sender.decideAndIssue` reads the field as
+    `instanceof String`, so a null happens to be anonymous there today -- and
+    a key sent only when it means something cannot acquire a second meaning
+    from a later reader."""
+    bridge = FakeBridge([fake_result()])
+    issue.issue(bridge, tool_ctx.conn, tool_ctx.blobs, tool_ctx.config,
+                engagement_id=tool_ctx.engagement.id, run_id=tool_ctx.run_id,
+                scheme="http", host="127.0.0.1", port=8080, method="GET",
+                path="/a")
+    assert "identity_id" not in bridge.sent[0][0]
+
+
+@pytest.mark.parametrize("bad", [
+    ("GE T", "/a"), ("GET", "/a b"), ("GET", "/a\r\nX: 1"),
+    ("GET\n", "/a"), ("GET", "/a\x00"),
+])
+def test_a_request_that_could_be_split_is_refused_before_the_wire(bad):
+    """Request smuggling starts at home. A method or path carrying CR, LF,
+    NUL or a space would let an agent's ONE request become two, and the
+    second would not have crossed the gate as itself. Refused here as a
+    ValueError -- a caller's mistake, not a denial -- so it never lands in a
+    journal row as an ordinary refusal."""
+    method, path = bad
+    with pytest.raises(ValueError):
+        issue.request_bytes(method, path, "127.0.0.1", ())
+
+
+def test_a_header_line_without_a_colon_is_refused():
+    with pytest.raises(ValueError):
+        issue.request_bytes("GET", "/a", "127.0.0.1", ("not a header",))
+
+
+def test_the_host_header_is_not_duplicated():
+    """The caller may spell `Host:` themselves -- a virtual-host test needs
+    to -- and two Host headers is a request smuggling primitive, not a
+    preference."""
+    raw = issue.request_bytes("GET", "/a", "127.0.0.1", ("Host: other.test",))
+    assert raw.count(b"Host:") == 1
+    assert b"Host: other.test" in raw
+```
+
+- [ ] **Step 13: Run them to watch them fail**
+
+Run: `.venv/bin/pytest tests/test_issue.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'hx.issue'`
+
+- [ ] **Step 14: Write `src/hx/issue.py`**
+
+```python
+# src/hx/issue.py
+"""The one route from the tool layer to the wire, and the only writer of
+`via='send'` exchange rows.
+
+WHAT WAS MISSING. `src/hx/store/schema.sql` says it plainly: "`Capture.java`
+delivers `via: proxy` and nothing else, so this build stores no send-path
+exchange row at all." The Java confirms it -- `via` is written in exactly two
+places, both in `proxy/Capture.java`, and `send/Sender.java` returns a result
+map without ever pushing an `exchange` frame. Meanwhile spec section 8's
+digest opens with `exchange_id`, and `http.grep`, `http.body` and
+`evidence.attach` are each defined as a read keyed on one. Six tools rested on
+a row nothing wrote. This module writes it.
+
+FROM PYTHON, NOT FROM JAVA, and the trade is worth saying out loud. The result
+frame already carries the redacted response bytes, the status, the timing and
+the outcome; the request bytes are the ones this side composed. That is
+everything the `exchange` table needs. What a Java change would add is the
+POST-INJECTION request bytes and the resolved IP -- and would cost a second
+writer into a table whose proxy writer took a plan to get right.
+
+SO `req_blob` IS WHAT HX ASKED TO BE SENT, NOT WHAT LEFT THE JVM. They differ
+by the identity header the extension injects. That difference is in the SAFE
+direction and is the reason this is tolerable rather than merely cheap: the
+credential is injected inside the JVM, so it cannot be in the bytes this side
+hashes, and the blob store is content-addressed -- hashing raw bytes and
+redacting afterwards would mean the raw bytes are already on disk. An agent
+that needs to know an identity applied reads `exchange.identity`, which this
+module writes, rather than grepping the request blob for a header it will
+never find there.
+
+A REFUSAL RAISES, and the argument is `hx.checks.probe`'s rule one word for
+word: a sender that RETURNED a refusal would leave a caller free to read it as
+a response. `BridgeServer.send` never returns one -- it raises `BridgeError`
+with the wire's class on `.error_class` -- and this module raises
+`IssueRefused` with that class as its reason.
+
+`resolved_ip` AND `scope_version_id` STAY NULL, because the proxy writer
+leaves both NULL too. Filling one here and not there would make `via` the
+thing that decides how much a row knows.
+"""
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+
+from . import capture as capture_mod
+from . import http_text
+from . import surface as surface_mod
+from .bridge.server import BridgeError
+from .store import db as db_mod
+from .store import records
+
+#: Bytes that end a line or terminate a string, in any position of a request
+#: line or a header. One request becoming two is the whole of request
+#: smuggling, and a `\r\n` an agent put in a path would do it below the gate
+#: -- the extension decides about the request it was handed, and the second
+#: request was never handed to it.
+FORBIDDEN = ("\r", "\n", "\0")
+
+#: Default scheme ports, omitted from the stored URL so a send and a proxy
+#: observation of the same endpoint normalise onto ONE surface. Burp's own URL
+#: omits them, and a surface split by nothing but the writer would double
+#: every coverage figure.
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+class IssueRefused(Exception):
+    """The request did not produce an answer. `reason` is the wire's class."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+@dataclass(frozen=True)
+class Issued:
+    """Spec section 8's digest, plus the bytes for a caller that wants them.
+
+    `response` is the REDACTED response, whole, and it is here so that
+    `http.send` can compute its delta and `http.replay_as` can compare two
+    replies without a second round trip to the blob store it just wrote. It
+    is deliberately NOT part of what a tool returns to an agent: Principle 1
+    is handles and digests, never payloads.
+    """
+
+    exchange_id: str
+    status: int | None
+    bytes: int
+    ms: int
+    outcome: str
+    content_type: str | None
+    body_sha256: str
+    first_line: str
+    response: bytes
+
+
+def _url(scheme: str, host: str, port: int, path: str) -> str:
+    if DEFAULT_PORTS.get(scheme) == port:
+        return f"{scheme}://{host}{path}"
+    return f"{scheme}://{host}:{port}{path}"
+
+
+def _clean(what: str, value: str) -> str:
+    for ch in FORBIDDEN:
+        if ch in value:
+            raise ValueError(
+                f"{what} contains {ch!r}, which would end the line: "
+                f"{value!r}. One request becoming two is the whole of request "
+                "smuggling, and it would happen BELOW the gate -- the "
+                "extension decides about the request it was handed, and the "
+                "second request was never handed to it.")
+    return value
+
+
+def request_bytes(method: str, path: str, host: str,
+                  headers=(), body: bytes = b"") -> bytes:
+    """One origin-form HTTP/1.1 request, or a ValueError.
+
+    HEADERS ARE WIRE LINES, `Name: value`, not a mapping. `hx.tools.schema`
+    requires `additionalProperties: false` on every object it publishes, so a
+    free-key map is not expressible as a tool argument at all -- and an array
+    of lines is what HTTP itself carries, so the agent writes what the wire
+    will hold rather than a shape this side has to flatten.
+
+    A ValueError, never an `IssueRefused`: nothing on the wire said no, a
+    caller made a mistake, and an `IssueRefused` would land in a journal row
+    as an ordinary refusal indistinguishable from a rate limit -- the same
+    distinction `hx.checks.probe.ProbeSender.get` draws for the same reason.
+    """
+    _clean("method", method)
+    _clean("path", path)
+    if " " in method or not method:
+        raise ValueError(f"method must be one token, got {method!r}")
+    if not path.startswith("/"):
+        raise ValueError(
+            f"path must be origin-form and start with '/', got {path!r}")
+    if " " in path:
+        raise ValueError(
+            f"path contains a space, which ends the request target: {path!r}. "
+            "Percent-encode it.")
+    lines = [f"{method} {path} HTTP/1.1"]
+    given = []
+    for line in headers:
+        _clean("header", line)
+        if ":" not in line:
+            raise ValueError(
+                f"header {line!r} has no ':'; headers are wire lines of the "
+                "form 'Name: value'")
+        given.append(line)
+    # THE CALLER'S HOST WINS AND IS NOT JOINED BY A SECOND. A virtual-host
+    # test needs to spell `Host:` itself, and two Host headers is a smuggling
+    # primitive rather than a preference.
+    if not any(line.partition(":")[0].strip().lower() == "host"
+               for line in given):
+        lines.append(f"Host: {host}")
+    lines += given
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+    return head + body
+
+
+def issue(bridge, conn, blobs, config, *, engagement_id: str,
+          run_id: str, scheme: str, host: str, port: int, method: str,
+          path: str, headers=(), body: bytes = b"", identity=None,
+          timeout: float = 30.0) -> Issued:
+    """Send one request and record it. Raises `IssueRefused` on every refusal.
+
+    `identity` is `(id, generation)` or None -- NEVER a `Resolved`. Principle
+    5 keeps the credential below the tool layer, and a function that took one
+    could put it in a return value that gets journalled. The extension holds
+    the secret; this side holds the name, sends it as `identity_id`, and
+    stores it on the row.
+    """
+    raw = request_bytes(method, path, host, headers, body)
+    req = {"target_host": host, "target_port": port, "tls": scheme == "https"}
+    if identity is not None:
+        # PRESENT ONLY WHEN BOUND. See `ProbeSender.get` -- an absent key is
+        # anonymous, and a null would leave the extension deciding what a
+        # null means.
+        req["identity_id"] = identity[0]
+
+    try:
+        result = bridge.send(req, raw, timeout=timeout)
+    except BridgeError as exc:
+        cls = exc.error_class or "transport_error"
+        detail = str(exc).removeprefix(f"{cls}: ")
+        raise IssueRefused(cls, "" if detail == cls else detail) from exc
+
+    response = result.get(type(bridge).BODY_KEY, b"")
+    status = result.get("status")
+    outcome = result.get("outcome", "ok")
+    ms = int(result.get("ms") or 0)
+    head, _rest = http_text.split_head_body(response)
+    types = http_text.header_values(head, "content-type")
+    first_line = head.split(b"\n", 1)[0].rstrip(b"\r").decode(
+        "latin-1", "replace")
+
+    url = _url(scheme, host, port, path)
+    norm = surface_mod.normalise(
+        method, url,
+        preserve=frozenset(config.preserve_segments),
+        slug_threshold=config.slug_threshold)
+
+    # BLOBS BEFORE THE TRANSACTION, deliberately, and the argument is the
+    # proxy writer's: the blob store is not in the database, so a ROLLBACK
+    # cannot take a file back. Writing them first leaves an orphan blob a
+    # sweep can collect; writing them after a committed row that NAMES them
+    # would leave corruption a report reads as evidence.
+    req_blob, _ = blobs.put(raw)
+    resp_blob, resp_len = blobs.put(response) if response else (None, None)
+
+    cap = capture_mod.Capture(conn=conn, blobs=blobs,
+                              engagement_id=engagement_id, config=config)
+    at = capture_mod.now_us()
+    with db_mod.transaction(conn):
+        exchange_id = records.record_exchange(
+            conn, run_id=run_id, method=method, url=url, status=status,
+            req_blob=req_blob, resp_blob=resp_blob, resp_len=resp_len,
+            ms=ms, at_us=at, outcome=outcome, via="send",
+            identity=None if identity is None else identity[0],
+            identity_generation=None if identity is None else identity[1],
+            # NEVER `proven`. A canary bracket proves a RUN (spec section 6);
+            # one send has no bracket, so `assumed` is the whole of what is
+            # known and `proven` would be a claim no canary backs.
+            identity_state=None if identity is None else "assumed")
+        # S5's coverage floor, and the proxy writer bumps it for the same
+        # reason: a run that sent a hundred requests and reports having
+        # issued none makes every figure derived from this column wrong.
+        conn.execute(
+            "UPDATE run SET requests_issued = requests_issued + 1"
+            " WHERE id=?", (run_id,))
+        surface_id = cap.upsert_surface(norm, exchange_id=exchange_id,
+                                        run_id=run_id, via="send")
+        # The back-reference, and it cannot be written earlier: the surface's
+        # exemplar is this exchange, so the exchange row has to exist before
+        # the surface row can name it.
+        conn.execute("UPDATE exchange SET surface_id=? WHERE id=?",
+                     (surface_id, exchange_id))
+
+    return Issued(
+        exchange_id=exchange_id, status=status, bytes=len(response), ms=ms,
+        outcome=outcome, content_type=types[0] if types else None,
+        body_sha256="sha256:" + hashlib.sha256(response).hexdigest(),
+        first_line=first_line, response=response)
+```
+
+**Two things to verify against the repo rather than trusting this text:**
+1. `capture_mod.now_us` — confirm the name and that it is importable (`command grep -n "def now_us\|now_us" src/hx/capture.py`). If it lives elsewhere, import it from there.
+2. `type(bridge).BODY_KEY` — the real `BridgeServer` defines `BODY_KEY`; confirm it is a class attribute and not an instance one. If it is module-level, import it directly.
+
+- [ ] **Step 15: Run the issue tests**
+
+Run: `.venv/bin/pytest tests/test_issue.py -q`
+Expected: PASS, all of them.
+
+- [ ] **Step 16: Run the whole suite and ruff**
+
+Run: `.venv/bin/pytest -q && .venv/bin/ruff check src tests`
+Expected: 1830 + the new tests passed, 1 skipped; ruff clean.
+
+- [ ] **Step 17: Commit**
+
+```bash
+git add src/hx/issue.py src/hx/store/records.py tests/test_issue.py tests/conftest.py
+git commit -m "feat(issue): the send path records an exchange row
+
+Nothing in this build stored via='send'. schema.sql said so, the Java
+confirmed it, and six of Plan B's tools are defined as reads keyed on an
+exchange_id that nothing produced. hx.issue composes the request, sends it
+through the one bridge seam, writes both blobs, upserts the surface as
+agent-discovered and bumps run.requests_issued.
+
+record_exchange gains the identity triple, defaulted to None so every
+existing call site is unchanged. A send under an identity records
+identity_state='assumed': a canary bracket proves a run, and one send
+has none."
+```
+
+---
+
+## Task 2: `delta_vs_baseline`
+
+Principle 1's own justification: *"a bare `{exchange_id, status, bytes, ms}` is uninformative: twelve XSS payload variants against one endpoint return twelve identical-looking tuples."* The delta is what makes the digest worth returning.
+
+**Files:**
+- Create: `src/hx/delta.py`
+- Test: `tests/test_delta.py`
+
+**Interfaces:**
+- Consumes: `hx.store.blobs.BlobStore.get(digest, expected_len)`; the `surface` and `exchange` tables.
+- Produces:
+  - `hx.delta.against(baseline_status, baseline_body, status, body) -> dict` with keys `status_changed`, `len_delta`, `new_tokens`, and `new_tokens_truncated` when it applies
+  - `hx.delta.baseline_for(conn, blobs, surface_id) -> tuple[int | None, bytes] | None`
+  - `hx.delta.TOKEN`, `MAX_TOKENS`, `MAX_DIFF_BYTES`
+
+---
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_delta.py
+"""What changed between a response and its surface's exemplar.
+
+The digest exists because twelve payload variants against one endpoint return
+twelve identical tuples without it. So the test that matters most here is the
+one where a reflected token appears in `new_tokens` and nothing else does.
+"""
+from hx import delta
+
+
+def test_a_reflected_payload_shows_up_as_a_new_token():
+    """The whole point. An agent sends `hZq9xK` and wants to be told, in the
+    digest, that `hZq9xK` came back -- without reading a 1.2 MB body."""
+    base = b"<html><body>Hello visitor</body></html>"
+    now = b"<html><body>Hello hZq9xK</body></html>"
+    got = delta.against(200, base, 200, now)
+    assert got["new_tokens"] == ["hZq9xK"]
+    assert got["status_changed"] is False
+    assert got["len_delta"] == len(now) - len(base)
+
+
+def test_tokens_present_in_the_baseline_are_not_new():
+    base = b"session=abcdef ; csrf=ghijkl"
+    now = b"session=abcdef ; csrf=ghijkl ; extra=mnopqr"
+    assert delta.against(200, base, 200, now)["new_tokens"] == ["mnopqr"]
+
+
+def test_short_runs_are_not_tokens():
+    """A six-character floor. Without it every `<div>`, `class` and `href`
+    in a re-rendered page is a `new_token`, and the field an agent reads for
+    signal becomes the field it learns to skip."""
+    assert delta.against(200, b"a", 200, b"a bc def ghij")["new_tokens"] == []
+
+
+def test_a_status_change_is_reported_even_when_the_body_is_identical():
+    got = delta.against(200, b"same", 403, b"same")
+    assert got["status_changed"] is True
+    assert got["len_delta"] == 0
+    assert got["new_tokens"] == []
+
+
+def test_tokens_are_capped_and_the_cap_is_declared():
+    """A silent cap reads as "that was all of them", which is section 12's
+    failure in a single field."""
+    now = b" ".join(b"tok%05d" % i for i in range(delta.MAX_TOKENS + 10))
+    got = delta.against(200, b"", 200, now)
+    assert len(got["new_tokens"]) == delta.MAX_TOKENS
+    assert got["new_tokens_truncated"] is True
+
+
+def test_an_oversized_body_reports_null_tokens_rather_than_scanning_it():
+    """`new_tokens: null` is "not computed"; `[]` is "computed, none found".
+    Collapsing the two would let an agent read a 40 MB download it never
+    diffed as proof that nothing changed."""
+    big = b"x" * (delta.MAX_DIFF_BYTES + 1)
+    got = delta.against(200, b"", 200, big)
+    assert got["new_tokens"] is None
+    assert got["len_delta"] == len(big)
+    assert got["status_changed"] is False
+
+
+def test_a_surface_with_no_exemplar_has_no_baseline(tool_ctx):
+    assert delta.baseline_for(tool_ctx.conn, tool_ctx.blobs, "no-such") is None
+```
+
+Add one more test once Task 1 is in: `baseline_for` over a surface whose exemplar exchange has a `resp_blob`, asserting it returns `(status, bytes)`. Build the row with `hx.issue.issue` and a `FakeBridge` rather than by hand — a fixture that writes the row itself would pass while the real writer wrote something else.
+
+- [ ] **Step 2: Run to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_delta.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'hx.delta'`
+
+- [ ] **Step 3: Write `src/hx/delta.py`**
+
+```python
+# src/hx/delta.py
+"""What changed between a response and its surface's exemplar.
+
+SPEC SECTION 8 PUTS THIS IN THE DIGEST AND GIVES THE REASON: "a bare
+{exchange_id, status, bytes, ms} is uninformative: twelve XSS payload variants
+against one endpoint return twelve identical-looking tuples". Principle 1 says
+handles and digests, never payloads -- and a digest that cannot tell two
+responses apart makes Principle 1 a rule against usefulness rather than
+against volume.
+
+THE BASELINE IS THE SURFACE'S EXEMPLAR, and there is no other honest choice
+available here. `surface.exemplar_exchange_id` is the request that first
+defined the endpoint; it is what "normal" means for that surface in this
+engagement's own data. A request that reaches no known surface has NO baseline
+and the digest then carries `delta_vs_baseline: null` -- not a zero delta,
+which would read as "nothing changed" about a comparison never made.
+
+`new_tokens` IS THREE-VALUED FOR THE SAME REASON. `[]` is "computed, none
+found"; `null` is "not computed, the bodies were too large to diff". Section
+12's rule is that a report which cannot distinguish tested-clean from
+never-reached is worse than no report, and a field that spells both `[]` is
+that rule broken inside one key.
+"""
+from __future__ import annotations
+
+import re
+
+#: A token is a run of characters a payload or an identifier is made of. The
+#: SIX-CHARACTER FLOOR is what makes the field readable: without it every
+#: `<div>`, `class`, `href` and `span` in a re-rendered page is a new token,
+#: and the one field an agent reads for signal becomes the one it learns to
+#: skip. Six admits every realistic payload marker and excludes almost all
+#: HTML and English.
+TOKEN = re.compile(rb"[A-Za-z0-9_-]{6,}")
+
+#: Reported, never silent -- see `new_tokens_truncated`. A response that
+#: differs in three hundred tokens has been rewritten, and the first twenty
+#: say so as well as all three hundred would.
+MAX_TOKENS = 20
+
+#: Above this, tokens are not computed and the field says so. Two 8 MB bodies
+#: tokenised into sets is tens of megabytes of transient allocation inside the
+#: one long-lived process that also holds the Burp.
+MAX_DIFF_BYTES = 2 * 1024 * 1024
+
+
+def against(baseline_status, baseline_body: bytes,
+            status, body: bytes) -> dict:
+    """The delta, with `new_tokens` None when the bodies were too big to diff.
+
+    `status_changed` and `len_delta` are ALWAYS computed: they cost nothing
+    and they are the two facts that survive a body no one could diff.
+    """
+    out = {
+        "status_changed": baseline_status != status,
+        "len_delta": len(body) - len(baseline_body),
+        "new_tokens": None,
+    }
+    if len(body) > MAX_DIFF_BYTES or len(baseline_body) > MAX_DIFF_BYTES:
+        return out
+    seen = set(TOKEN.findall(baseline_body))
+    fresh = []
+    for tok in TOKEN.findall(body):
+        if tok in seen:
+            continue
+        seen.add(tok)
+        fresh.append(tok.decode("latin-1"))
+    if len(fresh) > MAX_TOKENS:
+        out["new_tokens_truncated"] = True
+        fresh = fresh[:MAX_TOKENS]
+    out["new_tokens"] = fresh
+    return out
+
+
+def baseline_for(conn, blobs, surface_id):
+    """`(status, response_bytes)` for a surface's exemplar, or None.
+
+    None for every way there is not one: no surface row, no exemplar, an
+    exemplar whose response was never stored. All three are "there is nothing
+    to compare against", and a caller that told them apart would be reporting
+    on its own bookkeeping rather than on the application.
+    """
+    row = conn.execute(
+        "SELECT x.status, x.resp_blob, x.resp_len FROM surface s"
+        " JOIN exchange x ON x.id = s.exemplar_exchange_id"
+        " WHERE s.id = ?", (surface_id,)).fetchone()
+    if row is None or row[1] is None:
+        return None
+    return row[0], blobs.get(row[1], row[2])
+```
+
+- [ ] **Step 4: Run the delta tests**
+
+Run: `.venv/bin/pytest tests/test_delta.py -q`
+Expected: PASS
+
+- [ ] **Step 5: Full suite, ruff, commit**
+
+```bash
+.venv/bin/pytest -q && .venv/bin/ruff check src tests
+git add src/hx/delta.py tests/test_delta.py
+git commit -m "feat(delta): the digest's delta_vs_baseline
+
+Spec section 8's justification for the digest is that twelve payload variants
+return twelve identical tuples without it. Baseline is the surface's exemplar;
+no exemplar means null rather than a zero delta, and new_tokens is null when
+the bodies were too large to diff rather than an empty list that would read as
+'nothing changed'."
+```
+
+---
+
+## Task 3: The session bracket
+
+`ToolContext.session` has been `None` since Plan A shipped. This task fills it — and settles what happens in the adapter that structurally cannot hold one.
+
+**Files:**
+- Create: `src/hx/tools/live.py`
+- Modify: `src/hx/tools/dispatch.py` (`ToolContext` gains two fields)
+- Modify: `src/hx/tools/impl/run.py` (`start` opens, `finish` closes)
+- Modify: `src/hx/tools/adapters/cli.py` (`build_context` takes `stack`)
+- Test: `tests/test_tools_live.py`, additions to `tests/test_tools_run.py`, `tests/integration/test_tool_session.py`
+
+**Interfaces:**
+- Consumes: `hx.session.session(eng, *, instance, jar=None, workdir=None, seed=None)` — a context manager yielding `LiveSession(operator_port, crawler_port, epoch, bridge, workdir, proc)`, raising `SessionError`. `LiveSession.gone() -> str | None`.
+- Produces:
+  - `hx.tools.live.EGRESS_KINDS`, `INSTANCE`
+  - `hx.tools.live.open_for(ctx, run_id, kind) -> dict` — never raises
+  - `hx.tools.live.close_for(ctx, run_id) -> bool`
+  - `hx.tools.live.ensure_identity(ctx, identity_id) -> tuple[str, int]`
+  - `ToolContext.stack: contextlib.ExitStack | None`, `ToolContext._registered: set`, `ToolContext._session_run_id: str | None`
+
+---
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_tools_live.py
+"""The session bracket.
+
+FIVE OUTCOMES, AND FOUR OF THEM ARE "NO SESSION". That is the shape worth
+holding in mind while reading: a run opens either way, and what varies is the
+reason it has no Burp. An agent that is told `not_needed` knows its browse run
+never wanted one; one told `no_host` knows it is running under `hx tool` and
+should move to `hx mcp`; one told `launch_failed` has an operator problem; one
+told `session_held` knows which run to finish. A single `live: false` would
+collapse four different next actions into one shrug.
+"""
+import contextlib
+
+import pytest
+
+from hx import session as session_mod
+from hx.tools import live
+
+
+class FakeLive:
+    """What `session.session()` yields, minus the JVM."""
+
+    operator_port = 18080
+    crawler_port = 18081
+    epoch = 3
+    bridge = object()
+
+    def gone(self):
+        return None
+
+
+@contextlib.contextmanager
+def _fake_session(eng, **kw):
+    yield FakeLive()
+
+
+def test_a_browse_run_is_told_it_never_needed_one(tool_ctx):
+    got = live.open_for(tool_ctx, "run-1", "browse")
+    assert got["live"] is False
+    assert got["reason"] == "not_needed"
+
+
+def test_without_a_host_stack_it_names_the_adapter_and_the_fix(tool_ctx):
+    """`hx tool` is one process per call. A session launched there would be
+    torn down microseconds later by `session()`'s own unconditional
+    teardown, so the honest answer is that this ADAPTER cannot hold one."""
+    tool_ctx.stack = None
+    got = live.open_for(tool_ctx, "run-1", "manual")
+    assert got["live"] is False
+    assert got["reason"] == "no_host"
+    assert "hx mcp" in got["detail"]
+
+
+def test_a_launch_failure_is_reported_not_raised(tool_ctx, monkeypatch):
+    """`run.start` must still open the run: refusing outright would leave no
+    run row and no agent_action row -- no trace that the instrument failed."""
+    def boom(eng, **kw):
+        raise session_mod.SessionError("no burp jar under ~/F0RT1KA/burp-lab")
+
+    monkeypatch.setattr(session_mod, "session", boom)
+    tool_ctx.stack = contextlib.ExitStack()
+    got = live.open_for(tool_ctx, "run-1", "manual")
+    assert got["live"] is False
+    assert got["reason"] == "launch_failed"
+    assert "burp-lab" in got["detail"]
+
+
+def test_a_successful_launch_binds_the_session_and_reports_its_ports(
+        tool_ctx, monkeypatch):
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    got = live.open_for(tool_ctx, "run-1", "manual")
+    assert got["live"] is True
+    assert got["operator_port"] == 18080
+    assert got["crawler_port"] == 18081
+    assert got["epoch"] == 3
+    assert tool_ctx.session is not None
+
+
+def test_a_second_egress_run_is_told_who_holds_the_session(
+        tool_ctx, monkeypatch):
+    """One Burp at a time, owned by the run that launched it. The second run
+    OPENS -- it can still record findings and query surfaces -- and is told
+    exactly which run to finish."""
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    live.open_for(tool_ctx, "run-1", "manual")
+    got = live.open_for(tool_ctx, "run-2", "scan")
+    assert got["live"] is False
+    assert got["reason"] == "session_held"
+    assert "run-1" in got["detail"]
+
+
+def test_only_the_owning_run_can_close_the_session(tool_ctx, monkeypatch):
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    live.open_for(tool_ctx, "run-1", "manual")
+    assert live.close_for(tool_ctx, "run-2") is False
+    assert tool_ctx.session is not None
+    assert live.close_for(tool_ctx, "run-1") is True
+    assert tool_ctx.session is None
+
+
+def test_a_dead_session_is_not_handed_out_as_live(tool_ctx, monkeypatch):
+    """`LiveSession.gone()` has two ways to be true and neither is 'the
+    process exited': a JVM that is up while its extension dropped the bridge
+    reconnects at DENY-ALL -- alive, proxying nothing, recording nothing."""
+    class Dead(FakeLive):
+        def gone(self):
+            return "Burp's extension dropped the bridge connection"
+
+    @contextlib.contextmanager
+    def dead_session(eng, **kw):
+        yield Dead()
+
+    monkeypatch.setattr(session_mod, "session", dead_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    got = live.open_for(tool_ctx, "run-1", "manual")
+    assert got["live"] is False
+    assert got["reason"] == "launch_failed"
+    assert tool_ctx.session is None
+
+
+def test_an_identity_is_registered_once_per_generation(tool_ctx, monkeypatch):
+    """`register_identity` refuses a generation that does not advance
+    (`stale_generation`), so a second registration of the same generation is
+    an error rather than a no-op."""
+    ...  # see Step 5 -- needs a config with a declared identity
+```
+
+- [ ] **Step 2: Run to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_tools_live.py -q`
+Expected: FAIL — `ImportError: cannot import name 'live' from 'hx.tools'`
+
+- [ ] **Step 3: Add the three `ToolContext` fields**
+
+In `src/hx/tools/dispatch.py`. **No marker** — the file exists. Add `import contextlib` to the imports, and these fields after `session`:
+
+```python
+    #: The ADAPTER'S ExitStack, and the reason egress belongs to a long-lived
+    #: adapter rather than to `hx tool`. `hx.session.session()` tears Burp
+    #: down on EVERY exit, so a JVM launched inside a one-shot `hx tool`
+    #: process dies microseconds later -- there is no object in that adapter
+    #: for a session to outlive. `hx mcp` is one process for the whole
+    #: conversation, opens a stack around its serve loop, and hands it here;
+    #: `run.start` pushes the session onto it and `run.finish` pops it. A
+    #: crash unwinds the stack, which is spec section 8's "a crash must not
+    #: orphan a JVM" -- the FIRST of its three layers, the other two being
+    #: `run.reap_stale` and `session()`'s own teardown.
+    #:
+    #: None means this adapter cannot host a session, which is a different
+    #: fact from "no session is open" and is reported as its own reason.
+    stack: Any = None
+    #: The run that launched the session on `stack`. At most one session at a
+    #: time -- see `hx.tools.live`.
+    _session_run_id: str | None = dataclasses.field(default=None, repr=False)
+    #: `(identity_id, generation)` already registered on THIS session's
+    #: extension. `BridgeServer.register_identity` refuses a generation that
+    #: does not advance what the extension holds (`stale_generation`), so a
+    #: second registration of the same pair is an error, not a no-op. Cleared
+    #: with the session, because a new extension has heard of none of them.
+    _registered: set = dataclasses.field(default_factory=set, repr=False)
+```
+
+- [ ] **Step 4: Write `src/hx/tools/live.py`**
+
+```python
+# src/hx/tools/live.py
+"""The session bracket: which runs get a Burp, and who owns it.
+
+SPEC SECTION 8 GIVES THE SHAPE. `run.start` opens the bracket and
+`run.finish` closes it; an egress tool outside that bracket answers
+`unavailable / no_session`. This is "each command owns its own Burp" -- the
+rule already chosen for the CLI -- scaled to a session rather than replaced.
+
+FOUR WAYS TO HAVE NO SESSION, AND THEY ARE FOUR DIFFERENT NEXT ACTIONS. That
+is why `open_for` returns a reason rather than a bool:
+
+  not_needed     this run kind never wanted one (browse, crawl)
+  no_host        this ADAPTER cannot hold one -- use `hx mcp`
+  launch_failed  Burp would not start, or started dead
+  session_held   another run has it; finish that one
+
+Section 12's rule is that a report which cannot distinguish "tested, clean"
+from "never reached" is worse than no report, and the same rule applies to an
+agent's knowledge of its own instrument. A single `live: false` would collapse
+four distinguishable situations into one shrug -- which is exactly the
+argument that registers `crawl.run` rather than omitting it.
+
+A FAILED LAUNCH DOES NOT STOP THE RUN FROM OPENING. Refusing `run.start`
+outright would leave no `run` row and no `agent_action` row: no trace that the
+instrument failed, on the one call that was trying to set it up. The run
+opens, the failure is in the result and in the journal, non-egress work
+proceeds, and every egress tool answers `no_session` on its own -- so nothing
+false can be concluded from it.
+"""
+from __future__ import annotations
+
+import os
+
+from .. import identity as identity_mod
+from .. import session as session_mod
+from ..bridge import codec
+from ..bridge.server import BridgeError
+
+#: Run kinds that imply traffic this side issues. `browse` is the operator's
+#: own browser through `hx capture start`, which owns its own Burp -- spec
+#: section 8: "a browse run never needed the tool layer to launch anything".
+#: `crawl` is here for completeness and is not in the set, because `crawl.run`
+#: is permanently unavailable and a crawl run has nothing to send.
+EGRESS_KINDS = frozenset({"manual", "scan"})
+
+#: `hx.session.session`'s `instance`, which names both the `-Dhx.instance` the
+#: extension reports and the directory under the engagement root this session
+#: owns. Distinct from "capture" and "scan" so an agent's session and an
+#: operator's `hx capture start` do not collide on a bridge socket path.
+INSTANCE = "tools"
+
+
+def open_for(ctx, run_id: str, kind: str) -> dict:
+    """Launch Burp for a run of this kind, or say why not. NEVER RAISES.
+
+    A raise here would come out of `run.start`, and `dispatch` would render it
+    `error / internal` -- "hx is broken" for a Burp that is merely not
+    installed. The distinction between a defect and a missing instrument is
+    the one this whole return value exists to draw.
+    """
+    if kind not in EGRESS_KINDS:
+        return {"live": False, "reason": "not_needed",
+                "detail": f"a {kind} run issues no traffic from this side, "
+                          "so it needs no session"}
+    if ctx.stack is None:
+        return {"live": False, "reason": "no_host",
+                "detail": "this adapter is one process per call and cannot "
+                          "hold a Burp open across calls: `hx.session."
+                          "session()` tears it down on every exit. Run the "
+                          "tool layer under `hx mcp`, which is one long-lived "
+                          "process, or use the 11 tools that need no session."}
+    if ctx.session is not None:
+        return {"live": False, "reason": "session_held",
+                "detail": f"run {ctx._session_run_id} holds this engagement's "
+                          "Burp; one session at a time. Finish that run first "
+                          "-- a scan and a manual pass are different runs and "
+                          "should not share an instrument."}
+    try:
+        live = ctx.stack.enter_context(
+            session_mod.session(ctx.engagement, instance=INSTANCE))
+    except Exception as exc:            # noqa: BLE001 -- see the docstring
+        return {"live": False, "reason": "launch_failed",
+                "detail": f"{type(exc).__name__}: {exc}"}
+    # A SESSION THAT ARRIVES DEAD IS NOT A SESSION. `gone()` has two ways to
+    # be true and only one is a dead JVM: an extension that dropped the
+    # bridge reconnects at DENY-ALL, which is a Burp that is up, proxies
+    # nothing and records nothing. Handing that back as `live` would give
+    # every later tool a session object whose every send is refused.
+    dead = live.gone()
+    if dead is not None:
+        ctx.stack.close()
+        return {"live": False, "reason": "launch_failed", "detail": dead}
+    ctx.session = live
+    ctx._session_run_id = run_id
+    ctx._registered = set()
+    return {"live": True, "operator_port": live.operator_port,
+            "crawler_port": live.crawler_port, "epoch": live.epoch}
+
+
+def close_for(ctx, run_id: str) -> bool:
+    """Tear down the session if this run owns it. True if it did.
+
+    `ExitStack.close()` unwinds everything on the stack and leaves it
+    reusable, which is what makes one stack enough for a session that opens
+    and closes many times across one `hx mcp` conversation.
+    """
+    if ctx.session is None or ctx._session_run_id != run_id:
+        return False
+    ctx.stack.close()
+    ctx.session = None
+    ctx._session_run_id = None
+    ctx._registered = set()
+    return True
+
+
+def ensure_identity(ctx, identity_id: str) -> tuple[str, int]:
+    """Resolve and register one identity; return `(id, generation)`.
+
+    THE CREDENTIAL NEVER COMES BACK. Principle 5 puts resolution below the
+    tool layer, and this function is that boundary: a `Resolved` is built,
+    handed straight to the extension, and dropped. What returns is a name and
+    a number, which is what an exchange row stores and what a journal may
+    hold.
+
+    REGISTERED ONCE PER (id, generation) PER SESSION.
+    `BridgeServer.register_identity` refuses a generation that does not
+    advance what the extension already holds -- `stale_generation` -- so a
+    second registration of the same pair is an ERROR rather than a no-op, and
+    a tool that re-registered on every send would fail on its second one.
+
+    Raises ValueError for an undeclared identity (a caller's mistake, and the
+    message lists what IS declared) and BridgeError for a refusal from the
+    extension.
+    """
+    declared = ctx.config.identities.get(identity_id)
+    if declared is None:
+        raise ValueError(
+            f"identity {identity_id!r} is not declared in this config. "
+            f"Declared: {sorted(ctx.config.identities) or 'none'}")
+    resolved = identity_mod.resolve(declared, dict(os.environ))
+    key = (resolved.id, resolved.generation)
+    if key not in ctx._registered:
+        ctx.session.bridge.register_identity(
+            resolved, origins=tuple(declared.origins))
+        ctx._registered.add(key)
+    return key
+```
+
+**Note on the unused imports:** `codec` and `BridgeError` are imported for the exception types a caller must handle. If `ruff` flags either as unused, remove it rather than adding a `noqa` — the docstring already names them.
+
+- [ ] **Step 5: Write the identity-registration test**
+
+Add to `tests/test_tools_live.py`. It needs a config carrying a declared identity; find how `tests/test_scan_identity.py` (or whichever suite covers `_identity_bracket`) builds one and follow it, rather than hand-rolling a `Config`.
+
+```python
+def test_an_identity_is_registered_once_per_generation(
+        tool_ctx, monkeypatch, staff_identity_config):
+    """A second registration of the same generation would be refused
+    `stale_generation` by the extension, so a tool that re-registered on
+    every send would fail on its second one."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_ctx.config = staff_identity_config
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge([])})()
+    tool_ctx._registered = set()
+
+    first = live.ensure_identity(tool_ctx, "staff")
+    second = live.ensure_identity(tool_ctx, "staff")
+    assert first == second == ("staff", 1)
+    assert len(tool_ctx.session.bridge.identities) == 1
+
+
+def test_the_credential_never_leaves_this_function(
+        tool_ctx, monkeypatch, staff_identity_config):
+    """Principle 5. What comes back is a name and a number -- an exchange
+    row's worth -- and never a `Resolved`, which a journalled return value
+    would put the secret into."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_ctx.config = staff_identity_config
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge([])})()
+    tool_ctx._registered = set()
+    got = live.ensure_identity(tool_ctx, "staff")
+    assert got == ("staff", 1)
+    assert "s3cret" not in repr(got)
+
+
+def test_an_undeclared_identity_names_what_is_declared(
+        tool_ctx, staff_identity_config):
+    tool_ctx.config = staff_identity_config
+    with pytest.raises(ValueError, match="staff"):
+        live.ensure_identity(tool_ctx, "nope")
+```
+
+- [ ] **Step 6: Wire the bracket into `run.start` and `run.finish`**
+
+In `src/hx/tools/impl/run.py`. **No markers** — the file exists.
+
+`start`, replacing its return:
+
+```python
+    run_id = run_mod.open_run(ctx.conn, engagement_id=ctx.engagement.id,
+                              kind=kind,
+                              safety_profile=ctx.config.safety_profile)
+    ctx.run_id = run_id
+    # AFTER the run row, deliberately: `open_for` can fail, and a failure
+    # that had to be reported with no run to report it against would be a
+    # failure with no journal row and no run row -- the one call that was
+    # trying to set the instrument up, leaving no trace that it did not.
+    return {"id": run_id, "kind": kind,
+            "safety_profile": ctx.config.safety_profile,
+            "session": live_mod.open_for(ctx, run_id, kind)}
+```
+
+`finish`, after the run is closed and before its return, adding `session_closed` to the result dict:
+
+```python
+    # THE JVM GOES WITH THE RUN. `run.finish` is the one tool exempt from the
+    # halt refusal (`dispatch.HALT_EXEMPT`) precisely so that an operator who
+    # has hit STOP can still close the bracket -- and closing the bracket has
+    # to include tearing the Burp down, or a halt leaves a live JVM behind
+    # with nothing left that is allowed to stop it.
+    closed = live_mod.close_for(ctx, run_id)
+```
+
+and add `"session_closed": closed` to what `finish` returns.
+
+Import: `from .. import live as live_mod`.
+
+- [ ] **Step 7: Let `build_context` take a stack**
+
+In `src/hx/tools/adapters/cli.py`. **No marker.**
+
+```python
+def build_context(engagement, *, stack=None) -> dispatch_mod.ToolContext:
+```
+
+with `stack=stack` passed through, and this paragraph replacing the last two sentences of the existing docstring:
+
+```
+    `stack` IS NONE FROM THIS ADAPTER AND THAT IS THE HONEST ANSWER, not a
+    limitation waiting to be lifted. `hx.session.session()` tears Burp down on
+    every exit, so a JVM launched inside a one-shot `hx tool` process dies
+    with it -- there is no object here for a session to outlive. `run.start`
+    is told so and reports `session: {live: false, reason: "no_host"}`, which
+    names `hx mcp` as the adapter that can. The parameter exists because
+    `hx mcp` builds its context through this same function.
+```
+
+- [ ] **Step 8: Extend the `run.start` / `run.finish` tests**
+
+Add to `tests/test_tools_run.py`: `run.start` on a `manual` run through a context with no stack reports `session.reason == "no_host"` and still returns a run id; `run.finish` reports `session_closed: false` when there was none. Do not re-test `live.open_for`'s branches here — they are Task 3's own suite.
+
+- [ ] **Step 9: Write the integration test**
+
+```python
+# tests/integration/test_tool_session.py
+"""The bracket against a real Burp.
+
+Everything else about the bracket is proved with a monkeypatched
+`session.session`, which is right -- the branches are about bookkeeping. This
+file proves the one thing a fake cannot: that `run.start` on a manual run
+brings up a JVM whose extension is CONFIGURED, and that `run.finish` takes it
+away again.
+"""
+import contextlib
+
+import pytest
+
+from hx.tools import dispatch as dispatch_mod
+from hx.tools import impl  # noqa: F401 -- registers every tool
+
+
+@pytest.mark.integration
+def test_run_start_brings_up_a_configured_burp_and_run_finish_stops_it(
+        engagement, burp_fixture):
+    with contextlib.ExitStack() as stack:
+        ctx = dispatch_mod.ToolContext(
+            engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
+            config=engagement.config,
+            halt=..., stack=stack)          # halt: follow the conftest's own
+                                            # construction of OperatorHalt
+        env = dispatch_mod.dispatch(ctx, "run.start", {"kind": "manual"},
+                                    why="prove the bracket brings up a JVM")
+        assert env.outcome == "ok"
+        sess = env.result["session"]
+        assert sess["live"] is True, sess
+        # EPOCH IS NEVER 0 HERE. 0 is what the extension reports at DENY-ALL,
+        # and a session that reached this object got a `configure` the
+        # extension accepted. An assertion on the ports alone would pass
+        # against a Burp that refuses everything.
+        assert sess["epoch"] != 0
+        assert ctx.session is not None
+        proc = ctx.session.proc
+
+        env = dispatch_mod.dispatch(ctx, "run.finish", {"status": "completed"},
+                                    why="close the bracket")
+        assert env.outcome == "ok"
+        assert env.result["session_closed"] is True
+        assert ctx.session is None
+        assert proc.poll() is not None, "run.finish left the JVM running"
+```
+
+**Before writing this:** read `tests/integration/conftest.py` for the `engagement` and Burp fixtures it actually provides and follow them exactly, including the unbuilt-jar guard. The `halt=...` above is a placeholder — construct `OperatorHalt` the way `tests/conftest.py`'s `tool_ctx` does.
+
+- [ ] **Step 10: Run everything**
+
+```bash
+extension/build.sh                                    # the jar must not be stale
+.venv/bin/pytest -q
+.venv/bin/pytest -m integration -q
+.venv/bin/ruff check src tests
+```
+
+Expected: unit green; integration 45 passed (44 + the new one). **If the integration run reports `unbuilt: extension jar is older than its sources`, that is the fixture doing its job** — run `extension/build.sh` and re-run. Note that `extension/test.sh` compiles test classes *without* rebuilding the jar, so running it leaves the jar stale.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/hx/tools/live.py src/hx/tools/dispatch.py src/hx/tools/impl/run.py \
+        src/hx/tools/adapters/cli.py tests/test_tools_live.py \
+        tests/test_tools_run.py tests/integration/test_tool_session.py
+git commit -m "feat(tools): run.start opens the session bracket
+
+ToolContext.session has been None since Plan A. run.start on a manual or scan
+run now launches Burp onto the adapter's ExitStack and run.finish tears it
+down; a crash unwinds the stack, which is section 8's first layer against an
+orphaned JVM.
+
+Four ways to have no session and they are four different next actions:
+not_needed, no_host, launch_failed, session_held. hx tool reports no_host and
+names hx mcp, because session() tears Burp down on every exit and a one-shot
+process has nothing for a session to outlive."
+```
+
+---
+
+## Task 4: `http.send`
+
+The first tool an agent reaches for, and the one every other egress tool is measured against.
+
+**Files:**
+- Create: `src/hx/tools/impl/http.py` (this task writes `send` only; Tasks 5 and 6 append to it)
+- Modify: `src/hx/tools/impl/__init__.py`
+- Test: `tests/test_tools_http.py`
+- Test: `tests/integration/test_tool_http.py`
+
+**Interfaces:**
+- Consumes: `hx.issue.issue(...) -> Issued`, `hx.issue.IssueRefused`; `hx.delta.against`, `hx.delta.baseline_for`; `hx.tools.live.ensure_identity`; `hx.tools.errors.ToolRefused`, `ToolUnavailable`.
+- Produces: the registered tool `http.send`, and the module-level helper `hx.tools.impl.http._digest(ctx, issued) -> dict` that Task 6 reuses.
+
+---
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_tools_http.py
+"""The four http.* tools.
+
+WHAT THESE TESTS ARE FOR, given that `tests/test_issue.py` already proves the
+send path: the TOOL layer's own obligations. Does a refusal from the wire
+arrive as `refused` with the wire's class as the reason, or as `error /
+internal`? Does the digest an agent receives carry a payload, in defiance of
+Principle 1? Does an argument the schema should have caught reach the handler?
+Those are questions about this layer and not about `hx.issue`.
+"""
+import pytest
+
+from hx.tools import dispatch as dispatch_mod
+from hx.tools import impl  # noqa: F401 -- registers every tool
+from hx.bridge.server import BridgeError
+
+from .conftest import FakeBridge, fake_result
+
+
+def _with_session(ctx, bridge):
+    """A context whose session is a bridge and nothing else.
+
+    The tools reach `ctx.session.bridge` and never anything else on the
+    session, which is worth knowing when reading these: a `LiveSession`'s
+    ports, workdir and `proc` belong to the bracket, not to a send.
+    """
+    ctx.session = type("S", (), {"bridge": bridge})()
+    return ctx
+
+
+def test_send_returns_the_digest_and_not_the_body(tool_ctx):
+    """Principle 1, and the one assertion in this file that is about the
+    product's shape rather than its plumbing. A body in the envelope would be
+    journalled into `agent_action.result_summary` and would put a client's
+    response bytes in a table that is read by whoever asks what the run did."""
+    body = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>secret</h1>"
+    ctx = _with_session(tool_ctx, FakeBridge([fake_result(body)]))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a"},
+                                why="probe the index")
+    assert env.outcome == "ok"
+    assert set(env.result) >= {"exchange_id", "status", "bytes", "ms",
+                               "content_type", "body_sha256", "first_line",
+                               "outcome", "delta_vs_baseline"}
+    assert b"secret" not in repr(env.result).encode()
+
+
+def test_a_scope_denial_is_refused_with_the_wires_own_class(tool_ctx):
+    """Principle 6: the safety profile is enforced in the extension and the
+    tool layer merely REPORTS what was refused. `error / internal` here would
+    tell the agent hx is broken when in fact hx worked exactly as designed."""
+    ctx = _with_session(tool_ctx, FakeBridge(
+        [BridgeError("scope_denied: not in scope", error_class="scope_denied")]))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "evil.test", "port": 80,
+                                 "method": "GET", "path": "/a"},
+                                why="try an out-of-scope host")
+    assert env.outcome == "refused"
+    assert env.reason == "scope_denied"
+
+
+def test_without_a_session_it_is_unavailable_not_an_error(tool_ctx):
+    """The dispatcher's own `needs_egress` guard, which Plan A shipped and
+    nothing has ever reached until now: `http.send` is the first registered
+    tool with the bit set."""
+    tool_ctx.session = None
+    env = dispatch_mod.dispatch(tool_ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a"},
+                                why="no session on purpose")
+    assert env.outcome == "unavailable"
+    assert env.reason == "no_session"
+
+
+def test_send_without_a_why_is_refused(tool_ctx):
+    """Principle 5. `http.send` mutates -- it puts bytes on a client's
+    network -- so `missing_why` fires before anything reaches the wire."""
+    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a"})
+    assert env.outcome == "refused"
+    assert env.reason == "missing_why"
+    assert ctx.session.bridge.sent == [], "a why-less send reached the wire"
+
+
+def test_send_is_refused_while_the_engagement_is_halted(tool_ctx):
+    """An operator has hit STOP. `http.send` mutates and is not in
+    HALT_EXEMPT, so the dispatcher refuses before the handler runs."""
+    tool_ctx.halt.halt("operator stopped the run")
+    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a"},
+                                why="should never reach the wire")
+    assert env.outcome == "refused"
+    assert env.reason == "halted"
+    assert ctx.session.bridge.sent == []
+
+
+@pytest.mark.parametrize("args", [
+    {"host": "127.0.0.1", "method": "GET"},                     # no path
+    {"host": "127.0.0.1", "method": "GET", "path": "a"},        # not origin-form
+    {"host": "127.0.0.1", "method": "GET", "path": "/a",
+     "port": 0},                                                # port floor
+    {"host": "127.0.0.1", "method": "GET", "path": "/a",
+     "port": 70000},                                            # port ceiling
+    {"host": "127.0.0.1", "method": "GET", "path": "/a",
+     "scheme": "gopher"},                                       # scheme enum
+    {"host": "127.0.0.1", "method": "GET", "path": "/a",
+     "headers": "X: 1"},                                        # headers is a list
+    {"host": "127.0.0.1", "method": "GET", "path": "/a",
+     "nonsense": 1},                                            # additionalProperties
+])
+def test_bad_arguments_never_reach_the_wire(tool_ctx, args):
+    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    env = dispatch_mod.dispatch(ctx, "http.send", args, why="malformed")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert ctx.session.bridge.sent == []
+
+
+def test_a_path_carrying_crlf_is_refused_as_bad_args(tool_ctx):
+    """`issue.request_bytes` raises ValueError for this, and the handler must
+    turn it into `bad_args` rather than letting it become `error / internal`.
+    An agent told hx is broken retries; one told its path is malformed fixes
+    the path."""
+    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a\r\nX: 1"},
+                                why="attempt a split")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert ctx.session.bridge.sent == []
+
+
+def test_an_undeclared_identity_is_refused_and_names_the_declared_ones(
+        tool_ctx):
+    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a",
+                                 "identity": "ghost"},
+                                why="use an identity that does not exist")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert "ghost" in (env.detail or "")
+    assert ctx.session.bridge.sent == []
+
+
+def test_the_delta_is_null_when_the_surface_has_no_exemplar_yet(tool_ctx):
+    """`null` and not a zero delta: nothing was compared, and a zero delta
+    would read as 'identical to normal' about a comparison never made."""
+    ctx = _with_session(tool_ctx, FakeBridge([fake_result()]))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/brand-new"},
+                                why="first ever request to this path")
+    assert env.result["delta_vs_baseline"] is None
+
+
+def test_a_second_send_to_the_same_surface_gets_a_delta(tool_ctx):
+    """The first send becomes the surface's exemplar; the second is compared
+    against it. This is the shape an agent actually uses: baseline, then
+    payload."""
+    first = b"HTTP/1.1 200 OK\r\n\r\nHello visitor"
+    second = b"HTTP/1.1 200 OK\r\n\r\nHello hZq9xK"
+    ctx = _with_session(tool_ctx, FakeBridge(
+        [fake_result(first), fake_result(second)]))
+    args = {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/x"}
+    dispatch_mod.dispatch(ctx, "http.send", args, why="baseline")
+    env = dispatch_mod.dispatch(ctx, "http.send", args, why="payload")
+    got = env.result["delta_vs_baseline"]
+    assert got is not None
+    assert got["new_tokens"] == ["hZq9xK"]
+```
+
+- [ ] **Step 2: Run to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_tools_http.py -q`
+Expected: FAIL — every case refused `not_registered`, because `http.send` is not a tool yet. That is the right first failure: it proves the dispatcher's registry gate is what stands between an agent and an unimplemented name.
+
+- [ ] **Step 3: Write `src/hx/tools/impl/http.py`**
+
+```python
+# src/hx/tools/impl/http.py
+"""The four ways an agent touches the wire and what it got back.
+
+PRINCIPLE 1 IS THE SHAPE OF THIS MODULE: handles and digests, never payloads.
+`send` and `replay_as` return a digest; `grep` and `body` are how the bytes
+behind a digest are read, and they are separate tools precisely so that
+reading is a decision an agent makes and a journal records, rather than
+something that happens to every response whether or not anyone wanted it.
+
+PRINCIPLE 2 IS WHY `grep` COMES BEFORE `body`. An agent does not know where in
+a 1.2 MB bundle the interesting bytes are, so match-addressed reading is the
+documented default and `body(range)` is the escape hatch used AFTER a match
+yields an offset.
+
+PRINCIPLE 6 IS WHY ALMOST NOTHING HERE DECIDES ANYTHING. Scope, method,
+dangerous paths, rate and budget are the extension's, and this module's whole
+job on a refusal is to report the class the wire answered with. A refusal
+translated into `error / internal` would tell an agent hx is broken at the
+exact moment hx worked as designed.
+"""
+from __future__ import annotations
+
+from ... import delta as delta_mod
+from ... import issue as issue_mod
+from .. import envelope, live, registry, spec
+from ..errors import ToolRefused
+
+#: Latin-1 everywhere bytes become text in a return value, and it is a
+#: deliberate choice rather than a default. It is the only codec that maps
+#: every byte to exactly one character and back, so a response no UTF-8
+#: decoder could read still round-trips through a JSON envelope -- and a
+#: binary body does not silently become a string of replacement characters
+#: that an agent then greps for a payload it will never find.
+TEXT = "latin-1"
+
+#: The methods the tool layer will compose. Not a security control -- the
+#: extension's `method.allow` is that, and it is checked again in the JVM --
+#: but a list an agent can read off `tools/list` beats a 400 from a peer.
+METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+#: One megabyte of request body. `hx.tools.journal` spills arguments over 4 KB
+#: to the blob store, so a large body costs a blob rather than a giant
+#: `agent_action` row -- this cap is about the WIRE, not the journal.
+MAX_BODY = 1024 * 1024
+
+
+def _digest(ctx, issued) -> dict:
+    """Section 8's digest for one `Issued`, including its delta.
+
+    The bytes never appear. `issued.response` exists so this function can
+    diff without a round trip to the blob store `issue` just wrote, and it
+    stops here.
+    """
+    surface_id = ctx.conn.execute(
+        "SELECT surface_id FROM exchange WHERE id=?",
+        (issued.exchange_id,)).fetchone()
+    base = None
+    if surface_id is not None and surface_id[0] is not None:
+        base = delta_mod.baseline_for(ctx.conn, ctx.blobs, surface_id[0])
+    # THE EXEMPLAR MAY BE THIS VERY EXCHANGE. A first request to a new
+    # surface becomes that surface's exemplar inside `issue`, so comparing
+    # against it would report a zero delta against itself -- which reads as
+    # "identical to normal" about a comparison that never happened. `None` is
+    # the honest answer for a first sight of a surface.
+    exemplar = ctx.conn.execute(
+        "SELECT exemplar_exchange_id FROM surface WHERE id=?",
+        (surface_id[0],)).fetchone() if base is not None else None
+    if exemplar is not None and exemplar[0] == issued.exchange_id:
+        base = None
+    return {
+        "exchange_id": issued.exchange_id,
+        "status": issued.status,
+        "bytes": issued.bytes,
+        "ms": issued.ms,
+        "outcome": issued.outcome,
+        "content_type": issued.content_type,
+        "body_sha256": issued.body_sha256,
+        "first_line": issued.first_line,
+        "delta_vs_baseline": (
+            None if base is None
+            else delta_mod.against(base[0], base[1], issued.status,
+                                   issued.response)),
+    }
+
+
+def send(ctx, *, host: str, method: str, path: str, port: int = 80,
+         scheme: str = "http", headers=None, body: str | None = None,
+         identity: str | None = None) -> dict:
+    """Issue one request and return its digest."""
+    ident = None
+    if identity is not None:
+        try:
+            ident = live.ensure_identity(ctx, identity)
+        except ValueError as exc:
+            # AN UNDECLARED IDENTITY IS THE AGENT'S MISTAKE, not a defect.
+            # `bad_args` puts it beside a malformed path, which is where an
+            # agent will look for it; `error / internal` would put it beside
+            # a crash.
+            raise ToolRefused("bad_args", str(exc)) from exc
+    try:
+        issued = issue_mod.issue(
+            ctx.session.bridge, ctx.conn, ctx.blobs, ctx.config,
+            engagement_id=ctx.engagement.id, run_id=ctx.run_id,
+            scheme=scheme, host=host, port=port, method=method, path=path,
+            headers=tuple(headers or ()),
+            body=(body or "").encode(TEXT), identity=ident)
+    except ValueError as exc:
+        # `request_bytes` raises this for a request that could be split, and
+        # the schema cannot catch it: a CR inside a string is a valid string.
+        raise ToolRefused("bad_args", str(exc)) from exc
+    except issue_mod.IssueRefused as exc:
+        # PRINCIPLE 6. The class is the wire's, unchanged, so an agent that
+        # gets `dangerous_denied` learns the profile refused it and one that
+        # gets `rate_limited` learns to slow down -- two different next
+        # actions that a single `error` would have made one.
+        raise ToolRefused(exc.reason, exc.detail) from exc
+    return _digest(ctx, issued)
+
+
+registry.register(spec.ToolSpec(
+    name="http.send", handler=send, needs_egress=True, mutates=True,
+    summary="Issue one HTTP request through the extension and return its "
+            "digest -- never its body. Use http.grep to read what came back.",
+    params={"type": "object", "additionalProperties": False,
+            "required": ["host", "method", "path"], "properties": {
+                "host": {"type": "string", "minLength": 1, "maxLength": 253,
+                         "description": "target host; scope is enforced in "
+                                        "the extension, not here"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535,
+                         "description": "default 80"},
+                "scheme": {"type": "string", "enum": ["http", "https"],
+                           "description": "default http"},
+                "method": {"type": "string", "enum": METHODS},
+                "path": {"type": "string", "minLength": 1, "maxLength": 4096,
+                         "description": "origin-form, starts with '/', "
+                                        "percent-encoded"},
+                "headers": {"type": "array", "maxItems": 64,
+                            "items": {"type": "string", "maxLength": 8192},
+                            "description": "wire lines, 'Name: value'. A Host "
+                                           "header is added if you omit one."},
+                "body": {"type": "string", "maxLength": MAX_BODY,
+                         "description": "request body, latin-1"},
+                "identity": {"type": "string", "maxLength": 64,
+                             "description": "the NAME of an identity declared "
+                                            "in config.yaml. The credential "
+                                            "is resolved and injected below "
+                                            "this layer; you never handle it."},
+            }}))
+```
+
+**Check `hx.tools.errors` first:** confirm `ToolRefused(reason, detail)`'s exact signature and that `bad_args` is in `envelope.REASONS_FOR["refused"]`. Every reason used here must be in that mapping or the `Envelope` constructor will reject it — see Plan A's Task 3 finding, where reasons were partitioned by *comment* and two classes could construct the wrong pairing. **Wire classes such as `scope_denied`, `rate_limited`, `dangerous_denied`, `budget_exhausted`, `method_denied` and `transport_error` must be added to `REASONS_FOR["refused"]`** if they are not already there; check before writing the handler, and add them with a comment naming the extension as their source.
+
+- [ ] **Step 4: Register the module**
+
+`src/hx/tools/impl/__init__.py` — **no marker**:
+
+```python
+from . import checks, finding, http, report, run, surface  # noqa: F401
+```
+
+- [ ] **Step 5: Run the tests**
+
+Run: `.venv/bin/pytest tests/test_tools_http.py -q`
+Expected: PASS. If `test_a_second_send_to_the_same_surface_gets_a_delta` fails with a zero delta, the exemplar guard in `_digest` is wrong — read it again rather than adjusting the test.
+
+- [ ] **Step 6: The integration test**
+
+```python
+# tests/integration/test_tool_http.py
+"""http.send against a real extension.
+
+ONE TEST, AND IT IS THE ONE A FAKE CANNOT DO: that the bytes this side
+composes are bytes the extension accepts, decides about, and issues -- and
+that the row written afterwards names an exchange whose blobs are readable.
+Every refusal class is proved against `FakeBridge` in the unit suite, because
+a loopback target will never produce most of them.
+"""
+import pytest
+
+from hx.tools import dispatch as dispatch_mod
+from hx.tools import impl  # noqa: F401
+
+
+@pytest.mark.integration
+def test_send_reaches_a_loopback_target_and_records_a_readable_exchange(
+        tool_session, target):
+    env = dispatch_mod.dispatch(
+        tool_session, "http.send",
+        {"host": target.host, "port": target.port, "method": "GET",
+         "path": "/"},
+        why="prove the composed request survives the extension")
+    assert env.outcome == "ok", env.as_dict()
+    assert env.result["status"] == 200
+
+    row = tool_session.conn.execute(
+        "SELECT via, req_blob, resp_blob FROM exchange WHERE id=?",
+        (env.result["exchange_id"],)).fetchone()
+    assert row[0] == "send"
+    # THE BLOBS ARE READ BACK, not merely asserted non-null: a digest naming
+    # a blob the store cannot return is exactly the corruption a report would
+    # read as evidence.
+    assert tool_session.blobs.get(row[1])
+    assert tool_session.blobs.get(row[2])
+```
+
+**Add a `tool_session` fixture** to `tests/integration/conftest.py`: a `ToolContext` with an `ExitStack`, a real engagement and a live Burp, built by dispatching `run.start` with `kind="manual"` and torn down by `run.finish`. Follow the existing fixtures' Burp guards exactly. `target` is the existing loopback `TargetServer` fixture — **do not point it anywhere outside `127.0.0.0/8`; the fixture refuses, and that refusal is load-bearing.**
+
+- [ ] **Step 7: Full suite, ruff, commit**
+
+```bash
+extension/build.sh
+.venv/bin/pytest -q && .venv/bin/pytest -m integration -q && .venv/bin/ruff check src tests
+git add src/hx/tools/impl/http.py src/hx/tools/impl/__init__.py \
+        src/hx/tools/envelope.py tests/test_tools_http.py \
+        tests/integration/test_tool_http.py tests/integration/conftest.py
+git commit -m "feat(tools): http.send
+
+The first registered tool with needs_egress set, so the dispatcher's own
+no_session guard is reached for the first time since Plan A shipped it.
+
+Returns section 8's digest and never the body: a body in the envelope is a
+body in agent_action.result_summary. A refusal carries the WIRE's class
+unchanged (Principle 6) -- scope_denied and rate_limited are two different
+next actions, and one 'error' would have made them one."
+```
+
+---
+
+## Task 5: `http.grep` and `http.body`
+
+Principle 2, both halves.
+
+**Files:**
+- Modify: `src/hx/tools/impl/http.py` (append)
+- Test: `tests/test_tools_http.py` (append)
+
+**Interfaces:**
+- Consumes: `hx.http_text.split_head_body`; `BlobStore.get`; `hx.tools.envelope.page`.
+- Produces: the registered tools `http.grep` and `http.body`; `hx.tools.impl.http.PARTS`, `CONTEXT_DEFAULT`, `CONTEXT_MAX`, `RANGE_MAX`, `MAX_EXCHANGES`.
+
+---
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_tools_http.py`:
+
+```python
+def _one_exchange(ctx, body=b"HTTP/1.1 200 OK\r\n\r\nneedle in a haystack"):
+    """Send one request through a fake bridge and return its exchange id."""
+    ctx = _with_session(ctx, FakeBridge([fake_result(body)]))
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/hay"},
+                                why="set up a body to read")
+    return env.result["exchange_id"]
+
+
+def test_grep_finds_a_literal_and_reports_its_offset(tool_ctx):
+    """The offset is the whole point: `http.body(range)` is the escape hatch
+    used AFTER a match yields one."""
+    xid = _one_exchange(tool_ctx)
+    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "needle"})
+    assert env.outcome == "ok"
+    row = env.result["rows"][0]
+    assert row["exchange_id"] == xid
+    assert row["part"] == "response"
+    assert isinstance(row["offset"], int)
+    assert "needle" in row["match"]
+
+
+def test_grep_that_matches_nothing_is_empty_not_ok(tool_ctx):
+    """Principle 4. `empty` says the search ran and found nothing; `ok` with
+    zero rows would be indistinguishable from a search that never ran."""
+    xid = _one_exchange(tool_ctx)
+    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "absent"})
+    assert env.outcome == "empty"
+
+
+def test_grep_searches_the_request_when_asked(tool_ctx):
+    xid = _one_exchange(tool_ctx)
+    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "/hay",
+                                 "part": "request"})
+    assert env.outcome == "ok"
+    assert env.result["rows"][0]["part"] == "request"
+
+
+def test_grep_needs_no_session(tool_ctx):
+    """It reads the blob store, which is on this side. An agent that has
+    finished its run can still read what it captured -- and a tool marked
+    needs_egress would have refused that."""
+    xid = _one_exchange(tool_ctx)
+    tool_ctx.session = None
+    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "needle"})
+    assert env.outcome == "ok"
+
+
+def test_grep_reports_which_exchanges_it_could_not_read(tool_ctx):
+    """Section 12 inside one envelope. An exchange whose blob is missing is
+    not an exchange with no matches, and a facet that said `0 matches` about
+    both would be the report that cannot distinguish tested from unreached."""
+    xid = _one_exchange(tool_ctx)
+    env = dispatch_mod.dispatch(tool_ctx, "http.grep",
+                                {"exchange_ids": [xid, "x-nonexistent"],
+                                 "pattern": "needle"})
+    assert env.result["facets"]["unreadable"] == ["x-nonexistent"]
+
+
+def test_body_returns_a_bounded_range_and_the_total(tool_ctx):
+    xid = _one_exchange(tool_ctx)
+    env = dispatch_mod.dispatch(tool_ctx, "http.body",
+                                {"exchange_id": xid, "start": 0, "length": 8})
+    assert env.outcome == "ok"
+    assert len(env.result["bytes"]) == 8
+    # THE TOTAL IS ALWAYS THERE, so an agent knows whether it has the whole
+    # thing. A range with no total is a window with no idea how far the room
+    # extends.
+    assert env.result["total"] > 8
+
+
+def test_body_past_the_end_is_empty_rather_than_an_error(tool_ctx):
+    """Reading past the end is a legitimate way to discover the end."""
+    xid = _one_exchange(tool_ctx)
+    env = dispatch_mod.dispatch(tool_ctx, "http.body",
+                                {"exchange_id": xid, "start": 99999,
+                                 "length": 10})
+    assert env.outcome == "empty"
+
+
+def test_body_of_an_unknown_exchange_is_refused(tool_ctx):
+    env = dispatch_mod.dispatch(tool_ctx, "http.body",
+                                {"exchange_id": "x-nope", "start": 0,
+                                 "length": 8})
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+
+
+def test_a_binary_body_round_trips_rather_than_becoming_question_marks(
+        tool_ctx):
+    """Latin-1 is chosen for exactly this: every byte maps to one character
+    and back. A UTF-8 decode with `errors='replace'` would turn a binary
+    body into a string of U+FFFD an agent then greps for a payload it can
+    never find."""
+    raw = b"HTTP/1.1 200 OK\r\n\r\n\x00\x80\xff\xfe"
+    xid = _one_exchange(tool_ctx, raw)
+    env = dispatch_mod.dispatch(tool_ctx, "http.body",
+                                {"exchange_id": xid, "start": 0,
+                                 "length": 64, "part": "response"})
+    assert env.result["bytes"].encode("latin-1") == raw
+```
+
+- [ ] **Step 2: Run to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_tools_http.py -q -k "grep or body"`
+Expected: FAIL — refused `not_registered`.
+
+- [ ] **Step 3: Append the two tools to `src/hx/tools/impl/http.py`**
+
+**This block carries no marker** — `http.py` exists after Task 4.
+
+```python
+#: `both` is the default because an agent looking for its own payload does
+#: not always know which half reflected it -- a header echoed into a
+#: response, a parameter echoed into the request log.
+PARTS = ["request", "response", "both"]
+
+CONTEXT_DEFAULT = 64
+CONTEXT_MAX = 512
+#: 64 KB per `http.body` call. Above this an agent should be grepping.
+RANGE_MAX = 64 * 1024
+#: Exchanges per grep. Bounded because each one is a whole body read out of
+#: the blob store into memory in the one process that also holds the Burp.
+MAX_EXCHANGES = 50
+
+
+def _blobs_for(ctx, exchange_id, part):
+    """`[(part_name, bytes)]` for one exchange, or None if it is not there.
+
+    None covers every way there is nothing to read -- no such row, a NULL
+    blob, a blob the store cannot return -- because all three are "this
+    exchange cannot be searched", and a caller that told them apart would be
+    reporting on hx's bookkeeping rather than on the traffic.
+    """
+    row = ctx.conn.execute(
+        "SELECT req_blob, resp_blob, resp_len FROM exchange WHERE id=?",
+        (exchange_id,)).fetchone()
+    if row is None:
+        return None
+    out = []
+    if part in ("request", "both") and row[0]:
+        out.append(("request", ctx.blobs.get(row[0])))
+    if part in ("response", "both") and row[1]:
+        out.append(("response", ctx.blobs.get(row[1], row[2])))
+    return out or None
+
+
+def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
+         context_bytes: int = CONTEXT_DEFAULT,
+         ignore_case: bool = False) -> dict:
+    """Principle 2: match-addressed reading, the documented default.
+
+    LITERAL BYTES, NOT A REGULAR EXPRESSION, and this is a decision rather
+    than an omission. Python's `re` has no timeout, the pattern here is
+    agent-authored, and a catastrophic backtrack would hang the ONE
+    long-lived process that also holds this engagement's Burp open -- taking
+    the session, the run and the operator's halt path with it. A literal
+    match cannot backtrack. It also serves what this tool is actually for:
+    you search for the payload token you just sent, and `delta_vs_baseline`
+    already tells you which tokens are new. Anything a literal cannot express
+    is `http.body(range)`'s job, or a passive check's.
+    """
+    needle = pattern.encode(TEXT)
+    if ignore_case:
+        needle = needle.lower()
+    rows, unreadable = [], []
+    for xid in exchange_ids[:MAX_EXCHANGES]:
+        found = _blobs_for(ctx, xid, part)
+        if found is None:
+            unreadable.append(xid)
+            continue
+        for part_name, data in found:
+            hay = data.lower() if ignore_case else data
+            at = hay.find(needle)
+            while at != -1:
+                start = max(0, at - context_bytes)
+                end = min(len(data), at + len(needle) + context_bytes)
+                rows.append({
+                    "exchange_id": xid, "part": part_name, "offset": at,
+                    "before": data[start:at].decode(TEXT),
+                    "match": data[at:at + len(needle)].decode(TEXT),
+                    "after": data[at + len(needle):end].decode(TEXT),
+                })
+                at = hay.find(needle, at + len(needle))
+    # UNREADABLE IS A FACET AND NOT A SILENCE. An exchange whose blob is gone
+    # is not an exchange with no matches, and section 12's rule -- a report
+    # that cannot tell "tested, clean" from "never reached" is worse than no
+    # report -- is exactly as true of one envelope as of a whole engagement.
+    return envelope.page(rows, total=len(rows), limit=envelope.MAX_LIMIT,
+                         facets={"unreadable": unreadable,
+                                 "searched": len(exchange_ids[:MAX_EXCHANGES])})
+
+
+def body(ctx, *, exchange_id: str, start: int = 0,
+         length: int = RANGE_MAX, part: str = "response") -> dict:
+    """Principle 2's escape hatch, used after a match yields an offset."""
+    if part == "both":
+        raise ToolRefused(
+            "bad_args", "http.body reads one part; 'both' is grep's default, "
+                        "not a range this tool can return")
+    found = _blobs_for(ctx, exchange_id, part)
+    if found is None:
+        raise ToolRefused(
+            "bad_args",
+            f"no readable {part} for exchange {exchange_id!r}. It may not "
+            "exist, or its body may never have been stored -- surface.detail "
+            "lists the exchanges this engagement holds.")
+    _name, data = found[0]
+    window = data[start:start + min(length, RANGE_MAX)]
+    if not window:
+        # `empty`, via the zero-row page below: reading past the end is a
+        # legitimate way to find the end, and an error would make it a
+        # mistake.
+        return envelope.page([], total=len(data), limit=1,
+                             facets={"exchange_id": exchange_id, "part": part})
+    return {"exchange_id": exchange_id, "part": part, "start": start,
+            "length": len(window), "total": len(data),
+            "bytes": window.decode(TEXT)}
+
+
+registry.register(spec.ToolSpec(
+    name="http.grep", handler=grep,
+    summary="Search stored request/response bytes for a literal string and "
+            "return each match with its offset and surrounding context.",
+    params={"type": "object", "additionalProperties": False,
+            "required": ["exchange_ids", "pattern"], "properties": {
+                "exchange_ids": {"type": "array", "maxItems": MAX_EXCHANGES,
+                                 "items": {"type": "string", "maxLength": 64}},
+                "pattern": {"type": "string", "minLength": 1,
+                            "maxLength": 1024,
+                            "description": "a literal string, NOT a regular "
+                                           "expression"},
+                "part": {"type": "string", "enum": PARTS,
+                         "description": "default response"},
+                "context_bytes": {"type": "integer", "minimum": 0,
+                                  "maximum": CONTEXT_MAX,
+                                  "description": "bytes either side of each "
+                                                 "match; default 64"},
+                "ignore_case": {"type": "boolean"},
+            }}))
+
+registry.register(spec.ToolSpec(
+    name="http.body", handler=body,
+    summary="Read a bounded range of one stored request or response. Use "
+            "http.grep first to find the offset.",
+    params={"type": "object", "additionalProperties": False,
+            "required": ["exchange_id"], "properties": {
+                "exchange_id": {"type": "string", "maxLength": 64},
+                "start": {"type": "integer", "minimum": 0,
+                          "maximum": 1_000_000_000},
+                "length": {"type": "integer", "minimum": 1,
+                           "maximum": RANGE_MAX},
+                "part": {"type": "string", "enum": ["request", "response"]},
+            }}))
+```
+
+**Verify against `envelope.page`'s real signature** before writing: it takes `limit + 1` rows to detect truncation and accepts `total`, `limit`, `cursor_of`, `facets`. The calls above pass fewer rows than the limit, which is the non-truncated path — confirm that is what `page` expects, and confirm a zero-row page produces outcome `empty`.
+
+- [ ] **Step 4: Run and commit**
+
+```bash
+.venv/bin/pytest -q && .venv/bin/ruff check src tests
+git add src/hx/tools/impl/http.py tests/test_tools_http.py
+git commit -m "feat(tools): http.grep and http.body
+
+Principle 2, both halves: match-addressed reading is the default and a
+bounded range is the escape hatch used after a match yields an offset.
+
+grep matches LITERAL bytes. Python's re has no timeout, the pattern is
+agent-authored, and a catastrophic backtrack would hang the one long-lived
+process that also holds the Burp -- taking the session, the run and the
+operator's halt path with it. Recorded as known debt in DECISIONS.md.
+
+Neither tool needs a session: both read this side's blob store, so an agent
+that has finished its run can still read what it captured."
+```
+
+---
+
+## Task 6: `http.replay_as`
+
+The authorisation table, in one call.
+
+**Files:**
+- Modify: `src/hx/tools/impl/http.py` (append)
+- Test: `tests/test_tools_http.py` (append)
+
+**Interfaces:**
+- Consumes: `hx.issue.issue`, `hx.issue.request_bytes` (for the round trip out of a stored blob), `hx.delta.against`, `hx.tools.live.ensure_identity`, `hx.tools.impl.http._digest`.
+- Produces: the registered tool `http.replay_as`; `MAX_IDENTITIES`.
+
+---
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_tools_http.py`:
+
+```python
+def test_replay_as_returns_one_row_per_identity_plus_the_baseline(
+        tool_ctx, staff_identity_config, monkeypatch):
+    """The shape an authz finding is written from: same request, several
+    sessions, one column of differences."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_ctx.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    denied = b"HTTP/1.1 403 Forbidden\r\n\r\nno"
+    ctx = _with_session(tool_ctx, FakeBridge(
+        [fake_result(ok), fake_result(denied, status=403)]))
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff"]},
+        why="check whether /admin is reachable as staff")
+    assert env.outcome == "ok"
+    rows = env.result["rows"]
+    assert [r["identity"] for r in rows] == ["staff"]
+    assert rows[0]["digest"]["status"] == 403
+    assert rows[0]["differs"] is True
+
+
+def test_include_anonymous_adds_an_unauthenticated_row(
+        tool_ctx, staff_identity_config, monkeypatch):
+    """Its own boolean, not a magic identity name. The unauthenticated
+    comparison is the single most valuable row in an authz table, and a
+    reserved string could collide with a name an operator declared."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_ctx.config = staff_identity_config
+    ...
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff"],
+         "include_anonymous": True},
+        why="compare staff against anonymous")
+    assert [r["identity"] for r in env.result["rows"]] == ["staff", None]
+
+
+def test_replay_of_an_unknown_exchange_is_refused_before_any_send(tool_ctx):
+    ctx = _with_session(tool_ctx, FakeBridge([]))
+    env = dispatch_mod.dispatch(ctx, "http.replay_as",
+                                {"exchange_id": "x-nope",
+                                 "identities": ["staff"]},
+                                why="replay something that is not there")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert ctx.session.bridge.sent == []
+
+
+def test_one_identitys_refusal_does_not_lose_the_others(
+        tool_ctx, staff_identity_config, monkeypatch):
+    """A rate limit on the second identity must not discard the first
+    identity's answer. Section 12 again: 'two identities, one answer, one
+    refusal' and 'two identities, one answer' are different facts."""
+    ...
+    rows = env.result["rows"]
+    assert rows[0]["digest"] is not None
+    assert rows[1]["digest"] is None
+    assert rows[1]["refused"] == "rate_limited"
+
+
+def test_replay_needs_a_why_and_a_session(tool_ctx):
+    """It mutates -- it puts N more requests on a client's network -- and it
+    needs egress."""
+    ...
+```
+
+Fill the elided bodies following the patterns already in this file. Add a `_one_exchange_on(ctx, body, *, path)` helper beside `_one_exchange` rather than copying it: the two differ only by path.
+
+- [ ] **Step 2: Run to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_tools_http.py -q -k replay`
+Expected: FAIL — refused `not_registered`.
+
+- [ ] **Step 3: Append `replay_as`**
+
+**No marker.**
+
+```python
+#: Identities per replay. Each one is a whole extra request against a client's
+#: application, so this is a blast-radius bound rather than a performance one.
+MAX_IDENTITIES = 8
+
+
+def replay_as(ctx, *, exchange_id: str, identities,
+              include_anonymous: bool = False) -> dict:
+    """Re-issue one stored request under several identities and compare.
+
+    THE BASELINE IS THE ORIGINAL EXCHANGE, not the first replay. An authz
+    question is "does this identity see what that one saw", and the thing
+    that was seen is the exchange the agent is pointing at. Comparing replays
+    only against each other would answer a different question and would give
+    no answer at all for a single identity.
+
+    ONE IDENTITY'S REFUSAL DOES NOT DISCARD THE OTHERS. A row carries either
+    a `digest` or a `refused` class, never neither and never both -- so "two
+    identities, one answer and one rate limit" stays distinguishable from
+    "two identities, one answer", which is section 12's rule inside one
+    result.
+
+    `include_anonymous` IS ITS OWN FLAG rather than a reserved name in
+    `identities`. The unauthenticated comparison is the most valuable row in
+    an authz table and a magic string could collide with an identity an
+    operator declared.
+    """
+    row = ctx.conn.execute(
+        "SELECT req_blob, resp_blob, resp_len, status, method, url"
+        " FROM exchange WHERE id=?", (exchange_id,)).fetchone()
+    if row is None or row[0] is None:
+        raise ToolRefused(
+            "bad_args",
+            f"exchange {exchange_id!r} has no stored request to replay. "
+            "surface.detail lists the exchanges this engagement holds.")
+    req_blob, resp_blob, resp_len, status, method, url = row
+    raw = ctx.blobs.get(req_blob)
+    base_body = ctx.blobs.get(resp_blob, resp_len) if resp_blob else b""
+
+    scheme, host, port, path = _parts_of(url, raw)
+
+    # RESOLVE EVERY IDENTITY BEFORE SENDING ANYTHING. A typo in the third
+    # name would otherwise be discovered after two requests had already
+    # reached the client's application -- and those two are not recallable.
+    wanted = list(identities)[:MAX_IDENTITIES]
+    try:
+        resolved = [live.ensure_identity(ctx, name) for name in wanted]
+    except ValueError as exc:
+        raise ToolRefused("bad_args", str(exc)) from exc
+    plan = list(zip(wanted, resolved))
+    if include_anonymous:
+        plan.append((None, None))
+
+    rows = []
+    for name, ident in plan:
+        try:
+            issued = issue_mod.issue(
+                ctx.session.bridge, ctx.conn, ctx.blobs, ctx.config,
+                engagement_id=ctx.engagement.id, run_id=ctx.run_id,
+                scheme=scheme, host=host, port=port, method=method,
+                path=path, headers=_replayed_headers(raw),
+                body=_replayed_body(raw), identity=ident)
+        except issue_mod.IssueRefused as exc:
+            rows.append({"identity": name, "digest": None,
+                         "refused": exc.reason, "detail": exc.detail,
+                         "differs": None})
+            continue
+        rows.append({
+            "identity": name, "digest": _digest(ctx, issued), "refused": None,
+            "diff_vs_original": delta_mod.against(
+                status, base_body, issued.status, issued.response),
+            "differs": (status != issued.status
+                        or base_body != issued.response),
+        })
+    return envelope.page(rows, total=len(rows), limit=envelope.MAX_LIMIT,
+                         facets={"original": exchange_id,
+                                 "original_status": status})
+
+
+registry.register(spec.ToolSpec(
+    name="http.replay_as", handler=replay_as, needs_egress=True, mutates=True,
+    summary="Re-issue one stored request under several identities and report "
+            "each one's digest and how it differs from the original.",
+    params={"type": "object", "additionalProperties": False,
+            "required": ["exchange_id", "identities"], "properties": {
+                "exchange_id": {"type": "string", "maxLength": 64},
+                "identities": {"type": "array", "maxItems": MAX_IDENTITIES,
+                               "items": {"type": "string", "maxLength": 64},
+                               "description": "NAMES declared in config.yaml"},
+                "include_anonymous": {
+                    "type": "boolean",
+                    "description": "also replay with no identity at all"},
+            }}))
+```
+
+**Three helpers this task must also write**, each small and each with its own test:
+
+- `_parts_of(url, raw) -> (scheme, host, port, path)`. The stored `url` is **redacted** (`records.redact_url` runs on every write), so a URL that carried userinfo or a credential parameter has been rewritten. Take the scheme, host and port from the URL and the **path from the stored request line**, which is not redacted. Say that in a comment — it is the kind of thing that looks like an inconsistency and is not.
+- `_replayed_headers(raw) -> tuple[str, ...]`. The stored request's header lines, **minus any the extension injects** — an identity header from the original replayed verbatim would defeat the whole tool by sending identity A's credential under identity B's name. Drop every header named by any declared identity's `inject.header`, and drop `Content-Length` (recomputed by `request_bytes`'s caller from the body). Comment the first of those two; it is the load-bearing one.
+- `_replayed_body(raw) -> bytes`. Everything after the head.
+
+- [ ] **Step 4: Run, ruff, commit**
+
+```bash
+.venv/bin/pytest -q && .venv/bin/ruff check src tests
+git add src/hx/tools/impl/http.py tests/test_tools_http.py
+git commit -m "feat(tools): http.replay_as
+
+Same request, several identities, one column of differences -- the shape an
+authz finding is written from. include_anonymous is its own boolean rather
+than a reserved name that could collide with an identity an operator declared.
+
+Every identity resolves BEFORE anything sends: a typo in the third name
+would otherwise be found after two requests had already reached the client's
+application, and those are not recallable. A refusal on one identity keeps
+the others' answers, because 'one answer and one rate limit' and 'one answer'
+are different facts."
+```
+
+---
+
+## Task 7: `scan.run` and `crawl.run`
+
+**Files:**
+- Create: `src/hx/tools/impl/scan.py`
+- Modify: `src/hx/tools/impl/__init__.py`
+- Test: `tests/test_tools_scan.py`
+
+**Interfaces:**
+- Consumes: `hx.scan.run(conn, *, engagement_id, blobs, config, checks=None, surface_filter=None, max_seconds=None, bridge=None, identity=None) -> ScanSummary`; `hx.scan.IdentityDead`; `hx.checks.registry.CHECKS`, `.KNOWN_CLASSES`; `ctx.open_runs()`.
+- Produces: the registered tools `scan.run` and `crawl.run`.
+
+---
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_tools_scan.py
+"""scan.run and crawl.run.
+
+`crawl.run` is registered and always unavailable, and the test for that is
+the most important one in this file. An agent with NO crawl tool has no
+reason to say discovery was proxy-only; an agent that asks and is told
+`not_implemented` does. That is section 12's rule applied to the agent's
+knowledge of its own instrument, and a tool that quietly did not exist would
+be the silence the rule is against.
+"""
+import pytest
+
+from hx import scan as scan_mod
+from hx.tools import dispatch as dispatch_mod
+from hx.tools import impl  # noqa: F401
+
+
+def test_crawl_run_is_registered_and_permanently_unavailable(tool_ctx):
+    env = dispatch_mod.dispatch(tool_ctx, "crawl.run",
+                                {"target": "http://127.0.0.1:8080/"},
+                                why="see whether crawling exists")
+    assert env.outcome == "unavailable"
+    assert env.reason == "not_implemented"
+    # AND IT SAYS WHAT TO DO INSTEAD. An `unavailable` that names no
+    # alternative leaves an agent with a dead end where it needs a next step.
+    assert "proxy" in (env.detail or "").lower()
+
+
+def test_crawl_run_is_unavailable_even_with_a_live_session(tool_ctx):
+    """`unavailable` here is about the FEATURE, not about the instrument. A
+    version that answered `no_session` would tell an agent that starting a
+    session would help, and it would not."""
+    tool_ctx.session = object()
+    env = dispatch_mod.dispatch(tool_ctx, "crawl.run",
+                                {"target": "http://127.0.0.1:8080/"},
+                                why="with a session this time")
+    assert env.reason == "not_implemented"
+
+
+def test_scan_run_refuses_outside_a_scan_run(tool_ctx, live_session):
+    """`hx.scan.run` calls `run.current_run(kind='scan')`, which AUTO-OPENS a
+    run when none is open -- and a run the tool layer did not open is a run
+    nothing will close, which makes the next `run.start(kind='scan')` refuse
+    `run_open` forever. Requiring the bracket keeps `current_run` in its
+    finding role and never in its opening one."""
+    ...  # open a `manual` run, then dispatch scan.run
+    assert env.outcome == "refused"
+    assert env.reason == "wrong_run_kind"
+    assert "run.start" in (env.detail or "")
+
+
+def test_scan_run_reports_the_summary_an_operator_would_see(
+        tool_ctx, live_session, monkeypatch):
+    """`checks_run` is check_run ROWS WRITTEN and `findings` is DISTINCT
+    findings -- both hard-won meanings (see ScanSummary's docstring), and a
+    tool that recomputed either would be a third place they can disagree."""
+    ...
+
+
+def test_a_dead_identity_is_unavailable_rather_than_an_error(
+        tool_ctx, live_session, monkeypatch):
+    """`IdentityDead` means the scan HALTED rather than completing clean, and
+    section 12 is explicit that those must not render alike. `error` would
+    say hx broke; `unavailable / identity_dead` says the session died and the
+    coverage is short."""
+    def dead(*a, **kw):
+        raise scan_mod.IdentityDead("staff could not be proved live",
+                                    stop_reason="identity staff dead")
+
+    monkeypatch.setattr(scan_mod, "run", dead)
+    ...
+    assert env.outcome == "unavailable"
+    assert env.reason == "identity_dead"
+
+
+def test_unknown_check_ids_are_refused_and_the_known_ones_are_named(
+        tool_ctx, live_session):
+    """A typo'd check id that was silently dropped would produce a scan that
+    ran fewer checks than the agent asked for and reported success."""
+    ...
+    assert env.reason == "bad_args"
+```
+
+Fill the elided bodies. A `live_session` fixture (a `tool_ctx` with a fake bridge on `ctx.session` and an open run of the right kind) belongs in `tests/conftest.py` beside `FakeBridge`, since Task 6's tests want it too.
+
+- [ ] **Step 2: Run to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_tools_scan.py -q`
+Expected: FAIL — refused `not_registered`.
+
+- [ ] **Step 3: Write `src/hx/tools/impl/scan.py`**
+
+```python
+# src/hx/tools/impl/scan.py
+"""Running the corpus, and the one tool that never runs at all.
+
+`crawl.run` IS REGISTERED AND ALWAYS UNAVAILABLE, and registering a tool that
+never succeeds looks like noise and is the opposite. An agent with no `crawl`
+tool has no reason to say discovery was proxy-only; an agent that asks and is
+told `not_implemented` does. That is section 12's governing rule -- a report
+that cannot distinguish "tested, clean" from "never reached" is worse than no
+report -- applied to the agent's own knowledge of its instrument, and it is
+what `unavailable` exists for.
+"""
+from __future__ import annotations
+
+from ... import scan as scan_mod
+from ...checks import registry as check_registry
+from .. import envelope, registry, spec
+from ..errors import ToolRefused, ToolUnavailable
+
+#: Wall-clock ceiling for one `scan.run`. All v1 tools are synchronous -- no
+#: job runner, no job table, no polling -- so a scan is a call an agent waits
+#: on, and an unbounded one is a conversation that never comes back. The
+#: caller may ask for less and not for more.
+MAX_SECONDS = 1800
+
+
+def run(ctx, *, surface_ids=None, checks=None,
+        max_seconds: int = MAX_SECONDS) -> dict:
+    """Run the enabled corpus over some or all surfaces. Synchronous.
+
+    IT MUST BE CALLED INSIDE A `scan` RUN, and the reason is mechanical
+    rather than tidy. `hx.scan.run` resolves its run with
+    `hx.run.current_run(kind="scan")`, which AUTO-OPENS one when none is
+    open. A run the tool layer did not open is a run `run.finish` will never
+    close, and the next `run.start(kind="scan")` then refuses `run_open`
+    forever against a run nobody remembers. Requiring the bracket keeps
+    `current_run` in its finding role and never in its opening one.
+    """
+    open_now = dict((kind, rid) for rid, kind in ctx.open_runs())
+    if "scan" not in open_now:
+        raise ToolRefused(
+            "wrong_run_kind",
+            "scan.run belongs inside a scan run, and none is open. "
+            "`run.start` with kind='scan' first -- a scan run is what "
+            "`check_run` rows are attributed to, and one this layer did not "
+            "open is one nothing will close.")
+
+    corpus = None
+    if checks is not None:
+        known = {c.id: c for c in check_registry.CHECKS}
+        unknown = sorted(set(checks) - set(known))
+        if unknown:
+            # NEVER SILENTLY DROPPED. A typo'd id that vanished would produce
+            # a scan that ran fewer checks than was asked for and reported
+            # success, which is a coverage lie with a green tick on it.
+            raise ToolRefused(
+                "bad_args",
+                f"unknown check ids {unknown}. `checks.list` names every "
+                "check in the corpus, including the disabled ones.")
+        corpus = tuple(known[c] for c in checks)
+
+    wanted = None if surface_ids is None else set(surface_ids)
+    try:
+        summary = scan_mod.run(
+            ctx.conn, engagement_id=ctx.engagement.id, blobs=ctx.blobs,
+            config=ctx.config, checks=corpus,
+            # A PREDICATE, because that is what `hx.scan.run` takes. `surface`
+            # rows arrive as sqlite rows and `[0]` is the id -- read
+            # `hx.scan.run`'s own use of `surface_filter` and follow it rather
+            # than trusting this index.
+            surface_filter=(None if wanted is None
+                            else (lambda s: s[0] in wanted)),
+            max_seconds=min(max_seconds, MAX_SECONDS),
+            bridge=ctx.session.bridge,
+            # NOT OVERRIDDEN. `hx.scan.run` resolves `config.scan_identity`
+            # itself and is the only thing in the product that reads that
+            # field; passing None here is what lets it. An identity chosen
+            # per call would put the run's bracket and the run's traffic
+            # under two different answers.
+            identity=None)
+    except scan_mod.IdentityDead as exc:
+        # THE SCAN HALTED RATHER THAN COMPLETING CLEAN, and section 12 is
+        # explicit that those two must not render alike. `error` would say hx
+        # broke; this says the session died and the coverage is short.
+        raise ToolUnavailable("identity_dead", str(exc)) from exc
+
+    return {
+        "checks_run": summary.checks_run,
+        "skipped": summary.skipped,
+        "findings": summary.findings,
+        # `checks_run` is ROWS WRITTEN and `findings` is DISTINCT findings --
+        # both meanings were argued for in `ScanSummary`'s docstring after a
+        # scan printed `findings 40` while the store held 1. Read, never
+        # recomputed: a second place these are derived is a second place they
+        # can disagree with the report.
+        "executed": summary.checks_run - summary.skipped,
+    }
+
+
+def crawl(ctx, **kw) -> dict:
+    raise ToolUnavailable(
+        "not_implemented",
+        "hx has no crawler in v1. Discovery is the operator's browser through "
+        "the proxy (`hx capture start`), and `surface.query` shows what that "
+        "has reached. Say so in the report: a surface nobody browsed is a "
+        "surface nothing tested.")
+
+
+registry.register(spec.ToolSpec(
+    name="scan.run", handler=run, needs_egress=True, mutates=True,
+    summary="Run the enabled checks over some or all surfaces. Synchronous "
+            "and bounded; must be called inside a scan run.",
+    params={"type": "object", "additionalProperties": False, "properties": {
+        "surface_ids": {"type": "array", "maxItems": 500,
+                        "items": {"type": "string", "maxLength": 64},
+                        "description": "omit to scan every surface"},
+        "checks": {"type": "array", "maxItems": 100,
+                   "items": {"type": "string", "maxLength": 64},
+                   "description": "check ids from checks.list; omit for the "
+                                  "enabled corpus"},
+        "max_seconds": {"type": "integer", "minimum": 1,
+                        "maximum": MAX_SECONDS},
+    }}))
+
+registry.register(spec.ToolSpec(
+    name="crawl.run", handler=crawl,
+    summary="NOT IMPLEMENTED in v1 and always answers unavailable. Listed so "
+            "that a report can say discovery was proxy-only.",
+    params={"type": "object", "additionalProperties": False, "properties": {
+        "target": {"type": "string", "maxLength": 2048},
+        "identity": {"type": "string", "maxLength": 64},
+        "max_pages": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "max_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    }}))
+```
+
+**`crawl.run` carries neither `needs_egress` nor `mutates` on purpose.** With `needs_egress` set, the dispatcher's guard would answer `no_session` first — telling an agent that starting a session would help, when it would not. With `mutates` set it would demand a `why` for a call that can never do anything. `not_implemented` must be the *first* answer, every time; add a test that proves it with no session and no `why`.
+
+**Also check `ToolUnavailable`'s reasons:** `not_implemented` and `identity_dead` must be in `envelope.REASONS_FOR["unavailable"]`, and `wrong_run_kind` in `REASONS_FOR["refused"]`. Add them if they are not, in the same commit.
+
+- [ ] **Step 4: Register, run, commit**
+
+`src/hx/tools/impl/__init__.py` — **no marker**:
+
+```python
+from . import checks, finding, http, report, run, scan, surface  # noqa: F401
+```
+
+```bash
+.venv/bin/pytest -q && .venv/bin/ruff check src tests
+git add src/hx/tools/impl/scan.py src/hx/tools/impl/__init__.py \
+        src/hx/tools/envelope.py tests/test_tools_scan.py tests/conftest.py
+git commit -m "feat(tools): scan.run and crawl.run
+
+scan.run refuses outside a scan run: hx.scan.run resolves its run with
+current_run(kind='scan'), which auto-opens one, and a run this layer did not
+open is a run run.finish will never close -- the next run.start(kind='scan')
+would then refuse run_open forever against a run nobody remembers.
+
+crawl.run is registered and always unavailable, with neither needs_egress nor
+mutates, so not_implemented is the FIRST answer rather than no_session. An
+agent with no crawl tool has no reason to say discovery was proxy-only; one
+that asks and is told does."
+```
+
+---
+
+## Task 8: `hx mcp` — the adapter
+
+The seventeen tools, over stdio, in one long-lived process that can hold a Burp.
+
+**Files:**
+- Create: `src/hx/tools/adapters/mcp.py`
+- Modify: `src/hx/cli.py` (the `hx mcp` command)
+- Test: `tests/test_mcp_adapter.py`
+
+**Interfaces:**
+- Consumes: `hx.tools.registry.TOOLS`, `hx.tools.dispatch.dispatch`, `hx.tools.adapters.cli.build_context`.
+- Produces: `hx.tools.adapters.mcp.serve(engagement, stdin, stdout)`, `handle(ctx, message) -> dict | None`, `PROTOCOL_VERSION`, `tool_schema(tool) -> dict`.
+
+---
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_mcp_adapter.py
+"""hx mcp: JSON-RPC 2.0 over stdio, hand-rolled.
+
+WHY HAND-ROLLED is a decision the spec left open and this task settles: MCP
+stdio is newline-delimited JSON-RPC 2.0 and a server needs `initialize`,
+`tools/list` and `tools/call`. That is what this module is. This project runs
+on two Python dependencies and a Java extension with none, and a security
+tool's dependency footprint is part of its argument -- an SDK here would be a
+third dependency, plus its transitive closure, inside the process that holds
+the client's credentials and the operator's halt path.
+
+THE TESTS DRIVE `handle` RATHER THAN THE LOOP wherever they can. The loop is
+four lines of framing; the protocol is the part that can be wrong.
+"""
+import io
+import json
+
+from hx.tools import registry
+from hx.tools.adapters import mcp
+
+
+def test_initialize_answers_with_a_protocol_version_and_tool_capability():
+    got = mcp.handle(None, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {}})
+    assert got["id"] == 1
+    assert got["result"]["protocolVersion"] == mcp.PROTOCOL_VERSION
+    assert "tools" in got["result"]["capabilities"]
+
+
+def test_a_notification_gets_no_reply_at_all():
+    """JSON-RPC: a message with no `id` is a notification and answering one
+    is a protocol violation. `notifications/initialized` is the one every
+    client sends immediately after `initialize`, so a server that replied
+    would break on its first real conversation."""
+    assert mcp.handle(None, {"jsonrpc": "2.0",
+                             "method": "notifications/initialized"}) is None
+
+
+def test_tools_list_publishes_every_registered_tool(tool_ctx):
+    got = mcp.handle(tool_ctx, {"jsonrpc": "2.0", "id": 2,
+                                "method": "tools/list"})
+    names = {t["name"] for t in got["result"]["tools"]}
+    assert names == set(registry.TOOLS)
+    assert len(names) == 17
+
+
+def test_a_mutating_tools_published_schema_carries_why(tool_ctx):
+    """MCP hands a tool ONE arguments object, so `why` has to travel inside
+    it -- there is nowhere else for Principle 5's reason to go. The adapter
+    pops it back out before `dispatch` validates, because `ToolSpec.params`
+    sets `additionalProperties: false` and would otherwise refuse it."""
+    got = mcp.handle(tool_ctx, {"jsonrpc": "2.0", "id": 2,
+                                "method": "tools/list"})
+    by_name = {t["name"]: t for t in got["result"]["tools"]}
+    assert "why" in by_name["run.start"]["inputSchema"]["properties"]
+    assert "why" in by_name["run.start"]["inputSchema"]["required"]
+    # And NOT on a read-only tool, where it would be noise an agent fills in.
+    assert "why" not in by_name["surface.query"]["inputSchema"]["properties"]
+
+
+def test_tools_call_dispatches_and_why_never_reaches_the_handler(tool_ctx):
+    got = mcp.handle(tool_ctx, {
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "run.start",
+                   "arguments": {"kind": "manual", "why": "start probing"}}})
+    payload = json.loads(got["result"]["content"][0]["text"])
+    assert payload["outcome"] == "ok"
+    assert payload["result"]["kind"] == "manual"
+    # `why` reached agent_action and not the handler: had it been passed
+    # through as an argument, the schema's additionalProperties: false would
+    # have refused the call as bad_args.
+    row = tool_ctx.conn.execute(
+        "SELECT why FROM agent_action ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert row[0] == "start probing"
+
+
+def test_a_refused_tool_is_isError_but_still_a_jsonrpc_result(tool_ctx):
+    """A refusal is the tool answering, not the transport failing. A
+    JSON-RPC `error` here would make `scope_denied` look like a broken server
+    and would lose the envelope an agent needs to read."""
+    got = mcp.handle(tool_ctx, {
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "run.start", "arguments": {"kind": "manual"}}})
+    assert "error" not in got
+    assert got["result"]["isError"] is True
+    payload = json.loads(got["result"]["content"][0]["text"])
+    assert payload["reason"] == "missing_why"
+
+
+def test_an_unknown_method_is_a_jsonrpc_error(tool_ctx):
+    got = mcp.handle(tool_ctx, {"jsonrpc": "2.0", "id": 5,
+                                "method": "resources/list"})
+    assert got["error"]["code"] == -32601
+
+
+def test_a_malformed_line_does_not_kill_the_server(tool_ctx):
+    """The one property the loop must have. An agent that emits one bad line
+    -- a truncated write, a stray log -- must not take the session, the run
+    and the operator's halt path down with it."""
+    out = io.StringIO()
+    mcp.serve_streams(tool_ctx, io.StringIO(
+        "not json\n"
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'), out)
+    lines = [json.loads(x) for x in out.getvalue().splitlines()]
+    assert lines[0]["error"]["code"] == -32700     # parse error
+    assert lines[1]["result"]["protocolVersion"] == mcp.PROTOCOL_VERSION
+
+
+def test_nothing_but_json_rpc_reaches_stdout(tool_ctx):
+    """stdout IS the protocol. A print, a warning, a library's banner --
+    anything else on this stream desynchronises the client for the rest of
+    the conversation, and there is no resynchronising a newline-delimited
+    protocol."""
+    out = io.StringIO()
+    mcp.serve_streams(tool_ctx, io.StringIO(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'), out)
+    for line in out.getvalue().splitlines():
+        assert json.loads(line)["jsonrpc"] == "2.0"
+
+
+def test_every_published_schema_is_one_this_validator_can_enforce():
+    """`tool_schema` adds `why` to a schema `check_schema` already passed,
+    and a publisher that emitted something the validator ignores would be
+    promising a constraint nothing applies -- which is the exact defect
+    `check_schema` exists to refuse."""
+    from hx.tools import schema
+    for tool in registry.TOOLS.values():
+        schema.check_schema(mcp.tool_schema(tool)["inputSchema"],
+                            where=tool.name)
+```
+
+- [ ] **Step 2: Run to watch it fail**
+
+Run: `.venv/bin/pytest tests/test_mcp_adapter.py -q`
+Expected: FAIL — `ImportError: cannot import name 'mcp'`
+
+- [ ] **Step 3: Write `src/hx/tools/adapters/mcp.py`**
+
+```python
+# src/hx/tools/adapters/mcp.py
+"""`hx mcp` -- the seventeen tools over stdio, spoken as JSON-RPC 2.0.
+
+HAND-ROLLED, AND THAT WAS THE SPEC'S ONE OPEN QUESTION FOR THIS PLAN. MCP's
+stdio transport is newline-delimited JSON-RPC 2.0, and a server needs three
+methods: `initialize`, `tools/list` and `tools/call`. That is this file. The
+alternative was the `mcp` Python SDK -- a third dependency plus its transitive
+closure, inside the one process that holds this engagement's credentials, its
+Burp and the operator's halt path. This project runs on two Python
+dependencies and a Java extension with none, and a security tool's dependency
+footprint is part of its argument. Revisit if MCP's transport requirements
+grow past three methods and a line of JSON.
+
+THIS ADAPTER IS ONE PROCESS FOR A WHOLE CONVERSATION, which is the only reason
+egress works at all. `hx.session.session()` tears Burp down on every exit, so
+`hx tool` -- one process per call -- has nothing for a session to outlive and
+reports `no_host`. Here there is an `ExitStack` around the serve loop:
+`run.start` pushes a session onto it, `run.finish` pops it, and ANY exit from
+`serve` -- return, exception, the agent closing the pipe -- unwinds it. That
+is spec section 8's "a crash must not orphan a JVM", first of its three
+layers.
+
+`why` TRAVELS INSIDE THE ARGUMENTS AND IS TAKEN BACK OUT. MCP hands a tool one
+arguments object and has nowhere else to put Principle 5's reason, so
+`tools/list` publishes `why` as a required property of every mutating tool and
+`tools/call` pops it before `dispatch` validates -- `ToolSpec.params` sets
+`additionalProperties: false` and would refuse it otherwise. The published
+schema and the enforced schema are therefore NOT the same object, which is
+worth saying out loud: `tool_schema` builds the published one from the
+enforced one, and a test runs `check_schema` over the result so the extra
+property cannot become a constraint nothing applies.
+
+STDOUT IS THE PROTOCOL. Nothing else may be written to it -- not a print, not
+a warning, not a traceback. A newline-delimited protocol has no
+resynchronisation point, so one stray line desynchronises the client for the
+rest of the conversation. Diagnostics go to stderr.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import sys
+
+from .. import dispatch as dispatch_mod
+from .. import impl  # noqa: F401 -- registers every tool
+from .. import registry
+from . import cli as cli_adapter
+
+#: The MCP revision this server speaks. A client that asks for another is
+#: answered with this one, which is what the specification says to do: the
+#: server states what it supports and the client decides.
+PROTOCOL_VERSION = "2025-06-18"
+
+SERVER_INFO = {"name": "hx", "version": "0.1.0"}
+
+#: JSON-RPC 2.0 s5.1.
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INTERNAL_ERROR = -32603
+
+WHY_DESCRIPTION = (
+    "Why you are doing this, in a sentence. It is written to agent_action "
+    "and read by whoever asks what this run did.")
+
+
+def tool_schema(tool) -> dict:
+    """One `tools/list` entry: the enforced schema, plus `why` when it needs
+    one.
+
+    A COPY, never the registered object. `ToolSpec` is frozen and its
+    `params` is the dict `dispatch` validates against; adding a key to it in
+    place would publish a property the validator then refuses.
+    """
+    params = json.loads(json.dumps(tool.params))
+    if tool.requires_why:
+        params.setdefault("properties", {})["why"] = {
+            "type": "string", "minLength": 1, "maxLength": 500,
+            "description": WHY_DESCRIPTION}
+        params["required"] = sorted(set(params.get("required", [])) | {"why"})
+    return {"name": tool.name, "description": tool.summary,
+            "inputSchema": params}
+
+
+def _ok(msg_id, result) -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def _err(msg_id, code, message) -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id,
+            "error": {"code": code, "message": message}}
+
+
+def handle(ctx, msg) -> dict | None:
+    """One message in, one reply out -- or None for a notification.
+
+    A NOTIFICATION IS A MESSAGE WITH NO `id`, and answering one is a protocol
+    violation. `notifications/initialized` is the message every client sends
+    the moment `initialize` returns, so a server that replied to it would
+    break on its first real conversation rather than in some corner.
+    """
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+        return _err(None, INVALID_REQUEST, "not a JSON-RPC 2.0 message")
+    msg_id = msg.get("id")
+    method = msg.get("method")
+    if msg_id is None:
+        return None
+    if method == "initialize":
+        return _ok(msg_id, {"protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": SERVER_INFO})
+    if method == "tools/list":
+        return _ok(msg_id, {"tools": [tool_schema(registry.TOOLS[n])
+                                      for n in sorted(registry.TOOLS)]})
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        args = dict(params.get("arguments") or {})
+        # POPPED, not passed through. `ToolSpec.params` is
+        # additionalProperties: false, so a `why` left in here would be
+        # refused as bad_args -- and Principle 5's reason belongs in
+        # agent_action, which is where `dispatch`'s keyword puts it.
+        why = args.pop("why", None)
+        env = dispatch_mod.dispatch(ctx, params.get("name"), args, why=why)
+        # A REFUSAL IS A RESULT, NOT A TRANSPORT ERROR. `isError` is MCP's
+        # way of saying the tool answered badly; a JSON-RPC `error` would say
+        # the SERVER failed, would lose the envelope, and would make
+        # `scope_denied` -- the extension working exactly as designed -- look
+        # like a broken server.
+        return _ok(msg_id, {
+            "content": [{"type": "text",
+                         "text": json.dumps(env.as_dict(), sort_keys=True)}],
+            "isError": not env.ran})
+    return _err(msg_id, METHOD_NOT_FOUND, f"unknown method {method!r}")
+
+
+def serve_streams(ctx, stdin, stdout) -> None:
+    """The loop. Takes streams so a test can drive it without a subprocess.
+
+    ONE BAD LINE MUST NOT END THE CONVERSATION. A truncated write or a stray
+    log line from the agent's side is a parse error for that message and
+    nothing more -- ending the loop would take the session, the run and the
+    operator's halt path with it, over one malformed line.
+    """
+    for line in stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError as exc:
+            reply = _err(None, PARSE_ERROR, f"could not parse: {exc}")
+        else:
+            try:
+                reply = handle(ctx, msg)
+            except Exception as exc:            # noqa: BLE001
+                # `dispatch` never raises, so reaching this is a defect in
+                # THIS file. Named in the reply rather than swallowed, and
+                # the loop continues: a broken `tools/list` should not cost
+                # an operator their live session.
+                reply = _err(msg.get("id") if isinstance(msg, dict) else None,
+                             INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
+        if reply is not None:
+            stdout.write(json.dumps(reply) + "\n")
+            stdout.flush()
+
+
+def serve(engagement) -> None:
+    """`hx mcp`, wired to the real stdio.
+
+    THE EXITSTACK IS THE POINT OF THIS FUNCTION. It is what `run.start`
+    pushes a Burp onto, and every way out of here -- the agent closing the
+    pipe, a raise, a signal that unwinds -- tears that Burp down.
+    """
+    with contextlib.ExitStack() as stack:
+        ctx = cli_adapter.build_context(engagement, stack=stack)
+        serve_streams(ctx, sys.stdin, sys.stdout)
+```
+
+- [ ] **Step 4: Add the `hx mcp` command**
+
+In `src/hx/cli.py`, following the shape of the neighbouring commands (engagement resolution, error handling). **No marker.**
+
+```python
+@main.command()
+@click.pass_context
+def mcp(ctx):
+    """Serve the tool layer over MCP on stdio.
+
+    THE ADAPTER THAT CAN HOLD A BURP. `hx tool` is one process per call and
+    `hx.session.session()` tears Burp down on every exit, so egress tools
+    there answer `no_host`. This command is one process for the whole
+    conversation: `run.start` brings a session up and `run.finish` -- or any
+    exit from this command -- takes it down.
+
+    NOTHING BUT JSON-RPC MAY REACH STDOUT while this runs.
+    """
+    eng = _open_engagement(ctx)     # follow the neighbouring commands
+    mcp_adapter.serve(eng)
+```
+
+- [ ] **Step 5: Run everything**
+
+```bash
+.venv/bin/pytest -q && .venv/bin/ruff check src tests
+```
+
+Then drive it by hand once, because a protocol is worth seeing speak:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  | .venv/bin/hx --engagement <path> mcp | .venv/bin/python -m json.tool --json-lines
+```
+
+Expected: exactly two lines out for three in, and 17 tools in the second.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/hx/tools/adapters/mcp.py src/hx/cli.py tests/test_mcp_adapter.py
+git commit -m "feat(mcp): hx mcp, hand-rolled JSON-RPC 2.0 over stdio
+
+Settles the spec's section 13 open question: hand-rolled, no mcp SDK. The
+stdio transport is newline-delimited JSON-RPC and the server needs three
+methods. An SDK would be a third dependency plus its transitive closure
+inside the process that holds this engagement's credentials, its Burp and the
+operator's halt path.
+
+One process for the whole conversation, with an ExitStack around the loop:
+run.start pushes a Burp onto it and any exit unwinds it. That is what makes
+the six egress tools reachable at all.
+
+why travels inside the arguments -- MCP hands a tool one object -- and is
+popped back out before dispatch validates, because ToolSpec.params is
+additionalProperties: false. A test runs check_schema over every published
+schema so the added property cannot become a constraint nothing enforces."
+```
+
+---
+
+## Finishing the plan
+
+- [ ] **Step 1: Arm the plan-drift markers**
+
+Every block in this plan that describes a file which now exists must carry its `# path` marker, and every excerpt block must be a contiguous run of the file byte for byte. Run `scripts/sync_plan_block.py` for each, then:
+
+```bash
+.venv/bin/pytest tests/test_plan_matches_repo.py -q
+```
+
+It will fail on the count. Update `EXPECTED_BLOCKS` to the number reported, and **name the blocks in the commit message** — the constant exists so that a number moving is a decision somebody wrote down.
+
+- [ ] **Step 2: Record the debts in `docs/DECISIONS.md`**
+
+Add a `## The egress tools` chapter and these rows to the known-debt table:
+
+| Debt | Why it is not paid |
+|---|---|
+| `http.grep` matches literal bytes, not regexes | `re` has no timeout and the pattern is agent-authored; a catastrophic backtrack would hang the process holding the Burp and the halt path. A regex design needs a bounded engine or a subprocess, and neither belongs in this plan. |
+| `exchange.req_blob` on a `via='send'` row is the pre-injection request | The extension injects the identity header inside the JVM. Fixing it needs `Sender` to push an exchange frame — a Java change, and a second writer into the exchange table. |
+| `resolved_ip` is NULL on every exchange row | True of the proxy writer too. Filling it on one path only would make `via` decide how much a row knows. |
+| A send's `identity_state` is always `assumed` | A canary bracket proves a run; a single send has none. Proving one per send would double the traffic. |
+
+- [ ] **Step 3: Update `README.md` if it lists the tools**
+
+Check (`command grep -n "hx tool\|tool layer" README.md`) and, if the 11 are listed, make it 17 — and say which six need `hx mcp`.
+
+- [ ] **Step 4: The full gate**
+
+```bash
+extension/build.sh                    # never run test.sh last; it leaves the jar stale
+.venv/bin/pytest -q
+.venv/bin/pytest -m integration -q
+.venv/bin/ruff check src tests
+.venv/bin/mypy src/hx || true         # non-blocking, as CI has it
+extension/test.sh                     # unchanged by this plan; prove it
+```
+
+All green, or the plan is not done.
+
+---
+
+## Self-Review
+
+Run against the spec with fresh eyes before dispatching Task 1.
+
+**Spec coverage.** §7's six Plan B tools: `http.send` (Task 4), `http.grep` and `http.body` (Task 5), `http.replay_as` (Task 6), `scan.run` and `crawl.run` (Task 7). §8's session lifecycle: Task 3, with the three anti-orphan layers named. §9's MCP adapter and its open question: Task 8. §10's split: this plan is B, and it modifies `run.start` — which §10 warned it would, and which is why Task 3 reads Plan A's `run.start` rather than assuming it.
+
+**Not covered, deliberately, and each is stated where it lands:** `delta_vs_baseline`'s `new_tokens` is capped and can be `null`; `http.grep` is literal-only; the send-path request blob is pre-injection. All four are in the DECISIONS table above.
+
+**Type consistency.** `Issued` is produced in Task 1 and consumed in Tasks 4 and 6 under the same field names. `live.open_for`'s four reasons are asserted in Task 3's tests and rendered in `run.start`'s result. `_digest` is defined in Task 4 and reused in Task 6. `ensure_identity` returns `(id, generation)` in Task 3 and is passed to `issue`'s `identity=` parameter — which takes exactly that tuple, not a `Resolved`, in Task 1.
+
+**The one structural risk.** Task 4's `_digest` guards against comparing a first-sight surface with its own exchange as exemplar. That guard has two SQL round trips and an ordering assumption about when `issue` writes the exemplar. If Task 4's review finds it wrong, the fix belongs in `delta.baseline_for` — give it the exchange id to exclude — not in a third query at the call site.
+
+---
+
+## Execution Handoff
+
+Plan saved to `docs/superpowers/plans/2026-08-31-tool-layer-egress.md`. Two execution options:
+
+**1. Subagent-Driven (recommended)** — a fresh subagent per task, review between tasks, fast iteration. This is how Plan A ran, and its per-task reviews found a defect in every one of eleven tasks.
+
+**2. Inline Execution** — tasks executed in this session with checkpoints for review.
