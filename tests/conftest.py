@@ -180,6 +180,30 @@ def tool_run(tool_ctx):
 
 
 @pytest.fixture
+def live_session(tool_ctx):
+    """A `tool_ctx` with a fake bridge on `ctx.session` and an open `scan`
+    run -- the bracket Ruling 9 makes `scan.run` require (`hx.scan.run`
+    resolves its run via `current_run(kind='scan')`, which the tool layer
+    must have already opened) and the bridge every `needs_egress` tool needs
+    to get past the dispatcher's `no_session` guard.
+
+    `FakeBridge` (`tests/test_probe.py`) is the project's one double for
+    `BridgeServer.send`-shaped things; imported locally, matching this
+    file's own `engagement` fixture, so this module keeps importing nothing
+    with a side effect at collection time.
+    """
+    from hx import run as run_mod
+
+    from tests.test_probe import FakeBridge
+
+    tool_ctx.run_id = run_mod.open_run(
+        tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="scan",
+        safety_profile=tool_ctx.config.safety_profile)
+    tool_ctx.session = type("S", (), {"bridge": FakeBridge()})()
+    return tool_ctx
+
+
+@pytest.fixture
 def staff_identity_config(engagement):
     """The engagement's config with one static identity, `staff`, declared.
 

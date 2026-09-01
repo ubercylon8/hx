@@ -22,9 +22,10 @@ PLAN_B = {"http.send", "http.grep", "http.body", "http.replay_as",
 #: Which of PLAN_B is actually registered so far. Each Plan B task adds its
 #: tool's name here in the same commit that registers it -- the discipline
 #: PLAN_A already kept as a fixed set, now split in two because PLAN_A no
-#: longer describes the whole registry once ANY Plan B tool lands. Task 4
-#: (`http.send`) is the first.
-PLAN_B_BUILT = {"http.send", "http.grep", "http.body", "http.replay_as"}
+#: longer describes the whole registry once ANY Plan B tool lands. Task 7
+#: (`scan.run`, `crawl.run`) is the last, so this now equals `PLAN_B`.
+PLAN_B_BUILT = {"http.send", "http.grep", "http.body", "http.replay_as",
+                "scan.run", "crawl.run"}
 
 
 def test_the_registry_is_exactly_the_tools_built_so_far():
@@ -69,7 +70,7 @@ def test_every_registered_tool_has_an_enforceable_schema_and_a_summary():
 
 def test_mutating_tools_are_exactly_the_ones_that_write():
     writes = {"run.start", "run.finish", "finding.record", "evidence.attach",
-              "http.send", "http.replay_as"}
+              "http.send", "http.replay_as", "scan.run"}
     assert {n for n, t in registry.TOOLS.items() if t.mutates} == writes
 
 
