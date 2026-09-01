@@ -3379,8 +3379,10 @@ def test_one_identitys_refusal_does_not_lose_the_others(
     rows = env.result["rows"]
     assert [r["identity"] for r in rows] == ["staff", "auditor"]
     assert rows[0]["digest"] is not None
+    assert rows[0]["not_answered"] is None
     assert rows[1]["digest"] is None
-    assert rows[1]["refused"] == "rate_limited"
+    assert rows[1]["not_answered"]["reason"] == "rate_limited"
+    assert rows[1]["not_answered"]["outcome"] == "refused"
 
 
 def test_an_original_with_no_stored_response_compares_against_nothing(
@@ -3577,6 +3579,94 @@ def test_a_credential_header_no_identity_declares_is_never_replayed(
         "request the agent never captured"
 
 
+def test_a_timeout_is_reported_as_not_answered_rather_than_refused(
+        tool_run, staff_identity_config, monkeypatch):
+    """RULING 23. The row key used to be `refused`, and a `timeout` under it
+    says a gate declined this identity when in fact NOTHING ANSWERED --
+    while `http.send` maps that same class to `unavailable`. Ruling 3's split
+    survived into the envelope vocabulary and died at the row boundary, in
+    exactly the rows an authorisation table is written from.
+
+    The pair is asserted together: a `rate_limited` row must still read
+    `refused`, or "rename the key" would have been "call everything
+    unavailable"."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    monkeypatch.setenv("HX_AUDITOR_TOKEN", "an0ther")
+    tool_run.config = _also(staff_identity_config, "auditor", "Authorization")
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [
+        sent_result(ok),
+        BridgeError("timeout: no answer", error_class="timeout"),
+        BridgeError("rate_limited: slow down", error_class="rate_limited")])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff", "auditor"]},
+        why="one identity times out and one is rate limited")
+    assert env.outcome == "ok"
+    timed_out, limited = env.result["rows"]
+    assert timed_out["not_answered"]["outcome"] == "unavailable"
+    assert timed_out["not_answered"]["reason"] == "timeout"
+    assert limited["not_answered"]["outcome"] == "refused"
+    assert limited["not_answered"]["reason"] == "rate_limited"
+
+
+def test_grep_with_an_empty_exchange_list_is_refused_not_answered_empty(
+        tool_run):
+    """RULING 23's second half. `empty` is what an agent BRANCHES on -- it
+    means "I looked and found nothing", so the agent moves on. Nothing was
+    looked at. `minItems: 1` puts it where a caller mistake belongs, in the
+    schema, so the refusal arrives before the handler.
+
+    Ruling 14's `if considered and not any_readable` deliberately excludes
+    the empty case and is NOT what answers here: `env.detail` naming an
+    items count is the tell that the schema refused it."""
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                {"exchange_ids": [], "pattern": "needle"})
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert "items" in (env.detail or "")
+
+
+@pytest.mark.parametrize("include_anonymous", [False, True])
+def test_replay_with_an_empty_identity_list_is_refused(
+        tool_run, staff_identity_config, monkeypatch, include_anonymous):
+    """The same rule, and THE EXCHANGE IS REAL so the empty list is the only
+    thing wrong with the call. A first version of this test passed a made-up
+    `exchange_id`, and `replay_as` refuses THAT before it ever looks at the
+    identities -- so it stayed green with `minItems` removed. Measured, and
+    the reason this test stages an exchange it does not otherwise need.
+
+    `include_anonymous: true` is covered deliberately rather than
+    incidentally, and it is the case where `minItems` takes something away:
+    MEASURED before the fix, `identities: []` answered `empty` on its own and
+    `ok` with `include_anonymous`, so the anonymous-only replay WORKED. The
+    reply queue below carries a second `sent_result` for exactly that reason
+    -- without it the shape crashes on an exhausted double rather than on
+    the product, and the measurement would be about the fixture. Closing it
+    is the ruling's call and it is consistent with the tool: this one asks
+    "does this identity see what that one saw", `include_anonymous` is the
+    COMPARISON row, and a replay naming no identity is `http.send`'s
+    question."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    sent_before = len(ctx.session.bridge.requests)
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": [],
+         "include_anonymous": include_anonymous},
+        why="an empty identity list")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert "items" in (env.detail or "")
+    assert len(ctx.session.bridge.requests) == sent_before
+
+
 def test_more_identities_than_the_bound_is_refused_not_silently_truncated(
         tool_run, staff_identity_config, monkeypatch):
     """The schema's `maxItems` already holds this, so the handler's own guard
@@ -3730,6 +3820,23 @@ REASON_FOR_CLASS = {
 UNKNOWN_CLASS = ("unavailable", "transport_error")
 
 
+def _classify(reason: str, detail: str) -> tuple[str, str, str]:
+    """`(outcome, reason, detail)` for one wire error class.
+
+    THE ONE PLACE `REASON_FOR_CLASS` IS READ, because it now has two callers
+    that must not drift: `_raise_for_class` turns the answer into a
+    `ToolError` for a whole call, and `replay_as` puts it in a `not_answered`
+    row for one identity out of several. An agent reading `reason` off an
+    envelope and `not_answered.reason` off a row has to be reading one
+    vocabulary, or the report counts the same denial two ways depending on
+    which tool met it.
+    """
+    outcome, mapped = REASON_FOR_CLASS.get(reason, UNKNOWN_CLASS)
+    if reason not in REASON_FOR_CLASS:
+        detail = f"[unmapped class {reason!r}] {detail}".rstrip()
+    return outcome, mapped, detail
+
+
 def _raise_for_class(reason: str, detail: str, cause: BaseException) -> None:
     """Turn a wire error class into the right `ToolError` subclass.
 
@@ -3755,9 +3862,7 @@ def _raise_for_class(reason: str, detail: str, cause: BaseException) -> None:
     journal can still see what the extension actually said even though this
     build has no name for it.
     """
-    outcome, mapped = REASON_FOR_CLASS.get(reason, UNKNOWN_CLASS)
-    if reason not in REASON_FOR_CLASS:
-        detail = f"[unmapped class {reason!r}] {detail}".rstrip()
+    outcome, mapped, detail = _classify(reason, detail)
     cls = ToolRefused if outcome == "refused" else ToolUnavailable
     raise cls(mapped, detail) from cause
 
@@ -4108,7 +4213,16 @@ registry.register(spec.ToolSpec(
             "return each match with its offset and surrounding context.",
     params={"type": "object", "additionalProperties": False,
             "required": ["exchange_ids", "pattern"], "properties": {
-                "exchange_ids": {"type": "array", "maxItems": MAX_EXCHANGES,
+                # RULING 23: `minItems: 1`. An empty list reached the
+                # handler, searched nothing and answered `empty` -- which to
+                # an agent means "I looked and found no match". Nothing was
+                # looked at. It is a caller mistake and the schema is where
+                # a caller mistake is named. Ruling 14's `if considered and
+                # not any_readable` deliberately excludes the empty case and
+                # is left alone: that guard is about exchanges that could
+                # not be read, not about a list nobody filled in.
+                "exchange_ids": {"type": "array", "minItems": 1,
+                                 "maxItems": MAX_EXCHANGES,
                                  "items": {"type": "string", "maxLength": 64}},
                 "pattern": {"type": "string", "minLength": 1,
                             "maxLength": 1024,
@@ -4282,10 +4396,20 @@ def replay_as(ctx, *, exchange_id: str, identities,
     no answer at all for a single identity.
 
     ONE IDENTITY'S REFUSAL DOES NOT DISCARD THE OTHERS. A row carries either
-    a `digest` or a `refused` class, never neither and never both -- so "two
+    a `digest` or a `not_answered`, never neither and never both -- so "two
     identities, one answer and one rate limit" stays distinguishable from
     "two identities, one answer", which is section 12's rule inside one
     result.
+
+    `not_answered` CARRIES RULING 3's SPLIT INTO THE ROW (Ruling 23). It was
+    spelled `refused`, and a `timeout` under that key says a gate declined
+    this identity when in fact nothing answered -- while `http.send` maps the
+    same class to `unavailable`. So the distinction the envelope vocabulary
+    was built around died at the row boundary, in the rows an authorisation
+    table is written from: "staff was refused" and "staff timed out" are
+    different findings and only one of them is about the application.
+    `{outcome, reason, detail}` says which, in the same vocabulary
+    `envelope.reason` uses for a whole call.
 
     `include_anonymous` IS ITS OWN FLAG rather than a reserved name in
     `identities`. The unauthenticated comparison is the most valuable row in
@@ -4424,13 +4548,25 @@ def replay_as(ctx, *, exchange_id: str, identities,
                 scheme=scheme, host=host, port=port, method=method,
                 path=path, headers=headers, body=body, identity=ident)
         except issue_mod.IssueRefused as exc:
+            # RULING 23: `not_answered`, NOT `refused`, AND IT CARRIES THE
+            # SPLIT. A `timeout` reported under a key called `refused` says a
+            # gate declined this identity when in fact nothing answered --
+            # and `http.send` maps that same class to `unavailable`, so
+            # Ruling 3's whole distinction survived into the envelope
+            # vocabulary and died in the row vocabulary. An authz table is
+            # written from these rows: "staff was refused" and "staff timed
+            # out" are different findings, and only one of them is about the
+            # application. The row now says which.
+            outcome, reason, detail = _classify(exc.reason, exc.detail or "")
             rows.append({"identity": name, "digest": None,
-                         "refused": exc.reason, "detail": exc.detail,
+                         "not_answered": {"outcome": outcome,
+                                          "reason": reason,
+                                          "detail": detail or None},
                          "diff_vs_original": None, "differs": None})
             continue
         rows.append({
-            "identity": name, "digest": _digest(ctx, issued), "refused": None,
-            "detail": None,
+            "identity": name, "digest": _digest(ctx, issued),
+            "not_answered": None,
             "diff_vs_original": (
                 None if base_body is None
                 else delta_mod.against(status, base_body, issued.status,
@@ -4448,13 +4584,22 @@ def replay_as(ctx, *, exchange_id: str, identities,
 registry.register(spec.ToolSpec(
     name="http.replay_as", handler=replay_as, needs_egress=True, mutates=True,
     summary="Re-issue one stored request under several identities and report "
-            "each one's digest and how it differs from the original. A null "
-            "`differs` means NOT COMPARED -- the replay was refused, or the "
-            "original's response body was never stored -- never 'the same'.",
+            "each one's digest and how it differs from the original. A row "
+            "carries a digest OR a `not_answered` {outcome, reason, detail}. "
+            "A null `differs` means NOT COMPARED -- nothing came back, or "
+            "the original's body was never stored -- never 'the same'.",
     params={"type": "object", "additionalProperties": False,
             "required": ["exchange_id", "identities"], "properties": {
                 "exchange_id": {"type": "string", "maxLength": 64},
-                "identities": {"type": "array", "maxItems": MAX_IDENTITIES,
+                # RULING 23, the same rule: `identities: []` replayed
+                # nothing and answered `empty`. This also settles the
+                # anonymous-only shape, and settling it is deliberate rather
+                # than incidental: `include_anonymous` is the COMPARISON row,
+                # and this tool's question is "does this identity see what
+                # that one saw". A call naming no identity is asking a
+                # different question, and `http.send` answers that one.
+                "identities": {"type": "array", "minItems": 1,
+                               "maxItems": MAX_IDENTITIES,
                                "items": {"type": "string", "maxLength": 64},
                                "description": "NAMES declared in config.yaml"},
                 "include_anonymous": {

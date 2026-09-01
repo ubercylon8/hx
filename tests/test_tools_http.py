@@ -897,8 +897,10 @@ def test_one_identitys_refusal_does_not_lose_the_others(
     rows = env.result["rows"]
     assert [r["identity"] for r in rows] == ["staff", "auditor"]
     assert rows[0]["digest"] is not None
+    assert rows[0]["not_answered"] is None
     assert rows[1]["digest"] is None
-    assert rows[1]["refused"] == "rate_limited"
+    assert rows[1]["not_answered"]["reason"] == "rate_limited"
+    assert rows[1]["not_answered"]["outcome"] == "refused"
 
 
 def test_an_original_with_no_stored_response_compares_against_nothing(
@@ -1093,6 +1095,94 @@ def test_a_credential_header_no_identity_declares_is_never_replayed(
     assert b"X-Trace: 7" in replayed, \
         "a replay that drops a header carrying no credential sends a " \
         "request the agent never captured"
+
+
+def test_a_timeout_is_reported_as_not_answered_rather_than_refused(
+        tool_run, staff_identity_config, monkeypatch):
+    """RULING 23. The row key used to be `refused`, and a `timeout` under it
+    says a gate declined this identity when in fact NOTHING ANSWERED --
+    while `http.send` maps that same class to `unavailable`. Ruling 3's split
+    survived into the envelope vocabulary and died at the row boundary, in
+    exactly the rows an authorisation table is written from.
+
+    The pair is asserted together: a `rate_limited` row must still read
+    `refused`, or "rename the key" would have been "call everything
+    unavailable"."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    monkeypatch.setenv("HX_AUDITOR_TOKEN", "an0ther")
+    tool_run.config = _also(staff_identity_config, "auditor", "Authorization")
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [
+        sent_result(ok),
+        BridgeError("timeout: no answer", error_class="timeout"),
+        BridgeError("rate_limited: slow down", error_class="rate_limited")])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff", "auditor"]},
+        why="one identity times out and one is rate limited")
+    assert env.outcome == "ok"
+    timed_out, limited = env.result["rows"]
+    assert timed_out["not_answered"]["outcome"] == "unavailable"
+    assert timed_out["not_answered"]["reason"] == "timeout"
+    assert limited["not_answered"]["outcome"] == "refused"
+    assert limited["not_answered"]["reason"] == "rate_limited"
+
+
+def test_grep_with_an_empty_exchange_list_is_refused_not_answered_empty(
+        tool_run):
+    """RULING 23's second half. `empty` is what an agent BRANCHES on -- it
+    means "I looked and found nothing", so the agent moves on. Nothing was
+    looked at. `minItems: 1` puts it where a caller mistake belongs, in the
+    schema, so the refusal arrives before the handler.
+
+    Ruling 14's `if considered and not any_readable` deliberately excludes
+    the empty case and is NOT what answers here: `env.detail` naming an
+    items count is the tell that the schema refused it."""
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                {"exchange_ids": [], "pattern": "needle"})
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert "items" in (env.detail or "")
+
+
+@pytest.mark.parametrize("include_anonymous", [False, True])
+def test_replay_with_an_empty_identity_list_is_refused(
+        tool_run, staff_identity_config, monkeypatch, include_anonymous):
+    """The same rule, and THE EXCHANGE IS REAL so the empty list is the only
+    thing wrong with the call. A first version of this test passed a made-up
+    `exchange_id`, and `replay_as` refuses THAT before it ever looks at the
+    identities -- so it stayed green with `minItems` removed. Measured, and
+    the reason this test stages an exchange it does not otherwise need.
+
+    `include_anonymous: true` is covered deliberately rather than
+    incidentally, and it is the case where `minItems` takes something away:
+    MEASURED before the fix, `identities: []` answered `empty` on its own and
+    `ok` with `include_anonymous`, so the anonymous-only replay WORKED. The
+    reply queue below carries a second `sent_result` for exactly that reason
+    -- without it the shape crashes on an exhausted double rather than on
+    the product, and the measurement would be about the fixture. Closing it
+    is the ruling's call and it is consistent with the tool: this one asks
+    "does this identity see what that one saw", `include_anonymous` is the
+    COMPARISON row, and a replay naming no identity is `http.send`'s
+    question."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    sent_before = len(ctx.session.bridge.requests)
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": [],
+         "include_anonymous": include_anonymous},
+        why="an empty identity list")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert "items" in (env.detail or "")
+    assert len(ctx.session.bridge.requests) == sent_before
 
 
 def test_more_identities_than_the_bound_is_refused_not_silently_truncated(

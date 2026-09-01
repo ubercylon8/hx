@@ -118,6 +118,23 @@ REASON_FOR_CLASS = {
 UNKNOWN_CLASS = ("unavailable", "transport_error")
 
 
+def _classify(reason: str, detail: str) -> tuple[str, str, str]:
+    """`(outcome, reason, detail)` for one wire error class.
+
+    THE ONE PLACE `REASON_FOR_CLASS` IS READ, because it now has two callers
+    that must not drift: `_raise_for_class` turns the answer into a
+    `ToolError` for a whole call, and `replay_as` puts it in a `not_answered`
+    row for one identity out of several. An agent reading `reason` off an
+    envelope and `not_answered.reason` off a row has to be reading one
+    vocabulary, or the report counts the same denial two ways depending on
+    which tool met it.
+    """
+    outcome, mapped = REASON_FOR_CLASS.get(reason, UNKNOWN_CLASS)
+    if reason not in REASON_FOR_CLASS:
+        detail = f"[unmapped class {reason!r}] {detail}".rstrip()
+    return outcome, mapped, detail
+
+
 def _raise_for_class(reason: str, detail: str, cause: BaseException) -> None:
     """Turn a wire error class into the right `ToolError` subclass.
 
@@ -143,9 +160,7 @@ def _raise_for_class(reason: str, detail: str, cause: BaseException) -> None:
     journal can still see what the extension actually said even though this
     build has no name for it.
     """
-    outcome, mapped = REASON_FOR_CLASS.get(reason, UNKNOWN_CLASS)
-    if reason not in REASON_FOR_CLASS:
-        detail = f"[unmapped class {reason!r}] {detail}".rstrip()
+    outcome, mapped, detail = _classify(reason, detail)
     cls = ToolRefused if outcome == "refused" else ToolUnavailable
     raise cls(mapped, detail) from cause
 
@@ -496,7 +511,16 @@ registry.register(spec.ToolSpec(
             "return each match with its offset and surrounding context.",
     params={"type": "object", "additionalProperties": False,
             "required": ["exchange_ids", "pattern"], "properties": {
-                "exchange_ids": {"type": "array", "maxItems": MAX_EXCHANGES,
+                # RULING 23: `minItems: 1`. An empty list reached the
+                # handler, searched nothing and answered `empty` -- which to
+                # an agent means "I looked and found no match". Nothing was
+                # looked at. It is a caller mistake and the schema is where
+                # a caller mistake is named. Ruling 14's `if considered and
+                # not any_readable` deliberately excludes the empty case and
+                # is left alone: that guard is about exchanges that could
+                # not be read, not about a list nobody filled in.
+                "exchange_ids": {"type": "array", "minItems": 1,
+                                 "maxItems": MAX_EXCHANGES,
                                  "items": {"type": "string", "maxLength": 64}},
                 "pattern": {"type": "string", "minLength": 1,
                             "maxLength": 1024,
@@ -670,10 +694,20 @@ def replay_as(ctx, *, exchange_id: str, identities,
     no answer at all for a single identity.
 
     ONE IDENTITY'S REFUSAL DOES NOT DISCARD THE OTHERS. A row carries either
-    a `digest` or a `refused` class, never neither and never both -- so "two
+    a `digest` or a `not_answered`, never neither and never both -- so "two
     identities, one answer and one rate limit" stays distinguishable from
     "two identities, one answer", which is section 12's rule inside one
     result.
+
+    `not_answered` CARRIES RULING 3's SPLIT INTO THE ROW (Ruling 23). It was
+    spelled `refused`, and a `timeout` under that key says a gate declined
+    this identity when in fact nothing answered -- while `http.send` maps the
+    same class to `unavailable`. So the distinction the envelope vocabulary
+    was built around died at the row boundary, in the rows an authorisation
+    table is written from: "staff was refused" and "staff timed out" are
+    different findings and only one of them is about the application.
+    `{outcome, reason, detail}` says which, in the same vocabulary
+    `envelope.reason` uses for a whole call.
 
     `include_anonymous` IS ITS OWN FLAG rather than a reserved name in
     `identities`. The unauthenticated comparison is the most valuable row in
@@ -812,13 +846,25 @@ def replay_as(ctx, *, exchange_id: str, identities,
                 scheme=scheme, host=host, port=port, method=method,
                 path=path, headers=headers, body=body, identity=ident)
         except issue_mod.IssueRefused as exc:
+            # RULING 23: `not_answered`, NOT `refused`, AND IT CARRIES THE
+            # SPLIT. A `timeout` reported under a key called `refused` says a
+            # gate declined this identity when in fact nothing answered --
+            # and `http.send` maps that same class to `unavailable`, so
+            # Ruling 3's whole distinction survived into the envelope
+            # vocabulary and died in the row vocabulary. An authz table is
+            # written from these rows: "staff was refused" and "staff timed
+            # out" are different findings, and only one of them is about the
+            # application. The row now says which.
+            outcome, reason, detail = _classify(exc.reason, exc.detail or "")
             rows.append({"identity": name, "digest": None,
-                         "refused": exc.reason, "detail": exc.detail,
+                         "not_answered": {"outcome": outcome,
+                                          "reason": reason,
+                                          "detail": detail or None},
                          "diff_vs_original": None, "differs": None})
             continue
         rows.append({
-            "identity": name, "digest": _digest(ctx, issued), "refused": None,
-            "detail": None,
+            "identity": name, "digest": _digest(ctx, issued),
+            "not_answered": None,
             "diff_vs_original": (
                 None if base_body is None
                 else delta_mod.against(status, base_body, issued.status,
@@ -836,13 +882,22 @@ def replay_as(ctx, *, exchange_id: str, identities,
 registry.register(spec.ToolSpec(
     name="http.replay_as", handler=replay_as, needs_egress=True, mutates=True,
     summary="Re-issue one stored request under several identities and report "
-            "each one's digest and how it differs from the original. A null "
-            "`differs` means NOT COMPARED -- the replay was refused, or the "
-            "original's response body was never stored -- never 'the same'.",
+            "each one's digest and how it differs from the original. A row "
+            "carries a digest OR a `not_answered` {outcome, reason, detail}. "
+            "A null `differs` means NOT COMPARED -- nothing came back, or "
+            "the original's body was never stored -- never 'the same'.",
     params={"type": "object", "additionalProperties": False,
             "required": ["exchange_id", "identities"], "properties": {
                 "exchange_id": {"type": "string", "maxLength": 64},
-                "identities": {"type": "array", "maxItems": MAX_IDENTITIES,
+                # RULING 23, the same rule: `identities: []` replayed
+                # nothing and answered `empty`. This also settles the
+                # anonymous-only shape, and settling it is deliberate rather
+                # than incidental: `include_anonymous` is the COMPARISON row,
+                # and this tool's question is "does this identity see what
+                # that one saw". A call naming no identity is asking a
+                # different question, and `http.send` answers that one.
+                "identities": {"type": "array", "minItems": 1,
+                               "maxItems": MAX_IDENTITIES,
                                "items": {"type": "string", "maxLength": 64},
                                "description": "NAMES declared in config.yaml"},
                 "include_anonymous": {
