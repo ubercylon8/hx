@@ -246,3 +246,147 @@ def test_an_unknown_wire_class_does_not_escape_dispatch(tool_run):
                                 why="unknown class")
     assert env.outcome in ("refused", "unavailable")
     assert "nova_class_from_2027" in (env.detail or "")
+
+
+def _one_exchange(ctx, body=b"HTTP/1.1 200 OK\r\n\r\nneedle in a haystack"):
+    """Send one request through a fake bridge and return its exchange id."""
+    ctx = _with_session(ctx, [sent_result(body)])
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/hay"},
+                                why="set up a body to read")
+    return env.result["exchange_id"]
+
+
+def test_grep_finds_a_literal_and_reports_its_offset(tool_run):
+    """The offset is the whole point: `http.body(range)` is the escape hatch
+    used AFTER a match yields one."""
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "needle"})
+    assert env.outcome == "ok"
+    row = env.result["rows"][0]
+    assert row["exchange_id"] == xid
+    assert row["part"] == "response"
+    assert isinstance(row["offset"], int)
+    assert "needle" in row["match"]
+
+
+def test_grep_that_matches_nothing_is_empty_not_ok(tool_run):
+    """Principle 4. `empty` says the search ran and found nothing; `ok` with
+    zero rows would be indistinguishable from a search that never ran."""
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "absent"})
+    assert env.outcome == "empty"
+
+
+def test_grep_searches_the_request_when_asked(tool_run):
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "/hay",
+                                 "part": "request"})
+    assert env.outcome == "ok"
+    assert env.result["rows"][0]["part"] == "request"
+
+
+def test_grep_needs_no_session(tool_run):
+    """It reads the blob store, which is on this side. An agent that has
+    finished its run can still read what it captured -- and a tool marked
+    needs_egress would have refused that."""
+    xid = _one_exchange(tool_run)
+    tool_run.session = None
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                {"exchange_ids": [xid], "pattern": "needle"})
+    assert env.outcome == "ok"
+
+
+def test_grep_reports_which_exchanges_it_could_not_read(tool_run):
+    """Section 12 inside one envelope. An exchange whose blob is missing is
+    not an exchange with no matches, and a facet that said `0 matches` about
+    both would be the report that cannot distinguish tested from unreached."""
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                {"exchange_ids": [xid, "x-nonexistent"],
+                                 "pattern": "needle"})
+    assert env.result["facets"]["unreadable"] == ["x-nonexistent"]
+
+
+def test_body_returns_a_bounded_range_and_the_total(tool_run):
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.body",
+                                {"exchange_id": xid, "start": 0, "length": 8})
+    assert env.outcome == "ok"
+    assert len(env.result["bytes"]) == 8
+    # THE TOTAL IS ALWAYS THERE, so an agent knows whether it has the whole
+    # thing. A range with no total is a window with no idea how far the room
+    # extends.
+    assert env.result["total"] > 8
+
+
+def test_body_past_the_end_answers_ok_with_zero_length_and_the_real_total(
+        tool_run):
+    """Reading past the end is a legitimate way to discover the end, so it is
+    not an error -- and it is not `empty` either.
+
+    `empty` IS PRINCIPLE 3's LIST VOCABULARY and `http.body` returns no list.
+    `envelope.answered` reads `empty` off a page envelope's `total == 0`, so
+    spelling this `empty` would mean reporting `total: 0` for a body that is
+    5 KB long -- a lie about the one number an agent needs in order to know
+    it has read the whole thing. `ok` with `length: 0` and the true `total`
+    says exactly what happened and where the end is."""
+    xid = _one_exchange(tool_run)
+    env = dispatch_mod.dispatch(tool_run, "http.body",
+                                {"exchange_id": xid, "start": 99999,
+                                 "length": 10})
+    assert env.outcome == "ok"
+    assert env.result["length"] == 0
+    assert env.result["total"] > 0
+
+
+def test_body_of_an_unknown_exchange_is_refused(tool_run):
+    env = dispatch_mod.dispatch(tool_run, "http.body",
+                                {"exchange_id": "x-nope", "start": 0,
+                                 "length": 8})
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+
+
+def test_a_binary_body_round_trips_rather_than_becoming_question_marks(
+        tool_run):
+    """Latin-1 is chosen for exactly this: every byte maps to one character
+    and back. A UTF-8 decode with `errors='replace'` would turn a binary
+    body into a string of U+FFFD an agent then greps for a payload it can
+    never find."""
+    raw = b"HTTP/1.1 200 OK\r\n\r\n\x00\x80\xff\xfe"
+    xid = _one_exchange(tool_run, raw)
+    env = dispatch_mod.dispatch(tool_run, "http.body",
+                                {"exchange_id": xid, "start": 0,
+                                 "length": 64, "part": "response"})
+    assert env.result["bytes"].encode("latin-1") == raw
+
+
+def test_grep_reports_a_corrupt_blob_as_unreadable_not_internal_error(
+        tool_run):
+    """`_blobs_for`'s own docstring says a blob the store cannot return is
+    covered by the same None it returns for a missing row -- so a corrupt
+    blob must land the exchange in `unreadable`, not blow up as
+    `error / internal`. `error / internal` here would tell an agent hx is
+    broken when in fact one stored blob failed its digest check."""
+    from hx.store.blobs import CorruptBlob
+
+    xid = _one_exchange(tool_run)
+    real_get = tool_run.blobs.get
+
+    def _corrupt(digest, expected_len=None):
+        raise CorruptBlob(f"blob {digest} failed digest verification")
+
+    tool_run.blobs.get = _corrupt
+    try:
+        env = dispatch_mod.dispatch(tool_run, "http.grep",
+                                    {"exchange_ids": [xid],
+                                     "pattern": "needle"})
+    finally:
+        tool_run.blobs.get = real_get
+    assert env.outcome == "empty"
+    assert env.result["facets"]["unreadable"] == [xid]

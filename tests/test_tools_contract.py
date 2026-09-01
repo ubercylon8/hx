@@ -24,7 +24,7 @@ PLAN_B = {"http.send", "http.grep", "http.body", "http.replay_as",
 #: PLAN_A already kept as a fixed set, now split in two because PLAN_A no
 #: longer describes the whole registry once ANY Plan B tool lands. Task 4
 #: (`http.send`) is the first.
-PLAN_B_BUILT = {"http.send"}
+PLAN_B_BUILT = {"http.send", "http.grep", "http.body"}
 
 
 def test_the_registry_is_exactly_the_tools_built_so_far():

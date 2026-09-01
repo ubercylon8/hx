@@ -24,7 +24,8 @@ from ... import delta as delta_mod
 from ... import identity as identity_mod
 from ... import issue as issue_mod
 from ...bridge.server import BridgeError
-from .. import live, registry, spec
+from ...store.blobs import CorruptBlob
+from .. import envelope, live, registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
 #: Latin-1 everywhere bytes become text in a return value, and it is a
@@ -228,4 +229,162 @@ registry.register(spec.ToolSpec(
                                             "in config.yaml. The credential "
                                             "is resolved and injected below "
                                             "this layer; you never handle it."},
+            }}))
+
+
+#: `both` is the default because an agent looking for its own payload does
+#: not always know which half reflected it -- a header echoed into a
+#: response, a parameter echoed into the request log.
+PARTS = ["request", "response", "both"]
+
+CONTEXT_DEFAULT = 64
+CONTEXT_MAX = 512
+#: 64 KB per `http.body` call. Above this an agent should be grepping.
+RANGE_MAX = 64 * 1024
+#: Exchanges per grep. Bounded because each one is a whole body read out of
+#: the blob store into memory in the one process that also holds the Burp.
+MAX_EXCHANGES = 50
+
+
+def _blobs_for(ctx, exchange_id, part):
+    """`[(part_name, bytes)]` for one exchange, or None if it is not there.
+
+    None covers every way there is nothing to read -- no such row, a NULL
+    blob, a blob the store cannot return -- because all three are "this
+    exchange cannot be searched", and a caller that told them apart would be
+    reporting on hx's bookkeeping rather than on the traffic. A per-part
+    `CorruptBlob` (digest mismatch, missing file) is caught here rather than
+    left to propagate: uncaught it would reach `dispatch`'s generic `except
+    Exception` and answer `error / internal`, telling an agent hx is broken
+    when in fact one stored blob failed its own integrity check -- exactly
+    the "tested, clean" vs "never reached" confusion section 12 rules out.
+    """
+    row = ctx.conn.execute(
+        "SELECT req_blob, resp_blob, resp_len FROM exchange WHERE id=?",
+        (exchange_id,)).fetchone()
+    if row is None:
+        return None
+    out = []
+    if part in ("request", "both") and row[0]:
+        try:
+            out.append(("request", ctx.blobs.get(row[0])))
+        except CorruptBlob:
+            pass
+    if part in ("response", "both") and row[1]:
+        try:
+            out.append(("response", ctx.blobs.get(row[1], row[2])))
+        except CorruptBlob:
+            pass
+    return out or None
+
+
+def grep(ctx, *, exchange_ids, pattern: str, part: str = "response",
+         context_bytes: int = CONTEXT_DEFAULT,
+         ignore_case: bool = False) -> dict:
+    """Principle 2: match-addressed reading, the documented default.
+
+    LITERAL BYTES, NOT A REGULAR EXPRESSION, and this is a decision rather
+    than an omission. Python's `re` has no timeout, the pattern here is
+    agent-authored, and a catastrophic backtrack would hang the ONE
+    long-lived process that also holds this engagement's Burp open -- taking
+    the session, the run and the operator's halt path with it. A literal
+    match cannot backtrack. It also serves what this tool is actually for:
+    you search for the payload token you just sent, and `delta_vs_baseline`
+    already tells you which tokens are new. Anything a literal cannot express
+    is `http.body(range)`'s job, or a passive check's. Recorded as known debt
+    in `docs/DECISIONS.md`.
+    """
+    needle = pattern.encode(TEXT)
+    if ignore_case:
+        needle = needle.lower()
+    rows, unreadable = [], []
+    for xid in exchange_ids[:MAX_EXCHANGES]:
+        found = _blobs_for(ctx, xid, part)
+        if found is None:
+            unreadable.append(xid)
+            continue
+        for part_name, data in found:
+            hay = data.lower() if ignore_case else data
+            at = hay.find(needle)
+            while at != -1:
+                start = max(0, at - context_bytes)
+                end = min(len(data), at + len(needle) + context_bytes)
+                rows.append({
+                    "exchange_id": xid, "part": part_name, "offset": at,
+                    "before": data[start:at].decode(TEXT),
+                    "match": data[at:at + len(needle)].decode(TEXT),
+                    "after": data[at + len(needle):end].decode(TEXT),
+                })
+                at = hay.find(needle, at + len(needle))
+    # UNREADABLE IS A FACET AND NOT A SILENCE. An exchange whose blob is gone
+    # is not an exchange with no matches, and section 12's rule -- a report
+    # that cannot tell "tested, clean" from "never reached" is worse than no
+    # report -- is exactly as true of one envelope as of a whole engagement.
+    return envelope.page(rows, total=len(rows), limit=envelope.MAX_LIMIT,
+                         facets={"unreadable": unreadable,
+                                 "searched": len(exchange_ids[:MAX_EXCHANGES])})
+
+
+def body(ctx, *, exchange_id: str, start: int = 0,
+         length: int = RANGE_MAX, part: str = "response") -> dict:
+    """Principle 2's escape hatch, used after a match yields an offset."""
+    if part == "both":
+        raise ToolRefused(
+            "bad_args", "http.body reads one part; 'both' is grep's default, "
+                        "not a range this tool can return")
+    found = _blobs_for(ctx, exchange_id, part)
+    if found is None:
+        raise ToolRefused(
+            "bad_args",
+            f"no readable {part} for exchange {exchange_id!r}. It may not "
+            "exist, or its body may never have been stored -- surface.detail "
+            "lists the exchanges this engagement holds.")
+    _name, data = found[0]
+    window = data[start:start + min(length, RANGE_MAX)]
+    # ONE SHAPE, INCLUDING PAST THE END. Reading past the end is a legitimate
+    # way to find the end, so it is not an error -- and it is not `empty`
+    # either: `empty` is Principle 3's LIST vocabulary, and
+    # `envelope.answered` reads it off a page envelope's `total == 0`. To
+    # spell this `empty` would mean reporting `total: 0` for a body that is
+    # 5 KB long, which is a lie about the one number an agent needs to know
+    # whether it has the whole thing. `length: 0` beside the true `total`
+    # says where the end is.
+    return {"exchange_id": exchange_id, "part": part, "start": start,
+            "length": len(window), "total": len(data),
+            "bytes": window.decode(TEXT)}
+
+
+registry.register(spec.ToolSpec(
+    name="http.grep", handler=grep,
+    summary="Search stored request/response bytes for a literal string and "
+            "return each match with its offset and surrounding context.",
+    params={"type": "object", "additionalProperties": False,
+            "required": ["exchange_ids", "pattern"], "properties": {
+                "exchange_ids": {"type": "array", "maxItems": MAX_EXCHANGES,
+                                 "items": {"type": "string", "maxLength": 64}},
+                "pattern": {"type": "string", "minLength": 1,
+                            "maxLength": 1024,
+                            "description": "a literal string, NOT a regular "
+                                           "expression"},
+                "part": {"type": "string", "enum": PARTS,
+                         "description": "default response"},
+                "context_bytes": {"type": "integer", "minimum": 0,
+                                  "maximum": CONTEXT_MAX,
+                                  "description": "bytes either side of each "
+                                                 "match; default 64"},
+                "ignore_case": {"type": "boolean"},
+            }}))
+
+registry.register(spec.ToolSpec(
+    name="http.body", handler=body,
+    summary="Read a bounded range of one stored request or response. Use "
+            "http.grep first to find the offset.",
+    params={"type": "object", "additionalProperties": False,
+            "required": ["exchange_id"], "properties": {
+                "exchange_id": {"type": "string", "maxLength": 64},
+                "start": {"type": "integer", "minimum": 0,
+                          "maximum": 1_000_000_000},
+                "length": {"type": "integer", "minimum": 1,
+                           "maximum": RANGE_MAX},
+                "part": {"type": "string", "enum": ["request", "response"]},
             }}))
