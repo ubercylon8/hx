@@ -25,13 +25,27 @@ jobs:
 
     steps:
       - name: Checkout repository
+        # zizmor: ignore[artipacked]
+        # THE CREDENTIAL IS LOAD-BEARING HERE TOO, and `persist-credentials: false`
+        # sat here until 2026-09-01 on the grounds that "findings are posted through
+        # the GitHub API rather than git, so the checkout's credential has no
+        # consumer". True of the findings; false of the checkout. The action checks
+        # out the PR branch ITSELF -- `git fetch origin --depth=<commits in the PR>`
+        # -- and with credentials stripped the remote carries no auth, so git asks
+        # for a username on a machine with no tty:
+        #
+        #   fatal: could not read Username for 'https://github.com': No such device
+        #   Action failed with error: Command failed: git fetch origin --depth=28 ...
+        #
+        # IT FAILED THAT WAY ON EVERY RUN THAT REACHED IT, and the greens hid it: a
+        # PR that edits this file makes the action self-skip (see the note below),
+        # and self-skip is reported as success. Every green run in this workflow's
+        # history was a skip; every run that actually started, failed. `claude.yml`
+        # has always carried the credential and has always worked -- this is that
+        # same shape, with the reason it needs one written down rather than assumed.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 1
-          # This job only reads; findings are posted through the GitHub API rather
-          # than git, so the checkout's credential has no consumer. NOT true of
-          # claude.yml, where the @claude responder can commit.
-          persist-credentials: false
 
       # A PR THAT EDITS THIS FILE GETS NO REVIEW, AND THE CHECK STILL SHOWS GREEN.
       #
