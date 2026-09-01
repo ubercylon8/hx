@@ -1558,6 +1558,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from hx.tools import envelope, journal
 
 
@@ -1622,6 +1624,35 @@ def test_the_why_is_stored_verbatim(engagement):
                    env=envelope.answered("run.start", {"run_id": "r-1"}),
                    blobs=engagement.blobs)
     assert _row(engagement.db, engagement.id)[4] == "mapping the checkout flow"
+
+
+@pytest.mark.parametrize("raw,expect_absent", [
+    ("/callback?access_token=SEKRIT&state=x", "SEKRIT"),
+    ("/cb?token=SEKRIT", "SEKRIT"),
+    ("http://alice:SEKRIT@app.test/a", "SEKRIT"),
+])
+def test_a_credential_in_a_url_argument_is_redacted_too(raw, expect_absent):
+    """THE HEADER GUARD DID NOT COVER THIS, and the store disagreed with
+    itself about the same string. MEASURED before the fix: `exchange.url`
+    held `access_token={{observed:param}}` while `agent_action.args_blob`
+    held the token verbatim -- one table redacting what the other kept.
+
+    `http.send`'s `path` is agent-supplied and required, and replaying an
+    OAuth callback is ordinary work during an assessment, so this is
+    reachable by typing rather than by contriving."""
+    got = journal._redacted(raw)
+    assert expect_absent not in got
+    # The KEY survives: "the agent sent an access_token" is the fact
+    # run.journal exists to report.
+    assert "{{observed:" in got
+
+
+def test_redaction_leaves_ordinary_strings_alone():
+    """The redactor runs over EVERY string argument, so it has to be inert on
+    the ones that carry nothing. A guard that mangled `pattern` or `path`
+    would corrupt the journal's account of what was tried."""
+    for benign in ["needle", "/a?b=c", "GET", "", "not a url, just prose"]:
+        assert journal._redacted(benign) == benign
 ```
 
 `tests/conftest.py` has no `engagement` fixture yet — it has `engagement_conn`
@@ -1714,7 +1745,7 @@ import time
 from typing import Any
 
 from ..config import CREDENTIAL_HEADERS
-from ..store.records import new_id
+from ..store.records import new_id, redact_url
 from .envelope import Envelope
 
 #: Above this many bytes of encoded JSON, the arguments go to the blob store.
@@ -1765,11 +1796,28 @@ def _redacted(value: Any) -> Any:
     the fact `run.journal` exists to report, and a row that dropped the line
     entirely would answer "what did I already try" with a request that was
     never made.
+
+    A CREDENTIAL IN A URL IS THE SAME EXPOSURE AND WAS NOT COVERED. Header
+    lines were the shape this guard was written for, and an argument can
+    carry one in a query string just as easily: `http.send`'s `path` is
+    agent-supplied and required, and replaying an OAuth callback --
+    `/cb?access_token=...` -- is ordinary work during an assessment.
+    MEASURED: `exchange.url` held `access_token={{observed:param}}` while
+    `agent_action.args_blob` held the token, so the store redacted the same
+    string in one table and kept it in the other.
+
+    `records.redact_url` is REUSED rather than reimplemented -- it already
+    knows userinfo and the credential parameter names, and it is what writes
+    the redacted `exchange.url` this was disagreeing with. It is safe on
+    arbitrary strings: measured against prose, bare words, header lines and
+    empty input, it returns them unchanged and raises on none of them, so it
+    can run over every string argument rather than over ones guessed to be
+    URLs. Found by the first automated review this repository completed.
     """
     if isinstance(value, str):
         found = _CREDENTIAL_LINE.match(value)
         if found is None:
-            return value
+            return redact_url(value)
         return f"{found.group(1)}: {_placeholder(found.group(1))}"
     if isinstance(value, dict):
         return {key: _redacted(item) for key, item in value.items()}

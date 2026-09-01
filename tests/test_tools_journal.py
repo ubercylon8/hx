@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from hx.tools import envelope, journal
 
 
@@ -68,3 +70,32 @@ def test_the_why_is_stored_verbatim(engagement):
                    env=envelope.answered("run.start", {"run_id": "r-1"}),
                    blobs=engagement.blobs)
     assert _row(engagement.db, engagement.id)[4] == "mapping the checkout flow"
+
+
+@pytest.mark.parametrize("raw,expect_absent", [
+    ("/callback?access_token=SEKRIT&state=x", "SEKRIT"),
+    ("/cb?token=SEKRIT", "SEKRIT"),
+    ("http://alice:SEKRIT@app.test/a", "SEKRIT"),
+])
+def test_a_credential_in_a_url_argument_is_redacted_too(raw, expect_absent):
+    """THE HEADER GUARD DID NOT COVER THIS, and the store disagreed with
+    itself about the same string. MEASURED before the fix: `exchange.url`
+    held `access_token={{observed:param}}` while `agent_action.args_blob`
+    held the token verbatim -- one table redacting what the other kept.
+
+    `http.send`'s `path` is agent-supplied and required, and replaying an
+    OAuth callback is ordinary work during an assessment, so this is
+    reachable by typing rather than by contriving."""
+    got = journal._redacted(raw)
+    assert expect_absent not in got
+    # The KEY survives: "the agent sent an access_token" is the fact
+    # run.journal exists to report.
+    assert "{{observed:" in got
+
+
+def test_redaction_leaves_ordinary_strings_alone():
+    """The redactor runs over EVERY string argument, so it has to be inert on
+    the ones that carry nothing. A guard that mangled `pattern` or `path`
+    would corrupt the journal's account of what was tried."""
+    for benign in ["needle", "/a?b=c", "GET", "", "not a url, just prose"]:
+        assert journal._redacted(benign) == benign

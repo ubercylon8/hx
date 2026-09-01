@@ -49,7 +49,7 @@ import time
 from typing import Any
 
 from ..config import CREDENTIAL_HEADERS
-from ..store.records import new_id
+from ..store.records import new_id, redact_url
 from .envelope import Envelope
 
 #: Above this many bytes of encoded JSON, the arguments go to the blob store.
@@ -100,11 +100,28 @@ def _redacted(value: Any) -> Any:
     the fact `run.journal` exists to report, and a row that dropped the line
     entirely would answer "what did I already try" with a request that was
     never made.
+
+    A CREDENTIAL IN A URL IS THE SAME EXPOSURE AND WAS NOT COVERED. Header
+    lines were the shape this guard was written for, and an argument can
+    carry one in a query string just as easily: `http.send`'s `path` is
+    agent-supplied and required, and replaying an OAuth callback --
+    `/cb?access_token=...` -- is ordinary work during an assessment.
+    MEASURED: `exchange.url` held `access_token={{observed:param}}` while
+    `agent_action.args_blob` held the token, so the store redacted the same
+    string in one table and kept it in the other.
+
+    `records.redact_url` is REUSED rather than reimplemented -- it already
+    knows userinfo and the credential parameter names, and it is what writes
+    the redacted `exchange.url` this was disagreeing with. It is safe on
+    arbitrary strings: measured against prose, bare words, header lines and
+    empty input, it returns them unchanged and raises on none of them, so it
+    can run over every string argument rather than over ones guessed to be
+    URLs. Found by the first automated review this repository completed.
     """
     if isinstance(value, str):
         found = _CREDENTIAL_LINE.match(value)
         if found is None:
-            return value
+            return redact_url(value)
         return f"{found.group(1)}: {_placeholder(found.group(1))}"
     if isinstance(value, dict):
         return {key: _redacted(item) for key, item in value.items()}
