@@ -111,12 +111,28 @@ Every call is checked in a fixed order, and the first rule that matches wins:
 not_registered -> halted -> missing_why -> bad_args -> no_session
 ```
 
-**Eleven of the seventeen tools spec section 8 names are built**: `run.start`,
-`run.finish`, `run.journal`, `run.resume`, `surface.query`, `surface.detail`,
-`finding.record`, `finding.query`, `evidence.attach`, `checks.list`, `report.render`. The
-other six — `http.send`, `http.grep`, `http.body`, `http.replay_as`, `scan.run`,
-`crawl.run` — are not built yet; they are exactly the ones that need a live session
-(`needs_egress`), which arrives with the session bracket in a later plan. Three more —
+**All seventeen tools spec section 8 names are built.** Eleven need no session and
+work from any adapter: `run.start`, `run.finish`, `run.journal`, `run.resume`,
+`surface.query`, `surface.detail`, `finding.record`, `finding.query`, `evidence.attach`,
+`checks.list`, `report.render`. Six touch the wire — `http.send`, `http.grep`,
+`http.body`, `http.replay_as`, `scan.run`, `crawl.run` — and of those, four need a live
+session (`needs_egress`); `http.grep` and `http.body` read the stored blobs, so an agent
+that has finished its run can still read what it captured. `crawl.run` is registered and
+always answers `unavailable / not_implemented`: an agent with no crawl tool has no reason
+to say discovery was proxy-only, and one that asks and is told does.
+
+**The four egress tools work under `hx mcp`, not under `hx tool`.** `hx.session.session()`
+tears Burp down on every exit and each `hx tool` call is its own process, so there is
+nothing there for a session to outlive. `run.start` says so by name — `session: {live:
+false, reason: "no_host"}` — rather than leaving those tools to answer a generic
+`no_session`. `hx mcp` is one long-lived process: `run.start` brings a Burp up on its
+`ExitStack` and `run.finish`, or any exit at all, takes it down.
+
+```bash
+hx mcp --root path/to/engagement    # newline-delimited JSON-RPC 2.0 on stdio
+```
+
+Three more —
 `engagement.create`, `surface.add`, `finding.set_status` — are deliberately never
 tools at all: creating an engagement and confirming a finding are human acts, and stay in
 the CLI and the (future) web app.
@@ -165,9 +181,9 @@ Against the v1 scope in the design spec, five of nine items are done. Outstandin
   crawl.
 - **Identities** — `config.yaml` accepts an `identities` block and nothing applies it. This
   is the root of the unauthenticated-probe limitation above.
-- **The agent tool interface, partly.** `hx tool` (see [Tools](#tools) above) exposes eleven
-  of the seventeen tools over a shell; an MCP adapter over the same `dispatch`, and the six
-  tools that need a live session, are not built yet.
+- **A crawler.** `crawl.run` is registered and permanently answers
+  `unavailable / not_implemented`. Discovery is the operator's browser through the proxy,
+  and a report should say so.
 - **The web app screens.**
 
 ---

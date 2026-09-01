@@ -21,7 +21,7 @@ from .. import impl  # noqa: F401  -- registers every tool
 from .. import registry
 
 
-def build_context(engagement) -> dispatch_mod.ToolContext:
+def build_context(engagement, *, stack=None) -> dispatch_mod.ToolContext:
     """A context over an open engagement.
 
     NOTHING IS BOUND HERE, and that is fine: each `hx tool` invocation is its
@@ -32,13 +32,21 @@ def build_context(engagement) -> dispatch_mod.ToolContext:
     cannot do is hold a run across invocations in the FIELD -- there is no
     long-lived object here for `run.start` to bind onto that a later call
     would see -- which is exactly why the resolution had to move to the
-    store rather than staying a process-local field. Plan B's MCP adapter is
-    one long-lived process, and can bind for real; that is not this task.
+    store rather than staying a process-local field.
+
+    `stack` IS NONE FROM THIS ADAPTER AND THAT IS THE HONEST ANSWER, not a
+    limitation waiting to be lifted. `hx.session.session()` tears Burp down on
+    every exit, so a JVM launched inside a one-shot `hx tool` process dies
+    with it -- there is no object here for a session to outlive. `run.start`
+    is told so and reports `session: {live: false, reason: "no_host"}`, which
+    names `hx mcp` as the adapter that can. The parameter exists because
+    `hx mcp` builds its context through this same function.
     """
     return dispatch_mod.ToolContext(
         engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
         config=engagement.config,
-        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db),
+        stack=stack)
 
 
 def render_listing() -> str:

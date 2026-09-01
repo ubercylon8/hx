@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from hx.tools import envelope, journal
 
 
@@ -68,3 +70,93 @@ def test_the_why_is_stored_verbatim(engagement):
                    env=envelope.answered("run.start", {"run_id": "r-1"}),
                    blobs=engagement.blobs)
     assert _row(engagement.db, engagement.id)[4] == "mapping the checkout flow"
+
+
+@pytest.mark.parametrize("raw,expect_absent", [
+    ("/callback?access_token=SEKRIT&state=x", "SEKRIT"),
+    ("/cb?token=SEKRIT", "SEKRIT"),
+    ("http://alice:SEKRIT@app.test/a", "SEKRIT"),
+])
+def test_a_credential_in_a_url_argument_is_redacted_too(raw, expect_absent):
+    """THE HEADER GUARD DID NOT COVER THIS, and the store disagreed with
+    itself about the same string. MEASURED before the fix: `exchange.url`
+    held `access_token={{observed:param}}` while `agent_action.args_blob`
+    held the token verbatim -- one table redacting what the other kept.
+
+    `http.send`'s `path` is agent-supplied and required, and replaying an
+    OAuth callback is ordinary work during an assessment, so this is
+    reachable by typing rather than by contriving."""
+    got = journal._redacted(raw)
+    assert expect_absent not in got
+    # The KEY survives: "the agent sent an access_token" is the fact
+    # run.journal exists to report.
+    assert "{{observed:" in got
+
+
+def test_redaction_leaves_ordinary_strings_alone():
+    """The redactor runs over EVERY string argument, so it has to be inert on
+    the ones that carry nothing. A guard that mangled `pattern` or `path`
+    would corrupt the journal's account of what was tried."""
+    for benign in ["needle", "/a?b=c", "GET", "", "not a url, just prose"]:
+        assert journal._redacted(benign) == benign
+
+
+@pytest.mark.parametrize("raw,secret", [
+    ("field=1\r\nCookie: session=SEKRIT\r\nother=3", "SEKRIT"),
+    ("a=1\nAuthorization: Bearer SEKRIT", "SEKRIT"),
+    ("x=1\r\nProxy-Authorization: Basic SEKRIT\r\ny=2", "SEKRIT"),
+])
+def test_a_credential_on_a_later_line_is_redacted(raw, secret):
+    """THE ANCHORED VERSION MISSED THE SHAPE `http.send` ALREADY SHIPS.
+    `headers` arrives as separate array items, so line one was always the
+    whole string and `.match` sufficed. A `body` is one free string, and an
+    agent replaying a captured request by hand puts a whole request in it --
+    credential on line two, nothing looking past line one.
+
+    This was recorded in DECISIONS.md as debt against a hypothetical FUTURE
+    tool taking a raw request string. The tool exists; it is `http.send`."""
+    got = journal._redacted(raw)
+    assert secret not in got
+    assert "{{observed:" in got
+
+
+def test_redaction_keeps_the_lines_around_a_credential():
+    """Only the matched LINES go. A journal that dropped the rest of a body
+    would answer "what did I already try" with a request that was never
+    made."""
+    got = journal._redacted("field=1\r\nCookie: session=SEKRIT\r\nother=3")
+    assert "field=1" in got and "other=3" in got
+    # And no stray CR left inside the value that replaced the line: MULTILINE's
+    # `$` matches before the `\n` but not before the `\r`.
+    assert "\r\r" not in got
+    assert got.count("\r\n") == 2
+
+
+@pytest.mark.parametrize("sep,label", [
+    ("\r", "bare CR -- a line terminator RFC 9112 s2.2 requires tolerating"),
+    ("\r\n", "CRLF"),
+    ("\n", "bare LF"),
+])
+def test_a_credential_after_any_line_terminator_is_redacted(sep, label):
+    """MULTILINE's `^` treats only `\\n` as a boundary, and CR ends a line in
+    HTTP. `hx.http_text.split_head_body` tolerates a bare CR for exactly that
+    reason, so a request split on one puts a credential at a real line start
+    that `^` alone does not see. MEASURED before the fix:
+    `"field=1\\rCookie: session=<real>"` reached args_blob intact."""
+    got = journal._redacted(f"field=1{sep}Cookie: session=SEKRIT")
+    assert "SEKRIT" not in got, label
+    assert "{{observed:cookie}}" in got
+
+
+@pytest.mark.parametrize("raw", [
+    "the Cookie: header was odd",
+    "a=1; Cookie: b",
+    "explaining why Authorization: matters",
+])
+def test_a_credential_name_that_does_not_start_a_line_is_left_alone(raw):
+    """NOT THE SAME GAP UNFIXED -- a decision. None of these is a header
+    line: they are prose and a form field. A redactor firing on them would
+    corrupt the journal's account of what was tried, which is the one thing
+    it exists to preserve. What is guarded is a credential at a LINE START,
+    in every spelling a line can start with."""
+    assert journal._redacted(raw) == raw

@@ -108,6 +108,43 @@ class ToolContext:
     config: Any
     halt: Any
     session: Any = None
+    #: The ADAPTER'S ExitStack, and the reason egress belongs to a long-lived
+    #: adapter rather than to `hx tool`. `hx.session.session()` tears Burp
+    #: down on EVERY exit, so a JVM launched inside a one-shot `hx tool`
+    #: process dies microseconds later -- there is no object in that adapter
+    #: for a session to outlive. `hx mcp` is one process for the whole
+    #: conversation, opens a stack around its serve loop, and hands it here;
+    #: `run.start` pushes the session onto it and `run.finish` pops it. A
+    #: crash unwinds the stack, which is spec section 8's "a crash must not
+    #: orphan a JVM" -- the FIRST of its three layers, the other two being
+    #: `run.reap_stale` and `session()`'s own teardown.
+    #:
+    #: None means this adapter cannot host a session, which is a different
+    #: fact from "no session is open" and is reported as its own reason.
+    stack: Any = None
+    #: The run that launched the session on `stack`. At most one session at a
+    #: time -- see `hx.tools.live`.
+    _session_run_id: str | None = dataclasses.field(default=None, repr=False)
+    #: An ExitStack NESTED inside `stack`, holding the session and nothing
+    #: else, so that `run.finish` can tear down the session WITHOUT tearing
+    #: down whatever else the adapter registered on its own stack. Closing an
+    #: inner stack unwinds only what the inner stack holds and leaves it
+    #: reusable; closing the outer one still unwinds the inner, so a crash
+    #: kills the JVM exactly as before.
+    #:
+    #: CREATED ONCE AND REUSED, deliberately. Entering a fresh inner stack per
+    #: session would leave one spent `__exit__` callback on the adapter's
+    #: stack per session -- a no-op each, and unbounded growth across an
+    #: `hx mcp` conversation that opens and closes runs all day. `ExitStack.
+    #: close()` leaves the stack usable, so one is enough for every session
+    #: this context will ever hold.
+    _session_stack: Any = dataclasses.field(default=None, repr=False)
+    #: `(identity_id, generation)` already registered on THIS session's
+    #: extension. `BridgeServer.register_identity` refuses a generation that
+    #: does not advance what the extension holds (`stale_generation`), so a
+    #: second registration of the same pair is an error, not a no-op. Cleared
+    #: with the session, because a new extension has heard of none of them.
+    _registered: set = dataclasses.field(default_factory=set, repr=False)
     actor: str = "agent"
     _bound_run_id: str | None = dataclasses.field(default=None, repr=False)
     #: `None` means "not resolved for this call yet", never "resolved to

@@ -58,6 +58,16 @@ class FakeBridge:
         # run issued under the identity" is a claim about all of them, and
         # `last_req` alone cannot tell one bound probe from ten.
         self.requests: list[dict] = []
+        # Every `register_identity` call, and every queued `replies()` answer
+        # not yet consumed. Both additive -- see the two methods below.
+        self.identities: list = []
+        self._queue: list | None = None
+        # Set by `refuse_identity`, read by `register_identity`. Separate
+        # from `_refusal`/`_refusals_left` above: those are `send`'s and a
+        # test proving `http.send` reports an identity REGISTRATION refusal
+        # (the extension's own liveness canary answering `identity_dead`,
+        # say) needs `send` itself to still be free to answer normally.
+        self._identity_refusal: tuple[str, str] | None = None
 
     def reply(self, header: dict, body: bytes = b"") -> None:
         self._header = header
@@ -70,6 +80,40 @@ class FakeBridge:
         self._refusal = (cls, detail, retry_after_us)
         self._refusals_left = times
 
+    def register_identity(self, resolved, *, origins) -> None:
+        """Recorded, never asserted-on by this class. `hx.tools.live` must
+        register an identity exactly once per generation -- the real
+        extension refuses a repeat with `stale_generation` -- so a test needs
+        to be able to COUNT registrations, and the credential must be
+        countable without being printed.
+
+        REFUSES INSTEAD, raising `BridgeError`, when `refuse_identity` was
+        called -- reproducing the real `BridgeServer.register_identity`'s own
+        contract (its docstring: "Raises BridgeError ... `error_class` set to
+        the peer's `class`") the same way `send` reproduces `BridgeServer.
+        send`'s.
+        """
+        if self._identity_refusal is not None:
+            cls, detail = self._identity_refusal
+            raise server.BridgeError(
+                f"{cls}: {detail}".rstrip(": "), error_class=cls)
+        self.identities.append((resolved.id, resolved.generation, origins))
+
+    def refuse_identity(self, cls: str, detail: str = "") -> None:
+        """Every `register_identity` call after this one raises `cls`."""
+        self._identity_refusal = (cls, detail)
+
+    def replies(self, seq) -> None:
+        """Queue successive answers for successive sends.
+
+        `reply()` sets ONE answer that every send gets, which is right for a
+        probe loop asking the same question. `http.replay_as` sends N times
+        inside ONE tool call and the whole point is that the answers DIFFER --
+        a single reply would make an authz test pass against a bridge that
+        cannot tell two identities apart.
+        """
+        self._queue = list(seq)
+
     def send(self, req: dict, body: bytes = b"", timeout: float = 30.0,
               *, enforce_locally: bool = True) -> dict:
         self.calls += 1
@@ -77,6 +121,12 @@ class FakeBridge:
         self.last_body = body
         self.bodies.append(body)
         self.requests.append(dict(req))
+        if self._queue:
+            item = self._queue.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            header, resp_body = item
+            return {**header, server.BridgeServer.BODY_KEY: resp_body}
         if self._refusal is not None and self._refusals_left != 0:
             if self._refusals_left is not None:
                 self._refusals_left -= 1
@@ -85,6 +135,13 @@ class FakeBridge:
                 f"{cls}: {detail}".rstrip(": "), error_class=cls,
                 retry_after_us=hint)
         return {**self._header, server.BridgeServer.BODY_KEY: self._body}
+
+
+def sent_result(body=b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nhi",
+                *, status=200, ms=7, outcome="ok", epoch=1):
+    """One `result` frame, shaped as `Sender.decideAndIssue` builds it."""
+    return ({"status": status, "bytes": len(body), "ms": ms,
+             "outcome": outcome, "config_epoch": epoch}, body)
 
 
 def _sender(bridge, path="/a"):

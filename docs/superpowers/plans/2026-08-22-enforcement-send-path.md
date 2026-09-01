@@ -3214,6 +3214,43 @@ public class PolicyTest {
         //
         // The absolute figures are still PRINTED, because a reader chasing a
         // slow suite wants the milliseconds even when the ratio is fine.
+        //
+        // THE CEILING IS CALIBRATED TO THE SLOWEST MACHINE THIS SUITE RUNS ON,
+        // amended 2026-09-01, and 100 was calibrated to the fastest. The
+        // paragraphs above measured 54 on a 24-core desktop and set the
+        // ceiling at roughly 2x that -- but the suite also runs on GitHub's
+        // shared 2-4 vCPU runners, where it read 107 and 112 and went red on
+        // 3 of 12 runs with no Java change in the branch at all. That is the
+        // third time this check has been red for the machine rather than the
+        // code, and the paragraph above already names the cost: a reader
+        // trained to look past a red line looks past the one that matters.
+        //
+        // MEASURED THIS ROUND, all three machine classes:
+        //   24-core desktop, quiescent        55, 55, 56
+        //   the same, 24 busy threads         56, 77   (absolute 170-219 ms)
+        //   GitHub shared runner              107, 112
+        // The ratio is NOT machine-independent, which the earlier round hoped
+        // it would be: the costly path does 16 readings over 8 KB and a weak
+        // shared vCPU punishes it harder than it punishes the short reference,
+        // so the ratio rises as the machine gets worse. 250 is ~2.2x the worst
+        // figure observed anywhere, keeping the author's original 2x rule
+        // while applying it to the machine that actually fails.
+        //
+        // AND A MIN-OF-N ESTIMATOR WAS TRIED FIRST, because "use the least
+        // contended sample" is the obvious answer and it does not work here:
+        // measured under 24-thread load, min read 77 and 74 where the median
+        // read 75 and 56 -- sometimes worse, never better. Recorded so the
+        // next person reaching for it can skip the experiment.
+        //
+        // WHAT THIS CHECK IS WORTH, restated because a looser ceiling makes it
+        // fair to ask. It does not catch the defect it was written for -- the
+        // paragraph above measured the ratio UNCHANGED at 54 with the reading
+        // bound removed, and the deterministic `readingBudget` assertions
+        // earlier in this file are where that guarantee lives. What it catches
+        // is a change making the EXPENSIVE path disproportionately worse, and
+        // it catches that at 250 as well as at 100 for any regression worth a
+        // red line: a doubling of the costly path alone reads 220 on a desktop
+        // and over 250 on CI.
         String costly = "/\u2215\u2170\ufe52/D\uff0f2\u2216;%c2/.\u2170\u29f89\u0269/\uff05";
         StringBuilder costlyTiled = new StringBuilder();
         while (costlyTiled.length() + costly.length() <= Policy.MAX_TARGET_CHARS)
@@ -3252,8 +3289,8 @@ public class PolicyTest {
               + " characters, " + Policy.readings(costlyPath, Policy.readingBudget(costlyPath.length())).size()
               + " readings) is answered " + (cVerdict.allowed() ? "allow" : cVerdict.errorClass())
               + " at " + ratio + "x the cost of the same volume read cheaply ("
-              + (cNs / 1_000_000) + " ms vs " + (rNs / 1_000_000) + " ms)",
-              ratio < 100 && cVerdict != null);
+              + (cNs / 1_000) + " us vs " + (rNs / 1_000) + " us)",
+              ratio < 250 && cVerdict != null);
 
         // ...while a long BENIGN target is decided rather than refused: the
         // size bound must not turn into a length bound of its own.
@@ -23192,17 +23229,19 @@ def test_the_module_docstrings_counts_are_the_counts():
     """The docstring said "twenty-one columns, six of which are nullable ids".
     Both numbers were wrong, and neither was checkable by reading.
 
-    MEASURED: the two INSERTs name 26 columns (10 + 16). Twenty-three is the
-    number of keyword parameters (9 + 14) -- a different thing, and the likely
+    MEASURED: the two INSERTs name 29 columns (10 + 19). Twenty-six is the
+    number of keyword parameters (9 + 17) -- a different thing, and the likely
     source of the error, so it is derived here too and named as itself. Five
     keyword parameters are nullable ids; `req_blob` and `resp_blob` are `str |
     None` as well and are deliberately excluded, because a blob digest is not
     a row id.
 
     The numbers were 25 and 21 until Plan 4 gave both writers a `via` and
-    `denial` the column to put it in. That they MOVED is the demonstration:
-    the docstring they pin was updated because this went red, which is the
-    opposite of the comment that carried a stale number for two plans.
+    `denial` the column to put it in, then 26 and 23 until Plan B gave
+    `record_exchange` the identity triple. That they keep MOVING is the
+    demonstration: the docstring they pin was updated because this went red,
+    which is the opposite of the comment that carried a stale number for two
+    plans.
 
     Derived rather than transcribed. A comment carrying a number nothing
     computes is a comment that goes stale on the next column.
@@ -23227,8 +23266,8 @@ def test_the_module_docstrings_counts_are_the_counts():
             if annotation == "str | None" and param.name.endswith("_id"):
                 nullable_ids.append(f"{name}.{param.name}")
 
-    assert columns == 26, columns
-    assert keywords == 23, keywords
+    assert columns == 29, columns
+    assert keywords == 26, keywords
     assert nullable_ids == [
         "record_denial.run_id", "record_denial.scope_version_id",
         "record_exchange.run_id", "record_exchange.surface_id",
@@ -23237,8 +23276,8 @@ def test_the_module_docstrings_counts_are_the_counts():
 
     # ...and the docstring says the numbers this just computed.
     doc = records.__doc__
-    assert "**26** columns" in doc, doc
-    assert "10 on `denial`, 16 on `exchange`" in doc, doc
+    assert "**29** columns" in doc, doc
+    assert "10 on `denial`, 19 on `exchange`" in doc, doc
     assert "**five**" in doc, doc
 
 
@@ -23566,6 +23605,32 @@ def test_ids_have_the_shape_the_rest_of_the_store_uses():
     assert re.fullmatch(r"d-[0-9a-f]{12}", records.new_id("d"))
     assert re.fullmatch(r"d-[0-9a-f]{12}", engagement_mod._new_id("d"))
     assert len({records.new_id("d") for _ in range(1000)}) == 1000
+
+
+def test_record_exchange_carries_the_identity_triple(conn):
+    """The three columns have existed since SCHEMA_VERSION 9 and nothing has
+    ever filled them. A send issued under a named identity is the first
+    traffic in this build that HAS an identity to record."""
+    row_id = records.record_exchange(
+        conn, run_id="r-1", method="GET", url="http://127.0.0.1:8080/a",
+        status=200, req_blob=None, resp_blob=None, ms=5, at_us=1,
+        identity="staff", identity_generation=3, identity_state="assumed")
+    got = conn.execute(
+        "SELECT identity, identity_generation, identity_state"
+        " FROM exchange WHERE id=?", (row_id,)).fetchone()
+    assert tuple(got) == ("staff", 3, "assumed")
+
+
+def test_record_exchange_still_defaults_the_triple_to_null(conn):
+    """Every existing call site passes none of the three, and an anonymous
+    send has none to pass. NULL is the fact, not a gap."""
+    row_id = records.record_exchange(
+        conn, run_id="r-1", method="GET", url="http://127.0.0.1:8080/a",
+        status=200, req_blob=None, resp_blob=None, ms=5, at_us=1)
+    got = conn.execute(
+        "SELECT identity, identity_generation, identity_state"
+        " FROM exchange WHERE id=?", (row_id,)).fetchone()
+    assert tuple(got) == (None, None, None)
 ```
 
 
@@ -23593,11 +23658,12 @@ argument would file evidence against the wrong run without any type error to
 show for it.
 
 COUNTED, because this paragraph had both numbers wrong. The two INSERTs name
-**26** columns -- 10 on `denial`, 16 on `exchange` -- not twenty-one; 23 is the
-number of KEYWORD PARAMETERS the two writers take between them (9 and 14),
+**29** columns -- 10 on `denial`, 19 on `exchange` -- not twenty-one; 26 is the
+number of KEYWORD PARAMETERS the two writers take between them (9 and 17),
 which is a different thing and the likely source of the error. (25/21/8/13
-until Plan 4 gave both writers a `via`, and `denial` the column to put it in.
-The numbers move; that they are DERIVED rather than transcribed is the point.)
+until Plan 4 gave both writers a `via`, and `denial` the column to put it in;
+26/23/9/14 until Plan B gave `record_exchange` the identity triple. The
+numbers move; that they are DERIVED rather than transcribed is the point.)
 And **five** of
 those parameters are nullable ids of the same shape, not six:
 `record_denial.run_id`, `record_denial.scope_version_id`,
@@ -24195,7 +24261,10 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
                     resp_len: int | None = None,
                     surface_id: str | None = None,
                     scope_version_id: str | None = None,
-                    seq: int | None = None) -> str:
+                    seq: int | None = None,
+                    identity: str | None = None,
+                    identity_generation: int | None = None,
+                    identity_state: str | None = None) -> str:
     """Record one request that was issued. Returns the row id.
 
     `req_blob` and `resp_blob` are blob-store digests of the REDACTED bytes.
@@ -24216,9 +24285,15 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     proxy's egress point and passed 'proxy'. It still DEFAULTS to 'send', so
     every send-path call site is unchanged; `crawl` has no caller yet.
 
-    `identity`, `identity_generation` and `identity_state` stay NULL. Identity
-    injection ships in Plan 5; writing 'assumed' now would be a claim about
-    authentication that nothing in this plan can support.
+    THE IDENTITY TRIPLE IS NULL FOR EVERYTHING THIS BUILD HAD UNTIL PLAN B.
+    The three columns arrived with SCHEMA_VERSION 9 and nothing filled them:
+    proxy traffic carries the operator's own browser session, which the
+    identity design puts out of scope, and no send path recorded a row at
+    all. `hx.issue` is the first caller with an answer, and it writes
+    `identity_state='assumed'` -- never `proven`. A canary bracket proves a
+    RUN (spec section 6); one send has no bracket, so `assumed` is the whole
+    of what is known and `proven` here would be a claim no canary backs.
+    Defaulted to None so every existing call site is byte-for-byte unchanged.
     """
     if via not in VIA_VALUES:
         raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
@@ -24275,15 +24350,17 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
         " recv_us, method, url, status, req_blob, resp_blob, resp_len,"
-        " body_shed, scope_version_id, seq)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " body_shed, scope_version_id, seq, identity, identity_generation,"
+        " identity_state)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (row_id, run_id, surface_id, via, outcome, at_us,
          at_us + ms * 1000, method, url, status, req_blob, resp_blob,
          resp_len,
          # S6: solicited exchanges are NEVER shed -- they are about to become
          # evidence. Only unsolicited proxy observations may set this.
          0,
-         scope_version_id, seq),
+         scope_version_id, seq, identity, identity_generation,
+         identity_state),
     )
     return row_id
 
@@ -28942,6 +29019,8 @@ import pytest
 from hx import config, engagement, session
 from hx.bridge import server
 from hx.halt import OperatorHalt
+from hx.tools import dispatch as dispatch_mod
+from hx.tools import impl as tools_impl  # noqa: F401 -- registers every tool
 from tests.integration import burp_fixture as bf
 from tests.integration.target_server import TargetServer
 
@@ -29354,9 +29433,23 @@ class Rig:
 # copied real client project state into a temporary directory, and reported
 # green. It is a guard now rather than a warning: the same env dict also sets
 # `HOME` to a directory that does not exist, so a seed variable that goes
-# missing fails loudly, in that test, naming the fake home. What is true here
-# is the narrow claim: no fixture in this directory sets that variable, and no
-# launcher in this file needs it, because they say the seed in code.
+# missing fails loudly, in that test, naming the fake home.
+#
+# A SECOND TEST DEPENDS ON IT, AND FROM A FIXTURE. `tests/integration/
+# test_tool_session.py` drives `hx.tools.live.open_for`, which calls
+# `session()` with NO `seed` on purpose -- a tool layer has no business
+# choosing which Burp home a consultant's licence lives in -- so the
+# environment variable is the only lever that test has, and its module-scoped
+# autouse `_prerequisites` fixture sets it beside the unbuilt/missing guards.
+# That is the correct lever rather than a shortcut past this paragraph: the
+# alternative would be a `seed=` argument threaded from `run.start` through
+# `open_for` into the product, existing for the benefit of one test.
+#
+# What is true here is the narrow claim, and it is now about THIS file: no
+# fixture in `tests/integration/conftest.py` sets that variable, and no
+# launcher in this file needs it, because they say the seed in code. A
+# fixture in a test MODULE that sets it -- scoped to that module, never
+# autouse across the directory -- is the documented override doing its job.
 
 
 @pytest.fixture
@@ -29472,6 +29565,88 @@ def rig(tmp_path):
         yield Rig(eng=eng, srv=srv, proc=proc, target=target, offside=offside,
                   halt=operator_halt, run_id=run_id, workdir=tmp_path,
                   proxy_port=ports[0], crawler_port=ports[1])
+
+
+@pytest.fixture
+def target():
+    """One loopback `TargetServer`, for a test that needs a real peer and
+    nothing else about `rig` -- no engagement, no bridge, no Burp.
+
+    `tool_session` below depends on this fixture rather than building its own
+    `TargetServer`, so the two agree on which loopback address and port a
+    test's `config.scope_include` was built from.
+    """
+    srv = TargetServer("127.0.0.1")
+    srv.start()
+    try:
+        yield srv
+    finally:
+        srv.stop()
+
+
+@pytest.fixture
+def tool_session(tmp_path, target, monkeypatch):
+    """A `ToolContext` with a real, live Burp bracketed around a `manual` run.
+
+    `tests/integration/test_tool_session.py` already proves the bracket
+    itself -- `run.start` brings up a CONFIGURED Burp, `run.finish` takes it
+    away. This fixture exists for `http.send`'s own integration test, which
+    needs the same bracket sitting in front of a real target rather than
+    `FakeBridge`.
+
+    THE BRACKET IS THE PRODUCT'S, not `bf.launch_burp` called directly the
+    way `rig` calls it. `dispatch(ctx, "run.start", ...)` is what an agent
+    actually invokes, so proving `http.send` here through anything else would
+    prove a different code path than the one this task built.
+
+    THE SEED HOME IS NOT THE OPERATOR'S, for the same reason
+    `test_tool_session.py`'s own docstring gives: `hx.tools.live.open_for`
+    calls `session()` with no `seed`, deliberately, because a tool layer has
+    no business choosing which Burp home a consultant's licence lives in. So
+    this fixture says so the way an operator would, through
+    `$HX_BURP_SEED_HOME` -- copied here rather than imported, because it is
+    exactly the lever that file already documents and there is no third
+    reason to invent.
+
+    THE UNBUILT/MISSING GUARD ORDER MATCHES `rig`'S: an unbuilt jar is a
+    FAILURE (a forgotten `extension/build.sh` must not read as "no Burp
+    here"), and only once that is ruled out does a missing Burp install
+    become a SKIP.
+    """
+    if bf.unbuilt():
+        pytest.fail("unbuilt: " + ", ".join(bf.unbuilt()))
+    if bf.missing():
+        pytest.skip("missing: " + ", ".join(bf.missing()))
+    monkeypatch.setenv("HX_BURP_SEED_HOME", str(bf.SEED_HOME))
+
+    cfg = config.Config(name="tool-session", client="loopback",
+                        scope_include=[f"{target.origin}/*"])
+    eng = engagement.create(tmp_path / "engagement", cfg,
+                            author="integration-tool-session")
+    with contextlib.ExitStack() as stack:
+        # BEFORE anything that can fail below it, so a `run.start` that
+        # raises still closes the database this fixture opened -- the same
+        # ordering discipline `rig` uses for `target.stop`/`offside.stop`.
+        stack.callback(eng.db.close)
+        ctx = dispatch_mod.ToolContext(
+            engagement=eng, conn=eng.db, blobs=eng.blobs, config=eng.config,
+            halt=OperatorHalt(eng.root, eng.db), stack=stack)
+        env = dispatch_mod.dispatch(
+            ctx, "run.start", {"kind": "manual"},
+            why="integration fixture: bracket a Burp for http.send")
+        if env.outcome != "ok":
+            pytest.fail(f"run.start did not open a session: {env.as_dict()}")
+        try:
+            yield ctx
+        finally:
+            # THE OWNER CLOSES IT. `hx.tools.live.close_for` only tears down
+            # a session this run opened, and this fixture's `run.start`
+            # above is that run -- see its own docstring for why a second
+            # run helping itself to another run's teardown is not the shape
+            # to invite even in a fixture.
+            dispatch_mod.dispatch(
+                ctx, "run.finish", {"status": "completed"},
+                why="integration fixture: close the bracket")
 ```
 
 - [ ] **Step 8: Write the end-to-end test**

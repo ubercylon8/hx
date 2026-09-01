@@ -11,11 +11,12 @@ argument would file evidence against the wrong run without any type error to
 show for it.
 
 COUNTED, because this paragraph had both numbers wrong. The two INSERTs name
-**26** columns -- 10 on `denial`, 16 on `exchange` -- not twenty-one; 23 is the
-number of KEYWORD PARAMETERS the two writers take between them (9 and 14),
+**29** columns -- 10 on `denial`, 19 on `exchange` -- not twenty-one; 26 is the
+number of KEYWORD PARAMETERS the two writers take between them (9 and 17),
 which is a different thing and the likely source of the error. (25/21/8/13
-until Plan 4 gave both writers a `via`, and `denial` the column to put it in.
-The numbers move; that they are DERIVED rather than transcribed is the point.)
+until Plan 4 gave both writers a `via`, and `denial` the column to put it in;
+26/23/9/14 until Plan B gave `record_exchange` the identity triple. The
+numbers move; that they are DERIVED rather than transcribed is the point.)
 And **five** of
 those parameters are nullable ids of the same shape, not six:
 `record_denial.run_id`, `record_denial.scope_version_id`,
@@ -613,7 +614,10 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
                     resp_len: int | None = None,
                     surface_id: str | None = None,
                     scope_version_id: str | None = None,
-                    seq: int | None = None) -> str:
+                    seq: int | None = None,
+                    identity: str | None = None,
+                    identity_generation: int | None = None,
+                    identity_state: str | None = None) -> str:
     """Record one request that was issued. Returns the row id.
 
     `req_blob` and `resp_blob` are blob-store digests of the REDACTED bytes.
@@ -634,9 +638,15 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     proxy's egress point and passed 'proxy'. It still DEFAULTS to 'send', so
     every send-path call site is unchanged; `crawl` has no caller yet.
 
-    `identity`, `identity_generation` and `identity_state` stay NULL. Identity
-    injection ships in Plan 5; writing 'assumed' now would be a claim about
-    authentication that nothing in this plan can support.
+    THE IDENTITY TRIPLE IS NULL FOR EVERYTHING THIS BUILD HAD UNTIL PLAN B.
+    The three columns arrived with SCHEMA_VERSION 9 and nothing filled them:
+    proxy traffic carries the operator's own browser session, which the
+    identity design puts out of scope, and no send path recorded a row at
+    all. `hx.issue` is the first caller with an answer, and it writes
+    `identity_state='assumed'` -- never `proven`. A canary bracket proves a
+    RUN (spec section 6); one send has no bracket, so `assumed` is the whole
+    of what is known and `proven` here would be a claim no canary backs.
+    Defaulted to None so every existing call site is byte-for-byte unchanged.
     """
     if via not in VIA_VALUES:
         raise ValueError(f"unknown via {via!r}; S5 names {sorted(VIA_VALUES)}")
@@ -693,15 +703,17 @@ def record_exchange(conn: sqlite3.Connection, *, run_id: str | None,
     conn.execute(
         "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
         " recv_us, method, url, status, req_blob, resp_blob, resp_len,"
-        " body_shed, scope_version_id, seq)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " body_shed, scope_version_id, seq, identity, identity_generation,"
+        " identity_state)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (row_id, run_id, surface_id, via, outcome, at_us,
          at_us + ms * 1000, method, url, status, req_blob, resp_blob,
          resp_len,
          # S6: solicited exchanges are NEVER shed -- they are about to become
          # evidence. Only unsolicited proxy observations may set this.
          0,
-         scope_version_id, seq),
+         scope_version_id, seq, identity, identity_generation,
+         identity_state),
     )
     return row_id
 

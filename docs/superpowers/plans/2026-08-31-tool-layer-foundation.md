@@ -1262,9 +1262,35 @@ OUTCOMES = ("ok", "empty", "unavailable", "refused", "error")
 #: The report counts refusals by reason -- a cross-partition reason corrupts a
 #: client-facing number. Twelve tests passed with this open because only one
 #: tried a reason outside REASONS entirely; none crossed between groups.
+#: WIDENED FOR `http.send` (Task 4): the wire's own refusal classes now flow
+#: through, unchanged, from `hx.tools.impl.http.REASON_FOR_CLASS`. The split
+#: between the two outcomes is not arbitrary. REFUSED is "something decided
+#: no" -- scope, method, dangerous-path, rate and budget are the extension's
+#: POLICY answering, and a client-facing count of refusals is a statement
+#: about scope discipline. UNAVAILABLE is "no answer came back" -- a timeout,
+#: a dropped bridge or an unconfigured extension decided NOTHING, and counting
+#: those as refusals would put network weather into a number an operator
+#: reads as policy. Both are `ran=False`, so neither can be misread as a clean
+#: result; what differs is what the report is entitled to say about them.
 REASONS_FOR = {
-    "refused": frozenset({"not_registered", "halted", "missing_why", "bad_args", "run_open"}),
-    "unavailable": frozenset({"no_session", "no_run", "not_implemented"}),
+    "refused": frozenset({
+        "not_registered", "halted", "missing_why", "bad_args", "run_open",
+        "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
+        "budget_exhausted", "bad_frame", "wrong_run_kind",
+        # WIDENED AGAIN BY RULING 19, and for the same reason as the first
+        # widening: these are the rest of what the extension can put on an
+        # `error` frame, and nine of them were falling through to
+        # `unavailable / transport_error` -- a policy denial counted as
+        # network weather in the one number an operator reads as scope
+        # discipline. `tests/test_tools_http.py` compares this side against
+        # the emit sites the Java actually carries.
+        "unmanaged_credential", "unknown_identity", "identity_origin",
+        "unknown_frame", "protocol_mismatch", "engagement_mismatch",
+        "bad_config", "bad_identity", "stale_generation"}),
+    "unavailable": frozenset({
+        "no_session", "no_run", "not_implemented", "identity_dead",
+        "identity_unresolved", "transport_error", "timeout", "bridge_lost",
+        "not_configured", "unreadable"}),
     "error": frozenset({"internal"}),
 }
 
@@ -1532,6 +1558,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from hx.tools import envelope, journal
 
 
@@ -1596,6 +1624,35 @@ def test_the_why_is_stored_verbatim(engagement):
                    env=envelope.answered("run.start", {"run_id": "r-1"}),
                    blobs=engagement.blobs)
     assert _row(engagement.db, engagement.id)[4] == "mapping the checkout flow"
+
+
+@pytest.mark.parametrize("raw,expect_absent", [
+    ("/callback?access_token=SEKRIT&state=x", "SEKRIT"),
+    ("/cb?token=SEKRIT", "SEKRIT"),
+    ("http://alice:SEKRIT@app.test/a", "SEKRIT"),
+])
+def test_a_credential_in_a_url_argument_is_redacted_too(raw, expect_absent):
+    """THE HEADER GUARD DID NOT COVER THIS, and the store disagreed with
+    itself about the same string. MEASURED before the fix: `exchange.url`
+    held `access_token={{observed:param}}` while `agent_action.args_blob`
+    held the token verbatim -- one table redacting what the other kept.
+
+    `http.send`'s `path` is agent-supplied and required, and replaying an
+    OAuth callback is ordinary work during an assessment, so this is
+    reachable by typing rather than by contriving."""
+    got = journal._redacted(raw)
+    assert expect_absent not in got
+    # The KEY survives: "the agent sent an access_token" is the fact
+    # run.journal exists to report.
+    assert "{{observed:" in got
+
+
+def test_redaction_leaves_ordinary_strings_alone():
+    """The redactor runs over EVERY string argument, so it has to be inert on
+    the ones that carry nothing. A guard that mangled `pattern` or `path`
+    would corrupt the journal's account of what was tried."""
+    for benign in ["needle", "/a?b=c", "GET", "", "not a url, just prose"]:
+        assert journal._redacted(benign) == benign
 ```
 
 `tests/conftest.py` has no `engagement` fixture yet — it has `engagement_conn`
@@ -1654,20 +1711,41 @@ common read a single row and refuses to truncate the record of what was tried.
 The `sha256:` prefix makes the two cases unambiguous to whoever reads the
 column, which a bare digest would not.
 
-STORING ARGUMENTS VERBATIM IS SAFE ONLY BECAUSE PRINCIPLE 5 HOLDS: the agent
-passes identity BY NAME, `hx.identity.resolve` runs below this layer, and no
-tool returns a `Resolved`. The safety of this choice rests on Principle 5
-keeping credentials out of the tool layer; it holds for the registered tools'
-schemas, and nothing in this layer filters arguments. `record` serialises
-whatever dict it is handed. Task 11 adds the schema-level assertion.
+STORING ARGUMENTS VERBATIM IS SAFE BECAUSE THE ENCODER REDACTS -- and that
+sentence used to end "because Principle 5 holds". Principle 5 does hold: the
+agent passes identity BY NAME, `hx.identity.resolve` runs below this layer,
+and no tool returns a `Resolved`. But the argument rested on a second claim,
+that it "holds for the registered tools' schemas", and that claim expired the
+moment a tool accepted arbitrary header lines. RULING 21, MEASURED:
+`http.send(headers=["Cookie: session=SUPERSECRETVALUE"])` wrote
+
+    {"headers":["Cookie: session=SUPERSECRETVALUE"], ...}
+
+into `agent_action.args_blob`, and "a credential value never appears in a
+journal row" is a stated binding constraint of this project. `http.send` now
+refuses that argument outright -- but the refusal path is journalled too, so
+the refusal alone would not have closed it, and a future tool that legitimately
+carries header lines would reopen it.
+
+So `encode_args` redacts, and the guarantee is a property of THIS module
+rather than of the schemas above it. It is deliberately blunt: EVERY string
+anywhere in the arguments that BEGINS with one of
+`config.CREDENTIAL_HEADERS` and a colon loses its value, whichever argument
+it arrived in. The cost is real and is the right way round -- an agent
+grepping for its own session cookie sees `http.grep(pattern=...)` recorded
+with the value replaced -- because the alternative is a per-argument rule
+that a future tool would silently fall outside of, which is the exact shape
+of the defect this closes.
 """
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
-from ..store.records import new_id
+from ..config import CREDENTIAL_HEADERS
+from ..store.records import new_id, redact_url
 from .envelope import Envelope
 
 #: Above this many bytes of encoded JSON, the arguments go to the blob store.
@@ -1678,6 +1756,104 @@ SPILL_PREFIX = "sha256:"
 
 #: `result_summary` is read in a list; it is a line, not a document.
 SUMMARY_MAX = 300
+
+#: A string that OPENS with one of the three credential header names and a
+#: colon. Anchored at the start, so `"the Cookie: header"` inside a `why` or a
+#: detail is not a header line and is left alone; the wire lines a tool takes
+#: begin with the field name by definition.
+#:
+#: `config.CREDENTIAL_HEADERS` is IMPORTED rather than restated, for the
+#: reason `hx.tools.impl.http._replayed_headers` gives for importing the same
+#: tuple: it is already pinned byte for byte against the extension's own
+#: `Redactor.CREDENTIAL_HEADERS`, and a second copy is a second thing to keep
+#: in sync with the JVM.
+#: PER LINE, ANYWHERE IN THE STRING -- not anchored at position 0. The
+#: anchored `.match` version covered `headers` (whose lines arrive as separate
+#: array items) and missed the shape `http.send` ALREADY SHIPS: a `body` is a
+#: free string, and an agent replaying a captured request by hand puts a whole
+#: request in one -- `"field=1\r\nCookie: session=<real>"` -- where the
+#: credential is on line two and nothing looked past line one. That was
+#: recorded as debt against a hypothetical FUTURE tool; the tool exists.
+#:
+#: `[^\r\n]*` rather than `.*`: MULTILINE's `$` matches before the `\n` but
+#: not before the `\r`, so `.*` would keep a trailing CR inside the value it
+#: was replacing and leave a stray one in the row.
+#: `(?:^|(?<=\r))` rather than `^` alone: Python's MULTILINE `^` treats only
+#: `\n` as a line boundary, and CR is a line terminator in HTTP. A request
+#: split on bare CR -- which RFC 9112 s2.2 requires a recipient to tolerate,
+#: and which `hx.http_text.split_head_body` tolerates for exactly that reason
+#: -- puts a credential at a real line start that `^` does not recognise.
+#: MEASURED: `"field=1\rCookie: session=<real>"` reached `args_blob` intact.
+#: `\r\n` cannot double-match: after the CR sits the LF, which `[ \t]*` will
+#: not cross, so only the MULTILINE `^` after the LF fires.
+#:
+#: MID-LINE OCCURRENCES ARE DELIBERATELY NOT MATCHED, and that is a decision
+#: rather than the same gap unfixed. `"the Cookie: header was odd"` is prose,
+#: `"a=1; Cookie: b"` is a form field, and neither is a header line; a
+#: redactor that fired on either would corrupt the journal's account of what
+#: was tried, which is the one thing it exists to preserve. A test pins that
+#: inertness. What is guarded is a credential at a LINE START, in any of the
+#: three spellings a line can start with.
+_CREDENTIAL_LINE = re.compile(
+    r"(?:^|(?<=\r))[ \t]*(" + "|".join(re.escape(h) for h in CREDENTIAL_HEADERS)
+    + r")[ \t]*:[^\r\n]*", re.IGNORECASE | re.MULTILINE)
+
+def _placeholder(name: str) -> str:
+    """What replaces a credential header's VALUE.
+
+    The vocabulary the extension already writes into a redacted blob --
+    `{{observed:<name>}}`, lower-cased, `Redactor.observedHeader` -- so an
+    operator reading a journal row and an operator reading a stored request
+    are reading one placeholder rather than two.
+    """
+    return "{{observed:" + name.strip().lower() + "}}"
+
+
+def _redacted(value: Any) -> Any:
+    """`value` with every credential header line's value replaced.
+
+    Recursive over the JSON shapes an argument can be, because the line can
+    arrive anywhere: `http.send` takes an ARRAY of them today, and nothing
+    stops a future tool from taking one string or a dict of them. A guard
+    written for the one shape that exists is the guard that misses the next
+    one -- which is how this hole opened in the first place.
+
+    The NAME is kept and only the value goes, exactly as `records.redact_url`
+    keeps a credential parameter's key: "the agent sent a Cookie header" is
+    the fact `run.journal` exists to report, and a row that dropped the line
+    entirely would answer "what did I already try" with a request that was
+    never made.
+
+    A CREDENTIAL IN A URL IS THE SAME EXPOSURE AND WAS NOT COVERED. Header
+    lines were the shape this guard was written for, and an argument can
+    carry one in a query string just as easily: `http.send`'s `path` is
+    agent-supplied and required, and replaying an OAuth callback --
+    `/cb?access_token=...` -- is ordinary work during an assessment.
+    MEASURED: `exchange.url` held `access_token={{observed:param}}` while
+    `agent_action.args_blob` held the token, so the store redacted the same
+    string in one table and kept it in the other.
+
+    `records.redact_url` is REUSED rather than reimplemented -- it already
+    knows userinfo and the credential parameter names, and it is what writes
+    the redacted `exchange.url` this was disagreeing with. It is safe on
+    arbitrary strings: measured against prose, bare words, header lines and
+    empty input, it returns them unchanged and raises on none of them, so it
+    can run over every string argument rather than over ones guessed to be
+    URLs. Found by the first automated review this repository completed.
+    """
+    if isinstance(value, str):
+        # `sub`, not `match`: one string can carry several credential lines and
+        # can carry them beside content worth keeping. Replacing only the
+        # matched LINES leaves the rest of a body intact, so the journal still
+        # answers "what did I already try" with the request that was made.
+        redacted = _CREDENTIAL_LINE.sub(
+            lambda m: f"{m.group(1)}: {_placeholder(m.group(1))}", value)
+        return redact_url(redacted)
+    if isinstance(value, dict):
+        return {key: _redacted(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redacted(item) for item in value]
+    return value
 
 
 def _now_us() -> int:
@@ -1691,13 +1867,18 @@ def encode_args(args: dict[str, Any], blobs) -> str | None:
     reader comparing journal rows is comparing arguments rather than dict
     ordering.
 
+    CREDENTIAL HEADER LINES LOSE THEIR VALUES FIRST -- see this module's
+    docstring for why that guarantee lives here rather than in the schemas
+    above. The redaction runs before `json.dumps`, so it covers the spilled
+    blob exactly as it covers the inline column.
+
     May raise `TypeError` or `ValueError` if `json.dumps` encounters a
     non-serialisable value or circular reference; the raise happens before
     the `INSERT`, so no partial row is written.
     """
     if not args:
         return None
-    text = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    text = json.dumps(_redacted(args), sort_keys=True, separators=(",", ":"))
     raw = text.encode("utf-8")
     if len(raw) <= ARGS_INLINE_MAX:
         return text
@@ -2205,6 +2386,43 @@ class ToolContext:
     config: Any
     halt: Any
     session: Any = None
+    #: The ADAPTER'S ExitStack, and the reason egress belongs to a long-lived
+    #: adapter rather than to `hx tool`. `hx.session.session()` tears Burp
+    #: down on EVERY exit, so a JVM launched inside a one-shot `hx tool`
+    #: process dies microseconds later -- there is no object in that adapter
+    #: for a session to outlive. `hx mcp` is one process for the whole
+    #: conversation, opens a stack around its serve loop, and hands it here;
+    #: `run.start` pushes the session onto it and `run.finish` pops it. A
+    #: crash unwinds the stack, which is spec section 8's "a crash must not
+    #: orphan a JVM" -- the FIRST of its three layers, the other two being
+    #: `run.reap_stale` and `session()`'s own teardown.
+    #:
+    #: None means this adapter cannot host a session, which is a different
+    #: fact from "no session is open" and is reported as its own reason.
+    stack: Any = None
+    #: The run that launched the session on `stack`. At most one session at a
+    #: time -- see `hx.tools.live`.
+    _session_run_id: str | None = dataclasses.field(default=None, repr=False)
+    #: An ExitStack NESTED inside `stack`, holding the session and nothing
+    #: else, so that `run.finish` can tear down the session WITHOUT tearing
+    #: down whatever else the adapter registered on its own stack. Closing an
+    #: inner stack unwinds only what the inner stack holds and leaves it
+    #: reusable; closing the outer one still unwinds the inner, so a crash
+    #: kills the JVM exactly as before.
+    #:
+    #: CREATED ONCE AND REUSED, deliberately. Entering a fresh inner stack per
+    #: session would leave one spent `__exit__` callback on the adapter's
+    #: stack per session -- a no-op each, and unbounded growth across an
+    #: `hx mcp` conversation that opens and closes runs all day. `ExitStack.
+    #: close()` leaves the stack usable, so one is enough for every session
+    #: this context will ever hold.
+    _session_stack: Any = dataclasses.field(default=None, repr=False)
+    #: `(identity_id, generation)` already registered on THIS session's
+    #: extension. `BridgeServer.register_identity` refuses a generation that
+    #: does not advance what the extension holds (`stale_generation`), so a
+    #: second registration of the same pair is an error, not a no-op. Cleared
+    #: with the session, because a new extension has heard of none of them.
+    _registered: set = dataclasses.field(default_factory=set, repr=False)
     actor: str = "agent"
     _bound_run_id: str | None = dataclasses.field(default=None, repr=False)
     #: `None` means "not resolved for this call yet", never "resolved to
@@ -2653,7 +2871,7 @@ puts the session here rather than in a tool of its own.
 from __future__ import annotations
 
 from ... import run as run_mod
-from .. import envelope, registry, spec
+from .. import envelope, live as live_mod, registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
 #: `killed` is absent DELIBERATELY. The run table admits five statuses; that
@@ -2668,7 +2886,9 @@ JOURNAL_DEFAULT = 20
 
 
 def start(ctx, kind: str) -> dict:
-    """Open a run and bind it to this context."""
+    """Open a run, bind it to this context, and bracket a Burp if the kind
+    needs one -- `session` in the result says whether it got one, and if not,
+    which of `hx.tools.live`'s four reasons applies."""
     # Check for existing running runs of the same kind for this engagement.
     # Per-kind, not per-engagement: a crawl running while you browse is two runs,
     # because the enforcement rules differ by exactly that distinction.
@@ -2684,8 +2904,13 @@ def start(ctx, kind: str) -> dict:
                               kind=kind,
                               safety_profile=ctx.config.safety_profile)
     ctx.run_id = run_id
+    # AFTER the run row, deliberately: `open_for` can fail, and a failure
+    # that had to be reported with no run to report it against would be a
+    # failure with no journal row and no run row -- the one call that was
+    # trying to set the instrument up, leaving no trace that it did not.
     return {"id": run_id, "kind": kind,
-            "safety_profile": ctx.config.safety_profile}
+            "safety_profile": ctx.config.safety_profile,
+            "session": live_mod.open_for(ctx, run_id, kind)}
 
 
 def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -> dict:
@@ -2734,13 +2959,24 @@ def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -
                 "no_run", "no run is open on this context; run.start opens one")
 
     run_mod.close_run(ctx.conn, run_id=closed, status=status, stop_reason=note)
+    # THE JVM GOES WITH THE RUN. `run.finish` is the one tool exempt from the
+    # halt refusal (`dispatch.HALT_EXEMPT`) precisely so that an operator who
+    # has hit STOP can still close the bracket -- and closing the bracket has
+    # to include tearing the Burp down, or a halt leaves a live JVM behind
+    # with nothing left that is allowed to stop it.
+    #
+    # `closed`, not `ctx.run_id`: `kind` may have named a run this context
+    # never bound, and the session belongs to whichever run LAUNCHED it --
+    # `close_for` answers False for any other, so a `finish` that closed one
+    # run cannot take away another run's instrument.
+    session_closed = live_mod.close_for(ctx, closed)
     # Only clear what THIS context bound, and only if it is the run just
     # closed -- `kind` may have closed a run this context never bound (one
     # opened by a different context on the same engagement), and clearing an
     # unrelated binding would forget a run that is still open.
     if ctx.run_id == closed:
         ctx.run_id = None
-    return {"id": closed, "status": status}
+    return {"id": closed, "status": status, "session_closed": session_closed}
 
 
 def journal(ctx, since: int | None = None, last_n: int | None = None,
@@ -4072,12 +4308,34 @@ PLAN_A = {
 PLAN_B = {"http.send", "http.grep", "http.body", "http.replay_as",
           "scan.run", "crawl.run"}
 
+#: Which of PLAN_B is actually registered so far. Each Plan B task adds its
+#: tool's name here in the same commit that registers it -- the discipline
+#: PLAN_A already kept as a fixed set, now split in two because PLAN_A no
+#: longer describes the whole registry once ANY Plan B tool lands. Task 7
+#: (`scan.run`, `crawl.run`) is the last, so this now equals `PLAN_B`.
+PLAN_B_BUILT = {"http.send", "http.grep", "http.body", "http.replay_as",
+                "scan.run", "crawl.run"}
 
-def test_the_registry_is_exactly_plan_as_eleven():
+
+def test_the_registry_is_exactly_the_tools_built_so_far():
     # Property 1, half of it. Adding a tool without spec'ing it fails here,
-    # and so does spec'ing one without building it. Plan B flips this to the
+    # and so does spec'ing one without building it. PLAN_B_BUILT grows to
+    # match PLAN_B as the rest of Plan B lands, at which point this is the
     # full seventeen.
-    assert set(registry.TOOLS) == PLAN_A
+    assert set(registry.TOOLS) == PLAN_A | PLAN_B_BUILT
+
+
+def test_plan_b_built_is_a_subset_of_plan_b():
+    # Fix round 1's finding 3. `test_the_registry_is_exactly_the_tools_built_
+    # so_far` above is only as strong as `PLAN_B_BUILT` itself: without this,
+    # a tool registered under a name outside section 8's seventeen is
+    # admitted into the registry just by adding it to `PLAN_B_BUILT`, and
+    # `test_plan_a_and_plan_b_together_are_section_eights_seventeen` below
+    # would never see it -- it compares only `PLAN_A | PLAN_B`, which
+    # `PLAN_B_BUILT` does not appear in at all. This restores the half of
+    # property 1 that check was meant to cover: `PLAN_B_BUILT` may only ever
+    # name tools the plan already promised.
+    assert PLAN_B_BUILT <= PLAN_B
 
 
 def test_plan_a_and_plan_b_together_are_section_eights_seventeen():
@@ -4100,12 +4358,20 @@ def test_every_registered_tool_has_an_enforceable_schema_and_a_summary():
 
 
 def test_mutating_tools_are_exactly_the_ones_that_write():
-    writes = {"run.start", "run.finish", "finding.record", "evidence.attach"}
+    writes = {"run.start", "run.finish", "finding.record", "evidence.attach",
+              "http.send", "http.replay_as", "scan.run"}
     assert {n for n, t in registry.TOOLS.items() if t.mutates} == writes
 
 
 def test_no_plan_a_tool_needs_egress():
-    assert not any(t.needs_egress for t in registry.TOOLS.values())
+    # The claim is about PLAN_A specifically, not about the registry as a
+    # whole: PLAN_B's whole reason to exist is the six tools that DO carry
+    # `needs_egress` (spec section 8), and `http.send` is the first of them
+    # to be built. Filtered to PLAN_A so this keeps meaning what it always
+    # meant rather than becoming vacuously true or falsely red the moment
+    # any Plan B tool lands.
+    assert not any(t.needs_egress for n, t in registry.TOOLS.items()
+                   if n in PLAN_A)
 
 
 def test_every_tool_schema_matches_its_handlers_signature():
@@ -4231,7 +4497,7 @@ from .. import impl  # noqa: F401  -- registers every tool
 from .. import registry
 
 
-def build_context(engagement) -> dispatch_mod.ToolContext:
+def build_context(engagement, *, stack=None) -> dispatch_mod.ToolContext:
     """A context over an open engagement.
 
     NOTHING IS BOUND HERE, and that is fine: each `hx tool` invocation is its
@@ -4242,13 +4508,21 @@ def build_context(engagement) -> dispatch_mod.ToolContext:
     cannot do is hold a run across invocations in the FIELD -- there is no
     long-lived object here for `run.start` to bind onto that a later call
     would see -- which is exactly why the resolution had to move to the
-    store rather than staying a process-local field. Plan B's MCP adapter is
-    one long-lived process, and can bind for real; that is not this task.
+    store rather than staying a process-local field.
+
+    `stack` IS NONE FROM THIS ADAPTER AND THAT IS THE HONEST ANSWER, not a
+    limitation waiting to be lifted. `hx.session.session()` tears Burp down on
+    every exit, so a JVM launched inside a one-shot `hx tool` process dies
+    with it -- there is no object here for a session to outlive. `run.start`
+    is told so and reports `session: {live: false, reason: "no_host"}`, which
+    names `hx mcp` as the adapter that can. The parameter exists because
+    `hx mcp` builds its context through this same function.
     """
     return dispatch_mod.ToolContext(
         engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
         config=engagement.config,
-        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db),
+        stack=stack)
 
 
 def render_listing() -> str:

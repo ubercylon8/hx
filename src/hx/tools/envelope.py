@@ -31,9 +31,35 @@ OUTCOMES = ("ok", "empty", "unavailable", "refused", "error")
 #: The report counts refusals by reason -- a cross-partition reason corrupts a
 #: client-facing number. Twelve tests passed with this open because only one
 #: tried a reason outside REASONS entirely; none crossed between groups.
+#: WIDENED FOR `http.send` (Task 4): the wire's own refusal classes now flow
+#: through, unchanged, from `hx.tools.impl.http.REASON_FOR_CLASS`. The split
+#: between the two outcomes is not arbitrary. REFUSED is "something decided
+#: no" -- scope, method, dangerous-path, rate and budget are the extension's
+#: POLICY answering, and a client-facing count of refusals is a statement
+#: about scope discipline. UNAVAILABLE is "no answer came back" -- a timeout,
+#: a dropped bridge or an unconfigured extension decided NOTHING, and counting
+#: those as refusals would put network weather into a number an operator
+#: reads as policy. Both are `ran=False`, so neither can be misread as a clean
+#: result; what differs is what the report is entitled to say about them.
 REASONS_FOR = {
-    "refused": frozenset({"not_registered", "halted", "missing_why", "bad_args", "run_open"}),
-    "unavailable": frozenset({"no_session", "no_run", "not_implemented"}),
+    "refused": frozenset({
+        "not_registered", "halted", "missing_why", "bad_args", "run_open",
+        "scope_denied", "method_denied", "dangerous_denied", "rate_limited",
+        "budget_exhausted", "bad_frame", "wrong_run_kind",
+        # WIDENED AGAIN BY RULING 19, and for the same reason as the first
+        # widening: these are the rest of what the extension can put on an
+        # `error` frame, and nine of them were falling through to
+        # `unavailable / transport_error` -- a policy denial counted as
+        # network weather in the one number an operator reads as scope
+        # discipline. `tests/test_tools_http.py` compares this side against
+        # the emit sites the Java actually carries.
+        "unmanaged_credential", "unknown_identity", "identity_origin",
+        "unknown_frame", "protocol_mismatch", "engagement_mismatch",
+        "bad_config", "bad_identity", "stale_generation"}),
+    "unavailable": frozenset({
+        "no_session", "no_run", "not_implemented", "identity_dead",
+        "identity_unresolved", "transport_error", "timeout", "bridge_lost",
+        "not_configured", "unreadable"}),
     "error": frozenset({"internal"}),
 }
 

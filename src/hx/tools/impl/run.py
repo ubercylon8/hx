@@ -9,7 +9,7 @@ puts the session here rather than in a tool of its own.
 from __future__ import annotations
 
 from ... import run as run_mod
-from .. import envelope, registry, spec
+from .. import envelope, live as live_mod, registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
 #: `killed` is absent DELIBERATELY. The run table admits five statuses; that
@@ -24,7 +24,9 @@ JOURNAL_DEFAULT = 20
 
 
 def start(ctx, kind: str) -> dict:
-    """Open a run and bind it to this context."""
+    """Open a run, bind it to this context, and bracket a Burp if the kind
+    needs one -- `session` in the result says whether it got one, and if not,
+    which of `hx.tools.live`'s four reasons applies."""
     # Check for existing running runs of the same kind for this engagement.
     # Per-kind, not per-engagement: a crawl running while you browse is two runs,
     # because the enforcement rules differ by exactly that distinction.
@@ -40,8 +42,13 @@ def start(ctx, kind: str) -> dict:
                               kind=kind,
                               safety_profile=ctx.config.safety_profile)
     ctx.run_id = run_id
+    # AFTER the run row, deliberately: `open_for` can fail, and a failure
+    # that had to be reported with no run to report it against would be a
+    # failure with no journal row and no run row -- the one call that was
+    # trying to set the instrument up, leaving no trace that it did not.
     return {"id": run_id, "kind": kind,
-            "safety_profile": ctx.config.safety_profile}
+            "safety_profile": ctx.config.safety_profile,
+            "session": live_mod.open_for(ctx, run_id, kind)}
 
 
 def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -> dict:
@@ -90,13 +97,24 @@ def finish(ctx, status: str, note: str | None = None, kind: str | None = None) -
                 "no_run", "no run is open on this context; run.start opens one")
 
     run_mod.close_run(ctx.conn, run_id=closed, status=status, stop_reason=note)
+    # THE JVM GOES WITH THE RUN. `run.finish` is the one tool exempt from the
+    # halt refusal (`dispatch.HALT_EXEMPT`) precisely so that an operator who
+    # has hit STOP can still close the bracket -- and closing the bracket has
+    # to include tearing the Burp down, or a halt leaves a live JVM behind
+    # with nothing left that is allowed to stop it.
+    #
+    # `closed`, not `ctx.run_id`: `kind` may have named a run this context
+    # never bound, and the session belongs to whichever run LAUNCHED it --
+    # `close_for` answers False for any other, so a `finish` that closed one
+    # run cannot take away another run's instrument.
+    session_closed = live_mod.close_for(ctx, closed)
     # Only clear what THIS context bound, and only if it is the run just
     # closed -- `kind` may have closed a run this context never bound (one
     # opened by a different context on the same engagement), and clearing an
     # unrelated binding would forget a run that is still open.
     if ctx.run_id == closed:
         ctx.run_id = None
-    return {"id": closed, "status": status}
+    return {"id": closed, "status": status, "session_closed": session_closed}
 
 
 def journal(ctx, since: int | None = None, last_n: int | None = None,
