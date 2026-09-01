@@ -655,6 +655,12 @@ git commit -m "feat(checks): the passive corpus names what it examined"
 
 ## Task 4: bare-LF responses are parsed, not silently emptied
 
+`split_head_body`, `header_lines`, `header_names` and `header_values` moved out
+of `_http.py` into `src/hx/http_text.py` under Plan B's Task 1 (2026-08-31),
+which is why the two excerpt markers below point at that file and this
+section's own file list still says `_http.py` — both describe what this task
+actually did at the time, not where the code lives today.
+
 **Files:**
 - Modify: `src/hx/checks/passive/_http.py` (`bodies`, `responses`, `header_names`, `header_values`)
 - Test: `tests/test_checks_http.py`

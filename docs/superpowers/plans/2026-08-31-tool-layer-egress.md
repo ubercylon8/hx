@@ -503,6 +503,8 @@ exchange row in this build -- and `http.grep`, `http.body` and
 about a row, a blob or a surface is an assertion about whether those three
 tools have anything to read.
 """
+import hashlib
+
 import pytest
 
 from hx import issue
@@ -545,7 +547,41 @@ def test_the_digest_is_section_8s_digest(tool_run):
     assert got.content_type == "application/json"
     assert got.first_line == "HTTP/1.1 201 Created"
     assert got.body_sha256.startswith("sha256:")
+    # `bytes` counts the WHOLE redacted response; `body` and `body_sha256`
+    # are the payload alone, split from the head. The two are different
+    # spans on purpose -- see finding 2 below for what goes wrong if
+    # `body_sha256` ever hashes `response` instead.
     assert got.bytes == len(body)
+    assert got.body == b"{}"
+    assert got.body_sha256 == "sha256:" + hashlib.sha256(b"{}").hexdigest()
+
+
+def test_body_sha256_hashes_only_the_body_not_the_headers(tool_run):
+    """Finding 2. Two responses whose PAYLOAD is identical and whose headers
+    are not -- a fresh `Date`, a per-session `Set-Cookie` -- must produce the
+    same `body_sha256`. If this hashed `response` (status line and headers
+    included) instead, `http.replay_as` would report an authorisation
+    difference between two replies that answered identically."""
+    bridge = FakeBridge()
+    bridge.replies([
+        sent_result(b"HTTP/1.1 200 OK\r\nDate: Mon, 01 Jan 2001 00:00:00 GMT"
+                    b"\r\n\r\nsame payload"),
+        sent_result(b"HTTP/1.1 200 OK\r\nDate: Tue, 02 Jan 2001 00:00:00 GMT"
+                    b"\r\nSet-Cookie: sid=abc123\r\n\r\nsame payload"),
+    ])
+    kwargs = dict(
+        bridge=bridge, conn=tool_run.conn, blobs=tool_run.blobs,
+        config=tool_run.config, engagement_id=tool_run.engagement.id,
+        run_id=tool_run.run_id, scheme="http", host="127.0.0.1", port=8080,
+        method="GET")
+    first = issue.issue(**kwargs, path="/a")
+    second = issue.issue(**kwargs, path="/b")
+    assert first.body == second.body == b"same payload"
+    # The responses genuinely differ (in `bytes`, the whole-response count),
+    # which is what makes an EQUAL body_sha256 the meaningful assertion here
+    # rather than a coincidence of two identical replies.
+    assert first.bytes != second.bytes
+    assert first.body_sha256 == second.body_sha256
 
 
 def test_the_surface_is_upserted_as_agent_discovered(tool_run):
@@ -658,6 +694,54 @@ def test_a_header_line_without_a_colon_is_refused():
         issue.request_bytes("GET", "/a", "127.0.0.1", ("not a header",))
 
 
+@pytest.mark.parametrize("line", [":evil", " X: 1"])
+def test_a_header_with_an_empty_or_whitespace_led_name_is_refused(line):
+    """Finding 3. `:evil` names no field at all; ` X: 1` is obs-fold, which
+    some parsers reject and others fold into the PRECEDING header -- a
+    parser-disagreement primitive reachable through http.send's headers
+    array, even though neither shape can split a request by itself."""
+    with pytest.raises(ValueError):
+        issue.request_bytes("GET", "/a", "127.0.0.1", (line,))
+
+
+def test_a_body_with_no_framing_header_gets_a_computed_content_length():
+    """Finding 1. RFC 9112 S6.3: a request with neither Content-Length nor
+    Transfer-Encoding has a ZERO-length body, so an unframed body sits in
+    the connection buffer to be parsed as the head of the NEXT request on
+    that keep-alive connection -- request splitting, produced by the exact
+    function whose `FORBIDDEN` guard exists to prevent it."""
+    raw = issue.request_bytes("POST", "/a", "h.test", (), b"x=1")
+    assert b"\r\nContent-Length: 3\r\n" in raw
+    assert raw.endswith(b"x=1")
+
+
+def test_an_agreeing_content_length_is_left_alone():
+    raw = issue.request_bytes(
+        "POST", "/a", "h.test", ("Content-Length: 3",), b"x=1")
+    assert raw.count(b"Content-Length:") == 1
+
+
+def test_a_disagreeing_content_length_is_refused():
+    """A CL that does not match the body is a request-smuggling primitive
+    (CL.TE / TE.CL), not a typo -- refused rather than silently corrected,
+    which would send a request different from the one the caller asked
+    for."""
+    with pytest.raises(ValueError, match="disagrees"):
+        issue.request_bytes(
+            "POST", "/a", "h.test", ("Content-Length: 99",), b"x=1")
+
+
+def test_transfer_encoding_is_refused_outright():
+    with pytest.raises(ValueError, match="Transfer-Encoding"):
+        issue.request_bytes(
+            "GET", "/a", "h.test", ("Transfer-Encoding: chunked",))
+
+
+def test_an_empty_body_emits_no_content_length():
+    raw = issue.request_bytes("GET", "/a", "h.test", ())
+    assert b"Content-Length" not in raw
+
+
 def test_the_host_header_is_not_duplicated():
     """The caller may spell `Host:` themselves -- a virtual-host test needs
     to -- and two Host headers is a request smuggling primitive, not a
@@ -755,10 +839,20 @@ class Issued:
     """Spec section 8's digest, plus the bytes for a caller that wants them.
 
     `response` is the REDACTED response, whole, and it is here so that
-    `http.send` can compute its delta and `http.replay_as` can compare two
-    replies without a second round trip to the blob store it just wrote. It
-    is deliberately NOT part of what a tool returns to an agent: Principle 1
-    is handles and digests, never payloads.
+    `http.replay_as` can compare two replies without a second round trip to
+    the blob store it just wrote. `body` is `response`'s payload alone, split
+    from the head with `http_text.split_head_body` -- what `body_sha256`
+    hashes and what `hx.delta` diffs. Neither is part of what a tool returns
+    to an agent: Principle 1 is handles and digests, never payloads.
+
+    `bytes` AND `body_sha256` DELIBERATELY DESCRIBE DIFFERENT SPANS OF THE
+    SAME RESPONSE. `bytes` counts the WHOLE redacted response, because that
+    is the number the extension's own frame reports and the two must not
+    disagree; `body_sha256` hashes only the PAYLOAD, because that is the span
+    `http.grep` and `http.replay_as` mean by "the body" and the one section 8
+    named the field for. Two byte-identical bodies with a fresh `Date:` or a
+    per-session `Set-Cookie` would hash differently if this hashed the whole
+    response -- reporting an authorisation difference that does not exist.
     """
 
     exchange_id: str
@@ -770,6 +864,7 @@ class Issued:
     body_sha256: str
     first_line: str
     response: bytes
+    body: bytes
 
 
 def _url(scheme: str, host: str, port: int, path: str) -> str:
@@ -804,6 +899,27 @@ def request_bytes(method: str, path: str, host: str,
     caller made a mistake, and an `IssueRefused` would land in a journal row
     as an ordinary refusal indistinguishable from a rate limit -- the same
     distinction `hx.checks.probe.ProbeSender.get` draws for the same reason.
+
+    FRAMING IS THIS FUNCTION'S OWN PROBLEM, not its caller's. A non-empty
+    body with no `Content-Length` and no `Transfer-Encoding` is, per RFC 9112
+    S6.3, a request with a ZERO-LENGTH body -- the peer stops reading at the
+    blank line, and the bytes this function put after it sit in the
+    connection buffer to be parsed as the START of the NEXT request on that
+    keep-alive connection. That is request splitting, produced by the exact
+    function whose `FORBIDDEN` guard above exists to stop it, and the JVM
+    does not repair it: `Sender.wireBytes` appends the body verbatim and
+    computes no length of its own. So: no framing header given and a
+    non-empty body means one is COMPUTED here.
+
+    A caller-supplied `Content-Length` that disagrees with `len(body)`, and
+    any `Transfer-Encoding` at all, are both REFUSALS rather than
+    corrections. A CL/TE mismatch -- or two framing mechanisms naming two
+    different lengths for the same message -- is a request-smuggling
+    primitive in its own right (CL.TE / TE.CL), and this seam is not where
+    one gets built by accident: correcting it silently would make the
+    request this function sends different from the one the caller asked for,
+    which is worse than refusing. Deliberate desync testing needs a
+    different tool than the one every agent request goes through.
     """
     _clean("method", method)
     _clean("path", path)
@@ -818,12 +934,45 @@ def request_bytes(method: str, path: str, host: str,
             "Percent-encode it.")
     lines = [f"{method} {path} HTTP/1.1"]
     given = []
+    has_content_length = False
     for line in headers:
         _clean("header", line)
         if ":" not in line:
             raise ValueError(
                 f"header {line!r} has no ':'; headers are wire lines of the "
                 "form 'Name: value'")
+        name, _, value = line.partition(":")
+        if not name or name[0] in " \t":
+            raise ValueError(
+                f"header {line!r} has an empty or whitespace-led field "
+                "name. RFC 9112 has no field name that starts with "
+                "whitespace -- that shape is obs-fold, which some parsers "
+                "reject and some fold into the PRECEDING header, and an "
+                "agent-supplied header line is not the place either "
+                "behaviour is safe to invite.")
+        lname = name.strip().lower()
+        if lname == "transfer-encoding":
+            raise ValueError(
+                f"header {line!r} sets Transfer-Encoding, refused outright. "
+                "A Content-Length/Transfer-Encoding disagreement is a "
+                "request-smuggling primitive (CL.TE / TE.CL), and this seam "
+                "is not where one gets built by accident -- deliberate "
+                "desync testing needs a different tool than the one every "
+                "agent request goes through.")
+        if lname == "content-length":
+            try:
+                declared = int(value.strip())
+            except ValueError:
+                raise ValueError(
+                    f"header {line!r} is not a valid Content-Length "
+                    "integer") from None
+            if declared != len(body):
+                raise ValueError(
+                    f"header {line!r} disagrees with the body actually "
+                    f"given ({len(body)} bytes). A Content-Length that does "
+                    "not match its body is a request-smuggling primitive, "
+                    "not a typo to silently correct.")
+            has_content_length = True
         given.append(line)
     # THE CALLER'S HOST WINS AND IS NOT JOINED BY A SECOND. A virtual-host
     # test needs to spell `Host:` itself, and two Host headers is a smuggling
@@ -832,6 +981,8 @@ def request_bytes(method: str, path: str, host: str,
                for line in given):
         lines.append(f"Host: {host}")
     lines += given
+    if body and not has_content_length:
+        lines.append(f"Content-Length: {len(body)}")
     head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
     return head + body
 
@@ -870,7 +1021,7 @@ def issue(bridge, conn, blobs, config, *, engagement_id: str,
     status = result.get("status")
     outcome = result.get("outcome", "ok")
     ms = int(result.get("ms") or 0)
-    head, _rest = http_text.split_head_body(response)
+    head, response_body = http_text.split_head_body(response)
     types = http_text.header_values(head, "content-type")
     first_line = head.split(b"\n", 1)[0].rstrip(b"\r").decode(
         "latin-1", "replace")
@@ -920,8 +1071,12 @@ def issue(bridge, conn, blobs, config, *, engagement_id: str,
     return Issued(
         exchange_id=exchange_id, status=status, bytes=len(response), ms=ms,
         outcome=outcome, content_type=types[0] if types else None,
-        body_sha256="sha256:" + hashlib.sha256(response).hexdigest(),
-        first_line=first_line, response=response)
+        # HASHES THE BODY, NOT `response`. `bytes` above is the whole
+        # redacted response -- it has to match the extension's own frame --
+        # while this is the payload alone; see `Issued`'s docstring for why
+        # the two spans differ on purpose and are not a mismatch to "fix".
+        body_sha256="sha256:" + hashlib.sha256(response_body).hexdigest(),
+        first_line=first_line, response=response, body=response_body)
 ```
 
 **Two things to verify against the repo rather than trusting this text:**
@@ -967,10 +1122,10 @@ Principle 1's own justification: *"a bare `{exchange_id, status, bytes, ms}` is 
 - Test: `tests/test_delta.py`
 
 **Interfaces:**
-- Consumes: `hx.store.blobs.BlobStore.get(digest, expected_len)`; the `surface` and `exchange` tables.
+- Consumes: `hx.store.blobs.BlobStore.get(digest, expected_len)`; `hx.http_text.split_head_body`; the `surface` and `exchange` tables.
 - Produces:
   - `hx.delta.against(baseline_status, baseline_body, status, body) -> dict` with keys `status_changed`, `len_delta`, `new_tokens`, and `new_tokens_truncated` when it applies
-  - `hx.delta.baseline_for(conn, blobs, surface_id) -> tuple[int | None, bytes] | None`
+  - `hx.delta.baseline_for(conn, blobs, surface_id) -> tuple[int | None, bytes] | None` -- the second element is the exemplar's BODY, not its whole stored response
   - `hx.delta.TOKEN`, `MAX_TOKENS`, `MAX_DIFF_BYTES`
 
 ---
@@ -1043,7 +1198,7 @@ def test_a_surface_with_no_exemplar_has_no_baseline(tool_ctx):
     assert delta.baseline_for(tool_ctx.conn, tool_ctx.blobs, "no-such") is None
 ```
 
-Add one more test once Task 1 is in: `baseline_for` over a surface whose exemplar exchange has a `resp_blob`, asserting it returns `(status, bytes)`. Build the row with `hx.issue.issue` and a `FakeBridge` rather than by hand — a fixture that writes the row itself would pass while the real writer wrote something else.
+Add one more test once Task 1 is in: `baseline_for` over a surface whose exemplar exchange has a `resp_blob`, asserting it returns `(status, body_bytes)` -- the BODY, not the whole stored response. Build the row with `hx.issue.issue` and a `FakeBridge` rather than by hand — a fixture that writes the row itself would pass while the real writer wrote something else.
 
 - [ ] **Step 2: Run to watch it fail**
 
@@ -1079,6 +1234,8 @@ that rule broken inside one key.
 from __future__ import annotations
 
 import re
+
+from . import http_text
 
 #: A token is a run of characters a payload or an identifier is made of. The
 #: SIX-CHARACTER FLOOR is what makes the field readable: without it every
@@ -1128,12 +1285,17 @@ def against(baseline_status, baseline_body: bytes,
 
 
 def baseline_for(conn, blobs, surface_id):
-    """`(status, response_bytes)` for a surface's exemplar, or None.
+    """`(status, body_bytes)` for a surface's exemplar, or None.
 
     None for every way there is not one: no surface row, no exemplar, an
     exemplar whose response was never stored. All three are "there is nothing
     to compare against", and a caller that told them apart would be reporting
     on its own bookkeeping rather than on the application.
+
+    BODY, NOT THE WHOLE STORED RESPONSE. A delta over whole responses counts
+    header churn as change: `new_tokens` fills with `Date` and `Set-Cookie`
+    noise, which is the signal section 8 built the digest for being drowned
+    out by the transport that carried it, not by the application.
     """
     row = conn.execute(
         "SELECT x.status, x.resp_blob, x.resp_len FROM surface s"
@@ -1141,7 +1303,8 @@ def baseline_for(conn, blobs, surface_id):
         " WHERE s.id = ?", (surface_id,)).fetchone()
     if row is None or row[1] is None:
         return None
-    return row[0], blobs.get(row[1], row[2])
+    _head, body = http_text.split_head_body(blobs.get(row[1], row[2]))
+    return row[0], body
 ```
 
 - [ ] **Step 4: Run the delta tests**
@@ -1948,9 +2111,9 @@ MAX_BODY = 1024 * 1024
 def _digest(ctx, issued) -> dict:
     """Section 8's digest for one `Issued`, including its delta.
 
-    The bytes never appear. `issued.response` exists so this function can
-    diff without a round trip to the blob store `issue` just wrote, and it
-    stops here.
+    The bytes never appear. `issued.body` exists so this function can diff
+    against the baseline's body without a round trip to the blob store
+    `issue` just wrote, and it stops here.
     """
     surface_id = ctx.conn.execute(
         "SELECT surface_id FROM exchange WHERE id=?",
@@ -1980,7 +2143,7 @@ def _digest(ctx, issued) -> dict:
         "delta_vs_baseline": (
             None if base is None
             else delta_mod.against(base[0], base[1], issued.status,
-                                   issued.response)),
+                                   issued.body)),
     }
 
 

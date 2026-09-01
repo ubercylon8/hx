@@ -77,10 +77,20 @@ class Issued:
     """Spec section 8's digest, plus the bytes for a caller that wants them.
 
     `response` is the REDACTED response, whole, and it is here so that
-    `http.send` can compute its delta and `http.replay_as` can compare two
-    replies without a second round trip to the blob store it just wrote. It
-    is deliberately NOT part of what a tool returns to an agent: Principle 1
-    is handles and digests, never payloads.
+    `http.replay_as` can compare two replies without a second round trip to
+    the blob store it just wrote. `body` is `response`'s payload alone, split
+    from the head with `http_text.split_head_body` -- what `body_sha256`
+    hashes and what `hx.delta` diffs. Neither is part of what a tool returns
+    to an agent: Principle 1 is handles and digests, never payloads.
+
+    `bytes` AND `body_sha256` DELIBERATELY DESCRIBE DIFFERENT SPANS OF THE
+    SAME RESPONSE. `bytes` counts the WHOLE redacted response, because that
+    is the number the extension's own frame reports and the two must not
+    disagree; `body_sha256` hashes only the PAYLOAD, because that is the span
+    `http.grep` and `http.replay_as` mean by "the body" and the one section 8
+    named the field for. Two byte-identical bodies with a fresh `Date:` or a
+    per-session `Set-Cookie` would hash differently if this hashed the whole
+    response -- reporting an authorisation difference that does not exist.
     """
 
     exchange_id: str
@@ -92,6 +102,7 @@ class Issued:
     body_sha256: str
     first_line: str
     response: bytes
+    body: bytes
 
 
 def _url(scheme: str, host: str, port: int, path: str) -> str:
@@ -126,6 +137,27 @@ def request_bytes(method: str, path: str, host: str,
     caller made a mistake, and an `IssueRefused` would land in a journal row
     as an ordinary refusal indistinguishable from a rate limit -- the same
     distinction `hx.checks.probe.ProbeSender.get` draws for the same reason.
+
+    FRAMING IS THIS FUNCTION'S OWN PROBLEM, not its caller's. A non-empty
+    body with no `Content-Length` and no `Transfer-Encoding` is, per RFC 9112
+    S6.3, a request with a ZERO-LENGTH body -- the peer stops reading at the
+    blank line, and the bytes this function put after it sit in the
+    connection buffer to be parsed as the START of the NEXT request on that
+    keep-alive connection. That is request splitting, produced by the exact
+    function whose `FORBIDDEN` guard above exists to stop it, and the JVM
+    does not repair it: `Sender.wireBytes` appends the body verbatim and
+    computes no length of its own. So: no framing header given and a
+    non-empty body means one is COMPUTED here.
+
+    A caller-supplied `Content-Length` that disagrees with `len(body)`, and
+    any `Transfer-Encoding` at all, are both REFUSALS rather than
+    corrections. A CL/TE mismatch -- or two framing mechanisms naming two
+    different lengths for the same message -- is a request-smuggling
+    primitive in its own right (CL.TE / TE.CL), and this seam is not where
+    one gets built by accident: correcting it silently would make the
+    request this function sends different from the one the caller asked for,
+    which is worse than refusing. Deliberate desync testing needs a
+    different tool than the one every agent request goes through.
     """
     _clean("method", method)
     _clean("path", path)
@@ -140,12 +172,45 @@ def request_bytes(method: str, path: str, host: str,
             "Percent-encode it.")
     lines = [f"{method} {path} HTTP/1.1"]
     given = []
+    has_content_length = False
     for line in headers:
         _clean("header", line)
         if ":" not in line:
             raise ValueError(
                 f"header {line!r} has no ':'; headers are wire lines of the "
                 "form 'Name: value'")
+        name, _, value = line.partition(":")
+        if not name or name[0] in " \t":
+            raise ValueError(
+                f"header {line!r} has an empty or whitespace-led field "
+                "name. RFC 9112 has no field name that starts with "
+                "whitespace -- that shape is obs-fold, which some parsers "
+                "reject and some fold into the PRECEDING header, and an "
+                "agent-supplied header line is not the place either "
+                "behaviour is safe to invite.")
+        lname = name.strip().lower()
+        if lname == "transfer-encoding":
+            raise ValueError(
+                f"header {line!r} sets Transfer-Encoding, refused outright. "
+                "A Content-Length/Transfer-Encoding disagreement is a "
+                "request-smuggling primitive (CL.TE / TE.CL), and this seam "
+                "is not where one gets built by accident -- deliberate "
+                "desync testing needs a different tool than the one every "
+                "agent request goes through.")
+        if lname == "content-length":
+            try:
+                declared = int(value.strip())
+            except ValueError:
+                raise ValueError(
+                    f"header {line!r} is not a valid Content-Length "
+                    "integer") from None
+            if declared != len(body):
+                raise ValueError(
+                    f"header {line!r} disagrees with the body actually "
+                    f"given ({len(body)} bytes). A Content-Length that does "
+                    "not match its body is a request-smuggling primitive, "
+                    "not a typo to silently correct.")
+            has_content_length = True
         given.append(line)
     # THE CALLER'S HOST WINS AND IS NOT JOINED BY A SECOND. A virtual-host
     # test needs to spell `Host:` itself, and two Host headers is a smuggling
@@ -154,6 +219,8 @@ def request_bytes(method: str, path: str, host: str,
                for line in given):
         lines.append(f"Host: {host}")
     lines += given
+    if body and not has_content_length:
+        lines.append(f"Content-Length: {len(body)}")
     head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
     return head + body
 
@@ -192,7 +259,7 @@ def issue(bridge, conn, blobs, config, *, engagement_id: str,
     status = result.get("status")
     outcome = result.get("outcome", "ok")
     ms = int(result.get("ms") or 0)
-    head, _rest = http_text.split_head_body(response)
+    head, response_body = http_text.split_head_body(response)
     types = http_text.header_values(head, "content-type")
     first_line = head.split(b"\n", 1)[0].rstrip(b"\r").decode(
         "latin-1", "replace")
@@ -242,5 +309,9 @@ def issue(bridge, conn, blobs, config, *, engagement_id: str,
     return Issued(
         exchange_id=exchange_id, status=status, bytes=len(response), ms=ms,
         outcome=outcome, content_type=types[0] if types else None,
-        body_sha256="sha256:" + hashlib.sha256(response).hexdigest(),
-        first_line=first_line, response=response)
+        # HASHES THE BODY, NOT `response`. `bytes` above is the whole
+        # redacted response -- it has to match the extension's own frame --
+        # while this is the payload alone; see `Issued`'s docstring for why
+        # the two spans differ on purpose and are not a mismatch to "fix".
+        body_sha256="sha256:" + hashlib.sha256(response_body).hexdigest(),
+        first_line=first_line, response=response, body=response_body)

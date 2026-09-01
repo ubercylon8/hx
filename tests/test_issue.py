@@ -8,6 +8,8 @@ exchange row in this build -- and `http.grep`, `http.body` and
 about a row, a blob or a surface is an assertion about whether those three
 tools have anything to read.
 """
+import hashlib
+
 import pytest
 
 from hx import issue
@@ -50,7 +52,41 @@ def test_the_digest_is_section_8s_digest(tool_run):
     assert got.content_type == "application/json"
     assert got.first_line == "HTTP/1.1 201 Created"
     assert got.body_sha256.startswith("sha256:")
+    # `bytes` counts the WHOLE redacted response; `body` and `body_sha256`
+    # are the payload alone, split from the head. The two are different
+    # spans on purpose -- see finding 2 below for what goes wrong if
+    # `body_sha256` ever hashes `response` instead.
     assert got.bytes == len(body)
+    assert got.body == b"{}"
+    assert got.body_sha256 == "sha256:" + hashlib.sha256(b"{}").hexdigest()
+
+
+def test_body_sha256_hashes_only_the_body_not_the_headers(tool_run):
+    """Finding 2. Two responses whose PAYLOAD is identical and whose headers
+    are not -- a fresh `Date`, a per-session `Set-Cookie` -- must produce the
+    same `body_sha256`. If this hashed `response` (status line and headers
+    included) instead, `http.replay_as` would report an authorisation
+    difference between two replies that answered identically."""
+    bridge = FakeBridge()
+    bridge.replies([
+        sent_result(b"HTTP/1.1 200 OK\r\nDate: Mon, 01 Jan 2001 00:00:00 GMT"
+                    b"\r\n\r\nsame payload"),
+        sent_result(b"HTTP/1.1 200 OK\r\nDate: Tue, 02 Jan 2001 00:00:00 GMT"
+                    b"\r\nSet-Cookie: sid=abc123\r\n\r\nsame payload"),
+    ])
+    kwargs = dict(
+        bridge=bridge, conn=tool_run.conn, blobs=tool_run.blobs,
+        config=tool_run.config, engagement_id=tool_run.engagement.id,
+        run_id=tool_run.run_id, scheme="http", host="127.0.0.1", port=8080,
+        method="GET")
+    first = issue.issue(**kwargs, path="/a")
+    second = issue.issue(**kwargs, path="/b")
+    assert first.body == second.body == b"same payload"
+    # The responses genuinely differ (in `bytes`, the whole-response count),
+    # which is what makes an EQUAL body_sha256 the meaningful assertion here
+    # rather than a coincidence of two identical replies.
+    assert first.bytes != second.bytes
+    assert first.body_sha256 == second.body_sha256
 
 
 def test_the_surface_is_upserted_as_agent_discovered(tool_run):
@@ -161,6 +197,54 @@ def test_a_request_that_could_be_split_is_refused_before_the_wire(bad):
 def test_a_header_line_without_a_colon_is_refused():
     with pytest.raises(ValueError):
         issue.request_bytes("GET", "/a", "127.0.0.1", ("not a header",))
+
+
+@pytest.mark.parametrize("line", [":evil", " X: 1"])
+def test_a_header_with_an_empty_or_whitespace_led_name_is_refused(line):
+    """Finding 3. `:evil` names no field at all; ` X: 1` is obs-fold, which
+    some parsers reject and others fold into the PRECEDING header -- a
+    parser-disagreement primitive reachable through http.send's headers
+    array, even though neither shape can split a request by itself."""
+    with pytest.raises(ValueError):
+        issue.request_bytes("GET", "/a", "127.0.0.1", (line,))
+
+
+def test_a_body_with_no_framing_header_gets_a_computed_content_length():
+    """Finding 1. RFC 9112 S6.3: a request with neither Content-Length nor
+    Transfer-Encoding has a ZERO-length body, so an unframed body sits in
+    the connection buffer to be parsed as the head of the NEXT request on
+    that keep-alive connection -- request splitting, produced by the exact
+    function whose `FORBIDDEN` guard exists to prevent it."""
+    raw = issue.request_bytes("POST", "/a", "h.test", (), b"x=1")
+    assert b"\r\nContent-Length: 3\r\n" in raw
+    assert raw.endswith(b"x=1")
+
+
+def test_an_agreeing_content_length_is_left_alone():
+    raw = issue.request_bytes(
+        "POST", "/a", "h.test", ("Content-Length: 3",), b"x=1")
+    assert raw.count(b"Content-Length:") == 1
+
+
+def test_a_disagreeing_content_length_is_refused():
+    """A CL that does not match the body is a request-smuggling primitive
+    (CL.TE / TE.CL), not a typo -- refused rather than silently corrected,
+    which would send a request different from the one the caller asked
+    for."""
+    with pytest.raises(ValueError, match="disagrees"):
+        issue.request_bytes(
+            "POST", "/a", "h.test", ("Content-Length: 99",), b"x=1")
+
+
+def test_transfer_encoding_is_refused_outright():
+    with pytest.raises(ValueError, match="Transfer-Encoding"):
+        issue.request_bytes(
+            "GET", "/a", "h.test", ("Transfer-Encoding: chunked",))
+
+
+def test_an_empty_body_emits_no_content_length():
+    raw = issue.request_bytes("GET", "/a", "h.test", ())
+    assert b"Content-Length" not in raw
 
 
 def test_the_host_header_is_not_duplicated():
