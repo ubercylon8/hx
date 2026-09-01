@@ -248,14 +248,29 @@ def test_an_unknown_wire_class_does_not_escape_dispatch(tool_run):
     assert "nova_class_from_2027" in (env.detail or "")
 
 
-def _one_exchange(ctx, body=b"HTTP/1.1 200 OK\r\n\r\nneedle in a haystack"):
-    """Send one request through a fake bridge and return its exchange id."""
-    ctx = _with_session(ctx, [sent_result(body)])
+def _one_exchange_on(ctx, body, *, path):
+    """One stored exchange at `path`, sent through a fake bridge; its id.
+
+    THE SESSION IS THE CALLER'S WHEN THERE IS ONE, and that is the whole of
+    what this adds over `_one_exchange` below. A replay test queues the
+    baseline's reply and its replays' replies in ONE `_with_session` call --
+    the ORDER of that queue is the fact under test, since the whole point of
+    `http.replay_as` is that the answers DIFFER -- so opening a second
+    session here would throw the queue away and leave the replay sending into
+    a bridge with nothing left to say.
+    """
+    if ctx.session is None:
+        ctx = _with_session(ctx, [sent_result(body)])
     env = dispatch_mod.dispatch(ctx, "http.send",
                                 {"host": "127.0.0.1", "port": 8080,
-                                 "method": "GET", "path": "/hay"},
+                                 "method": "GET", "path": path},
                                 why="set up a body to read")
     return env.result["exchange_id"]
+
+
+def _one_exchange(ctx, body=b"HTTP/1.1 200 OK\r\n\r\nneedle in a haystack"):
+    """Send one request through a fake bridge and return its exchange id."""
+    return _one_exchange_on(ctx, body, path="/hay")
 
 
 def test_grep_finds_a_literal_and_reports_its_offset(tool_run):
@@ -421,3 +436,320 @@ def test_grep_reports_a_corrupt_blob_as_unavailable_not_internal_error(
         tool_run.blobs.get = real_get
     assert env.outcome == "unavailable"
     assert env.reason == "unreadable"
+
+
+def _also(config, name, header):
+    """`config` with a SECOND declared identity, so that a two-identity
+    replay is two identities and not one identity twice.
+
+    `staff_identity_config` declares one, which is all Tasks 3 and 4 needed.
+    Section 12's rule inside one result -- "two identities, one answer and
+    one rate limit" must stay distinguishable from "two identities, one
+    answer" -- is a claim about a row that is NOT the first, and a fixture
+    with one identity cannot make it.
+    """
+    import dataclasses
+
+    from hx import config as config_mod
+
+    ident = config_mod.Identity(
+        id=name, strategy="static",
+        inject=config_mod.Inject(header=header,
+                                 value_from_env=f"HX_{name.upper()}_TOKEN"),
+        liveness=config_mod.Liveness(path="/account", expect_body="Sign out",
+                                     expect_absent="Sign in"),
+        origins=("https://app.test/",))
+    return dataclasses.replace(
+        config, identities={**config.identities, name: ident})
+
+
+def test_replay_as_returns_one_row_per_identity_plus_the_baseline(
+        tool_run, staff_identity_config, monkeypatch):
+    """The shape an authz finding is written from: same request, several
+    sessions, one column of differences."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    denied = b"HTTP/1.1 403 Forbidden\r\n\r\nno"
+    ctx = _with_session(tool_run,
+                        [sent_result(ok), sent_result(denied, status=403)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff"]},
+        why="check whether /admin is reachable as staff")
+    assert env.outcome == "ok"
+    rows = env.result["rows"]
+    assert [r["identity"] for r in rows] == ["staff"]
+    assert rows[0]["digest"]["status"] == 403
+    assert rows[0]["differs"] is True
+
+
+def test_the_replayed_path_comes_from_the_request_line_not_the_redacted_url(
+        tool_run, staff_identity_config, monkeypatch):
+    """The trap `_parts_of` exists for. `records.redact_url` runs on EVERY
+    write to `exchange.url`, so the stored url for a request carrying
+    `?token=` holds `{{observed:param}}` where the credential was. Replaying
+    THAT path would put a placeholder on the wire -- a different request from
+    the one under investigation, answered differently, and the difference
+    reported as an authorisation finding. The stored request BLOB is not
+    rewritten by that rule, so its own request line is the one to re-issue.
+
+    The origin still comes from the url, because an origin-form request line
+    carries none -- which is the half that looks like an inconsistency."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin/users?token=abc123")
+    stored_url, = ctx.conn.execute(
+        "SELECT url FROM exchange WHERE id=?", (xid,)).fetchone()
+    assert "abc123" not in stored_url, \
+        "the url was never redacted, so this test proves nothing"
+
+    dispatch_mod.dispatch(ctx, "http.replay_as",
+                          {"exchange_id": xid, "identities": ["staff"]},
+                          why="replay the admin listing as staff")
+    replayed = ctx.session.bridge.bodies[-1]
+    assert replayed.startswith(b"GET /admin/users?token=abc123 HTTP/1.1\r\n")
+    assert b"observed:param" not in replayed
+    # And to the same origin, taken from the url rather than from the
+    # origin-form request line, which carries none.
+    sent = ctx.session.bridge.requests[-1]
+    assert (sent["target_host"], sent["target_port"]) == ("127.0.0.1", 8080)
+
+
+def test_an_identity_header_in_the_stored_request_is_never_replayed(
+        tool_run, staff_identity_config, monkeypatch):
+    """THE LOAD-BEARING RULE OF THIS TOOL. `staff` injects `Cookie` and the
+    stored request already carries one. Replayed verbatim, the original
+    session's cookie would go out under staff's name: the application would
+    answer both replays as the SAME session, every row would come back
+    identical, and the tool would report "no difference" for two sessions
+    that were never two. An authorisation finding gets written from these
+    rows.
+
+    The `X-Trace` half is the other direction and is not decoration: a
+    replay that dropped every header would be equally wrong, and would send
+    a request the agent never captured."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    env = dispatch_mod.dispatch(
+        ctx, "http.send",
+        {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/admin",
+         "headers": ["Cookie: session=alice", "X-Trace: 7"]},
+        why="capture a request that carries a session cookie")
+    xid = env.result["exchange_id"]
+    assert b"Cookie: session=alice" in ctx.session.bridge.bodies[0], \
+        "the fixture never put the cookie on the wire, so nothing is proven"
+
+    dispatch_mod.dispatch(ctx, "http.replay_as",
+                          {"exchange_id": xid, "identities": ["staff"]},
+                          why="replay /admin as staff")
+    replayed = ctx.session.bridge.bodies[-1]
+    assert b"session=alice" not in replayed
+    assert b"Cookie" not in replayed
+    assert b"X-Trace: 7" in replayed, \
+        "a replay that drops a header no identity injects sends a request " \
+        "the agent never captured"
+
+
+def test_include_anonymous_adds_an_unauthenticated_row(
+        tool_run, staff_identity_config, monkeypatch):
+    """Its own boolean, not a magic identity name. The unauthenticated
+    comparison is the single most valuable row in an authz table, and a
+    reserved string could collide with a name an operator declared."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    away = b"HTTP/1.1 302 Found\r\nLocation: /login\r\n\r\n"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok),
+                                   sent_result(away, status=302)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff"],
+         "include_anonymous": True},
+        why="compare staff against anonymous")
+    assert [r["identity"] for r in env.result["rows"]] == ["staff", None]
+    # UNAUTHENTICATED ON THE WIRE, not merely labelled so. `hx.issue` omits
+    # `identity_id` entirely rather than sending a null, because an absent
+    # key is what the extension reads as anonymous.
+    staff_send, anon_send = ctx.session.bridge.requests[-2:]
+    assert staff_send["identity_id"] == "staff"
+    assert "identity_id" not in anon_send
+
+
+def test_replay_of_an_unknown_exchange_is_refused_before_any_send(tool_run):
+    ctx = _with_session(tool_run, [])
+    env = dispatch_mod.dispatch(ctx, "http.replay_as",
+                                {"exchange_id": "x-nope",
+                                 "identities": ["staff"]},
+                                why="replay something that is not there")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert ctx.session.bridge.requests == []
+
+
+def test_an_undeclared_identity_is_refused_before_the_declared_ones_send(
+        tool_run, staff_identity_config, monkeypatch):
+    """Every identity resolves BEFORE anything sends. A typo in the second
+    name found after the first identity's request had already reached the
+    client's application would be a request nobody can recall."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    sent_before = len(ctx.session.bridge.requests)
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff", "ghost"]},
+        why="one good name and one typo")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert "ghost" in (env.detail or "")
+    assert len(ctx.session.bridge.requests) == sent_before, \
+        "staff's replay reached the wire before the typo was found"
+
+
+def test_one_identitys_refusal_does_not_lose_the_others(
+        tool_run, staff_identity_config, monkeypatch):
+    """A rate limit on the second identity must not discard the first
+    identity's answer. Section 12 again: 'two identities, one answer, one
+    refusal' and 'two identities, one answer' are different facts."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    monkeypatch.setenv("HX_AUDITOR_TOKEN", "an0ther")
+    tool_run.config = _also(staff_identity_config, "auditor", "Authorization")
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [
+        sent_result(ok), sent_result(ok),
+        BridgeError("rate_limited: slow down", error_class="rate_limited")])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff", "auditor"]},
+        why="compare staff against auditor")
+    assert env.outcome == "ok"
+    rows = env.result["rows"]
+    assert [r["identity"] for r in rows] == ["staff", "auditor"]
+    assert rows[0]["digest"] is not None
+    assert rows[1]["digest"] is None
+    assert rows[1]["refused"] == "rate_limited"
+
+
+def test_an_original_with_no_stored_response_compares_against_nothing(
+        tool_run, staff_identity_config, monkeypatch):
+    """`resp_blob` is NULL for an exchange whose body was shed and for one
+    whose transport failed before a response existed. Diffing against `b""`
+    there would report a length delta and `differs: true` on EVERY row -- an
+    authorisation difference on every single call, which is the one claim
+    this tool must never make wrongly. `null` says the comparison was not
+    made, exactly as `delta.new_tokens` is null rather than `[]` when the
+    bodies were too large to diff, and the facet names the reason."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    ctx.conn.execute(
+        "UPDATE exchange SET resp_blob=NULL, resp_len=NULL WHERE id=?", (xid,))
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as", {"exchange_id": xid, "identities": ["staff"]},
+        why="replay an exchange whose response was never stored")
+    assert env.outcome == "ok"
+    row = env.result["rows"][0]
+    # The replay still happened and its digest is still worth having.
+    assert row["digest"]["status"] == 200
+    assert row["differs"] is None
+    assert row["diff_vs_original"] is None
+    assert env.result["facets"]["original_body_stored"] is False
+
+
+def test_a_corrupt_request_blob_is_unavailable_and_reaches_no_wire(
+        tool_run, staff_identity_config, monkeypatch):
+    """A blob that fails its own digest check is not a bad argument and it is
+    not a defect in hx: `unavailable / unreadable`, the same answer
+    `http.grep` gives for the same failure. And nothing may reach a client's
+    application on the way to finding out."""
+    from hx.store.blobs import CorruptBlob
+
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    sent_before = len(ctx.session.bridge.requests)
+    real_get = ctx.blobs.get
+
+    def _corrupt(digest, expected_len=None):
+        raise CorruptBlob(f"blob {digest} failed digest verification")
+
+    ctx.blobs.get = _corrupt
+    try:
+        env = dispatch_mod.dispatch(
+            ctx, "http.replay_as",
+            {"exchange_id": xid, "identities": ["staff"]},
+            why="replay an exchange whose request blob is corrupt")
+    finally:
+        ctx.blobs.get = real_get
+    assert env.outcome == "unavailable"
+    assert env.reason == "unreadable"
+    assert len(ctx.session.bridge.requests) == sent_before
+
+
+def test_replay_needs_a_why_and_a_session(tool_run):
+    """It mutates -- it puts N more requests on a client's network -- and it
+    needs egress."""
+    ctx = _with_session(tool_run, [])
+    args = {"exchange_id": "x-nope", "identities": ["staff"]}
+    env = dispatch_mod.dispatch(ctx, "http.replay_as", args)
+    assert env.outcome == "refused"
+    assert env.reason == "missing_why"
+    assert ctx.session.bridge.requests == []
+
+    bridge = ctx.session.bridge
+    ctx.session = None
+    env = dispatch_mod.dispatch(ctx, "http.replay_as", args,
+                                why="no session on purpose")
+    assert env.outcome == "unavailable"
+    assert env.reason == "no_session"
+    assert bridge.requests == []
+
+
+def test_a_stale_content_length_is_recomputed_rather_than_replayed(
+        tool_run, staff_identity_config, monkeypatch):
+    """A stored request whose `Content-Length` disagrees with its stored body
+    -- a proxy observation whose body was shed, say -- is exactly what
+    `issue.request_bytes` REFUSES: a Content-Length that does not match its
+    body is a request-smuggling primitive, not a typo to correct silently.
+    So the header is dropped and recomputed from the body actually being
+    sent, and the replay happens. Replayed verbatim it would refuse instead,
+    and an authz question would go unanswered over a header nobody read."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    stale = (b"POST /admin HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             b"Content-Length: 99\r\n\r\nx=1")
+    digest, _len = ctx.blobs.put(stale)
+    ctx.conn.execute(
+        "UPDATE exchange SET req_blob=?, method='POST' WHERE id=?",
+        (digest, xid))
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as", {"exchange_id": xid, "identities": ["staff"]},
+        why="replay a request whose stored Content-Length is stale")
+    assert env.outcome == "ok"
+    replayed = ctx.session.bridge.bodies[-1]
+    assert b"Content-Length: 3\r\n" in replayed
+    assert b"Content-Length: 99" not in replayed
+    assert replayed.endswith(b"\r\n\r\nx=1")
