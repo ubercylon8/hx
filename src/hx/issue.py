@@ -215,8 +215,32 @@ def request_bytes(method: str, path: str, host: str,
     # THE CALLER'S HOST WINS AND IS NOT JOINED BY A SECOND. A virtual-host
     # test needs to spell `Host:` itself, and two Host headers is a smuggling
     # primitive rather than a preference.
-    if not any(line.partition(":")[0].strip().lower() == "host"
-               for line in given):
+    #
+    # SO TWO FROM THE CALLER IS REFUSED, not just two from us. The first
+    # version of this guard asked only "did the caller supply a Host?" and
+    # added one when they had not -- which is correct for nought and one, and
+    # silently forwards a pair. MEASURED: `("Host: a.test", "Host: b.test")`
+    # went out as `Host: a.test\r\nHost: b.test`. RFC 9112 s3.2 requires a
+    # server to reject that, but the attack does not need a compliant server:
+    # a front end that honours the first and a back end that honours the
+    # second is the whole of host-header desync, and this function's entire
+    # subject is refusing to build such a request. Found by the first
+    # automated review this repository has ever completed.
+    #
+    # The test beside it was no help and is worth naming: it asserted
+    # `count(b"Host:") == 1` for ONE supplied header, so it proved the tool
+    # does not ADD a duplicate and never asked whether a caller could SUPPLY
+    # one.
+    hosts = [line for line in given
+             if line.partition(":")[0].strip().lower() == "host"]
+    if len(hosts) > 1:
+        raise ValueError(
+            f"{len(hosts)} Host headers: {hosts!r}. RFC 9112 s3.2 admits "
+            "exactly one, and a pair is host-header desync -- a front end "
+            "honouring the first and a back end honouring the second are "
+            "reading two different requests out of the bytes this function "
+            "built.")
+    if not hosts:
         lines.append(f"Host: {host}")
     lines += given
     if body and not has_content_length:

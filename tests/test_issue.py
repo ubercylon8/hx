@@ -254,3 +254,25 @@ def test_the_host_header_is_not_duplicated():
     raw = issue.request_bytes("GET", "/a", "127.0.0.1", ("Host: other.test",))
     assert raw.count(b"Host:") == 1
     assert b"Host: other.test" in raw
+
+
+@pytest.mark.parametrize("headers", [
+    ("Host: a.test", "Host: b.test"),
+    ("host: a.test", "HOST: b.test"),      # field names are case-insensitive
+    ("Host: a.test", "X-Other: 1", "Host: b.test"),
+])
+def test_two_host_headers_from_the_caller_are_refused(headers):
+    """THE VERSION OF THIS FILE THAT SHIPPED DID NOT CATCH THIS, and the test
+    above is why it read as covered. It asserts `count(b"Host:") == 1` for ONE
+    supplied header -- proving the tool does not ADD a duplicate, and never
+    asking whether a caller could SUPPLY one. MEASURED before the fix:
+    `("Host: a.test", "Host: b.test")` went out as
+    `Host: a.test\r\nHost: b.test`.
+
+    RFC 9112 s3.2 requires a server to reject a pair, but the attack does not
+    need a compliant server: a front end honouring the first and a back end
+    honouring the second read two different requests out of one byte string,
+    which is host-header desync. This function's whole subject is refusing to
+    build a request that can be read two ways."""
+    with pytest.raises(ValueError, match="Host headers"):
+        issue.request_bytes("GET", "/a", "127.0.0.1", headers)
