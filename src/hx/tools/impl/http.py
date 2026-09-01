@@ -191,10 +191,58 @@ def _digest(ctx, issued) -> dict:
     }
 
 
+def _refuse_credential_headers(headers) -> None:
+    """RULING 21: a credential the agent types is not a header this tool takes.
+
+    `identity=` IS THE SUPPORTED ROUTE AND THE ONLY ONE. Principle 5 is that
+    the agent names an identity and `hx.identity.resolve` turns it into a
+    value BELOW this layer, so nothing above ever holds one. A free-form
+    `headers` array is a way around that, and it was measured going around
+    it: `http.send(headers=["Cookie: session=SUPERSECRETVALUE"])` wrote that
+    value verbatim into `agent_action.args_blob`, and "a credential value
+    never appears in a journal row" is a stated binding constraint of this
+    project. `hx.tools.journal.encode_args` now redacts as well -- two
+    independent guards, because the refusal alone would not cover a future
+    tool that legitimately carries header lines, and the redaction alone
+    would leave the agent with a tool that quietly does not do what it
+    said.
+
+    THE REFUSAL IS HONEST RATHER THAN INVENTIVE. The JVM already answers
+    `unmanaged_credential` for exactly this shape -- `Redactor
+    .unmanagedCredential`, checked in `Sender` before the Gate -- so every
+    such send was going to be refused anyway, one round trip and one
+    journalled credential later. This says so on this side, in the
+    vocabulary the agent can act on.
+
+    THE HEADER IS NAMED AND THE VALUE IS NEVER REPEATED. A detail is copied
+    into `agent_action.result_summary` by `journal.summarise`, which is the
+    second column the same constraint applies to -- the third finding of the
+    previous whole-branch review, in that column, for that reason.
+    """
+    named = {name.lower() for name in config_mod.CREDENTIAL_HEADERS}
+    for line in headers:
+        name, sep, _value = line.partition(":")
+        if sep and name.strip().lower() in named:
+            raise ToolRefused(
+                "bad_args",
+                f"a {name.strip()} header may not be passed to http.send: "
+                "credentials are declared in config.yaml and injected below "
+                "this layer. Pass identity=<name> instead. The extension "
+                "refuses a request carrying one it did not itself inject, so "
+                "this send could not have completed either way. (The value "
+                "you sent is not repeated here and was not stored.)")
+
+
 def send(ctx, *, host: str, method: str, path: str, port: int = 80,
          scheme: str = "http", headers=None, body: str | None = None,
          identity: str | None = None) -> dict:
     """Issue one request and return its digest."""
+    # FIRST, AND BEFORE THE IDENTITY IS RESOLVED, for Ruling 16's reason one
+    # tool over: `ensure_identity` REGISTERS, and a registration can fire the
+    # extension's liveness canary at the client's application. This check
+    # costs nothing -- it reads the argument it was handed and touches no
+    # I/O -- so it runs before the step that can put traffic on the wire.
+    _refuse_credential_headers(headers or ())
     ident = None
     if identity is not None:
         try:
@@ -263,7 +311,10 @@ registry.register(spec.ToolSpec(
                 "headers": {"type": "array", "maxItems": 64,
                             "items": {"type": "string", "maxLength": 8192},
                             "description": "wire lines, 'Name: value'. A Host "
-                                           "header is added if you omit one."},
+                                           "header is added if you omit one. "
+                                           "A Cookie, Authorization or "
+                                           "Proxy-Authorization line is "
+                                           "REFUSED -- use identity."},
                 "body": {"type": "string", "maxLength": MAX_BODY,
                          "description": "request body, latin-1"},
                 "identity": {"type": "string", "maxLength": 64,

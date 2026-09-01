@@ -399,3 +399,98 @@ def test_a_secret_shaped_argument_value_never_reaches_agent_action(tool_ctx):
     assert row is not None, "the refused call was not journalled at all"
     assert secret not in (row[0] or "")
     assert secret not in (row[1] or "")
+
+
+def test_a_credential_header_value_never_reaches_agent_action(tool_run):
+    """RULING 21, driven end to end, and the binding constraint it restores.
+
+    MEASURED before the fix: `http.send(headers=["Cookie: session=<secret>"])`
+    wrote
+
+        {"headers":["Cookie: session=SUPERSECRETVALUE"], ...}
+
+    into `agent_action.args_blob`. `journal.py`'s docstring argued verbatim
+    storage was safe and rested that on Principle 5 holding "for the
+    registered tools' schemas" -- true until a tool accepted arbitrary header
+    lines, which `http.send` does.
+
+    TWO GUARDS, AND THIS TEST NEEDS BOTH. `http.send` refuses the argument,
+    but a refusal is journalled like every other call -- so the row is
+    written either way, and only `journal.encode_args`' redaction keeps the
+    value out of it. Asserting the refusal alone would leave the column
+    untested; asserting the column alone would let the tool quietly accept a
+    credential it must not.
+    """
+    from hx.tools import dispatch, impl  # noqa: F401  (registers every tool)
+
+    from tests.test_probe import FakeBridge, sent_result
+
+    # A SESSION IS REQUIRED TO REACH THE HANDLER AT ALL: `http.send` sets
+    # needs_egress, and `dispatch`'s published order puts `no_session` after
+    # schema validation but before the handler -- so without one the call
+    # would be answered `unavailable / no_session` and the credential guard
+    # this test is about would never run.
+    bridge = FakeBridge()
+    bridge.replies([sent_result(b"HTTP/1.1 200 OK\r\n\r\nhi")])
+    tool_run.session = type("S", (), {"bridge": bridge})()
+
+    secret = "SUPERSECRETVALUE"
+    env = dispatch.dispatch(
+        tool_run, "http.send",
+        {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/a",
+         "headers": [f"Cookie: session={secret}"]},
+        why="the unsupported route")
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert secret not in (env.detail or "")
+
+    assert bridge.requests == [], "the credential reached the wire"
+
+    row = tool_run.conn.execute(
+        "SELECT args_blob, result_summary FROM agent_action"
+        " WHERE tool='http.send' ORDER BY ts_us DESC LIMIT 1").fetchone()
+    assert row is not None, "the refused call was not journalled at all"
+    assert secret not in (row[0] or "")
+    assert secret not in (row[1] or "")
+    # The LINE is still recorded -- only its value went. "The agent sent a
+    # Cookie header" is the fact run.journal exists to report, and a row
+    # that dropped the header would answer "what have I already tried" with
+    # a call that was never made.
+    assert "Cookie" in (row[0] or "")
+
+
+def test_the_redaction_covers_the_spilled_blob_and_not_just_the_column(
+        engagement):
+    """`args_blob` holds `sha256:<digest>` above 4 KB, and a redaction that
+    ran only on the inline branch would put the credential in the blob store
+    instead -- the half §7 calls the one that cannot be retrofitted, because
+    once written it is in every backup.
+
+    `encode_args` redacts BEFORE `json.dumps`, so both branches are covered
+    by construction; this drives the spill branch to prove it, and asserts
+    the padding really did push it over the cap."""
+    from hx.tools import journal
+
+    secret = "SUPERSECRETVALUE"
+    args = {"headers": [f"Authorization: Bearer {secret}"],
+            "body": "x" * (journal.ARGS_INLINE_MAX + 1)}
+    got = journal.encode_args(args, engagement.blobs)
+    assert got.startswith(journal.SPILL_PREFIX), \
+        "the arguments were small enough to stay inline; nothing is proven"
+    stored = engagement.blobs.get(got[len(journal.SPILL_PREFIX):])
+    assert secret.encode() not in stored
+    assert b"Authorization" in stored
+
+
+def test_a_header_name_inside_ordinary_text_is_left_alone():
+    """The redaction is anchored at the start of a string, so a `why` that
+    mentions a Cookie header, or a grep pattern that merely contains the
+    word, keeps its text. A rule that redacted anywhere would rewrite the
+    record of what was tried, which is section 12's failure in the table
+    built to prevent it."""
+    from hx.tools import journal
+
+    args = {"why": "the Cookie: header was already there",
+            "pattern": "X-Debug: Cookie: 1"}
+    got = journal.encode_args(args, None)
+    assert "the Cookie: header was already there" in got
+    assert "X-Debug: Cookie: 1" in got

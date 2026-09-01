@@ -202,6 +202,61 @@ def test_a_declared_identity_whose_credential_will_not_resolve_is_unavailable(
     assert ctx.session.bridge.requests == [], "send reached the wire anyway"
 
 
+@pytest.mark.parametrize("line", [
+    "Cookie: session=SUPERSECRETVALUE",
+    "Authorization: Bearer SUPERSECRETVALUE",
+    "Proxy-Authorization: Basic SUPERSECRETVALUE",
+    "cookie:session=SUPERSECRETVALUE",          # lower-cased, no space
+    "  Cookie  :  session=SUPERSECRETVALUE",    # padded either side
+])
+def test_a_credential_header_is_refused_and_its_value_is_never_echoed(
+        tool_run, line):
+    """RULING 21. Principle 5 is that the agent names an identity and the
+    value is resolved BELOW this layer; a free-form `headers` array is a way
+    around that, and it was measured going around it -- the value reached
+    `agent_action.args_blob` verbatim.
+
+    `bad_args` and not a wire class, because this is an argument the agent
+    controls and can correct, and the refusal points at the route that
+    works. It also matches what the JVM would have said: `Sender.java`
+    answers `unmanaged_credential` for exactly this shape before the Gate, so
+    the send was never going to complete -- the refusal is honest rather than
+    inventive, and it costs one round trip less.
+
+    THE HEADER IS NAMED AND THE VALUE IS NOT. A detail is copied into
+    `agent_action.result_summary` by `journal.summarise`, which is the second
+    column the binding constraint applies to."""
+    ctx = _with_session(tool_run, [sent_result()])
+    env = dispatch_mod.dispatch(ctx, "http.send",
+                                {"host": "127.0.0.1", "port": 8080,
+                                 "method": "GET", "path": "/a",
+                                 "headers": [line, "X-Trace: 7"]},
+                                why="pass a credential the supported way")
+    assert env.outcome == "refused"
+    assert env.reason == "bad_args"
+    assert "SUPERSECRETVALUE" not in (env.detail or "")
+    assert "identity" in (env.detail or "")
+    assert line.split(":")[0].strip() in (env.detail or "")
+    assert ctx.session.bridge.requests == [], \
+        "a request carrying a typed-in credential reached the wire"
+
+
+def test_an_ordinary_header_is_not_refused_by_the_credential_guard(tool_run):
+    """The other half, and it is not decoration: a guard that refused every
+    `headers` array would pass every assertion above while making the
+    argument useless. `X-Forwarded-For` and `Set-Cookie` both contain a
+    credential header's NAME as a substring and neither is one."""
+    ctx = _with_session(tool_run, [sent_result()])
+    env = dispatch_mod.dispatch(
+        ctx, "http.send",
+        {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/a",
+         "headers": ["X-Trace: 7", "X-Cookie-Debug: 1",
+                     "X-Authorization-Mode: none"]},
+        why="ordinary headers still work")
+    assert env.outcome == "ok"
+    assert b"X-Cookie-Debug: 1" in ctx.session.bridge.bodies[0]
+
+
 def test_the_delta_is_null_when_the_surface_has_no_exemplar_yet(tool_run):
     """`null` and not a zero delta: nothing was compared, and a zero delta
     would read as 'identical to normal' about a comparison never made."""
@@ -566,6 +621,34 @@ def test_grep_reports_a_corrupt_blob_as_unavailable_not_internal_error(
     assert env.reason == "unreadable"
 
 
+def _restage_request(ctx, xid, raw):
+    """Replace one exchange's stored request with `raw`, as a proxy capture.
+
+    THESE TESTS USED TO BUILD THEIR STORED REQUEST WITH `http.send(headers=
+    [...])`, AND RULING 21 CLOSED THAT DOOR -- correctly, and the door was
+    never open on a real wire either: `Sender.java` answers
+    `unmanaged_credential` for a request carrying a credential header it did
+    not itself inject, before the Gate. A stored request that carries a
+    Cookie or a bearer is a PROXY OBSERVATION, which is the case `replay_as`
+    exists for and which `Sender`'s own comment names as "the natural agent
+    action ... replaying a request lifted from Burp's history". So the blob
+    is staged directly, which is what capture would have written.
+
+    The caller asserts the credential really is in the stored blob: a helper
+    that silently staged nothing would leave a green test proving nothing,
+    which is what the `bodies[0]` assertion it replaces was for.
+    """
+    digest, _len = ctx.blobs.put(raw)
+    ctx.conn.execute("UPDATE exchange SET req_blob=? WHERE id=?",
+                     (digest, xid))
+
+
+def _stored_request(ctx, xid) -> bytes:
+    digest, = ctx.conn.execute(
+        "SELECT req_blob FROM exchange WHERE id=?", (xid,)).fetchone()
+    return ctx.blobs.get(digest)
+
+
 def _also(config, name, header):
     """`config` with a SECOND declared identity, so that a two-identity
     replay is two identities and not one identity twice.
@@ -665,14 +748,13 @@ def test_an_identity_header_in_the_stored_request_is_never_replayed(
     tool_run.config = staff_identity_config
     ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
     ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
-    env = dispatch_mod.dispatch(
-        ctx, "http.send",
-        {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/admin",
-         "headers": ["Cookie: session=alice", "X-Trace: 7"]},
-        why="capture a request that carries a session cookie")
-    xid = env.result["exchange_id"]
-    assert b"Cookie: session=alice" in ctx.session.bridge.bodies[0], \
-        "the fixture never put the cookie on the wire, so nothing is proven"
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    _restage_request(
+        ctx, xid,
+        b"GET /admin HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Cookie: session=alice\r\nX-Trace: 7\r\n\r\n")
+    assert b"Cookie: session=alice" in _stored_request(ctx, xid), \
+        "the stored request never carried the cookie, so nothing is proven"
 
     dispatch_mod.dispatch(ctx, "http.replay_as",
                           {"exchange_id": xid, "identities": ["staff"]},
@@ -956,14 +1038,13 @@ def test_a_credential_header_no_identity_declares_is_never_replayed(
     tool_run.config = staff_identity_config
     ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
     ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
-    env = dispatch_mod.dispatch(
-        ctx, "http.send",
-        {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/admin",
-         "headers": ["Authorization: Bearer alices-token", "X-Trace: 7"]},
-        why="capture a request lifted from history, bearer and all")
-    xid = env.result["exchange_id"]
-    assert b"alices-token" in ctx.session.bridge.bodies[0], \
-        "the fixture never put the bearer on the wire, so nothing is proven"
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    _restage_request(
+        ctx, xid,
+        b"GET /admin HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Authorization: Bearer alices-token\r\nX-Trace: 7\r\n\r\n")
+    assert b"alices-token" in _stored_request(ctx, xid), \
+        "the stored request never carried the bearer, so nothing is proven"
 
     dispatch_mod.dispatch(ctx, "http.replay_as",
                           {"exchange_id": xid, "identities": ["staff"]},
