@@ -185,6 +185,30 @@ def close_for(ctx, run_id: str) -> bool:
     return True
 
 
+def declaration_of(ctx, identity_id: str):
+    """The `Identity` this config declares under `identity_id`, or ValueError.
+
+    SPLIT OUT OF `ensure_identity` FOR RULING 16, and it is the whole of the
+    check that costs nothing. `ensure_identity` RESOLVES and REGISTERS, and a
+    registration can fire the extension's liveness canary against the
+    client's application -- so a tool replaying under several identities
+    checks EVERY name here first and only then resolves any of them. A typo
+    in the third name discovered after the first two had been registered
+    would be a typo found after traffic had reached the client, which is the
+    thing "resolve before sending" exists to prevent.
+
+    ONE FUNCTION RATHER THAN A SECOND COPY OF THE SENTENCE. The message an
+    agent reads for an undeclared name is one message, and a copy is what
+    drifts.
+    """
+    found = ctx.config.identities.get(identity_id)
+    if found is None:
+        raise ValueError(
+            f"identity {identity_id!r} is not declared in this config. "
+            f"Declared: {sorted(ctx.config.identities) or 'none'}")
+    return found
+
+
 def ensure_identity(ctx, identity_id: str) -> tuple[str, int]:
     """Resolve and register one identity; return `(id, generation)`.
 
@@ -204,11 +228,7 @@ def ensure_identity(ctx, identity_id: str) -> tuple[str, int]:
     message lists what IS declared) and BridgeError for a refusal from the
     extension.
     """
-    declared = ctx.config.identities.get(identity_id)
-    if declared is None:
-        raise ValueError(
-            f"identity {identity_id!r} is not declared in this config. "
-            f"Declared: {sorted(ctx.config.identities) or 'none'}")
+    declared = declaration_of(ctx, identity_id)
     resolved = identity_mod.resolve(declared, dict(os.environ))
     key = (resolved.id, resolved.generation)
     if key not in ctx._registered:

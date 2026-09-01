@@ -595,11 +595,17 @@ def test_replay_of_an_unknown_exchange_is_refused_before_any_send(tool_run):
     assert ctx.session.bridge.requests == []
 
 
-def test_an_undeclared_identity_is_refused_before_the_declared_ones_send(
+def test_an_undeclared_identity_is_refused_before_any_identity_registers(
         tool_run, staff_identity_config, monkeypatch):
-    """Every identity resolves BEFORE anything sends. A typo in the second
-    name found after the first identity's request had already reached the
-    client's application would be a request nobody can recall."""
+    """RULING 16. Every name is CHECKED before any name is RESOLVED, and both
+    happen before anything sends.
+
+    `bridge.identities` is the half that `bridge.requests` cannot see:
+    `ensure_identity` registers with the extension, whose liveness canary is
+    itself traffic against the client's application, so a typo in the second
+    name found after the first had been registered is still a typo found
+    after the client had been touched. An empty `requests` alone would let
+    that regression through."""
     monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
     tool_run.config = staff_identity_config
     ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
@@ -616,6 +622,9 @@ def test_an_undeclared_identity_is_refused_before_the_declared_ones_send(
     assert "ghost" in (env.detail or "")
     assert len(ctx.session.bridge.requests) == sent_before, \
         "staff's replay reached the wire before the typo was found"
+    assert ctx.session.bridge.identities == [], \
+        "staff was registered -- and its canary fired -- before the typo " \
+        "in the second name was found"
 
 
 def test_one_identitys_refusal_does_not_lose_the_others(
@@ -753,3 +762,112 @@ def test_a_stale_content_length_is_recomputed_rather_than_replayed(
     assert b"Content-Length: 3\r\n" in replayed
     assert b"Content-Length: 99" not in replayed
     assert replayed.endswith(b"\r\n\r\nx=1")
+
+
+def _dated(body, *, date, cookie):
+    """One response whose HEAD is unique and whose BODY is not.
+
+    `Date:` and a per-session `Set-Cookie` are the two headers that differ
+    between any two replies to one request, which is exactly what makes
+    comparing whole responses report a difference every time.
+    """
+    return (b"HTTP/1.1 200 OK\r\nDate: " + date + b"\r\nSet-Cookie: s="
+            + cookie + b"\r\nContent-Type: text/html\r\n\r\n" + body)
+
+
+def test_replies_differing_only_in_date_and_cookie_do_not_differ(
+        tool_run, staff_identity_config, monkeypatch):
+    """TRAP 4, and `replay_as`'s own comment calls it the one answer this
+    tool must never give wrongly. Two replays of one request differ in their
+    `Date:` and their per-session `Set-Cookie` even when the application
+    returned byte-identical content, so a comparison over WHOLE responses
+    reports an authorisation difference on EVERY single call -- and an
+    authz finding gets written from these rows.
+
+    `differs is False` is the assertion, not `not differs`: null is "not
+    computed" and would satisfy a falsiness check while meaning the
+    opposite."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    page = b"admin panel, unchanged"
+    ctx = _with_session(tool_run, [
+        sent_result(_dated(page, date=b"Mon, 01 Sep 2026 00:00:00 GMT",
+                           cookie=b"aaaaaa")),
+        sent_result(_dated(page, date=b"Mon, 01 Sep 2026 00:00:07 GMT",
+                           cookie=b"bbbbbb")),
+        sent_result(_dated(page, date=b"Mon, 01 Sep 2026 00:00:09 GMT",
+                           cookie=b"cccccc"))])
+    xid = _one_exchange_on(ctx, page, path="/admin")
+
+    env = dispatch_mod.dispatch(
+        ctx, "http.replay_as",
+        {"exchange_id": xid, "identities": ["staff"],
+         "include_anonymous": True},
+        why="two sessions that are shown the same page")
+    rows = env.result["rows"]
+    assert [r["identity"] for r in rows] == ["staff", None]
+    assert rows[0]["differs"] is False
+    assert rows[1]["differs"] is False
+    assert rows[0]["diff_vs_original"]["len_delta"] == 0
+    assert rows[1]["diff_vs_original"]["len_delta"] == 0
+
+
+def test_a_credential_header_no_identity_declares_is_never_replayed(
+        tool_run, staff_identity_config, monkeypatch):
+    """RULING 15, and the half the declared set cannot reach. `staff` injects
+    `Cookie`, so an `Authorization` in the stored request is named by NO
+    declared identity -- and it is exactly what a request lifted from Burp's
+    history carries, which `Sender.java` itself names as the natural agent
+    action.
+
+    Replayed verbatim, the extension refuses it as `unmanaged_credential`
+    before the Gate, so every row comes back refused and no authz table can
+    be built at all. `FakeBridge` implements no such check, which is why the
+    SENT BYTES are what this asserts on rather than the envelope."""
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok), sent_result(ok)])
+    env = dispatch_mod.dispatch(
+        ctx, "http.send",
+        {"host": "127.0.0.1", "port": 8080, "method": "GET", "path": "/admin",
+         "headers": ["Authorization: Bearer alices-token", "X-Trace: 7"]},
+        why="capture a request lifted from history, bearer and all")
+    xid = env.result["exchange_id"]
+    assert b"alices-token" in ctx.session.bridge.bodies[0], \
+        "the fixture never put the bearer on the wire, so nothing is proven"
+
+    dispatch_mod.dispatch(ctx, "http.replay_as",
+                          {"exchange_id": xid, "identities": ["staff"]},
+                          why="replay /admin as staff")
+    replayed = ctx.session.bridge.bodies[-1]
+    assert b"alices-token" not in replayed
+    assert b"Authorization" not in replayed
+    assert b"X-Trace: 7" in replayed, \
+        "a replay that drops a header carrying no credential sends a " \
+        "request the agent never captured"
+
+
+def test_more_identities_than_the_bound_is_refused_not_silently_truncated(
+        tool_run, staff_identity_config, monkeypatch):
+    """The schema's `maxItems` already holds this, so the handler's own guard
+    is unreachable through `dispatch` -- which is why it is asserted against
+    the handler directly. A SLICE is the wrong shape for a bound whose whole
+    subject is blast radius: it would drop the identities past the eighth and
+    return a complete-looking table that never asked about them."""
+    from hx.tools.errors import ToolRefused
+    from hx.tools.impl import http as http_mod
+
+    monkeypatch.setenv("HX_STAFF_TOKEN", "s3cret")
+    tool_run.config = staff_identity_config
+    ok = b"HTTP/1.1 200 OK\r\n\r\nadmin panel"
+    ctx = _with_session(tool_run, [sent_result(ok)])
+    xid = _one_exchange_on(ctx, ok, path="/admin")
+    sent_before = len(ctx.session.bridge.requests)
+
+    with pytest.raises(ToolRefused) as caught:
+        http_mod.replay_as(
+            ctx, exchange_id=xid,
+            identities=["staff"] * (http_mod.MAX_IDENTITIES + 1))
+    assert caught.value.reason == "bad_args"
+    assert len(ctx.session.bridge.requests) == sent_before

@@ -20,6 +20,7 @@ exact moment hx worked as designed.
 """
 from __future__ import annotations
 
+from ... import config as config_mod
 from ... import delta as delta_mod
 from ... import http_text
 from ... import identity as identity_mod
@@ -413,6 +414,11 @@ registry.register(spec.ToolSpec(
 
 #: Identities per replay. Each one is a whole extra request against a client's
 #: application, so this is a blast-radius bound rather than a performance one.
+#: THE SEND CEILING IS ONE HIGHER: `include_anonymous` adds a row that is not
+#: an identity and is not counted here, so a full call issues nine requests,
+#: not eight. Named rather than folded in, because the bound an operator
+#: reasons about is "how many sessions am I comparing" and the anonymous row
+#: is the comparison rather than one of the sessions.
 MAX_IDENTITIES = 8
 
 
@@ -488,6 +494,20 @@ def _replayed_headers(ctx, raw: bytes) -> tuple[str, ...]:
     name this side knows -- and a rule that dropped only the known one would
     be exactly as wrong on the rows where it matters most.
 
+    RULING 15: THE DROP SET IS `config.CREDENTIAL_HEADERS` UNION THE DECLARED
+    ONES, and both halves are needed. The declared half covers the identities
+    THIS engagement configured. The standing half covers a credential the
+    original request carried that no identity here declares -- an
+    `Authorization` on an engagement whose only identity injects `Cookie` --
+    and that is the case a replay is MOST likely to meet, since the natural
+    agent action is replaying a request lifted from Burp's history. Without
+    it the extension refuses every replay as `unmanaged_credential` before
+    the Gate (`Redactor.unmanagedCredential`), so the tool is not wrong so
+    much as dead: every row comes back refused and no authz table can be
+    built at all. `config.CREDENTIAL_HEADERS` is IMPORTED rather than
+    restated, because it is already pinned byte for byte against the
+    extension's own list and a second copy is a second thing to keep in sync.
+
     `Content-Length` GOES TOO, for a plainer reason: `issue.request_bytes`
     computes it from the body it is handed and REFUSES a caller-supplied one
     that disagrees, because a Content-Length that does not match its body is
@@ -496,8 +516,9 @@ def _replayed_headers(ctx, raw: bytes) -> tuple[str, ...]:
     disagreement, so replaying the header would turn a perfectly replayable
     request into a refusal over a number this side can simply recompute.
     """
-    drop = {ident.inject.header.strip().lower()
-            for ident in ctx.config.identities.values()}
+    drop = {name.lower() for name in config_mod.CREDENTIAL_HEADERS}
+    drop.update(ident.inject.header.strip().lower()
+                for ident in ctx.config.identities.values())
     drop.add("content-length")
     head, _body = http_text.split_head_body(raw)
     kept = []
@@ -554,6 +575,15 @@ def replay_as(ctx, *, exchange_id: str, identities,
     `diff_vs_original` are null, "not computed", exactly as `delta`'s own
     `new_tokens` is null rather than `[]` when the bodies were too big to
     diff, and the `original_body_stored` facet names the reason.
+
+    A NULL `differs` MEANS "NOT COMPUTED", NEVER "NO DIFFERENCE", and it
+    happens two ways: the identity's replay was REFUSED, so there is no
+    response to compare, or the original had no stored response body, so
+    there is nothing to compare against. `false` is the only value that says
+    the two bodies matched. An agent writing `if not row["differs"]` reads a
+    row where nothing was ever sent as a clean result, which is section 12's
+    "tested, clean" against "never reached" inside one key -- `refused` tells
+    the two apart on the row and `original_body_stored` on the facet.
     """
     row = ctx.conn.execute(
         "SELECT req_blob, resp_blob, resp_len, status, method, url"
@@ -608,11 +638,31 @@ def replay_as(ctx, *, exchange_id: str, identities,
     except ValueError as exc:
         raise ToolRefused("bad_args", str(exc)) from exc
 
-    # RESOLVE EVERY IDENTITY BEFORE SENDING ANYTHING. A typo in the third
-    # name would otherwise be discovered after two requests had already
-    # reached the client's application -- and those two are not recallable.
-    wanted = list(identities)[:MAX_IDENTITIES]
+    # THE BOUND REFUSES RATHER THAN SLICING. The schema's `maxItems` already
+    # holds it, so this is unreachable through `dispatch` -- but a SLICE is
+    # the wrong shape for a bound whose whole subject is blast radius: relax
+    # the schema and it would silently drop the identities past the eighth
+    # and report a complete-looking table that never asked about them.
+    wanted = list(identities)
+    if len(wanted) > MAX_IDENTITIES:
+        raise ToolRefused(
+            "bad_args",
+            f"{len(wanted)} identities is more than the {MAX_IDENTITIES} one "
+            "replay may put on a client's application. Split the call.")
+    # RULING 16, AND IT IS TWO PASSES RATHER THAN ONE. `ensure_identity`
+    # RESOLVES AND REGISTERS, and a registration can fire the extension's
+    # liveness canary against the client's application -- which is traffic. A
+    # typo in the third name found after the first two had been registered
+    # would be a typo found after traffic had already reached the client, and
+    # that traffic is not recallable. So the check that costs NOTHING -- a
+    # lookup in `config.identities`, no I/O of any kind -- runs over every
+    # name before the step that can touch the client runs over any of them.
     try:
+        for name in wanted:
+            live.declaration_of(ctx, name)
+        # ...AND ONLY NOW. Still before any SEND, which is the second half of
+        # the same ruling: nothing goes on the wire until every identity has
+        # a credential behind it.
         resolved = [live.ensure_identity(ctx, name) for name in wanted]
     except ValueError as exc:
         raise ToolRefused("bad_args", str(exc)) from exc
@@ -664,7 +714,9 @@ def replay_as(ctx, *, exchange_id: str, identities,
 registry.register(spec.ToolSpec(
     name="http.replay_as", handler=replay_as, needs_egress=True, mutates=True,
     summary="Re-issue one stored request under several identities and report "
-            "each one's digest and how it differs from the original.",
+            "each one's digest and how it differs from the original. A null "
+            "`differs` means NOT COMPARED -- the replay was refused, or the "
+            "original's response body was never stored -- never 'the same'.",
     params={"type": "object", "additionalProperties": False,
             "required": ["exchange_id", "identities"], "properties": {
                 "exchange_id": {"type": "string", "maxLength": 64},
