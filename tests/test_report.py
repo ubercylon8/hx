@@ -938,7 +938,15 @@ def test_a_partly_remediated_finding_renders_the_current_prose_not_run_ones():
     assert "The response set `session` without SameSite." in out
     assert "`session` is exposed because it lacks SameSite." in out
     assert "Set SameSite on `session`." in out
-    assert "HttpOnly" not in out
+    # THE SWEEP SURVIVES, MINUS ONE LINE. `HttpOnly` must appear nowhere in
+    # this finding's own prose -- that is the point of a bare-token check
+    # after the four column assertions above. It DOES now appear once in the
+    # document, in the Findings scope line added 2026-09-02, which says what
+    # `cookie_flags` LOOKS FOR. That is corpus scope and not this finding's
+    # stale text, so the line is excluded rather than the sweep weakened.
+    body = "\n".join(line for line in out.splitlines()
+                     if "What this assessment looked for" not in line)
+    assert "HttpOnly" not in body
     # `cwe` is computed from the same current state `severity` is
     # (`cookie_flags`: "CWE-1004" if HttpOnly is missing else "CWE-614"), so
     # leaving it behind pairs a refreshed severity with a stale
@@ -1210,6 +1218,11 @@ class _FakeActiveCheck:
     version = "1"
     klass = "active_safe"
     insertion_kinds = frozenset({"query"})
+    # Read by the Findings scope line since 2026-09-02, and here for the
+    # reason the docstring above gives for `version` and `insertion_kinds`:
+    # this is a check by the same description `registry.validate` uses, not a
+    # stub that happens to satisfy one caller.
+    looks_for = "a category this test invented"
 
 
 def test_the_shipped_corpus_now_ships_an_active_check_and_the_prose_says_so(
@@ -1685,7 +1698,16 @@ def test_an_aborted_findings_section_is_not_byte_identical_to_a_clean_one(
     # rather than boilerplate: a completed clean run still says the plain
     # thing. (`test_none_recorded_is_unqualified_once_a_clean_scan_has_run`
     # pins the same sentence from the F4 side.)
-    assert clean_findings == "## Findings\n\nNone recorded.\n\n"
+    # The scope line joined this section on 2026-09-02, so the literal is no
+    # longer the whole of it. The property under test is unchanged and is the
+    # assertion above: an aborted section must not be byte-identical to a
+    # clean one. This pins the clean section's own two facts -- it says
+    # `None recorded.` and it does NOT carry the unfinished-run qualifier --
+    # rather than the exact bytes, which now include a sentence derived from
+    # the registry and would re-break on every check added.
+    assert "None recorded.\n" in clean_findings
+    assert "did not finish" not in clean_findings
+    assert "was not looked for" in clean_findings
 
 
 def test_a_findings_list_from_an_unfinished_run_is_marked_partial():

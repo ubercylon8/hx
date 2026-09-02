@@ -106,6 +106,21 @@ def validate(checks) -> None:
                 "the pass and list its hook in `_RUNNER_CALLS` before "
                 "registering a check that needs it")
 
+        # LAST, DELIBERATELY. Every rule above decides whether this check can
+        # RUN; this one decides whether the report can DESCRIBE it, and a
+        # check with no hook and no `looks_for` should hear about the hook
+        # first.
+        looks_for = getattr(check, "looks_for", None)
+        if not isinstance(looks_for, str) or not looks_for.strip():
+            raise RegistryError(
+                f"{check.id}: no `looks_for`. The report's Findings section "
+                "opens by naming what this build looked for, derived from "
+                "this attribute -- a check without one would vanish from that "
+                "sentence AND take the absence of its category with it, so "
+                "the report would under-claim its own coverage with nothing "
+                "to say so. One lowercase noun phrase (an acronym may open "
+                "it), no trailing stop; see `base.Check.looks_for`")
+
 
 CHECKS: tuple[base.Check, ...] = (
     cookie_flags.CookieFlags(),

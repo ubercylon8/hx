@@ -4709,6 +4709,7 @@ class _CliActive:
     which also means it runs against `engagement_with_surface`'s exchange,
     whose `req_blob` is NULL and yields no points to derive."""
     id, version, klass = "hx.test.cliactive", "1", "active_safe"
+    looks_for = "a category this test invented"
     insertion_kinds = frozenset()
 
     def probes(self, ctx, surface, insertions, send):
@@ -4837,6 +4838,7 @@ def test_scan_does_not_open_a_session_for_a_non_passive_class_that_reads(
 
     class ReadsOnly:
         id, version, klass = "hx.test.reads", "1", "active_timing"
+        looks_for = "a category this test invented"
         insertion_kinds = frozenset()
 
         def on_surface(self, ctx, surface, exchanges):

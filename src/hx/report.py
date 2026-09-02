@@ -285,7 +285,7 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
 
     out.extend(_provenance(conn, engagement_id, config, created_us=eng[3],
                            unfinished=cov.unfinished))
-    out.extend(_findings(conn, engagement_id, scanned=cov.scanned,
+    out.extend(_findings(conn, engagement_id, config, scanned=cov.scanned,
                          unfinished=cov.unfinished))
     out.extend(_coverage(config, cov=cov))
     if blobs is not None:
@@ -866,7 +866,51 @@ def _status(conn, finding_id, status) -> str:
     return f' · *status: {status} — "{_flat(_redact(note))}"*'
 
 
-def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
+def _scope_of_the_corpus(config) -> str:
+    """What this build looked for, and the sentence saying nothing else was.
+
+    MEASURED 2026-09-02, the first end-to-end run of this harness. Against a
+    target serving no Content-Security-Policy, a `/ftp` listing full of
+    `.bak` files and an unauthenticated admin configuration endpoint, this
+    section rendered `None recorded.` Every verdict behind it was correct --
+    `security_headers` tests three headers and all three passed or did not
+    apply, and the corpus has no directory-listing check and no authorisation
+    check. What was wrong was the SUM: a client reading `None recorded` above
+    fourteen `clean` rows concludes the application was assessed and sound.
+
+    S12's rule was already enforced for SURFACES -- Coverage names the ones
+    nothing answered for. It was not enforced for the CORPUS ITSELF, and that
+    boundary is the one a reader cannot see and cannot guess. Limits states
+    it, in nine bullets seventy lines below where the eye lands; this is the
+    same fact where it is read.
+
+    DERIVED FROM `enabled_for(config)` AND NOT FROM `CHECKS`. An engagement
+    that disables a class must not be told those categories were looked for
+    -- that would be this line committing the exact false-coverage claim it
+    exists to prevent.
+
+    The closing pointer names three categories rather than deriving them,
+    because an absence cannot be derived: these are the three the dry run
+    proved a reader assumes are covered.
+    """
+    phrases = [c.looks_for for c in registry.enabled(config)]
+    if not phrases:
+        return ("**No check was enabled for this engagement**, so nothing "
+                "below is a statement about the application: this scan "
+                "looked for nothing. See Limits.\n")
+    return (
+        "**What this assessment looked for**, and nothing else: "
+        + " · ".join(_flat(_redact(p)) for p in sorted(phrases))
+        + ". **A category absent from that list was not looked for**, and "
+        "its absence here is not evidence of its absence in the "
+        "application — directory listings, authorisation and access-control "
+        "flaws, and injection classes other than SQL are outside this build. "
+        "See Limits at the end of this report for the full statement of what "
+        "was not covered.\n")
+
+
+def _findings(conn, engagement_id, config, *, scanned,
+              unfinished) -> list[str]:
     # `ORDER BY title, id`: F13 of fix round 1. Without an ORDER BY, two
     # renders of the same store can list one severity's findings in a
     # different order -- SQLite makes no promise about it -- and a retest
@@ -884,9 +928,9 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # different fact from "0 findings") -- a client reading an
             # unqualified "None recorded" above a "not been scanned"
             # Coverage section reads it as a clean bill it never earned.
-            return ["## Findings\n",
-                   "None recorded — this engagement has not been scanned "
-                   "yet; see Coverage below.\n"]
+            return ["## Findings\n", _scope_of_the_corpus(config),
+                    "None recorded — this engagement has not been scanned "
+                    "yet; see Coverage below.\n"]
         if unfinished:
             # N2 (fix round C), and the same qualifier pattern F4 established
             # one branch up. MEASURED on an `aborted` run: this section
@@ -897,15 +941,16 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # client reads first. Coverage below already marks its numbers
             # partial, so the information was in the document; the part read
             # first did not carry it.
-            return ["## Findings\n",
-                   f"None recorded — but {len(unfinished)} of the runs behind "
+            return ["## Findings\n", _scope_of_the_corpus(config),
+                    f"None recorded — but {len(unfinished)} of the runs behind "
                     "this report did not finish (each is named under "
                     "Provenance above), so this is not a clean bill: a check "
                     "a stopped run never got to cannot have found anything. "
                     "See Coverage below for what was and was not reached.\n"]
-        return ["## Findings\n", "None recorded.\n"]
+        return ["## Findings\n", _scope_of_the_corpus(config),
+                "None recorded.\n"]
 
-    out = ["## Findings\n"]
+    out = ["## Findings\n", _scope_of_the_corpus(config)]
     if unfinished:
         # The same defect in the other direction, and the same fix: a LIST of
         # findings drawn from runs that stopped renders byte-identically to

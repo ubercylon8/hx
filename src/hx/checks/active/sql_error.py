@@ -211,6 +211,7 @@ def _describe(insertion: base.Insertion, resp, signature: str, vendor: str) -> s
 class SqlError:
     id = "hx.active.sql-error"
     version = "1"
+    looks_for = ("database error messages disclosed in a response")
     klass = "active_safe"
     insertion_kinds = frozenset({"query", "path_segment"})
 

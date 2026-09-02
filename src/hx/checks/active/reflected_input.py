@@ -265,6 +265,7 @@ def _describe(insertion: base.Insertion, marker: str, resp, *,
 class ReflectedInput:
     id = "hx.active.reflected-input"
     version = "1"
+    looks_for = ("request input echoed back into a response")
     klass = "active_safe"
     insertion_kinds = frozenset({"query", "path_segment", "header", "cookie"})
 

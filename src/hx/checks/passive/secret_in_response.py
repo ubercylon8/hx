@@ -47,6 +47,7 @@ _ISSUE_TYPES = tuple(issue_type_id for *_, issue_type_id in _PATTERNS)
 class SecretInResponse:
     id = "hx.passive.secret-in-response"
     version = "1"
+    looks_for = ("credentials and keys disclosed in a response body")
     klass = "passive"
     insertion_kinds = frozenset()
 

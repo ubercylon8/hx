@@ -603,9 +603,10 @@ one call, keeping the comment that explains why they are computed once:
 
     out.extend(_provenance(conn, engagement_id, config, created_us=eng[3],
                            unfinished=cov.unfinished))
-    out.extend(_findings(conn, engagement_id, scanned=cov.scanned,
+    out.extend(_findings(conn, engagement_id, config, scanned=cov.scanned,
                          unfinished=cov.unfinished))
     out.extend(_coverage(config, cov=cov))
+    if blobs is not None:
 ```
 
 **(d)** Change `_coverage`'s signature to `def _coverage(config, *, cov) ->

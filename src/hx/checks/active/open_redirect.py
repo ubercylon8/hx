@@ -222,6 +222,7 @@ def _location_value(head: bytes) -> str:
 class OpenRedirect:
     id = "hx.active.open-redirect"
     version = "1"
+    looks_for = ("redirects to an address supplied in the request")
     klass = "active_safe"
     insertion_kinds = frozenset({"query"})
 
