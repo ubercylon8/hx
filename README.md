@@ -135,7 +135,32 @@ hx mcp --root path/to/engagement    # newline-delimited JSON-RPC 2.0 on stdio
 Three more —
 `engagement.create`, `surface.add`, `finding.set_status` — are deliberately never
 tools at all: creating an engagement and confirming a finding are human acts, and stay in
-the CLI and the (future) web app.
+the CLI and the web app below.
+
+**`hx web` serves the read-only web app.** It is a browser window onto an engagement
+store — the overview, surfaces, findings, a finding's evidence chain and the raw exchange
+behind it — plus the same two human acts as the CLI: confirming or dismissing a finding,
+and hitting STOP.
+
+```bash
+hx web --base path/to/engagements    # serves http://127.0.0.1:8901
+```
+
+It binds `127.0.0.1` only and **there is no `--host` option** — S11 fixes the terms for
+serving wider than loopback (a per-install bearer token, landing before the first write
+endpoint), neither ships here, so the operator has no flag to get the binding wrong.
+`--base` names the engagements *parent* directory, matching `hx new --root`; every other
+command's `--root` is one engagement's own directory, and that inconsistency predates this
+command (see `docs/DECISIONS.md`). The only two things a request can change are a
+finding's triage status and the halt — everything else is a read.
+
+```bash
+hx triage f-xyz --status confirmed
+hx triage f-xyz --status false_positive --note "staging only; the CDN sets it in prod"
+```
+
+`hx triage` is the same act from a terminal: `--note` is required for `false_positive` —
+it reaches the client deliverable — and optional for `confirmed`.
 
 ---
 
@@ -175,16 +200,14 @@ engagement updates findings rather than duplicating them.
 
 ## What is not built yet
 
-Against the v1 scope in the design spec, five of nine items are done. Outstanding:
+Against the v1 scope in the design spec, six of nine items are done. Outstanding:
 
 - **The crawler** — the schema and the extension's crawler listener exist; nothing drives a
-  crawl.
+  crawl. `crawl.run` is registered and permanently answers `unavailable /
+  not_implemented`: discovery is the operator's browser through the proxy, and a report
+  should say so.
 - **Identities** — `config.yaml` accepts an `identities` block and nothing applies it. This
   is the root of the unauthenticated-probe limitation above.
-- **A crawler.** `crawl.run` is registered and permanently answers
-  `unavailable / not_implemented`. Discovery is the operator's browser through the proxy,
-  and a report should say so.
-- **The web app screens.**
 
 ---
 

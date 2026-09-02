@@ -484,6 +484,54 @@ therefore different objects, `tool_schema` deep-copies, and a test runs
 `check_schema` over every published one so the added property cannot become a
 constraint nothing enforces.
 
+## The web app
+
+### Starlette, not FastAPI
+
+Measured 2026-09-01: `fastapi uvicorn jinja2` resolves to 15 packages against
+`starlette uvicorn jinja2`'s 9, and the six extra include `pydantic-core`, a
+compiled extension. FastAPI is Starlette plus pydantic validation and OpenAPI
+generation, and this app's entire validated input is a status enum and a note
+string — S11's own "should not pull hundreds of transitive packages to render
+a table" is the argument for the smaller closure.
+
+### Reads do not go through the tool layer
+
+`tools/dispatch.py` journals every call, and `journal.record` defaults to
+`actor="agent"` — so routing a page view through it would write one
+`agent_action` row per view, and the agent transcript screen would fill with
+the act of reading it. The audit trail would stop being able to answer "what
+did the agent do", which is the question it exists to answer. The envelopes
+disagree too: handles and digests, match-addressed reads and token-budget caps
+are shaped for a model with a context window, and a human with a browser has
+neither constraint. `src/hx/web/reads.py` owns its own queries instead, one
+function per screen, over a connection the caller opened read-only and closes
+at the end of the request.
+
+### Coverage was extracted, and nothing else
+
+`hx.coverage.facts` and `hx.run.is_stale`/`stale_before_us` are the only two
+pieces of `report.py`/`run.py` Task 1 pulled out, because they are the only
+two with a SECOND caller: the report and the web overview screen both need
+the same coverage figures and the same definition of a dead run, and two
+copies of either is how a screen and a report end up disagreeing about the
+same engagement. Nothing else in `report.py` — `_findings`, `_provenance`,
+`_limits` — has a second consumer yet, so extracting it would be indirection
+with no argument behind it.
+
+### The app can stop but not start
+
+The web app spec fixes the control surface at exactly two things — the STOP
+button and finding triage — "and this design does not widen it" (§1 of
+`docs/superpowers/specs/2026-09-01-web-app-design.md`, quoting master spec
+§8's *"creating an engagement and confirming a finding are human acts; they
+live in the CLI and the web app"*). Starting a scan is not a database write:
+it launches Burp, drives the bridge, and holds a process for the run's whole
+duration, and none of that is a thing an unauthenticated loopback HTTP
+request should be able to trigger. Stopping and triaging are cheap and
+synchronous by comparison — one sentinel file, one SQLite row, one
+status-event insert — which is exactly the shape the spec draws the line at.
+
 ## Process decisions
 
 ### A plan is a historical argument, not live documentation
@@ -524,6 +572,11 @@ not run since the commit that added the second.
 
 | | |
 |---|---|
+| `--root` means the engagements PARENT to `hx new` and one engagement's OWN directory to every other command; `hx web --base` is a third name for the first meaning | Renaming a flag on six merged commands is a breaking change to an operator's muscle memory and to any script they have written, in exchange for tidiness. `--base` is a new name that does not inherit the ambiguity. |
+| No authentication, and no non-loopback binding | S11 sets the terms: a per-install bearer token lands *before* the first write endpoint on a wider binding. Neither is needed while the Host allowlist and loopback binding hold. |
+| A GET can create `blobs/tmp/` via `BlobStore.__init__` | The one filesystem side effect on a read path. It creates a directory at `0700` inside an engagement that already exists and touches no database, blob or config file. Removing it means a read-only BlobStore constructor, which is a change to a module three other callers share. |
+| Triage has no optimistic concurrency | Two operators triaging one finding both get events recorded and the last wins the cached projection. The log is append-only, so the race is visible rather than silent. |
+| The web app does not render `denial` rows | The overview shows what was tested and found; what was REFUSED is a fourth screen, and S11's screen list does not name one. `hx info` and the report both show denial counts today. |
 | `finding.normaliser_version DEFAULT 1` | Inherited from a merged plan whose own deadline expired before the branch that noticed it. Cannot produce a wrong result today: nothing writes or reads the column |
 | `2026-08-27-checks-and-reporting.md` holds `plan-drift: pending` | 26 blocks uncompared, including whole-file markers for code later plans rewrote |
 | `open_redirect` can only be shown a fix on a 2xx | A fix delivered by `302 → /home` leaves the finding live indefinitely. The discriminator that would fix it does not exist without a control probe: a login redirect is typically same-origin too |
