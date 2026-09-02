@@ -3045,3 +3045,48 @@ def test_no_credential_and_no_environment_value_appears_in_a_report(
     for secret in (_ENV_VALUE, "s3cr3t-report-cookie", _ENV_NAME,
                    _REFRESH_TOKEN, "./mint.sh"):
         assert secret not in out, f"{secret!r} reached the rendered report"
+
+
+def test_a_dismissed_findings_reason_reaches_the_report(engagement_conn):
+    """S12 pointed at triage. A bare `status: false_positive` in a client
+    deliverable cannot distinguish "we checked and it is not real" from "we
+    did not want to write it up", and the note is REQUIRED at the moment the
+    finding is dropped precisely so that this line can carry it."""
+    from hx import triage as triage_mod
+
+    engagement_conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level)"
+        " VALUES('f-fp','e-1','k-fp','Missing HSTS','Low','Firm','check',"
+        "'new','surface')")
+    triage_mod.set_status(engagement_conn, finding_id="f-fp",
+                          to_status="false_positive",
+                          note="staging only; the CDN sets it in production")
+
+    cfg = config_mod.Config(name="T", client="T", safety_profile="staging",
+                            scope_include=["https://app.test/*"])
+    out = report.render(engagement_conn, engagement_id="e-1", config=cfg)
+
+    assert "staging only; the CDN sets it in production" in out
+    assert "status: false_positive" in out
+
+
+def test_a_confirmed_finding_with_no_note_still_renders_its_status(
+        engagement_conn):
+    """The note is optional on `confirmed`, so the status half must not
+    depend on one being there."""
+    from hx import triage as triage_mod
+
+    engagement_conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level)"
+        " VALUES('f-ok','e-1','k-ok','Missing HSTS','Low','Firm','check',"
+        "'new','surface')")
+    triage_mod.set_status(engagement_conn, finding_id="f-ok",
+                          to_status="confirmed")
+
+    cfg = config_mod.Config(name="T", client="T", safety_profile="staging",
+                            scope_include=["https://app.test/*"])
+    out = report.render(engagement_conn, engagement_id="e-1", config=cfg)
+
+    assert "status: confirmed" in out

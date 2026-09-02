@@ -71,6 +71,7 @@ from hx import config as config_mod
 from hx import coverage as coverage_mod
 from hx import insertion as insertion_mod
 from hx import surface as surface_mod
+from hx import triage as triage_mod
 from hx.checks import probe
 from hx.checks import registry
 from hx.store import records
@@ -842,6 +843,29 @@ def _latest_observed(conn, finding_id) -> bool | None:
     return bool(row[0])
 
 
+def _status(conn, finding_id, status) -> str:
+    """The status half of a finding's subtitle, with the human's reason.
+
+    S12 has a sibling nobody wrote down until 2026-09-01: a report that
+    cannot distinguish "we checked and it is not real" from "we did not want
+    to write it up". A bare `status: false_positive` is exactly that
+    ambiguity, and it is why `triage.NOTE_REQUIRED` makes the note
+    compulsory on that transition -- the field and its destination are one
+    feature, and shipping the first without the second is friction that goes
+    nowhere.
+
+    `_flat` and `_redact` for the reason D4 gives: the note is free text a
+    human typed, and every rendered free-text value is flattened, not only
+    the ones that reach a table.
+    """
+    if status == "new":
+        return ""
+    note = triage_mod.latest_note(conn, finding_id)
+    if not note:
+        return f" · *status: {status}*"
+    return f' · *status: {status} — "{_flat(_redact(note))}"*'
+
+
 def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
     # `ORDER BY title, id`: F13 of fix round 1. Without an ORDER BY, two
     # renders of the same store can list one severity's findings in a
@@ -959,7 +983,7 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # paragraph. A real `CWE-1004` is unchanged by it.
             out.append(f"*Confidence: {confidence}*"
                        + (f" · *{_flat(cwe)}*" if cwe else "")
-                       + (f" · *status: {status}*" if status != "new" else "")
+                       + _status(conn, fid, status)
                        + marker
                        + "\n")
             # D4. These three reached `out` with `_redact` and no `_flat`,
