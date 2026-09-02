@@ -864,6 +864,21 @@ def test_latest_note_is_the_most_recent_events(engagement_conn):
     assert triage_mod.latest_note(engagement_conn, "f-1") == "second"
 
 
+def test_latest_note_breaks_a_tied_timestamp_by_the_later_insert(
+        engagement_conn):
+    """Two events can land in the same microsecond; `ts_us DESC, rowid DESC`
+    settles the tie on the later INSERT rather than leaving SQLite free to
+    return either row for a bare `ORDER BY ts_us DESC`."""
+    _finding(engagement_conn)
+    triage_mod.set_status(engagement_conn, finding_id="f-1",
+                          to_status="confirmed", now_us=10)
+    triage_mod.set_status(engagement_conn, finding_id="f-1",
+                          to_status="false_positive", note="second",
+                          now_us=10)
+
+    assert triage_mod.latest_note(engagement_conn, "f-1") == "second"
+
+
 def test_the_trigger_still_refuses_an_agent_confirmation(engagement_conn):
     """Not this module's guard -- the store's. Pinned here because
     `triage.py` is now the thing standing between an agent and this table,
@@ -2980,6 +2995,50 @@ def test_a_surface_whose_only_check_row_is_skipped_shows_no_answers(
         conn.close()
 
 
+def test_an_empty_engagement_says_nothing_was_captured_on_the_surface_screen(
+        client):
+    """No surface exists yet; the screen must say so rather than rendering
+    an empty table with no explanation.
+
+    MUTATION: delete the `{% if not surfaces %}` branch from
+    surfaces.html, leaving only the table. This test must go red.
+    """
+    body = client.get("/e/alpha/surfaces").text
+    assert "Nothing captured yet" in body
+    assert "<table>" not in body
+
+
+def test_no_findings_says_so_rather_than_an_empty_table(client):
+    """MUTATION: delete the `{% if not findings %}` branch from
+    findings.html, leaving only the table. This test must go red.
+    """
+    body = client.get("/e/alpha/findings").text
+    assert "No finding matches" in body
+    assert "<table>" not in body
+
+
+def test_a_host_scoped_finding_shows_its_host_not_a_path_template(
+        client, alpha_db):
+    """A `host`- or `engagement`-scoped finding has no `surface_id`, so the
+    LEFT JOIN's `path_template` is NULL -- `findings.html` falls back to
+    the finding's own `host` column rather than rendering a blank cell.
+
+    MUTATION: in findings.html, change the `{% if f.path_template %}`
+    branch to always render (drop the `{% else %}` fallback). This test
+    must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level, host)"
+        " VALUES('f-host',?,'k-host','Weak TLS config','Medium','Firm',"
+        "'check','new','host','weak.alpha.test')", (eid,))
+
+    body = client.get("/e/alpha/findings").text
+
+    assert "weak.alpha.test" in body
+
+
 def test_the_findings_screen_orders_by_severity(client, alpha_db):
     eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
     _finding(alpha_db, eid, fid="f-low", severity="Low", title="Low one")
@@ -3366,7 +3425,7 @@ def test_the_finding_detail_shows_its_evidence_chain(client, alpha_db):
     body = client.get("/e/alpha/findings/f1").text
 
     assert "the payload came back verbatim" in body
-    assert "x1" in body
+    assert '/e/alpha/exchanges/x1">x1</a>' in body
 
 
 def test_the_finding_detail_shows_its_status_history(client, alpha_db):
@@ -3386,6 +3445,29 @@ def test_the_finding_detail_shows_its_status_history(client, alpha_db):
 
 def test_an_unknown_finding_is_a_404(client):
     assert client.get("/e/alpha/findings/f-nope").status_code == 404
+
+
+def test_an_unknown_exchange_is_a_404(client):
+    assert client.get("/e/alpha/exchanges/x-nope").status_code == 404
+
+
+def test_the_finding_screens_three_empty_states(client, alpha_db):
+    """No evidence, no observation and no triage history are three
+    different absences, and each gets its own sentence rather than a blank
+    table -- pinned together since all three come from one finding with
+    nothing attached to it yet.
+
+    MUTATION: change any of the three `{% if not ... %}` guards in
+    finding.html to `{% if ... %}`. This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _finding(alpha_db, eid, fid="f1")
+
+    body = client.get("/e/alpha/findings/f1").text
+
+    assert "No evidence is attached" in body
+    assert "No run has recorded an observation" in body
+    assert "Never triaged" in body
 
 
 def test_the_exchange_view_shows_both_halves(client, alpha_db, web_base):
@@ -3411,61 +3493,6 @@ def test_the_exchange_view_shows_both_halves(client, alpha_db, web_base):
 
     assert "Host: alpha.test" in body
     assert "Content-Type: text/html" in body
-
-
-def test_a_hostile_response_body_is_escaped_not_executed(
-        client, alpha_db, web_base):
-    """THE CORE THREAT of spec section 4, at the screen it actually lands
-    on. A response body is attacker-influenced by definition -- half the
-    check corpus exists to find places where attacker input comes back in
-    one -- and this app renders it into a browser with no authentication in
-    front of it.
-
-    MUTATION: pass `autoescape=False` in `render.templates()`. This test
-    must go red. It asserts the RAW form is ABSENT rather than that an
-    escaped form is present, because a page can hold both.
-    """
-    from hx.store.blobs import BlobStore
-
-    payload = b"<script>fetch('/e/beta')</script>"
-    blobs = BlobStore(web_base / "alpha" / "blobs")
-    digest, length = blobs.put(b"HTTP/1.1 200 OK\r\n\r\n" + payload)
-    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
-    alpha_db.execute(
-        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
-        " status) VALUES('r1',?,'scan','staging',1,'completed')", (eid,))
-    alpha_db.execute(
-        "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method, url,"
-        " status, resp_blob, resp_len)"
-        " VALUES('x1','r1','send','ok',1,'GET','https://alpha.test/',200,"
-        f"'{digest}',{length})")
-
-    body = client.get("/e/alpha/exchanges/x1").text
-
-    assert payload.decode() not in body
-    assert "&lt;script&gt;" in body
-
-
-def test_an_unreadable_blob_says_so_rather_than_showing_an_empty_body(
-        client, alpha_db):
-    """S12 at the level of one panel: a body that could not be read must not
-    render as a body that was empty. The exchange row names a digest whose
-    file was never written.
-
-    MUTATION: catch `CorruptBlob` and return `b""`. This test must go red.
-    """
-    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
-    alpha_db.execute(
-        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
-        " status) VALUES('r1',?,'scan','staging',1,'completed')", (eid,))
-    alpha_db.execute(
-        "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method, url,"
-        " status, resp_blob) VALUES('x1','r1','send','ok',1,'GET',"
-        "'https://alpha.test/',200,'" + "0" * 64 + "')")
-
-    body = client.get("/e/alpha/exchanges/x1").text
-
-    assert "could not be read" in body
 ```
 
 Create `tests/test_credentials_never_reach_the_screen.py`:
@@ -3532,6 +3559,7 @@ def test_url_userinfo_never_reaches_the_finding_screen(client, alpha_db):
     body = client.get("/e/alpha/findings/f1").text
 
     assert SECRET not in body
+    assert "alpha.test/panel" in body
 
 
 def test_the_scope_patterns_on_the_overview_are_redacted(client, web_base):

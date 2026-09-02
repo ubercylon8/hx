@@ -171,6 +171,50 @@ def test_a_surface_whose_only_check_row_is_skipped_shows_no_answers(
         conn.close()
 
 
+def test_an_empty_engagement_says_nothing_was_captured_on_the_surface_screen(
+        client):
+    """No surface exists yet; the screen must say so rather than rendering
+    an empty table with no explanation.
+
+    MUTATION: delete the `{% if not surfaces %}` branch from
+    surfaces.html, leaving only the table. This test must go red.
+    """
+    body = client.get("/e/alpha/surfaces").text
+    assert "Nothing captured yet" in body
+    assert "<table>" not in body
+
+
+def test_no_findings_says_so_rather_than_an_empty_table(client):
+    """MUTATION: delete the `{% if not findings %}` branch from
+    findings.html, leaving only the table. This test must go red.
+    """
+    body = client.get("/e/alpha/findings").text
+    assert "No finding matches" in body
+    assert "<table>" not in body
+
+
+def test_a_host_scoped_finding_shows_its_host_not_a_path_template(
+        client, alpha_db):
+    """A `host`- or `engagement`-scoped finding has no `surface_id`, so the
+    LEFT JOIN's `path_template` is NULL -- `findings.html` falls back to
+    the finding's own `host` column rather than rendering a blank cell.
+
+    MUTATION: in findings.html, change the `{% if f.path_template %}`
+    branch to always render (drop the `{% else %}` fallback). This test
+    must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level, host)"
+        " VALUES('f-host',?,'k-host','Weak TLS config','Medium','Firm',"
+        "'check','new','host','weak.alpha.test')", (eid,))
+
+    body = client.get("/e/alpha/findings").text
+
+    assert "weak.alpha.test" in body
+
+
 def test_the_findings_screen_orders_by_severity(client, alpha_db):
     eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
     _finding(alpha_db, eid, fid="f-low", severity="Low", title="Low one")
@@ -232,7 +276,7 @@ def test_the_finding_detail_shows_its_evidence_chain(client, alpha_db):
     body = client.get("/e/alpha/findings/f1").text
 
     assert "the payload came back verbatim" in body
-    assert "x1" in body
+    assert '/e/alpha/exchanges/x1">x1</a>' in body
 
 
 def test_the_finding_detail_shows_its_status_history(client, alpha_db):
@@ -252,6 +296,29 @@ def test_the_finding_detail_shows_its_status_history(client, alpha_db):
 
 def test_an_unknown_finding_is_a_404(client):
     assert client.get("/e/alpha/findings/f-nope").status_code == 404
+
+
+def test_an_unknown_exchange_is_a_404(client):
+    assert client.get("/e/alpha/exchanges/x-nope").status_code == 404
+
+
+def test_the_finding_screens_three_empty_states(client, alpha_db):
+    """No evidence, no observation and no triage history are three
+    different absences, and each gets its own sentence rather than a blank
+    table -- pinned together since all three come from one finding with
+    nothing attached to it yet.
+
+    MUTATION: change any of the three `{% if not ... %}` guards in
+    finding.html to `{% if ... %}`. This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _finding(alpha_db, eid, fid="f1")
+
+    body = client.get("/e/alpha/findings/f1").text
+
+    assert "No evidence is attached" in body
+    assert "No run has recorded an observation" in body
+    assert "Never triaged" in body
 
 
 def test_the_exchange_view_shows_both_halves(client, alpha_db, web_base):

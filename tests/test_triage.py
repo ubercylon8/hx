@@ -151,6 +151,21 @@ def test_latest_note_is_the_most_recent_events(engagement_conn):
     assert triage_mod.latest_note(engagement_conn, "f-1") == "second"
 
 
+def test_latest_note_breaks_a_tied_timestamp_by_the_later_insert(
+        engagement_conn):
+    """Two events can land in the same microsecond; `ts_us DESC, rowid DESC`
+    settles the tie on the later INSERT rather than leaving SQLite free to
+    return either row for a bare `ORDER BY ts_us DESC`."""
+    _finding(engagement_conn)
+    triage_mod.set_status(engagement_conn, finding_id="f-1",
+                          to_status="confirmed", now_us=10)
+    triage_mod.set_status(engagement_conn, finding_id="f-1",
+                          to_status="false_positive", note="second",
+                          now_us=10)
+
+    assert triage_mod.latest_note(engagement_conn, "f-1") == "second"
+
+
 def test_the_trigger_still_refuses_an_agent_confirmation(engagement_conn):
     """Not this module's guard -- the store's. Pinned here because
     `triage.py` is now the thing standing between an agent and this table,

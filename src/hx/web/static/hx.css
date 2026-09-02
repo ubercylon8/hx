@@ -90,3 +90,15 @@ th { color: var(--muted); font-weight: 600; }
 tr.stale { background: var(--stale-bg); }
 
 code { font-family: ui-monospace, monospace; }
+
+.bytes {
+  font-family: ui-monospace, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 32rem;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75em 1em;
+  margin: 0.5em 0 1.5em;
+}

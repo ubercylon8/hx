@@ -58,6 +58,7 @@ def test_url_userinfo_never_reaches_the_finding_screen(client, alpha_db):
     body = client.get("/e/alpha/findings/f1").text
 
     assert SECRET not in body
+    assert "alpha.test/panel" in body
 
 
 def test_the_scope_patterns_on_the_overview_are_redacted(client, web_base):
