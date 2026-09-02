@@ -75,16 +75,31 @@ def test_every_response_carries_the_content_security_policy(client):
 def test_a_refusal_carries_the_headers_too(client):
     """"Every response" has to mean every response, and a refusal is exactly
     the response that returns EARLY -- skipping whatever the success path
-    does on its way out. The 421 is what a rebinding attack receives.
+    does on its way out. The 421 is what a rebinding attack receives; the
+    403 is what a cross-site write receives, and it is the SAME class of
+    early-return bug -- an earlier draft of the 403 branch shipped without
+    `_secured` two paragraphs below a comment saying both exits must have
+    it, which is exactly why this test covers both rather than only the
+    421 it was first written for.
 
-    MUTATION: in `_guard`, return the refusal directly instead of through
-    `_secured`. This test must go red while the one above stays green, which
-    is the whole reason both exist.
+    MUTATION: in `_guard`, return the Host refusal directly instead of
+    through `_secured`. This test must go red while the one above stays
+    green, which is the whole reason both exist.
+
+    MUTATION: in `_guard`, return the cross-site refusal directly instead
+    of through `_secured`. This test must also go red for that mutation,
+    independently of the Host-refusal assertions above.
     """
     refused = client.get("/", headers={"Host": "attacker.example"})
     assert refused.status_code == 421
     assert "default-src 'none'" in refused.headers["content-security-policy"]
     assert refused.headers["x-content-type-options"] == "nosniff"
+
+    cross_site = client.post("/e/alpha/halt", data={"reason": "x"},
+                             follow_redirects=False)
+    assert cross_site.status_code == 403
+    assert "default-src 'none'" in cross_site.headers["content-security-policy"]
+    assert cross_site.headers["x-content-type-options"] == "nosniff"
 
 
 def test_every_response_forbids_content_sniffing(client):

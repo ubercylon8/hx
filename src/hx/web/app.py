@@ -52,11 +52,22 @@ CSP = ("default-src 'none'; script-src 'none'; style-src 'self'; "
 #: ordinary browsers on a read-only app.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
-#: The largest form body either write route will read. Both carry a status
-#: word and a note; 64 KiB is generous for that and finite, which is the
-#: property that matters -- `request.body()` reads the whole thing into
-#: memory before anyone looks at it.
+#: The largest form body either write route will accept. Both carry a
+#: status word and a note; 64 KiB is generous for that and finite. NOT a
+#: memory guard -- `request.body()` has already buffered the whole thing
+#: before this check runs, so an oversized POST costs the same memory
+#: either way. This is a policy limit ("a triage note this large is not
+#: legitimate"), acceptable here because the loopback bind and the
+#: same-origin guard already stand in front of it; a real DoS control would
+#: need to cap `request.stream()` before buffering, which neither write
+#: route needs.
 MAX_FORM = 64 * 1024
+
+#: Returned by `_form_fields` when the body passed the content-type check
+#: but exceeded `MAX_FORM`, kept distinct from `None` so a 70 KiB
+#: urlencoded body is answered 413 ("too large") rather than 415 ("wrong
+#: content type", which it was not).
+_TOO_LARGE = object()
 
 
 def hostname(header: str) -> str:
@@ -103,16 +114,20 @@ async def _form_fields(request):
     `parse_qsl` is stdlib doing what it has done correctly for decades
     rather than a parser written here.
 
-    None means "this was not a form this app accepts", and the caller
-    answers 415. An empty dict is a different thing: a well-formed empty
-    form, which `set_status` then refuses on its own terms.
+    Three outcomes, not two. `None` means "this was not a form this app
+    accepts" and the caller answers 415. `_TOO_LARGE` means the content type
+    was right but the body was not, and the caller answers 413 -- collapsing
+    the two into one refusal would tell an oversized urlencoded body it sent
+    the wrong content type, which it did not. An empty dict is a third,
+    different thing again: a well-formed empty form, which `set_status`
+    then refuses on its own terms.
     """
     ctype = request.headers.get("content-type", "")
     if ctype.split(";")[0].strip().lower() != "application/x-www-form-urlencoded":
         return None
     body = await request.body()
     if len(body) > MAX_FORM:
-        return None
+        return _TOO_LARGE
     return dict(parse_qsl(body.decode("utf-8", "replace"),
                           keep_blank_values=True))
 
@@ -122,8 +137,15 @@ def _same_origin(request) -> bool:
 
     `Sec-Fetch-Site` FIRST and decisively: it is the browser's own account
     of where the request came from, and a page cannot forge it. When it is
-    absent -- an older browser, or a client that is not a browser -- the
-    fallback is an exact `Origin` match against THIS request's own origin.
+    the ONLY signal present -- an older browser, or a client that is not a
+    browser -- the fallback is an exact `Origin` match against THIS
+    request's own origin.
+
+    When BOTH headers are present, they must AGREE. `Sec-Fetch-Site` cannot
+    be forged by a page, but nothing stops a non-browser client from
+    sending an honest `same-origin` next to a mismatched `Origin` -- no real
+    browser produces that pairing, so a request carrying it is lying about
+    something, and `Sec-Fetch-Site` alone would have waved it through.
 
     Exact, not "the origin's host is in ALLOWED_HOSTS": another web app on
     this machine is not this web app, and a host-level comparison would let
@@ -134,13 +156,18 @@ def _same_origin(request) -> bool:
     strict answer is a curl command that needs one more flag, against a
     silent write from a page the operator merely visited.
     """
+    expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+    origin = request.headers.get("origin")
+
     fetch_site = request.headers.get("sec-fetch-site")
     if fetch_site is not None:
-        return fetch_site == "same-origin"
-    origin = request.headers.get("origin")
+        if fetch_site != "same-origin":
+            return False
+        return origin is None or origin == expected
+
     if not origin:
         return False
-    return origin == f"{request.url.scheme}://{request.headers.get('host', '')}"
+    return origin == expected
 
 
 async def _guard(request, call_next):
@@ -298,6 +325,9 @@ def exchange(request):
 async def triage_post(request):
     entry = _entry(request)
     form = await _form_fields(request)
+    if form is _TOO_LARGE:
+        return PlainTextResponse(
+            f"request body exceeds {MAX_FORM} bytes", status_code=413)
     if form is None:
         return PlainTextResponse(
             "this route accepts application/x-www-form-urlencoded only",
@@ -326,6 +356,9 @@ async def triage_post(request):
 async def halt_post(request):
     entry = _entry(request)
     form = await _form_fields(request)
+    if form is _TOO_LARGE:
+        return PlainTextResponse(
+            f"request body exceeds {MAX_FORM} bytes", status_code=413)
     if form is None:
         return PlainTextResponse(
             "this route accepts application/x-www-form-urlencoded only",
