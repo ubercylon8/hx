@@ -99,10 +99,16 @@ split per screen rather than become the module that knows everything.
 
 ## The plan-drift gate
 
-`tests/test_plan_matches_repo.py` byte-compares every fenced ```python /
-```java / ```sql block whose **first line** is a `# <path>` marker against
+`tests/test_plan_matches_repo.py` byte-compares every fenced `python`,
+`java` or `sql` block whose **first line** is a `# <path>` marker against
 the file it names. A block for a file that does not exist yet is skipped; a
 block for a file that *does* exist and differs is a failure.
+
+**No line in this document may BEGIN with a triple backtick that is not a
+real fence.** `scripts/task-brief` tracks fences by toggling on any line
+starting with one, so a sentence that wraps a language tag to the start of a
+line puts the extractor into fence mode for the rest of the file and it
+finds no task at all. That happened here once already.
 
 While this plan is being executed its blocks carry **no marker**, so none is
 compared. The final section arms them in one pass, once every file exists.
