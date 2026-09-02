@@ -297,6 +297,24 @@ class Check(Protocol):
     klass: str
     insertion_kinds: frozenset[str]
 
+    #: WHAT A CLIENT IS TOLD THIS CHECK LOOKED FOR, as a lowercase noun
+    #: phrase with no trailing stop -- the phrases are joined into one
+    #: sentence at the top of the report's Findings section.
+    #:
+    #: It exists because of what the first end-to-end run measured on
+    #: 2026-09-02: against a target serving no CSP, a `/ftp` listing full of
+    #: `.bak` files and an unauthenticated admin config endpoint, the report
+    #: said `None recorded.` Every verdict was right and the sum was
+    #: misleading, because nothing above the fold said what the corpus does
+    #: and does not look at. Section 12's rule was enforced for SURFACES --
+    #: Coverage names the ones nothing answered for -- and not for the
+    #: corpus's own scope, which is the boundary a reader cannot guess.
+    #:
+    #: `registry.validate` REQUIRES IT, so a check joining the corpus without
+    #: one is an import error rather than a category that quietly disappears
+    #: from the sentence while its absence disappears with it.
+    looks_for: str
+
 
 @dataclass(frozen=True)
 class ExchangeRow:

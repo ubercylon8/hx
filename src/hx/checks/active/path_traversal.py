@@ -241,6 +241,7 @@ def _describe(insertion: base.Insertion, resp, signature: str, what: str) -> str
 class PathTraversal:
     id = "hx.active.path-traversal"
     version = "1"
+    looks_for = ("file paths that climb out of their intended directory")
     klass = "active_safe"
     insertion_kinds = frozenset({"query", "path_segment"})
 

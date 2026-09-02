@@ -150,6 +150,7 @@ def _credentials_phrase(values: list[str]) -> str:
 class Cors:
     id = "hx.active.cors"
     version = "1"
+    looks_for = ("a cross-origin policy that reflects an attacker's origin")
     klass = "active_safe"
     insertion_kinds = frozenset()
 

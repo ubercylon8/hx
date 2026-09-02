@@ -11,6 +11,7 @@ from hx.checks import base, registry
 
 class _Passive:
     id, version, klass = "t.passive", "1", "passive"
+    looks_for = "a category this test invented"
     insertion_kinds = frozenset()
 
     def on_surface(self, ctx, surface, exchanges):
@@ -26,6 +27,7 @@ class _PassiveThatProbes(_Passive):
 
 class _NoHooks:
     id, version, klass = "t.no-hooks", "1", "passive"
+    looks_for = "a category this test invented"
     insertion_kinds = frozenset()
 
 
@@ -53,6 +55,7 @@ def test_duplicate_ids_are_refused():
 def test_an_unknown_class_is_refused():
     class _Weird(_Passive):
         id, klass = "t.weird", "active_telepathy"
+        looks_for = "a category this test invented"
     with pytest.raises(registry.RegistryError, match="active_telepathy"):
         registry.validate((_Weird(),))
 
@@ -87,6 +90,7 @@ def test_every_shipped_check_id_is_namespaced():
 
 class _OnlyCorpus:
     id, version, klass = "t.only-corpus", "1", "passive"
+    looks_for = "a category this test invented"
     insertion_kinds = frozenset()
 
     def on_corpus(self, ctx, surfaces):
@@ -102,6 +106,7 @@ class _SurfaceAndCorpus(_Passive):
 
 class _ActiveThatOnlyProbes:
     id, version, klass = "t.only-probes", "1", "active_safe"
+    looks_for = "a category this test invented"
     insertion_kinds = frozenset()
 
     def probes(self, ctx, surface, insertions, send):

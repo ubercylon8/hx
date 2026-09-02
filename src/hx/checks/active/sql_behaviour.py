@@ -134,6 +134,7 @@ def _describe(insertion: base.Insertion, kind: str,
 class SqlBehaviour:
     id = "hx.active.sql-behaviour"
     version = "1"
+    looks_for = ("SQL injection detectable by a difference between two responses")
     klass = "active_safe"
     insertion_kinds = frozenset({"query", "path_segment"})
 

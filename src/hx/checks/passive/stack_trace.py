@@ -38,6 +38,7 @@ _PATTERNS = (
 class StackTrace:
     id = "hx.passive.stack-trace"
     version = "1"
+    looks_for = ("stack traces and debug output returned to a client")
     klass = "passive"
     insertion_kinds = frozenset()
 

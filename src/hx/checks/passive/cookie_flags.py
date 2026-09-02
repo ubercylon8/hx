@@ -130,6 +130,7 @@ def _issue_type(name: str) -> str:
 class CookieFlags:
     id = "hx.passive.cookie-flags"
     version = "1"
+    looks_for = ("cookies set without the Secure, HttpOnly or SameSite flags")
     klass = "passive"
     insertion_kinds = frozenset()
 

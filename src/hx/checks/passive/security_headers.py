@@ -72,6 +72,8 @@ _HEADERS = (
 class SecurityHeaders:
     id = "hx.passive.security-headers"
     version = "1"
+    looks_for = ("three response headers: X-Content-Type-Options, "
+                 "frame protection, and HSTS")
     klass = "passive"
     insertion_kinds = frozenset()
 
