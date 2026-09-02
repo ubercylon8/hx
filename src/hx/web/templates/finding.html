@@ -80,5 +80,21 @@ here to check it against.</p>
 </tbody>
 </table>
 {% endif %}
-{% block triage %}{% endblock %}
+<h2>Triage</h2>
+<p class="muted">Confirming a finding is a human act — the agent cannot do
+it, and the record of who decided what is append-only.</p>
+<form method="post" action="/e/{{ entry.name }}/findings/{{ finding.id }}/status" class="triage">
+  <label>Decision
+    <select name="status">
+      {% for t in targets %}
+      <option value="{{ t }}" {{ 'selected' if t == finding.status else '' }}>{{ t }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Note
+    <input type="text" name="note" size="60"
+           placeholder="required to dismiss — it reaches the client report">
+  </label>
+  <button type="submit">Record</button>
+</form>
 {% endblock %}

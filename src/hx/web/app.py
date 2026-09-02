@@ -15,17 +15,21 @@ runs `def` endpoints in a threadpool and `sqlite3` connections default to
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import parse_qsl
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, RedirectResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from hx import config as config_mod
+from hx import halt as halt_mod
 from hx import triage as triage_mod
+from hx.store import db as db_mod
 from hx.store.blobs import BlobStore
 from hx.web import reads as reads_mod
 from hx.web import registry as registry_mod
@@ -42,6 +46,17 @@ ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 CSP = ("default-src 'none'; script-src 'none'; style-src 'self'; "
        "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; "
        "base-uri 'none'")
+
+#: Methods that cannot change anything, and so need no cross-site guard.
+#: HEAD and OPTIONS are here because a guard that broke them would break
+#: ordinary browsers on a read-only app.
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+#: The largest form body either write route will read. Both carry a status
+#: word and a note; 64 KiB is generous for that and finite, which is the
+#: property that matters -- `request.body()` reads the whole thing into
+#: memory before anyone looks at it.
+MAX_FORM = 64 * 1024
 
 
 def hostname(header: str) -> str:
@@ -74,6 +89,60 @@ def _secured(response):
     return response
 
 
+async def _form_fields(request):
+    """The two write routes' form, or None if the request is not one.
+
+    NOT `request.form()`. MEASURED against Starlette 1.6.0: that method
+    asserts `python-multipart` is installed BEFORE it looks at the content
+    type, so it raises even for a plain urlencoded body.
+
+    Installing `python-multipart` is the easy fix and the wrong one. With it
+    present, `request.form()` parses `multipart/form-data` -- file uploads
+    included -- on two routes that want two short strings. This app accepts
+    exactly ONE content type on a path that can change something, and
+    `parse_qsl` is stdlib doing what it has done correctly for decades
+    rather than a parser written here.
+
+    None means "this was not a form this app accepts", and the caller
+    answers 415. An empty dict is a different thing: a well-formed empty
+    form, which `set_status` then refuses on its own terms.
+    """
+    ctype = request.headers.get("content-type", "")
+    if ctype.split(";")[0].strip().lower() != "application/x-www-form-urlencoded":
+        return None
+    body = await request.body()
+    if len(body) > MAX_FORM:
+        return None
+    return dict(parse_qsl(body.decode("utf-8", "replace"),
+                          keep_blank_values=True))
+
+
+def _same_origin(request) -> bool:
+    """Whether a state-changing request came from this app's own pages.
+
+    `Sec-Fetch-Site` FIRST and decisively: it is the browser's own account
+    of where the request came from, and a page cannot forge it. When it is
+    absent -- an older browser, or a client that is not a browser -- the
+    fallback is an exact `Origin` match against THIS request's own origin.
+
+    Exact, not "the origin's host is in ALLOWED_HOSTS": another web app on
+    this machine is not this web app, and a host-level comparison would let
+    anything on `localhost:9999` write into a client engagement.
+
+    Neither header present is a REFUSAL. Fail closed: the operator has
+    `hx triage` and `hx halt` for the no-browser case, and the cost of the
+    strict answer is a curl command that needs one more flag, against a
+    silent write from a page the operator merely visited.
+    """
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site is not None:
+        return fetch_site == "same-origin"
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    return origin == f"{request.url.scheme}://{request.headers.get('host', '')}"
+
+
 async def _guard(request, call_next):
     """The Host allowlist, and the headers every response carries.
 
@@ -92,6 +161,13 @@ async def _guard(request, call_next):
     if hostname(request.headers.get("host", "")) not in ALLOWED_HOSTS:
         return _secured(PlainTextResponse("this host is not served here",
                                           status_code=421))
+    if request.method not in SAFE_METHODS and not _same_origin(request):
+        # REFUSED BEFORE THE HANDLER RUNS, which is the whole point: a guard
+        # that rejects after writing is not a guard, and the tests assert
+        # the finding's status is unchanged rather than only that a 403 came
+        # back.
+        return _secured(PlainTextResponse("cross-site write refused",
+                                          status_code=403))
     return _secured(await call_next(request))
 
 
@@ -136,6 +212,14 @@ def overview(request):
         except (config_mod.ConfigError, OSError) as exc:
             raise HTTPException(status_code=404) from exc
         data = reads_mod.overview(conn, entry.engagement_id, config)
+        # Through OperatorHalt rather than by testing for the file, so this
+        # sees a halt recorded in the STORE as well as one on disk --
+        # `halted` is a union, and the two disagree when a harness died
+        # between the two writes. A read-only connection is enough: the
+        # constructor and both properties only SELECT.
+        halt_state = halt_mod.OperatorHalt(entry.path, conn)
+        data["halted"] = halt_state.halted
+        data["halt_reason"] = halt_state.reason
     finally:
         conn.close()
     return request.app.state.templates.TemplateResponse(
@@ -211,6 +295,54 @@ def exchange(request):
         request, "exchange.html", {"entry": entry, "exchange": data})
 
 
+async def triage_post(request):
+    entry = _entry(request)
+    form = await _form_fields(request)
+    if form is None:
+        return PlainTextResponse(
+            "this route accepts application/x-www-form-urlencoded only",
+            status_code=415)
+    finding_id = request.path_params["fid"]
+    to_status = form.get("status", "")
+    note = form.get("note")
+
+    def write():
+        conn = db_mod.connect(entry.path / "hx.db")
+        try:
+            return triage_mod.set_status(conn, finding_id=finding_id,
+                                         to_status=to_status, note=note)
+        finally:
+            conn.close()
+
+    try:
+        await run_in_threadpool(write)
+    except triage_mod.TriageError as exc:
+        return PlainTextResponse(str(exc), status_code=400)
+    # POST/redirect/GET: a reload must not re-submit a triage decision.
+    return RedirectResponse(f"/e/{entry.name}/findings/{finding_id}",
+                            status_code=303)
+
+
+async def halt_post(request):
+    entry = _entry(request)
+    form = await _form_fields(request)
+    if form is None:
+        return PlainTextResponse(
+            "this route accepts application/x-www-form-urlencoded only",
+            status_code=415)
+    reason = form.get("reason", "").strip() or "stopped from the web app"
+
+    def write():
+        conn = db_mod.connect(entry.path / "hx.db")
+        try:
+            halt_mod.OperatorHalt(entry.path, conn).halt(reason)
+        finally:
+            conn.close()
+
+    await run_in_threadpool(write)
+    return RedirectResponse(f"/e/{entry.name}", status_code=303)
+
+
 def create_app(base) -> Starlette:
     app = Starlette(
         routes=[
@@ -220,6 +352,9 @@ def create_app(base) -> Starlette:
             Route("/e/{name}/findings", findings),
             Route("/e/{name}/findings/{fid}", finding),
             Route("/e/{name}/exchanges/{xid}", exchange),
+            Route("/e/{name}/findings/{fid}/status", triage_post,
+                  methods=["POST"]),
+            Route("/e/{name}/halt", halt_post, methods=["POST"]),
             Mount("/static",
                   StaticFiles(directory=str(render_mod.STATIC)),
                   name="static"),
