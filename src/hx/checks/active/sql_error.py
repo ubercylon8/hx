@@ -122,8 +122,6 @@ task owns.
 """
 from __future__ import annotations
 
-from urllib.parse import quote
-
 from hx.checks import base
 from hx.checks.active import _probe_util
 
@@ -169,32 +167,6 @@ def _probe_value() -> str:
     """
     return f"{_probe_util.canary()}'"
 
-
-def _for_insertion(path: str, path_template: str,
-                   insertion: base.Insertion, value: str) -> str | None:
-    """The path for one probe, `value` in exactly the place `insertion`
-    names. Percent-encoded (`quote(..., safe="")`) because the value rides
-    the request line -- the same discipline `open_redirect.py`'s
-    `_probe_path` and `reflected_input.py`'s `_for_insertion` document.
-
-    `path` IS THE ADDRESS AND `path_template` IS ONLY THE MAP: everything sent
-    is built on the exemplar's concrete path, and the template is consulted
-    for one thing, which segment index a `path_segment` insertion names.
-
-    `path_segment` replaces EVERY occurrence of the placeholder, matching
-    `reflected_input.py`'s own handling of a template that repeats
-    `{id}` -- `hx.insertion.derive` yields one `Insertion` per name, so both
-    occurrences are the same insertion point and both must carry the value.
-    `None` when that substitution cannot be made at all; the caller records a
-    gap rather than probing an address assembled out of a mismatch.
-    """
-    if insertion.kind == "query":
-        return (f"{path}?{quote(insertion.name, safe='')}="
-                f"{quote(value, safe='')}")
-    if insertion.kind == "path_segment":
-        return _probe_util.substitute_segment(
-            path, path_template, insertion.name, quote(value, safe=""))
-    raise ValueError(f"sql_error does not probe insertion kind {insertion.kind!r}")
 
 
 def _location(resp, signature: str) -> str:
@@ -254,7 +226,9 @@ class SqlError:
                 continue
 
             value = _probe_value()
-            path = _for_insertion(sender.path, path_template, insertion, value)
+            path = _probe_util.probe_path(sender.path, path_template,
+                                          insertion, value,
+                                          check_id=self.id)
             if path is None:
                 # Nothing was sent, so nothing was examined: a gap, and
                 # `probed_any` deliberately not set.

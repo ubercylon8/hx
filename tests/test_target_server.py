@@ -538,6 +538,15 @@ _STILL_VULNERABLE = {
     "hx.active.sql-error": (
         "/db/lookup?id=42%27", None,
         lambda s, h, b: sql_error._SIGNATURES[0][0].encode() in b),
+    # THE ONLY PREDICATE HERE THAT IS NOT ABOUT THE RESPONSE'S CONTENT, and
+    # that is the check it belongs to. `sql-behaviour` reads the DIFFERENCE
+    # between two answers, so "still vulnerable" is a bare 500 to the
+    # unbalanced quote -- carrying no driver wording, nothing a string
+    # matcher could see. The fixed route answers 200, which is what makes the
+    # differential disappear.
+    "hx.active.sql-behaviour": (
+        "/db/search?term=widget%27", None,
+        lambda s, h, b: b'"matched": 0' in b),
 }
 
 

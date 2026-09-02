@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import secrets
 import string
+from urllib.parse import quote
 
 from hx.checks import base
 from hx.checks import probe as probe_mod
@@ -454,3 +455,39 @@ def verdict(candidates, gaps, *,
             "which is a check reporting `tested, clean` for a surface it "
             "never tested. Pass `unprobed=<why>` instead")
     return base.Verdict.clean(considered=examined)
+
+def probe_path(path: str, path_template: str,
+               insertion: base.Insertion, value: str, *,
+               check_id: str) -> str | None:
+    """The path for one probe, `value` in exactly the place `insertion`
+    names. Percent-encoded (`quote(..., safe="")`) because the value rides
+    the request line -- the same discipline `open_redirect.py`'s
+    `_probe_path` and `reflected_input.py`'s `_for_insertion` document.
+
+    `path` IS THE ADDRESS AND `path_template` IS ONLY THE MAP: everything sent
+    is built on the exemplar's concrete path, and the template is consulted
+    for one thing, which segment index a `path_segment` insertion names.
+
+    `path_segment` replaces EVERY occurrence of the placeholder, matching
+    `reflected_input.py`'s own handling of a template that repeats
+    `{id}` -- `hx.insertion.derive` yields one `Insertion` per name, so both
+    occurrences are the same insertion point and both must carry the value.
+    `None` when that substitution cannot be made at all; the caller records a
+    gap rather than probing an address assembled out of a mismatch.
+
+    SHARED, AND IT WAS `sql_error._for_insertion` until 2026-09-02.
+    `sql_behaviour` builds the same two kinds of probe path from the same
+    two facts, and this module exists so a rule two checks obey is written
+    once -- the argument `send_or_gap` above makes about five copies of one
+    `except` applies unchanged to two copies of one path builder.
+    `check_id` reaches only the ValueError, so the message still names who
+    asked for an insertion kind they never declared.
+    """
+    if insertion.kind == "query":
+        return (f"{path}?{quote(insertion.name, safe='')}="
+                f"{quote(value, safe='')}")
+    if insertion.kind == "path_segment":
+        return substitute_segment(
+            path, path_template, insertion.name, quote(value, safe=""))
+    raise ValueError(
+        f"{check_id} does not probe insertion kind {insertion.kind!r}")

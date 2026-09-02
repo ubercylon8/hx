@@ -95,26 +95,36 @@ S4's operator/agent split, and `Rig.browse`'s own docstring carries it.
 from __future__ import annotations
 
 import time
-from collections import Counter
 
 import pytest
 
 from hx import insertion, report, scan
 from hx.checks import base, probe, registry
 from hx.checks.active import cors, reflected_input
+from tests.integration import target_server as ts
 from tests.integration.target_server import (
     LOGIN_WALL_ROUTE, SESSION_COOKIE_VALUE, STATE_CHANGING_ROUTE,
     TEMPLATED_ROUTE, TEMPLATED_SURFACE, VULNERABLE_ROUTES)
 
 pytestmark = pytest.mark.integration
 
-# What one scan of the five vulnerable surfaces costs, MEASURED (see
+# What one scan of the SIX vulnerable surfaces costs, MEASURED (see
 # `test_every_active_check_finds_its_own_endpoint`'s own assertion, which pins
 # the number against the target server's log rather than against this constant).
-# Five CORS probes, one per surface; four reflected-input probes plus one
-# escalation on the surface that reflects; four sql-error probes; one open
-# redirect; one traversal.
-PROBES_PER_SCAN = 16
+#
+# Was 16 for five surfaces and five checks: five CORS probes, one per surface;
+# four reflected-input probes plus one escalation on the surface that reflects;
+# four sql-error probes; one open redirect; one traversal.
+#
+# 29 since 2026-09-02, and the jump is larger than one check because
+# `hx.active.sql-behaviour` is the first check in this corpus to send TWO
+# probes per insertion point -- the unbalanced quote and the escaped one --
+# since its signal is the DIFFERENCE between them rather than anything in one
+# response. A sixth vulnerable route also adds one probe to every other check
+# that accepts a point on it. The number is asserted against the target's own
+# request log, so it is a measurement rather than a budget: if it moves again,
+# read the log before changing it.
+PROBES_PER_SCAN = 29
 
 # Every check that SENDS. Read off the registry rather than spelled here, so a
 # check added to the corpus without a vulnerable route (or without this file
@@ -288,18 +298,55 @@ def test_every_active_check_finds_its_own_endpoint(rig):
         f"limiter's own arithmetic puts the floor at {floor_s}s and anything "
         "far above it is a sender waiting more than it was asked to")
 
+    # EVERY CHECK FINDS ITS OWN ROUTE, and the set is exact rather than a
+    # count -- a check that found somebody else's route and missed its own
+    # would satisfy a count and is precisely the mangled-payload failure this
+    # test exists to catch.
+    #
+    # ONE OVERLAP IS EXPECTED AND IS A TRUE POSITIVE. `/db/lookup`
+    # interpolates its parameter into a query, so it is injectable, and
+    # `sql-behaviour` reads the same unbalanced-quote differential there that
+    # `sql-error` reads driver wording from. Two checks finding one genuinely
+    # vulnerable route is not a defect: they report different issue types
+    # (CWE-89 against CWE-209) and `finding.dedupe_key` carries
+    # `issue_type_id`, so they file separately and a client sees both -- fix
+    # the interpolation and both go away; fix only the error page and one
+    # remains, which is the honest outcome.
+    #
+    # The earlier form of this assertion was `Counter(...) == {id: 1 ...}`,
+    # which held while the five active checks had disjoint payload filters and
+    # broke the moment a sixth shared one. Naming the pairs keeps the tripwire
+    # exact instead of loosening it to "at least one".
+    expected_pairs = {(check_id, ts.VULNERABLE_ROUTES[check_id].split("?")[0])
+                      for check_id in ACTIVE_CHECK_IDS}
+    expected_pairs.add(("hx.active.sql-behaviour", "/db/lookup"))
     findings = _active_findings(rig)
-    assert Counter(f["check_id"] for f in findings) == \
-        {check_id: 1 for check_id in ACTIVE_CHECK_IDS}, (
-            f"expected exactly one finding per active check, got "
-            f"{[(f['check_id'], f['path_template']) for f in findings]}")
+    assert {(f["check_id"], f["path_template"]) for f in findings} == \
+        expected_pairs, (
+            f"expected each active check to find its own route, got "
+            f"{sorted((f['check_id'], f['path_template']) for f in findings)}")
 
-    # Each one filed against the surface the fixture built for it. A check
-    # finding its issue on somebody else's route would still satisfy the count
-    # above and would mean the corpus is answering to the wrong evidence.
+    # EVERY CHECK FILED AGAINST THE SURFACE THE FIXTURE BUILT FOR IT. The
+    # failure this guards is a check answering to the wrong evidence -- one
+    # that finds its issue ONLY on somebody else's route, which the exact set
+    # above would still admit if the fixture map and the finding map happened
+    # to be permutations of each other.
+    #
+    # "its own route is AMONG its findings" rather than "is its only finding",
+    # since 2026-09-02: `sql-behaviour` legitimately finds `/db/lookup` as
+    # well, for the reason written above the set assertion. Anything a check
+    # finds beyond its own route is constrained by that set, so nothing is
+    # unguarded here -- this loop pins the half the set cannot: that the
+    # pairing is not a coincidence of two equal-sized maps.
+    found_by_check: dict[str, set[str]] = {}
     for finding in findings:
-        want = VULNERABLE_ROUTES[finding["check_id"]].split("?")[0]
-        assert finding["path_template"] == want, finding
+        found_by_check.setdefault(finding["check_id"], set()).add(
+            finding["path_template"])
+    for check_id in ACTIVE_CHECK_IDS:
+        want = VULNERABLE_ROUTES[check_id].split("?")[0]
+        assert want in found_by_check.get(check_id, set()), (
+            f"{check_id} did not find the route built for it ({want}); it "
+            f"found {sorted(found_by_check.get(check_id, set()))}")
 
     # `requests_sent` IS NON-ZERO WHERE AN ACTIVE CHECK FOUND SOMETHING. A
     # finding filed by a check that sent nothing would mean the verdict came
