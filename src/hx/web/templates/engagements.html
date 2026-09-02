@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Engagements{% endblock %}
+{% block content %}
+<h1>Engagements</h1>
+<p class="muted">{{ base }}</p>
+{% if not entries %}
+<p>No engagement here yet. <code>hx new NAME --client CLIENT --scope URL</code> creates one.</p>
+{% else %}
+<table>
+<thead><tr>
+  <th>Engagement</th><th>Client</th><th>Status</th><th>Created</th>
+  <th class="num">Runs</th><th>Findings</th>
+</tr></thead>
+<tbody>
+{% for e in entries %}
+<tr>
+{% if e.problem %}
+  <td>{{ e.name }}</td>
+  <td colspan="5" class="problem">unreadable — {{ e.problem }}</td>
+{% else %}
+  <td><a href="/e/{{ e.name }}">{{ e.name }}</a></td>
+  <td>{{ e.client }}</td>
+  <td>{{ e.status }}</td>
+  <td>{{ e.created_us | when }}</td>
+  <td class="num">{{ e.runs }}</td>
+  <td>
+  {% for sev, n in e.findings.items() %}
+    <span class="sev sev-{{ sev | lower }}">{{ sev }} {{ n }}</span>
+  {% else %}
+    —
+  {% endfor %}
+  </td>
+{% endif %}
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endblock %}

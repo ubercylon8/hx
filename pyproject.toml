@@ -3,7 +3,21 @@ name = "hx"
 version = "0.1.0"
 description = "Agent-driven web application security assessment harness"
 requires-python = ">=3.12"
-dependencies = ["PyYAML>=6.0", "click>=8.1"]
+dependencies = [
+    "PyYAML>=6.0",
+    "click>=8.1",
+    # The web app (spec 2026-09-01, master spec S11 as amended). Starlette
+    # and NOT FastAPI: measured on 2026-09-01, `fastapi uvicorn jinja2`
+    # resolves to 15 packages against `starlette uvicorn jinja2`'s 9, and the
+    # six extra include `pydantic-core`, a compiled extension. FastAPI is
+    # Starlette plus pydantic validation and OpenAPI generation, and this app
+    # is server-rendered Jinja whose entire validated input is a status enum
+    # and a note string. S11's own "should not pull hundreds of transitive
+    # packages to render a table" is the argument for the smaller closure.
+    "starlette>=1.6",
+    "jinja2>=3.1",
+    "uvicorn>=0.52",
+]
 
 [project.scripts]
 hx = "hx.cli:main"
@@ -28,6 +42,19 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.14",
     "mypy>=1.14",
+    # `starlette.testclient.TestClient` needs an httpx-family client. DEV ONLY: nothing in
+    # `src/hx` imports it, and the app itself makes no outbound HTTP request
+    # of any kind -- S4's invariant is that every byte leaving this machine
+    # crosses the JVM, and an HTTP client in the runtime closure is the kind
+    # of thing that quietly stops being true.
+    # httpx2 AND NOT httpx: MEASURED 2026-09-01 against Starlette 1.6.0,
+    # importing TestClient with plain httpx raises
+    # `StarletteDeprecationWarning: Using httpx with starlette.testclient is
+    # deprecated; install httpx2 instead`. Starting a new dependency on a path
+    # its own author has deprecated means the next Starlette bump breaks the
+    # whole web suite at once. httpx2 is the same author (Tom Christie), the
+    # same BSD-3-Clause licence, and the package Starlette's own message names.
+    "httpx2>=2.12",
 ]
 
 [tool.ruff]

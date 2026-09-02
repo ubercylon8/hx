@@ -235,3 +235,55 @@ def staff_identity_config(engagement):
                                      expect_absent="Sign in"),
         origins=("https://app.test/",))
     return dataclasses.replace(engagement.config, identities={"staff": staff})
+
+
+@pytest.fixture
+def web_base(tmp_path):
+    """A base directory holding two engagements: `alpha` and `beta`.
+
+    Two rather than one, so a screen that reads the wrong store has
+    something to be caught by. Both connections are closed: the app opens
+    its own read-only connection per request, and a writer left open here
+    would hide a WAL visibility bug rather than expose one.
+    """
+    from hx import config as config_mod
+    from hx import engagement as eng_mod
+
+    base = tmp_path / "engagements"
+    base.mkdir()
+    for name, client in (("alpha", "Alpha Inc"), ("beta", "Beta Ltd")):
+        cfg = config_mod.Config(name=name, client=client,
+                                safety_profile="staging",
+                                scope_include=[f"https://{name}.test/*"])
+        eng = eng_mod.create(base / name, cfg, author="test")
+        eng.db.close()
+    return base
+
+
+@pytest.fixture
+def alpha_db(web_base):
+    """A read-write connection to `alpha`, for seeding rows a screen reads."""
+    from hx.store import db as db_mod
+
+    conn = db_mod.connect(web_base / "alpha" / "hx.db")
+    yield conn
+    conn.close()
+
+
+@pytest.fixture
+def client(web_base):
+    """A TestClient over `web_base`.
+
+    `base_url` IS THE POINT. TestClient sends `Host: testserver` by default
+    and the app's allowlist refuses it with 421 -- correctly, since that is
+    the DNS-rebinding defence doing its job. Every screen test would fail
+    without this line, and the one test that WANTS the refusal overrides the
+    header itself.
+    """
+    from starlette.testclient import TestClient
+
+    from hx.web.app import create_app
+
+    with TestClient(create_app(web_base),
+                    base_url="http://127.0.0.1:8901") as test_client:
+        yield test_client

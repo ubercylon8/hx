@@ -942,3 +942,39 @@ def mcp(root) -> None:
     # [the stack]" -- false for the single exit that matters in production.
     with _sigterm_ends_the_session():
         mcp_adapter.serve(eng)
+
+
+@main.command()
+@click.option("--base", "base", type=click.Path(path_type=Path), default=None,
+              help="Directory holding engagements. Defaults to the same "
+                   "place `hx new` writes them.")
+@click.option("--port", type=int, default=8901, show_default=True)
+def web(base, port) -> None:
+    """Serve the read-only web app on 127.0.0.1.
+
+    THERE IS NO --host OPTION. S11: "v1 binds 127.0.0.1 only... when it is
+    bound [wider], a per-install bearer token lands BEFORE the first write
+    endpoint." Neither ships here, so the way to guarantee the binding is to
+    give the operator no flag to get it wrong -- the same reasoning the
+    integration suite's TargetServer uses when it refuses any address
+    outside 127.0.0.0/8.
+
+    `--base` is the engagements PARENT directory, matching what `hx new
+    --root` means. Every other command's `--root` is one engagement's own
+    directory; that inconsistency predates this command and is recorded in
+    docs/DECISIONS.md rather than fixed by renaming six merged flags.
+    """
+    import uvicorn
+
+    from hx.web.app import create_app
+
+    root = base or default_root()
+    click.echo(f"serving {root} at http://127.0.0.1:{port}")
+    click.echo("read-only except for finding triage and STOP; "
+               "`hx resume` is the only way to lift a halt")
+    uvicorn.run(create_app(root), host="127.0.0.1", port=port,
+                # The access log carries request paths, and a path here can
+                # carry a search string an operator typed. Nothing about a
+                # client engagement belongs in a terminal scrollback by
+                # default.
+                access_log=False, log_level="warning")
