@@ -163,6 +163,122 @@ def test_a_name_the_scan_did_not_return_is_a_404(client, name):
     assert client.get(f"/e/{name}").status_code == 404
 
 
+def test_a_traversal_that_lands_on_a_real_directory_is_still_a_404(tmp_path):
+    """The parametrize cases above are cheap and cover encodings, but
+    nothing exists at any of those paths -- so under the named mutation
+    `registry._entry` still fails to open a database there and the handler
+    still 404s, for a reason that has nothing to do with the allowlist.
+    This test gives the traversal somewhere REAL to land.
+
+    A `%2f`-smuggled slash (`base / "..%2fsecret"`, landing on a SIBLING
+    directory) does not reach any handler at all, mutated or not: Starlette
+    matches routes against `scope["path"]`, which the ASGI spec requires to
+    already be percent-DECODED, so `..%2fsecret` is compared as `../secret`
+    against `Route("/e/{name}")`'s `[^/]+` pattern -- CONFIRMED by patching
+    in the coordinator's exact named mutation and finding this still 404s,
+    for yet a THIRD reason with nothing to do with the allowlist: the route
+    itself never matches a decoded path containing "/". That holds under a
+    real ASGI server too, not just this test's client, since `scope["path"]`
+    decoding is an ASGI-wide guarantee, not a TestClient quirk.
+
+    `%2e%2e` is the one encoding that survives BOTH obstacles: it decodes
+    to a bare `..` with no slash, so it IS a single path segment the route
+    matches, and being percent-encoded it is NOT the literal `..` httpx2
+    normalises away before the request is even built (see the parametrize
+    list's comment above). A bare `..` can only reach ONE directory up --
+    `base`'s own parent -- so THAT is where the real store has to live.
+    `container` plays two roles at once: it is a valid engagement in its
+    own right, and it is `base.parent`, so `base / ".."` resolves to it.
+    `scan(base)` only walks `base`'s own children (`alpha`, `beta`), so
+    `container` is never among them regardless of what lives there.
+
+    MUTATION: replace `registry.lookup(base, name)` in the overview handler
+    with an entry built from `base / name`. This test must go red -- unlike
+    every case in the parametrize above, which a mutated handler would
+    still 404 for the unrelated reason that nothing is there.
+    """
+    from hx import config as config_mod
+    from hx import engagement as eng_mod
+    from starlette.testclient import TestClient
+
+    from hx.web.app import create_app
+
+    container = tmp_path / "container"
+    shadow_cfg = config_mod.Config(name="shadow", client="Shadow Corp",
+                                   safety_profile="staging",
+                                   scope_include=["https://shadow.test/*"])
+    eng_mod.create(container, shadow_cfg, author="test").db.close()
+
+    base = container / "engagements"
+    base.mkdir()
+    for name, client_name in (("alpha", "Alpha Inc"), ("beta", "Beta Ltd")):
+        cfg = config_mod.Config(name=name, client=client_name,
+                                safety_profile="staging",
+                                scope_include=[f"https://{name}.test/*"])
+        eng_mod.create(base / name, cfg, author="test").db.close()
+
+    with TestClient(create_app(base),
+                    base_url="http://127.0.0.1:8901") as c:
+        response = c.get("/e/%2e%2e")
+
+    assert response.status_code == 404
+    assert "Shadow Corp" not in response.text
+
+
+def test_a_missing_config_file_is_a_404_that_still_carries_the_csp(
+        client, web_base):
+    """A DELETED config.yaml is caught TWICE, deliberately. `registry._entry`
+    catches it the cheap way during the scan `_entry(request)` reads, so
+    `entry.problem is not None` already 404s before `config_mod.load` is
+    ever attempted; the overview handler's own `try/except` around that
+    call (exercised directly by the test below, on a config that survives
+    the cheap check) would catch the same `OSError` a second time if it
+    ever got there. That is intentional redundancy, not slack -- CONFIRMED
+    by removing each guard alone and finding this test still green either
+    way; only removing BOTH turns it red.
+
+    MUTATION: delete BOTH `entry.problem is not None` from `_entry(request)`
+    in `hx/web/app.py` AND the `try/except (config_mod.ConfigError,
+    OSError)` around `config_mod.load` in the overview handler. Either
+    mutation alone leaves this test green -- that is the redundancy
+    working as designed. Only removing both must turn it red, with a 500
+    and no Content-Security-Policy header.
+    """
+    (web_base / "alpha" / "config.yaml").unlink()
+
+    response = client.get("/e/alpha")
+
+    assert response.status_code == 404
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
+def test_malformed_yaml_that_passes_the_cheap_check_is_still_a_404_with_csp(
+        client, web_base):
+    """The fault `registry._entry`'s cheap `read_bytes()` CANNOT catch:
+    a `config.yaml` that exists and is readable but does not parse.
+    `config_mod.load` raising `ConfigError` inside the overview handler
+    used to escape as an uncaught exception -- Starlette's
+    `ServerErrorMiddleware` sits OUTSIDE `_guard`, so that response left
+    with no Content-Security-Policy, no `X-Content-Type-Options` and no
+    `Referrer-Policy` at all, next to a body that is exactly as
+    attacker-reachable as any other response this app sends.
+
+    The CSP assertion is the point, not the status code alone: a plain 404
+    proves the handler stopped the exception; the header proves it stopped
+    it EARLY ENOUGH to still go through `_secured`.
+
+    MUTATION: delete the `try/except (config_mod.ConfigError, OSError)`
+    around `config_mod.load` in the overview handler. This test must go
+    red with a 500 and no Content-Security-Policy header at all.
+    """
+    (web_base / "alpha" / "config.yaml").write_text("not: valid: yaml: [[[")
+
+    response = client.get("/e/alpha")
+
+    assert response.status_code == 404
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
 def test_the_hostname_helper_splits_ports_and_brackets():
     """A unit test beside the integration ones, because the parsing is where
     a Host check goes wrong quietly."""

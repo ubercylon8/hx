@@ -53,6 +53,23 @@ def test_a_store_from_another_schema_version_scans_as_a_problem(tmp_path):
     assert entry.engagement_id is None
 
 
+def test_a_deleted_config_file_scans_as_a_problem(tmp_path):
+    """A store can have a perfectly good `hx.db` and no `config.yaml` --
+    deleted, moved, or never written back after an edit. The overview
+    handler needs a config to render at all, so a directory missing one is
+    exactly as unusable as a directory whose schema is wrong, and the index
+    must say so rather than link to a screen that cannot render.
+    """
+    _make(tmp_path, "alpha")
+    (tmp_path / "alpha" / "config.yaml").unlink()
+
+    entry = registry_mod.scan(tmp_path)[0]
+
+    assert entry.problem is not None
+    assert "config.yaml" in entry.problem
+    assert entry.engagement_id is None
+
+
 def test_lookup_returns_the_named_engagement(tmp_path):
     _make(tmp_path, "alpha")
     assert registry_mod.lookup(tmp_path, "alpha").name == "alpha"

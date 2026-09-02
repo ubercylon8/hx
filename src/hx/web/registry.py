@@ -70,6 +70,19 @@ def _entry(path: Path) -> Entry:
             return Entry(**blank, schema_version=version,
                          problem=f"expected one engagement row, found {len(rows)}")
         row = rows[0]
+        config_path = path / "config.yaml"
+        try:
+            # A CHEAP check -- a read, not a parse. `config_mod.load` would
+            # also catch a MALFORMED file, but running it here means every
+            # engagement's config is parsed on every index render just to
+            # find out. The overview handler pays that cost for the one
+            # engagement a request actually names; this only screens for
+            # the file being missing or unreadable, the same class of fault
+            # as the schema-version check above.
+            config_path.read_bytes()
+        except OSError as exc:
+            return Entry(**blank, schema_version=version,
+                         problem=f"cannot read {config_path}: {exc}")
         findings = {
             r[0]: r[1] for r in conn.execute(
                 "SELECT severity, COUNT(*) FROM finding WHERE engagement_id=?"

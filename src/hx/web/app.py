@@ -119,7 +119,20 @@ def overview(request):
     entry = _entry(request)
     conn = registry_mod.open_read(entry)
     try:
-        config = config_mod.load(entry.path / "config.yaml")
+        try:
+            # `_entry`'s own check catches the CHEAP fault -- missing or
+            # unreadable -- for every engagement the index scans. Malformed
+            # YAML is only discoverable by parsing, and this is the one
+            # place that cost is paid for one engagement rather than all
+            # of them. Either way the failure becomes a 404 raised INSIDE
+            # this handler, not an uncaught exception: Starlette's
+            # ServerErrorMiddleware sits outside `_guard`, so anything that
+            # escapes this far would leave with no CSP, no `nosniff` and no
+            # `Referrer-Policy` -- exactly the response a captured, hostile
+            # body is rendered next to.
+            config = config_mod.load(entry.path / "config.yaml")
+        except (config_mod.ConfigError, OSError) as exc:
+            raise HTTPException(status_code=404) from exc
         data = reads_mod.overview(conn, entry.engagement_id, config)
     finally:
         conn.close()
