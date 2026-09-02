@@ -28,10 +28,11 @@ Every task's requirements implicitly include this section.
 - **Python 3.12.** `from __future__ import annotations` at the top of every
   new module, matching the tree.
 - **Runtime dependencies become exactly:** `PyYAML>=6.0`, `click>=8.1`,
-  `starlette>=0.47`, `jinja2>=3.1`, `uvicorn>=0.35`. Installed closure is 10
+  `starlette>=1.6`, `jinja2>=3.1`, `uvicorn>=0.52`. Installed closure is 10
   packages: `anyio click h11 idna jinja2 markupsafe pyyaml starlette
-  typing-extensions uvicorn`. **Do not add `fastapi`, `pydantic`, `httpx`, or
-  `python-multipart` to runtime deps.** `httpx` goes in the `dev` group only.
+  typing-extensions uvicorn`. **Do not add `fastapi`, `pydantic`, `httpx2`, or
+  `python-multipart` to runtime deps.** `httpx2` goes in the `dev` group
+  only.
 - **No new integration tests.** The web app never touches Burp. The
   `integration` marker stays at 46 tests.
 - **`ruff check src tests` must pass**, and ruff's `select = ["E4","E7","E9","F"]`
@@ -1368,9 +1369,9 @@ dependencies = [
     # is server-rendered Jinja whose entire validated input is a status enum
     # and a note string. S11's own "should not pull hundreds of transitive
     # packages to render a table" is the argument for the smaller closure.
-    "starlette>=0.47",
+    "starlette>=1.6",
     "jinja2>=3.1",
-    "uvicorn>=0.35",
+    "uvicorn>=0.52",
 ]
 ```
 
@@ -1381,12 +1382,19 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.14",
     "mypy>=1.14",
-    # `starlette.testclient.TestClient` is httpx-backed. DEV ONLY: nothing in
+    # `starlette.testclient.TestClient` needs an httpx-family client. DEV ONLY: nothing in
     # `src/hx` imports it, and the app itself makes no outbound HTTP request
     # of any kind -- S4's invariant is that every byte leaving this machine
     # crosses the JVM, and an HTTP client in the runtime closure is the kind
     # of thing that quietly stops being true.
-    "httpx>=0.28",
+    # httpx2 AND NOT httpx: MEASURED 2026-09-01 against Starlette 1.6.0,
+    # importing TestClient with plain httpx raises
+    # `StarletteDeprecationWarning: Using httpx with starlette.testclient is
+    # deprecated; install httpx2 instead`. Starting a new dependency on a path
+    # its own author has deprecated means the next Starlette bump breaks the
+    # whole web suite at once. httpx2 is the same author (Tom Christie), the
+    # same BSD-3-Clause licence, and the package Starlette's own message names.
+    "httpx2>=2.12",
 ]
 ```
 
@@ -1394,7 +1402,8 @@ Then install:
 
 ```bash
 uv sync
-.venv/bin/python -c "import starlette, jinja2, uvicorn, httpx; print('ok')"
+.venv/bin/python -c "import starlette, jinja2, uvicorn, httpx2; print('ok')"
+.venv/bin/python -W error::DeprecationWarning -c "from starlette.testclient import TestClient; print('testclient clean')"
 ```
 
 - [ ] **Step 2: Write the failing registry tests**

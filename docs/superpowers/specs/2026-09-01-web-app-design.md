@@ -411,8 +411,11 @@ and each lands as working software with its own review cycle.
 ## 9. Testing
 
 **No new integration tests.** The web app never touches Burp, so the
-46-test integration suite is unchanged. One new dev dependency: `httpx`,
-which `starlette.testclient.TestClient` is built on.
+46-test integration suite is unchanged. One new dev dependency: `httpx2`,
+which `starlette.testclient.TestClient` is built on. **Amended 2026-09-01
+during execution:** plain `httpx` was the original choice; Starlette 1.6.0
+raises `StarletteDeprecationWarning` on importing `TestClient` with it and
+names `httpx2` as the replacement. Same author, same licence.
 
 Two fixtures over the existing `engagement`: a `web_base` holding two or
 three engagements — so the list screen and the isolation tests have
