@@ -19,6 +19,21 @@ import sqlite3
 from hx import coverage as coverage_mod
 from hx import run as run_mod
 
+#: `finding.severity`'s CHECK constraint, in the order a reader wants them.
+#: Copied deliberately rather than derived: the column's vocabulary is
+#: closed, and a filter that accepted something the column cannot hold would
+#: silently return nothing and look like a clean result.
+SEVERITIES = ("Critical", "High", "Medium", "Low", "Info")
+
+#: `finding.status`'s CHECK constraint. WIDER than `triage.TARGETS`, and
+#: deliberately: triage may only WRITE two of these, but a store can hold
+#: any of the five and a filter that could not name them would hide rows.
+STATUSES = ("new", "triaged", "confirmed", "false_positive", "reported")
+
+
+class FilterError(Exception):
+    """A filter value outside the column's closed vocabulary."""
+
 
 def _run_rows(conn: sqlite3.Connection, engagement_id: str) -> tuple:
     """Every run, newest first, with a display status that tells the truth.
@@ -105,3 +120,74 @@ def overview(conn: sqlite3.Connection, engagement_id: str, config) -> dict:
             "SELECT COUNT(*) FROM exchange x JOIN run r ON r.id = x.run_id"
             " WHERE r.engagement_id=?", (engagement_id,)).fetchone()[0],
     }
+
+
+def surfaces(conn: sqlite3.Connection, engagement_id: str) -> tuple:
+    """Every captured surface, with how much was done to it.
+
+    `answered` counts DISTINCT checks whose verdict is in
+    `coverage.ANSWERED` -- the same definition the report and the overview
+    use. A `pending` or `skipped` row records a gap, and a column that
+    counted them would say a check ran when none did, which is S12's failure
+    at the level of a single table cell.
+    """
+    marks = ",".join("?" for _ in coverage_mod.ANSWERED)
+    rows = conn.execute(
+        "SELECT s.id, s.method, s.scheme, s.host, s.port, s.path_template,"
+        " s.query_key_set, s.kind, s.discovered_by,"
+        " (SELECT COUNT(*) FROM exchange x WHERE x.surface_id = s.id),"
+        f" (SELECT COUNT(DISTINCT cr.check_id) FROM check_run cr"
+        f"  WHERE cr.surface_id = s.id AND cr.verdict IN ({marks}))"
+        " FROM surface s WHERE s.engagement_id=?"
+        " ORDER BY s.path_template, s.method, s.id",
+        (*coverage_mod.ANSWERED, engagement_id)).fetchall()
+    return tuple({
+        "id": r[0], "method": r[1], "scheme": r[2], "host": r[3],
+        "port": r[4], "path_template": r[5], "query_key_set": r[6],
+        "kind": r[7], "discovered_by": r[8], "exchanges": r[9],
+        "answered": r[10],
+    } for r in rows)
+
+
+def findings(conn: sqlite3.Connection, engagement_id: str, *,
+             severity: str | None = None,
+             status: str | None = None) -> tuple:
+    """Findings, most severe first, optionally filtered.
+
+    An unrecognised filter value RAISES rather than being ignored. A screen
+    that quietly drops a filter shows more rows than were asked for while
+    looking as though it obeyed, and the operator's conclusion -- "I
+    filtered to confirmed and there were none" -- becomes a false statement
+    about their own data.
+    """
+    if severity is not None and severity not in SEVERITIES:
+        raise FilterError(
+            f"{severity!r} is not a severity; this store holds "
+            f"{list(SEVERITIES)}")
+    if status is not None and status not in STATUSES:
+        raise FilterError(
+            f"{status!r} is not a status; this store holds {list(STATUSES)}")
+
+    where = ["f.engagement_id=?"]
+    args: list = [engagement_id]
+    if severity is not None:
+        where.append("f.severity=?")
+        args.append(severity)
+    if status is not None:
+        where.append("f.status=?")
+        args.append(status)
+
+    order = " ".join(
+        f"WHEN '{name}' THEN {n}" for n, name in enumerate(SEVERITIES))
+    rows = conn.execute(
+        "SELECT f.id, f.title, f.severity, f.confidence, f.status,"
+        " f.check_id, f.host, s.method, s.path_template"
+        " FROM finding f LEFT JOIN surface s ON s.id = f.surface_id"
+        " WHERE " + " AND ".join(where) +
+        f" ORDER BY CASE f.severity {order} ELSE 99 END, f.title, f.id",
+        args).fetchall()
+    return tuple({
+        "id": r[0], "title": r[1], "severity": r[2], "confidence": r[3],
+        "status": r[4], "check_id": r[5], "host": r[6],
+        "method": r[7], "path_template": r[8],
+    } for r in rows)

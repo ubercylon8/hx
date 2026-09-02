@@ -112,3 +112,103 @@ def test_the_coverage_figures_match_what_the_report_computes(
     assert f"{cov.captured} surface(s) captured" in body
     assert "missing-hsts" in body
     assert "Never tested" not in body
+
+
+def _surface(conn, eid, sid="s1", method="GET", template="/a"):
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, discovered_by, normaliser_version)"
+        " VALUES(?,?,?,'https','alpha.test',443,?,'proxy',2)",
+        (sid, eid, method, template))
+
+
+def _finding(conn, eid, fid="f1", severity="High", status="new",
+             title="Reflected input", surface_id=None):
+    conn.execute(
+        "INSERT INTO finding(id, engagement_id, dedupe_key, title, severity,"
+        " confidence, created_by, status, scope_level, surface_id,"
+        " check_id) VALUES(?,?,?,?,?,'Firm','check',?,'surface',?,'refl')",
+        (fid, eid, f"k-{fid}", title, severity, status, surface_id))
+
+
+def test_the_surface_screen_names_each_surface_and_how_it_was_found(
+        client, alpha_db):
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _surface(alpha_db, eid, template="/order/{id}")
+
+    body = client.get("/e/alpha/surfaces").text
+
+    assert "/order/{id}" in body
+    assert "proxy" in body
+
+
+def test_a_surface_whose_only_check_row_is_skipped_shows_no_answers(
+        client, alpha_db):
+    """`answered` counts only verdicts in `coverage.ANSWERED`. A `skipped`
+    row records a GAP -- the budget cut the scan off before it -- and
+    counting it would make the column say a check ran when none did.
+
+    MUTATION: drop the `verdict IN (...)` clause from `reads.surfaces`.
+    This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _surface(alpha_db, eid)
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status) VALUES('r1',?,'scan','staging',1,'completed')", (eid,))
+    alpha_db.execute(
+        "INSERT INTO check_run(id, run_id, surface_id, check_id,"
+        " check_version, verdict) VALUES('c1','r1','s1','x','1','skipped')")
+
+    from hx.web import reads as reads_mod
+    from hx.web import registry as registry_mod
+
+    conn = registry_mod.open_read(registry_mod.lookup(
+        client.app.state.base, "alpha"))
+    try:
+        assert reads_mod.surfaces(conn, eid)[0]["answered"] == 0
+    finally:
+        conn.close()
+
+
+def test_the_findings_screen_orders_by_severity(client, alpha_db):
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _finding(alpha_db, eid, fid="f-low", severity="Low", title="Low one")
+    _finding(alpha_db, eid, fid="f-crit", severity="Critical",
+             title="Critical one")
+
+    body = client.get("/e/alpha/findings").text
+
+    assert body.index("Critical one") < body.index("Low one")
+
+
+def test_filtering_by_status_hides_the_others(client, alpha_db):
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _finding(alpha_db, eid, fid="f-new", status="new", title="Still new")
+    _finding(alpha_db, eid, fid="f-fp", status="false_positive",
+             title="Already dismissed")
+
+    body = client.get("/e/alpha/findings?status=false_positive").text
+
+    assert "Already dismissed" in body
+    assert "Still new" not in body
+
+
+def test_an_unknown_filter_value_is_refused_rather_than_ignored(client):
+    """A screen that silently drops a filter shows MORE than was asked for
+    while looking obedient, and "I filtered to confirmed and saw none"
+    becomes a false statement about the data.
+
+    MUTATION: make `findings` ignore an unrecognised value instead of
+    raising. This test must go red.
+    """
+    response = client.get("/e/alpha/findings?status=definitely_fine")
+    assert response.status_code == 400
+    assert "false_positive" in response.text
+
+
+def test_the_findings_screen_shows_the_current_status(client, alpha_db):
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _finding(alpha_db, eid, fid="f1", status="confirmed")
+
+    assert "confirmed" in client.get("/e/alpha/findings").text

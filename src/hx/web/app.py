@@ -140,11 +140,46 @@ def overview(request):
         request, "overview.html", {"entry": entry, "config": config, **data})
 
 
+def surfaces(request):
+    entry = _entry(request)
+    conn = registry_mod.open_read(entry)
+    try:
+        rows = reads_mod.surfaces(conn, entry.engagement_id)
+    finally:
+        conn.close()
+    return request.app.state.templates.TemplateResponse(
+        request, "surfaces.html", {"entry": entry, "surfaces": rows})
+
+
+def findings(request):
+    entry = _entry(request)
+    conn = registry_mod.open_read(entry)
+    try:
+        rows = reads_mod.findings(
+            conn, entry.engagement_id,
+            severity=request.query_params.get("severity"),
+            status=request.query_params.get("status"))
+    except reads_mod.FilterError as exc:
+        return PlainTextResponse(str(exc), status_code=400)
+    finally:
+        conn.close()
+    return request.app.state.templates.TemplateResponse(
+        request, "findings.html", {
+            "entry": entry, "findings": rows,
+            "severities": reads_mod.SEVERITIES,
+            "statuses": reads_mod.STATUSES,
+            "severity": request.query_params.get("severity"),
+            "status": request.query_params.get("status"),
+        })
+
+
 def create_app(base) -> Starlette:
     app = Starlette(
         routes=[
             Route("/", index),
             Route("/e/{name}", overview),
+            Route("/e/{name}/surfaces", surfaces),
+            Route("/e/{name}/findings", findings),
             Mount("/static",
                   StaticFiles(directory=str(render_mod.STATIC)),
                   name="static"),
