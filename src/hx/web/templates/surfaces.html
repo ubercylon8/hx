@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ entry.name }} surfaces{% endblock %}
+{% block crumb %}<span class="crumb"><a href="/e/{{ entry.name }}">{{ entry.name }}</a> · surfaces</span>{% endblock %}
+{% block content %}
+<h1>Surface</h1>
+{% if dropped_total %}
+<p class="warn"><strong>{{ dropped_total }} exchange(s) were dropped.</strong>
+Every count on this page is a <strong>floor, not a total</strong> — the
+extension could not hand over every exchange it saw.</p>
+{% endif %}
+{% if not surfaces %}
+<p>Nothing captured yet. Surfaces arrive through the proxy — browse the
+target through Burp, or run <code>hx capture start</code>.</p>
+{% else %}
+<p class="muted">{{ surfaces | length }} surface(s). A surface is the
+<em>template</em>, not the URL: <code>/order/1</code> and
+<code>/order/9999</code> are one row.</p>
+<table>
+<thead><tr>
+  <th>Method</th><th>Path template</th><th>Host</th><th>Query keys</th>
+  <th>Kind</th><th>Found by</th><th class="num">Exchanges</th>
+  <th class="num">Checks answered</th>
+</tr></thead>
+<tbody>
+{% for s in surfaces %}
+<tr>
+  <td>{{ s.method }}</td>
+  <td><code>{{ s.path_template }}</code></td>
+  <td>{{ s.scheme }}://{{ s.host }}:{{ s.port }}</td>
+  <td>{{ s.query_key_set or "—" }}</td>
+  <td>{{ s.kind }}</td>
+  <td>{{ s.discovered_by }}</td>
+  <td class="num">{{ s.exchanges }}</td>
+  <td class="num {{ 'warn-cell' if not s.answered else '' }}">{{ s.answered }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p class="muted">A zero in the last column means <strong>no check ever
+returned a verdict</strong> for that surface — never reached, which is not
+the same as clean.</p>
+{% endif %}
+{% endblock %}

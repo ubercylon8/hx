@@ -25,6 +25,7 @@ from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
 from hx import session as session_mod
+from hx import triage as triage_mod
 from hx.bridge import codec as codec_mod
 from hx.bridge import server as bridge_mod
 from hx.checks import registry
@@ -540,6 +541,41 @@ def resume(root) -> None:
 
 
 @main.command()
+@click.argument("finding_id")
+@click.option("--status", "to_status", required=True,
+              type=click.Choice(triage_mod.TARGETS),
+              help="The triage decision. S11 offers exactly these two.")
+@click.option("--note", default=None,
+              help="Why. REQUIRED for false_positive: it reaches the client "
+                   "deliverable, and a retest has to honour it.")
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def triage(finding_id, to_status, note, root) -> None:
+    """Record a human triage decision on a finding.
+
+    S8 keeps this out of the agent's hands: `finding.set_status` is in
+    `NEVER_AGENT_FACING`, so confirming a finding happens here or in the web
+    app and nowhere else.
+    """
+    eng = _open_engagement(root or default_root())
+    try:
+        change = triage_mod.set_status(eng.db, finding_id=finding_id,
+                                       to_status=to_status, note=note)
+    except triage_mod.TriageError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(
+            f"cannot record the decision at {eng.root}: {exc}") from exc
+
+    if not change.changed:
+        click.echo(f"{finding_id}: already {change.to_status}; "
+                   "nothing recorded")
+        return
+    click.echo(f"{finding_id}: {change.from_status} -> {change.to_status}")
+    if note and note.strip():
+        click.echo(f"  note  {note.strip()}")
+
+
+@main.command()
 @click.option("--root", type=click.Path(path_type=Path), default=None)
 @click.option("--max-seconds", type=int, default=None,
               help="Stop after this long. Remaining checks are recorded as "
@@ -906,3 +942,39 @@ def mcp(root) -> None:
     # [the stack]" -- false for the single exit that matters in production.
     with _sigterm_ends_the_session():
         mcp_adapter.serve(eng)
+
+
+@main.command()
+@click.option("--base", "base", type=click.Path(path_type=Path), default=None,
+              help="Directory holding engagements. Defaults to the same "
+                   "place `hx new` writes them.")
+@click.option("--port", type=int, default=8901, show_default=True)
+def web(base, port) -> None:
+    """Serve the read-only web app on 127.0.0.1.
+
+    THERE IS NO --host OPTION. S11: "v1 binds 127.0.0.1 only... when it is
+    bound [wider], a per-install bearer token lands BEFORE the first write
+    endpoint." Neither ships here, so the way to guarantee the binding is to
+    give the operator no flag to get it wrong -- the same reasoning the
+    integration suite's TargetServer uses when it refuses any address
+    outside 127.0.0.0/8.
+
+    `--base` is the engagements PARENT directory, matching what `hx new
+    --root` means. Every other command's `--root` is one engagement's own
+    directory; that inconsistency predates this command and is recorded in
+    docs/DECISIONS.md rather than fixed by renaming six merged flags.
+    """
+    import uvicorn
+
+    from hx.web.app import create_app
+
+    root = base or default_root()
+    click.echo(f"serving {root} at http://127.0.0.1:{port}")
+    click.echo("read-only except for finding triage and STOP; "
+               "`hx resume` is the only way to lift a halt")
+    uvicorn.run(create_app(root), host="127.0.0.1", port=port,
+                # The access log carries request paths, and a path here can
+                # carry a search string an operator typed. Nothing about a
+                # client engagement belongs in a terminal scrollback by
+                # default.
+                access_log=False, log_level="warning")

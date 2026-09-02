@@ -179,9 +179,9 @@ def current_run(conn: sqlite3.Connection, *, engagement_id: str, kind: str,
                     safety_profile=safety_profile, now_us=at)
 
 
-def reap_stale(conn: sqlite3.Connection, *, now_us: int | None = None,
-               stale_after_us: int | None = None) -> list[str]:
-    """Resolve runs whose harness died to `error`. Returns their ids.
+def stale_before_us(*, now_us: int | None = None,
+                    stale_after_us: int | None = None) -> int:
+    """The heartbeat a `running` run must be newer than to count as alive.
 
     Deliberately a WIDER window than IDLE_CLOSE_US: an idle run is one nobody
     used, and a stale one is a run whose process is gone. Reaping at the idle
@@ -189,18 +189,60 @@ def reap_stale(conn: sqlite3.Connection, *, now_us: int | None = None,
     """
     at = _now_us() if now_us is None else now_us
     window = IDLE_CLOSE_US * 2 if stale_after_us is None else stale_after_us
-    # COALESCE, not a bare comparison: heartbeat_us is NULLable, and in SQL
-    # `NULL < x` is NULL, which WHERE treats as false. A `running` run that
-    # never heartbeated at all would therefore never be reaped -- and a run
-    # that died before its first heartbeat is precisely the case this
-    # mechanism exists for. It falls back to started_us, which is NOT NULL, so
-    # a run that started long ago and never reported is stale on its own
-    # evidence.
+    return at - window
+
+
+def is_stale(status: str, heartbeat_us: int | None, started_us: int,
+             *, before_us: int) -> bool:
+    """Whether one run row is a run whose harness died.
+
+    ONE DEFINITION, because there are now two callers and they must not be
+    free to disagree. `reap_stale` below resolves such a run to `error` in
+    the store; the web app's overview screen RENDERS it as `error` without
+    writing anything, since its connections are read-only. A screen that
+    showed `running` for a run the reaper would kill is the first thing an
+    operator sees after a crash, and S5 is explicit: "an aborted run must
+    never render as a clean one, and neither must one that merely STOPPED
+    BEING UPDATED".
+
+    The fallback to `started_us` is what `reap_stale`'s SQL spelled
+    `COALESCE`, and it is load-bearing for the same reason: the column is
+    NULLable, and a run that died BEFORE its first heartbeat is precisely
+    what this mechanism is for. `started_us` is NOT NULL, so a run that
+    started long ago and never reported is stale on its own evidence.
+
+    `if heartbeat_us is None` AND NOT `heartbeat_us or started_us`: a
+    heartbeat of 0 is a real timestamp at the epoch, and `or` would discard
+    it for `started_us`. SQL's COALESCE tests for NULL, not falsiness, so
+    the truthiness spelling would not have been the same rule.
+    """
+    if status != "running":
+        return False
+    last = started_us if heartbeat_us is None else heartbeat_us
+    return last < before_us
+
+
+def reap_stale(conn: sqlite3.Connection, *, now_us: int | None = None,
+               stale_after_us: int | None = None) -> list[str]:
+    """Resolve runs whose harness died to `error`. Returns their ids.
+
+    THE PREDICATE MOVED OUT, to `is_stale` above, and the SQL got simpler
+    rather than smarter: this selects every `running` run and filters in
+    Python. The previous version asked SQLite
+    `COALESCE(heartbeat_us, started_us) < ?`, which was correct and was also
+    a SECOND copy of a rule the web app's read-only overview screen needs to
+    apply without writing. Two spellings of "stale" in two languages is how
+    a screen and a reaper end up disagreeing about the same run. The set
+    being filtered is every run currently `running` in one engagement, which
+    is nought or one in practice and never large.
+    """
+    at = _now_us() if now_us is None else now_us
+    before = stale_before_us(now_us=at, stale_after_us=stale_after_us)
     rows = conn.execute(
-        "SELECT id FROM run WHERE status='running'"
-        " AND COALESCE(heartbeat_us, started_us) < ?",
-        (at - window,)).fetchall()
-    ids = [r[0] for r in rows]
+        "SELECT id, heartbeat_us, started_us FROM run WHERE status='running'"
+    ).fetchall()
+    ids = [r[0] for r in rows if is_stale("running", r[1], r[2],
+                                          before_us=before)]
     for run_id in ids:
         conn.execute(
             "UPDATE run SET status='error', ended_us=?, stop_reason=?"

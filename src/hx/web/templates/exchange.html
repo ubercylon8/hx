@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}{{ exchange.id }}{% endblock %}
+{% block crumb %}<span class="crumb"><a href="/e/{{ entry.name }}">{{ entry.name }}</a> · exchange</span>{% endblock %}
+{% block content %}
+<h1><code>{{ exchange.method }} {{ exchange.url | redact }}</code></h1>
+<p class="muted">
+  {{ exchange.id }} · via {{ exchange.via }} ·
+  outcome <strong>{{ exchange.outcome }}</strong> ·
+  status {{ exchange.status if exchange.status is not none else "—" }} ·
+  sent {{ exchange.sent_us | when }}
+  {% if exchange.identity %}· as <code>{{ exchange.identity }}</code>
+  ({{ exchange.identity_state }}){% endif %}
+</p>
+{% if exchange.body_shed %}
+<p class="warn">This exchange's body was <strong>shed</strong> — the store
+kept the metadata and not the bytes. What is below is not the whole
+response.</p>
+{% endif %}
+
+<h2>Request</h2>
+{% if exchange.request_problem %}
+<p class="warn">{{ exchange.request_problem }}</p>
+{% elif not exchange.req_blob %}
+<p class="muted">No request was stored for this exchange.</p>
+{% else %}
+<pre class="bytes">{{ exchange.request }}</pre>
+{% endif %}
+
+<h2>Response</h2>
+{% if exchange.response_problem %}
+<p class="warn">{{ exchange.response_problem }}</p>
+{% elif not exchange.resp_blob %}
+<p class="muted">No response was stored for this exchange.</p>
+{% else %}
+<pre class="bytes">{{ exchange.response }}</pre>
+{% endif %}
+
+<p class="muted">Credentials this extension injected are already replaced in
+these bytes — redaction runs inside the JVM, before hashing, so the store
+never held them.</p>
+{% endblock %}

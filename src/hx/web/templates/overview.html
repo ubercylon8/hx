@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}{{ entry.name }}{% endblock %}
+{% block crumb %}<span class="crumb">{{ entry.name }}</span>{% endblock %}
+{% block content %}
+<h1>{{ entry.name }}</h1>
+{% if halted %}
+<p class="halted"><strong>HALTED</strong> — {{ halt_reason }}<br>
+Issuance is stopped. <strong>Only <code>hx resume</code> lifts it</strong>,
+and it records who did: stopping is one click, un-stopping is a deliberate
+trip to a terminal.</p>
+{% else %}
+<form method="post" action="/e/{{ entry.name }}/halt" class="stop">
+  <input type="text" name="reason" placeholder="why (optional)">
+  <button type="submit" class="danger">STOP issuance</button>
+</form>
+{% endif %}
+<nav class="screens">
+  <a href="/e/{{ entry.name }}/surfaces">Surface</a>
+  <a href="/e/{{ entry.name }}/findings">Findings</a>
+</nav>
+<p class="muted">{{ entry.client }} · created {{ entry.created_us | when }} · {{ entry.status }}</p>
+
+{% if dropped_total %}
+<p class="warn"><strong>{{ dropped_total }} exchange(s) were dropped.</strong>
+Every count on this page is a <strong>floor, not a total</strong> — the
+extension could not hand over every exchange it saw.</p>
+{% endif %}
+
+<h2>Scope of record</h2>
+<table>
+<thead><tr><th>Effective</th><th>sha256</th><th>Author</th><th>Reason</th></tr></thead>
+<tbody>
+{% for s in scopes %}
+<tr><td>{{ s[2] | when }}</td><td class="hash">{{ s[1] }}</td><td>{{ s[3] }}</td><td>{{ s[4] }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<ul class="scope">
+{% for pattern in config.scope_include %}<li class="include">{{ pattern | redact }}</li>{% endfor %}
+{% for pattern in config.scope_exclude %}<li class="exclude">{{ pattern | redact }}</li>{% endfor %}
+</ul>
+
+<h2>Authorisation</h2>
+{% if authorizations %}
+<table>
+<thead><tr><th>Signatory</th><th>Document</th><th>From</th><th>To</th></tr></thead>
+<tbody>
+{% for a in authorizations %}
+<tr><td>{{ a[0] }}</td><td class="hash">{{ a[1] }}</td><td>{{ a[2] | when }}</td><td>{{ a[3] | when }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p class="warn">No authorisation record. Nothing in hx writes this table yet,
+so its absence says nothing about whether the work was authorised — it says
+this store has no record of it.</p>
+{% endif %}
+
+<h2>Runs</h2>
+{% if not runs %}
+<p>No run has been opened for this engagement.</p>
+{% else %}
+<table>
+<thead><tr>
+  <th>Kind</th><th>Status</th><th>Started</th><th>Ended</th>
+  <th class="num">Issued</th><th class="num">Dropped</th><th>Why it stopped</th>
+</tr></thead>
+<tbody>
+{% for r in runs %}
+<tr class="{{ 'stale' if r.stale else '' }}">
+  <td>{{ r.kind }}</td>
+  <td class="status status-{{ r.status }}">{{ r.status }}</td>
+  <td>{{ r.started_us | when }}</td>
+  <td>{{ r.ended_us | when }}</td>
+  <td class="num">{{ r.requests_issued }}</td>
+  <td class="num">{{ r.dropped_total }}</td>
+  <td>{{ r.stop_reason or "—" }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+<h2>Coverage</h2>
+{% if coverage.unfinished %}
+<p class="warn"><strong>These numbers are partial.</strong>
+{{ coverage.unfinished | length }} of the runs behind them did not finish, so
+a check that never opened for a surface may simply be one the run never got to.</p>
+{% endif %}
+{% if not coverage.captured %}
+<p>No surface was captured, so there is nothing here for a check to have covered.</p>
+{% else %}
+<p>{{ coverage.captured }} surface(s) captured.
+<strong>{{ coverage.captured - (coverage.untested | length) }}</strong> had at
+least one check return a verdict; <strong>{{ coverage.untested | length }}</strong> had none.</p>
+{% endif %}
+{% if not coverage.scanned %}
+<p class="warn">This engagement has <strong>not been scanned</strong>. No check
+has run against any surface, so nothing here should be read as tested.</p>
+{% else %}
+<table>
+<thead><tr><th>Check</th><th>Verdict</th><th class="num">Surfaces</th></tr></thead>
+<tbody>
+{% for check_id, verdict, n in coverage.by_check %}
+<tr><td><code>{{ check_id }}</code></td><td>{{ verdict }}</td><td class="num">{{ n }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% for klass in unshipped %}
+<p class="warn"><code>{{ klass }}</code> is enabled in this engagement's config,
+but this build ships no checks in that class — nothing above is coverage for it.</p>
+{% endfor %}
+{% if coverage.untested %}
+<h3>Never tested</h3>
+<p>These {{ coverage.untested | length }} surface(s) were captured and no check
+ever returned a verdict for them. A surface named here was <strong>never
+reached</strong>, which is not the same as clean.</p>
+<ul class="untested">
+{% for method, template in coverage.untested %}<li><code>{{ method }} {{ template }}</code></li>{% endfor %}
+</ul>
+{% endif %}
+
+<h2>Findings</h2>
+<p>
+{% for sev, n in severities.items() %}<span class="sev sev-{{ sev | lower }}">{{ sev }} {{ n }}</span> {% else %}None recorded.{% endfor %}
+</p>
+<p class="muted">{{ surfaces }} surface(s) · {{ exchanges }} exchange(s)</p>
+{% endblock %}

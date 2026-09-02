@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}{{ entry.name }} findings{% endblock %}
+{% block crumb %}<span class="crumb"><a href="/e/{{ entry.name }}">{{ entry.name }}</a> · findings</span>{% endblock %}
+{% block content %}
+<h1>Findings</h1>
+<form method="get" class="filters">
+  <label>Severity
+    <select name="severity">
+      <option value="">any</option>
+      {% for s in severities %}
+      <option value="{{ s }}" {{ 'selected' if s == severity else '' }}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Status
+    <select name="status">
+      <option value="">any</option>
+      {% for s in statuses %}
+      <option value="{{ s }}" {{ 'selected' if s == status else '' }}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Filter</button>
+  <a href="/e/{{ entry.name }}/findings">clear</a>
+</form>
+{% if not findings %}
+<p>No finding matches.{% if severity or status %} The filter is on; <a href="/e/{{ entry.name }}/findings">clear it</a> to see everything.{% endif %}</p>
+{% else %}
+<table>
+<thead><tr>
+  <th>Severity</th><th>Title</th><th>Where</th><th>Check</th>
+  <th>Confidence</th><th>Status</th>
+</tr></thead>
+<tbody>
+{% for f in findings %}
+<tr>
+  <td><span class="sev sev-{{ f.severity | lower }}">{{ f.severity }}</span></td>
+  <td><a href="/e/{{ entry.name }}/findings/{{ f.id }}">{{ f.title }}</a></td>
+  <td>{% if f.path_template %}<code>{{ f.method }} {{ f.path_template }}</code>{% else %}{{ f.host or "—" }}{% endif %}</td>
+  <td><code>{{ f.check_id or "—" }}</code></td>
+  <td>{{ f.confidence }}</td>
+  <td class="status status-{{ f.status }}">{{ f.status }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endblock %}

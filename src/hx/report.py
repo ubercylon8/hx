@@ -68,8 +68,10 @@ import datetime
 import hashlib
 
 from hx import config as config_mod
+from hx import coverage as coverage_mod
 from hx import insertion as insertion_mod
 from hx import surface as surface_mod
+from hx import triage as triage_mod
 from hx.checks import probe
 from hx.checks import registry
 from hx.store import records
@@ -104,21 +106,6 @@ _UNTESTED_LIMIT = 20
 # more there were. See `_coverage` for why the table no longer groups on the
 # reason itself.
 _REASON_LIMIT = 2
-
-# The `check_run.verdict` values that mean a check actually produced an
-# answer about a surface, and therefore that the surface was REACHED.
-#
-# `pending` is excluded because S5 says what it is for in as many words: "a
-# 'pending' row is written BEFORE the check runs, so a crash leaves evidence
-# that the surface was never reached". `skipped` is excluded because it is
-# the runner saying the check never ran -- `hx.scan._skip_rest` writes it
-# when a budget cuts a scan off -- and `hx.checks.base`'s own docstring puts
-# `pending`, `skipped` and `error` on the runner's side of exactly S12's
-# distinction. `error` IS included: the check reached the surface and raised,
-# which is a failure to answer rather than a failure to arrive, and the row
-# renders in the table as `error` where a reader can see no clean answer was
-# obtained.
-_ANSWERED = ("clean", "finding", "inconclusive", "error")
 
 
 def _redact(text) -> str | None:
@@ -288,66 +275,23 @@ def render(conn, *, engagement_id, config, blobs=None) -> str:
     out.append(f"# {_flat(_redact(eng[2]))} — web application assessment\n")
     out.append(f"Engagement {_code(_redact(eng[1]))}.\n")
 
-    # ONE SOURCE OF TRUTH FOR "HAS THIS ENGAGEMENT EVER BEEN SCANNED",
-    # shared by `_findings` (F4 of fix round 1: an unscanned engagement's
-    # "None recorded" must not read as a clean bill) and `_coverage` (the
-    # original "not been scanned" paragraph). Computed once here rather than
-    # twice, differently, in two functions that would otherwise be free to
-    # quietly disagree.
-    scanned = bool(conn.execute(
-        "SELECT 1 FROM check_run cr JOIN run r ON r.id = cr.run_id"
-        " WHERE r.engagement_id=? LIMIT 1", (engagement_id,)).fetchone())
-
-    # F8 (fix round B), and computed here for the same reason `scanned` is:
-    # several sections make a statement about it and none may be free to
-    # disagree with the others. `_provenance` NAMES the runs that did not
-    # finish; `_coverage` marks its own numbers partial because of them; and
-    # -- N2 of fix round C -- `_findings` qualifies "None recorded" with them,
-    # exactly as it already qualifies it with `scanned`.
-    unfinished = _unfinished_runs(conn, engagement_id)
+    # ONE SOURCE OF TRUTH FOR THE COVERAGE FIGURES, shared by `_findings`
+    # (F4 of fix round 1: an unscanned engagement's "None recorded" must not
+    # read as a clean bill), `_coverage` (the original "not been scanned"
+    # paragraph) and -- since 2026-09-01 -- the web app's overview screen.
+    # Computed once here rather than several times, differently, in
+    # functions that would otherwise be free to quietly disagree.
+    cov = coverage_mod.facts(conn, engagement_id)
 
     out.extend(_provenance(conn, engagement_id, config, created_us=eng[3],
-                           unfinished=unfinished))
-    out.extend(_findings(conn, engagement_id, scanned=scanned,
-                         unfinished=unfinished))
-    out.extend(_coverage(conn, engagement_id, config, scanned=scanned,
-                         unfinished=unfinished))
+                           unfinished=cov.unfinished))
+    out.extend(_findings(conn, engagement_id, scanned=cov.scanned,
+                         unfinished=cov.unfinished))
+    out.extend(_coverage(config, cov=cov))
     if blobs is not None:
         out.extend(_insertion_coverage(conn, engagement_id, blobs))
     out.extend(_limits(conn, engagement_id))
     return "\n".join(out) + "\n"
-
-
-def _unfinished_runs(conn, engagement_id) -> list[tuple]:
-    """Every run behind this report that did not end `completed`.
-
-    F8 (fix round B). Nothing in this module read `run.status` or
-    `run.stop_reason`, and S5 says what that costs, of `run` itself:
-
-        an aborted run must never render as a clean one, and neither must
-        one that merely STOPPED BEING UPDATED: a run left `running` with a
-        stale heartbeat_us is a run whose harness died, and it resolves to
-        `error`, not `completed`.
-
-    A scan stopped by Ctrl-C, by a `sqlite3.Error` through `cli.scan`'s
-    `except`-less `try`/`finally`, or by a stale-heartbeat reap rendered its
-    partial coverage byte-identically to a complete pass. The abort path is
-    reachable today, and this is S12's governing rule again: a report that
-    cannot distinguish "tested, clean" from "never reached" is worse than no
-    report, and half a run is exactly the second thing wearing the first
-    thing's clothes.
-
-    `status <> 'completed'` rather than a list of the bad values, so all four
-    of `running | aborted | killed | error` are caught and a value added to
-    the CHECK constraint later cannot slip through as finished. `running` is
-    included deliberately: S5's own sentence says a run left running is a
-    dead harness, and a run genuinely still in flight while the report
-    renders has produced partial coverage too.
-    """
-    return conn.execute(
-        "SELECT id, kind, status, stop_reason, started_us FROM run"
-        " WHERE engagement_id=? AND status <> 'completed'"
-        " ORDER BY started_us, id", (engagement_id,)).fetchall()
 
 
 def _provenance(conn, engagement_id, config, *, created_us,
@@ -899,6 +843,29 @@ def _latest_observed(conn, finding_id) -> bool | None:
     return bool(row[0])
 
 
+def _status(conn, finding_id, status) -> str:
+    """The status half of a finding's subtitle, with the human's reason.
+
+    S12 has a sibling nobody wrote down until 2026-09-01: a report that
+    cannot distinguish "we checked and it is not real" from "we did not want
+    to write it up". A bare `status: false_positive` is exactly that
+    ambiguity, and it is why `triage.NOTE_REQUIRED` makes the note
+    compulsory on that transition -- the field and its destination are one
+    feature, and shipping the first without the second is friction that goes
+    nowhere.
+
+    `_flat` and `_redact` for the reason D4 gives: the note is free text a
+    human typed, and every rendered free-text value is flattened, not only
+    the ones that reach a table.
+    """
+    if status == "new":
+        return ""
+    note = triage_mod.latest_note(conn, finding_id)
+    if not note:
+        return f" · *status: {status}*"
+    return f' · *status: {status} — "{_flat(_redact(note))}"*'
+
+
 def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
     # `ORDER BY title, id`: F13 of fix round 1. Without an ORDER BY, two
     # renders of the same store can list one severity's findings in a
@@ -1016,7 +983,7 @@ def _findings(conn, engagement_id, *, scanned, unfinished) -> list[str]:
             # paragraph. A real `CWE-1004` is unchanged by it.
             out.append(f"*Confidence: {confidence}*"
                        + (f" · *{_flat(cwe)}*" if cwe else "")
-                       + (f" · *status: {status}*" if status != "new" else "")
+                       + _status(conn, fid, status)
                        + marker
                        + "\n")
             # D4. These three reached `out` with `_redact` and no `_flat`,
@@ -1145,7 +1112,7 @@ def _evidence(conn, finding_id) -> list[str]:
     return out
 
 
-def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
+def _coverage(config, *, cov) -> list[str]:
     """Which checks answered for which surfaces, and -- F2 of fix round B --
     which surfaces nothing answered for.
 
@@ -1178,19 +1145,17 @@ def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
     `_REASON_LIMIT` with the remainder counted -- the same cap-and-say-so
     rule `_evidence` and `_http._detail` already use.
     """
-    captured = conn.execute(
-        "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
-        (engagement_id,)).fetchone()[0]
-    untested = _untested_surfaces(conn, engagement_id)
+    captured = cov.captured
+    untested = cov.untested
 
     out = ["## Coverage\n"]
-    if unfinished:
+    if cov.unfinished:
         # F8: coverage drawn from a run that did not finish is coverage of
         # what that run reached before it stopped. Said HERE as well as in
         # Provenance because this is the section whose numbers are affected,
         # and a reader who scrolled straight to it must not take them for a
         # complete pass.
-        out.append(f"**These numbers are partial.** {len(unfinished)} of the "
+        out.append(f"**These numbers are partial.** {len(cov.unfinished)} of the "
                    "runs behind this section did not finish (each is named "
                    "under Provenance above), so a check that never opened "
                    "for a surface may simply be a check the run never got "
@@ -1203,7 +1168,7 @@ def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
         out.append("**No surface was captured for this engagement**, so "
                    "there is nothing here for a check to have covered.\n")
 
-    if not scanned:
+    if not cov.scanned:
         out.append("This engagement has **not been scanned**. No check has run "
                    "against any surface, so nothing below should be read as "
                    "tested.\n")
@@ -1215,13 +1180,8 @@ def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
         # counts a retested surface once per run it was retested in --
         # three surfaces scanned twice rendered "6". The error is always
         # upward, the one direction a coverage figure must not lie in.
-        rows = conn.execute(
-            "SELECT cr.check_id, cr.verdict, COUNT(DISTINCT cr.surface_id)"
-            " FROM check_run cr"
-            " JOIN run r ON r.id = cr.run_id WHERE r.engagement_id=?"
-            " GROUP BY cr.check_id, cr.verdict"
-            " ORDER BY cr.check_id, cr.verdict", (engagement_id,)).fetchall()
-        reasons = _reasons_by_row(conn, engagement_id)
+        rows = cov.by_check
+        reasons = cov.reasons
 
         out.append("Which checks ran, against how many distinct surfaces "
                    "each, and what they answered — one row per check and "
@@ -1242,9 +1202,7 @@ def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
     # the durable artifact must say the same thing, not less. Outside the
     # `scanned` branch on purpose: it is a fact about the build and this
     # engagement's config, true whether or not a scan has ever run.
-    unshipped = sorted(
-        klass for klass, on in config.checks.items()
-        if on and not any(c.klass == klass for c in registry.CHECKS))
+    unshipped = coverage_mod.unshipped_classes(config)
     for klass in unshipped:
         out.append(f"- note: `{klass}` is enabled in this engagement's "
                    "config, but this build ships no checks in that class — "
@@ -1260,33 +1218,6 @@ def _coverage(conn, engagement_id, config, *, scanned, unfinished) -> list[str]:
     # surfaces.
     out.extend(_untested(untested))
     return out
-
-
-def _untested_surfaces(conn, engagement_id) -> list[tuple]:
-    """Every captured surface no check ever returned a verdict for.
-
-    NOT "no `check_run` row": see `_ANSWERED`. A surface whose only rows are
-    `pending` (the runner opened them and the process died) or `skipped`
-    (the budget cut the scan off before them) was never actually tested, and
-    counting either as coverage is S12's failure in the direction that
-    matters -- reading a row that exists to record a gap as though it
-    recorded an answer.
-
-    `method` + `path_template` is the surface's readable identity, the same
-    pair `_insertion_coverage` selects and the same one `surface`'s own
-    UNIQUE constraint builds identity from. Ordered by template then method
-    so two renders of one store cannot differ, for the reason `_findings`
-    has an `ORDER BY`.
-    """
-    marks = ",".join("?" for _ in _ANSWERED)
-    return conn.execute(
-        "SELECT s.method, s.path_template FROM surface s"
-        " WHERE s.engagement_id=? AND NOT EXISTS ("
-        "   SELECT 1 FROM check_run cr JOIN run r ON r.id = cr.run_id"
-        "   WHERE cr.surface_id = s.id AND r.engagement_id = s.engagement_id"
-        f"    AND cr.verdict IN ({marks}))"
-        " ORDER BY s.path_template, s.method, s.id",
-        (engagement_id, *_ANSWERED)).fetchall()
 
 
 def _untested(untested) -> list[str]:
@@ -1315,27 +1246,6 @@ def _untested(untested) -> list[str]:
                    f"{len(untested)}). Every one is still recorded in the "
                    "store.")
     out.append("")
-    return out
-
-
-def _reasons_by_row(conn, engagement_id) -> dict:
-    """The distinct `check_run.reason` values under each (check, verdict),
-    commonest first.
-
-    Ordered by how many surfaces recorded each reason, then by the reason
-    text -- so the one a reader most needs is the one that survives
-    `_REASON_LIMIT`, and the tiebreak is stable across renders.
-    """
-    out: dict = {}
-    for check_id, verdict, reason, _surfaces in conn.execute(
-            "SELECT cr.check_id, cr.verdict, cr.reason,"
-            " COUNT(DISTINCT cr.surface_id) AS n FROM check_run cr"
-            " JOIN run r ON r.id = cr.run_id WHERE r.engagement_id=?"
-            " AND cr.reason IS NOT NULL AND cr.reason <> ''"
-            " GROUP BY cr.check_id, cr.verdict, cr.reason"
-            " ORDER BY cr.check_id, cr.verdict, n DESC, cr.reason",
-            (engagement_id,)).fetchall():
-        out.setdefault((check_id, verdict), []).append(reason)
     return out
 
 
@@ -1453,12 +1363,13 @@ def _origin_refused_scans(conn, engagement_id) -> int:
     `run()` writes it to `stop_reason` on the success path whenever that dict
     is non-empty, status `completed` and all: a run is not truncated by a
     refused probe (the surface it belongs to just reads `inconclusive`), so
-    this is not read off `_unfinished_runs` (`status <> 'completed'`).
-    `_halt_reason` folds the same tally in too, but only for `IdentityDead`
-    (`scan.py:883-888`'s own comment says why the other exceptions do not
-    carry it), and that path closes `status='error'` -- outside
-    `_unfinished_runs`' exclusion, so a halt with refused probes behind it is
-    counted here as well, alongside every other completed scan. This query
+    this is not read off `coverage.facts`' `unfinished`
+    (`status <> 'completed'`). `_halt_reason` folds the same tally in too,
+    but only for `IdentityDead` (`scan.py:883-888`'s own comment says why
+    the other exceptions do not carry it), and that path closes
+    `status='error'` -- outside `coverage.facts`' `unfinished`'s exclusion,
+    so a halt with refused probes behind it is counted here as well,
+    alongside every other completed scan. This query
     does not filter on `status` at all, matching `_identity_counts` above it:
     both count every `kind='scan'` row, whatever it closed as.
 
