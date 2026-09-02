@@ -99,6 +99,7 @@ def overview(conn: sqlite3.Connection, engagement_id: str, config) -> dict:
             "SELECT status, COUNT(*) FROM finding WHERE engagement_id=?"
             " GROUP BY status", (engagement_id,)).fetchall()}
     runs = _run_rows(conn, engagement_id)
+    coverage = coverage_mod.facts(conn, engagement_id)
     return {
         "engagement": eng,
         "scopes": scopes,
@@ -112,15 +113,34 @@ def overview(conn: sqlite3.Connection, engagement_id: str, config) -> dict:
         # somewhere else is how the honest version loses to the reassuring
         # one.
         "dropped_total": sum(r["dropped_total"] or 0 for r in runs),
-        "coverage": coverage_mod.facts(conn, engagement_id),
+        "coverage": coverage,
         "unshipped": coverage_mod.unshipped_classes(config),
-        "surfaces": conn.execute(
-            "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
-            (engagement_id,)).fetchone()[0],
+        # NOT a second `SELECT COUNT(*) FROM surface` -- `coverage.captured`
+        # is exactly that query, already run above. `overview.html` renders
+        # both figures on the same page, and a second query here was
+        # cross-task drift (Task 1 wrote `facts`, Task 3 wrote this
+        # function, and neither reviewer could see the other) rather than a
+        # second fact.
+        "surfaces": coverage.captured,
         "exchanges": conn.execute(
             "SELECT COUNT(*) FROM exchange x JOIN run r ON r.id = x.run_id"
             " WHERE r.engagement_id=?", (engagement_id,)).fetchone()[0],
     }
+
+
+def dropped_total(conn: sqlite3.Connection, engagement_id: str) -> int:
+    """Every exchange this engagement's runs report having dropped, summed.
+
+    S5's floor caveat is not only the overview's: the surfaces screen's
+    per-surface exchange counts and its surface list are the same floor
+    when any run dropped traffic, and `overview`'s own copy sums this same
+    column inline with the runs table it renders beside -- this is the
+    figure on its own, for the one other screen that needs it without
+    wanting the runs too.
+    """
+    return conn.execute(
+        "SELECT COALESCE(SUM(dropped_total), 0) FROM run WHERE"
+        " engagement_id=?", (engagement_id,)).fetchone()[0]
 
 
 def surfaces(conn: sqlite3.Connection, engagement_id: str) -> tuple:

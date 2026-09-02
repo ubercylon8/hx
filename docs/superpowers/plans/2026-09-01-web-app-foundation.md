@@ -2082,6 +2082,84 @@ def test_malformed_yaml_that_passes_the_cheap_check_is_still_a_404_with_csp(
     assert "default-src 'none'" in response.headers["content-security-policy"]
 
 
+_ORIGIN = {"Origin": "http://127.0.0.1:8901"}
+
+
+def test_a_db_error_in_triage_post_is_still_a_secured_500(client, monkeypatch):
+    """`_secured`'s docstring claims "every response this app emits,
+    refusals included" -- false while `ServerErrorMiddleware`, which sits
+    OUTSIDE `_guard`, was the thing turning an escaped exception into a
+    500. A `sqlite3.Error` from `db_mod.connect` inside `triage_post`'s
+    `write()` closure is one of three reachable paths that used to leave
+    with no CSP at all.
+
+    MUTATION: remove the `try`/`except Exception` wrapper around
+    `await call_next(request)` in `_guard`, going back to
+    `return _secured(await call_next(request))`. This test must go red --
+    a 500 with no `content-security-policy` header.
+    """
+    import sqlite3
+
+    from hx.store import db as db_mod
+
+    real_connect = db_mod.connect
+
+    def _boom(path, *, readonly=False):
+        if not readonly:
+            raise sqlite3.Error("simulated database failure")
+        return real_connect(path, readonly=readonly)
+
+    monkeypatch.setattr(db_mod, "connect", _boom)
+
+    response = client.post("/e/alpha/findings/f1/status",
+                           data={"status": "confirmed"}, headers=_ORIGIN,
+                           follow_redirects=False)
+
+    assert response.status_code == 500
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
+def test_an_os_error_in_halt_post_is_still_a_secured_500(client, monkeypatch):
+    """The second of the three reachable paths: an `OSError` from
+    `OperatorHalt.halt` inside `halt_post`.
+
+    MUTATION: remove the `try`/`except Exception` wrapper around
+    `await call_next(request)` in `_guard`. This test must go red.
+    """
+    from hx import halt as halt_mod
+
+    def _boom(self, reason):
+        raise OSError("simulated disk failure writing the sentinel")
+
+    monkeypatch.setattr(halt_mod.OperatorHalt, "halt", _boom)
+
+    response = client.post("/e/alpha/halt", data={"reason": "x"},
+                           headers=_ORIGIN, follow_redirects=False)
+
+    assert response.status_code == 500
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
+def test_an_os_error_opening_the_blob_store_is_still_a_secured_500(
+        client, monkeypatch):
+    """The third reachable path, and the plausible one: `BlobStore.__init__`
+    calls `secure_mkdir`, so reviewing an archived engagement on a read-only
+    mount is enough to hit this without anyone doing anything wrong.
+
+    MUTATION: remove the `try`/`except Exception` wrapper around
+    `await call_next(request)` in `_guard`. This test must go red.
+    """
+    def _boom(self, root):
+        raise OSError("simulated read-only mount")
+
+    monkeypatch.setattr(app_mod.BlobStore, "__init__", _boom)
+
+    response = client.get("/e/alpha/exchanges/x-nope")
+
+    assert response.status_code == 500
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
 def test_the_hostname_helper_splits_ports_and_brackets():
     """A unit test beside the integration ones, because the parsing is where
     a Host check goes wrong quietly."""
@@ -2279,6 +2357,7 @@ def overview(conn: sqlite3.Connection, engagement_id: str, config) -> dict:
             "SELECT status, COUNT(*) FROM finding WHERE engagement_id=?"
             " GROUP BY status", (engagement_id,)).fetchall()}
     runs = _run_rows(conn, engagement_id)
+    coverage = coverage_mod.facts(conn, engagement_id)
     return {
         "engagement": eng,
         "scopes": scopes,
@@ -2292,11 +2371,15 @@ def overview(conn: sqlite3.Connection, engagement_id: str, config) -> dict:
         # somewhere else is how the honest version loses to the reassuring
         # one.
         "dropped_total": sum(r["dropped_total"] or 0 for r in runs),
-        "coverage": coverage_mod.facts(conn, engagement_id),
+        "coverage": coverage,
         "unshipped": coverage_mod.unshipped_classes(config),
-        "surfaces": conn.execute(
-            "SELECT COUNT(*) FROM surface WHERE engagement_id=?",
-            (engagement_id,)).fetchone()[0],
+        # NOT a second `SELECT COUNT(*) FROM surface` -- `coverage.captured`
+        # is exactly that query, already run above. `overview.html` renders
+        # both figures on the same page, and a second query here was
+        # cross-task drift (Task 1 wrote `facts`, Task 3 wrote this
+        # function, and neither reviewer could see the other) rather than a
+        # second fact.
+        "surfaces": coverage.captured,
         "exchanges": conn.execute(
             "SELECT COUNT(*) FROM exchange x JOIN run r ON r.id = x.run_id"
             " WHERE r.engagement_id=?", (engagement_id,)).fetchone()[0],
@@ -2325,6 +2408,7 @@ runs `def` endpoints in a threadpool and `sqlite3` connections default to
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from urllib.parse import parse_qsl
 
@@ -2345,6 +2429,8 @@ from hx.store.blobs import BlobStore
 from hx.web import reads as reads_mod
 from hx.web import registry as registry_mod
 from hx.web import render as render_mod
+
+_log = logging.getLogger(__name__)
 
 #: S11: "v1 binds 127.0.0.1 only". `hx web` has no --host option, so this
 #: set is the whole of what an operator can reach the app at -- and, more to
@@ -2414,6 +2500,21 @@ async def _guard(request, call_next):
 
     421 rather than 403: Misdirected Request is exactly the case, a request
     for an authority this server does not answer for.
+
+    `call_next` is wrapped in its own try/except, deliberately not left to
+    Starlette's `ServerErrorMiddleware`: that middleware sits OUTSIDE this
+    one, so an exception it catches produces a 500 that never passed through
+    `_secured` -- no CSP, no `nosniff`, no `Referrer-Policy`, next to a body
+    that is exactly as attacker-reachable as any other response this app
+    sends. MEASURED on 2026-09-01 against three reachable paths: a
+    `sqlite3.Error` from `db_mod.connect` in `triage_post`, an `OSError` from
+    `OperatorHalt.halt` in `halt_post`, and an `OSError` from
+    `BlobStore.__init__`'s `secure_mkdir` in the `exchange` handler -- a
+    read-only mount is enough for the last one, and reviewing an archived
+    engagement is the plausible case. The body names nothing about the
+    engagement, the path or the exception, so turning this INTO a secured
+    response does not make it an information leak; the exception itself is
+    logged so it is not silently swallowed.
     """
     if hostname(request.headers.get("host", "")) not in ALLOWED_HOSTS:
         return _secured(PlainTextResponse("this host is not served here",
@@ -2425,7 +2526,15 @@ async def _guard(request, call_next):
         # back.
         return _secured(PlainTextResponse("cross-site write refused",
                                           status_code=403))
-    return _secured(await call_next(request))
+    try:
+        response = await call_next(request)
+    except Exception:  # noqa: BLE001 -- deliberately not BaseException, see
+        # above: KeyboardInterrupt and SystemExit must still propagate.
+        _log.exception("unhandled exception serving %s %s",
+                       request.method, request.url.path)
+        return _secured(PlainTextResponse(
+            "something went wrong handling this request", status_code=500))
+    return _secured(response)
 
 
 def _entry(request):
@@ -2843,33 +2952,66 @@ def test_the_overview_reads_the_engagement_the_url_names(client, alpha_db):
 
 def test_the_coverage_figures_match_what_the_report_computes(
         client, alpha_db):
-    """THE TEST THE EXTRACTION EXISTS FOR. One store, two renderers, the
-    same numbers. A second coverage query would drift, and the drift would
-    show a reassuring figure on exactly the engagements the report warns
-    about."""
-    from hx import coverage as coverage_mod
+    """THE TEST THE EXTRACTION EXISTS FOR. One store, two renderers -- the
+    overview screen and `report.render`, the actual deliverable -- the same
+    numbers. A second coverage query in either one would drift, and the
+    drift would show a reassuring figure on exactly the engagements the
+    other surface warns about.
+
+    The fixture has three surfaces, not one, so a wrong implementation has
+    somewhere to diverge: one answered (`clean`), one with only a `skipped`
+    check_run (a GAP, not an answer -- S12's distinction, and the reason
+    `verdict IN (...)` exists), and one with no check_run at all. Both
+    renderers must report the same captured/answered/untested split and
+    name the same two untested surfaces.
+
+    MUTATION: replace `coverage_mod.facts(conn, engagement_id)` inside
+    `reads.overview` with `overview`'s own inline queries computing the same
+    thing (the extraction this test exists for, undone). This test must go
+    red -- the screen and the report would still individually be self
+    -consistent, but the numbers only need to be tested once for that; this
+    test's job is to fail unless the SCREEN's numbers were computed the way
+    the REPORT's were.
+    """
+    from hx import config as config_mod
+    from hx import report as report_mod
+    from hx.web import registry as registry_mod
 
     eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
-    alpha_db.execute(
-        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
-        " path_template, discovered_by, normaliser_version)"
-        " VALUES('s1',?,'GET','https','alpha.test',443,'/a','proxy',2)", (eid,))
+    for sid, method, template in (("s1", "GET", "/a"), ("s2", "POST", "/b"),
+                                  ("s3", "GET", "/c")):
+        alpha_db.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+            " port, path_template, discovered_by, normaliser_version)"
+            " VALUES(?,?,?,'https','alpha.test',443,?,'proxy',2)",
+            (sid, eid, method, template))
     alpha_db.execute(
         "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
         " status, requests_issued, dropped_total)"
-        " VALUES('r1',?,'scan','staging',1,'completed',1,0)", (eid,))
+        " VALUES('r1',?,'scan','staging',1,'completed',2,0)", (eid,))
     alpha_db.execute(
         "INSERT INTO check_run(id, run_id, surface_id, check_id,"
         " check_version, verdict) VALUES('c1','r1','s1','missing-hsts','1',"
         "'clean')")
+    alpha_db.execute(
+        "INSERT INTO check_run(id, run_id, surface_id, check_id,"
+        " check_version, verdict) VALUES('c2','r1','s2','sql-error','1',"
+        "'skipped')")
 
-    cov = coverage_mod.facts(alpha_db, eid)
+    entry = registry_mod.lookup(client.app.state.base, "alpha")
+    config = config_mod.load(entry.path / "config.yaml")
+    report_out = report_mod.render(alpha_db, engagement_id=eid, config=config)
     body = client.get("/e/alpha").text
 
-    assert cov.captured == 1
-    assert f"{cov.captured} surface(s) captured" in body
-    assert "missing-hsts" in body
-    assert "Never tested" not in body
+    for surface in (report_out, body):
+        assert "3 surface(s)" in surface
+        assert "missing-hsts" in surface
+        assert "sql-error" in surface
+        assert "POST /b" in surface
+        assert "GET /c" in surface
+    assert "<strong>1</strong> had at" in body
+    assert "<strong>2</strong> had none" in body
+    assert "Never tested" in body
 ```
 
 - [ ] **Step 15: Run everything and check the gate**
@@ -2964,6 +3106,50 @@ def test_the_surface_screen_names_each_surface_and_how_it_was_found(
 
     assert "/order/{id}" in body
     assert "proxy" in body
+
+
+def test_the_surfaces_screen_warns_when_a_run_has_dropped_exchanges(
+        client, alpha_db):
+    """S5's floor caveat is not only the overview's: `/e/{name}/surfaces`
+    renders per-surface exchange counts and the surface list itself, both
+    of which are a floor when any run dropped traffic. The master spec's
+    Sec 12 rule is that a count presented without its caveat is worse than
+    no report at all.
+
+    MUTATION: delete the `{% if dropped_total %}` block from
+    surfaces.html. This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, requests_issued, dropped_total)"
+        " VALUES('r1',?,'scan','staging',1,'completed',10,4)", (eid,))
+
+    body = client.get("/e/alpha/surfaces").text
+
+    assert "floor" in body.lower()
+    assert "4 exchange(s) were dropped" in body
+
+
+def test_the_surfaces_screen_says_nothing_about_drops_when_there_are_none(
+        client, alpha_db):
+    """The control. Without it, the test above cannot tell "the warning
+    tracks drops" apart from "the warning is always on" -- a caveat that
+    always fires stops being read.
+
+    MUTATION: hardcode `dropped_total=1` in the surfaces route handler
+    (`hx/web/app.py`). This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, requests_issued, dropped_total)"
+        " VALUES('r1',?,'scan','staging',1,'completed',10,0)", (eid,))
+
+    body = client.get("/e/alpha/surfaces").text
+
+    assert "floor" not in body.lower()
+    assert "were dropped" not in body
 
 
 def test_a_surface_whose_only_check_row_is_skipped_shows_no_answers(
@@ -3204,10 +3390,12 @@ def surfaces(request):
     conn = registry_mod.open_read(entry)
     try:
         rows = reads_mod.surfaces(conn, entry.engagement_id)
+        dropped_total = reads_mod.dropped_total(conn, entry.engagement_id)
     finally:
         conn.close()
     return request.app.state.templates.TemplateResponse(
-        request, "surfaces.html", {"entry": entry, "surfaces": rows})
+        request, "surfaces.html", {"entry": entry, "surfaces": rows,
+                                   "dropped_total": dropped_total})
 
 
 def findings(request):
@@ -4301,6 +4489,7 @@ Add the imports:
 # src/hx/web/app.py -- the import block, updated for the write guard
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from urllib.parse import parse_qsl
 
@@ -4448,13 +4637,9 @@ and the branch inside `_guard`, immediately after the Host check:
 async def triage_post(request):
     entry = _entry(request)
     form = await _form_fields(request)
-    if form is _TOO_LARGE:
-        return PlainTextResponse(
-            f"request body exceeds {MAX_FORM} bytes", status_code=413)
-    if form is None:
-        return PlainTextResponse(
-            "this route accepts application/x-www-form-urlencoded only",
-            status_code=415)
+    refusal = _form_refusal(form)
+    if refusal is not None:
+        return refusal
     finding_id = request.path_params["fid"]
     to_status = form.get("status", "")
     note = form.get("note")
@@ -4479,13 +4664,9 @@ async def triage_post(request):
 async def halt_post(request):
     entry = _entry(request)
     form = await _form_fields(request)
-    if form is _TOO_LARGE:
-        return PlainTextResponse(
-            f"request body exceeds {MAX_FORM} bytes", status_code=413)
-    if form is None:
-        return PlainTextResponse(
-            "this route accepts application/x-www-form-urlencoded only",
-            status_code=415)
+    refusal = _form_refusal(form)
+    if refusal is not None:
+        return refusal
     reason = form.get("reason", "").strip() or "stopped from the web app"
 
     def write():

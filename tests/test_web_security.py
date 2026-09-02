@@ -294,6 +294,84 @@ def test_malformed_yaml_that_passes_the_cheap_check_is_still_a_404_with_csp(
     assert "default-src 'none'" in response.headers["content-security-policy"]
 
 
+_ORIGIN = {"Origin": "http://127.0.0.1:8901"}
+
+
+def test_a_db_error_in_triage_post_is_still_a_secured_500(client, monkeypatch):
+    """`_secured`'s docstring claims "every response this app emits,
+    refusals included" -- false while `ServerErrorMiddleware`, which sits
+    OUTSIDE `_guard`, was the thing turning an escaped exception into a
+    500. A `sqlite3.Error` from `db_mod.connect` inside `triage_post`'s
+    `write()` closure is one of three reachable paths that used to leave
+    with no CSP at all.
+
+    MUTATION: remove the `try`/`except Exception` wrapper around
+    `await call_next(request)` in `_guard`, going back to
+    `return _secured(await call_next(request))`. This test must go red --
+    a 500 with no `content-security-policy` header.
+    """
+    import sqlite3
+
+    from hx.store import db as db_mod
+
+    real_connect = db_mod.connect
+
+    def _boom(path, *, readonly=False):
+        if not readonly:
+            raise sqlite3.Error("simulated database failure")
+        return real_connect(path, readonly=readonly)
+
+    monkeypatch.setattr(db_mod, "connect", _boom)
+
+    response = client.post("/e/alpha/findings/f1/status",
+                           data={"status": "confirmed"}, headers=_ORIGIN,
+                           follow_redirects=False)
+
+    assert response.status_code == 500
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
+def test_an_os_error_in_halt_post_is_still_a_secured_500(client, monkeypatch):
+    """The second of the three reachable paths: an `OSError` from
+    `OperatorHalt.halt` inside `halt_post`.
+
+    MUTATION: remove the `try`/`except Exception` wrapper around
+    `await call_next(request)` in `_guard`. This test must go red.
+    """
+    from hx import halt as halt_mod
+
+    def _boom(self, reason):
+        raise OSError("simulated disk failure writing the sentinel")
+
+    monkeypatch.setattr(halt_mod.OperatorHalt, "halt", _boom)
+
+    response = client.post("/e/alpha/halt", data={"reason": "x"},
+                           headers=_ORIGIN, follow_redirects=False)
+
+    assert response.status_code == 500
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
+def test_an_os_error_opening_the_blob_store_is_still_a_secured_500(
+        client, monkeypatch):
+    """The third reachable path, and the plausible one: `BlobStore.__init__`
+    calls `secure_mkdir`, so reviewing an archived engagement on a read-only
+    mount is enough to hit this without anyone doing anything wrong.
+
+    MUTATION: remove the `try`/`except Exception` wrapper around
+    `await call_next(request)` in `_guard`. This test must go red.
+    """
+    def _boom(self, root):
+        raise OSError("simulated read-only mount")
+
+    monkeypatch.setattr(app_mod.BlobStore, "__init__", _boom)
+
+    response = client.get("/e/alpha/exchanges/x-nope")
+
+    assert response.status_code == 500
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
 def test_the_hostname_helper_splits_ports_and_brackets():
     """A unit test beside the integration ones, because the parsing is where
     a Host check goes wrong quietly."""

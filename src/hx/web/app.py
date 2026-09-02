@@ -14,6 +14,7 @@ runs `def` endpoints in a threadpool and `sqlite3` connections default to
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from urllib.parse import parse_qsl
 
@@ -34,6 +35,8 @@ from hx.store.blobs import BlobStore
 from hx.web import reads as reads_mod
 from hx.web import registry as registry_mod
 from hx.web import render as render_mod
+
+_log = logging.getLogger(__name__)
 
 #: S11: "v1 binds 127.0.0.1 only". `hx web` has no --host option, so this
 #: set is the whole of what an operator can reach the app at -- and, more to
@@ -132,6 +135,26 @@ async def _form_fields(request):
                           keep_blank_values=True))
 
 
+def _form_refusal(form):
+    """The 415/413 refusal for `_form_fields`'s result, or None if the form
+    was fine.
+
+    ONE PLACE, for the reason `_secured` gives for itself: both write routes
+    built this same seven-line block by hand, and a third write route would
+    otherwise have copied it a third time. `None` here means "not a
+    refusal", not "no form" -- an empty-but-well-formed form is `{}`, which
+    this correctly waves through for the caller to refuse on its own terms.
+    """
+    if form is _TOO_LARGE:
+        return PlainTextResponse(
+            f"request body exceeds {MAX_FORM} bytes", status_code=413)
+    if form is None:
+        return PlainTextResponse(
+            "this route accepts application/x-www-form-urlencoded only",
+            status_code=415)
+    return None
+
+
 def _same_origin(request) -> bool:
     """Whether a state-changing request came from this app's own pages.
 
@@ -184,6 +207,21 @@ async def _guard(request, call_next):
 
     421 rather than 403: Misdirected Request is exactly the case, a request
     for an authority this server does not answer for.
+
+    `call_next` is wrapped in its own try/except, deliberately not left to
+    Starlette's `ServerErrorMiddleware`: that middleware sits OUTSIDE this
+    one, so an exception it catches produces a 500 that never passed through
+    `_secured` -- no CSP, no `nosniff`, no `Referrer-Policy`, next to a body
+    that is exactly as attacker-reachable as any other response this app
+    sends. MEASURED on 2026-09-01 against three reachable paths: a
+    `sqlite3.Error` from `db_mod.connect` in `triage_post`, an `OSError` from
+    `OperatorHalt.halt` in `halt_post`, and an `OSError` from
+    `BlobStore.__init__`'s `secure_mkdir` in the `exchange` handler -- a
+    read-only mount is enough for the last one, and reviewing an archived
+    engagement is the plausible case. The body names nothing about the
+    engagement, the path or the exception, so turning this INTO a secured
+    response does not make it an information leak; the exception itself is
+    logged so it is not silently swallowed.
     """
     if hostname(request.headers.get("host", "")) not in ALLOWED_HOSTS:
         return _secured(PlainTextResponse("this host is not served here",
@@ -195,7 +233,15 @@ async def _guard(request, call_next):
         # back.
         return _secured(PlainTextResponse("cross-site write refused",
                                           status_code=403))
-    return _secured(await call_next(request))
+    try:
+        response = await call_next(request)
+    except Exception:  # noqa: BLE001 -- deliberately not BaseException, see
+        # above: KeyboardInterrupt and SystemExit must still propagate.
+        _log.exception("unhandled exception serving %s %s",
+                       request.method, request.url.path)
+        return _secured(PlainTextResponse(
+            "something went wrong handling this request", status_code=500))
+    return _secured(response)
 
 
 def _entry(request):
@@ -258,10 +304,12 @@ def surfaces(request):
     conn = registry_mod.open_read(entry)
     try:
         rows = reads_mod.surfaces(conn, entry.engagement_id)
+        dropped_total = reads_mod.dropped_total(conn, entry.engagement_id)
     finally:
         conn.close()
     return request.app.state.templates.TemplateResponse(
-        request, "surfaces.html", {"entry": entry, "surfaces": rows})
+        request, "surfaces.html", {"entry": entry, "surfaces": rows,
+                                   "dropped_total": dropped_total})
 
 
 def findings(request):
@@ -325,13 +373,9 @@ def exchange(request):
 async def triage_post(request):
     entry = _entry(request)
     form = await _form_fields(request)
-    if form is _TOO_LARGE:
-        return PlainTextResponse(
-            f"request body exceeds {MAX_FORM} bytes", status_code=413)
-    if form is None:
-        return PlainTextResponse(
-            "this route accepts application/x-www-form-urlencoded only",
-            status_code=415)
+    refusal = _form_refusal(form)
+    if refusal is not None:
+        return refusal
     finding_id = request.path_params["fid"]
     to_status = form.get("status", "")
     note = form.get("note")
@@ -356,13 +400,9 @@ async def triage_post(request):
 async def halt_post(request):
     entry = _entry(request)
     form = await _form_fields(request)
-    if form is _TOO_LARGE:
-        return PlainTextResponse(
-            f"request body exceeds {MAX_FORM} bytes", status_code=413)
-    if form is None:
-        return PlainTextResponse(
-            "this route accepts application/x-www-form-urlencoded only",
-            status_code=415)
+    refusal = _form_refusal(form)
+    if refusal is not None:
+        return refusal
     reason = form.get("reason", "").strip() or "stopped from the web app"
 
     def write():

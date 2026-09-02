@@ -85,33 +85,66 @@ def test_the_overview_reads_the_engagement_the_url_names(client, alpha_db):
 
 def test_the_coverage_figures_match_what_the_report_computes(
         client, alpha_db):
-    """THE TEST THE EXTRACTION EXISTS FOR. One store, two renderers, the
-    same numbers. A second coverage query would drift, and the drift would
-    show a reassuring figure on exactly the engagements the report warns
-    about."""
-    from hx import coverage as coverage_mod
+    """THE TEST THE EXTRACTION EXISTS FOR. One store, two renderers -- the
+    overview screen and `report.render`, the actual deliverable -- the same
+    numbers. A second coverage query in either one would drift, and the
+    drift would show a reassuring figure on exactly the engagements the
+    other surface warns about.
+
+    The fixture has three surfaces, not one, so a wrong implementation has
+    somewhere to diverge: one answered (`clean`), one with only a `skipped`
+    check_run (a GAP, not an answer -- S12's distinction, and the reason
+    `verdict IN (...)` exists), and one with no check_run at all. Both
+    renderers must report the same captured/answered/untested split and
+    name the same two untested surfaces.
+
+    MUTATION: replace `coverage_mod.facts(conn, engagement_id)` inside
+    `reads.overview` with `overview`'s own inline queries computing the same
+    thing (the extraction this test exists for, undone). This test must go
+    red -- the screen and the report would still individually be self
+    -consistent, but the numbers only need to be tested once for that; this
+    test's job is to fail unless the SCREEN's numbers were computed the way
+    the REPORT's were.
+    """
+    from hx import config as config_mod
+    from hx import report as report_mod
+    from hx.web import registry as registry_mod
 
     eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
-    alpha_db.execute(
-        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
-        " path_template, discovered_by, normaliser_version)"
-        " VALUES('s1',?,'GET','https','alpha.test',443,'/a','proxy',2)", (eid,))
+    for sid, method, template in (("s1", "GET", "/a"), ("s2", "POST", "/b"),
+                                  ("s3", "GET", "/c")):
+        alpha_db.execute(
+            "INSERT INTO surface(id, engagement_id, method, scheme, host,"
+            " port, path_template, discovered_by, normaliser_version)"
+            " VALUES(?,?,?,'https','alpha.test',443,?,'proxy',2)",
+            (sid, eid, method, template))
     alpha_db.execute(
         "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
         " status, requests_issued, dropped_total)"
-        " VALUES('r1',?,'scan','staging',1,'completed',1,0)", (eid,))
+        " VALUES('r1',?,'scan','staging',1,'completed',2,0)", (eid,))
     alpha_db.execute(
         "INSERT INTO check_run(id, run_id, surface_id, check_id,"
         " check_version, verdict) VALUES('c1','r1','s1','missing-hsts','1',"
         "'clean')")
+    alpha_db.execute(
+        "INSERT INTO check_run(id, run_id, surface_id, check_id,"
+        " check_version, verdict) VALUES('c2','r1','s2','sql-error','1',"
+        "'skipped')")
 
-    cov = coverage_mod.facts(alpha_db, eid)
+    entry = registry_mod.lookup(client.app.state.base, "alpha")
+    config = config_mod.load(entry.path / "config.yaml")
+    report_out = report_mod.render(alpha_db, engagement_id=eid, config=config)
     body = client.get("/e/alpha").text
 
-    assert cov.captured == 1
-    assert f"{cov.captured} surface(s) captured" in body
-    assert "missing-hsts" in body
-    assert "Never tested" not in body
+    for surface in (report_out, body):
+        assert "3 surface(s)" in surface
+        assert "missing-hsts" in surface
+        assert "sql-error" in surface
+        assert "POST /b" in surface
+        assert "GET /c" in surface
+    assert "<strong>1</strong> had at" in body
+    assert "<strong>2</strong> had none" in body
+    assert "Never tested" in body
 
 
 def _surface(conn, eid, sid="s1", method="GET", template="/a"):
@@ -140,6 +173,50 @@ def test_the_surface_screen_names_each_surface_and_how_it_was_found(
 
     assert "/order/{id}" in body
     assert "proxy" in body
+
+
+def test_the_surfaces_screen_warns_when_a_run_has_dropped_exchanges(
+        client, alpha_db):
+    """S5's floor caveat is not only the overview's: `/e/{name}/surfaces`
+    renders per-surface exchange counts and the surface list itself, both
+    of which are a floor when any run dropped traffic. The master spec's
+    Sec 12 rule is that a count presented without its caveat is worse than
+    no report at all.
+
+    MUTATION: delete the `{% if dropped_total %}` block from
+    surfaces.html. This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, requests_issued, dropped_total)"
+        " VALUES('r1',?,'scan','staging',1,'completed',10,4)", (eid,))
+
+    body = client.get("/e/alpha/surfaces").text
+
+    assert "floor" in body.lower()
+    assert "4 exchange(s) were dropped" in body
+
+
+def test_the_surfaces_screen_says_nothing_about_drops_when_there_are_none(
+        client, alpha_db):
+    """The control. Without it, the test above cannot tell "the warning
+    tracks drops" apart from "the warning is always on" -- a caveat that
+    always fires stops being read.
+
+    MUTATION: hardcode `dropped_total=1` in the surfaces route handler
+    (`hx/web/app.py`). This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, requests_issued, dropped_total)"
+        " VALUES('r1',?,'scan','staging',1,'completed',10,0)", (eid,))
+
+    body = client.get("/e/alpha/surfaces").text
+
+    assert "floor" not in body.lower()
+    assert "were dropped" not in body
 
 
 def test_a_surface_whose_only_check_row_is_skipped_shows_no_answers(

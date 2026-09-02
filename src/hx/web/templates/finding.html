@@ -14,7 +14,7 @@
 {% if finding.impact %}<h2>Impact</h2><p>{{ finding.impact | redact }}</p>{% endif %}
 {% if finding.remediation %}<h2>Remediation</h2><p>{{ finding.remediation | redact }}</p>{% endif %}
 {% if finding.cwe %}<p class="muted">{{ finding.cwe }}</p>{% endif %}
-{% if finding.payload %}<h2>Payload</h2><pre class="bytes">{{ finding.payload }}</pre>{% endif %}
+{% if finding.payload %}<h2>Payload</h2><pre class="bytes">{{ finding.payload | redact }}</pre>{% endif %}
 
 <h2>Evidence</h2>
 {% if not evidence %}
@@ -33,7 +33,7 @@ here to check it against.</p>
       <a href="/e/{{ entry.name }}/exchanges/{{ e.exchange_id }}">{{ e.exchange_id }}</a>
       <span class="muted">{{ e.method }} {{ e.url | redact }} → {{ e.status if e.status is not none else "—" }}</span>
     {% else %}
-      <span class="muted">{{ e.kind }} {{ e.ref or "" }}</span>
+      <span class="muted">{{ e.kind }} {{ e.ref | redact if e.ref else "" }}</span>
     {% endif %}
   </td>
   <td>{{ e.outcome or "—" }}</td>
