@@ -5343,6 +5343,7 @@ from hx import report as report_mod
 from hx import run as run_mod
 from hx import scan as scan_mod
 from hx import session as session_mod
+from hx import triage as triage_mod
 from hx.bridge import codec as codec_mod
 from hx.bridge import server as bridge_mod
 from hx.checks import registry
@@ -5855,6 +5856,41 @@ def resume(root) -> None:
             f"resume failed and the halt still stands ({oh.sentinel_path}): {exc}"
         ) from exc
     click.echo(f"issuance resumed; the halt was: {was}")
+
+
+@main.command()
+@click.argument("finding_id")
+@click.option("--status", "to_status", required=True,
+              type=click.Choice(triage_mod.TARGETS),
+              help="The triage decision. S11 offers exactly these two.")
+@click.option("--note", default=None,
+              help="Why. REQUIRED for false_positive: it reaches the client "
+                   "deliverable, and a retest has to honour it.")
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def triage(finding_id, to_status, note, root) -> None:
+    """Record a human triage decision on a finding.
+
+    S8 keeps this out of the agent's hands: `finding.set_status` is in
+    `NEVER_AGENT_FACING`, so confirming a finding happens here or in the web
+    app and nowhere else.
+    """
+    eng = _open_engagement(root or default_root())
+    try:
+        change = triage_mod.set_status(eng.db, finding_id=finding_id,
+                                       to_status=to_status, note=note)
+    except triage_mod.TriageError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(
+            f"cannot record the decision at {eng.root}: {exc}") from exc
+
+    if not change.changed:
+        click.echo(f"{finding_id}: already {change.to_status}; "
+                   "nothing recorded")
+        return
+    click.echo(f"{finding_id}: {change.from_status} -> {change.to_status}")
+    if note and note.strip():
+        click.echo(f"  note  {note.strip()}")
 
 
 @main.command()
