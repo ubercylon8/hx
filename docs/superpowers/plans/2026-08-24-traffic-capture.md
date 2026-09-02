@@ -4809,14 +4809,43 @@ public class CaptureTest {
             check("the drop was reported with nothing following it ("
                   + sink.drops + ")", total == 1);
 
-            // And the eviction path reports too -- behaviour, not a separator:
-            // this half stays green under `take()`, and is kept as a pin on
-            // the answer rather than dressed up as more than it is.
-            offerAll(c, obs(3), obs(4), obs(5), obs(6), obs(7), obs(8));
-            waitUntil(() -> c.dropped() > 1 && reported(sink, "operator") > 0);
-            check("and an evicted record's drop is reported as well ("
-                  + sink.drops + ")", reported(sink, "operator") > 0);
         } finally { c.stop(); }
+
+        // And the eviction path reports too -- behaviour, not a separator:
+        // this half stays green under `take()`, and is kept as a pin on the
+        // answer rather than dressed up as more than it is.
+        //
+        // ITS OWN CAPTURE, AND NOT STARTED UNTIL THE QUEUE HAS OVERFLOWED.
+        // This assertion used to share the capture above and offer six
+        // records at a live drain, which made an eviction a RACE the drain
+        // had no reason to lose: `loop()` polls one record per iteration and
+        // delivers it, so a drain that keeps up leaves `queue.offer` never
+        // returning false, nothing evicted, `dropped()` still 1, and the
+        // wait spinning out. MEASURED on 2026-09-02 -- four CI runs on
+        // byte-identical Java, three green and one red, and reproduced here
+        // at 2 failures in 12 with the JVM pinned to a single core
+        // (`taskset -c 0`), which is the shape of a two-core runner. On 24
+        // cores it never failed in 15 runs under full load, which is why it
+        // read as unreproducible.
+        //
+        // `accepting` is true from construction, so an UNSTARTED capture
+        // takes offers into its queue with nothing draining them: six
+        // records into a queue of four evicts exactly two, by arithmetic
+        // rather than by scheduling. `start()` then reports them, because
+        // `loop()` calls `reportOutstanding()` on every iteration whether or
+        // not it polled a record.
+        Recording evicting = new Recording();
+        Capture e = new Capture(4, evicting);
+        offerAll(e, obs(3), obs(4), obs(5), obs(6), obs(7), obs(8));
+        check("six records into a queue of four evicted two, before any "
+              + "drain existed to race (" + e.dropped() + ")",
+              e.dropped() == 2);
+        e.start();
+        try {
+            waitUntil(() -> reported(evicting, "operator") > 0);
+            check("and an evicted record's drop is reported as well ("
+                  + evicting.drops + ")", reported(evicting, "operator") > 0);
+        } finally { e.stop(); }
     }
 
     static void dropsAreReportedPerSource() throws Exception {
