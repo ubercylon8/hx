@@ -254,3 +254,30 @@ def test_the_named_absences_cannot_contradict_the_derived_list():
                 f"the scope line denies {absent!r} while a shipped check "
                 f"claims to look for {term!r} — the sentence would contradict "
                 "itself. Remove that entry from `report._ABSENT_CATEGORIES`.")
+
+
+def test_an_engagement_with_every_class_disabled_says_it_looked_for_nothing(
+        engagement_conn):
+    """The branch that fires when `enabled(config)` is empty, and the most
+    honest sentence in this file: a scan that ran no check at all must say
+    so, not render an empty "looked for: ." and leave a reader to infer.
+
+    Raised by PR #17's re-review as an untested branch. It is one line of
+    test against the one sentence here that a client could most easily be
+    misled by, so it is worth more than the note that found it.
+
+    MUTATION: return the ordinary derived sentence when `phrases` is empty.
+    This test must go red -- the rendered line would read `looked for, and
+    nothing else: .` and claim a scope of nothing while sounding like a
+    scope of something.
+    """
+    cfg = _cfg()
+    for klass in list(cfg.checks):
+        cfg.checks[klass] = False
+    _scanned(engagement_conn)
+
+    out = report_mod.render(engagement_conn, engagement_id="e-1", config=cfg)
+
+    assert "looked for nothing" in out
+    assert "No check was enabled" in out
+    assert "and nothing else:" not in out
