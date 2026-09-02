@@ -866,6 +866,20 @@ def _status(conn, finding_id, status) -> str:
     return f' · *status: {status} — "{_flat(_redact(note))}"*'
 
 
+#: Categories this build ships nothing for, named in the Findings scope
+#: line because an ABSENCE cannot be derived from a registry -- these are
+#: the three the 2026-09-02 dry run proved a reader assumes are covered.
+#:
+#: `test_report_findings_scope.py` fails if any shipped check's `looks_for`
+#: claims one of them, because the scope line would then deny in its second
+#: clause what it asserts in its first.
+_ABSENT_CATEGORIES = (
+    "directory listings",
+    "authorisation and access-control flaws",
+    "injection classes other than SQL",
+)
+
+
 def _scope_of_the_corpus(config) -> str:
     """What this build looked for, and the sentence saying nothing else was.
 
@@ -884,14 +898,20 @@ def _scope_of_the_corpus(config) -> str:
     it, in nine bullets seventy lines below where the eye lands; this is the
     same fact where it is read.
 
-    DERIVED FROM `enabled_for(config)` AND NOT FROM `CHECKS`. An engagement
+    DERIVED FROM `registry.enabled(config)` AND NOT FROM `CHECKS`. An engagement
     that disables a class must not be told those categories were looked for
     -- that would be this line committing the exact false-coverage claim it
     exists to prevent.
 
     The closing pointer names three categories rather than deriving them,
     because an absence cannot be derived: these are the three the dry run
-    proved a reader assumes are covered.
+    proved a reader assumes are covered. `_ABSENT_CATEGORIES` holds them, and
+    a test fails loudly if the corpus ever grows a check whose own
+    `looks_for` claims one -- which would put this sentence in direct
+    contradiction with the derived list one clause above it, in the same
+    paragraph. A self-contradicting report is the precise failure this
+    function exists to prevent, so it must not be the one thing here that
+    can go stale in silence.
     """
     phrases = [c.looks_for for c in registry.enabled(config)]
     if not phrases:
@@ -903,8 +923,8 @@ def _scope_of_the_corpus(config) -> str:
         + " · ".join(_flat(_redact(p)) for p in sorted(phrases))
         + ". **A category absent from that list was not looked for**, and "
         "its absence here is not evidence of its absence in the "
-        "application — directory listings, authorisation and access-control "
-        "flaws, and injection classes other than SQL are outside this build. "
+        "application — " + ", ".join(_ABSENT_CATEGORIES[:-1])
+        + f", and {_ABSENT_CATEGORIES[-1]} are outside this build. "
         "See Limits at the end of this report for the full statement of what "
         "was not covered.\n")
 

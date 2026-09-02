@@ -209,3 +209,48 @@ def test_a_phrase_is_a_phrase_and_not_a_sentence():
         assert first.islower() or first.isupper(), (
             f"{check.id}: {first!r} is sentence case; use lowercase, or an "
             "acronym in full capitals")
+
+
+def test_the_named_absences_cannot_contradict_the_derived_list():
+    """The scope line asserts a list of categories in its first clause and
+    denies three in its second. Those three are HARDCODED, because an absence
+    cannot be derived from a registry that by definition does not contain it.
+
+    That makes them the one part of this sentence able to go stale in
+    silence: add a directory-listing check and the line would claim, in one
+    paragraph, both that directory listings were looked for and that they are
+    outside this build. A self-contradicting report is the precise failure
+    this whole line exists to prevent.
+
+    Raised by the PR #17 review as a Minor. Fixed rather than noted, because
+    a `# TODO` is a comment that does not fail.
+
+    MUTATION: add `"directory listings"` as some check's `looks_for`. This
+    test must go red.
+    """
+    # WHAT WOULD CONTRADICT EACH DENIAL, spelled out rather than derived from
+    # the phrase. The first draft of this test took each denial's leading
+    # noun, which turned "injection classes other than SQL" into "injection"
+    # and reddened against `sql-behaviour` -- denying OTHER injection classes
+    # while shipping a SQL one is not a contradiction, and the test said it
+    # was. A denial's meaning is not recoverable from its first word.
+    contradicted_by = {
+        "directory listings": ("directory listing", "directory index"),
+        "authorisation and access-control flaws":
+            ("authorisation", "authorization", "access control",
+             "access-control", "privilege"),
+        "injection classes other than SQL":
+            ("command injection", "ldap injection", "xpath injection",
+             "template injection", "nosql injection"),
+    }
+    assert set(contradicted_by) == set(report_mod._ABSENT_CATEGORIES), (
+        "a category was added to or removed from `_ABSENT_CATEGORIES` "
+        "without saying here what would contradict it")
+
+    claimed = " ".join(c.looks_for.lower() for c in registry.CHECKS)
+    for absent, terms in contradicted_by.items():
+        for term in terms:
+            assert term not in claimed, (
+                f"the scope line denies {absent!r} while a shipped check "
+                f"claims to look for {term!r} — the sentence would contradict "
+                "itself. Remove that entry from `report._ABSENT_CATEGORIES`.")
