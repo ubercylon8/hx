@@ -593,12 +593,18 @@ one call, keeping the comment that explains why they are computed once:
                            unfinished=cov.unfinished))
     out.extend(_findings(conn, engagement_id, scanned=cov.scanned,
                          unfinished=cov.unfinished))
-    out.extend(_coverage(conn, engagement_id, config, cov=cov))
+    out.extend(_coverage(config, cov=cov))
 ```
 
-**(d)** Change `_coverage`'s signature to `def _coverage(conn, engagement_id,
-config, *, cov) -> list[str]:` and replace its first two statements and its
-three query sites with reads off `cov`:
+**(d)** Change `_coverage`'s signature to `def _coverage(config, *, cov) ->
+list[str]:` — **`conn` and `engagement_id` go**, because after this edit
+every one of their six uses is replaced by a read off `cov`, and a parameter
+nothing reads is an invitation to re-add a query beside the shared one. That
+is exactly the drift the extraction exists to prevent. Update the call in
+`render` to `_coverage(config, cov=cov)`.
+
+Then replace its first two statements and its three query sites with reads
+off `cov`:
 
 | Was | Becomes |
 |---|---|
@@ -613,6 +619,12 @@ three query sites with reads off `cov`:
 
 Keep every comment in `_coverage` exactly as it stands. They record why each
 number is shaped the way it is, and the numbers have not changed.
+
+**(e)** `_limits`' docstring names `_unfinished_runs` twice (around
+`report.py:1456` and `:1460`) and this task deletes that function. Rewrite
+both references to name `coverage.facts`' `unfinished` instead. This
+repository's comments carry its reasoning, and a docstring pointing at a
+function that no longer exists sends the next reader looking for it.
 
 - [ ] **Step 12: Prove the report is byte-identical**
 
@@ -1332,7 +1344,7 @@ one.
   - `hx.web.app.create_app(base) -> Starlette`
   - `hx.web.app.ALLOWED_HOSTS: tuple[str, ...]`, `hx.web.app.CSP: str`
   - `hx.web.app.hostname(header) -> str`
-  - `hx.web.reads.overview(conn, engagement_id) -> dict`
+  - `hx.web.reads.overview(conn, engagement_id, config) -> dict`
 
 - [ ] **Step 1: Add the dependencies**
 
@@ -2501,12 +2513,11 @@ def test_the_overview_reads_the_engagement_the_url_names(client, alpha_db):
 
 
 def test_the_coverage_figures_match_what_the_report_computes(
-        client, alpha_db, web_base):
+        client, alpha_db):
     """THE TEST THE EXTRACTION EXISTS FOR. One store, two renderers, the
     same numbers. A second coverage query would drift, and the drift would
     show a reassuring figure on exactly the engagements the report warns
     about."""
-    from hx import config as config_mod
     from hx import coverage as coverage_mod
 
     eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
@@ -2524,7 +2535,6 @@ def test_the_coverage_figures_match_what_the_report_computes(
         "'clean')")
 
     cov = coverage_mod.facts(alpha_db, eid)
-    config_mod.load(web_base / "alpha" / "config.yaml")
     body = client.get("/e/alpha").text
 
     assert cov.captured == 1
