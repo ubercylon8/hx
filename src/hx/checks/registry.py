@@ -15,7 +15,8 @@ from __future__ import annotations
 
 from hx.checks import base
 from hx.checks.active import (cors, open_redirect, path_traversal,
-                              reflected_input, sql_error)
+                              reflected_input, sql_behaviour,
+                              sql_error)
 from hx.checks.passive import cookie_flags, secret_in_response
 from hx.checks.passive import security_headers, stack_trace
 
@@ -115,6 +116,7 @@ CHECKS: tuple[base.Check, ...] = (
     open_redirect.OpenRedirect(),
     reflected_input.ReflectedInput(),
     sql_error.SqlError(),
+    sql_behaviour.SqlBehaviour(),
     path_traversal.PathTraversal(),
 )
 

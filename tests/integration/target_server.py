@@ -164,12 +164,19 @@ UPGRADE_FRAME = b"\x81\x05hello"
 # the exemplar request, so a surface browsed without `?q=` offers a check
 # nowhere to put a payload and is skipped `no_insertion_point`. The path
 # template a finding is filed against is this path up to the `?`.
+# The result set `/db/search` returns for a query whose quotes balance.
+# Long enough that its absence clears `_MIN_LEN_DELTA` (32 bytes) in
+# `hx.checks.active.sql_behaviour`, which is the whole signal there.
+_WIDGET_ROWS = [{"id": n, "name": f"widget-{n}", "stock": n * 7}
+                for n in range(1, 6)]
+
 VULNERABLE_ROUTES: dict[str, str] = {
     "hx.active.cors": "/api/profile",
     "hx.active.open-redirect": "/go?next=/account",
     "hx.active.path-traversal": "/files?file=readme.txt",
     "hx.active.reflected-input": "/search?q=hello",
     "hx.active.sql-error": "/db/lookup?id=42",
+    "hx.active.sql-behaviour": "/db/search?term=widget",
 }
 
 # ONE ROUTE WHOSE PATH `hx.surface` WILL TEMPLATE, and the reason it is not in
@@ -570,13 +577,67 @@ class _Handler(BaseHTTPRequestHandler):
             # a 500 without the wording -- `_probe_util.unanswered` reads a
             # 5xx as a refusal, so `sql_error` would answer `inconclusive` and
             # the fix would read as a wall.
+            # ODD-COUNT, not "contains a quote", since 2026-09-02. A single
+            # quote leaves a literal unterminated and an escaped pair does not
+            # -- which is what a real driver does, and what stops this route
+            # answering an identical 500 to BOTH of `sql-behaviour`'s probes.
+            # It did, and that check correctly reported a gap for a surface it
+            # could learn nothing from. `sql_error`'s own payload carries one
+            # quote, so what it sees here is unchanged.
             ident = params.get("id", [""])[0]
-            if "'" in ident and not self.server.target.is_fixed(
+            if ident.count("'") % 2 == 1 and not self.server.target.is_fixed(
                     "hx.active.sql-error"):
                 self._reply_text(500, MYSQL_SYNTAX_ERROR,
                                  content_type="text/plain; charset=utf-8")
             else:
                 self._reply(200, {"found": False})
+        elif parts.path == "/db/search":
+            # For `hx.active.sql-behaviour`, AND DELIBERATELY A ROUTE
+            # `hx.active.sql-error` CANNOT FIND. That is the whole reason the
+            # behavioural check exists: measured on 2026-09-02 against OWASP
+            # Juice Shop, an unbalanced quote drew a bare HTTP 500 carrying no
+            # driver wording at all, `sql_error` had nothing to match, and
+            # `_probe_util.unanswered` filed the 500 as a gap. The engagement
+            # reported zero findings.
+            #
+            # So this route answers on the same RULE that target did -- an ODD
+            # number of quotes leaves a string literal unterminated, an EVEN
+            # number is a properly escaped one -- but it signals the break with
+            # an EMPTY RESULT SET rather than the 500 Juice Shop returned, and
+            # that difference is deliberate twice over.
+            #
+            # MEASURED, and it is why this comment exists: a 500 here halted
+            # the run. Section 4's distress detector watches for a burst of
+            # 5xx and stops issuance, which is the extension protecting a
+            # client's server exactly as designed; between this route and
+            # `/db/lookup` the corpus produced enough of them to trip it, and
+            # `sql-behaviour` recorded `probe refused (halted)`. A test target
+            # must not need the harness's own safety valve disabled to be
+            # testable.
+            #
+            # The second reason is that this is the more honest fixture. Blind
+            # boolean SQL injection looks exactly like this -- one status, two
+            # result sets -- and it is the shape no status code can reveal, so
+            # the route exercises the CONTENT half of `_material` while the
+            # unit tests pin the status half. No MySQL text and no stack trace
+            # either way: nothing a string matcher can see, which is what keeps
+            # `sql_error` answering `clean` here rather than fighting over the
+            # same route.
+            #
+            # FIXED, the parameter is bound: both spellings answer the same
+            # ordinary 200 and the differential disappears. NOT a wall and NOT
+            # a uniform 500 -- two identical refusals make this check answer
+            # `inconclusive` (it asks `unanswered` only when it found no
+            # difference), so a fix delivered that way would be
+            # indistinguishable from a login page, the confusion the two
+            # comments above already guard against.
+            term = params.get("term", [""])[0]
+            if (term.count("'") % 2 == 1 and not self.server.target.is_fixed(
+                    "hx.active.sql-behaviour")):
+                self._reply(200, {"results": [], "matched": 0})
+            else:
+                self._reply(200, {"results": _WIDGET_ROWS,
+                                  "matched": len(_WIDGET_ROWS)})
         elif parts.path == "/files":
             # For `hx.active.path-traversal`. `file` is one of the file-shaped
             # parameter names that check probes, and a value that climbs out of

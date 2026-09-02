@@ -986,7 +986,7 @@ def test_no_shipped_active_check_puts_a_placeholder_on_the_wire(tmp_path):
     env = _templated_env(tmp_path)
     fb = _replying_bridge()
     checks = tuple(c for c in registry.CHECKS if c.klass != "passive")
-    assert len(checks) == 5, checks
+    assert len(checks) == 6, checks
     scan.run(**env, checks=checks, bridge=fb)
 
     sent = _paths_on_the_wire(fb)
@@ -1483,7 +1483,7 @@ def test_no_probing_check_in_the_corpus_retires_anything(tmp_path):
     asserting against the mechanism this fix does not touch."""
     env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE, path_template="/search")
     active = tuple(c for c in registry.CHECKS if c.klass != "passive")
-    assert len(active) == 5, "the corpus changed shape; re-read this test"
+    assert len(active) == 6, "the corpus changed shape; re-read this test"
 
     considered = _considered_by(env, active, _replying_bridge())
     assert considered == set(), (
@@ -1657,7 +1657,7 @@ def test_every_probing_check_reads_a_login_wall_as_a_gap(tmp_path):
     env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE,
                path_template="/search")
     active = tuple(c for c in registry.CHECKS if c.klass != "passive")
-    assert len(active) == 5, "the corpus changed shape; re-read this test"
+    assert len(active) == 6, "the corpus changed shape; re-read this test"
     scan.run(**env, checks=active, bridge=_LoginWallBridge())
 
     rows = dict(env["conn"].execute(
@@ -1716,17 +1716,25 @@ def test_every_probing_check_reads_a_refused_request_as_a_gap(tmp_path,
     client reading that this surface was tested. Before the fix each of these
     five statuses produced five `clean` rows and five tested Coverage rows off
     nine requests none of which was answered -- five rows off nine, because
-    two of these checks send one probe apiece and three send three."""
+    two of these checks send one probe apiece and three send three.
+
+    SIX CHECKS AND FIFTEEN REQUESTS SINCE 2026-09-02, measured:
+    `hx.active.sql-behaviour` joined the corpus and sends TWO probes per
+    insertion point, because its signal is the difference between them.
+    It reaches this gap by a different route from its five siblings --
+    they refuse to read a non-2xx at all, while it reads both, finds them
+    identical, and records that an endpoint refusing every request refuses
+    both spellings of the payload alike."""
     env = _env(tmp_path, request_bytes=REQ_EVERY_SHAPE,
                path_template="/search")
     active = tuple(c for c in registry.CHECKS if c.klass != "passive")
-    assert len(active) == 5, "the corpus changed shape; re-read this test"
+    assert len(active) == 6, "the corpus changed shape; re-read this test"
     bridge = _RefusingBridge(status)
     scan.run(**env, checks=active, bridge=bridge)
 
     rows = dict(env["conn"].execute(
         "SELECT check_id, verdict FROM check_run").fetchall())
-    assert len(rows) == 5, rows
+    assert len(rows) == 6, rows
     clean = sorted(cid for cid, v in rows.items() if v == "clean")
     assert clean == [], (
         f"a target that refused every probe with {status} was read as a "
