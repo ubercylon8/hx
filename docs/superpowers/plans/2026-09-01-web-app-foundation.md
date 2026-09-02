@@ -1795,7 +1795,7 @@ def test_every_response_carries_the_content_security_policy(client):
     JavaScript. Plan B widens that to 'self' when it vendors htmx, where a
     reviewer can see it happen.
 
-    MUTATION: delete the `Content-Security-Policy` line from `_guard`.
+    MUTATION: delete the `Content-Security-Policy` line from `_secured`.
     """
     csp = client.get("/").headers["content-security-policy"]
     assert "default-src 'none'" in csp
@@ -1803,8 +1803,23 @@ def test_every_response_carries_the_content_security_policy(client):
     assert "frame-ancestors 'none'" in csp
 
 
+def test_a_refusal_carries_the_headers_too(client):
+    """"Every response" has to mean every response, and a refusal is exactly
+    the response that returns EARLY -- skipping whatever the success path
+    does on its way out. The 421 is what a rebinding attack receives.
+
+    MUTATION: in `_guard`, return the refusal directly instead of through
+    `_secured`. This test must go red while the one above stays green, which
+    is the whole reason both exist.
+    """
+    refused = client.get("/", headers={"Host": "attacker.example"})
+    assert refused.status_code == 421
+    assert "default-src 'none'" in refused.headers["content-security-policy"]
+    assert refused.headers["x-content-type-options"] == "nosniff"
+
+
 def test_every_response_forbids_content_sniffing(client):
-    """MUTATION: delete the `X-Content-Type-Options` line from `_guard`."""
+    """MUTATION: delete the `X-Content-Type-Options` line from `_secured`."""
     assert client.get("/").headers["x-content-type-options"] == "nosniff"
 
 
@@ -2133,6 +2148,22 @@ def hostname(header: str) -> str:
     return value.partition(":")[0]
 
 
+def _secured(response):
+    """Every response this app emits, refusals included.
+
+    ONE place, because refusal paths are the ones that get forgotten: they
+    return EARLY, before whatever the success path does on its way out.
+    MEASURED on 2026-09-01 -- an earlier draft set these three headers only
+    after `call_next`, so the 421, which is the response a DNS-rebinding
+    attack actually receives, went out with no CSP and no `nosniff` at all.
+    The test asked `client.get("/")` and was perfectly happy.
+    """
+    response.headers["Content-Security-Policy"] = CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 async def _guard(request, call_next):
     """The Host allowlist, and the headers every response carries.
 
@@ -2149,13 +2180,9 @@ async def _guard(request, call_next):
     for an authority this server does not answer for.
     """
     if hostname(request.headers.get("host", "")) not in ALLOWED_HOSTS:
-        return PlainTextResponse("this host is not served here",
-                                 status_code=421)
-    response = await call_next(request)
-    response.headers["Content-Security-Policy"] = CSP
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    return response
+        return _secured(PlainTextResponse("this host is not served here",
+                                          status_code=421))
+    return _secured(await call_next(request))
 
 
 def _entry(request):
@@ -3618,15 +3645,29 @@ against nothing. It arrives with the first POST and with a test that asserts
 the **finding's status is unchanged**, not merely that a 403 came back — a
 403 alone passes a handler that writes the row and then rejects.
 
-**POST handlers are `async def`.** `request.form()` is a coroutine and a
-sync handler cannot await it. The SQLite write then goes through
-`run_in_threadpool`, so a write never blocks the event loop. The forms are
-`application/x-www-form-urlencoded`, which Starlette parses natively —
-**`python-multipart` is not needed and must not be added**; it is only
-required for `multipart/form-data`, and nothing here uploads a file.
+**POST handlers are `async def`**, because reading a request body is a
+coroutine and a sync handler cannot await one. The SQLite write then goes
+through `run_in_threadpool`, so a write never blocks the event loop.
+
+**Do not call `request.form()`, and do not add `python-multipart`.**
+MEASURED against Starlette 1.6.0 on 2026-09-01: `request.form()` asserts
+`python-multipart` is installed *before* it looks at the content type, so it
+raises `AssertionError: The python-multipart library must be installed to
+use form parsing` even for a plain urlencoded body. An earlier draft of this
+plan asserted the opposite.
+
+Installing it would have been the easy fix and it is the wrong one, for a
+reason that is not about closure size: with `python-multipart` present,
+`request.form()` cheerfully parses `multipart/form-data` — **including file
+uploads** — on two routes that want two short strings. This app should
+accept exactly one content type on its write paths and refuse everything
+else. So the body is parsed with `urllib.parse.parse_qsl` behind an explicit
+content-type check and a size cap. That is stdlib doing what it has done
+correctly for decades, not a hand-rolled parser, and it makes "what this app
+accepts" a line you can read.
 
 **Files:**
-- Modify: `src/hx/web/app.py` (`SAFE_METHODS`, `_same_origin`, `_guard`, two routes, halt state on the overview)
+- Modify: `src/hx/web/app.py` (`SAFE_METHODS`, `MAX_FORM`, `_form_fields`, `_same_origin`, `_guard`, two routes, halt state on the overview)
 - Modify: `src/hx/web/templates/finding.html` (the triage form)
 - Modify: `src/hx/web/templates/overview.html` (the halt banner and STOP)
 - Create: `tests/test_web_writes.py`
@@ -3635,6 +3676,8 @@ required for `multipart/form-data`, and nothing here uploads a file.
 - Consumes: `hx.triage.set_status`, `hx.triage.TARGETS`,
   `hx.halt.OperatorHalt`, `hx.store.db.connect`
 - Produces: `hx.web.app.SAFE_METHODS: frozenset[str]`,
+  `hx.web.app.MAX_FORM: int`,
+  `hx.web.app._form_fields(request) -> dict[str, str] | None`,
   `hx.web.app._same_origin(request) -> bool`
 
 - [ ] **Step 1: Write the failing tests**
@@ -3737,6 +3780,25 @@ def test_a_cross_site_fetch_metadata_header_is_refused(client, alpha_db):
     assert _status(alpha_db) == "new"
 
 
+def test_a_multipart_body_is_refused(client, alpha_db):
+    """The app accepts ONE content type on a path that can change something.
+    `python-multipart` is deliberately absent, so `request.form()` would
+    RAISE here rather than refuse -- which is why these routes read the body
+    themselves.
+
+    MUTATION: drop the content-type check from `_form_fields`. Must go red.
+    """
+    _finding(alpha_db)
+
+    response = client.post("/e/alpha/findings/f1/status",
+                           files={"status": ("x.txt", b"confirmed")},
+                           headers=ORIGIN, follow_redirects=False)
+
+    assert response.status_code == 415
+    assert _status(alpha_db) == "new"
+    assert _events(alpha_db) == 0
+
+
 def test_reads_are_not_affected_by_the_origin_check(client):
     """The control. A guard applied to GET would make the whole app
     unusable from a link, and every other test here would still pass."""
@@ -3836,6 +3898,8 @@ exists.
 Add the imports:
 
 ```python
+from urllib.parse import parse_qsl
+
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import RedirectResponse
 
@@ -3851,6 +3915,43 @@ Add the constant beside `CSP`:
 #: HEAD and OPTIONS are here because a guard that broke them would break
 #: ordinary browsers on a read-only app.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+#: The largest form body either write route will read. Both carry a status
+#: word and a note; 64 KiB is generous for that and finite, which is the
+#: property that matters -- `request.body()` reads the whole thing into
+#: memory before anyone looks at it.
+MAX_FORM = 64 * 1024
+```
+
+and the body reader, above `_same_origin`:
+
+```python
+async def _form_fields(request):
+    """The two write routes' form, or None if the request is not one.
+
+    NOT `request.form()`. MEASURED against Starlette 1.6.0: that method
+    asserts `python-multipart` is installed BEFORE it looks at the content
+    type, so it raises even for a plain urlencoded body.
+
+    Installing `python-multipart` is the easy fix and the wrong one. With it
+    present, `request.form()` parses `multipart/form-data` -- file uploads
+    included -- on two routes that want two short strings. This app accepts
+    exactly ONE content type on a path that can change something, and
+    `parse_qsl` is stdlib doing what it has done correctly for decades
+    rather than a parser written here.
+
+    None means "this was not a form this app accepts", and the caller
+    answers 415. An empty dict is a different thing: a well-formed empty
+    form, which `set_status` then refuses on its own terms.
+    """
+    ctype = request.headers.get("content-type", "")
+    if ctype.split(";")[0].strip().lower() != "application/x-www-form-urlencoded":
+        return None
+    body = await request.body()
+    if len(body) > MAX_FORM:
+        return None
+    return dict(parse_qsl(body.decode("utf-8", "replace"),
+                          keep_blank_values=True))
 ```
 
 Add the check above `_guard`:
@@ -3898,18 +3999,20 @@ and the branch inside `_guard`, immediately after the Host check:
 ```python
 async def triage_post(request):
     entry = _entry(request)
-    form = await request.form()
+    form = await _form_fields(request)
+    if form is None:
+        return PlainTextResponse(
+            "this route accepts application/x-www-form-urlencoded only",
+            status_code=415)
     finding_id = request.path_params["fid"]
-    to_status = form.get("status")
+    to_status = form.get("status", "")
     note = form.get("note")
 
     def write():
         conn = db_mod.connect(entry.path / "hx.db")
         try:
-            return triage_mod.set_status(
-                conn, finding_id=finding_id,
-                to_status=to_status if isinstance(to_status, str) else "",
-                note=note if isinstance(note, str) else None)
+            return triage_mod.set_status(conn, finding_id=finding_id,
+                                         to_status=to_status, note=note)
         finally:
             conn.close()
 
@@ -3924,10 +4027,12 @@ async def triage_post(request):
 
 async def halt_post(request):
     entry = _entry(request)
-    form = await request.form()
-    given = form.get("reason")
-    reason = (given.strip() if isinstance(given, str) else "") or \
-        "stopped from the web app"
+    form = await _form_fields(request)
+    if form is None:
+        return PlainTextResponse(
+            "this route accepts application/x-www-form-urlencoded only",
+            status_code=415)
+    reason = form.get("reason", "").strip() or "stopped from the web app"
 
     def write():
         conn = db_mod.connect(entry.path / "hx.db")
@@ -4029,6 +4134,8 @@ One at a time, on a clean tree — batching misattributes results.
 | `reads._run_rows` returns `row[2]` unconditionally | `test_a_running_run_with_a_dead_heartbeat_renders_as_error` |
 | Remove `\| redact` from `exchange.html`'s URL | `test_url_userinfo_never_reaches_the_exchange_screen` |
 | `findings` ignores an unknown filter value | `test_an_unknown_filter_value_is_refused_rather_than_ignored` |
+| Return the Host refusal directly, not through `_secured` | `test_a_refusal_carries_the_headers_too` |
+| Drop the content-type check from `_form_fields` | `test_a_multipart_body_is_refused` |
 
 For each: apply it, run the named test, confirm it FAILS, revert with
 `git checkout -- <file>`, and record the result. **A mutation that leaves
