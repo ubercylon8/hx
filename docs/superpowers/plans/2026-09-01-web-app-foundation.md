@@ -161,10 +161,14 @@ smaller half and they pin the NULL-heartbeat rule that `reap_stale`'s comment
 exists to protect.
 
 ```python
+# tests/test_coverage.py -- the staleness tests and stale_before_us/is_stale cases
 """The two extractions Task 1 makes, and the behaviour they must not move."""
 from __future__ import annotations
 
+from hx import config as config_mod
+from hx import coverage as coverage_mod
 from hx import run as run_mod
+from hx.store import db as db_mod
 
 
 def test_a_completed_run_is_never_stale():
@@ -213,6 +217,7 @@ Insert both immediately **above** `def reap_stale`, so the predicate reads
 before its first caller.
 
 ```python
+# src/hx/run.py -- stale_before_us() and is_stale(), above reap_stale()
 def stale_before_us(*, now_us: int | None = None,
                     stale_after_us: int | None = None) -> int:
     """The heartbeat a `running` run must be newer than to count as alive.
@@ -262,6 +267,7 @@ Replace the body of `reap_stale` (its docstring's first line stays; the
 COALESCE comment is replaced because the COALESCE is gone).
 
 ```python
+# src/hx/run.py -- reap_stale(), rewritten to use is_stale()
 def reap_stale(conn: sqlite3.Connection, *, now_us: int | None = None,
                stale_after_us: int | None = None) -> list[str]:
     """Resolve runs whose harness died to `error`. Returns their ids.
@@ -289,7 +295,6 @@ def reap_stale(conn: sqlite3.Connection, *, now_us: int | None = None,
             " WHERE id=? AND status='running'",
             (at, "heartbeat went stale: the harness stopped without closing "
                  "this run, so its coverage is incomplete", run_id))
-    return ids
 ```
 
 - [ ] **Step 5: Verify the extraction moved no behaviour**
@@ -316,15 +321,7 @@ hand, so they pin the numbers rather than the phrasing — the report's own
 suite already pins the phrasing.
 
 ```python
-import sqlite3
-
-import pytest
-
-from hx import coverage as coverage_mod
-from hx import config as config_mod
-from hx.store import db as db_mod
-
-
+# tests/test_coverage.py -- the coverage-facts tests, appended
 def _store(tmp_path):
     conn = db_mod.connect(tmp_path / "hx.db")
     db_mod.init_schema(conn)
@@ -427,7 +424,7 @@ def test_a_running_run_counts_as_unfinished(tmp_path):
 
 def test_an_enabled_class_the_build_ships_nothing_for_is_named():
     """F11 of the report's review. A check class the operator enabled and
-    this build has no checks in leaves no `check_run` row, so it leaves no
+    this build has no checks in it leaves no `check_run` row, so it leaves no
     trace in the table -- and silence there reads as coverage."""
     cfg = config_mod.Config(name="t", client="T", safety_profile="staging",
                             scope_include=["https://app.test/*"])
@@ -446,6 +443,7 @@ Expected: FAIL, `ModuleNotFoundError: No module named 'hx.coverage'`.
 - [ ] **Step 9: Create `src/hx/coverage.py`**
 
 ```python
+# src/hx/coverage.py
 """The coverage facts, computed once and rendered twice.
 
 S12 -- "a report that cannot distinguish 'tested, clean' from 'never
@@ -582,6 +580,7 @@ Four edits, and `tests/test_report.py` must not need a single change.
 **(a)** Add the import beside the others near line 70:
 
 ```python
+# src/hx/report.py -- the coverage import
 from hx import coverage as coverage_mod
 ```
 
@@ -593,6 +592,7 @@ from hx import coverage as coverage_mod
 one call, keeping the comment that explains why they are computed once:
 
 ```python
+# src/hx/report.py -- coverage in render(), the single call site
     # ONE SOURCE OF TRUTH FOR THE COVERAGE FIGURES, shared by `_findings`
     # (F4 of fix round 1: an unscanned engagement's "None recorded" must not
     # read as a clean bill), `_coverage` (the original "not been scanned"
@@ -710,6 +710,7 @@ raised. A test that only asserts the exception passes code that writes the
 row and then raises.
 
 ```python
+# tests/test_triage.py
 """The only writer of `finding_status_event`, and what it refuses."""
 from __future__ import annotations
 
@@ -887,6 +888,7 @@ Expected: FAIL, `ModuleNotFoundError: No module named 'hx.triage'`.
 - [ ] **Step 3: Create `src/hx/triage.py`**
 
 ```python
+# src/hx/triage.py
 """The only writer of `finding_status_event`.
 
 S8: "Creating an engagement and confirming a finding are human acts; they
@@ -1056,6 +1058,7 @@ git commit -m "feat(triage): the first writer of finding_status_event"
 Create `tests/test_cli_triage.py`.
 
 ```python
+# tests/test_cli_triage.py
 """`hx triage` -- the terminal half of S8's human act."""
 from __future__ import annotations
 
@@ -1136,6 +1139,7 @@ Expected: FAIL, `Error: No such command 'triage'.`
 Add the import beside the others (line 20-28 block, alphabetical):
 
 ```python
+# src/hx/cli.py -- the triage import
 from hx import triage as triage_mod
 ```
 
@@ -1143,6 +1147,7 @@ Then the command, immediately **after** the `resume` command and before
 `scan`:
 
 ```python
+# src/hx/cli.py -- the triage command
 @main.command()
 @click.argument("finding_id")
 @click.option("--status", "to_status", required=True,
@@ -1195,6 +1200,7 @@ Expected: PASS, and `tests/test_cli.py` unmodified.
 Append to `tests/test_report.py`:
 
 ```python
+# tests/test_report.py -- the dismissed-finding and confirmed-finding report tests
 def test_a_dismissed_findings_reason_reaches_the_report(engagement_conn):
     """S12 pointed at triage. A bare `status: false_positive` in a client
     deliverable cannot distinguish "we checked and it is not real" from "we
@@ -1213,7 +1219,7 @@ def test_a_dismissed_findings_reason_reaches_the_report(engagement_conn):
 
     cfg = config_mod.Config(name="T", client="T", safety_profile="staging",
                             scope_include=["https://app.test/*"])
-    out = report_mod.render(engagement_conn, engagement_id="e-1", config=cfg)
+    out = report.render(engagement_conn, engagement_id="e-1", config=cfg)
 
     assert "staging only; the CDN sets it in production" in out
     assert "status: false_positive" in out
@@ -1235,7 +1241,7 @@ def test_a_confirmed_finding_with_no_note_still_renders_its_status(
 
     cfg = config_mod.Config(name="T", client="T", safety_profile="staging",
                             scope_include=["https://app.test/*"])
-    out = report_mod.render(engagement_conn, engagement_id="e-1", config=cfg)
+    out = report.render(engagement_conn, engagement_id="e-1", config=cfg)
 
     assert "status: confirmed" in out
 ```
@@ -1255,12 +1261,14 @@ Expected: FAIL — the note is absent from the rendered document.
 Add the import to `src/hx/report.py` beside the others:
 
 ```python
+# src/hx/report.py -- the triage import
 from hx import triage as triage_mod
 ```
 
 Add this helper immediately above `_findings`:
 
 ```python
+# src/hx/report.py -- _status(), the report's own status renderer
 def _status(conn, finding_id, status) -> str:
     """The status half of a finding's subtitle, with the human's reason.
 
@@ -1419,6 +1427,7 @@ uv sync
 Create `tests/test_web_registry.py`.
 
 ```python
+# tests/test_web_registry.py
 """Which engagements exist, and which names the app will answer to."""
 from __future__ import annotations
 
@@ -1474,6 +1483,23 @@ def test_a_store_from_another_schema_version_scans_as_a_problem(tmp_path):
     assert entry.engagement_id is None
 
 
+def test_a_deleted_config_file_scans_as_a_problem(tmp_path):
+    """A store can have a perfectly good `hx.db` and no `config.yaml` --
+    deleted, moved, or never written back after an edit. The overview
+    handler needs a config to render at all, so a directory missing one is
+    exactly as unusable as a directory whose schema is wrong, and the index
+    must say so rather than link to a screen that cannot render.
+    """
+    _make(tmp_path, "alpha")
+    (tmp_path / "alpha" / "config.yaml").unlink()
+
+    entry = registry_mod.scan(tmp_path)[0]
+
+    assert entry.problem is not None
+    assert "config.yaml" in entry.problem
+    assert entry.engagement_id is None
+
+
 def test_lookup_returns_the_named_engagement(tmp_path):
     _make(tmp_path, "alpha")
     assert registry_mod.lookup(tmp_path, "alpha").name == "alpha"
@@ -1520,6 +1546,7 @@ Expected: FAIL, `ModuleNotFoundError: No module named 'hx.web'`.
 `src/hx/web/registry.py`:
 
 ```python
+# src/hx/web/registry.py
 """Which engagements exist under the base directory, and which names are real.
 
 THE SCAN IS THE ALLOWLIST. A URL carries an engagement's DIRECTORY NAME, and
@@ -1592,6 +1619,19 @@ def _entry(path: Path) -> Entry:
             return Entry(**blank, schema_version=version,
                          problem=f"expected one engagement row, found {len(rows)}")
         row = rows[0]
+        config_path = path / "config.yaml"
+        try:
+            # A CHEAP check -- a read, not a parse. `config_mod.load` would
+            # also catch a MALFORMED file, but running it here means every
+            # engagement's config is parsed on every index render just to
+            # find out. The overview handler pays that cost for the one
+            # engagement a request actually names; this only screens for
+            # the file being missing or unreadable, the same class of fault
+            # as the schema-version check above.
+            config_path.read_bytes()
+        except OSError as exc:
+            return Entry(**blank, schema_version=version,
+                         problem=f"cannot read {config_path}: {exc}")
         findings = {
             r[0]: r[1] for r in conn.execute(
                 "SELECT severity, COUNT(*) FROM finding WHERE engagement_id=?"
@@ -1671,6 +1711,7 @@ docstring says why — without it every screen test would 421, which is the
 allowlist working rather than a bug.
 
 ```python
+# tests/conftest.py -- the web fixtures
 @pytest.fixture
 def web_base(tmp_path):
     """A base directory holding two engagements: `alpha` and `beta`.
@@ -1729,6 +1770,7 @@ Create `tests/test_web_security.py`. **Every test names the mutation that
 must turn it red.** A test whose mutation you cannot state is not finished.
 
 ```python
+# tests/test_web_security.py
 """Spec section 4: what this app can leak, and to whom.
 
 The app renders response bodies captured from a client's application.
@@ -1806,16 +1848,31 @@ def test_every_response_carries_the_content_security_policy(client):
 def test_a_refusal_carries_the_headers_too(client):
     """"Every response" has to mean every response, and a refusal is exactly
     the response that returns EARLY -- skipping whatever the success path
-    does on its way out. The 421 is what a rebinding attack receives.
+    does on its way out. The 421 is what a rebinding attack receives; the
+    403 is what a cross-site write receives, and it is the SAME class of
+    early-return bug -- an earlier draft of the 403 branch shipped without
+    `_secured` two paragraphs below a comment saying both exits must have
+    it, which is exactly why this test covers both rather than only the
+    421 it was first written for.
 
-    MUTATION: in `_guard`, return the refusal directly instead of through
-    `_secured`. This test must go red while the one above stays green, which
-    is the whole reason both exist.
+    MUTATION: in `_guard`, return the Host refusal directly instead of
+    through `_secured`. This test must go red while the one above stays
+    green, which is the whole reason both exist.
+
+    MUTATION: in `_guard`, return the cross-site refusal directly instead
+    of through `_secured`. This test must also go red for that mutation,
+    independently of the Host-refusal assertions above.
     """
     refused = client.get("/", headers={"Host": "attacker.example"})
     assert refused.status_code == 421
     assert "default-src 'none'" in refused.headers["content-security-policy"]
     assert refused.headers["x-content-type-options"] == "nosniff"
+
+    cross_site = client.post("/e/alpha/halt", data={"reason": "x"},
+                             follow_redirects=False)
+    assert cross_site.status_code == 403
+    assert "default-src 'none'" in cross_site.headers["content-security-policy"]
+    assert cross_site.headers["x-content-type-options"] == "nosniff"
 
 
 def test_every_response_forbids_content_sniffing(client):
@@ -1873,7 +1930,17 @@ def test_the_read_path_cannot_write(web_base):
 
 
 @pytest.mark.parametrize("name", [
-    "..", "%2e%2e", "..%2f..%2fetc", "alpha%2f..%2f..", "beta%00", "ALPHA",
+    # A literal ".." is deliberately absent from this list: httpx2's URL
+    # class applies RFC 3986 dot-segment removal (`remove_dot_segments`)
+    # at request-construction time -- MEASURED 2026-09-01, by inspecting
+    # `httpx2.Client._merge_url` and `URL.copy_with` directly -- so
+    # `client.get("/e/..")` collapses to `client.get("/")` before a byte
+    # leaves this process. Every conforming HTTP client, including a
+    # browser, does the same normalisation, so this exact byte sequence
+    # cannot reach any server over HTTP. `test_web_registry.py`'s
+    # `test_lookup_refuses_a_name_the_scan_did_not_return` still exercises
+    # `registry.lookup(base, "..")` directly, at the layer where it matters.
+    "%2e%2e", "..%2f..%2fetc", "alpha%2f..%2f..", "beta%00", "ALPHA",
 ])
 def test_a_name_the_scan_did_not_return_is_a_404(client, name):
     """THE REGISTRY SCAN IS THE ALLOWLIST. Not a sanitiser over a path join.
@@ -1882,6 +1949,122 @@ def test_a_name_the_scan_did_not_return_is_a_404(client, name):
     with an entry built from `base / name`. This test must go red.
     """
     assert client.get(f"/e/{name}").status_code == 404
+
+
+def test_a_traversal_that_lands_on_a_real_directory_is_still_a_404(tmp_path):
+    """The parametrize cases above are cheap and cover encodings, but
+    nothing exists at any of those paths -- so under the named mutation
+    `registry._entry` still fails to open a database there and the handler
+    still 404s, for a reason that has nothing to do with the allowlist.
+    This test gives the traversal somewhere REAL to land.
+
+    A `%2f`-smuggled slash (`base / "..%2fsecret"`, landing on a SIBLING
+    directory) does not reach any handler at all, mutated or not: Starlette
+    matches routes against `scope["path"]`, which the ASGI spec requires to
+    already be percent-DECODED, so `..%2fsecret` is compared as `../secret`
+    against `Route("/e/{name}")`'s `[^/]+` pattern -- CONFIRMED by patching
+    in the coordinator's exact named mutation and finding this still 404s,
+    for yet a THIRD reason with nothing to do with the allowlist: the route
+    itself never matches a decoded path containing "/". That holds under a
+    real ASGI server too, not just this test's client, since `scope["path"]`
+    decoding is an ASGI-wide guarantee, not a TestClient quirk.
+
+    `%2e%2e` is the one encoding that survives BOTH obstacles: it decodes
+    to a bare `..` with no slash, so it IS a single path segment the route
+    matches, and being percent-encoded it is NOT the literal `..` httpx2
+    normalises away before the request is even built (see the parametrize
+    list's comment above). A bare `..` can only reach ONE directory up --
+    `base`'s own parent -- so THAT is where the real store has to live.
+    `container` plays two roles at once: it is a valid engagement in its
+    own right, and it is `base.parent`, so `base / ".."` resolves to it.
+    `scan(base)` only walks `base`'s own children (`alpha`, `beta`), so
+    `container` is never among them regardless of what lives there.
+
+    MUTATION: replace `registry.lookup(base, name)` in the overview handler
+    with an entry built from `base / name`. This test must go red -- unlike
+    every case in the parametrize above, which a mutated handler would
+    still 404 for the unrelated reason that nothing is there.
+    """
+    from hx import config as config_mod
+    from hx import engagement as eng_mod
+    from starlette.testclient import TestClient
+
+    from hx.web.app import create_app
+
+    container = tmp_path / "container"
+    shadow_cfg = config_mod.Config(name="shadow", client="Shadow Corp",
+                                   safety_profile="staging",
+                                   scope_include=["https://shadow.test/*"])
+    eng_mod.create(container, shadow_cfg, author="test").db.close()
+
+    base = container / "engagements"
+    base.mkdir()
+    for name, client_name in (("alpha", "Alpha Inc"), ("beta", "Beta Ltd")):
+        cfg = config_mod.Config(name=name, client=client_name,
+                                safety_profile="staging",
+                                scope_include=[f"https://{name}.test/*"])
+        eng_mod.create(base / name, cfg, author="test").db.close()
+
+    with TestClient(create_app(base),
+                    base_url="http://127.0.0.1:8901") as c:
+        response = c.get("/e/%2e%2e")
+
+    assert response.status_code == 404
+    assert "Shadow Corp" not in response.text
+
+
+def test_a_missing_config_file_is_a_404_that_still_carries_the_csp(
+        client, web_base):
+    """A DELETED config.yaml is caught TWICE, deliberately. `registry._entry`
+    catches it the cheap way during the scan `_entry(request)` reads, so
+    `entry.problem is not None` already 404s before `config_mod.load` is
+    ever attempted; the overview handler's own `try/except` around that
+    call (exercised directly by the test below, on a config that survives
+    the cheap check) would catch the same `OSError` a second time if it
+    ever got there. That is intentional redundancy, not slack -- CONFIRMED
+    by removing each guard alone and finding this test still green either
+    way; only removing BOTH turns it red.
+
+    MUTATION: delete BOTH `entry.problem is not None` from `_entry(request)`
+    in `hx/web/app.py` AND the `try/except (config_mod.ConfigError,
+    OSError)` around `config_mod.load` in the overview handler. Either
+    mutation alone leaves this test green -- that is the redundancy
+    working as designed. Only removing both must turn it red, with a 500
+    and no Content-Security-Policy header.
+    """
+    (web_base / "alpha" / "config.yaml").unlink()
+
+    response = client.get("/e/alpha")
+
+    assert response.status_code == 404
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+
+
+def test_malformed_yaml_that_passes_the_cheap_check_is_still_a_404_with_csp(
+        client, web_base):
+    """The fault `registry._entry`'s cheap `read_bytes()` CANNOT catch:
+    a `config.yaml` that exists and is readable but does not parse.
+    `config_mod.load` raising `ConfigError` inside the overview handler
+    used to escape as an uncaught exception -- Starlette's
+    `ServerErrorMiddleware` sits OUTSIDE `_guard`, so that response left
+    with no Content-Security-Policy, no `X-Content-Type-Options` and no
+    `Referrer-Policy` at all, next to a body that is exactly as
+    attacker-reachable as any other response this app sends.
+
+    The CSP assertion is the point, not the status code alone: a plain 404
+    proves the handler stopped the exception; the header proves it stopped
+    it EARLY ENOUGH to still go through `_secured`.
+
+    MUTATION: delete the `try/except (config_mod.ConfigError, OSError)`
+    around `config_mod.load` in the overview handler. This test must go
+    red with a 500 and no Content-Security-Policy header at all.
+    """
+    (web_base / "alpha" / "config.yaml").write_text("not: valid: yaml: [[[")
+
+    response = client.get("/e/alpha")
+
+    assert response.status_code == 404
+    assert "default-src 'none'" in response.headers["content-security-policy"]
 
 
 def test_the_hostname_helper_splits_ports_and_brackets():
@@ -1905,6 +2088,7 @@ Expected: FAIL, `ModuleNotFoundError: No module named 'hx.web.app'`.
 - [ ] **Step 9: Create `src/hx/web/render.py`**
 
 ```python
+# src/hx/web/render.py
 """The Jinja environment, and the filters that must never be forgotten.
 
 AUTOESCAPE IS OURS, NOT A FRAMEWORK DEFAULT. The environment is built here
@@ -1978,6 +2162,7 @@ def templates() -> Jinja2Templates:
 - [ ] **Step 10: Create `src/hx/web/reads.py`**
 
 ```python
+# src/hx/web/reads.py -- the module docstring through overview()
 """Read-only queries, one function per screen.
 
 NOT THE TOOL LAYER, deliberately. `tools/dispatch.py` journals every call --
@@ -1998,6 +2183,22 @@ import sqlite3
 
 from hx import coverage as coverage_mod
 from hx import run as run_mod
+from hx.store.blobs import CorruptBlob
+
+#: `finding.severity`'s CHECK constraint, in the order a reader wants them.
+#: Copied deliberately rather than derived: the column's vocabulary is
+#: closed, and a filter that accepted something the column cannot hold would
+#: silently return nothing and look like a clean result.
+SEVERITIES = ("Critical", "High", "Medium", "Low", "Info")
+
+#: `finding.status`'s CHECK constraint. WIDER than `triage.TARGETS`, and
+#: deliberately: triage may only WRITE two of these, but a store can hold
+#: any of the five and a filter that could not name them would hide rows.
+STATUSES = ("new", "triaged", "confirmed", "false_positive", "reported")
+
+
+class FilterError(Exception):
+    """A filter value outside the column's closed vocabulary."""
 
 
 def _run_rows(conn: sqlite3.Connection, engagement_id: str) -> tuple:
@@ -2089,7 +2290,10 @@ def overview(conn: sqlite3.Connection, engagement_id: str, config) -> dict:
 
 - [ ] **Step 11: Create `src/hx/web/app.py`**
 
+The module docstring, imports and the two top-level constants:
+
 ```python
+# src/hx/web/app.py -- the module docstring, imports and constants through CSP
 """The app: what it serves, and who it refuses to serve it to.
 
 THIS APP SENDS NOTHING. No bridge client, no `Sender`, no socket to the
@@ -2107,16 +2311,22 @@ runs `def` endpoints in a threadpool and `sqlite3` connections default to
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import parse_qsl
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, RedirectResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from hx import config as config_mod
+from hx import halt as halt_mod
+from hx import triage as triage_mod
+from hx.store import db as db_mod
+from hx.store.blobs import BlobStore
 from hx.web import reads as reads_mod
 from hx.web import registry as registry_mod
 from hx.web import render as render_mod
@@ -2132,8 +2342,14 @@ ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 CSP = ("default-src 'none'; script-src 'none'; style-src 'self'; "
        "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; "
        "base-uri 'none'")
+```
 
+Task 6 later inserts `SAFE_METHODS`, `MAX_FORM` and `_TOO_LARGE` between
+`CSP` and `hostname` -- they carry their own marker where they land, so this
+block stops at `CSP`. `hostname` and `_secured`:
 
+```python
+# src/hx/web/app.py -- hostname() and _secured()
 def hostname(header: str) -> str:
     """The host half of a `Host` header, without its port.
 
@@ -2162,8 +2378,13 @@ def _secured(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     return response
+```
 
+Task 6 inserts `_form_fields` and `_same_origin` here, each marked where
+they land. `_guard`, `_entry`, `index` and `overview`:
 
+```python
+# src/hx/web/app.py -- _guard, _entry, index and overview
 async def _guard(request, call_next):
     """The Host allowlist, and the headers every response carries.
 
@@ -2182,6 +2403,13 @@ async def _guard(request, call_next):
     if hostname(request.headers.get("host", "")) not in ALLOWED_HOSTS:
         return _secured(PlainTextResponse("this host is not served here",
                                           status_code=421))
+    if request.method not in SAFE_METHODS and not _same_origin(request):
+        # REFUSED BEFORE THE HANDLER RUNS, which is the whole point: a guard
+        # that rejects after writing is not a guard, and the tests assert
+        # the finding's status is unchanged rather than only that a 403 came
+        # back.
+        return _secured(PlainTextResponse("cross-site write refused",
+                                          status_code=403))
     return _secured(await call_next(request))
 
 
@@ -2211,19 +2439,53 @@ def overview(request):
     entry = _entry(request)
     conn = registry_mod.open_read(entry)
     try:
-        config = config_mod.load(entry.path / "config.yaml")
+        try:
+            # `_entry`'s own check catches the CHEAP fault -- missing or
+            # unreadable -- for every engagement the index scans. Malformed
+            # YAML is only discoverable by parsing, and this is the one
+            # place that cost is paid for one engagement rather than all
+            # of them. Either way the failure becomes a 404 raised INSIDE
+            # this handler, not an uncaught exception: Starlette's
+            # ServerErrorMiddleware sits outside `_guard`, so anything that
+            # escapes this far would leave with no CSP, no `nosniff` and no
+            # `Referrer-Policy` -- exactly the response a captured, hostile
+            # body is rendered next to.
+            config = config_mod.load(entry.path / "config.yaml")
+        except (config_mod.ConfigError, OSError) as exc:
+            raise HTTPException(status_code=404) from exc
         data = reads_mod.overview(conn, entry.engagement_id, config)
+        # Through OperatorHalt rather than by testing for the file, so this
+        # sees a halt recorded in the STORE as well as one on disk --
+        # `halted` is a union, and the two disagree when a harness died
+        # between the two writes. A read-only connection is enough: the
+        # constructor and both properties only SELECT.
+        halt_state = halt_mod.OperatorHalt(entry.path, conn)
+        data["halted"] = halt_state.halted
+        data["halt_reason"] = halt_state.reason
     finally:
         conn.close()
     return request.app.state.templates.TemplateResponse(
         request, "overview.html", {"entry": entry, "config": config, **data})
+```
 
+`surfaces`, `findings`, `finding`, `exchange`, `triage_post` and `halt_post`
+are added by later tasks and marked where they land. `create_app` closes the
+file:
 
+```python
+# src/hx/web/app.py -- create_app()
 def create_app(base) -> Starlette:
     app = Starlette(
         routes=[
             Route("/", index),
             Route("/e/{name}", overview),
+            Route("/e/{name}/surfaces", surfaces),
+            Route("/e/{name}/findings", findings),
+            Route("/e/{name}/findings/{fid}", finding),
+            Route("/e/{name}/exchanges/{xid}", exchange),
+            Route("/e/{name}/findings/{fid}/status", triage_post,
+                  methods=["POST"]),
+            Route("/e/{name}/halt", halt_post, methods=["POST"]),
             Mount("/static",
                   StaticFiles(directory=str(render_mod.STATIC)),
                   name="static"),
@@ -2431,6 +2693,7 @@ is no test on appearance and none is wanted.
 - [ ] **Step 13: Add `hx web` to `src/hx/cli.py`**
 
 ```python
+# src/hx/cli.py -- the web command
 @main.command()
 @click.option("--base", "base", type=click.Path(path_type=Path), default=None,
               help="Directory holding engagements. Defaults to the same "
@@ -2477,6 +2740,7 @@ changes if the query is wrong — never a bare `status_code == 200`, which is
 the vacuous shape this repo has shipped before.
 
 ```python
+# tests/test_web_screens.py -- the overview screen tests
 """Each screen shows the right data, not merely a 200."""
 from __future__ import annotations
 
@@ -2658,6 +2922,7 @@ then a false statement about the data.
 Append to `tests/test_web_screens.py`.
 
 ```python
+# tests/test_web_screens.py -- the surfaces and findings screen tests
 def _surface(conn, eid, sid="s1", method="GET", template="/a"):
     conn.execute(
         "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
@@ -2771,6 +3036,7 @@ Expected: FAIL with 404s from the two missing routes.
 Add the import and both vocabularies below the existing imports:
 
 ```python
+# src/hx/web/reads.py -- SEVERITIES, STATUSES and FilterError
 #: `finding.severity`'s CHECK constraint, in the order a reader wants them.
 #: Copied deliberately rather than derived: the column's vocabulary is
 #: closed, and a filter that accepted something the column cannot hold would
@@ -2790,6 +3056,7 @@ class FilterError(Exception):
 Then both functions:
 
 ```python
+# src/hx/web/reads.py -- surfaces() and findings()
 def surfaces(conn: sqlite3.Connection, engagement_id: str) -> tuple:
     """Every captured surface, with how much was done to it.
 
@@ -2872,6 +3139,7 @@ not already (it did — `overview` uses it).
 - [ ] **Step 4: Add the routes to `src/hx/web/app.py`**
 
 ```python
+# src/hx/web/app.py -- surfaces() and findings()
 def surfaces(request):
     entry = _entry(request)
     conn = registry_mod.open_read(entry)
@@ -2908,6 +3176,7 @@ def findings(request):
 and both routes, after `/e/{name}`:
 
 ```python
+# src/hx/web/app.py -- the surfaces and findings routes
             Route("/e/{name}/surfaces", surfaces),
             Route("/e/{name}/findings", findings),
 ```
@@ -3078,6 +3347,7 @@ toggle, and the side-by-side `replay_as` diff.
 Append to `tests/test_web_screens.py`:
 
 ```python
+# tests/test_web_screens.py -- the finding detail and exchange screen tests
 def test_the_finding_detail_shows_its_evidence_chain(client, alpha_db):
     eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
     _finding(alpha_db, eid, fid="f1")
@@ -3201,6 +3471,7 @@ def test_an_unreadable_blob_says_so_rather_than_showing_an_empty_body(
 Create `tests/test_credentials_never_reach_the_screen.py`:
 
 ```python
+# tests/test_credentials_never_reach_the_screen.py
 """The screen half of `test_credentials_never_reach_the_store.py`.
 
 Section 7's rule -- a credential value never appears in config.yaml, a
@@ -3303,6 +3574,7 @@ Append to `src/hx/web/reads.py`, and add `from hx import triage as triage_mod`
 and `from hx.store.blobs import CorruptBlob` to its imports:
 
 ```python
+# src/hx/web/reads.py -- TEXT, finding_detail(), evidence(), observations(), _body() and exchange()
 #: The encoding every captured byte is shown through, matching
 #: `tools/impl/http.py`'s own `TEXT`. latin-1 round-trips all 256 byte
 #: values, so the viewer shows what was actually on the wire and agrees
@@ -3418,6 +3690,7 @@ In `app.py`, add `from hx import triage as triage_mod` and
 `from hx.store.blobs import BlobStore` to the imports, then:
 
 ```python
+# src/hx/web/app.py -- finding() and exchange()
 def finding(request):
     entry = _entry(request)
     conn = registry_mod.open_read(entry)
@@ -3457,6 +3730,7 @@ def exchange(request):
 and the routes:
 
 ```python
+# src/hx/web/app.py -- the finding and exchange routes
             Route("/e/{name}/findings/{fid}", finding),
             Route("/e/{name}/exchanges/{xid}", exchange),
 ```
@@ -3685,8 +3959,11 @@ accepts" a line you can read.
 Create `tests/test_web_writes.py`.
 
 ```python
+# tests/test_web_writes.py
 """The two acts S8 forbids the agent, and the guard on the way in."""
 from __future__ import annotations
+
+from hx.web import app as app_mod
 
 ORIGIN = {"Origin": "http://127.0.0.1:8901"}
 
@@ -3780,6 +4057,33 @@ def test_a_cross_site_fetch_metadata_header_is_refused(client, alpha_db):
     assert _status(alpha_db) == "new"
 
 
+def test_a_forged_fetch_metadata_paired_with_a_mismatched_origin_is_refused(
+        client, alpha_db):
+    """`Sec-Fetch-Site` cannot be forged by a PAGE, but nothing stops a
+    non-browser client from sending an honest `same-origin` next to a
+    mismatched `Origin` -- no real browser produces that pairing. Trusting
+    `Sec-Fetch-Site` alone whenever it is present would accept it anyway;
+    the two must AGREE when both are on the wire.
+
+    MUTATION: in `_same_origin`, return `fetch_site == "same-origin"`
+    unconditionally instead of also requiring Origin agreement when both
+    headers are present. This test must go red, while
+    `test_a_cross_site_fetch_metadata_header_is_refused` and
+    `test_a_same_origin_post_confirms_the_finding` both stay green.
+    """
+    _finding(alpha_db)
+
+    response = client.post(
+        "/e/alpha/findings/f1/status", data={"status": "confirmed"},
+        headers={"Origin": "https://attacker.example",
+                "Sec-Fetch-Site": "same-origin"},
+        follow_redirects=False)
+
+    assert response.status_code == 403
+    assert _status(alpha_db) == "new"
+    assert _events(alpha_db) == 0
+
+
 def test_a_multipart_body_is_refused(client, alpha_db):
     """The app accepts ONE content type on a path that can change something.
     `python-multipart` is deliberately absent, so `request.form()` would
@@ -3795,6 +4099,32 @@ def test_a_multipart_body_is_refused(client, alpha_db):
                            headers=ORIGIN, follow_redirects=False)
 
     assert response.status_code == 415
+    assert _status(alpha_db) == "new"
+    assert _events(alpha_db) == 0
+
+
+def test_an_oversized_form_body_is_refused(client, alpha_db):
+    """`request.body()` has already buffered the whole thing before
+    `_form_fields` ever checks its length, so `MAX_FORM` is a policy limit
+    ("a triage note this large is not legitimate"), not a memory guard --
+    but the refusal must still land before any write, same as every other
+    refusal in this file, and it must be answered 413 rather than
+    collapsed into the 415 that means something else (wrong content type,
+    which this body did not have).
+
+    MUTATION: delete the `len(body) > MAX_FORM` check from `_form_fields`
+    (or make it always False). This test must go red.
+    """
+    _finding(alpha_db)
+    oversized = "note=" + "a" * (app_mod.MAX_FORM + 1)
+
+    response = client.post(
+        "/e/alpha/findings/f1/status", content=oversized,
+        headers={**ORIGIN,
+                "Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=False)
+
+    assert response.status_code == 413
     assert _status(alpha_db) == "new"
     assert _events(alpha_db) == 0
 
@@ -3874,6 +4204,48 @@ def test_a_halted_engagement_says_so_on_the_overview(client, web_base):
     assert "hx resume" in body
 
 
+def test_a_healthy_engagement_offers_the_stop_button(client):
+    """The other half of the union: nothing halted means the STOP form
+    renders and the banner does not. Without this test,
+    `test_a_halted_engagement_says_so_on_the_overview` cannot tell "the
+    banner tracks halt state" apart from "the banner is always on".
+
+    MUTATION: hardcode `data["halted"] = True` in the overview handler.
+    This test must go red.
+    """
+    body = client.get("/e/alpha").text
+
+    assert "HALTED" not in body
+    assert 'action="/e/alpha/halt"' in body
+    assert "STOP issuance" in body
+
+
+def test_a_halt_recorded_only_in_the_store_still_shows(client, alpha_db):
+    """`OperatorHalt.halted` is a union of the STORE and the sentinel FILE,
+    and the union is load-bearing in both directions: an operator can
+    `touch` the sentinel from a shell when the bridge is dead (a file with
+    no row behind it), and a harness can die between writing the row and
+    writing the file (a row with no sentinel on disk). This is the second
+    case -- the row lands, the file never does -- written directly the way
+    `OperatorHalt.halt()` orders its own two writes, so the test does not
+    depend on that method to prove the READ side of the union.
+
+    MUTATION: change `data["halted"] = halt_state.halted` to
+    `data["halted"] = halt_state.sentinel_path.exists()` in the overview
+    handler. This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO agent_action(id, engagement_id, run_id, ts_us, actor,"
+        " tool, why) VALUES('a-store-only', ?, NULL, 1, 'operator', 'halt',"
+        " 'stopped from the store')", (eid,))
+
+    body = client.get("/e/alpha").text
+
+    assert "HALTED" in body
+    assert "stopped from the store" in body
+
+
 def test_stop_is_refused_cross_origin(client, web_base):
     """MUTATION: exempt `/halt` from the guard. Must go red."""
     response = client.post("/e/alpha/halt", data={"reason": "x"},
@@ -3898,34 +4270,62 @@ exists.
 Add the imports:
 
 ```python
+# src/hx/web/app.py -- the import block, updated for the write guard
+from __future__ import annotations
+
+from pathlib import Path
 from urllib.parse import parse_qsl
 
+from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import RedirectResponse
+from starlette.exceptions import HTTPException
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import PlainTextResponse, RedirectResponse
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
+from hx import config as config_mod
 from hx import halt as halt_mod
 from hx import triage as triage_mod
 from hx.store import db as db_mod
+from hx.store.blobs import BlobStore
+from hx.web import reads as reads_mod
+from hx.web import registry as registry_mod
+from hx.web import render as render_mod
 ```
 
 Add the constant beside `CSP`:
 
 ```python
+# src/hx/web/app.py -- SAFE_METHODS, MAX_FORM and _TOO_LARGE
 #: Methods that cannot change anything, and so need no cross-site guard.
 #: HEAD and OPTIONS are here because a guard that broke them would break
 #: ordinary browsers on a read-only app.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
-#: The largest form body either write route will read. Both carry a status
-#: word and a note; 64 KiB is generous for that and finite, which is the
-#: property that matters -- `request.body()` reads the whole thing into
-#: memory before anyone looks at it.
+#: The largest form body either write route will accept. Both carry a
+#: status word and a note; 64 KiB is generous for that and finite. NOT a
+#: memory guard -- `request.body()` has already buffered the whole thing
+#: before this check runs, so an oversized POST costs the same memory
+#: either way. This is a policy limit ("a triage note this large is not
+#: legitimate"), acceptable here because the loopback bind and the
+#: same-origin guard already stand in front of it; a real DoS control would
+#: need to cap `request.stream()` before buffering, which neither write
+#: route needs.
 MAX_FORM = 64 * 1024
+
+#: Returned by `_form_fields` when the body passed the content-type check
+#: but exceeded `MAX_FORM`, kept distinct from `None` so a 70 KiB
+#: urlencoded body is answered 413 ("too large") rather than 415 ("wrong
+#: content type", which it was not).
+_TOO_LARGE = object()
 ```
 
 and the body reader, above `_same_origin`:
 
 ```python
+# src/hx/web/app.py -- _form_fields()
 async def _form_fields(request):
     """The two write routes' form, or None if the request is not one.
 
@@ -3940,16 +4340,20 @@ async def _form_fields(request):
     `parse_qsl` is stdlib doing what it has done correctly for decades
     rather than a parser written here.
 
-    None means "this was not a form this app accepts", and the caller
-    answers 415. An empty dict is a different thing: a well-formed empty
-    form, which `set_status` then refuses on its own terms.
+    Three outcomes, not two. `None` means "this was not a form this app
+    accepts" and the caller answers 415. `_TOO_LARGE` means the content type
+    was right but the body was not, and the caller answers 413 -- collapsing
+    the two into one refusal would tell an oversized urlencoded body it sent
+    the wrong content type, which it did not. An empty dict is a third,
+    different thing again: a well-formed empty form, which `set_status`
+    then refuses on its own terms.
     """
     ctype = request.headers.get("content-type", "")
     if ctype.split(";")[0].strip().lower() != "application/x-www-form-urlencoded":
         return None
     body = await request.body()
     if len(body) > MAX_FORM:
-        return None
+        return _TOO_LARGE
     return dict(parse_qsl(body.decode("utf-8", "replace"),
                           keep_blank_values=True))
 ```
@@ -3957,13 +4361,21 @@ async def _form_fields(request):
 Add the check above `_guard`:
 
 ```python
+# src/hx/web/app.py -- _same_origin()
 def _same_origin(request) -> bool:
     """Whether a state-changing request came from this app's own pages.
 
     `Sec-Fetch-Site` FIRST and decisively: it is the browser's own account
     of where the request came from, and a page cannot forge it. When it is
-    absent -- an older browser, or a client that is not a browser -- the
-    fallback is an exact `Origin` match against THIS request's own origin.
+    the ONLY signal present -- an older browser, or a client that is not a
+    browser -- the fallback is an exact `Origin` match against THIS
+    request's own origin.
+
+    When BOTH headers are present, they must AGREE. `Sec-Fetch-Site` cannot
+    be forged by a page, but nothing stops a non-browser client from
+    sending an honest `same-origin` next to a mismatched `Origin` -- no real
+    browser produces that pairing, so a request carrying it is lying about
+    something, and `Sec-Fetch-Site` alone would have waved it through.
 
     Exact, not "the origin's host is in ALLOWED_HOSTS": another web app on
     this machine is not this web app, and a host-level comparison would let
@@ -3974,32 +4386,43 @@ def _same_origin(request) -> bool:
     strict answer is a curl command that needs one more flag, against a
     silent write from a page the operator merely visited.
     """
+    expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+    origin = request.headers.get("origin")
+
     fetch_site = request.headers.get("sec-fetch-site")
     if fetch_site is not None:
-        return fetch_site == "same-origin"
-    origin = request.headers.get("origin")
+        if fetch_site != "same-origin":
+            return False
+        return origin is None or origin == expected
+
     if not origin:
         return False
-    return origin == f"{request.url.scheme}://{request.headers.get('host', '')}"
+    return origin == expected
 ```
 
 and the branch inside `_guard`, immediately after the Host check:
 
 ```python
+# src/hx/web/app.py -- the cross-site branch inside _guard
     if request.method not in SAFE_METHODS and not _same_origin(request):
         # REFUSED BEFORE THE HANDLER RUNS, which is the whole point: a guard
         # that rejects after writing is not a guard, and the tests assert
         # the finding's status is unchanged rather than only that a 403 came
         # back.
-        return PlainTextResponse("cross-site write refused", status_code=403)
+        return _secured(PlainTextResponse("cross-site write refused",
+                                          status_code=403))
 ```
 
 - [ ] **Step 4: Add the two routes**
 
 ```python
+# src/hx/web/app.py -- triage_post() and halt_post()
 async def triage_post(request):
     entry = _entry(request)
     form = await _form_fields(request)
+    if form is _TOO_LARGE:
+        return PlainTextResponse(
+            f"request body exceeds {MAX_FORM} bytes", status_code=413)
     if form is None:
         return PlainTextResponse(
             "this route accepts application/x-www-form-urlencoded only",
@@ -4028,6 +4451,9 @@ async def triage_post(request):
 async def halt_post(request):
     entry = _entry(request)
     form = await _form_fields(request)
+    if form is _TOO_LARGE:
+        return PlainTextResponse(
+            f"request body exceeds {MAX_FORM} bytes", status_code=413)
     if form is None:
         return PlainTextResponse(
             "this route accepts application/x-www-form-urlencoded only",
@@ -4048,6 +4474,7 @@ async def halt_post(request):
 and the routes:
 
 ```python
+# src/hx/web/app.py -- the triage and halt routes
             Route("/e/{name}/findings/{fid}/status", triage_post,
                   methods=["POST"]),
             Route("/e/{name}/halt", halt_post, methods=["POST"]),
@@ -4058,6 +4485,7 @@ and the routes:
 In `app.py`'s `overview` handler, inside the `try`, after `data = ...`:
 
 ```python
+# src/hx/web/app.py -- the halt banner added to overview
         # Through OperatorHalt rather than by testing for the file, so this
         # sees a halt recorded in the STORE as well as one on disk --
         # `halted` is a union, and the two disagree when a harness died
@@ -4135,7 +4563,16 @@ One at a time, on a clean tree — batching misattributes results.
 | Remove `\| redact` from `exchange.html`'s URL | `test_url_userinfo_never_reaches_the_exchange_screen` |
 | `findings` ignores an unknown filter value | `test_an_unknown_filter_value_is_refused_rather_than_ignored` |
 | Return the Host refusal directly, not through `_secured` | `test_a_refusal_carries_the_headers_too` |
+| Return the cross-site 403 directly, not through `_secured` | `test_a_refusal_carries_the_headers_too` |
 | Drop the content-type check from `_form_fields` | `test_a_multipart_body_is_refused` |
+| Delete the `MAX_FORM` size check from `_form_fields` | `test_an_oversized_form_body_is_refused` |
+| `data["halted"] = True` in the overview handler | `test_a_healthy_engagement_offers_the_stop_button` |
+| `data["halted"] = halt_state.sentinel_path.exists()` | `test_a_halt_recorded_only_in_the_store_still_shows` |
+
+**A mutation with no test beside it is not a passing row, it is a missing
+one.** The first version of this table had nine rows and the branch had
+eleven mutable invariants; "11 of 11 went red" was a true statement about an
+incomplete list. When you add a guard, add its row here in the same change.
 
 For each: apply it, run the named test, confirm it FAILS, revert with
 `git checkout -- <file>`, and record the result. **A mutation that leaves

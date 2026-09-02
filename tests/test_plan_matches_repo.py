@@ -362,7 +362,53 @@ def test_a_stale_excerpt_is_caught_where_a_whole_file_compare_never_looked(tmp_p
 # the paragraph above says the active-checks plan turned this suite red by
 # adding fourteen markers without moving it. Moving it deliberately is the
 # decision this constant exists to make somebody write down.
-EXPECTED_BLOCKS = 183
+#
+# 229 = 183 plus the FORTY-SIX the web-app-foundation plan contributes on
+# 2026-09-01, the day its six tasks were finished and the plan was armed for
+# closing. All forty-six compare against code that already exists, unlike
+# the egress plan's sixteen above -- this wave marks at the END of a plan's
+# execution, the ordinary case the rule at 341 describes. They are:
+#   Task 1 (3): `tests/test_coverage.py` split across its two writing
+#     steps; `src/hx/run.py`'s `stale_before_us`/`is_stale` and its rewritten
+#     `reap_stale`, two excerpts since Task 1's own docstring fix (below)
+#     sits between them.
+#   Task 2 (7): `tests/test_triage.py` and `src/hx/triage.py` whole;
+#     `tests/test_cli_triage.py` whole; three excerpts of `src/hx/cli.py`
+#     and `src/hx/report.py` for the `triage` command and its import; the
+#     dismissed/confirmed report tests appended to `tests/test_report.py`;
+#     `src/hx/report.py`'s `_status()`.
+#   Task 3 (10): `tests/test_web_registry.py`, `src/hx/web/registry.py`,
+#     `tests/test_web_security.py` and `src/hx/web/render.py` whole; the web
+#     fixtures in `tests/conftest.py`; `src/hx/web/reads.py` through
+#     `overview()`; `src/hx/cli.py`'s `web` command; the overview screen
+#     tests; and `src/hx/web/app.py`'s Step 11 block, split into FOUR
+#     excerpts (imports-through-CSP, `hostname`/`_secured`, `_guard`
+#     through `overview`, `create_app`) because Task 6 lands
+#     `_form_fields`/`_same_origin` and its constants in the middle of what
+#     was one contiguous block when Task 3 wrote it -- the same shape as
+#     the Interface Contract split noted at the top of this file.
+#   Task 4 (6): the surfaces/findings screen tests; `SEVERITIES`,
+#     `STATUSES` and `FilterError`, and `surfaces()`/`findings()`, in
+#     `src/hx/web/reads.py`; the matching pair in `src/hx/web/app.py`; and
+#     their two routes.
+#   Task 5 (6): `tests/test_credentials_never_reach_the_screen.py` whole;
+#     the finding/exchange screen tests; the evidence-chain reads appended
+#     to `src/hx/web/reads.py`; `finding()`/`exchange()` in
+#     `src/hx/web/app.py`; and their two routes.
+#   Task 6 (10): `tests/test_web_writes.py` whole (294 lines today, not the
+#     197 Step 1 wrote -- a later fix round extended it and this block now
+#     tracks the current file); the import block, `SAFE_METHODS`/
+#     `MAX_FORM`/`_TOO_LARGE`, `_form_fields()`, `_same_origin()`, the
+#     cross-site branch inside `_guard`, `triage_post()`/`halt_post()`,
+#     their two routes and the halt banner added to `overview()`, all in
+#     `src/hx/web/app.py`.
+# `src/hx/run.py`'s `is_stale` docstring is the one place this wave went
+# the other way: the plan already had the corrected paragraph explaining
+# `started_us if heartbeat_us is None else heartbeat_us` over `heartbeat_us
+# or started_us`, and `run.py` was fixed to match the plan rather than the
+# plan synced down to the stale code -- so that block reads "unchanged"
+# above, not "synced".
+EXPECTED_BLOCKS = 229
 
 
 def test_the_check_actually_found_some_blocks():

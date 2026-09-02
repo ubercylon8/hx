@@ -205,11 +205,16 @@ def is_stale(status: str, heartbeat_us: int | None, started_us: int,
     never render as a clean one, and neither must one that merely STOPPED
     BEING UPDATED".
 
-    The `heartbeat_us or started_us` fallback is what `reap_stale`'s SQL
-    spelled `COALESCE`, and it is load-bearing for the same reason: the
-    column is NULLable, and a run that died BEFORE its first heartbeat is
-    precisely what this mechanism is for. `started_us` is NOT NULL, so a run
-    that started long ago and never reported is stale on its own evidence.
+    The fallback to `started_us` is what `reap_stale`'s SQL spelled
+    `COALESCE`, and it is load-bearing for the same reason: the column is
+    NULLable, and a run that died BEFORE its first heartbeat is precisely
+    what this mechanism is for. `started_us` is NOT NULL, so a run that
+    started long ago and never reported is stale on its own evidence.
+
+    `if heartbeat_us is None` AND NOT `heartbeat_us or started_us`: a
+    heartbeat of 0 is a real timestamp at the epoch, and `or` would discard
+    it for `started_us`. SQL's COALESCE tests for NULL, not falsiness, so
+    the truthiness spelling would not have been the same rule.
     """
     if status != "running":
         return False
