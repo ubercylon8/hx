@@ -18,6 +18,7 @@ import sqlite3
 
 from hx import coverage as coverage_mod
 from hx import run as run_mod
+from hx.store.blobs import CorruptBlob
 
 #: `finding.severity`'s CHECK constraint, in the order a reader wants them.
 #: Copied deliberately rather than derived: the column's vocabulary is
@@ -191,3 +192,112 @@ def findings(conn: sqlite3.Connection, engagement_id: str, *,
         "status": r[4], "check_id": r[5], "host": r[6],
         "method": r[7], "path_template": r[8],
     } for r in rows)
+
+
+#: The encoding every captured byte is shown through, matching
+#: `tools/impl/http.py`'s own `TEXT`. latin-1 round-trips all 256 byte
+#: values, so the viewer shows what was actually on the wire and agrees
+#: with what `http.grep` matched against. utf-8 with `errors="replace"`
+#: would show a body the target never sent.
+TEXT = "latin-1"
+
+
+def finding_detail(conn: sqlite3.Connection, finding_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT f.id, f.title, f.description, f.impact, f.remediation, f.cwe,"
+        " f.references_json, f.severity, f.severity_source, f.confidence,"
+        " f.created_by, f.status, f.check_id, f.issue_type_id, f.payload,"
+        " f.insertion_name, f.insertion_kind, f.host, f.scope_level,"
+        " f.first_seen_run, f.last_seen_run, s.method, s.path_template"
+        " FROM finding f LEFT JOIN surface s ON s.id = f.surface_id"
+        " WHERE f.id=?", (finding_id,)).fetchone()
+    if row is None:
+        return None
+    keys = ("id", "title", "description", "impact", "remediation", "cwe",
+            "references_json", "severity", "severity_source", "confidence",
+            "created_by", "status", "check_id", "issue_type_id", "payload",
+            "insertion_name", "insertion_kind", "host", "scope_level",
+            "first_seen_run", "last_seen_run", "method", "path_template")
+    return dict(zip(keys, row))
+
+
+def evidence(conn: sqlite3.Connection, finding_id: str) -> tuple:
+    """The evidence chain, in the order it was attached.
+
+    Joined out to the exchange so a row can be read without a second click:
+    what was sent, what came back, and whether the exchange completed at
+    all. `outcome` is on the row deliberately -- evidence pointing at a
+    timed-out exchange is evidence of nothing, and a chain that hid that
+    would let a finding look better supported than it is.
+    """
+    rows = conn.execute(
+        "SELECT e.id, e.seq, e.role, e.kind, e.exchange_id, e.ref, e.note,"
+        " e.captured_us, x.method, x.url, x.status, x.outcome"
+        " FROM evidence e LEFT JOIN exchange x ON x.id = e.exchange_id"
+        " WHERE e.finding_id=? ORDER BY e.seq, e.id", (finding_id,)).fetchall()
+    keys = ("id", "seq", "role", "kind", "exchange_id", "ref", "note",
+            "captured_us", "method", "url", "status", "outcome")
+    return tuple(dict(zip(keys, r)) for r in rows)
+
+
+def observations(conn: sqlite3.Connection, finding_id: str) -> tuple:
+    """Whether each run still saw this finding.
+
+    `observed = 0` on the latest run is what the report renders as "appears
+    fixed; verify before closing", and the screen must be able to say the
+    same thing -- a retest whose result lives only in the deliverable is a
+    retest the operator cannot check before shipping it.
+    """
+    rows = conn.execute(
+        "SELECT o.run_id, o.observed, o.severity_at, o.confidence_at,"
+        " o.ts_us, r.kind, r.status FROM finding_observation o"
+        " JOIN run r ON r.id = o.run_id WHERE o.finding_id=?"
+        " ORDER BY o.ts_us, o.run_id", (finding_id,)).fetchall()
+    keys = ("run_id", "observed", "severity_at", "confidence_at", "ts_us",
+            "kind", "status")
+    return tuple(dict(zip(keys, r)) for r in rows)
+
+
+def _body(blobs, digest, expected_len=None) -> tuple[str, str | None]:
+    """One blob as text, or an honest account of why it is not here.
+
+    Returns `(text, problem)`. A body that COULD NOT BE READ must never
+    render as a body that was EMPTY -- that is S12's distinction at the
+    level of one panel, and returning `b""` on `CorruptBlob` is exactly the
+    collapse it forbids.
+    """
+    if digest is None:
+        return "", None
+    try:
+        return blobs.get(digest, expected_len).decode(TEXT), None
+    except CorruptBlob as exc:
+        return "", f"this body could not be read: {exc}"
+    except OSError as exc:
+        return "", f"this body could not be read: {exc}"
+
+
+def exchange(conn: sqlite3.Connection, blobs, exchange_id: str) -> dict | None:
+    """One exchange, both halves, as text.
+
+    NO REDACTION HAPPENS HERE. `Redactor.java` runs extension-side before
+    hashing, so these bytes already carry `{{identity:<id>:authz}}` and
+    `{{observed:set-cookie}}` where credentials were. S4: Python must never
+    gain a second place that decides any of this. The URL COLUMN is
+    different and is redacted in the template, through `records.redact_url`
+    -- the rule the Java side already shares character for character.
+    """
+    row = conn.execute(
+        "SELECT id, run_id, surface_id, via, outcome, sent_us, recv_us,"
+        " method, url, status, req_blob, resp_blob, resp_len, body_shed,"
+        " identity, identity_state, resolved_ip"
+        " FROM exchange WHERE id=?", (exchange_id,)).fetchone()
+    if row is None:
+        return None
+    keys = ("id", "run_id", "surface_id", "via", "outcome", "sent_us",
+            "recv_us", "method", "url", "status", "req_blob", "resp_blob",
+            "resp_len", "body_shed", "identity", "identity_state",
+            "resolved_ip")
+    out = dict(zip(keys, row))
+    out["request"], out["request_problem"] = _body(blobs, row[10])
+    out["response"], out["response_problem"] = _body(blobs, row[11], row[12])
+    return out

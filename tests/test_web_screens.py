@@ -212,3 +212,123 @@ def test_the_findings_screen_shows_the_current_status(client, alpha_db):
     _finding(alpha_db, eid, fid="f1", status="confirmed")
 
     assert "confirmed" in client.get("/e/alpha/findings").text
+
+
+def test_the_finding_detail_shows_its_evidence_chain(client, alpha_db):
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _finding(alpha_db, eid, fid="f1")
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status) VALUES('r1',?,'scan','staging',1,'completed')", (eid,))
+    alpha_db.execute(
+        "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method, url,"
+        " status) VALUES('x1','r1','send','ok',1,'GET',"
+        "'https://alpha.test/search?q=1',200)")
+    alpha_db.execute(
+        "INSERT INTO evidence(id, finding_id, seq, role, kind, exchange_id,"
+        " note, captured_us) VALUES('ev1','f1',1,'proof','exchange','x1',"
+        "'the payload came back verbatim',1)")
+
+    body = client.get("/e/alpha/findings/f1").text
+
+    assert "the payload came back verbatim" in body
+    assert "x1" in body
+
+
+def test_the_finding_detail_shows_its_status_history(client, alpha_db):
+    from hx import triage as triage_mod
+
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    _finding(alpha_db, eid, fid="f1")
+    triage_mod.set_status(alpha_db, finding_id="f1",
+                          to_status="false_positive",
+                          note="header is set at the CDN")
+
+    body = client.get("/e/alpha/findings/f1").text
+
+    assert "header is set at the CDN" in body
+    assert "human" in body
+
+
+def test_an_unknown_finding_is_a_404(client):
+    assert client.get("/e/alpha/findings/f-nope").status_code == 404
+
+
+def test_the_exchange_view_shows_both_halves(client, alpha_db, web_base):
+    from hx.store.blobs import BlobStore
+
+    blobs = BlobStore(web_base / "alpha" / "blobs")
+    req_digest, req_len = blobs.put(b"GET /search?q=1 HTTP/1.1\r\n"
+                                    b"Host: alpha.test\r\n\r\n")
+    resp_digest, resp_len = blobs.put(b"HTTP/1.1 200 OK\r\n"
+                                      b"Content-Type: text/html\r\n\r\n"
+                                      b"<b>hello</b>")
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status) VALUES('r1',?,'scan','staging',1,'completed')", (eid,))
+    alpha_db.execute(
+        "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method, url,"
+        " status, req_blob, resp_blob, resp_len)"
+        " VALUES('x1','r1','send','ok',1,'GET','https://alpha.test/search',"
+        f"200,'{req_digest}','{resp_digest}',{resp_len})")
+
+    body = client.get("/e/alpha/exchanges/x1").text
+
+    assert "Host: alpha.test" in body
+    assert "Content-Type: text/html" in body
+
+
+def test_a_hostile_response_body_is_escaped_not_executed(
+        client, alpha_db, web_base):
+    """THE CORE THREAT of spec section 4, at the screen it actually lands
+    on. A response body is attacker-influenced by definition -- half the
+    check corpus exists to find places where attacker input comes back in
+    one -- and this app renders it into a browser with no authentication in
+    front of it.
+
+    MUTATION: pass `autoescape=False` in `render.templates()`. This test
+    must go red. It asserts the RAW form is ABSENT rather than that an
+    escaped form is present, because a page can hold both.
+    """
+    from hx.store.blobs import BlobStore
+
+    payload = b"<script>fetch('/e/beta')</script>"
+    blobs = BlobStore(web_base / "alpha" / "blobs")
+    digest, length = blobs.put(b"HTTP/1.1 200 OK\r\n\r\n" + payload)
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status) VALUES('r1',?,'scan','staging',1,'completed')", (eid,))
+    alpha_db.execute(
+        "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method, url,"
+        " status, resp_blob, resp_len)"
+        " VALUES('x1','r1','send','ok',1,'GET','https://alpha.test/',200,"
+        f"'{digest}',{length})")
+
+    body = client.get("/e/alpha/exchanges/x1").text
+
+    assert payload.decode() not in body
+    assert "&lt;script&gt;" in body
+
+
+def test_an_unreadable_blob_says_so_rather_than_showing_an_empty_body(
+        client, alpha_db):
+    """S12 at the level of one panel: a body that could not be read must not
+    render as a body that was empty. The exchange row names a digest whose
+    file was never written.
+
+    MUTATION: catch `CorruptBlob` and return `b""`. This test must go red.
+    """
+    eid = alpha_db.execute("SELECT id FROM engagement").fetchone()[0]
+    alpha_db.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status) VALUES('r1',?,'scan','staging',1,'completed')", (eid,))
+    alpha_db.execute(
+        "INSERT INTO exchange(id, run_id, via, outcome, sent_us, method, url,"
+        " status, resp_blob) VALUES('x1','r1','send','ok',1,'GET',"
+        "'https://alpha.test/',200,'" + "0" * 64 + "')")
+
+    body = client.get("/e/alpha/exchanges/x1").text
+
+    assert "could not be read" in body

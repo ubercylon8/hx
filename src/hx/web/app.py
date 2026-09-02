@@ -25,6 +25,8 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from hx import config as config_mod
+from hx import triage as triage_mod
+from hx.store.blobs import BlobStore
 from hx.web import reads as reads_mod
 from hx.web import registry as registry_mod
 from hx.web import render as render_mod
@@ -173,6 +175,42 @@ def findings(request):
         })
 
 
+def finding(request):
+    entry = _entry(request)
+    conn = registry_mod.open_read(entry)
+    try:
+        detail = reads_mod.finding_detail(conn, request.path_params["fid"])
+        if detail is None:
+            raise HTTPException(status_code=404)
+        context = {
+            "entry": entry,
+            "finding": detail,
+            "evidence": reads_mod.evidence(conn, detail["id"]),
+            "observations": reads_mod.observations(conn, detail["id"]),
+            "history": triage_mod.history(conn, detail["id"]),
+            "targets": triage_mod.TARGETS,
+            "note_required": triage_mod.NOTE_REQUIRED,
+        }
+    finally:
+        conn.close()
+    return request.app.state.templates.TemplateResponse(
+        request, "finding.html", context)
+
+
+def exchange(request):
+    entry = _entry(request)
+    conn = registry_mod.open_read(entry)
+    try:
+        data = reads_mod.exchange(conn, BlobStore(entry.path / "blobs"),
+                                  request.path_params["xid"])
+        if data is None:
+            raise HTTPException(status_code=404)
+    finally:
+        conn.close()
+    return request.app.state.templates.TemplateResponse(
+        request, "exchange.html", {"entry": entry, "exchange": data})
+
+
 def create_app(base) -> Starlette:
     app = Starlette(
         routes=[
@@ -180,6 +218,8 @@ def create_app(base) -> Starlette:
             Route("/e/{name}", overview),
             Route("/e/{name}/surfaces", surfaces),
             Route("/e/{name}/findings", findings),
+            Route("/e/{name}/findings/{fid}", finding),
+            Route("/e/{name}/exchanges/{xid}", exchange),
             Mount("/static",
                   StaticFiles(directory=str(render_mod.STATIC)),
                   name="static"),
