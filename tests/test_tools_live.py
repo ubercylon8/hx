@@ -97,12 +97,32 @@ def test_a_successful_launch_binds_the_session_and_reports_its_ports(
 
 
 def test_a_scan_run_gets_one_too(tool_ctx, monkeypatch):
-    """EGRESS_KINDS is two kinds, not one. `manual` alone would leave the
+    """EGRESS_KINDS is three kinds, not one. `manual` alone would leave the
     agent's own check pass -- the one thing in section 8 that certainly
     sends -- reporting `not_needed` for a run that needs it most."""
     monkeypatch.setattr(session_mod, "session", _fake_session)
     tool_ctx.stack = contextlib.ExitStack()
     assert live.open_for(tool_ctx, "run-1", "scan")["live"] is True
+
+
+def test_a_crawl_run_gets_one_too(tool_ctx, monkeypatch):
+    """Ruling 21: `crawl` belongs in `EGRESS_KINDS`. Left out, `run.start
+    (kind="crawl")` would answer `not_needed`, no Burp would launch, and
+    `crawl.run` would have no `crawler_port` to dial -- a crawl that found
+    nothing presenting as a crawl that reached nothing, with no error
+    anywhere to say so.
+
+    MUTATION: drop `crawl` back out of `EGRESS_KINDS`. Must go red -- the
+    only other way `open_for` answers `live: True` is `ctx.session is not
+    None` already (`_held`, tested above), and this test's `tool_ctx` fixture
+    starts with `session=None`, so that path cannot produce this result
+    either.
+    """
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    got = live.open_for(tool_ctx, "run-1", "crawl")
+    assert got["live"] is True
+    assert got["crawler_port"] == 18081
 
 
 def test_a_second_egress_run_is_told_who_holds_the_session(

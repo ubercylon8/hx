@@ -37,9 +37,13 @@ from .. import session as session_mod
 #: Run kinds that imply traffic this side issues. `browse` is the operator's
 #: own browser through `hx capture start`, which owns its own Burp -- spec
 #: section 8: "a browse run never needed the tool layer to launch anything".
-#: `crawl` is here for completeness and is not in the set, because `crawl.run`
-#: is permanently unavailable and a crawl run has nothing to send.
-EGRESS_KINDS = frozenset({"manual", "scan"})
+#: `crawl` IS in the set: `crawl.run` drives a real browser through this
+#: session's `crawler_port`, and a crawl run with no session would have no
+#: proxy port to hand it -- `run.start(kind="crawl")` would answer
+#: `not_needed`, no Burp would launch, and `crawl.run` would find no
+#: `crawler_port` to dial, presenting as a crawl that found nothing rather
+#: than as the missing instrument it actually is.
+EGRESS_KINDS = frozenset({"manual", "scan", "crawl"})
 
 #: `hx.session.session`'s `instance`, which names both the `-Dhx.instance` the
 #: extension reports and the directory under the engagement root this session

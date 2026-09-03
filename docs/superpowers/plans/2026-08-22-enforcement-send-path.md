@@ -454,6 +454,12 @@ public class PolicyTest {
         t("theRefusalOrderIsPinned", PolicyTest::theRefusalOrderIsPinned);
         t("aBrokenGateIsNeverAnAllow", PolicyTest::aBrokenGateIsNeverAnAllow);
         t("policyNamesNoBurpType", PolicyTest::policyNamesNoBurpType);
+        t("renderAllowLetsASubresourceThroughForTheCrawler",
+          PolicyTest::renderAllowLetsASubresourceThroughForTheCrawler);
+        t("renderAllowDoesNotWidenTheSendPath",
+          PolicyTest::renderAllowDoesNotWidenTheSendPath);
+        t("scopeExcludeStillBeatsRenderAllow",
+          PolicyTest::scopeExcludeStillBeatsRenderAllow);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -3570,6 +3576,68 @@ public class PolicyTest {
             check(f.getFileName() + " names no burp.* type", !text.contains("burp."));
         }
     }
+
+    // ---- render.allow ----------------------------------------------------
+    //
+    // render.allow is a concession to RENDERING, consulted only by
+    // decideCrawl -- never by decide(), which is what the send path spends
+    // through Sender. Three properties, each pinned by exactly one test:
+    //   1. it lets the crawler through to an otherwise out-of-scope
+    //      subresource;
+    //   2. it does NOT widen what decide() -- the CHECK path -- will send a
+    //      probe to;
+    //   3. scope.exclude still outranks it, because an exclusion is the
+    //      operator naming something they know they must not touch.
+
+    /** MUTATION: delete the render.allow loop from checkScope (or make it
+     *  unreachable, e.g. by never setting renderAllow true for the crawler).
+     *  Must go red: decideCrawl would then deny a subresource render.allow
+     *  is supposed to let through. */
+    static void renderAllowLetsASubresourceThroughForTheCrawler() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation auth = authorised(
+                "scope.include", "https://app.test/*",
+                "render.allow", "https://cdn.test/*");
+        HxRequest r = req("GET", "https://cdn.test/app.js", "cdn.test", "/app.js", "");
+        Decision d = p.decideCrawl(r, auth);
+        check("crawler may render an allowed third-party subresource (got "
+              + (d.allowed() ? "allow" : d.errorClass() + ": " + d.detail()) + ")",
+              d.allowed());
+    }
+
+    /** THE SEPARATING CASE. MUTATION: make decideBeforeGate (or
+     *  beforeGate's default) pass renderAllow=true, so decide() consults
+     *  render.allow too. Must go red -- a rendering concession must not widen
+     *  what a CHECK can send a probe to. */
+    static void renderAllowDoesNotWidenTheSendPath() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation auth = authorised(
+                "scope.include", "https://app.test/*",
+                "render.allow", "https://cdn.test/*");
+        HxRequest r = req("GET", "https://cdn.test/app.js", "cdn.test", "/app.js", "");
+        Decision d = p.decide(r, auth);
+        check("render.allow does not widen decide() (got "
+              + (d.allowed() ? "allow" : d.errorClass()) + ")",
+              !d.allowed());
+    }
+
+    /** MUTATION: move the render.allow loop above the excludes loop in
+     *  checkScope. Must go red: a pattern under scope.exclude has to keep
+     *  beating a render.allow pattern that would otherwise cover the same
+     *  URL. */
+    static void scopeExcludeStillBeatsRenderAllow() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation auth = authorised(
+                "scope.include", "https://app.test/*",
+                "scope.exclude", "https://cdn.test/secret/*",
+                "render.allow", "https://cdn.test/*");
+        HxRequest r = req("GET", "https://cdn.test/secret/k.js",
+                          "cdn.test", "/secret/k.js", "");
+        Decision d = p.decideCrawl(r, auth);
+        check("scope.exclude outranks render.allow (got "
+              + (d.allowed() ? "allow" : d.errorClass()) + ")",
+              !d.allowed());
+    }
     /**
      * Round 7, CRITICAL. The query half got NONE of the byte folds the path
      * half got.
@@ -4488,6 +4556,21 @@ public final class Policy {
     }
 
     /**
+     * The CRAWLER's question: everything decide() asks, plus render.allow.
+     *
+     * A sibling rather than a flag on decide(), for the reason decideScopeOnly
+     * is a sibling: the caller identity is the whole difference, and a
+     * boolean at 30 call sites is a boolean somebody passes true from the send
+     * path. ChokepointTest counts issuing call sites; this adds one, and it is
+     * ProxyGate's CRAWLER branch.
+     */
+    public Decision decideCrawl(HxRequest req, BridgeClient.Authorisation auth) {
+        Decision before = beforeGate(req, auth, true);
+        if (!before.allowed()) return before;
+        return checkGate(req);
+    }
+
+    /**
      * Everything decide() settles WITHOUT spending anything:
      * not_configured -> scope_denied -> method_denied -> dangerous_denied.
      *
@@ -4499,11 +4582,21 @@ public final class Policy {
      * exactly that reason, and there is one of each.
      */
     public Decision decideBeforeGate(HxRequest req, BridgeClient.Authorisation auth) {
+        return beforeGate(req, auth, false);
+    }
+
+    /**
+     * The shared body behind {@link #decideBeforeGate} and
+     * {@link #decideCrawl}: not_configured -> scope_denied (with render.allow
+     * consulted only when `renderAllow` is true) -> method_denied ->
+     * dangerous_denied.
+     */
+    private Decision beforeGate(HxRequest req, BridgeClient.Authorisation auth, boolean renderAllow) {
         Decision unusable = unusable(auth);
         if (unusable != null) return unusable;
 
         Map<String, List<String>> scope = auth.scope();
-        Decision scoped = checkScope(req, scope);
+        Decision scoped = checkScope(req, scope, renderAllow);
         if (!scoped.allowed()) return scoped;
 
         // NOT uppercased on either side. HTTP methods are case-sensitive (RFC
@@ -4581,7 +4674,9 @@ public final class Policy {
     public Decision decideScopeOnly(HxRequest req, BridgeClient.Authorisation auth) {
         Decision unusable = unusable(auth);
         if (unusable != null) return unusable;
-        return checkScope(req, auth.scope());
+        // false: the operator is not rendering under our policy and never
+        // asked for the render.allow concession -- see checkScope.
+        return checkScope(req, auth.scope(), false);
     }
 
     /**
@@ -4678,7 +4773,8 @@ public final class Policy {
      * never be reached, and the same config would authorise or refuse the same
      * request depending on which line the operator typed first.
      */
-    private static Decision checkScope(HxRequest req, Map<String, List<String>> scope) {
+    private static Decision checkScope(HxRequest req, Map<String, List<String>> scope,
+                                        boolean renderAllow) {
         Decision undecidable = undecidable(req);
         if (undecidable != null) return undecidable;
 
@@ -4797,6 +4893,25 @@ public final class Policy {
 
         for (Rule r : includes)
             if (r.allows(t, pathReadings)) return Decision.allow();
+
+        // AFTER the includes and AFTER the excludes, and both positions are
+        // the point. render.allow is a concession to RENDERING, not a second
+        // scope: an excluded destination stays excluded, and an included one
+        // never needed it. It is consulted only when the crawler asked --
+        // decide() passes false -- because a page needing a CDN to render is
+        // not an argument for letting a CHECK send a probe there.
+        if (renderAllow) {
+            for (String pattern : scope.getOrDefault("render.allow", List.of())) {
+                Rule r;
+                try {
+                    r = Rule.forInclude(pattern);
+                } catch (IllegalArgumentException e) {
+                    return Decision.deny("scope_denied",
+                            "unusable render.allow pattern: " + e.getMessage());
+                }
+                if (r.allows(t, pathReadings)) return Decision.allow();
+            }
+        }
 
         return Decision.deny("scope_denied", req.url() + " matches no scope.include pattern");
     }
@@ -18800,6 +18915,8 @@ public class ChokepointTest {
         t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
         t("theBridgeNamesNothingInTheProxyPackage",
           () -> theBridgeNamesNothingInTheProxyPackage(sources));
+        t("theProxyPackageAttachesNoIdentity",
+          () -> theProxyPackageAttachesNoIdentity(sources));
         t("theDeprecatedAccessorsAreUnusedEverywhere",
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
         t("everyDecisionReadsOneAuthorisationSnapshot",
@@ -19165,6 +19282,38 @@ public class ChokepointTest {
             if (count(text(p), "hx.proxy") > 0) naming.add(p.toString());
         }
         check("no file in hx.bridge names hx.proxy (" + naming + ")",
+              naming.isEmpty());
+    }
+
+    /**
+     * STRUCTURAL, not behavioural: task-1-brief.md's fourth render.allow test.
+     * The proxy path injects no identity at all -- `grep -rn "identity"
+     * extension/src/hx/proxy/*.java` returns only comments, no
+     * `IdentityRegistry` reference exists in the package -- so widening the
+     * crawler's allow set cannot attach a credential to an out-of-scope
+     * destination: there is no code on this path that could attach one.
+     * Identity attachment lives on the SEND path instead, gated by the
+     * identity's own registered origin (Sender.java's `identity_origin`), not
+     * by the scope decision.
+     *
+     * Placed here rather than in PolicyTest: this class already carries a
+     * tested comment/literal stripper ({@link #code}, exercised by
+     * theStripperIsNotVacuousAndDoesNotOverreach) and the sources() walk this
+     * check filters, so reusing them is safer than a second, ad hoc
+     * comment-stripping regex in hx.policy.
+     *
+     * MUTATION: add an IdentityRegistry field to any class in hx.proxy
+     * (ProxyGate.java, say). Must go red.
+     */
+    static void theProxyPackageAttachesNoIdentity(List<Path> sources) throws IOException {
+        List<String> naming = new ArrayList<>();
+        for (Path p : sources) {
+            if (!p.toString().contains("hx/proxy/")) continue;
+            // code(), not text(): a comment mentioning the word must not fail
+            // this check, and code() blanks comments (and literal bodies).
+            if (count(code(p), "IdentityRegistry") > 0) naming.add(p.toString());
+        }
+        check("no IdentityRegistry anywhere in hx.proxy (" + naming + ")",
               naming.isEmpty());
     }
 

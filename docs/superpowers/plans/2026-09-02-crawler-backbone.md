@@ -294,7 +294,6 @@ are what break, and a `unittest.mock` double would exercise none of them.
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -306,6 +305,7 @@ from hx.crawl import cdp
 PEER = r'''
 import json, os, sys
 buf = b""
+deferred = None
 while True:
     chunk = os.read(3, 65536)
     if not chunk:
@@ -314,18 +314,32 @@ while True:
     while b"\0" in buf:
         raw, buf = buf.split(b"\0", 1)
         msg = json.loads(raw)
+        # Flush what we owe BEFORE answering the new message, so an older
+        # reply reaches the pipe ahead of a newer one.
+        if deferred is not None:
+            os.write(4, json.dumps(
+                {"id": deferred, "result": {"deferred": True}}).encode() + b"\0")
+            deferred = None
+        if msg["method"] == "Peer.deferred":
+            deferred = msg["id"]
+            continue
         if msg["method"] == "Peer.emitEvent":
             os.write(4, json.dumps(
                 {"method": "Peer.happened", "params": {"n": 1}}).encode() + b"\0")
         if msg["method"] == "Peer.fail":
+            err = {"code": -32000, "message": "peer refused"}
             os.write(4, json.dumps(
-                {"id": msg["id"], "error": {"code": -32000,
-                                            "message": "peer refused"}}).encode() + b"\0")
+                {"id": msg["id"], "error": err}).encode() + b"\0")
             continue
         if msg["method"] == "Peer.silent":
             continue
-        os.write(4, json.dumps(
-            {"id": msg["id"], "result": {"echo": msg.get("params", {})}}).encode() + b"\0")
+        if msg["method"] == "Peer.garbled":
+            os.write(4, b"{not json\0")
+            reply = {"id": msg["id"], "result": {"echo": "after garbage"}}
+            os.write(4, json.dumps(reply).encode() + b"\0")
+            continue
+        reply = {"id": msg["id"], "result": {"echo": msg.get("params", {})}}
+        os.write(4, json.dumps(reply).encode() + b"\0")
 '''
 
 
@@ -355,18 +369,24 @@ def test_a_call_gets_its_own_reply():
 
 
 def test_replies_are_matched_by_id_not_by_arrival_order():
-    """THE CORRELATION TEST. Two calls in flight; the transport must return
-    each caller its own reply.
+    """THE CORRELATION TEST, and the fixture is the whole of it.
 
-    MUTATION: make `call` return the first message carrying any `id`.
-    This test must go red.
+    `Peer.deferred` leaves the peer owing a reply to id=1. That reply is
+    flushed to the pipe immediately BEFORE the reply to id=2, so two replies
+    arrive out of order and the transport must hand each caller its own.
+
+    MUTATION: in `call`, return the first message carrying any `id` rather
+    than the one matching `msg_id`. This test must go red -- id=2's caller
+    would receive `{"deferred": True}`.
+
+    An earlier draft of this test used a peer that never replied at all, so
+    only one reply ever existed and the mutation above still passed it. That
+    is why the fixture is shaped this way and not more simply.
     """
     conn, proc = _peer()
     try:
-        conn.call("Peer.silent", {"a": 1}, timeout=0.2)
-    except cdp.CdpTimeout:
-        pass
-    try:
+        with pytest.raises(cdp.CdpTimeout):
+            conn.call("Peer.deferred", timeout=0.3)
         assert conn.call("Peer.echo", {"b": 2}) == {"echo": {"b": 2}}
     finally:
         conn.close()
@@ -421,16 +441,117 @@ def test_events_arriving_during_a_call_are_buffered_not_discarded():
 
 
 def test_a_dead_peer_raises_closed_rather_than_hanging():
-    """MUTATION: treat a zero-length read as 'nothing yet' and loop. Must go
-    red by hanging -- a crashed browser would stall the crawl to its budget
-    instead of failing the page.
+    """MUTATION: in `_pump`, replace `if not chunk: raise CdpClosed(...)`
+    with `if not chunk: return`. Must go red.
+
+    The peer closes only its OUTPUT (fd 4) and then blocks, keeping its
+    INPUT (fd 3) open. That forces the failure through `_pump`'s read loop:
+    `_write` still succeeds (a reader is still attached), so the only way
+    this call can fail is a zero-length read on our end. A peer killed
+    outright would instead break the write with EPIPE and raise CdpClosed
+    from `_write`, unaffected by this mutation -- passing this test for the
+    wrong reason regardless of what `_pump` does with a zero-length read.
+
+    Under the mutation, `_pump` returns instead of raising, `call` loops
+    back around, `_pump` reads EOF again (a closed pipe is always
+    select()-ready), and this repeats until the call's own deadline fires
+    CdpTimeout -- a *different* exception than the CdpClosed asserted below,
+    so the mutation still turns this red rather than slipping through a
+    tuple of acceptable exceptions.
+    """
+    to_child_r, to_child_w = os.pipe()
+    from_child_r, from_child_w = os.pipe()
+
+    def fixup():
+        os.dup2(to_child_r, 3)
+        os.dup2(from_child_w, 4)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import os, time; os.close(4); time.sleep(5)"],
+        preexec_fn=fixup, pass_fds=(3, 4), close_fds=True,
+    )
+    os.close(to_child_r)
+    os.close(from_child_w)
+    conn = cdp.Connection(read_fd=from_child_r, write_fd=to_child_w)
+    try:
+        with pytest.raises(cdp.CdpClosed):
+            conn.call("Peer.echo", timeout=2.0)
+    finally:
+        conn.close()
+        proc.kill()
+        proc.wait()
+
+
+def test_a_fully_dead_peer_fails_the_write_not_the_read():
+    """MUTATION: in `_write`, swallow the `OSError` and `return` instead of
+    raising `CdpClosed`. Must go red -- with the write silently dropped,
+    `call` proceeds into `_pump`, finds nothing to read (the read pipe's
+    write end is deliberately held open below, so there is no EOF to catch
+    it either), and instead of failing closed it just burns its timeout and
+    raises `CdpTimeout` -- a different exception than the `CdpClosed`
+    asserted here.
+
+    COMPANION to `test_a_dead_peer_raises_closed_rather_than_hanging`, and
+    deliberately a SEPARATE fixture rather than one shared with it -- and
+    deliberately NOT a real child process either, unlike every other test in
+    this file. A "kill the peer outright" child (the brief's original
+    fixture, and my first attempt at this one) makes the mutation
+    UNOBSERVABLE: with both of the peer's fds gone, a silently-swallowed
+    write failure is immediately backstopped by `_pump`'s own (unmutated,
+    correct) read-EOF check, which also raises `CdpClosed` -- so the test
+    goes green for the wrong reason, the very failure this task exists to
+    catch. A "close only fd 3, then sleep" child fixes that in principle but
+    is racy in practice: nothing guarantees the child has closed its read
+    end before this test's first `os.write` runs, and a write that lands
+    before the close just sits unread in the kernel buffer forever, timing
+    out regardless of whether `_write` is correct or mutated -- confirmed
+    empirically, the "corrected" child fixture still failed on CORRECT code.
+    Two bare pipes, entirely in this process, are what make each end's
+    state deterministic: no fork, no exec, no race to lose.
+
+    `to_peer_w` has its only reader closed before `Connection` ever touches
+    it, so `_write`'s `os.write` is guaranteed EPIPE. `from_peer_r`'s writer
+    (`from_peer_w`) is held open and never written to, so a read on it can
+    only block, never see EOF -- there is no other way this call can end
+    except through `_write`'s own error handling.
+    """
+    to_peer_r, to_peer_w = os.pipe()
+    os.close(to_peer_r)
+    from_peer_r, from_peer_w = os.pipe()
+
+    conn = cdp.Connection(read_fd=from_peer_r, write_fd=to_peer_w)
+    try:
+        with pytest.raises(cdp.CdpClosed):
+            conn.call("Peer.echo", timeout=2.0)
+    finally:
+        conn.close()
+        os.close(from_peer_w)
+
+
+def test_a_malformed_frame_is_dropped_not_fatal():
+    """CONTROLLER RULING: `_pump`'s `except ValueError: continue` stays, even
+    though dropping an unparseable frame looks like it violates this
+    project's fail-closed rule as literally stated. It does not: fail-closed
+    governs decisions that could permit egress or authorise an action --
+    never allow what you could not verify. A garbled frame on a local pipe
+    from a browser we launched authorises nothing. Raising would let one
+    malformed frame end an entire crawl. Dropping is the safe direction on
+    both branches: a lost reply surfaces as the caller's own `CdpTimeout`,
+    which is loud; a lost event makes a page look like it requested less
+    than it did, which the crawler's page classifier reads as less yield --
+    i.e. it under-claims coverage, the direction spec Sec 12 explicitly
+    prefers.
+
+    MUTATION: re-raise instead of `continue` in that except block. Must go
+    red -- the call would die on the garbage frame instead of returning the
+    good reply that follows it on the same pipe.
     """
     conn, proc = _peer()
-    proc.kill()
-    proc.wait()
-    with pytest.raises((cdp.CdpClosed, cdp.CdpTimeout)):
-        conn.call("Peer.echo", timeout=2.0)
-    conn.close()
+    try:
+        assert conn.call("Peer.garbled") == {"echo": "after garbage"}
+    finally:
+        conn.close()
+        proc.kill()
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -673,11 +794,15 @@ Chrome bypasses configured proxies for loopback by default. Without the flag the
 
 MOSTLY WITHOUT LAUNCHING ONE. The argv is a list of strings and the
 discovery is a directory walk; both are testable as data, and testing them
-as data is what makes the flags reviewable. The one test that starts a real
-Chromium lives in the integration suite (Task 9).
+as data is what makes the flags reviewable. The two tests that drive a
+subprocess use a tiny fake "chrome" script, never real Chromium -- the one
+test that starts a real Chromium lives in the integration suite (Task 9).
 """
 from __future__ import annotations
 
+import os
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -704,13 +829,13 @@ def test_the_proxy_bypass_flag_is_present():
     unit test on argv proves we ask for it, not that it works.
     """
     argv = browser.launch_argv(Path("/x/chrome"), proxy_port=8080,
-                               user_data_dir=Path("/tmp/p"))
+                                user_data_dir=Path("/tmp/p"))
     assert "--proxy-bypass-list=<-loopback>" in argv
 
 
 def test_the_proxy_is_the_only_route_out():
     argv = browser.launch_argv(Path("/x/chrome"), proxy_port=9999,
-                               user_data_dir=Path("/tmp/p"))
+                                user_data_dir=Path("/tmp/p"))
     assert "--proxy-server=127.0.0.1:9999" in argv
 
 
@@ -719,10 +844,10 @@ def test_the_sandbox_is_never_disabled():
 
     A security tool renders hostile pages. Verified 2026-09-02 that
     Chromium starts sandboxed on this platform via unprivileged user
-    namespaces, so there is nothing to trade away.
+    namespaces, so there is nothing to trade off.
     """
     argv = browser.launch_argv(Path("/x/chrome"), proxy_port=1,
-                               user_data_dir=Path("/tmp/p"))
+                                user_data_dir=Path("/tmp/p"))
     assert "--no-sandbox" not in argv
     assert not any("disable-setuid-sandbox" in a for a in argv)
 
@@ -734,7 +859,7 @@ def test_the_profile_is_private_to_the_run():
     MUTATION: drop `--user-data-dir` from the argv. Must go red.
     """
     argv = browser.launch_argv(Path("/x/chrome"), proxy_port=1,
-                               user_data_dir=Path("/tmp/private-profile"))
+                                user_data_dir=Path("/tmp/private-profile"))
     assert "--user-data-dir=/tmp/private-profile" in argv
 
 
@@ -745,7 +870,7 @@ def test_remote_debugging_is_a_pipe_and_never_a_port():
     thing `pyproject.toml`'s httpx2 note objects to.
     """
     argv = browser.launch_argv(Path("/x/chrome"), proxy_port=1,
-                               user_data_dir=Path("/tmp/p"))
+                                user_data_dir=Path("/tmp/p"))
     assert "--remote-debugging-pipe" in argv
     assert not any(a.startswith("--remote-debugging-port") for a in argv)
 
@@ -768,6 +893,199 @@ def test_a_missing_browser_is_a_named_refusal_not_a_crash(tmp_path):
     ordinary state an operator must be told how to fix."""
     with pytest.raises(browser.BrowserUnavailable, match="burpbrowser"):
         browser.find_chromium(tmp_path)
+
+
+def test_session_id_is_none_before_the_browser_is_entered():
+    """Ruling 9: `Browser` exposes `.session_id` so Task 5/6 can read it. It
+    starts `None` -- there is no page session before a Chromium exists."""
+    b = browser.Browser(proxy_port=1, chrome=Path("/x/chrome"))
+    assert b.session_id is None
+
+
+def test_a_construction_failure_leaves_no_fds_process_or_profile_dir(
+        tmp_path, monkeypatch):
+    """`__enter__` opens two pipes, then calls `Popen()` and
+    `cdp.Connection()` -- both of which can raise something that is not a
+    `cdp.CdpError` (a bad exec, fd exhaustion, a `Connection()` construction
+    failure). Only the CDP-call block was ever guarded; an exception from
+    `Popen()` or `Connection()` used to propagate out of `__enter__`
+    uncaught. Python never calls `__exit__` on a context manager whose
+    `__enter__` didn't return, so `close()` never ran: a leaked Chromium (if
+    `Popen()` had succeeded) plus the profile dir plus whichever pipe fds
+    hadn't yet been handed off.
+
+    This fixture makes `Popen()` itself fail: `chrome` exists but is not
+    executable, so `Popen()` raises `PermissionError` while trying to exec
+    it -- a plain `OSError`, not `cdp.CdpError`, so only a guard around the
+    WHOLE construction (not just the CDP calls) can catch it. At the moment
+    of failure all four pipe fds `__enter__` opened are still unhanded-off
+    (Popen never returned, so the parent-side `os.close()` calls right
+    after it never ran either) -- which is exactly the case that exercises
+    the fix, not a degenerate one where there was nothing left to leak.
+
+    MUTATION: remove the `try`/`except BaseException` wrapping the whole of
+    `__enter__` (i.e. revert to guarding only the CDP-call block, as the
+    task brief originally had it). Must go red: the four fds this test
+    tracks stay open (`os.fstat` on them no longer raises), and the profile
+    directory survives.
+
+    `os.pipe` is spied on rather than guessed at, so the test checks the
+    OWN four fds `__enter__` made, not a coincidence. `b` is kept alive for
+    the whole test (never `del`eted, never let go out of scope before the
+    assertions run) specifically so `TemporaryDirectory`'s GC finalizer
+    cannot be the thing that removes the profile directory -- a finalizer
+    only runs once nothing still references the `TemporaryDirectory`, and a
+    live `b` holds one via `b._tmp` throughout. If the directory is gone,
+    `close()` removed it, not garbage collection.
+    """
+    chrome = tmp_path / "not-executable-chrome"
+    chrome.write_text("#!/bin/true\n")
+    # Deliberately NOT chmod'd +x.
+
+    created_fds: list[int] = []
+    real_pipe = os.pipe
+
+    def spy_pipe():
+        pair = real_pipe()
+        created_fds.extend(pair)
+        return pair
+
+    monkeypatch.setattr(os, "pipe", spy_pipe)
+
+    b = browser.Browser(proxy_port=1, chrome=chrome)
+    with pytest.raises(PermissionError):
+        b.__enter__()
+
+    # `__enter__`'s own two `os.pipe()` calls happen first, before
+    # `Popen()` -- which then opens an fd pair of its OWN internally, to
+    # report a failed exec back to the parent. That third pair is
+    # `subprocess`'s to close, not ours; only the first four are `__enter__`'s.
+    assert len(created_fds) >= 4, "fixture assumption: __enter__ opens two pipes"
+    our_fds = created_fds[:4]
+    for fd in our_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)  # closed fds fail fstat with EBADF
+
+    assert b.proc is None
+    assert b.conn is None
+    assert not Path(b._tmp.name).exists(), \
+        "profile dir survived a failed __enter__"
+
+
+# --- fixtures for the two tests that drive a subprocess --------------------
+
+
+def _fake_chrome_script(tmp_path: Path, body: str) -> Path:
+    """A tiny shebang script standing in for Chromium on fds 3/4.
+
+    Popen execs `argv[0]` directly (no shell), so this must be a real
+    executable file, not a `python -c ...` invocation -- `launch_argv`
+    appends Chromium-shaped flags after `argv[0]` that a bare interpreter
+    invocation could not parse. A shebang script ignores them like any CLI
+    tool ignores flags it doesn't ask for.
+    """
+    script = tmp_path / "fake-chrome"
+    script.write_text(f"#!{sys.executable}\n{body}")
+    script.chmod(0o755)
+    return script
+
+
+_CDP_PEER_BODY = """
+import json, os
+
+def send(msg):
+    os.write(4, json.dumps(msg).encode() + b"\\0")
+
+buf = b""
+while True:
+    chunk = os.read(3, 65536)
+    if not chunk:
+        break
+    buf += chunk
+    while b"\\0" in buf:
+        raw, buf = buf.split(b"\\0", 1)
+        if not raw:
+            continue
+        msg = json.loads(raw)
+        method = msg.get("method")
+        if method == "Browser.getVersion":
+            send({"id": msg["id"], "result": {"product": "fake/1.0"}})
+        elif method == "Target.createTarget":
+            send({"id": msg["id"], "result": {"targetId": "target-1"}})
+        elif method == "Target.attachToTarget":
+            if msg.get("params", {}).get("flatten") is True:
+                send({"id": msg["id"],
+                      "result": {"sessionId": "session-abc"}})
+            else:
+                send({"id": msg["id"],
+                      "error": {"code": -1, "message": "flatten required"}})
+        else:
+            send({"id": msg["id"], "result": {}})
+"""
+
+
+def test_entering_attaches_a_flattened_page_session(tmp_path):
+    """Ruling 9, measured 2026-09-02 against real Chromium: a
+    `--remote-debugging-pipe` connection is BROWSER-level. `Page`, `Network`,
+    `DOM` and `Runtime` don't exist on it (`Page.enable: 'Page.enable' wasn't
+    found`). `__enter__` must create a page target and attach with
+    `flatten: True`, and store the resulting session id.
+
+    MUTATION 1: remove the `Target.createTarget` / `Target.attachToTarget`
+    calls from `__enter__` (revert to the pre-Ruling-9 handshake). Must go
+    red -- `session_id` stays `None` and the assertion below fails.
+
+    MUTATION 2: drop `"flatten": True` from the `Target.attachToTarget`
+    params. Must go red -- this fixture's fake peer refuses to hand out a
+    session id without it, so `__enter__` raises `BrowserUnavailable`
+    instead of returning.
+    """
+    chrome = _fake_chrome_script(tmp_path, _CDP_PEER_BODY)
+    with browser.Browser(proxy_port=1, chrome=chrome) as b:
+        assert b.session_id == "session-abc"
+
+
+def test_a_browser_that_never_answers_cdp_fails_instead_of_hanging(tmp_path):
+    """Ruling 6, and it overrides the brief. The brief's error path read
+    `proc.stderr.read()` BEFORE killing the child; `read()` blocks until
+    EOF, and a Chromium that launched but never answers CDP is still alive,
+    so the crawler would hang forever inside the very handler that exists to
+    report a refused sandbox. MEASURED 2026-09-02: `read()` had not returned
+    after 2s against a live child.
+
+    MUTATION: in `_kill_and_read_stderr`, move `self.proc.kill()` to AFTER
+    `self.proc.communicate(...)`. Must go red: `communicate()` then waits
+    for the still-running fake "chromium" to exit on its own, which it never
+    does until it hits ITS OWN `communicate(timeout=self._stderr_timeout)`
+    ceiling -- blowing the wall-clock bound asserted below. This is the
+    "goes red by timing out, not by asserting" case the ruling calls for:
+    `pytest-timeout` is not a dependency, so the bound is measured with
+    `time.monotonic()` instead of a marker.
+
+    Uses `handshake_timeout=` / `stderr_timeout=` -- testability seams added
+    to `Browser.__init__` for exactly this test, documented in the task
+    report. Production code never sets them; the defaults are the timeouts
+    Ruling 6 and Ruling 9 specify (10s / 20s).
+    """
+    chrome = _fake_chrome_script(
+        tmp_path,
+        "import sys, time\n"
+        "sys.stderr.write('fake refusal: sandbox message\\n')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(60)\n",
+    )
+    start = time.monotonic()
+    with pytest.raises(browser.BrowserUnavailable, match="sandbox"):
+        with browser.Browser(proxy_port=1, chrome=chrome,
+                              handshake_timeout=0.3, stderr_timeout=3.0):
+            pass
+    elapsed = time.monotonic() - start
+    # Correct code: kill first, so `communicate()` on an already-dead child
+    # returns near-instantly -- measured ~0.3s (just handshake_timeout, the
+    # CdpTimeout on the browser-level handshake). Under the mutation,
+    # `communicate()` runs BEFORE the kill and must wait out the full
+    # `stderr_timeout` against a child that is still very much alive --
+    # measured ~3.3s. 2s cleanly separates the two without being flaky.
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -839,7 +1157,7 @@ def find_chromium(burp_home: Path | None = None) -> Path:
 
 
 def launch_argv(chrome: Path, *, proxy_port: int,
-                user_data_dir: Path) -> list[str]:
+                 user_data_dir: Path) -> list[str]:
     """Exactly what we ask Chromium for, as data so it can be reviewed.
 
     THE SECOND FLAG IS THE ONE THAT MATTERS. Measured 2026-09-02: with
@@ -881,57 +1199,133 @@ def launch_argv(chrome: Path, *, proxy_port: int,
 
 
 class Browser:
-    """A launched Chromium and its CDP connection.
+    """A launched Chromium, its CDP connection, and its one page session.
 
     A context manager, because a leaked Chromium survives the crawl, holds a
     private profile directory open, and keeps a proxy connection the
     extension is accounting for.
+
+    `--remote-debugging-pipe` gives a BROWSER-level CDP session: the Page,
+    Network, DOM and Runtime domains do not exist on it (Ruling 9, measured
+    2026-09-02 -- `Page.enable` came back "wasn't found" without this).
+    `__enter__` therefore creates a page target and attaches to it with
+    `flatten: True`, exposing the resulting `session_id` for callers (Task 5's
+    `page.visit`) to pass on every domain call. The attach lives here, on the
+    browser's lifetime, rather than per page: re-attaching per page would be
+    both wasteful and racy.
     """
 
     def __init__(self, *, proxy_port: int, burp_home: Path | None = None,
-                 chrome: Path | None = None) -> None:
+                 chrome: Path | None = None, handshake_timeout: float = 20.0,
+                 stderr_timeout: float = 10.0) -> None:
         self._chrome = Path(chrome) if chrome else find_chromium(burp_home)
         self._proxy_port = proxy_port
         self._tmp = tempfile.TemporaryDirectory(prefix="hx-crawl-profile-")
         self.proc: subprocess.Popen | None = None
         self.conn: cdp.Connection | None = None
+        self.session_id: str | None = None
+        # Testability seams: production callers never set these, so the
+        # defaults are the timeouts measured for a real Chromium handshake
+        # (Ruling 9) and for reading a killed child's stderr (Ruling 6).
+        # Tests that must stay fast without a real browser pass shorter
+        # values through the constructor rather than mocking `cdp.Connection`.
+        self._handshake_timeout = handshake_timeout
+        self._stderr_timeout = stderr_timeout
 
-    def __enter__(self) -> "Browser":
-        to_child_r, to_child_w = os.pipe()
-        from_child_r, from_child_w = os.pipe()
-
-        def fixup() -> None:
-            # dup2 ONTO 3 and 4, and `pass_fds=(3, 4)` below is not optional.
-            # subprocess closes descriptors outside pass_fds AFTER preexec_fn
-            # runs, so without it these are closed before exec and Chromium
-            # answers "Remote debugging pipe file descriptors are not open."
-            # Measured 2026-09-02, on the first attempt at this.
-            os.dup2(to_child_r, 3)
-            os.dup2(from_child_w, 4)
-
-        argv = launch_argv(self._chrome, proxy_port=self._proxy_port,
-                           user_data_dir=Path(self._tmp.name))
-        self.proc = subprocess.Popen(
-            argv, preexec_fn=fixup, pass_fds=(3, 4), close_fds=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        os.close(to_child_r)
-        os.close(from_child_w)
-        self.conn = cdp.Connection(read_fd=from_child_r, write_fd=to_child_w)
+    def __enter__(self) -> Browser:
+        # `open_fds` is every raw descriptor this method still owns and must
+        # close on any path that is not a successful return. Two things hand
+        # descriptors off to something else that will close them instead: a
+        # successful `Popen()` (the child's dup2'd copies of fds 3/4 become
+        # the CHILD's to close on exit, so the parent's `to_child_r` and
+        # `from_child_w` are closed right here) and a successful
+        # `cdp.Connection(...)` (which owns `from_child_r`/`to_child_w` from
+        # then on, via `Connection.close()`). Each handoff removes its fds
+        # from this set so a failure after it does not double-close them --
+        # and a failure BEFORE either handoff (even the first `os.pipe()`
+        # succeeding but the second failing) still finds every fd it made in
+        # the set and closes it exactly once.
+        open_fds: set[int] = set()
         try:
-            self.conn.call("Browser.getVersion", timeout=20.0)
+            to_child_r, to_child_w = os.pipe()
+            open_fds.update((to_child_r, to_child_w))
+            from_child_r, from_child_w = os.pipe()
+            open_fds.update((from_child_r, from_child_w))
+
+            def fixup() -> None:
+                # dup2 ONTO 3 and 4, and `pass_fds=(3, 4)` below is not
+                # optional. subprocess closes descriptors outside pass_fds
+                # AFTER preexec_fn runs, so without it these are closed
+                # before exec and Chromium answers "Remote debugging pipe
+                # file descriptors are not open." Measured 2026-09-02, on
+                # the first attempt at this.
+                os.dup2(to_child_r, 3)
+                os.dup2(from_child_w, 4)
+
+            argv = launch_argv(self._chrome, proxy_port=self._proxy_port,
+                                user_data_dir=Path(self._tmp.name))
+            self.proc = subprocess.Popen(
+                argv, preexec_fn=fixup, pass_fds=(3, 4), close_fds=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            os.close(to_child_r)
+            open_fds.discard(to_child_r)
+            os.close(from_child_w)
+            open_fds.discard(from_child_w)
+            self.conn = cdp.Connection(read_fd=from_child_r, write_fd=to_child_w)
+            open_fds.discard(from_child_r)
+            open_fds.discard(to_child_w)
+
+            self.conn.call("Browser.getVersion", timeout=self._handshake_timeout)
+            target_id = self.conn.call(
+                "Target.createTarget", {"url": "about:blank"},
+                timeout=self._handshake_timeout)["targetId"]
+            self.session_id = self.conn.call(
+                "Target.attachToTarget",
+                {"targetId": target_id, "flatten": True},
+                timeout=self._handshake_timeout)["sessionId"]
         except cdp.CdpError as e:
-            stderr = b""
-            if self.proc.stderr is not None:
-                stderr = self.proc.stderr.read() or b""
+            detail = self._kill_and_read_stderr()
             self.close()
             raise BrowserUnavailable(
                 "Chromium started but did not answer CDP. If the message "
                 "below mentions the sandbox, hx will not disable it: "
-                f"{stderr.decode('utf-8', 'replace')[:400]}") from e
+                f"{detail}") from e
+        except BaseException:
+            # BaseException, not Exception: a KeyboardInterrupt between
+            # `Popen()` and the handshake must not leak a running Chromium
+            # either. Whatever wasn't handed off above is still in
+            # `open_fds`; whatever WAS handed off is closed by `close()`
+            # via `self.proc`/`self.conn`, which are `None` if their
+            # construction never completed.
+            for fd in open_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self.close()
+            raise
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    def _kill_and_read_stderr(self) -> str:
+        """Chromium's own words about why it would not start.
+
+        KILL FIRST, and that ordering is the whole method.
+        `proc.stderr.read()` blocks until EOF, and a Chromium that launched
+        but never answered CDP is still running -- so reading before killing
+        hangs the error path forever. MEASURED 2026-09-02: `read()` had not
+        returned after 2s against a live child.
+        """
+        if self.proc is None:
+            return ""
+        self.proc.kill()
+        try:
+            _, err = self.proc.communicate(timeout=self._stderr_timeout)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            return ""
+        return (err or b"").decode("utf-8", "replace")[:400]
 
     def close(self) -> None:
         if self.conn is not None:
@@ -939,7 +1333,10 @@ class Browser:
             self.conn = None
         if self.proc is not None:
             self.proc.kill()
-            self.proc.wait(timeout=10)
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
             self.proc = None
         self._tmp.cleanup()
 ```
@@ -1068,13 +1465,26 @@ def test_a_foreign_origin_is_not_enqueued():
 def test_a_non_http_scheme_is_refused():
     """`javascript:`, `mailto:`, `data:` and `blob:` are not pages.
 
+    The `normalise()` assertion on `ftp://a.test/x` is load-bearing and the
+    `offer()` assertion alone is not enough: `javascript:`/`mailto:`/
+    `data:`/`blob:` have no host, so the `not host` branch refuses them
+    with the scheme check deleted entirely -- a wrong-reason pass. And
+    `ftp://a.test/x` DOES have a host, but routed through `offer()` its
+    differing scheme also gives it a differing origin, so the origin
+    allowlist would refuse it even with the scheme check gone -- a second
+    wrong-reason pass. Only a direct call to `normalise()` isolates the
+    scheme guard from both of those.
+
     MUTATION: accept any scheme in `normalise`. Must go red -- and the
     crawler would try to navigate to `javascript:alert(1)` harvested from a
     page under test.
     """
+    assert frontier.normalise("ftp://a.test/x") is None
+    assert frontier.normalise("ws://a.test/x") is None
     f = frontier.Frontier(["https://a.test/"], _b())
     assert f.offer(["javascript:alert(1)", "mailto:x@a.test",
-                    "data:text/html,x", "blob:https://a.test/z"]) == 0
+                    "data:text/html,x", "blob:https://a.test/z",
+                    "ftp://a.test/x"]) == 0
 
 
 def test_a_second_seed_origin_is_allowed():
@@ -1126,6 +1536,47 @@ def test_an_unexhausted_frontier_that_simply_ran_out_says_nothing():
     assert f.next() is not None
     assert f.next() is None
     assert f.exhausted is None
+
+
+# -- Ruling 13: three bugs measured in the brief's `normalise`, corrected. --
+
+
+def test_a_malformed_port_is_refused_and_does_not_end_the_crawl():
+    """These URLs come from `harvest`, which reads the DOM of a page under
+    test -- ATTACKER-INFLUENCED INPUT. `urlsplit` does not validate the
+    port; `parts.port` does, and it raises. MEASURED 2026-09-02: the first
+    draft read `.port` outside its `try` and one
+    `<a href="https://a.test:99999/">` ended the whole crawl with an
+    unhandled ValueError.
+
+    MUTATION: move the `parts.port` read outside the `try`. Must go red.
+    """
+    for bad in ("https://a.test:99999/x", "https://a.test:-1/x",
+                "https://a.test:abc/x"):
+        assert frontier.normalise(bad) is None
+
+
+def test_an_ipv6_host_keeps_its_brackets():
+    """`parts.hostname` strips them and a bare `::1` is not an authority.
+
+    MUTATION: drop the re-bracketing. Must go red -- and the crawler would
+    build `https://::1:8443/x`, which nothing can navigate to and which
+    compares equal to no origin.
+    """
+    assert frontier.normalise("https://[::1]:8443/x") == "https://[::1]:8443/x"
+    assert frontier.origin_of("https://[::1]:8443/x") == "https://[::1]:8443"
+
+
+def test_userinfo_is_refused_rather_than_stripped():
+    """REFUSED, NOT REWRITTEN. Stripping would visit a URL the page did not
+    name -- the confusion userinfo exists to create, and the shape
+    `Policy.checkScope` refuses on the Java side.
+
+    MUTATION: strip the userinfo and continue instead of returning None.
+    Must go red.
+    """
+    assert frontier.normalise("https://evil.test@app.test/") is None
+    assert frontier.normalise("https://user:pw@a.test/x") is None
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -1177,18 +1628,34 @@ def normalise(url: str) -> str | None:
     The fragment goes: `#a` and `#b` are one document and one request. The
     QUERY STAYS: it is exactly what a scan later probes, and collapsing it
     would discard the surfaces this crawler exists to find.
+
+    These URLs come from `harvest`, which reads the DOM of a page under
+    test -- attacker-influenced input. Every failure mode below must
+    resolve to `None`, never to a raised exception or a rewritten URL:
+    a malformed port must not end the crawl, and userinfo must be
+    refused, not silently stripped (see ruling-13-normalise.md).
     """
     try:
         parts = urlsplit(url)
+        host = parts.hostname
+        port = parts.port  # INSIDE the try: `.port` validates and raises,
+        # and this input came from a page under test
+        username = parts.username
+        password = parts.password
     except ValueError:
         return None
-    if parts.scheme not in ("http", "https"):
+    if parts.scheme not in ("http", "https") or not host:
         return None
-    if not parts.hostname:
+    if username is not None or password is not None:
+        # REFUSED, NOT STRIPPED. Rewriting would visit a URL the page did
+        # not name -- exactly the confusion userinfo exists to create, and
+        # the shape `Policy.checkScope` refuses on the Java side.
         return None
-    netloc = parts.hostname.lower()
-    if parts.port and parts.port != _DEFAULT_PORTS[parts.scheme]:
-        netloc = f"{netloc}:{parts.port}"
+    # Re-bracket IPv6: `.hostname` removes the brackets and a bare `::1`
+    # is not a URL authority.
+    netloc = f"[{host}]" if ":" in host else host.lower()
+    if port and port != _DEFAULT_PORTS[parts.scheme]:
+        netloc = f"{netloc}:{port}"
     return urlunsplit((parts.scheme, netloc, parts.path or "/",
                        parts.query, ""))
 
@@ -1341,14 +1808,16 @@ can see what each test is claiming.
 """
 from __future__ import annotations
 
-from hx.crawl import page
+from hx.crawl import cdp, page
 
 ORIGINS = {"https://app.test"}
 
 
-def _sent(url: str) -> dict:
-    return {"method": "Network.requestWillBeSent",
-            "params": {"requestId": url, "request": {"url": url}}}
+def _sent(url: str, *, rtype: str | None = None) -> dict:
+    params = {"requestId": url, "request": {"url": url}}
+    if rtype is not None:
+        params["type"] = rtype
+    return {"method": "Network.requestWillBeSent", "params": params}
 
 
 def _failed(url: str) -> dict:
@@ -1397,12 +1866,46 @@ def test_a_base_tag_is_honoured():
     assert out == ["https://app.test/api/v1"]
 
 
-def test_malformed_html_yields_what_it_can_rather_than_raising():
-    """A page under test is attacker-influenced input. MUTATION: let the
-    parser raise. Must go red -- one broken page would end the crawl.
+def test_grossly_malformed_markup_does_not_raise():
+    """Documents the tolerant behaviour on real garbled markup. NOT a
+    mutation-carrying test: CPython's `html.parser` is deliberately
+    exception-safe for any `str` input (strict mode was removed in 3.5) --
+    fuzzed 20,000 random strings over `<>"'=/!` plus NUL, a lone surrogate,
+    and out-of-range numeric character references, and none raised. So this
+    input alone cannot exercise `harvest`'s `except Exception` guard; see
+    `test_malformed_html_yields_what_it_can_rather_than_raising` below for
+    the test that actually forces that path and carries the mutation.
     """
     assert page.harvest('<a href="/a">x<<<>>"', "https://app.test/") == \
         ["https://app.test/a"]
+
+
+def test_malformed_html_yields_what_it_can_rather_than_raising(monkeypatch):
+    """A page under test is attacker-influenced input, and some future
+    document could make parsing fail partway through. MUTATION: let that
+    exception propagate out of `harvest` (delete its try/except around
+    `parser.feed`/`.close`). Must go red -- one broken page would end the
+    crawl.
+
+    CPython's `html.parser` will not raise for any crafted HTML string we
+    could find (see the sibling test above), so the failure is forced the
+    only way available in this Python version: patching the per-tag handler
+    `feed` calls into, so the SAME code path `harvest` protects -- an
+    exception raised while `HTMLParser.feed` is running -- is exercised for
+    real, and the first tag's link (parsed before the raise) is still real
+    and still returned.
+    """
+    real_handle = page._Links.handle_starttag
+
+    def flaky(self, tag, attrs):
+        real_handle(self, tag, attrs)
+        if tag == "b":
+            raise ValueError("simulated parser failure mid-document")
+
+    monkeypatch.setattr(page._Links, "handle_starttag", flaky)
+    out = page.harvest('<a href="/a">x</a><b href="/b">y</b>',
+                       "https://app.test/")
+    assert out == ["https://app.test/a"]
 
 
 # --- classification: S12 applied to one page -------------------------------
@@ -1457,6 +1960,34 @@ def test_an_in_scope_failure_is_the_target_failing_not_a_policy_drop():
     assert r.in_scope_failures == ("https://app.test/broken.js",)
 
 
+def test_page_origins_is_seed_origins_so_unseeded_in_scope_failure_reads_dropped():
+    """F2, PINNING THE DOCUMENTED LIMITATION rather than hiding it: `page_
+    origins` is SEED origins, not scope (see `classify`'s docstring). A
+    scope that covers `api.app.test` but was only ever seeded from
+    `app.test` has no way, from inside this function, to tell "target-side
+    failure on an in-scope-but-unseeded origin" apart from "hx dropped an
+    out-of-scope host" -- both look identical here: a failed request whose
+    origin is not in `page_origins`. This is CURRENT, INTENDED-DOCUMENTED
+    behaviour (the fix is the docstring plus the CLI's pointer at the
+    authoritative denial rows, not a second scope matcher -- spec §7
+    forbids one) -- this test exists to keep the limitation visible rather
+    than let a future change silently narrow or widen it unnoticed.
+
+    MUTATION: swap the two branches of the `dropped_candidates` loop (`if
+    origin_of(url) in page_origins: dropped.add(host)` / `else: in_scope_
+    failures.append(url)`, i.e. the opposite of today's code). Must go
+    red -- `api.app.test` is not in `page_origins` here, so under the swap
+    it lands in `in_scope_failures` and `dropped_hosts` comes back empty,
+    failing both assertions below.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _sent("https://api.app.test/data"),
+              _failed("https://api.app.test/data")]
+    r = page.classify(events, page_origins={"https://app.test"}, harvested=2)
+    assert r.dropped_hosts == ("api.app.test",)
+    assert r.in_scope_failures == ()
+
+
 def test_a_document_that_never_loaded_is_failed_not_degraded():
     events = [_sent("https://app.test/"), _failed("https://app.test/")]
     r = page.classify(events, page_origins=ORIGINS, harvested=0)
@@ -1468,14 +1999,23 @@ def test_a_page_with_xhr_but_no_links_still_counts_as_rendered():
     result came from a page's own fetch calls, not from its links. A page
     that yielded only XHR has been reached.
 
-    MUTATION: judge `rendered` on `harvested` alone. Must go red.
+    A dropped third party is included so the assertion actually depends on
+    `own` rather than passing by the unconditional "no drop -> rendered"
+    branch: with no drop present at all, `state` lands on "rendered"
+    regardless of `yielded`, and this test would pass even with the named
+    mutation applied, catching nothing. (Found by asking, of this test,
+    "is there any other path to this same assertion?")
+
+    MUTATION: judge `rendered` on `harvested` alone (drop `or own > 0`).
+    Must go red.
     """
     events = [_sent("https://app.test/"), _ok("https://app.test/"),
               _sent("https://app.test/api/items?q=1"),
-              _ok("https://app.test/api/items?q=1")]
+              _ok("https://app.test/api/items?q=1"),
+              _sent("https://cdn.test/app.js"), _failed("https://cdn.test/app.js")]
     r = page.classify(events, page_origins=ORIGINS, harvested=0)
     assert r.state == "rendered"
-    assert r.requests == 2
+    assert r.requests == 3
 
 
 def test_dropped_hosts_are_deduplicated_and_ordered():
@@ -1485,6 +2025,187 @@ def test_dropped_hosts_are_deduplicated_and_ordered():
         events += [_sent(u), _failed(u)]
     r = page.classify(events, page_origins=ORIGINS, harvested=0)
     assert r.dropped_hosts == ("ads.test", "cdn.test")
+
+
+# --- classification: F4 -- the document is identified by `type`, not by
+# arrival order -------------------------------------------------------------
+
+def test_a_stale_request_from_the_previous_page_does_not_masquerade_as_the_document():
+    """F4, the re-diagnosed favicon race. `visit` reuses one page session for
+    every URL in the crawl, and `drain(0.0)` before navigation only clears
+    events that have ALREADY arrived -- a trailing event from page N-1 can
+    still be in flight and be the FIRST thing this page's event list holds.
+    Judging "the document" by arrival order then risks taking that stale,
+    successful request as this page's document while the real, typed
+    `Document` request failed -- an OVER-CLAIM (`rendered` for a page that
+    never loaded), which §12 calls the unsurvivable direction.
+
+    Here the stale request (no `type`, arrives first, succeeds) precedes the
+    real document (`type="Document"`, arrives second, fails with no
+    response).
+
+    MUTATION: identify the document by first arrival (`first_seen`) instead
+    of preferring `typed_document`. Must go red -- first-arrival picks the
+    stale successful request as the document, and this page would be
+    reported `rendered` (having harvested nothing but a drop of nobody, so
+    it would in fact fall through to `rendered` on the "no drop" branch)
+    instead of `failed`.
+    """
+    events = [
+        _sent("https://app.test/favicon.ico"),  # stale, from the prior page
+        _ok("https://app.test/favicon.ico"),
+        _sent("https://app.test/real-page", rtype="Document"),
+        _failed("https://app.test/real-page"),
+    ]
+    r = page.classify(events, page_origins=ORIGINS, harvested=0)
+    assert r.state == "failed"
+
+
+def test_the_document_falls_back_to_first_arrival_when_nothing_carries_type():
+    """F4's fallback half: a synthetic or truncated event stream (every
+    OTHER test in this file, and a real capped/aborted page) may carry no
+    `type` field on any event at all. The fix must not regress those --
+    first-arrival is still used when no event is typed.
+
+    MUTATION: require a typed event unconditionally (drop the `if typed_
+    document is not None else first_seen` fallback, e.g. leave `document`
+    as `None` whenever nothing is typed). Must go red -- with `document`
+    forced to `None`, `classify` takes the `document is None` branch and
+    reports `failed` for a page that in fact loaded and yielded a link.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/")]
+    r = page.classify(events, page_origins=ORIGINS, harvested=1)
+    assert r.state == "rendered"
+
+
+# --- classification: Ruling 11 -- a drop is a failure with NO response -----
+
+def test_a_document_served_then_truncated_is_not_reported_as_failed():
+    """MEASURED 2026-09-02: a request can appear in BOTH `responseReceived`
+    and `loadingFailed` -- served, then broken mid-body. The crawler did
+    receive and harvest that page.
+
+    MUTATION: classify the document on `failed` rather than on
+    `failed - answered`. Must go red -- a page we read would be reported as
+    one that never loaded.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _failed("https://app.test/")]
+    r = page.classify(events, page_origins=ORIGINS, harvested=3)
+    assert r.state == "rendered"
+
+
+def test_a_third_party_served_then_broken_is_not_named_as_dropped():
+    """`dropped_hosts` is the list an operator pastes into `render_allow`.
+    A resource that WAS served and then broke was not blocked by anything,
+    and naming it would have them widen scope to fix a phantom.
+
+    MUTATION: put every out-of-scope failure in `dropped_hosts` rather than
+    only those with no response. Must go red.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _sent("https://cdn.test/a.js"), _ok("https://cdn.test/a.js"),
+              _failed("https://cdn.test/a.js")]
+    r = page.classify(events, page_origins=ORIGINS, harvested=2)
+    assert r.dropped_hosts == ()
+
+
+# --- visit: Ruling 18 -- a page's CDP error is contained, a dead browser is
+# not -------------------------------------------------------------------
+
+class _FakeConn:
+    """A `cdp.Connection` double whose `.call` raises once, on a named
+    method, and answers empty-but-valid on everything else. `.drain` never
+    raises -- the real `Connection.drain` swallows `CdpTimeout`/`CdpClosed`
+    internally (see `cdp.py`), so `visit` never sees those from `drain`.
+    """
+
+    def __init__(self, raise_on: str, exc: Exception) -> None:
+        self._raise_on = raise_on
+        self._exc = exc
+        self.calls: list[str] = []
+
+    def call(self, method, params=None, *, session_id=None, timeout=None):
+        self.calls.append(method)
+        if method == self._raise_on:
+            raise self._exc
+        if method == "DOM.getDocument":
+            return {"root": {"nodeId": 1}}
+        if method == "DOM.getOuterHTML":
+            return {"outerHTML": "<a href=\"/x\">x</a>"}
+        return {}
+
+    def drain(self, timeout):
+        return []
+
+
+def test_a_page_whose_network_enable_raises_cdp_error_is_recorded_failed():
+    """Ruling 18: `visit`'s contract is "tell me about this page", and "I
+    could not reach it" is an ANSWER, not an exception -- `classify` already
+    has a `failed` state for exactly that.
+
+    MUTATION: remove the `except cdp.CdpError` guard around `Network.enable`
+    / `Page.enable` inside `visit` (let the error propagate). Must go red --
+    without it, `page.visit` itself raises instead of returning, so this
+    call raises `cdp.CdpError` instead of returning a `PageResult`.
+    """
+    conn = _FakeConn(raise_on="Network.enable", exc=cdp.CdpError("boom"))
+    result, links = page.visit(conn, "https://app.test/",
+                               page_origins=ORIGINS, session_id="s1")
+    assert result == page.PageResult(state="failed", requests=0,
+                                     dropped_hosts=(), in_scope_failures=(),
+                                     capped=False)
+    assert links == []
+
+
+def test_a_page_whose_call_raises_cdp_closed_propagates():
+    """Ruling 18: `cdp.CdpClosed` means the browser itself is gone -- every
+    later page would fail the identical way, so ending the crawl by letting
+    it propagate is correct. This is the more important of the two halves:
+    catching `CdpClosed` alongside `CdpError` would turn a dead browser into
+    a silent run of N "failed" pages, which is S12's failure wearing a new
+    hat.
+
+    MUTATION: catch `cdp.CdpClosed` inside `visit` (e.g. list it after the
+    general `except cdp.CdpError`, or drop its `except cdp.CdpClosed: raise`
+    clause entirely) so it is treated the same as a contained `CdpError`.
+    Must go red -- `visit` would return a failed `PageResult` instead of
+    raising.
+    """
+    conn = _FakeConn(raise_on="Network.enable", exc=cdp.CdpClosed("closed"))
+    try:
+        page.visit(conn, "https://app.test/", page_origins=ORIGINS,
+                  session_id="s1")
+    except cdp.CdpClosed:
+        pass
+    else:
+        raise AssertionError("expected cdp.CdpClosed to propagate")
+
+
+def test_a_page_whose_dom_read_raises_cdp_closed_also_propagates():
+    """Ruling 18, the third site. The DOM-read guard's `except cdp.CdpError`
+    is a superclass match and would ALSO catch `CdpClosed` unless it has its
+    own `except cdp.CdpClosed: raise` ahead of it -- silently reducing a
+    dead browser mid-DOM-read to `html = ""` instead of ending the crawl.
+
+    Both tests above raise on `Network.enable`, the FIRST call `visit`
+    makes, so neither one ever reaches this guard. This is the test that
+    does: `Network.enable`, `Page.enable` and `Page.navigate` must all
+    succeed here, or this test would pass because of an earlier guard and
+    prove nothing about the site it names.
+
+    MUTATION: at the DOM-read site, remove `except cdp.CdpClosed: raise` so
+    the broad `except cdp.CdpError` swallows it. Must go red.
+    """
+    conn = _FakeConn(raise_on="DOM.getDocument", exc=cdp.CdpClosed("closed"))
+    try:
+        page.visit(conn, "https://app.test/", page_origins=ORIGINS,
+                  session_id="s1", settle=0.0)
+    except cdp.CdpClosed:
+        pass
+    else:
+        raise AssertionError("expected cdp.CdpClosed to propagate")
+    assert conn.calls[:3] == ["Network.enable", "Page.enable", "Page.navigate"]
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -1510,6 +2231,13 @@ denied, it does not know whose render the denial broke.
 
 `classify` is therefore a pure function over CDP events, so the judgement
 can be tested without a browser and read without running anything.
+
+SESSION REQUIRED (Ruling 9, measured 2026-09-02): `--remote-debugging-pipe`
+gives a BROWSER-level CDP connection. `Page`, `Network` and `DOM` do not
+exist on it -- `Page.enable` came back "wasn't found" without a page-target
+session attached. `visit` therefore takes a required `session_id` and every
+domain call carries it; `Browser.__enter__` (`hx.crawl.browser`) is what
+creates that session, once, for the browser's whole lifetime.
 """
 from __future__ import annotations
 
@@ -1588,11 +2316,35 @@ def classify(events: list[dict], *, page_origins: set[str],
     different facts: an out-of-scope failure is one hx dropped, an in-scope
     failure is the target itself failing. Reporting them as one would send an
     operator to put their own application's host into `render_allow`.
+
+    `page_origins` IS SEED ORIGINS, NOT SCOPE -- read that literally, not as
+    a simplification. Spec §6 describes this split as made "by re-running the
+    scope predicate"; spec §7 forbids a second Python scope matcher (`there
+    is no Python scope matcher in this repo today ... a second matcher is a
+    second answer`). `hx.crawl.run.crawl` resolves that by building
+    `page_origins` from the seed URLs' own origins, which is a narrower
+    question than scope and can disagree with it in exactly one direction:
+    an engagement whose scope covers a second origin that was NEVER SEEDED
+    (say scope allows `api.app.test` but only `app.test` was given as a
+    seed) will have a target-side failure on that unseeded-but-in-scope
+    origin classified here as an out-of-scope drop, because this function has
+    no way to know the origin is in scope -- it only knows it was not seeded.
+    That host then lands in `dropped_hosts` (the list `render_allow` is
+    pasted from) instead of `in_scope_failures`, and nothing here contradicts
+    it. The JVM's own `denial` table is the authoritative record of what was
+    actually dropped by policy (§6: "cross-checkable against the denial
+    rows, which remain authoritative") -- an operator relying on
+    `dropped_hosts` alone should confirm against those rows before treating
+    a host as policy-dropped, precisely because this predicate can be wrong
+    in that one direction. It is never wrong the other way: an origin this
+    predicate calls in-scope really was seeded, so `in_scope_failures` never
+    contains a host hx would have dropped.
     """
     urls: dict[str, str] = {}
     failed: set[str] = set()
     answered: set[str] = set()
-    document: str | None = None
+    first_seen: str | None = None
+    typed_document: str | None = None
 
     for e in events:
         params = e.get("params", {})
@@ -1600,16 +2352,52 @@ def classify(events: list[dict], *, page_origins: set[str],
         if e.get("method") == "Network.requestWillBeSent":
             url = params.get("request", {}).get("url", "")
             urls[rid] = url
-            if document is None:
-                document = rid
+            if first_seen is None:
+                first_seen = rid
+            # F4 (whole-branch review, re-diagnosis of a previously-logged
+            # favicon race): the page session is REUSED for every URL in the
+            # crawl, and `visit`'s `conn.drain(timeout=0.0)` before
+            # navigation only clears events that have ALREADY ARRIVED -- a
+            # trailing event from the PREVIOUS page can still be in flight
+            # and be the first thing this page's event list sees. Judging
+            # "the document" by arrival order then risks taking page N-1's
+            # request as page N's document, and if that stale request
+            # happened to succeed while the real document failed, this page
+            # OVER-CLAIMS -- reported `rendered` for a page that never
+            # loaded, which is the direction §12 calls unsurvivable.
+            # Chromium sets `type` on `Network.requestWillBeSent` and marks
+            # exactly the navigation request `"Document"`, so that field
+            # identifies the real document regardless of arrival order.
+            if typed_document is None and params.get("type") == "Document":
+                typed_document = rid
         elif e.get("method") == "Network.loadingFailed":
             failed.add(rid)
         elif e.get("method") == "Network.responseReceived":
             answered.add(rid)
 
+    # PREFER THE TYPED DOCUMENT; FALL BACK TO FIRST ARRIVAL. A synthetic or
+    # truncated event stream (as every test in this file constructs, and as
+    # a capped/aborted real page may produce) may carry no `type` field at
+    # all -- first-arrival is still the best available signal then, exactly
+    # as it was before this fix, so a stream with no typed event classifies
+    # exactly as it always did.
+    document = typed_document if typed_document is not None else first_seen
+
+    # A DROP IS A FAILURE WITH NO RESPONSE (Ruling 11, measured 2026-09-02):
+    # a proxy that closes without answering produces `loadingFailed`
+    # (net::ERR_EMPTY_RESPONSE) and NO `responseReceived`, while a resource
+    # that was served and then broke mid-body produces BOTH. Treating the
+    # sets as disjoint would put a served-then-broken third party into
+    # `dropped_hosts` -- and that list is what an operator pastes into
+    # `render_allow`, so they would widen scope to fix something nothing
+    # blocked. It would also report a document that loaded and then had a
+    # trailing body error as `failed`, when it was in fact received and
+    # harvested.
+    dropped_candidates = failed - answered
+
     dropped: set[str] = set()
     in_scope_failures: list[str] = []
-    for rid in failed:
+    for rid in dropped_candidates:
         url = urls.get(rid, "")
         if origin_of(url) in page_origins:
             in_scope_failures.append(url)
@@ -1618,7 +2406,7 @@ def classify(events: list[dict], *, page_origins: set[str],
             if host:
                 dropped.add(host)
 
-    if document is None or document in failed:
+    if document is None or document in dropped_candidates:
         state = "failed"
     else:
         # YIELD is links OR in-scope requests beyond the document itself.
@@ -1646,25 +2434,65 @@ def classify(events: list[dict], *, page_origins: set[str],
                       capped=capped)
 
 
+def _failed() -> tuple[PageResult, list[str]]:
+    """CONTAINED (Ruling 18): "I could not reach this page" is an ANSWER to
+    `visit`'s question, not an exception -- `classify` already has a
+    `failed` state for exactly that, so a page `visit` could not reach still
+    appears in the crawl's summary instead of vanishing from it.
+    """
+    return (PageResult(state="failed", requests=0, dropped_hosts=(),
+                       in_scope_failures=(), capped=False), [])
+
+
 def visit(conn: cdp.Connection, url: str, *, page_origins: set[str],
-          settle: float = 2.0, cap: float = 20.0) -> tuple[PageResult, list[str]]:
+          session_id: str, settle: float = 2.0,
+          cap: float = 20.0) -> tuple[PageResult, list[str]]:
     """Navigate, wait for quiet, harvest, judge.
+
+    `session_id` is the page-target session `Browser.__enter__` attached
+    (Ruling 9) -- required, not optional, because every call below is a
+    `Page`/`Network`/`DOM` domain call and none of those domains exist on
+    the browser-level connection `--remote-debugging-pipe` hands us.
 
     `cap` is what stops one long-polling endpoint, analytics beacon or open
     WebSocket consuming the whole crawl budget. A page that hits it is
     recorded as CAPPED, not as complete -- capped and complete are different
     claims and the summary keeps them apart.
+
+    RULING 18 -- one page's failure must not end the crawl, but a dead
+    browser must. `cdp.CdpError` (and its `CdpTimeout` sibling, where not
+    already given a more specific meaning below) is CONTAINED here as a
+    `failed` `PageResult`: `crawl()` calls `visit` with no guard of its own,
+    on purpose, because the guard belongs to the question `visit` answers,
+    not to the loop that asks it. `cdp.CdpClosed` means the browser itself
+    is gone -- every later page would fail the identical way, so it
+    PROPAGATES uncaught. Each `except` below lists `CdpClosed` before the
+    general `CdpError` it is a subclass of, so a dead browser is never
+    caught by the broader clause and reported as one more failed page.
     """
-    conn.call("Network.enable")
-    conn.call("Page.enable")
+    try:
+        conn.call("Network.enable", session_id=session_id)
+        conn.call("Page.enable", session_id=session_id)
+    except cdp.CdpClosed:
+        raise
+    except cdp.CdpError:
+        return _failed()
     conn.drain(timeout=0.0)
 
     events: list[dict] = []
     capped = False
     try:
-        conn.call("Page.navigate", {"url": url}, timeout=cap)
+        conn.call("Page.navigate", {"url": url}, session_id=session_id,
+                  timeout=cap)
     except cdp.CdpTimeout:
+        # A slow navigation is not a failed page -- the settle loop below
+        # still collects whatever the page produced before the cap, and
+        # `capped` keeps that distinct from a complete visit.
         capped = True
+    except cdp.CdpClosed:
+        raise
+    except cdp.CdpError:
+        return _failed()
 
     deadline = time.monotonic() + cap
     quiet_since = None
@@ -1682,14 +2510,31 @@ def visit(conn: cdp.Connection, url: str, *, page_origins: set[str],
 
     html = ""
     try:
-        root = conn.call("DOM.getDocument", {"depth": -1}, timeout=cap)
+        root = conn.call("DOM.getDocument", {"depth": -1},
+                         session_id=session_id, timeout=cap)
         node_id = root.get("root", {}).get("nodeId")
         if node_id:
             html = conn.call("DOM.getOuterHTML", {"nodeId": node_id},
+                             session_id=session_id,
                              timeout=cap).get("outerHTML", "")
+    except cdp.CdpClosed:
+        raise
     except cdp.CdpError:
         # A document we cannot read is a page we harvested nothing from --
-        # which `classify` will read as no yield, and that is honest.
+        # which `classify` will read as no yield, and that is honest. This
+        # is narrower than the whole-page failure above: the events already
+        # collected are still real and still classified.
+        #
+        # DELIBERATELY NOT `_failed()` here, unlike the two guards above --
+        # and this is the whole asymmetry, not an inconsistency to tidy up.
+        # By this point the network events have already been collected: we
+        # know what the page requested. Reporting `failed` would discard
+        # that real signal in favour of a weaker claim. Letting `classify`
+        # judge on the events alone (in-scope requests seen -> `rendered`;
+        # nothing, plus drops -> `degraded`) is strictly more informative,
+        # and S12's preference is always the most specific true statement
+        # available. The other two sites fail BEFORE any signal exists;
+        # this one fails AFTER. That is the whole asymmetry.
         html = ""
 
     links = harvest(html, url) if html else []
@@ -1772,6 +2617,7 @@ from hx.crawl import run as crawl_run
 class _FakeBrowser:
     def __init__(self, **kw) -> None:
         self.conn = object()
+        self.session_id = "fake-session"
         self.closed = False
 
     def __enter__(self):
@@ -1788,7 +2634,7 @@ def _visitor(pages: dict[str, tuple[page.PageResult, list[str]]]):
     """A `visit` double: a map from URL to what that page yields."""
     default = (page.PageResult("rendered", 1, (), (), False), [])
 
-    def visit(conn, url, *, page_origins, settle=2.0, cap=20.0):
+    def visit(conn, url, *, page_origins, session_id, settle=2.0, cap=20.0):
         return pages.get(url, default)
     return visit
 
@@ -1799,6 +2645,11 @@ def _b(pages=100, seconds=100.0, requests=10_000):
 
 
 def test_links_from_one_page_become_the_next_pages():
+    """A page's harvested links must reach the frontier, or the crawl never
+    leaves its seeds.
+
+    MUTATION: drop the `frontier.offer(links)` call. Must go red.
+    """
     visit = _visitor({
         "https://a.test/": (page.PageResult("rendered", 2, (), (), False),
                             ["https://a.test/x", "https://a.test/y"]),
@@ -1809,6 +2660,13 @@ def test_links_from_one_page_become_the_next_pages():
 
 
 def test_the_summary_counts_each_state_separately():
+    """`rendered`/`degraded`/`failed` are separate counts, not one bucket --
+    an operator reading only `pages` cannot tell a clean crawl from one that
+    never rendered.
+
+    MUTATION: bucket every page's result into `counts["rendered"]`
+    regardless of `result.state`. Must go red.
+    """
     visit = _visitor({
         "https://a.test/": (page.PageResult("rendered", 1, (), (), False),
                             ["https://a.test/d", "https://a.test/f"]),
@@ -1853,7 +2711,12 @@ def test_a_truncated_crawl_names_the_budget_that_stopped_it():
 
 
 def test_a_complete_crawl_reports_no_truncation():
-    """THE SEPARATING CASE, without which every crawl claims truncation."""
+    """THE SEPARATING CASE, without which every crawl claims truncation.
+
+    MUTATION: report `truncated_by=frontier.exhausted or "max_pages"`
+    (or any expression that names a budget even when the queue simply
+    emptied). Must go red.
+    """
     visit = _visitor({})
     s = crawl_run.crawl(seeds=["https://a.test/"], proxy_port=1, budget=_b(),
                         visit=visit, browser_factory=_FakeBrowser)
@@ -1878,7 +2741,9 @@ def test_the_browser_is_closed_even_when_a_page_raises():
     """A leaked Chromium outlives the crawl and holds a proxy connection the
     extension is accounting for.
 
-    MUTATION: drop the context manager around the loop. Must go red.
+    MUTATION: drop the context manager around the loop (call
+    `browser_factory(...)` directly instead of `with browser_factory(...)`).
+    Must go red.
     """
     made: list[_FakeBrowser] = []
 
@@ -1917,6 +2782,20 @@ that the loop, the budget accounting and the summary arithmetic can be
 tested without Chromium. That is the seam, not a convenience: the parts of
 this file worth getting right are arithmetic, and arithmetic should not need
 a browser to exercise.
+
+SESSION REQUIRED (Ruling 9): a `--remote-debugging-pipe` connection is
+BROWSER-level -- `Page`/`Network`/`DOM` do not exist on it. `browser.Browser`
+attaches a page target once, for the browser's whole lifetime, and exposes
+the resulting `.session_id`; every call to `visit` below passes it on.
+
+ONE PAGE'S FAILURE DOES NOT END THE CRAWL, BUT A DEAD BROWSER DOES (Ruling
+18). That guard lives inside `page.visit`, not here: `visit`'s contract is
+"tell me about this page", and "I could not reach it" is an answer
+(`PageResult(state="failed", ...)`), not an exception -- so this loop calls
+`visit` with no guard of its own, on purpose. A `cdp.CdpClosed` means the
+browser itself is gone and `visit` lets it propagate; this function does not
+catch it either, so it propagates out of `crawl` and the `with` block below
+still closes the browser on the way out.
 """
 from __future__ import annotations
 
@@ -1925,6 +2804,21 @@ from typing import Callable, Iterable, NamedTuple
 from hx.crawl import browser as browser_mod
 from hx.crawl import frontier as frontier_mod
 from hx.crawl import page as page_mod
+
+
+#: The four things this crawler does not do, worded once. `as_tool_result`
+#: puts these in the agent-facing dict as `not_done`; `hx crawl`'s CLI
+#: (`cli.py`) echoes them verbatim as the closing lines of its printed
+#: summary, so the operator who ran the crawl from a terminal reads the
+#: identical disclosure the agent gets rather than a fifth phrasing of the
+#: same four facts. Spec §9: the crawl summary AND the report's Limits
+#: section must both say this in as many words.
+NOT_DONE = (
+    "forms are not submitted",
+    "nothing is clicked",
+    "no interaction-gated route is walked",
+    "the crawl is unauthenticated",
+)
 
 
 class CrawlSummary(NamedTuple):
@@ -1942,7 +2836,13 @@ def crawl(*, seeds: Iterable[str], proxy_port: int,
           budget: frontier_mod.Budget, burp_home=None,
           visit: Callable = page_mod.visit,
           browser_factory: Callable = browser_mod.Browser) -> CrawlSummary:
-    """Visit pages until the frontier is empty or a budget stops us."""
+    """Visit pages until the frontier is empty or a budget stops us.
+
+    The browser is opened as a context manager and stays one for the whole
+    loop, on purpose: a page that raises must still close it. A leaked
+    Chromium outlives the crawl and holds a proxy connection the extension
+    is accounting for.
+    """
     seeds = list(seeds)
     origins = {o for o in (frontier_mod.origin_of(s) for s in seeds) if o}
     frontier = frontier_mod.Frontier(seeds, budget)
@@ -1952,19 +2852,24 @@ def crawl(*, seeds: Iterable[str], proxy_port: int,
     requests = 0
     dropped: set[str] = set()
 
-    with browser_factory(proxy_port=proxy_port, burp_home=burp_home) as browser:
+    with browser_factory(proxy_port=proxy_port, burp_home=burp_home) as br:
         while True:
             url = frontier.next()
             if url is None:
                 break
-            result, links = visit(browser.conn, url, page_origins=origins)
+            result, links = visit(br.conn, url, page_origins=origins,
+                                  session_id=br.session_id)
             counts[result.state] = counts.get(result.state, 0) + 1
             capped += 1 if result.capped else 0
             requests += result.requests
+            # UNIONED across pages (not just the last one), because this
+            # list is what an operator pastes into `render_allow` -- a
+            # per-page list would make them assemble it by hand.
             dropped.update(result.dropped_hosts)
             # CHARGED AS WE GO. Without this `max_requests` is unenforceable
             # and a crawl can run away inside a page budget -- one page that
-            # fires a thousand XHR is a thousand requests against the target.
+            # fires a thousand XHR is a thousand requests against the
+            # target, not zero.
             frontier.note_requests(result.requests)
             frontier.offer(links)
 
@@ -1973,10 +2878,30 @@ def crawl(*, seeds: Iterable[str], proxy_port: int,
         rendered=counts["rendered"], degraded=counts["degraded"],
         failed=counts["failed"], capped=capped, requests=requests,
         dropped_hosts=tuple(sorted(dropped)),
-        # NAMED, or None. A truncated crawl that presented as a complete one
-        # is S12's failure one level up, and a complete crawl that claimed
+        # NAMED, or None. A truncated crawl that presented as complete is
+        # S12's failure one level up; a complete crawl that claimed
         # truncation would be the same error pointing the other way.
         truncated_by=frontier.exhausted)
+
+
+def as_tool_result(summary: CrawlSummary) -> dict:
+    """The summary as the agent sees it.
+
+    `truncated_by` is not optional in this dict. A crawl that stopped on a
+    budget and reported only its counts would read as a complete crawl of a
+    small application, which is S12's failure with the numbers intact.
+    """
+    return {
+        "pages": summary.pages,
+        "rendered": summary.rendered,
+        "degraded": summary.degraded,
+        "failed": summary.failed,
+        "capped": summary.capped,
+        "requests": summary.requests,
+        "dropped_hosts": list(summary.dropped_hosts),
+        "truncated_by": summary.truncated_by,
+        "not_done": list(NOT_DONE),
+    }
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -2054,20 +2979,50 @@ registry.register(spec.ToolSpec(
 
 ```python
 # tests/test_crawl_tool.py -- the tool envelope, not the browser
-"""`crawl.run` as the agent sees it. The crawl itself is stubbed; what is
-under test is the envelope, the refusals and the flags.
+"""`crawl.run` as the agent sees it. The crawl itself is stubbed throughout;
+what is under test is the envelope, the refusals and the flags.
+
+Dispatcher-level round trips (does `dispatch()` see the same `needs_egress`
+and run-kind guards it gives `scan.run`) live in `tests/test_tools_scan.py`,
+next to `scan.run`'s own. This file calls the handler directly, the way the
+plan's own Step 1 does, so a guard's ORDER inside the handler is pinned even
+against a `ctx` that would crash if touched (`ctx=None`).
 """
 from __future__ import annotations
 
+import dataclasses
+
+import pytest
+
+from hx import run as run_mod
+from hx.crawl import browser as browser_mod
+from hx.crawl import frontier as frontier_mod
 from hx.crawl import run as crawl_run
-from hx.tools import registry
+from hx.tools import errors, registry
+from hx.tools.impl import scan as scan_impl
+from tests.test_probe import FakeBridge
+
+
+@pytest.fixture
+def tool_run_crawl(tool_ctx):
+    """A `tool_ctx` with a `crawl` run already open and a fake session on it
+    -- the bracket `crawl.run`'s own guard requires, and the `crawler_port`
+    every successful call reads."""
+    tool_ctx.run_id = run_mod.open_run(
+        tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="crawl",
+        safety_profile=tool_ctx.config.safety_profile)
+    tool_ctx.session = type(
+        "S", (), {"bridge": FakeBridge(), "crawler_port": 41999,
+                  "operator_port": 41998})()
+    return tool_ctx
 
 
 def test_crawl_run_is_registered_as_needing_egress():
     """MUTATION: drop `needs_egress=True`. Must go red -- a crawl that does
     not declare egress skips the checks every other sending tool passes.
     """
-    spec = registry.get("crawl.run")
+    spec = registry.lookup("crawl.run")
+    assert spec is not None
     assert spec.needs_egress is True
     assert spec.mutates is True
 
@@ -2090,14 +3045,167 @@ def test_asking_for_an_identity_is_refused_and_names_the_reason():
     that is silently ignored is worse than one that is rejected: the agent
     would report having crawled as a user.
 
-    MUTATION: ignore `identity` instead of raising. Must go red.
+    MUTATION: ignore `identity` instead of raising. Must go red -- `ctx` is
+    `None` here on purpose, so a mutated handler that let this call fall
+    through to any other guard (the run-kind check, the missing-`target`
+    check) hits `ctx.open_runs()` or similar on `None` and raises
+    `AttributeError`, which `pytest.raises(ToolUnavailable, ...)` does not
+    accept either. There is no other path to the same green result.
     """
-    from hx.tools import errors
-    from hx.tools.impl import scan as scan_impl
-    import pytest
-
     with pytest.raises(errors.ToolUnavailable, match="authenticated"):
         scan_impl.crawl(ctx=None, identity="admin")
+
+
+def test_identity_is_refused_before_anything_else_is_even_looked_at():
+    """The refusal fires even with a well-formed `target` present, which is
+    the proof identity is checked FIRST rather than merely checked somewhere
+    before the run-kind guard happens to be hit with `ctx=None` too.
+
+    MUTATION: move the identity check after the run-kind guard. Must go red
+    -- with a `target` supplied, that guard is the next thing reached, and
+    it touches `ctx.open_runs()` on a `None` ctx, raising `AttributeError`
+    rather than the `ToolUnavailable` this test requires.
+    """
+    with pytest.raises(errors.ToolUnavailable, match="authenticated"):
+        scan_impl.crawl(ctx=None, identity="admin", target="http://x.test/")
+
+
+def test_it_refuses_outside_a_crawl_run(tool_ctx):
+    """The same mechanical reason `scan.run` refuses outside a `scan` run:
+    `crawl.run` has no run of its own to auto-open, so a run this layer did
+    not open is a run `run.finish` would never close.
+
+    MUTATION: drop the run-kind guard. Must go red -- `tool_ctx` has no
+    session, so a mutated handler would fall through to `ctx.session.
+    crawler_port` and raise `AttributeError` on `None`, not the intended
+    `ToolRefused`.
+    """
+    with pytest.raises(errors.ToolRefused) as exc_info:
+        scan_impl.crawl(ctx=tool_ctx, target="http://127.0.0.1:8080/")
+    assert exc_info.value.reason == "wrong_run_kind"
+
+
+def test_it_refuses_with_no_target(tool_run_crawl, monkeypatch):
+    """MUTATION: drop the `target` check. Must go red -- with the run-kind
+    and session guards satisfied by `tool_run_crawl`, a mutated handler
+    would reach the (stubbed) crawler with `seeds=[None]` and return
+    normally instead of raising.
+    """
+    def _must_not_run(**kw):
+        raise AssertionError("the crawler must not run without a target")
+
+    monkeypatch.setattr(crawl_run, "crawl", _must_not_run)
+    with pytest.raises(errors.ToolRefused) as exc_info:
+        scan_impl.crawl(ctx=tool_run_crawl)
+    assert exc_info.value.reason == "bad_args"
+
+
+def test_it_drives_the_crawler_through_the_crawler_port_not_the_operator_one(
+        tool_run_crawl, monkeypatch):
+    """`operator_port` and `crawler_port` are NOT interchangeable (Ruling
+    21): the extension tells the operator's own browsing from an agent's
+    crawl by WHICH LISTENER a request arrived on, and nothing in the
+    traffic itself. Dialling the wrong one silently swaps the two rule
+    sets.
+
+    MUTATION: pass `ctx.session.operator_port` instead of `.crawler_port`.
+    Must go red -- the two ports are set to different, distinctive values
+    on the fixture, so the assertion below tells them apart directly; there
+    is no other value in this handler that could produce 41999.
+    """
+    seen = {}
+
+    def fake_crawl(**kw):
+        seen.update(kw)
+        return crawl_run.CrawlSummary(
+            pages=1, rendered=1, degraded=0, failed=0, capped=0, requests=1,
+            dropped_hosts=(), truncated_by=None)
+
+    monkeypatch.setattr(crawl_run, "crawl", fake_crawl)
+    scan_impl.crawl(ctx=tool_run_crawl, target="http://a.test/")
+    assert seen["proxy_port"] == 41999
+
+
+def test_it_builds_the_budget_from_the_call_and_the_session_config(
+        tool_run_crawl, monkeypatch):
+    """`max_pages`/`max_seconds` come from the agent's own call; `max_
+    requests` comes from `ctx.config` -- the schema carries no such
+    parameter (Global Constraints), so the budget must not invent one from
+    a hardcoded number or accept one from the agent.
+
+    MUTATION: hardcode `max_requests` in the `Budget` instead of reading
+    `ctx.config.max_requests`. Must go red -- the fixture's config is set to
+    the distinctive value 777 below, which no plausible hardcoded default
+    (2000, 5000, ...) would match.
+    """
+    tool_run_crawl.config = dataclasses.replace(
+        tool_run_crawl.config, max_requests=777)
+    seen = {}
+
+    def fake_crawl(**kw):
+        seen.update(kw)
+        return crawl_run.CrawlSummary(
+            pages=0, rendered=0, degraded=0, failed=0, capped=0, requests=0,
+            dropped_hosts=(), truncated_by=None)
+
+    monkeypatch.setattr(crawl_run, "crawl", fake_crawl)
+    scan_impl.crawl(ctx=tool_run_crawl, target="http://a.test/",
+                    max_pages=5, max_seconds=30)
+    assert seen["budget"] == frontier_mod.Budget(
+        max_pages=5, max_seconds=30, max_requests=777)
+
+
+def test_a_missing_browser_reaches_the_agent_as_unavailable_not_broken(
+        tool_run_crawl, monkeypatch):
+    """F3: `browser.BrowserUnavailable` is not a `ToolError`, and `dispatch`
+    (`hx.tools.dispatch`) renders any non-`ToolError` exception as
+    `envelope.failed` -- which tells the agent hx itself is broken. A Burp
+    that has never downloaded its own bundled browser is the MOST LIKELY
+    failure of `crawl.run`, and it has a clear operator fix (open Burp's own
+    browser once so it downloads Chromium); that is an unavailability, not a
+    defect, and this module's own docstring is about exactly that
+    distinction for the old always-unavailable stub.
+
+    `find_chromium`'s own message is carried through verbatim rather than
+    reworded here.
+
+    MUTATION: drop the `except browser_mod.BrowserUnavailable` wrap around
+    the `crawl_run_mod.crawl` call inside `scan_impl.crawl` (let it
+    propagate bare). Must go red -- `pytest.raises(errors.ToolUnavailable,
+    ...)` would instead see the raw `browser_mod.BrowserUnavailable`
+    propagate uncaught, which is not a `ToolUnavailable` at all.
+    """
+    def fake_crawl(**kw):
+        raise browser_mod.BrowserUnavailable(
+            "no bundled Chromium under /home/x/.BurpSuite/burpbrowser")
+
+    monkeypatch.setattr(crawl_run, "crawl", fake_crawl)
+    with pytest.raises(errors.ToolUnavailable,
+                       match="no bundled Chromium") as exc_info:
+        scan_impl.crawl(ctx=tool_run_crawl, target="http://a.test/")
+    assert exc_info.value.reason == "not_configured"
+
+
+def test_it_returns_the_projection_the_agent_reads(
+        tool_run_crawl, monkeypatch):
+    """The handler must hand back `as_tool_result`'s dict, not the raw
+    `CrawlSummary` namedtuple -- an agent reading `.truncated_by` off a
+    namedtuple would get it, but `.not_done` does not exist there at all.
+
+    MUTATION: return the bare `CrawlSummary` instead of `as_tool_result
+    (summary)`. Must go red -- `not_done` is only ever added by the
+    projection.
+    """
+    def fake_crawl(**kw):
+        return crawl_run.CrawlSummary(
+            pages=4, rendered=3, degraded=1, failed=0, capped=0, requests=7,
+            dropped_hosts=("evil.test",), truncated_by="max_seconds")
+
+    monkeypatch.setattr(crawl_run, "crawl", fake_crawl)
+    body = scan_impl.crawl(ctx=tool_run_crawl, target="http://a.test/")
+    assert body["truncated_by"] == "max_seconds"
+    assert body["dropped_hosts"] == ["evil.test"]
+    assert "not_done" in body
 ```
 
 `registry.get` and `errors.ToolUnavailable` are the existing names — confirm the spelling against `src/hx/tools/registry.py` and `src/hx/tools/errors.py` before writing, and use whatever those modules actually export rather than these if they differ.
@@ -2130,9 +3238,7 @@ def as_tool_result(summary: CrawlSummary) -> dict:
         "requests": summary.requests,
         "dropped_hosts": list(summary.dropped_hosts),
         "truncated_by": summary.truncated_by,
-        "not_done": ["forms are not submitted", "nothing is clicked",
-                     "no interaction-gated route is walked",
-                     "the crawl is unauthenticated"],
+        "not_done": list(NOT_DONE),
     }
 ```
 
@@ -2221,7 +3327,7 @@ def _cfg():
 def _crawled(conn):
     conn.execute(
         "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
-        " status) VALUES('r-c','e-1','crawl','staging',1,'closed')")
+        " status) VALUES('r-c','e-1','crawl','staging',1,'completed')")
 
 
 def test_an_engagement_that_crawled_discloses_what_the_crawl_did_not_do(
@@ -2229,13 +3335,19 @@ def test_an_engagement_that_crawled_discloses_what_the_crawl_did_not_do(
     """MUTATION: delete any one of the four disclosures. Must go red.
 
     Parametrised over the four rather than asserted as one string, so that
-    losing exactly one cannot hide behind the other three.
+    losing exactly one cannot hide behind the other three. The two phrases
+    that read as ordinary English words elsewhere in the report --
+    "interaction" (the no-blind-only-checks bullet) and "unauthenticated"
+    (the every-probe-was-sent-unauthenticated bullet, which this minimal
+    engagement also renders, having proved no session) -- are asserted by
+    the LONGER phrase unique to the crawl bullet, so this test cannot pass
+    on the strength of an unrelated bullet that happens to share one word.
     """
     _crawled(engagement_conn)
     out = report_mod.render(engagement_conn, engagement_id="e-1",
                             config=_cfg())
-    for phrase in ("no form", "clicks nothing", "interaction",
-                   "unauthenticated"):
+    for phrase in ("no forms", "clicks nothing", "interaction to reach",
+                   "runs **unauthenticated**"):
         assert phrase in out.lower(), phrase
 
 
@@ -2345,53 +3457,330 @@ unit suite; these are the three claims that cannot be.
 
 LOOPBACK ONLY. `TargetServer` refuses any host outside 127.0.0.0/8 and that
 refusal is load-bearing, not tidiness.
+
+WHY A REAL CRAWL RATHER THAN `rig.browse`, in the first two tests. `rig.browse`
+(the model `test_proxy_capture.py` follows for the operator/crawler split) is
+a raw socket that hands bytes straight to a Burp listener -- it never asks
+Chromium to decide whether a loopback destination should go through the
+configured proxy at all, so it cannot see the ONE bug this task exists to
+catch. Only `hx.crawl.run.crawl`, driving `hx.crawl.browser.Browser`'s real
+`launch_argv`, puts that decision in the path. The third test is a Policy
+question with no browser-specific claim in it, so it uses `rig.browse` like
+every other proxy-split test in this suite -- see its own docstring.
 """
 from __future__ import annotations
 
+import dataclasses
+import socket
+import time
+
 import pytest
+
+from hx.crawl import frontier as frontier_mod
+from hx.crawl import run as crawl_run_mod
+from tests.integration.test_proxy_capture import status_of
+from tests.integration.test_send_path import _refusal_from
 
 pytestmark = pytest.mark.integration
 
 
-def test_a_crawl_produces_exchanges_attributed_to_the_crawler(...):
-    """THE TEST THIS WHOLE PLAN TURNS ON.
+def rows(rig, sql: str, args=()) -> list[dict]:
+    return [dict(row) for row in rig.eng.db.execute(sql, args).fetchall()]
 
-    Measured 2026-09-02: without `--proxy-bypass-list=<-loopback>`,
-    Chromium sent ZERO connections to the proxy for a loopback target and
-    reached it directly -- around ProxyGate and every S4 enforcement point.
-    Every target in this repo is loopback by mandate, so a crawler missing
-    that flag renders pages perfectly and passes any test that merely checks
-    the page loaded.
 
-    MUTATION: delete `--proxy-bypass-list=<-loopback>` from
-    `browser.launch_argv`. This test MUST go red.
+# A budget generous enough that nothing here truncates on a slow CI box, and
+# small enough that a runaway crawl (a page that somehow keeps yielding new
+# same-origin links) cannot turn a broken test into a hung one. Every seed
+# below is one JSON endpoint with no links, so in the unbroken case the
+# frontier empties itself after exactly one page and none of these numbers is
+# ever actually reached.
+_BUDGET = frontier_mod.Budget(max_pages=3, max_seconds=45, max_requests=50)
 
-    It asserts on the STORE, not on the page: rows attributed to the crawler
-    listener. A page-rendered assertion survives the mutation, which is why
-    it is not the assertion here.
+
+def _crawl(rig, *, seeds: list[str]) -> crawl_run_mod.CrawlSummary:
+    return crawl_run_mod.crawl(seeds=seeds, proxy_port=rig.crawler_port,
+                               budget=_BUDGET)
+
+
+# ---------------------------------------------------------------------------
+# 1. THE TEST THIS WHOLE PLAN TURNS ON.
+# ---------------------------------------------------------------------------
+
+def test_a_crawl_produces_exchanges_attributed_to_the_crawler(rig):
+    """A real Chromium, launched with the real `browser.launch_argv`, must
+    put its traffic through the crawler listener rather than around it.
+
+    MEASURED 2026-09-02: a Chromium launched with `--proxy-server` alone and
+    pointed at a loopback target sent ZERO connections to the proxy and
+    reached it directly -- Chrome bypasses a configured proxy for loopback by
+    default, and every target this suite is permitted to use is loopback.
+    `browser.launch_argv` carries a second flag, `--proxy-bypass-list=<-
+    loopback>`, that closes exactly this hole.
+
+    MUTATION: delete that flag from `browser.launch_argv`
+    (`sed -i '/proxy-bypass-list/d' src/hx/crawl/browser.py`). This test MUST
+    go red.
+
+    IT ASSERTS ON THE STORE, NEVER ON THE PAGE. A missing flag still renders
+    the page perfectly -- Chromium reaches the target directly and gets the
+    same bytes back -- so `summary.rendered == 1` or any assertion about the
+    DOM would stay green under the mutation and prove nothing. What can only
+    be true if the traffic actually crossed the crawler listener is a row in
+    `exchange`, attributed to a `crawl` run, naming this request. Without the
+    flag Chromium never dials the proxy at all, so no frame ever reaches
+    `BridgeServer`, the sink is never called, and this settle times out --
+    which is the failure this test is written to produce.
+
+    WOULD THIS FAIL IF ITS CLAIM WERE FALSE? Under the mutation above,
+    Chromium still renders `/health` (a direct loopback connection succeeds
+    identically to a proxied one against this target), so `crawl()` still
+    returns a normal-looking `CrawlSummary` with one rendered page. The
+    settle below is the only thing that can tell the two situations apart,
+    and its own failure message says why -- see `Rig.settle`.
     """
+    assert rig.configure() == 1
+
+    seed = f"{rig.target.origin}/health"
+    summary = _crawl(rig, seeds=[seed])
+    assert summary.pages == 1, (
+        f"the crawl visited {summary.pages} page(s) for one seed with no "
+        f"links; something about the frontier or the seed URL is wrong "
+        f"before this test can say anything about attribution: {summary}")
+
+    rig.settle(
+        lambda: rows(rig, "SELECT e.id FROM exchange e"
+                          " JOIN run r ON e.run_id = r.id"
+                          " WHERE r.kind = 'crawl'"),
+        "an exchange row attributed to a crawl run -- meaning Chromium's "
+        "request for the seed above actually crossed the crawler proxy "
+        "listener rather than going around it")
+
+    crawler_rows = rows(
+        rig, "SELECT e.*, r.kind AS run_kind FROM exchange e"
+             " JOIN run r ON e.run_id = r.id WHERE r.kind = 'crawl'")
+    urls = {row["url"] for row in crawler_rows}
+    assert seed in urls, (
+        f"a crawl run recorded exchanges, but none of them named the seed "
+        f"{seed!r}: {urls}. The crawler listener is carrying SOME traffic; "
+        f"this crawl's own request is not it")
+    for row in crawler_rows:
+        # 'proxy', not 'send' -- this came through ProxyGate, not the bridge
+        # send handler. Every row here should agree, since this test drove
+        # exactly one browser through exactly one listener.
+        assert row["via"] == "proxy", row
+        assert row["run_id"] in {r["id"] for r in
+                                 rows(rig, "SELECT id FROM run"
+                                          " WHERE kind='crawl'")}
+
+    seed_row = next(row for row in crawler_rows if row["url"] == seed)
+    assert seed_row["method"] == "GET"
+    assert seed_row["outcome"] == "ok"
+    assert seed_row["status"] == 200
 
 
-def test_an_out_of_scope_destination_is_dropped_and_recorded(...):
+# ---------------------------------------------------------------------------
+# 2. An out-of-scope destination is dropped and the drop is recorded.
+# ---------------------------------------------------------------------------
+
+def test_an_out_of_scope_destination_is_dropped_and_recorded(rig):
     """`TargetServer` binds the in-scope target on 127.0.0.1 and the
-    out-of-scope one on 127.0.0.2. BOTH ARE LOOPBACK, so this test shares
-    the bypass blind spot above: without the flag the browser would reach
-    127.0.0.2 directly and this test would be asserting the ABSENCE of a
-    recording rather than the PRESENCE of a refusal.
+    out-of-scope one (`rig.offside`) on 127.0.0.2 -- BOTH LOOPBACK, so this
+    shares test 1's blind spot: if Chromium bypassed the crawler's proxy for
+    loopback, it would reach 127.0.0.2 DIRECTLY, and "no exchange was
+    recorded for it" would be true for entirely the wrong reason -- a bypass,
+    not a refusal.
 
-    So it asserts the denial row exists, not that the exchange is missing.
+    So the assertion is the PRESENCE of a denial row and the offside
+    target's log staying flat, never the absence of an exchange on its own.
 
-    MUTATION: remove the CRAWLER branch from ProxyGate. Must go red.
+    MUTATION: remove the `if (source == Source.CRAWLER)` branch from
+    `ProxyGate.decide` (`extension/src/hx/proxy/ProxyGate.java`). Must go red.
+
+    THREE CONTROLS, the same shape `test_proxy_capture.py`'s out-of-scope
+    test uses and for the same reason -- "the log did not move" is satisfied
+    by a great many things that are not enforcement:
+
+      - the offside target is hit DIRECTLY first, so its log is proven able
+        to move at all;
+      - an in-scope crawl through the SAME listener is proven to deliver,
+        so the proxy path is known to be carrying traffic when the refusal
+        is measured;
+      - the denial ROW is asserted, so "nothing arrived" (a broken crawl, a
+        dead listener) is told apart from "hx refused it".
+
+    A SECOND MEASUREMENT LIVES BELOW THE FIRST, and it is not decoration --
+    it is the only half of this test the named mutation actually reaches.
+    MEASURED: with the CRAWLER branch removed, a request from that listener
+    falls to `Policy.decideScopeOnly` -- the OPERATOR's question -- which
+    asks about scope and stops. For a destination `scope.include` never
+    named at all, `decideScopeOnly` denies it exactly as `decideCrawl` would
+    have (both are `checkScope` underneath), so the out-of-scope half above
+    is UNCHANGED by this mutation and stays green: confirmed by running it
+    against the mutated jar before writing this paragraph. `dangerous.path`
+    is what `decideScopeOnly` never asks and `decideCrawl` does, so a
+    request that is IN scope and ALSO matches a dangerous pattern is what
+    the mutation actually flips from denied to delivered -- proven the same
+    way, against the same jar: the out-of-scope half stayed green and the
+    dangerous-path half below went red, naming a hit at `/account/logout`.
     """
+    assert rig.configure() == 1
+
+    # Control 1: the offside log moves when something reaches it directly.
+    direct = socket.create_connection((rig.offside.host, rig.offside.port),
+                                      timeout=10)
+    try:
+        direct.sendall(b"GET /health HTTP/1.1\r\n"
+                       b"Host: " + rig.offside.host.encode() + b"\r\n"
+                       b"Connection: close\r\n\r\n")
+        while direct.recv(65536):
+            pass
+    finally:
+        direct.close()
+    assert [(h.method, h.path) for h in rig.offside.hits] == [("GET", "/health")]
+
+    # Control 2: the crawler listener is carrying real browser traffic right
+    # now, against the in-scope target.
+    control = _crawl(rig, seeds=[f"{rig.target.origin}/health"])
+    assert control.pages == 1, control
+    rig.settle(
+        lambda: rows(rig, "SELECT id FROM exchange WHERE url=?",
+                    (f"{rig.target.origin}/health",)),
+        "the in-scope control's exchange row -- without this, a refusal "
+        "below would be satisfied by a crawler that is not working at all")
+
+    # The measurement. 127.0.0.2 is out of scope -- the engagement's
+    # scope.include is the 127.0.0.1 target's origin and nothing else -- and
+    # it is LISTENING throughout, so a refusal that merely failed to deliver
+    # is separable from one that actively kept the bytes off it.
+    before = len(rig.offside.hits)
+    seed = f"{rig.offside.origin}/health"
+    summary = _crawl(rig, seeds=[seed])
+    assert summary.pages == 1, summary
+
+    rig.settle(
+        lambda: rows(rig, "SELECT id FROM denial"
+                          " WHERE via='proxy' AND kind='scope'"),
+        "the out-of-scope crawler denial")
+    # Settled, then given the same window again: the denial arriving proves
+    # the extension decided, not that the bytes stayed put -- a request that
+    # leaked around the gate would reach a loopback server well inside this.
+    time.sleep(0.5)
+
+    assert len(rig.offside.hits) == before, (
+        "THE VERDICT WAS NOT HONOURED, or Chromium never asked for one: the "
+        f"out-of-scope target received "
+        f"{[(h.method, h.path) for h in rig.offside.hits[before:]]}. Either "
+        "the crawler's `--proxy-bypass-list=<-loopback>` flag is doing "
+        "nothing for this destination, or the extension refused this "
+        "request and the bytes went out anyway.")
+
+    # THE SECOND MEASUREMENT. In scope, on the SAME listener, matching the
+    # dangerous.path denylist -- the rule decideScopeOnly never asks, so this
+    # is what actually moves under the mutation named above.
+    dangerous_path = "/account/logout"
+    dangerous_before = len(rig.target.hits_for(dangerous_path))
+    dangerous = _crawl(rig, seeds=[f"{rig.target.origin}{dangerous_path}"])
+    assert dangerous.pages == 1, dangerous
+
+    rig.settle(
+        lambda: rows(rig, "SELECT id FROM denial"
+                          " WHERE via='proxy' AND kind='dangerous'"),
+        "the crawler's dangerous-path denial")
+    time.sleep(0.5)
+
+    assert len(rig.target.hits_for(dangerous_path)) == dangerous_before, (
+        "a dangerous-path destination reached the target through the "
+        f"crawler listener: {dangerous_path} took "
+        f"{len(rig.target.hits_for(dangerous_path)) - dangerous_before} "
+        "more hit(s). This is the half of the test that the CRAWLER-branch "
+        "mutation actually moves -- see the docstring.")
+
+    dangerous_denial = rows(
+        rig, "SELECT * FROM denial WHERE via='proxy' AND kind='dangerous'")[0]
+    assert dangerous_denial["url"] == f"{rig.target.origin}{dangerous_path}"
+
+    denial = rows(rig, "SELECT * FROM denial"
+                       " WHERE via='proxy' AND kind='scope'")[0]
+    assert denial["method"] == "GET"
+    assert denial["url"] == seed
+    kinds = {row["id"]: row["kind"] for row in rows(rig, "SELECT id, kind FROM run")}
+    assert kinds[denial["run_id"]] == "crawl", (
+        "the refused request was attributed to a run of kind "
+        f"{kinds.get(denial['run_id'])!r}, not 'crawl' -- the denial is real "
+        "but filed under the wrong driver")
+
+    # No exchange for the offside seed either, which is the complementary
+    # half of the same fact -- not the primary claim (see the docstring
+    # above for why "absent" is not load-bearing on its own here).
+    assert rows(rig, "SELECT id FROM exchange WHERE url=?", (seed,)) == []
 
 
-def test_render_allow_changes_the_outcome_for_the_crawler_only(...):
-    """Task 1 end to end: with 127.0.0.2 in `render_allow`, the crawler
-    reaches it; the send path still does not.
+# ---------------------------------------------------------------------------
+# 3. render.allow enforces for the crawler and not for the send path.
+# ---------------------------------------------------------------------------
 
-    MUTATION: have `decideBeforeGate` pass `renderAllow=true`. Must go red
-    on the second half.
+def test_render_allow_changes_the_outcome_for_the_crawler_only(rig):
+    """Task 1 end to end. `Policy.decideCrawl` consults `render.allow` after
+    `scope.include`/`scope.exclude`; `Policy.decideBeforeGate` -- the path
+    `Sender` sends every CHECK's probe through -- calls the same shared
+    `beforeGate` with `renderAllow=false` and never looks at it.
+
+    NO BROWSER-SPECIFIC CLAIM LIVES HERE, unlike the two tests above: this is
+    a question about which of two Java methods a listener calls, and
+    `rig.browse` -- a raw socket handed straight to a Burp listener, the same
+    shape `test_proxy_capture.py`'s operator/crawler split test uses -- puts
+    that decision in the path just as well as a real Chromium would, at a
+    fraction of the cost. `render.allow` is set into the engagement's real
+    config and travels to the extension over the real `configure` frame
+    either way.
+
+    MUTATION: change `Policy.decideBeforeGate` to call
+    `beforeGate(req, auth, true)` instead of `false`
+    (`extension/src/hx/policy/Policy.java`). Must go red on the SECOND half
+    -- the send-path probe below would then be silently authorised by
+    render.allow too, which is exactly the widening s4's send/crawl split
+    exists to prevent: a rendering concession is not a licence for a security
+    check to issue a probe.
     """
+    rig.eng.config = dataclasses.replace(
+        rig.eng.config, render_allow=[f"{rig.offside.origin}/*"])
+    assert rig.configure() == 1
+
+    # THE CRAWLER HALF: render.allow authorises a destination scope.include
+    # never named.
+    crawler_resp = rig.browse("GET", "/health", to=rig.offside,
+                              port=rig.crawler_port)
+    assert status_of(crawler_resp) == 200, (
+        "the crawler listener refused a destination named in render.allow: "
+        f"{status_of(crawler_resp)}")
+    assert rig.offside.hits_for("/health"), (
+        "render.allow authorised the request on this side, and the offside "
+        "target never saw it -- a client-side 200 is not evidence of "
+        "delivery (see DROP_LOOKS_LIKE); read its log instead")
+    rig.settle(
+        lambda: rows(rig, "SELECT e.id FROM exchange e"
+                          " JOIN run r ON e.run_id = r.id"
+                          " WHERE r.kind='crawl' AND e.url=?",
+                    (f"{rig.offside.origin}/health",)),
+        "the crawler's render.allow exchange row")
+
+    # THE SEND-PATH HALF: same render.allow in force, same destination, and
+    # this route must refuse it exactly as if render.allow did not exist --
+    # `send_unguarded` drops only THIS side's own refusals (see its
+    # docstring), so a refusal that comes back proves the JVM decided, not
+    # this harness's bookkeeping.
+    before = len(rig.offside.hits)
+    refusal = _refusal_from(rig.send_unguarded, "GET", "/health",
+                            to=rig.offside)
+    assert refusal is not None, (
+        "a send-path probe to a render.allow-only destination was ALLOWED. "
+        "render.allow is a concession to RENDERING (Task 1's own words) and "
+        "must never widen what a security CHECK may send -- Sender calls "
+        "Policy.decideBeforeGate, which is not supposed to consult it at all")
+    assert refusal.error_class == "scope_denied", refusal
+    assert len(rig.offside.hits) == before, (
+        "the send path was refused on this side and the offside target's "
+        f"log moved anyway: {rig.offside.hits[before:]}")
 ```
 
 Fill each body against the real fixtures. The docstrings are the contract; the assertions must match what they claim.

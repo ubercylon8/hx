@@ -4359,7 +4359,7 @@ def test_every_registered_tool_has_an_enforceable_schema_and_a_summary():
 
 def test_mutating_tools_are_exactly_the_ones_that_write():
     writes = {"run.start", "run.finish", "finding.record", "evidence.attach",
-              "http.send", "http.replay_as", "scan.run"}
+              "http.send", "http.replay_as", "scan.run", "crawl.run"}
     assert {n for n, t in registry.TOOLS.items() if t.mutates} == writes
 
 

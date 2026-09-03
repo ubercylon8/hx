@@ -98,6 +98,12 @@ public class PolicyTest {
         t("theRefusalOrderIsPinned", PolicyTest::theRefusalOrderIsPinned);
         t("aBrokenGateIsNeverAnAllow", PolicyTest::aBrokenGateIsNeverAnAllow);
         t("policyNamesNoBurpType", PolicyTest::policyNamesNoBurpType);
+        t("renderAllowLetsASubresourceThroughForTheCrawler",
+          PolicyTest::renderAllowLetsASubresourceThroughForTheCrawler);
+        t("renderAllowDoesNotWidenTheSendPath",
+          PolicyTest::renderAllowDoesNotWidenTheSendPath);
+        t("scopeExcludeStillBeatsRenderAllow",
+          PolicyTest::scopeExcludeStillBeatsRenderAllow);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURE(S)");
         if (failures > 0) System.exit(1);
@@ -3213,6 +3219,68 @@ public class PolicyTest {
             String text = Files.readString(f, StandardCharsets.UTF_8);
             check(f.getFileName() + " names no burp.* type", !text.contains("burp."));
         }
+    }
+
+    // ---- render.allow ----------------------------------------------------
+    //
+    // render.allow is a concession to RENDERING, consulted only by
+    // decideCrawl -- never by decide(), which is what the send path spends
+    // through Sender. Three properties, each pinned by exactly one test:
+    //   1. it lets the crawler through to an otherwise out-of-scope
+    //      subresource;
+    //   2. it does NOT widen what decide() -- the CHECK path -- will send a
+    //      probe to;
+    //   3. scope.exclude still outranks it, because an exclusion is the
+    //      operator naming something they know they must not touch.
+
+    /** MUTATION: delete the render.allow loop from checkScope (or make it
+     *  unreachable, e.g. by never setting renderAllow true for the crawler).
+     *  Must go red: decideCrawl would then deny a subresource render.allow
+     *  is supposed to let through. */
+    static void renderAllowLetsASubresourceThroughForTheCrawler() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation auth = authorised(
+                "scope.include", "https://app.test/*",
+                "render.allow", "https://cdn.test/*");
+        HxRequest r = req("GET", "https://cdn.test/app.js", "cdn.test", "/app.js", "");
+        Decision d = p.decideCrawl(r, auth);
+        check("crawler may render an allowed third-party subresource (got "
+              + (d.allowed() ? "allow" : d.errorClass() + ": " + d.detail()) + ")",
+              d.allowed());
+    }
+
+    /** THE SEPARATING CASE. MUTATION: make decideBeforeGate (or
+     *  beforeGate's default) pass renderAllow=true, so decide() consults
+     *  render.allow too. Must go red -- a rendering concession must not widen
+     *  what a CHECK can send a probe to. */
+    static void renderAllowDoesNotWidenTheSendPath() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation auth = authorised(
+                "scope.include", "https://app.test/*",
+                "render.allow", "https://cdn.test/*");
+        HxRequest r = req("GET", "https://cdn.test/app.js", "cdn.test", "/app.js", "");
+        Decision d = p.decide(r, auth);
+        check("render.allow does not widen decide() (got "
+              + (d.allowed() ? "allow" : d.errorClass()) + ")",
+              !d.allowed());
+    }
+
+    /** MUTATION: move the render.allow loop above the excludes loop in
+     *  checkScope. Must go red: a pattern under scope.exclude has to keep
+     *  beating a render.allow pattern that would otherwise cover the same
+     *  URL. */
+    static void scopeExcludeStillBeatsRenderAllow() {
+        Policy p = allowingPolicy();
+        BridgeClient.Authorisation auth = authorised(
+                "scope.include", "https://app.test/*",
+                "scope.exclude", "https://cdn.test/secret/*",
+                "render.allow", "https://cdn.test/*");
+        HxRequest r = req("GET", "https://cdn.test/secret/k.js",
+                          "cdn.test", "/secret/k.js", "");
+        Decision d = p.decideCrawl(r, auth);
+        check("scope.exclude outranks render.allow (got "
+              + (d.allowed() ? "allow" : d.errorClass()) + ")",
+              !d.allowed());
     }
     /**
      * Round 7, CRITICAL. The query half got NONE of the byte folds the path

@@ -29,6 +29,8 @@ from hx import triage as triage_mod
 from hx.bridge import codec as codec_mod
 from hx.bridge import server as bridge_mod
 from hx.checks import registry
+from hx.crawl import frontier as frontier_mod
+from hx.crawl import run as crawl_run_mod
 from hx.store import db as db_mod
 from hx.store.paths import secure_mkdir
 
@@ -820,6 +822,143 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             if on and not any(c.klass == klass for c in registry.CHECKS):
                 click.echo(f"note      {klass} is enabled but this build "
                            f"ships no checks in it")
+    finally:
+        eng.db.close()
+
+
+@main.command("crawl")
+@click.option("--target", "targets", multiple=True, required=True,
+              help="Seed URL to crawl from. Repeatable -- one call may "
+                   "start from several origins at once.")
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+@click.option("--max-pages", type=click.IntRange(min=1), default=200,
+              show_default=True,
+              help="Page budget. Exhausting it truncates the crawl and the "
+                   "printed summary names which budget stopped it.")
+@click.option("--max-seconds", type=click.IntRange(min=1), default=600,
+              show_default=True, help="Wall-clock budget for the crawl.")
+@click.option(
+    "--max-requests",
+    type=click.IntRange(min=1),
+    default=5000,
+    show_default=True,
+    help="Per-run request budget, authorised on the extension's first "
+         "configure -- the same flag `capture start` and `scan` carry, "
+         "spelt the same way.",
+)
+@click.option(
+    "--burp-jar",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Which Burp jar to launch against. Default: $HX_BURP_JAR, then the "
+         "one jar found in $HX_BURP_LAB -- two jars there is an error, never "
+         "a guess, because the report records the version under test.",
+)
+def crawl(targets, root, max_pages, max_seconds, max_requests,
+          burp_jar) -> None:
+    """Drive a browser over TARGETS through a fresh Burp session.
+
+    Long crawls belong here, outside an agent's session: `crawl.run` is the
+    same crawler, bounded, for a mid-session sweep. THE SESSION OPENS
+    BEFORE THE RUN, as `capture start`'s does and for the same reason -- a
+    run row opened in front of a session that then fails to start is a run
+    that never captured anything.
+    """
+    path = root or default_root()
+    eng = _open_engagement(path)
+    # Unconditional, unlike `capture start`'s and `scan`'s override: this
+    # flag always carries a value (5000 by default, never None), so the
+    # session this launches is always authorised for exactly the budget the
+    # crawl itself is bounded by -- a crawl asking the browser for more
+    # requests than the extension was configured to allow would just start
+    # collecting policy denials once it ran past the smaller number.
+    eng.config = dataclasses.replace(eng.config, max_requests=max_requests)
+    try:
+        try:
+            with session_mod.session(eng, instance="crawl",
+                                      jar=burp_jar) as live:
+                run_id = run_mod.open_run(
+                    eng.db, engagement_id=eng.id, kind="crawl",
+                    safety_profile=eng.config.safety_profile)
+                died = None
+                try:
+                    summary = crawl_run_mod.crawl(
+                        seeds=targets,
+                        # THE CRAWLER PORT, NEVER THE OPERATOR ONE -- see
+                        # `hx.tools.live`'s module docstring for why the two
+                        # are not interchangeable.
+                        proxy_port=live.crawler_port,
+                        budget=frontier_mod.Budget(
+                            max_pages=max_pages, max_seconds=max_seconds,
+                            max_requests=max_requests))
+                except BaseException as exc:
+                    # A DEAD BROWSER IS NOT A COMPLETED RUN, exactly as a
+                    # dead Burp is not for `capture start`: the run row must
+                    # not read `completed` for a crawl that stopped because
+                    # its instrument broke rather than because the frontier
+                    # ran dry. `BaseException`, deliberately, not `Exception`
+                    # -- a Ctrl-C here is a `KeyboardInterrupt`, and closing
+                    # the run row on that path matters exactly as much as
+                    # closing it on a crawler crash: an operator who
+                    # interrupts a long crawl must not leave the run row
+                    # open forever either.
+                    died = f"{type(exc).__name__}: {exc}"
+                finally:
+                    run_mod.close_run(
+                        eng.db, run_id=run_id,
+                        status="error" if died else "completed",
+                        stop_reason=died)
+                if died:
+                    # A CLEAN MESSAGE, NOT A TRACEBACK -- `capture_start`'s
+                    # own rule for a died-mid-session Burp, applied here to
+                    # a died-mid-crawl browser. The run row above already
+                    # carries the raw exception in `stop_reason`; what an
+                    # operator running a security tool against a client's
+                    # application sees at the terminal is this one line, not
+                    # a stack trace out of `hx.crawl.run.crawl`.
+                    raise click.ClickException(died)
+        except session_mod.SessionError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        click.echo(f"pages     {summary.pages}")
+        click.echo(f"rendered  {summary.rendered}")
+        click.echo(f"degraded  {summary.degraded}")
+        click.echo(f"failed    {summary.failed}")
+        click.echo(f"capped    {summary.capped}")
+        click.echo(f"requests  {summary.requests}")
+        if summary.dropped_hosts:
+            click.echo(f"dropped   {', '.join(summary.dropped_hosts)}")
+            # F2: `dropped_hosts` is built from SEED origins, not scope
+            # (`hx.crawl.page.classify`'s docstring has the full statement).
+            # On an engagement whose scope covers a second origin that was
+            # never seeded, a target-side failure there reads as a policy
+            # drop here. The denial rows are the JVM's own record of what it
+            # actually refused and remain authoritative -- confirm a host
+            # here was truly dropped by policy against those, not this line
+            # alone, before pasting it into `render_allow`.
+            click.echo("          confirm against this engagement's denial "
+                       "rows, which remain authoritative, before pasting "
+                       "any of the above into render_allow")
+        # TRUNCATION IS PRINTED EITHER WAY. A truncated crawl that stopped on
+        # a budget and reported only its counts would read as a complete
+        # crawl of a small application -- S12's failure with the numbers
+        # intact -- and the silent case (no line at all) is exactly that
+        # shape, so both outcomes get an explicit line.
+        if summary.truncated_by:
+            click.echo(f"truncated {summary.truncated_by}")
+        else:
+            click.echo("truncated no -- the frontier ran dry before any "
+                       "budget did")
+        # F1: SPEC §9 -- the crawl summary AND the report's Limits section
+        # must both disclose these four things in as many words. §8 makes
+        # this CLI the surface for long crawls, and the operator who ran one
+        # from a terminal is the one most likely to over-read a clean-looking
+        # result; `report.py`'s Limits bullet already says this, and
+        # `crawl.run`'s `as_tool_result` already says it to the agent
+        # (`NOT_DONE`, `hx.crawl.run`) -- this reuses that exact wording
+        # rather than inventing a fifth phrasing of the same four facts.
+        for line in crawl_run_mod.NOT_DONE:
+            click.echo(f"not done  {line}")
     finally:
         eng.db.close()
 

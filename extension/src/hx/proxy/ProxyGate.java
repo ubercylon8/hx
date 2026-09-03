@@ -180,8 +180,10 @@ public final class ProxyGate {
                                + "to the operator or the crawler");
         }
         if (source == Source.CRAWLER) {
-            // The agent's rules, in S4's pinned order, Gate included.
-            Decision d = policy.decide(req, auth);
+            // The agent's rules, in S4's pinned order, Gate included -- plus
+            // render.allow, which exists so that dropping a third-party
+            // bundle does not silently stop the page under test from booting.
+            Decision d = policy.decideCrawl(req, auth);
             return d.allowed() ? Verdict.pass() : Verdict.deny(d);
         }
         // The operator: scope, and nothing after it. Not a weaker call of the

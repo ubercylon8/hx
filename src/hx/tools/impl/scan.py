@@ -1,18 +1,21 @@
 # src/hx/tools/impl/scan.py
-"""Running the corpus, and the one tool that never runs at all.
+"""Running the corpus, and driving the crawler for one bounded sweep.
 
-`crawl.run` IS REGISTERED AND ALWAYS UNAVAILABLE, and registering a tool that
-never succeeds looks like noise and is the opposite. An agent with no `crawl`
-tool has no reason to say discovery was proxy-only; an agent that asks and is
-told `not_implemented` does. That is section 12's governing rule -- a report
-that cannot distinguish "tested, clean" from "never reached" is worse than no
-report -- applied to the agent's own knowledge of its instrument, and it is
-what `unavailable` exists for.
+`crawl.run` USED TO BE REGISTERED AND ALWAYS UNAVAILABLE, back when hx had no
+crawler at all: registering a tool that never succeeds looked like noise and
+was the opposite -- an agent with no `crawl` tool had no reason to say
+discovery was proxy-only, and one that asked and was told `not_implemented`
+did. Now `hx.crawl.run.crawl` exists, and this module drives it the way `run`
+below drives the check corpus: synchronously, inside a run the tool layer
+opened, with the session's `crawler_port`.
 """
 from __future__ import annotations
 
 from ... import scan as scan_mod
 from ...checks import registry as check_registry
+from ...crawl import browser as browser_mod
+from ...crawl import frontier as frontier_mod
+from ...crawl import run as crawl_run_mod
 from .. import registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
@@ -21,6 +24,13 @@ from ..errors import ToolRefused, ToolUnavailable
 #: on, and an unbounded one is a conversation that never comes back. The
 #: caller may ask for less and not for more.
 MAX_SECONDS = 1800
+
+#: `crawl.run`'s own defaults, applied when the agent omits `max_pages` /
+#: `max_seconds`. The same numbers `hx crawl`'s CLI options default to --
+#: one bounded sweep should mean the same bound whichever surface asks for
+#: it, and a caller that wants less is always free to say so.
+DEFAULT_MAX_PAGES = 200
+DEFAULT_MAX_SECONDS = 600
 
 
 def run(ctx, *, surface_ids=None, checks=None,
@@ -101,12 +111,79 @@ def run(ctx, *, surface_ids=None, checks=None,
 
 
 def crawl(ctx, **kw) -> dict:
-    raise ToolUnavailable(
-        "not_implemented",
-        "hx has no crawler in v1. Discovery is the operator's browser "
-        "through the proxy (`hx capture start`), and `surface.query` shows "
-        "what that has reached. Say so in the report: a surface nobody "
-        "browsed is a surface nothing tested.")
+    """Drive a browser over in-scope pages through the proxy. Synchronous
+    and bounded; must be called inside a crawl run.
+
+    IDENTITY IS REFUSED, NOT IGNORED, and checked FIRST -- before `ctx` is
+    touched at all. Authenticated crawling is deferred to its own spec: a
+    parameter the agent may pass that is silently ignored is worse than one
+    that is rejected, because the agent would report having crawled as a
+    user when it did not. Browsing through the proxy under an identity is
+    how an authenticated application gets covered instead.
+
+    IT MUST BE CALLED INSIDE A `crawl` RUN, for the mechanical reason
+    `run` above documents for `scan.run`: `crawl.run` has no run of its own
+    to auto-open, so a call with none open is a call whose traffic nothing
+    would be attributed to and whose run `run.finish` would never see.
+    """
+    if kw.get("identity"):
+        raise ToolUnavailable(
+            "not_implemented",
+            "authenticated crawling is not in this build. The crawler runs "
+            "unauthenticated, so anything behind a login was not reached by "
+            "it -- browse the application through the proxy instead, which "
+            "is how S9 covers authenticated applications. Re-run without "
+            "`identity`.")
+
+    open_now = dict((kind, rid) for rid, kind in ctx.open_runs())
+    if "crawl" not in open_now:
+        raise ToolRefused(
+            "wrong_run_kind",
+            "crawl.run belongs inside a crawl run, and none is open. "
+            "`run.start` with kind='crawl' first -- a crawl run is what "
+            "this traffic is attributed to, and one this layer did not "
+            "open is one nothing will close.")
+
+    target = kw.get("target")
+    if not target:
+        raise ToolRefused(
+            "bad_args",
+            "crawl.run needs a `target` to seed the crawl from.")
+
+    try:
+        summary = crawl_run_mod.crawl(
+            seeds=[target],
+            # THE CRAWLER PORT, NEVER THE OPERATOR ONE (Ruling 21).
+            # `operator_port` and `crawler_port` are not interchangeable: the
+            # extension tells the operator's own browsing from an agent's
+            # crawl by WHICH LISTENER a request arrived on, and nothing in
+            # the traffic itself -- dialling the wrong one silently swaps
+            # the two rule sets. `needs_egress=True` on the spec means
+            # `dispatch` already refused `unavailable / no_session` before
+            # this handler ran, so `ctx.session` is never None here.
+            proxy_port=ctx.session.crawler_port,
+            budget=frontier_mod.Budget(
+                max_pages=kw.get("max_pages") or DEFAULT_MAX_PAGES,
+                max_seconds=kw.get("max_seconds") or DEFAULT_MAX_SECONDS,
+                # NOT AN AGENT-FACING PARAMETER. The request budget is what
+                # already authorised this session's extension
+                # (`session.config_body`'s `limit.max_requests`), and
+                # letting a tool call ask for more than the session was
+                # launched with would be a second, disagreeing answer to a
+                # question the extension has already been told.
+                max_requests=ctx.config.max_requests))
+    except browser_mod.BrowserUnavailable as exc:
+        # F3: a Burp that has never downloaded its own bundled browser is
+        # the MOST LIKELY failure of `crawl.run`, and `dispatch` renders any
+        # exception that is not a `ToolError` as `envelope.failed` (`this
+        # tool is broken`) -- see `hx.tools.dispatch`. That is the wrong
+        # claim: the operator has a clear fix (open Burp's own browser once
+        # so it downloads Chromium), same as this module's own docstring
+        # describes for the old always-unavailable stub. `find_chromium`
+        # already writes a good operator-facing message; it is carried
+        # through rather than re-worded here.
+        raise ToolUnavailable("not_configured", str(exc)) from exc
+    return crawl_run_mod.as_tool_result(summary)
 
 
 registry.register(spec.ToolSpec(
@@ -126,9 +203,10 @@ registry.register(spec.ToolSpec(
     }}))
 
 registry.register(spec.ToolSpec(
-    name="crawl.run", handler=crawl,
-    summary="NOT IMPLEMENTED in v1 and always answers unavailable. Listed "
-            "so that a report can say discovery was proxy-only.",
+    name="crawl.run", handler=crawl, needs_egress=True, mutates=True,
+    summary="Drive a browser over in-scope pages through the proxy so their "
+            "requests are captured. Synchronous and bounded; must be called "
+            "inside a crawl run. Submits no forms and clicks nothing.",
     params={"type": "object", "additionalProperties": False, "properties": {
         "target": {"type": "string", "maxLength": 2048},
         "identity": {"type": "string", "maxLength": 64},

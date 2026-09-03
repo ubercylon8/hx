@@ -1541,6 +1541,14 @@ def _limits(conn, engagement_id) -> list[str]:
                    "total and how many no check answered for; read the "
                    "denominator there, not this bullet, for what was "
                    "reached.")
+        out.append("  This build's crawler follows links and renders "
+                   "JavaScript. It submits **no forms**, **clicks nothing**, "
+                   "walks no route that requires interaction to reach, and "
+                   "runs **unauthenticated** -- so anything behind a login, "
+                   "behind a button, or reachable only by submitting a form "
+                   "was not discovered by it. Pages recorded as `degraded` "
+                   "**may not have rendered**: a third-party resource they "
+                   "requested was out of scope and was dropped.")
     else:
         out.append("- **No automated crawl.** No run recorded for this "
                    "engagement has `kind = 'crawl'`: attack surface here is "

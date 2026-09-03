@@ -1684,12 +1684,32 @@ def test_a_successful_launch_binds_the_session_and_reports_its_ports(
 
 
 def test_a_scan_run_gets_one_too(tool_ctx, monkeypatch):
-    """EGRESS_KINDS is two kinds, not one. `manual` alone would leave the
+    """EGRESS_KINDS is three kinds, not one. `manual` alone would leave the
     agent's own check pass -- the one thing in section 8 that certainly
     sends -- reporting `not_needed` for a run that needs it most."""
     monkeypatch.setattr(session_mod, "session", _fake_session)
     tool_ctx.stack = contextlib.ExitStack()
     assert live.open_for(tool_ctx, "run-1", "scan")["live"] is True
+
+
+def test_a_crawl_run_gets_one_too(tool_ctx, monkeypatch):
+    """Ruling 21: `crawl` belongs in `EGRESS_KINDS`. Left out, `run.start
+    (kind="crawl")` would answer `not_needed`, no Burp would launch, and
+    `crawl.run` would have no `crawler_port` to dial -- a crawl that found
+    nothing presenting as a crawl that reached nothing, with no error
+    anywhere to say so.
+
+    MUTATION: drop `crawl` back out of `EGRESS_KINDS`. Must go red -- the
+    only other way `open_for` answers `live: True` is `ctx.session is not
+    None` already (`_held`, tested above), and this test's `tool_ctx` fixture
+    starts with `session=None`, so that path cannot produce this result
+    either.
+    """
+    monkeypatch.setattr(session_mod, "session", _fake_session)
+    tool_ctx.stack = contextlib.ExitStack()
+    got = live.open_for(tool_ctx, "run-1", "crawl")
+    assert got["live"] is True
+    assert got["crawler_port"] == 18081
 
 
 def test_a_second_egress_run_is_told_who_holds_the_session(
@@ -2080,9 +2100,13 @@ from .. import session as session_mod
 #: Run kinds that imply traffic this side issues. `browse` is the operator's
 #: own browser through `hx capture start`, which owns its own Burp -- spec
 #: section 8: "a browse run never needed the tool layer to launch anything".
-#: `crawl` is here for completeness and is not in the set, because `crawl.run`
-#: is permanently unavailable and a crawl run has nothing to send.
-EGRESS_KINDS = frozenset({"manual", "scan"})
+#: `crawl` IS in the set: `crawl.run` drives a real browser through this
+#: session's `crawler_port`, and a crawl run with no session would have no
+#: proxy port to hand it -- `run.start(kind="crawl")` would answer
+#: `not_needed`, no Burp would launch, and `crawl.run` would find no
+#: `crawler_port` to dial, presenting as a crawl that found nothing rather
+#: than as the missing instrument it actually is.
+EGRESS_KINDS = frozenset({"manual", "scan", "crawl"})
 
 #: `hx.session.session`'s `instance`, which names both the `-Dhx.instance` the
 #: extension reports and the directory under the engagement root this session
@@ -5526,44 +5550,117 @@ are different facts."
 
 ```python
 # tests/test_tools_scan.py
-"""scan.run and crawl.run.
+"""scan.run and crawl.run at the dispatcher.
 
-`crawl.run` is registered and always unavailable, and the test for that is
-the most important one in this file. An agent with NO crawl tool has no
-reason to say discovery was proxy-only; an agent that asks and is told
-`not_implemented` does. That is section 12's rule applied to the agent's
-knowledge of its own instrument, and a tool that quietly did not exist would
-be the silence the rule is against.
+`crawl.run` used to be registered and permanently unavailable; both of those
+tests moved on with the tool. What is left here is the same shape `scan.run`
+already had: a real handler, gated by `needs_egress` and a run-kind bracket
+the dispatcher and the handler enforce together. The envelope-level tests for
+`crawl.run`'s own behaviour -- the identity refusal, the summary projection
+-- live in `tests/test_crawl_tool.py`, closer to the handler they exercise;
+what belongs here is that the DISPATCHER's guards see it the same way they
+see `scan.run`.
 """
 from __future__ import annotations
 
 from hx import run as run_mod
 from hx import scan as scan_mod
+from hx.crawl import run as crawl_run_mod
 from hx.tools import dispatch as dispatch_mod
 from hx.tools import impl  # noqa: F401
+from tests.test_probe import FakeBridge
 
 
-def test_crawl_run_is_registered_and_permanently_unavailable(tool_ctx):
+def _crawl_session():
+    """What `ctx.session` needs for `crawl.run` to get past the dispatcher's
+    `no_session` guard and reach the handler's own `crawler_port` read."""
+    return type("S", (), {"bridge": FakeBridge(), "crawler_port": 41999})()
+
+
+def test_crawl_run_needs_a_session(tool_ctx):
+    """`needs_egress=True` on the spec means the dispatcher refuses
+    `no_session` before the handler ever runs -- the same guard `scan.run`
+    gets, and the one the old stub never reached because it always raised
+    first.
+
+    MUTATION: drop `needs_egress=True` from the `crawl.run` registration.
+    Must go red -- `tool_ctx` has no open run either, so a mutated
+    dispatcher would let the call reach the handler, whose own run-kind
+    guard would then answer `refused / wrong_run_kind` instead of
+    `unavailable / no_session`.
+    """
     env = dispatch_mod.dispatch(tool_ctx, "crawl.run",
                                 {"target": "http://127.0.0.1:8080/"},
-                                why="see whether crawling exists")
+                                why="see whether a session is required")
     assert env.outcome == "unavailable"
-    assert env.reason == "not_implemented"
-    # AND IT SAYS WHAT TO DO INSTEAD. An `unavailable` that names no
-    # alternative leaves an agent with a dead end where it needs a next step.
-    assert "proxy" in (env.detail or "").lower()
+    assert env.reason == "no_session"
 
 
-def test_crawl_run_is_unavailable_even_with_a_live_session(tool_ctx):
-    """`unavailable` here is about the FEATURE, not about the instrument. A
-    version that answered `no_session` would tell an agent that starting a
-    session would help, and it would not. No `why` either: a call that can
-    never mutate anything must never be told it needs one."""
-    tool_ctx.session = object()
+def test_crawl_run_refuses_outside_a_crawl_run(tool_ctx, monkeypatch):
+    """The same mechanical reason `scan.run` refuses outside a `scan` run:
+    `crawl.run` has no run of its own to auto-open, so a run this layer did
+    not open is a run `run.finish` would never close.
+
+    A session is set up (so the dispatcher's `no_session` guard does not
+    fire first) but the open run is `manual`, never `crawl` -- this must be
+    refused by the HANDLER'S OWN check, not by the egress guard above it.
+
+    MUTATION: drop the handler's run-kind guard. Must go red -- the crawler
+    itself is stubbed to fail loudly if reached (rather than risk a real
+    Chromium launch under the mutation), so a mutated handler that fell
+    through to it would error instead of answering `wrong_run_kind`.
+    """
+    def _must_not_run(**kw):
+        raise AssertionError("crawl.run must not reach the crawler here")
+
+    monkeypatch.setattr(crawl_run_mod, "crawl", _must_not_run)
+
+    tool_ctx.run_id = run_mod.open_run(
+        tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="manual",
+        safety_profile=tool_ctx.config.safety_profile)
+    tool_ctx.session = _crawl_session()
+
     env = dispatch_mod.dispatch(tool_ctx, "crawl.run",
-                                {"target": "http://127.0.0.1:8080/"})
-    assert env.outcome == "unavailable"
-    assert env.reason == "not_implemented"
+                                {"target": "http://127.0.0.1:8080/"},
+                                why="try it without a crawl run")
+    assert env.outcome == "refused"
+    assert env.reason == "wrong_run_kind"
+    assert "run.start" in (env.detail or "")
+
+
+def test_crawl_run_reports_the_summary_through_the_dispatcher(
+        tool_ctx, monkeypatch):
+    """The handler's projection reaches the agent through `dispatch`, not
+    only when called directly -- the same round trip `scan.run`'s summary
+    test below makes.
+
+    MUTATION: have the handler return the bare `CrawlSummary` instead of
+    `as_tool_result(summary)`. Must go red -- `dispatch` would then try to
+    fold a namedtuple into the envelope's `result`, and
+    `env.result["pages"]` (subscripting a namedtuple with a string key)
+    raises `TypeError` rather than answering `2`.
+    """
+    summary = crawl_run_mod.CrawlSummary(
+        pages=2, rendered=2, degraded=0, failed=0, capped=0, requests=4,
+        dropped_hosts=("cdn.test",), truncated_by=None)
+
+    def fake_crawl(**kw):
+        return summary
+
+    monkeypatch.setattr(crawl_run_mod, "crawl", fake_crawl)
+
+    tool_ctx.run_id = run_mod.open_run(
+        tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="crawl",
+        safety_profile=tool_ctx.config.safety_profile)
+    tool_ctx.session = _crawl_session()
+
+    env = dispatch_mod.dispatch(tool_ctx, "crawl.run",
+                                {"target": "http://127.0.0.1:8080/"},
+                                why="crawl the seed")
+    assert env.outcome == "ok"
+    assert env.result["pages"] == 2
+    assert env.result["dropped_hosts"] == ["cdn.test"]
+    assert env.result["truncated_by"] is None
 
 
 def test_scan_run_refuses_outside_a_scan_run(tool_ctx):
@@ -5659,20 +5756,23 @@ Expected: FAIL — refused `not_registered`.
 
 ```python
 # src/hx/tools/impl/scan.py
-"""Running the corpus, and the one tool that never runs at all.
+"""Running the corpus, and driving the crawler for one bounded sweep.
 
-`crawl.run` IS REGISTERED AND ALWAYS UNAVAILABLE, and registering a tool that
-never succeeds looks like noise and is the opposite. An agent with no `crawl`
-tool has no reason to say discovery was proxy-only; an agent that asks and is
-told `not_implemented` does. That is section 12's governing rule -- a report
-that cannot distinguish "tested, clean" from "never reached" is worse than no
-report -- applied to the agent's own knowledge of its instrument, and it is
-what `unavailable` exists for.
+`crawl.run` USED TO BE REGISTERED AND ALWAYS UNAVAILABLE, back when hx had no
+crawler at all: registering a tool that never succeeds looked like noise and
+was the opposite -- an agent with no `crawl` tool had no reason to say
+discovery was proxy-only, and one that asked and was told `not_implemented`
+did. Now `hx.crawl.run.crawl` exists, and this module drives it the way `run`
+below drives the check corpus: synchronously, inside a run the tool layer
+opened, with the session's `crawler_port`.
 """
 from __future__ import annotations
 
 from ... import scan as scan_mod
 from ...checks import registry as check_registry
+from ...crawl import browser as browser_mod
+from ...crawl import frontier as frontier_mod
+from ...crawl import run as crawl_run_mod
 from .. import registry, spec
 from ..errors import ToolRefused, ToolUnavailable
 
@@ -5681,6 +5781,13 @@ from ..errors import ToolRefused, ToolUnavailable
 #: on, and an unbounded one is a conversation that never comes back. The
 #: caller may ask for less and not for more.
 MAX_SECONDS = 1800
+
+#: `crawl.run`'s own defaults, applied when the agent omits `max_pages` /
+#: `max_seconds`. The same numbers `hx crawl`'s CLI options default to --
+#: one bounded sweep should mean the same bound whichever surface asks for
+#: it, and a caller that wants less is always free to say so.
+DEFAULT_MAX_PAGES = 200
+DEFAULT_MAX_SECONDS = 600
 
 
 def run(ctx, *, surface_ids=None, checks=None,
@@ -5761,12 +5868,79 @@ def run(ctx, *, surface_ids=None, checks=None,
 
 
 def crawl(ctx, **kw) -> dict:
-    raise ToolUnavailable(
-        "not_implemented",
-        "hx has no crawler in v1. Discovery is the operator's browser "
-        "through the proxy (`hx capture start`), and `surface.query` shows "
-        "what that has reached. Say so in the report: a surface nobody "
-        "browsed is a surface nothing tested.")
+    """Drive a browser over in-scope pages through the proxy. Synchronous
+    and bounded; must be called inside a crawl run.
+
+    IDENTITY IS REFUSED, NOT IGNORED, and checked FIRST -- before `ctx` is
+    touched at all. Authenticated crawling is deferred to its own spec: a
+    parameter the agent may pass that is silently ignored is worse than one
+    that is rejected, because the agent would report having crawled as a
+    user when it did not. Browsing through the proxy under an identity is
+    how an authenticated application gets covered instead.
+
+    IT MUST BE CALLED INSIDE A `crawl` RUN, for the mechanical reason
+    `run` above documents for `scan.run`: `crawl.run` has no run of its own
+    to auto-open, so a call with none open is a call whose traffic nothing
+    would be attributed to and whose run `run.finish` would never see.
+    """
+    if kw.get("identity"):
+        raise ToolUnavailable(
+            "not_implemented",
+            "authenticated crawling is not in this build. The crawler runs "
+            "unauthenticated, so anything behind a login was not reached by "
+            "it -- browse the application through the proxy instead, which "
+            "is how S9 covers authenticated applications. Re-run without "
+            "`identity`.")
+
+    open_now = dict((kind, rid) for rid, kind in ctx.open_runs())
+    if "crawl" not in open_now:
+        raise ToolRefused(
+            "wrong_run_kind",
+            "crawl.run belongs inside a crawl run, and none is open. "
+            "`run.start` with kind='crawl' first -- a crawl run is what "
+            "this traffic is attributed to, and one this layer did not "
+            "open is one nothing will close.")
+
+    target = kw.get("target")
+    if not target:
+        raise ToolRefused(
+            "bad_args",
+            "crawl.run needs a `target` to seed the crawl from.")
+
+    try:
+        summary = crawl_run_mod.crawl(
+            seeds=[target],
+            # THE CRAWLER PORT, NEVER THE OPERATOR ONE (Ruling 21).
+            # `operator_port` and `crawler_port` are not interchangeable: the
+            # extension tells the operator's own browsing from an agent's
+            # crawl by WHICH LISTENER a request arrived on, and nothing in
+            # the traffic itself -- dialling the wrong one silently swaps
+            # the two rule sets. `needs_egress=True` on the spec means
+            # `dispatch` already refused `unavailable / no_session` before
+            # this handler ran, so `ctx.session` is never None here.
+            proxy_port=ctx.session.crawler_port,
+            budget=frontier_mod.Budget(
+                max_pages=kw.get("max_pages") or DEFAULT_MAX_PAGES,
+                max_seconds=kw.get("max_seconds") or DEFAULT_MAX_SECONDS,
+                # NOT AN AGENT-FACING PARAMETER. The request budget is what
+                # already authorised this session's extension
+                # (`session.config_body`'s `limit.max_requests`), and
+                # letting a tool call ask for more than the session was
+                # launched with would be a second, disagreeing answer to a
+                # question the extension has already been told.
+                max_requests=ctx.config.max_requests))
+    except browser_mod.BrowserUnavailable as exc:
+        # F3: a Burp that has never downloaded its own bundled browser is
+        # the MOST LIKELY failure of `crawl.run`, and `dispatch` renders any
+        # exception that is not a `ToolError` as `envelope.failed` (`this
+        # tool is broken`) -- see `hx.tools.dispatch`. That is the wrong
+        # claim: the operator has a clear fix (open Burp's own browser once
+        # so it downloads Chromium), same as this module's own docstring
+        # describes for the old always-unavailable stub. `find_chromium`
+        # already writes a good operator-facing message; it is carried
+        # through rather than re-worded here.
+        raise ToolUnavailable("not_configured", str(exc)) from exc
+    return crawl_run_mod.as_tool_result(summary)
 
 
 registry.register(spec.ToolSpec(
@@ -5786,9 +5960,10 @@ registry.register(spec.ToolSpec(
     }}))
 
 registry.register(spec.ToolSpec(
-    name="crawl.run", handler=crawl,
-    summary="NOT IMPLEMENTED in v1 and always answers unavailable. Listed "
-            "so that a report can say discovery was proxy-only.",
+    name="crawl.run", handler=crawl, needs_egress=True, mutates=True,
+    summary="Drive a browser over in-scope pages through the proxy so their "
+            "requests are captured. Synchronous and bounded; must be called "
+            "inside a crawl run. Submits no forms and clicks nothing.",
     params={"type": "object", "additionalProperties": False, "properties": {
         "target": {"type": "string", "maxLength": 2048},
         "identity": {"type": "string", "maxLength": 64},

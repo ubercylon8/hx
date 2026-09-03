@@ -1,42 +1,115 @@
 # tests/test_tools_scan.py
-"""scan.run and crawl.run.
+"""scan.run and crawl.run at the dispatcher.
 
-`crawl.run` is registered and always unavailable, and the test for that is
-the most important one in this file. An agent with NO crawl tool has no
-reason to say discovery was proxy-only; an agent that asks and is told
-`not_implemented` does. That is section 12's rule applied to the agent's
-knowledge of its own instrument, and a tool that quietly did not exist would
-be the silence the rule is against.
+`crawl.run` used to be registered and permanently unavailable; both of those
+tests moved on with the tool. What is left here is the same shape `scan.run`
+already had: a real handler, gated by `needs_egress` and a run-kind bracket
+the dispatcher and the handler enforce together. The envelope-level tests for
+`crawl.run`'s own behaviour -- the identity refusal, the summary projection
+-- live in `tests/test_crawl_tool.py`, closer to the handler they exercise;
+what belongs here is that the DISPATCHER's guards see it the same way they
+see `scan.run`.
 """
 from __future__ import annotations
 
 from hx import run as run_mod
 from hx import scan as scan_mod
+from hx.crawl import run as crawl_run_mod
 from hx.tools import dispatch as dispatch_mod
 from hx.tools import impl  # noqa: F401
+from tests.test_probe import FakeBridge
 
 
-def test_crawl_run_is_registered_and_permanently_unavailable(tool_ctx):
+def _crawl_session():
+    """What `ctx.session` needs for `crawl.run` to get past the dispatcher's
+    `no_session` guard and reach the handler's own `crawler_port` read."""
+    return type("S", (), {"bridge": FakeBridge(), "crawler_port": 41999})()
+
+
+def test_crawl_run_needs_a_session(tool_ctx):
+    """`needs_egress=True` on the spec means the dispatcher refuses
+    `no_session` before the handler ever runs -- the same guard `scan.run`
+    gets, and the one the old stub never reached because it always raised
+    first.
+
+    MUTATION: drop `needs_egress=True` from the `crawl.run` registration.
+    Must go red -- `tool_ctx` has no open run either, so a mutated
+    dispatcher would let the call reach the handler, whose own run-kind
+    guard would then answer `refused / wrong_run_kind` instead of
+    `unavailable / no_session`.
+    """
     env = dispatch_mod.dispatch(tool_ctx, "crawl.run",
                                 {"target": "http://127.0.0.1:8080/"},
-                                why="see whether crawling exists")
+                                why="see whether a session is required")
     assert env.outcome == "unavailable"
-    assert env.reason == "not_implemented"
-    # AND IT SAYS WHAT TO DO INSTEAD. An `unavailable` that names no
-    # alternative leaves an agent with a dead end where it needs a next step.
-    assert "proxy" in (env.detail or "").lower()
+    assert env.reason == "no_session"
 
 
-def test_crawl_run_is_unavailable_even_with_a_live_session(tool_ctx):
-    """`unavailable` here is about the FEATURE, not about the instrument. A
-    version that answered `no_session` would tell an agent that starting a
-    session would help, and it would not. No `why` either: a call that can
-    never mutate anything must never be told it needs one."""
-    tool_ctx.session = object()
+def test_crawl_run_refuses_outside_a_crawl_run(tool_ctx, monkeypatch):
+    """The same mechanical reason `scan.run` refuses outside a `scan` run:
+    `crawl.run` has no run of its own to auto-open, so a run this layer did
+    not open is a run `run.finish` would never close.
+
+    A session is set up (so the dispatcher's `no_session` guard does not
+    fire first) but the open run is `manual`, never `crawl` -- this must be
+    refused by the HANDLER'S OWN check, not by the egress guard above it.
+
+    MUTATION: drop the handler's run-kind guard. Must go red -- the crawler
+    itself is stubbed to fail loudly if reached (rather than risk a real
+    Chromium launch under the mutation), so a mutated handler that fell
+    through to it would error instead of answering `wrong_run_kind`.
+    """
+    def _must_not_run(**kw):
+        raise AssertionError("crawl.run must not reach the crawler here")
+
+    monkeypatch.setattr(crawl_run_mod, "crawl", _must_not_run)
+
+    tool_ctx.run_id = run_mod.open_run(
+        tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="manual",
+        safety_profile=tool_ctx.config.safety_profile)
+    tool_ctx.session = _crawl_session()
+
     env = dispatch_mod.dispatch(tool_ctx, "crawl.run",
-                                {"target": "http://127.0.0.1:8080/"})
-    assert env.outcome == "unavailable"
-    assert env.reason == "not_implemented"
+                                {"target": "http://127.0.0.1:8080/"},
+                                why="try it without a crawl run")
+    assert env.outcome == "refused"
+    assert env.reason == "wrong_run_kind"
+    assert "run.start" in (env.detail or "")
+
+
+def test_crawl_run_reports_the_summary_through_the_dispatcher(
+        tool_ctx, monkeypatch):
+    """The handler's projection reaches the agent through `dispatch`, not
+    only when called directly -- the same round trip `scan.run`'s summary
+    test below makes.
+
+    MUTATION: have the handler return the bare `CrawlSummary` instead of
+    `as_tool_result(summary)`. Must go red -- `dispatch` would then try to
+    fold a namedtuple into the envelope's `result`, and
+    `env.result["pages"]` (subscripting a namedtuple with a string key)
+    raises `TypeError` rather than answering `2`.
+    """
+    summary = crawl_run_mod.CrawlSummary(
+        pages=2, rendered=2, degraded=0, failed=0, capped=0, requests=4,
+        dropped_hosts=("cdn.test",), truncated_by=None)
+
+    def fake_crawl(**kw):
+        return summary
+
+    monkeypatch.setattr(crawl_run_mod, "crawl", fake_crawl)
+
+    tool_ctx.run_id = run_mod.open_run(
+        tool_ctx.conn, engagement_id=tool_ctx.engagement.id, kind="crawl",
+        safety_profile=tool_ctx.config.safety_profile)
+    tool_ctx.session = _crawl_session()
+
+    env = dispatch_mod.dispatch(tool_ctx, "crawl.run",
+                                {"target": "http://127.0.0.1:8080/"},
+                                why="crawl the seed")
+    assert env.outcome == "ok"
+    assert env.result["pages"] == 2
+    assert env.result["dropped_hosts"] == ["cdn.test"]
+    assert env.result["truncated_by"] is None
 
 
 def test_scan_run_refuses_outside_a_scan_run(tool_ctx):

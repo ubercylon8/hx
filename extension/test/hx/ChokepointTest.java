@@ -149,6 +149,8 @@ public class ChokepointTest {
         t("montoyaIsConfinedToTheEntryPoint", () -> montoyaIsConfinedToTheEntryPoint(sources));
         t("theBridgeNamesNothingInTheProxyPackage",
           () -> theBridgeNamesNothingInTheProxyPackage(sources));
+        t("theProxyPackageAttachesNoIdentity",
+          () -> theProxyPackageAttachesNoIdentity(sources));
         t("theDeprecatedAccessorsAreUnusedEverywhere",
           () -> theDeprecatedAccessorsAreUnusedEverywhere(sources));
         t("everyDecisionReadsOneAuthorisationSnapshot",
@@ -514,6 +516,38 @@ public class ChokepointTest {
             if (count(text(p), "hx.proxy") > 0) naming.add(p.toString());
         }
         check("no file in hx.bridge names hx.proxy (" + naming + ")",
+              naming.isEmpty());
+    }
+
+    /**
+     * STRUCTURAL, not behavioural: task-1-brief.md's fourth render.allow test.
+     * The proxy path injects no identity at all -- `grep -rn "identity"
+     * extension/src/hx/proxy/*.java` returns only comments, no
+     * `IdentityRegistry` reference exists in the package -- so widening the
+     * crawler's allow set cannot attach a credential to an out-of-scope
+     * destination: there is no code on this path that could attach one.
+     * Identity attachment lives on the SEND path instead, gated by the
+     * identity's own registered origin (Sender.java's `identity_origin`), not
+     * by the scope decision.
+     *
+     * Placed here rather than in PolicyTest: this class already carries a
+     * tested comment/literal stripper ({@link #code}, exercised by
+     * theStripperIsNotVacuousAndDoesNotOverreach) and the sources() walk this
+     * check filters, so reusing them is safer than a second, ad hoc
+     * comment-stripping regex in hx.policy.
+     *
+     * MUTATION: add an IdentityRegistry field to any class in hx.proxy
+     * (ProxyGate.java, say). Must go red.
+     */
+    static void theProxyPackageAttachesNoIdentity(List<Path> sources) throws IOException {
+        List<String> naming = new ArrayList<>();
+        for (Path p : sources) {
+            if (!p.toString().contains("hx/proxy/")) continue;
+            // code(), not text(): a comment mentioning the word must not fail
+            // this check, and code() blanks comments (and literal bodies).
+            if (count(code(p), "IdentityRegistry") > 0) naming.add(p.toString());
+        }
+        check("no IdentityRegistry anywhere in hx.proxy (" + naming + ")",
               naming.isEmpty());
     }
 

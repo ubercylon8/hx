@@ -235,6 +235,21 @@ public final class Policy {
     }
 
     /**
+     * The CRAWLER's question: everything decide() asks, plus render.allow.
+     *
+     * A sibling rather than a flag on decide(), for the reason decideScopeOnly
+     * is a sibling: the caller identity is the whole difference, and a
+     * boolean at 30 call sites is a boolean somebody passes true from the send
+     * path. ChokepointTest counts issuing call sites; this adds one, and it is
+     * ProxyGate's CRAWLER branch.
+     */
+    public Decision decideCrawl(HxRequest req, BridgeClient.Authorisation auth) {
+        Decision before = beforeGate(req, auth, true);
+        if (!before.allowed()) return before;
+        return checkGate(req);
+    }
+
+    /**
      * Everything decide() settles WITHOUT spending anything:
      * not_configured -> scope_denied -> method_denied -> dangerous_denied.
      *
@@ -246,11 +261,21 @@ public final class Policy {
      * exactly that reason, and there is one of each.
      */
     public Decision decideBeforeGate(HxRequest req, BridgeClient.Authorisation auth) {
+        return beforeGate(req, auth, false);
+    }
+
+    /**
+     * The shared body behind {@link #decideBeforeGate} and
+     * {@link #decideCrawl}: not_configured -> scope_denied (with render.allow
+     * consulted only when `renderAllow` is true) -> method_denied ->
+     * dangerous_denied.
+     */
+    private Decision beforeGate(HxRequest req, BridgeClient.Authorisation auth, boolean renderAllow) {
         Decision unusable = unusable(auth);
         if (unusable != null) return unusable;
 
         Map<String, List<String>> scope = auth.scope();
-        Decision scoped = checkScope(req, scope);
+        Decision scoped = checkScope(req, scope, renderAllow);
         if (!scoped.allowed()) return scoped;
 
         // NOT uppercased on either side. HTTP methods are case-sensitive (RFC
@@ -328,7 +353,9 @@ public final class Policy {
     public Decision decideScopeOnly(HxRequest req, BridgeClient.Authorisation auth) {
         Decision unusable = unusable(auth);
         if (unusable != null) return unusable;
-        return checkScope(req, auth.scope());
+        // false: the operator is not rendering under our policy and never
+        // asked for the render.allow concession -- see checkScope.
+        return checkScope(req, auth.scope(), false);
     }
 
     /**
@@ -425,7 +452,8 @@ public final class Policy {
      * never be reached, and the same config would authorise or refuse the same
      * request depending on which line the operator typed first.
      */
-    private static Decision checkScope(HxRequest req, Map<String, List<String>> scope) {
+    private static Decision checkScope(HxRequest req, Map<String, List<String>> scope,
+                                        boolean renderAllow) {
         Decision undecidable = undecidable(req);
         if (undecidable != null) return undecidable;
 
@@ -544,6 +572,25 @@ public final class Policy {
 
         for (Rule r : includes)
             if (r.allows(t, pathReadings)) return Decision.allow();
+
+        // AFTER the includes and AFTER the excludes, and both positions are
+        // the point. render.allow is a concession to RENDERING, not a second
+        // scope: an excluded destination stays excluded, and an included one
+        // never needed it. It is consulted only when the crawler asked --
+        // decide() passes false -- because a page needing a CDN to render is
+        // not an argument for letting a CHECK send a probe there.
+        if (renderAllow) {
+            for (String pattern : scope.getOrDefault("render.allow", List.of())) {
+                Rule r;
+                try {
+                    r = Rule.forInclude(pattern);
+                } catch (IllegalArgumentException e) {
+                    return Decision.deny("scope_denied",
+                            "unusable render.allow pattern: " + e.getMessage());
+                }
+                if (r.allows(t, pathReadings)) return Decision.allow();
+            }
+        }
 
         return Decision.deny("scope_denied", req.url() + " matches no scope.include pattern");
     }
