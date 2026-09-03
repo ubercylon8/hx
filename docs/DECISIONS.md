@@ -532,6 +532,111 @@ request should be able to trigger. Stopping and triaging are cheap and
 synchronous by comparison — one sentinel file, one SQLite row, one
 status-event insert — which is exactly the shape the spec draws the line at.
 
+## What has been measured, and what has only been argued
+
+### `sql-behaviour`'s `Tentative` is now a number: 18 true positives, 0 false
+
+Measured 2026-09-02 against OWASP Benchmark 1.2, joined to its own
+`expectedresults-1.2.csv`. Every finding `hx.active.sql-behaviour` filed was
+a genuine SQL injection by that corpus's ground truth.
+
+The check ships `confidence="Tentative"` on the REASONED grounds that a
+quote differential proves the quote reached a PARSER and not that the parser
+is a database — an input validator or a WAF that rejects a bare quote and
+accepts an escaped one produces an identical signal. That reasoning stands;
+it now has evidence beside it rather than only an argument.
+
+**IT DOES NOT LICENSE PROMOTING IT TO `Firm`.** Eighteen findings, one
+corpus, all of one shape, on a run that did not finish. The number says the
+check is not obviously noisy. It does not say what its rate is on an
+application with real input validation, which is the case the Tentative
+grade exists for.
+
+### The same run measured NOTHING for two other checks, and says so
+
+| check | findings | clean | no answer |
+|---|---|---|---|
+| `sql-behaviour` | 18 | 0 | 149 |
+| `sql-error` | 0 | 0 | 167 |
+| `path-traversal` | 0 | 0 | 167 |
+
+The scan ABORTED: `5xx rate 22.0% over the last 50 requests exceeds 20.0%`.
+So the 18 is a floor, 149 of 167 surfaces went unanswered, and **there is no
+false-positive measurement for `sql-error` or `path-traversal` at all**.
+Recording the gap is the point: a measurement that cannot distinguish
+"measured, clean" from "never reached" is section 12's failure aimed at our
+own evidence.
+
+### hx cannot fully scan a target that errors under injection
+
+That abort is not a defect and was not worked around. Section 4's distress
+detector exists so a scanner does not hammer a client's application into the
+ground, and OWASP Benchmark's SQLi cases are DESIGNED to return 500 when
+injected — so it fires at 22% and the run ends.
+
+The threshold is hardcoded in the extension rather than configurable per
+engagement, and it was left alone deliberately. The same argument had
+already been made that morning, when a 500-answering integration route
+halted the Java suite: **a target must not need the harness's own safety
+valve disabled to be testable.** Raising it here to buy a bigger number
+would have been that rule broken for our own convenience.
+
+### Only 22% of that corpus is reachable, and the other 78% is three safety decisions
+
+Of Benchmark's 772 SQL-injection and path-traversal cases, 167 take their
+input from a GET query parameter and the rest do not:
+
+| input source | cases | why hx cannot reach it |
+|---|---|---|
+| `formparam` | 363 | a POST body; the default method allowlist is GET/HEAD/OPTIONS |
+| `header` | 167 | none of the three checks measured here declares a `header` insertion kind (`reflected_input` does, and is not one of them) |
+| `cookie` | 75 | the extension refuses caller-supplied credential headers |
+| `getparam` | **167** | reachable |
+
+The unreachable majority is not a coverage failure to fix; it is three
+deliberate refusals showing up as a number. The report's Limits section
+already says request-body parameters are recorded and not probed. This puts
+a figure on what that costs: on this corpus, 47% of the SQLi cases.
+
+### One number from that run is NOT a false-positive rate, and was retracted
+
+The same join reported `hx.active.reflected-input` at 12 true and 3 false.
+**That is a category mismatch, not three errors.** Benchmark's label answers
+"is this SQL injection"; `reflected-input` answers "is input echoed back". A
+case can be labelled safe for SQLi and still reflect its input, so the label
+cannot judge that check. Only `sql-behaviour` was validly measurable here,
+because it and the label ask the same question.
+
+### The free half of the measurement: hx pointed at its own web app
+
+`hx web` takes `?severity=` and `?status=`, refuses unrecognised values with
+400, and every query behind it is parameterised — an input validator with no
+SQL, which is exactly the false-positive shape `sql-behaviour` is Tentative
+about. Scanned on 2026-09-02: **zero findings from all three injection
+checks**, with `sql-behaviour` recording
+
+> both probes came back 400 and identical, so nothing here separates
+> `tested, clean` from `never reached` -- an endpoint that refuses every
+> request refuses an unbalanced quote and an escaped one alike
+
+That is the gap branch a corpus contract forced into the check the same
+morning, working against a real validator on a target whose ground truth is
+known absolutely.
+
+Two things that run surfaced in passing. The distress detector aborted it
+too, on latency rather than 5xx. And `hx.active.reflected-input` filed two
+`Certain` findings there while its own description records that `<>"'` did
+not survive — honest about what it proves ("reflected, not exploitable"),
+and still noise in a client report on an app that escapes correctly.
+
+### A measurement harness needs a stabler key than the path
+
+The join nearly failed: hx's normaliser templated `BenchmarkTest00026` into
+`/benchmark/sqli-00/{slug}`, so the path no longer identified the case. It
+worked only because the test name is ALSO a query parameter and survives in
+`surface.query_key_set`. Anything built to repeat this measurement must key
+on something the normaliser does not rewrite.
+
 ## Process decisions
 
 ### A plan is a historical argument, not live documentation
@@ -592,3 +697,5 @@ not run since the commit that added the second.
 | `journal.encode_args` redacts credential headers at a LINE START only | `_CREDENTIAL_LINE` matches at the start of a string and after `\n` or `\r`, so every spelling of a header line is covered — but a credential name that does not start a line (`a=1; Cookie: b`) is deliberately left alone, because prose and form fields are not header lines and a redactor firing on them would corrupt the journal's account of what was tried. Separately, `why` is written to its own column without passing through the encoder at all. **This row described `.match`-anchored non-MULTILINE behaviour until 2026-09-01, two commits after that stopped being true** — a stale debt row is worse than none, and it was found by a review rather than by its author. |
 | One mapped wire class no Java site emits | `identity_dead` is kept — removing it would contradict the refused/unavailable split — as a named `MAPPED_BUT_NOT_EMITTED_BY_THE_JVM` exception, so the *next* unreachable entry fails a test. The assertion is `extra <= set(...)`, so an exception that later becomes emitted goes stale silently. |
 | `hx tool` cannot reach the six egress tools | Structural, not a defect: `session()` tears Burp down on every exit and each call is its own process. Reported as `no_host` naming `hx mcp`, rather than left to look like a bug. |
+| No false-positive measurement exists for `sql-error` or `path-traversal` | The 2026-09-02 Benchmark run aborted on the 5xx distress threshold before either got a single verdict — 167 inconclusive each. The abort is correct behaviour; the consequence is that two shipped checks have a confidence grade backed by argument alone. |
+| A measurement run cannot cover a corpus that errors under injection | Section 4's distress detector stops issuance at a 20% 5xx rate, and OWASP Benchmark's SQLi cases are designed to 500. Scanning such a corpus in windows small enough to stay under the threshold needs batching hx does not have, and raising the threshold is the safety valve disabled for our own convenience. |
