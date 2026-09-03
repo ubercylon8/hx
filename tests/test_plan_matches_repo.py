@@ -108,6 +108,12 @@ NOT_A_FILE = {
     "contract sketch for src/hx/halt.py -- NOT the file, and deliberately":
         "says so in the marker: a contract, written before the file, and the "
         "file is compared by its own block a few steps later",
+    "PolicyTest additions -- a sketch of the four cases, not a transcription":
+        "four test methods to ADD to an existing 900-line PolicyTest.java. "
+        "Naming the file would compare the sketch against the whole of it and "
+        "fail on everything the sketch does not repeat; the crawler plan's "
+        "other Java blocks are fragments of Policy.java and ProxyGate.java "
+        "and say so in their own markers",
 }
 
 
@@ -408,7 +414,7 @@ def test_a_stale_excerpt_is_caught_where_a_whole_file_compare_never_looked(tmp_p
 # or started_us`, and `run.py` was fixed to match the plan rather than the
 # plan synced down to the stale code -- so that block reads "unchanged"
 # above, not "synced".
-EXPECTED_BLOCKS = 229
+EXPECTED_BLOCKS = 249
 
 
 def test_the_check_actually_found_some_blocks():
