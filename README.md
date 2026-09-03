@@ -10,6 +10,42 @@ a per-engagement SQLite database that a report is rendered from.
 
 `hx` does not bundle, redistribute, or modify Burp Suite. You bring your own copy.
 
+```mermaid
+flowchart LR
+  subgraph host["your machine"]
+    agent(["agent / CLI"]) -->|"local socket"| py
+    py["hx<br/><i>Python</i>"]
+    subgraph jvm["Burp Suite JVM"]
+      ext["hx extension<br/><i>Java</i>"]
+      gate{{"enforcement<br/>scope · method · rate · budget"}}
+      ext --- gate
+    end
+    py <-->|"bridge"| ext
+    py --> db[("SQLite<br/><i>per engagement</i>")]
+  end
+  gate ==>|"the only way out"| target(["target application"])
+  gate -.->|"denied"| drop["recorded, never silent"]
+
+  style gate stroke-width:3px
+  style target stroke-dasharray: 5
+```
+
+Everything `hx` sends crosses that one box. The Python side cannot go around
+it — it can only ask.
+
+---
+
+## Documentation
+
+| | |
+|---|---|
+| **[Install guide](docs/INSTALL.md)** | Prerequisites, building the extension, proving it works |
+| **[User guide](docs/USER-GUIDE.md)** | An engagement end to end, and how to read the report |
+| **[Architecture](docs/ARCHITECTURE.md)** | Where enforcement lives and why it is in Java |
+| **[Decisions](docs/DECISIONS.md)** | What was measured, what was only argued, and the debt |
+| **[Contributing](CONTRIBUTING.md)** | The three suites and the house rules |
+| **[Security](SECURITY.md)** | Reporting a vulnerability in `hx` itself |
+
 ---
 
 ## The safety model, first
@@ -56,7 +92,26 @@ reason.
 ```bash
 uv sync                                    # or: pip install -e .
 MONTOYA_JAR=/path/to/montoya-api.jar ./extension/build.sh
+export HX_BURP_JAR=/path/to/burpsuite_community.jar
 ```
+
+Then prove it: `.venv/bin/pytest -q`, `./extension/test.sh`, and
+`.venv/bin/pytest -m integration -q`. Full detail, including what a good run
+looks like and what the two different kinds of integration-suite failure mean,
+is in the **[install guide](docs/INSTALL.md)**.
+
+## Quickstart
+
+```bash
+hx new demo --client "Demo Ltd" --scope 'https://app.demo.test/*' --profile staging
+hx capture start --kind browse       # browse the app through the proxy, then:
+hx capture stop
+hx scan
+hx report                            # -> <engagement>/exports/
+```
+
+The **[user guide](docs/USER-GUIDE.md)** covers crawling, triage, the web app,
+halting, and driving `hx` from an agent.
 
 ## Use
 

@@ -37,6 +37,30 @@ assertions) is the one that guards the safety envelope.
 
 ## The two egress points
 
+```mermaid
+flowchart TB
+  browser(["operator's browser"]) --> L1["proxy listener<br/><i>operator</i>"]
+  crawler(["hx crawler"]) --> L2["proxy listener<br/><i>crawler</i>"]
+  checks(["checks / probes"]) --> SP["send path<br/><i>Sender</i>"]
+
+  L1 --> PG{{"ProxyGate"}}
+  L2 --> PG
+  PG -->|"OPERATOR:<br/>scope only"| OUT(["target"])
+  PG -->|"CRAWLER:<br/>full policy"| OUT
+  SP -->|"full policy<br/>+ identity"| OUT
+  PG -.->|refused| D[("denial row")]
+  SP -.->|refused| D
+
+  style PG stroke-width:3px
+  style SP stroke-width:3px
+```
+
+Two boxes with a heavy border, and nothing else reaches the network. The
+crawler shares the proxy listener with the operator and is told apart from it
+by **which listener the request arrived on** — never by anything in the
+traffic, which the target could forge.
+
+
 | | Proxy listener | Send path |
 |---|---|---|
 | Whose traffic | The operator's browser | `hx`'s own probes, and the crawler |
@@ -107,6 +131,37 @@ an answer, so it may report what it finds but may not close anything. Retirement
 passive-corpus property.
 
 ## The database
+
+```mermaid
+erDiagram
+  engagement ||--o{ run : "has"
+  engagement ||--o{ surface : "has"
+  engagement ||--o{ finding : "has"
+  engagement ||--o{ scope_version : "versioned by"
+  engagement ||--o{ authorization : "declared, never written"
+  run ||--o{ exchange : "issued"
+  run ||--o{ check_run : "ran"
+  run ||--o{ denial : "refused"
+  surface ||--o{ exchange : "observed at"
+  surface ||--o{ check_run : "examined"
+  check_run ||--o{ finding : "produced"
+  finding ||--o{ finding_observation : "seen in runs"
+  finding ||--o{ finding_status_event : "triaged by"
+  finding ||--o{ evidence : "supported by"
+```
+
+Fourteen tables; the twelve above are the ones a report reasons over.
+`agent_action` and `quarantine` sit outside it — the audit trail and the
+holding pen — and `finding_status_event` is the only writer of a finding's
+status, which is why a human act is distinguishable from a tool's.
+
+**`authorization` is declared and never written.** No code path in this build
+inserts a row, so the edge is labelled as it reads: the table exists, the
+schema anticipates the record, and every report states the record is absent.
+It carries the *absence* of the client's written permission, not the
+permission. Shown rather than omitted, because a data model that quietly
+dropped it would leave a reader to assume authorisation is tracked somewhere.
+
 
 14 tables in one SQLite file per engagement, `0o600` inside a `0o700` directory. Request and
 response bodies live in a content-addressed blob store, and **redaction runs before
