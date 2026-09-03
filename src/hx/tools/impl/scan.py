@@ -206,7 +206,11 @@ registry.register(spec.ToolSpec(
     name="crawl.run", handler=crawl, needs_egress=True, mutates=True,
     summary="Drive a browser over in-scope pages through the proxy so their "
             "requests are captured. Synchronous and bounded; must be called "
-            "inside a crawl run. Submits no forms and clicks nothing.",
+            "inside a crawl run. Submits no forms and clicks nothing. If the "
+            "result carries `truncated_by`, pass it to `run.finish` as the "
+            "`note` -- that is what records the crawl as incomplete, and a "
+            "report cannot otherwise tell a budget-stopped crawl from an "
+            "exhaustive one.",
     params={"type": "object", "additionalProperties": False, "properties": {
         "target": {"type": "string", "maxLength": 2048},
         "identity": {"type": "string", "maxLength": 64},

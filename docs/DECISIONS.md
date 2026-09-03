@@ -637,6 +637,116 @@ worked only because the test name is ALSO a query parameter and survives in
 `surface.query_key_set`. Anything built to repeat this measurement must key
 on something the normaliser does not rewrite.
 
+## Tests that cannot fail
+
+Across this repository's history, **eighteen assertions have shipped or nearly
+shipped that could not fail**. Every one looked like a passing test. Not one was
+found by reading; every one was found by APPLYING a mutation and watching the
+suite stay green.
+
+This chapter is the catalogue, the question that finds them faster than the
+catalogue does, and the ways the measurement itself has lied.
+
+### The question
+
+**"Under this mutation, is there any other path that reaches this same
+assertion?"**
+
+That single question found six of the eleven vacuities on the crawler branch,
+including three in tests the plan's own author had written and traced by hand.
+It generalises every shape below, and it is cheaper to ask than to classify.
+
+The shapes are worth knowing anyway, because they tell you *where* to look for
+the other path.
+
+### The seven shapes
+
+1. **The assertion is guaranteed true by the code beneath it.**
+   `assert returned <= MAX_LIMIT` where the callee enforces that either way.
+
+2. **The name promises more than the body checks.**
+   `test_every_response_carries_the_CSP` asked only for a 200. The 421 refusal
+   returned early with no headers at all, and needed a second test.
+
+3. **The attack has no target to reach.** A traversal parametrize where four of
+   five inputs 404'd under the mutation because nothing existed at those paths
+   — not because the allowlist held.
+
+4. **A purely negative assertion**, which survives the guarded thing being
+   DELETED rather than merely broken. `assert SECRET not in body` stayed green
+   when the evidence URL was removed from the template entirely.
+
+5. **A "single source of truth" test that exercises only one of the two things
+   it binds.** The test justifying an extraction could not detect the
+   extraction being undone, because both sides called the same function.
+
+6. **A substring that appears elsewhere in a large generated document.**
+   Asserting `"interaction" in report` and `"unauthenticated" in report` proved
+   nothing about a new Limits bullet: both words already occur in other,
+   unconditional bullets. Delete the whole disclosure and both assertions stay
+   green. The masking mechanism here is not code — it is neighbouring prose.
+   Testing four disclosures SEPARATELY was necessary and not sufficient; each
+   phrase must also be UNIQUE to the branch under test.
+
+7. **Two correct implementations agreeing on the test's chosen input.**
+   A test named the mutation "remove `ProxyGate`'s CRAWLER branch", but
+   `decideScopeOnly` denies a plain out-of-scope destination *identically* to
+   `decideCrawl` — the operator path and the crawler path agree on that input,
+   so the branch is unobservable through it. The fix was not a better
+   assertion but a better INPUT: an in-scope `dangerous.path` URL, which only
+   `decideCrawl` checks, and on which the two paths finally disagree.
+
+Shape 7 is the one to keep in mind when testing a branch: a branch is only
+observable through an input on which its arms differ.
+
+### The measurement lies too
+
+A mutation run is itself an experiment, and it has produced the wrong answer
+three times here, by three different mechanisms with one shape — **the thing
+that ran was not the thing that changed.**
+
+- **Stale `__pycache__`** made a mutation appear not to apply. The test looked
+  vacuous; it was healthy.
+- **`git stash` leaves untracked files in place**, so a "baseline" taken that
+  way still contained the new module. The reading was false in the other
+  direction.
+- **An imprecise mutation verifies nothing.** "Return the first reply" was
+  implemented as `dict.popitem()`, which is LIFO in CPython 3.7+; with two
+  replies in flight, "newest" and "the one I asked for" coincide and the
+  mutation passed. Spelled as `next(iter(...))` it failed correctly. A named
+  mutation is code, and an ambiguous name has implementations that disagree.
+
+So: clear the cache, verify a baseline by removing files rather than stashing
+them, and write the mutation as literal code rather than a description.
+
+### Structure beats behaviour where it is available
+
+The strongest test on the crawler branch asserts no behaviour at all:
+`ChokepointTest.theProxyPackageAttachesNoIdentity` greps the `hx.proxy` package
+for `IdentityRegistry` and requires zero matches.
+
+The reason it is stronger, in the PR review's own words, is that it "makes the
+property true by construction rather than by one code path being careful."
+Behaviour has many causes, which is what every shape above exploits. A
+structural claim has one: the string is in the package or it is not, and no
+second mechanism can satisfy it.
+
+Not every property is structural. When one is — *this package never touches
+credentials*, *this module imports no socket* — assert the structure.
+
+### The gate
+
+Every security-relevant test's docstring names the mutation that must turn it
+red, and each plan tabulates them. Apply them ONE AT A TIME on a clean tree;
+batching misattributes results. Commit before sweeping, so every
+`git checkout --` is safe.
+
+**A mutation with no test beside it is not a passing row, it is a missing one.**
+One table reported "11 of 11 went red" against a branch with thirteen mutable
+invariants. The claim was true and told nobody anything — §12's own failure,
+a coverage figure that cannot distinguish "tested, clean" from "never listed",
+aimed at the quality gate instead of at the report.
+
 ## Process decisions
 
 ### A plan is a historical argument, not live documentation

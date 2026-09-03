@@ -34,6 +34,14 @@ def _ok(url: str) -> dict:
 # --- harvesting ------------------------------------------------------------
 
 def test_anchors_areas_iframes_and_form_actions_are_all_harvested():
+    """All four link-bearing tags in one call, so a fix or refactor to one
+    entry of `_LINK_ATTRS` cannot silently drop another.
+
+    MUTATION: remove the `"area": "href"` entry from `_LINK_ATTRS`. This
+    test must go red -- `https://app.test/b` would be missing from `out`,
+    and an `<area>` inside an image map (the one HTML link shape none of
+    the other tests here uses) would go uncrawled.
+    """
     html = ('<a href="/a">x</a>'
             '<area href="/b">'
             '<iframe src="/c"></iframe>'
@@ -57,11 +65,27 @@ def test_a_form_action_is_harvested_as_a_url_and_never_submitted():
 
 
 def test_relative_urls_resolve_against_the_page_not_the_origin():
+    """`urljoin` needs the FULL page URL, path and all, or `b` off
+    `/deep/a` resolves to the wrong place. The origin alone is not enough.
+
+    MUTATION: when no `<base>` tag is present, resolve against the page's
+    origin instead of its full URL, e.g. `base = f"{urlsplit(base_url).
+    scheme}://{urlsplit(base_url).netloc}/"`. This test must go red --
+    `b` would resolve to `https://app.test/b`, discarding the `/deep/`
+    the page actually lives under.
+    """
     out = page.harvest('<a href="b">x</a>', "https://app.test/deep/a")
     assert out == ["https://app.test/deep/b"]
 
 
 def test_a_base_tag_is_honoured():
+    """A page that sets `<base>` means relative links there, not against its
+    own URL -- `v1` here must resolve under `/api/`, not under `/other`.
+
+    MUTATION: drop the `<base>`-tag branch and always resolve against
+    `base_url` (`base = base_url`, unconditionally). This test must go red --
+    `v1` would resolve to `https://app.test/v1`, ignoring the declared base.
+    """
     out = page.harvest('<base href="https://app.test/api/">'
                        '<a href="v1">x</a>', "https://app.test/other")
     assert out == ["https://app.test/api/v1"]
@@ -112,7 +136,26 @@ def test_malformed_html_yields_what_it_can_rather_than_raising(monkeypatch):
 # --- classification: S12 applied to one page -------------------------------
 
 def test_a_page_that_loaded_and_yielded_links_is_rendered():
-    events = [_sent("https://app.test/"), _ok("https://app.test/")]
+    """`classify` returns "rendered" from two different places: the `yielded`
+    branch (`if yielded: state = "rendered"`) and the fallback at the bottom
+    of the same if/elif/else (`else: state = "rendered"`, taken whenever
+    nothing was dropped). MEASURED: as first written this test's events had
+    no drop, so `dropped` was empty and deleting the `yielded` branch
+    entirely (`if False: state = "rendered"`) fell straight through to the
+    no-drop fallback and produced the identical verdict -- the test stayed
+    green under a mutation that removed the exact thing it claims to check.
+    A dropped third party is included below (the same fix
+    `test_a_page_with_xhr_but_no_links_still_counts_as_rendered` already
+    needed for its own case) so the assertion actually depends on `yielded`:
+    without it, `dropped` is non-empty and this page would fall to
+    "degraded", not "rendered".
+
+    MUTATION: delete the `if yielded: state = "rendered"` branch (e.g.
+    replace its condition with `if False:`), leaving `elif dropped: state =
+    "degraded"` as the next thing tested. Must go red.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _sent("https://cdn.test/app.js"), _failed("https://cdn.test/app.js")]
     r = page.classify(events, page_origins=ORIGINS, harvested=3)
     assert r.state == "rendered"
 
@@ -190,6 +233,20 @@ def test_page_origins_is_seed_origins_so_unseeded_in_scope_failure_reads_dropped
 
 
 def test_a_document_that_never_loaded_is_failed_not_degraded():
+    """The document itself is the request in `dropped_candidates` here (no
+    `responseReceived` for it at all) -- the most basic case `document in
+    dropped_candidates` exists for, distinct from the `degraded` cases below
+    where a THIRD PARTY, not the document, drops.
+
+    MUTATION: drop `or document in dropped_candidates` from the `state =
+    "failed"` guard, leaving only `if document is None:`. This test must go
+    red -- `document` is not `None` here (it is the sent request's id), so
+    the mutated guard does not fire; the loop below then classifies the
+    document's own origin as in-scope (it IS in `page_origins`) and files it
+    under `in_scope_failures` rather than `dropped`, so `dropped` stays
+    empty and `classify` falls all the way to the "no drop" fallback,
+    reporting `rendered` for a page that never loaded.
+    """
     events = [_sent("https://app.test/"), _failed("https://app.test/")]
     r = page.classify(events, page_origins=ORIGINS, harvested=0)
     assert r.state == "failed"
@@ -220,6 +277,21 @@ def test_a_page_with_xhr_but_no_links_still_counts_as_rendered():
 
 
 def test_dropped_hosts_are_deduplicated_and_ordered():
+    """Two dropped requests to `cdn.test` (`a.js` and `b.js`) must collapse
+    to one entry, and the two distinct hosts must come back sorted rather
+    than in event-arrival order (`cdn.test` is sent first here, `ads.test`
+    second, and the expected tuple is alphabetical).
+
+    DEDUPLICATION is structural, not something a mutation can meaningfully
+    target: `dropped` is a `set`, and a set cannot hold `"cdn.test"` twice
+    by construction (see DECISIONS.md's "Structure beats behaviour"). The
+    runtime-testable half of this test's name is the ORDERING, which is a
+    behavioural choice (`sorted(...)`) and can regress.
+
+    MUTATION: sort in reverse, `tuple(sorted(dropped, reverse=True))`. This
+    test must go red -- `dropped_hosts` would come back as `("cdn.test",
+    "ads.test")`.
+    """
     events = [_sent("https://app.test/"), _ok("https://app.test/")]
     for u in ("https://cdn.test/a.js", "https://cdn.test/b.js",
               "https://ads.test/t.gif"):

@@ -42,6 +42,15 @@ def test_the_proxy_bypass_flag_is_present():
 
 
 def test_the_proxy_is_the_only_route_out():
+    """`--proxy-server` must carry the CALLER'S port, not a hardcoded one --
+    the sibling test above pins that the bypass-list flag exists at all;
+    this one pins that the proxy address itself is wired through correctly.
+
+    MUTATION: hardcode the port, e.g. `"--proxy-server=127.0.0.1:8080"`
+    instead of `f"--proxy-server=127.0.0.1:{proxy_port}"`. This test must go
+    red -- called with `proxy_port=9999`, the assertion looks for
+    `...:9999` and finds `...:8080` in argv instead.
+    """
     argv = browser.launch_argv(Path("/x/chrome"), proxy_port=9999,
                                 user_data_dir=Path("/tmp/p"))
     assert "--proxy-server=127.0.0.1:9999" in argv
@@ -84,6 +93,17 @@ def test_remote_debugging_is_a_pipe_and_never_a_port():
 
 
 def test_the_newest_bundled_chromium_wins(tmp_path):
+    """The general "newest wins" claim, with three candidates in no
+    particular directory order -- distinct from the sibling test below,
+    which pins the NUMERIC-vs-lexicographic comparison specifically
+    (`"9" > "150"` as strings). This one would pass even with a naive
+    string sort, so it needs its own mutation on the selection itself.
+
+    MUTATION: pick the OLDEST candidate instead of the newest, e.g.
+    `newest = min(candidates, key=lambda d: _version_key(d.name))`. This
+    test must go red -- `find_chromium` would return `9.0.1.2`, the lowest
+    version present, instead of `150.0.7871.186`.
+    """
     home = _fake_burp_home(tmp_path, "9.0.1.2", "150.0.7871.186", "31.0.0.0")
     assert browser.find_chromium(home).parent.name == "150.0.7871.186"
 
@@ -98,14 +118,28 @@ def test_versions_are_compared_numerically_and_not_as_strings(tmp_path):
 
 def test_a_missing_browser_is_a_named_refusal_not_a_crash(tmp_path):
     """Burp downloads its browser on first use, so 'not there yet' is an
-    ordinary state an operator must be told how to fix."""
+    ordinary state an operator must be told how to fix.
+
+    MUTATION: raise a bare `RuntimeError(...)` (same message) instead of
+    `BrowserUnavailable(...)` in `find_chromium`. This test must go red --
+    `pytest.raises(browser.BrowserUnavailable, ...)` requires that specific
+    class, and a caller catching `BrowserUnavailable` to print the fix would
+    let a `RuntimeError` propagate as an unhandled crash instead.
+    """
     with pytest.raises(browser.BrowserUnavailable, match="burpbrowser"):
         browser.find_chromium(tmp_path)
 
 
 def test_session_id_is_none_before_the_browser_is_entered():
     """Ruling 9: `Browser` exposes `.session_id` so Task 5/6 can read it. It
-    starts `None` -- there is no page session before a Chromium exists."""
+    starts `None` -- there is no page session before a Chromium exists.
+
+    MUTATION: initialise `self.session_id: str | None = ""` instead of
+    `None` in `Browser.__init__`. This test must go red -- a caller who
+    checks `if browser.session_id is None` to decide whether `__enter__` has
+    run yet would see `""`, which is falsy but not `None`, and the check
+    would silently give the wrong answer.
+    """
     b = browser.Browser(proxy_port=1, chrome=Path("/x/chrome"))
     assert b.session_id is None
 

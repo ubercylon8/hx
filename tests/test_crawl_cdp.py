@@ -72,6 +72,18 @@ def _peer() -> tuple[cdp.Connection, subprocess.Popen]:
 
 
 def test_a_call_gets_its_own_reply():
+    """THE SMOKE TEST for the whole call/reply mechanism: send one command
+    over the pipe, get exactly the `result` field of its own reply back --
+    not the full CDP envelope, and not a coincidentally-matching neighbour
+    (with only one message in flight here, correlation-by-id itself is the
+    sibling test's job below; this one is the baseline every other test in
+    this file assumes still works).
+
+    MUTATION: return the raw `reply` dict from `call` instead of `reply.
+    get("result", {})`. This test must go red -- the returned value would be
+    `{"id": 1, "result": {"echo": {"x": 7}}}`, the whole envelope, not the
+    `{"echo": {"x": 7}}` a caller actually asked for.
+    """
     conn, proc = _peer()
     try:
         assert conn.call("Peer.echo", {"x": 7}) == {"echo": {"x": 7}}

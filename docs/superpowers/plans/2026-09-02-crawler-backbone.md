@@ -360,6 +360,18 @@ def _peer() -> tuple[cdp.Connection, subprocess.Popen]:
 
 
 def test_a_call_gets_its_own_reply():
+    """THE SMOKE TEST for the whole call/reply mechanism: send one command
+    over the pipe, get exactly the `result` field of its own reply back --
+    not the full CDP envelope, and not a coincidentally-matching neighbour
+    (with only one message in flight here, correlation-by-id itself is the
+    sibling test's job below; this one is the baseline every other test in
+    this file assumes still works).
+
+    MUTATION: return the raw `reply` dict from `call` instead of `reply.
+    get("result", {})`. This test must go red -- the returned value would be
+    `{"id": 1, "result": {"echo": {"x": 7}}}`, the whole envelope, not the
+    `{"echo": {"x": 7}}` a caller actually asked for.
+    """
     conn, proc = _peer()
     try:
         assert conn.call("Peer.echo", {"x": 7}) == {"echo": {"x": 7}}
@@ -834,6 +846,15 @@ def test_the_proxy_bypass_flag_is_present():
 
 
 def test_the_proxy_is_the_only_route_out():
+    """`--proxy-server` must carry the CALLER'S port, not a hardcoded one --
+    the sibling test above pins that the bypass-list flag exists at all;
+    this one pins that the proxy address itself is wired through correctly.
+
+    MUTATION: hardcode the port, e.g. `"--proxy-server=127.0.0.1:8080"`
+    instead of `f"--proxy-server=127.0.0.1:{proxy_port}"`. This test must go
+    red -- called with `proxy_port=9999`, the assertion looks for
+    `...:9999` and finds `...:8080` in argv instead.
+    """
     argv = browser.launch_argv(Path("/x/chrome"), proxy_port=9999,
                                 user_data_dir=Path("/tmp/p"))
     assert "--proxy-server=127.0.0.1:9999" in argv
@@ -876,6 +897,17 @@ def test_remote_debugging_is_a_pipe_and_never_a_port():
 
 
 def test_the_newest_bundled_chromium_wins(tmp_path):
+    """The general "newest wins" claim, with three candidates in no
+    particular directory order -- distinct from the sibling test below,
+    which pins the NUMERIC-vs-lexicographic comparison specifically
+    (`"9" > "150"` as strings). This one would pass even with a naive
+    string sort, so it needs its own mutation on the selection itself.
+
+    MUTATION: pick the OLDEST candidate instead of the newest, e.g.
+    `newest = min(candidates, key=lambda d: _version_key(d.name))`. This
+    test must go red -- `find_chromium` would return `9.0.1.2`, the lowest
+    version present, instead of `150.0.7871.186`.
+    """
     home = _fake_burp_home(tmp_path, "9.0.1.2", "150.0.7871.186", "31.0.0.0")
     assert browser.find_chromium(home).parent.name == "150.0.7871.186"
 
@@ -890,14 +922,28 @@ def test_versions_are_compared_numerically_and_not_as_strings(tmp_path):
 
 def test_a_missing_browser_is_a_named_refusal_not_a_crash(tmp_path):
     """Burp downloads its browser on first use, so 'not there yet' is an
-    ordinary state an operator must be told how to fix."""
+    ordinary state an operator must be told how to fix.
+
+    MUTATION: raise a bare `RuntimeError(...)` (same message) instead of
+    `BrowserUnavailable(...)` in `find_chromium`. This test must go red --
+    `pytest.raises(browser.BrowserUnavailable, ...)` requires that specific
+    class, and a caller catching `BrowserUnavailable` to print the fix would
+    let a `RuntimeError` propagate as an unhandled crash instead.
+    """
     with pytest.raises(browser.BrowserUnavailable, match="burpbrowser"):
         browser.find_chromium(tmp_path)
 
 
 def test_session_id_is_none_before_the_browser_is_entered():
     """Ruling 9: `Browser` exposes `.session_id` so Task 5/6 can read it. It
-    starts `None` -- there is no page session before a Chromium exists."""
+    starts `None` -- there is no page session before a Chromium exists.
+
+    MUTATION: initialise `self.session_id: str | None = ""` instead of
+    `None` in `Browser.__init__`. This test must go red -- a caller who
+    checks `if browser.session_id is None` to decide whether `__enter__` has
+    run yet would see `""`, which is falsy but not `None`, and the check
+    would silently give the wrong answer.
+    """
     b = browser.Browser(proxy_port=1, chrome=Path("/x/chrome"))
     assert b.session_id is None
 
@@ -1086,6 +1132,7 @@ def test_a_browser_that_never_answers_cdp_fails_instead_of_hanging(tmp_path):
     # `communicate()` runs BEFORE the kill and must wait out the full
     # `stderr_timeout` against a child that is still very much alive --
     # measured ~3.3s. 2s cleanly separates the two without being flaky.
+    assert elapsed < 2.0, f"took {elapsed:.2f}s -- the error path hung"
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -1422,6 +1469,12 @@ def _b(pages=100, seconds=100.0, requests=10_000):
 
 
 def test_a_fragment_is_not_a_different_page():
+    """`#a` and `#b` are one document and one request -- see the module
+    docstring's "the fragment goes" line.
+
+    MUTATION: pass `parts.fragment` instead of `""` as the fifth element of
+    the `urlunsplit(...)` tuple in `normalise`. This test must go red.
+    """
     assert frontier.normalise("https://a.test/x#frag") == "https://a.test/x"
 
 
@@ -1448,6 +1501,16 @@ def test_two_ids_on_one_path_are_two_pages():
 
 
 def test_a_url_already_seen_is_not_enqueued_twice():
+    """The `_seen` set, not just the queue: a URL already visited-or-queued
+    must not be offered again, or the same page would be crawled twice for
+    every link back to it. The second offer spells the URL with a different
+    fragment on purpose, so this also depends on `normalise` collapsing it to
+    the same seen-set key as the first.
+
+    MUTATION: delete the `if n in self._seen: return False` guard in
+    `_enqueue` (leave the unconditional `self._seen.add(n)` in place). This
+    test must go red -- the second `offer()` would return 1, not 0.
+    """
     f = frontier.Frontier(["https://a.test/"], _b())
     assert f.offer(["https://a.test/x"]) == 1
     assert f.offer(["https://a.test/x#other"]) == 0
@@ -1488,6 +1551,15 @@ def test_a_non_http_scheme_is_refused():
 
 
 def test_a_second_seed_origin_is_allowed():
+    """The origin allowlist is built from EVERY seed, not just the first --
+    a two-origin engagement (say `app.test` plus its `api.app.test`) must be
+    able to crawl both.
+
+    MUTATION: build `self._origins` from only the first seed, e.g.
+    `for seed in list(seeds)[:1]:` in `Frontier.__init__`. This test must go
+    red -- `b.test` would never make it into the allowlist and `offer()`
+    would return 0.
+    """
     f = frontier.Frontier(["https://a.test/", "https://b.test/"], _b())
     assert f.offer(["https://b.test/x"]) == 1
 
@@ -1507,6 +1579,18 @@ def test_the_page_budget_stops_the_crawl_and_names_itself():
 
 
 def test_the_request_budget_stops_the_crawl_and_names_itself():
+    """`next()`'s three budget checks read three DIFFERENT fields off
+    `self._budget`, and it is easy to copy-paste one check into another's
+    shape and read the wrong field -- `_b(requests=10)` leaves `max_pages`
+    and `max_seconds` at their generous defaults, so only the requests check
+    can fire here, and this test isolates it from its two siblings rather
+    than merely happening not to collide with them.
+
+    MUTATION: in the `self._requests >= self._budget.max_requests` check,
+    read `self._budget.max_pages` instead. This test must go red -- with
+    `max_pages` still at its default of 100, `11 >= 100` is false and
+    `next()` returns the queued page instead of `None`.
+    """
     f = frontier.Frontier(["https://a.test/1"], _b(requests=10))
     f.offer(["https://a.test/2"])
     assert f.next() is not None
@@ -1516,6 +1600,17 @@ def test_the_request_budget_stops_the_crawl_and_names_itself():
 
 
 def test_the_time_budget_stops_the_crawl_and_names_itself():
+    """Same isolation concern as the request-budget test above, for the
+    third of `next()`'s three budget checks: `_b(seconds=5.0)` leaves
+    `max_pages` and `max_requests` at their generous defaults, so only the
+    elapsed-time check can fire.
+
+    MUTATION: in the `self._clock() - self._started >= self._budget.
+    max_seconds` check, read `self._budget.max_requests` instead. This test
+    must go red -- with `max_requests` still at its default of 10_000, the
+    elapsed 99.0 seconds does not clear it and `next()` returns the queued
+    page instead of `None`.
+    """
     ticks = iter([0.0, 0.0, 99.0, 99.0])
     f = frontier.Frontier(["https://a.test/1"], _b(seconds=5.0),
                           clock=lambda: next(ticks))
@@ -1833,6 +1928,14 @@ def _ok(url: str) -> dict:
 # --- harvesting ------------------------------------------------------------
 
 def test_anchors_areas_iframes_and_form_actions_are_all_harvested():
+    """All four link-bearing tags in one call, so a fix or refactor to one
+    entry of `_LINK_ATTRS` cannot silently drop another.
+
+    MUTATION: remove the `"area": "href"` entry from `_LINK_ATTRS`. This
+    test must go red -- `https://app.test/b` would be missing from `out`,
+    and an `<area>` inside an image map (the one HTML link shape none of
+    the other tests here uses) would go uncrawled.
+    """
     html = ('<a href="/a">x</a>'
             '<area href="/b">'
             '<iframe src="/c"></iframe>'
@@ -1856,11 +1959,27 @@ def test_a_form_action_is_harvested_as_a_url_and_never_submitted():
 
 
 def test_relative_urls_resolve_against_the_page_not_the_origin():
+    """`urljoin` needs the FULL page URL, path and all, or `b` off
+    `/deep/a` resolves to the wrong place. The origin alone is not enough.
+
+    MUTATION: when no `<base>` tag is present, resolve against the page's
+    origin instead of its full URL, e.g. `base = f"{urlsplit(base_url).
+    scheme}://{urlsplit(base_url).netloc}/"`. This test must go red --
+    `b` would resolve to `https://app.test/b`, discarding the `/deep/`
+    the page actually lives under.
+    """
     out = page.harvest('<a href="b">x</a>', "https://app.test/deep/a")
     assert out == ["https://app.test/deep/b"]
 
 
 def test_a_base_tag_is_honoured():
+    """A page that sets `<base>` means relative links there, not against its
+    own URL -- `v1` here must resolve under `/api/`, not under `/other`.
+
+    MUTATION: drop the `<base>`-tag branch and always resolve against
+    `base_url` (`base = base_url`, unconditionally). This test must go red --
+    `v1` would resolve to `https://app.test/v1`, ignoring the declared base.
+    """
     out = page.harvest('<base href="https://app.test/api/">'
                        '<a href="v1">x</a>', "https://app.test/other")
     assert out == ["https://app.test/api/v1"]
@@ -1911,7 +2030,26 @@ def test_malformed_html_yields_what_it_can_rather_than_raising(monkeypatch):
 # --- classification: S12 applied to one page -------------------------------
 
 def test_a_page_that_loaded_and_yielded_links_is_rendered():
-    events = [_sent("https://app.test/"), _ok("https://app.test/")]
+    """`classify` returns "rendered" from two different places: the `yielded`
+    branch (`if yielded: state = "rendered"`) and the fallback at the bottom
+    of the same if/elif/else (`else: state = "rendered"`, taken whenever
+    nothing was dropped). MEASURED: as first written this test's events had
+    no drop, so `dropped` was empty and deleting the `yielded` branch
+    entirely (`if False: state = "rendered"`) fell straight through to the
+    no-drop fallback and produced the identical verdict -- the test stayed
+    green under a mutation that removed the exact thing it claims to check.
+    A dropped third party is included below (the same fix
+    `test_a_page_with_xhr_but_no_links_still_counts_as_rendered` already
+    needed for its own case) so the assertion actually depends on `yielded`:
+    without it, `dropped` is non-empty and this page would fall to
+    "degraded", not "rendered".
+
+    MUTATION: delete the `if yielded: state = "rendered"` branch (e.g.
+    replace its condition with `if False:`), leaving `elif dropped: state =
+    "degraded"` as the next thing tested. Must go red.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _sent("https://cdn.test/app.js"), _failed("https://cdn.test/app.js")]
     r = page.classify(events, page_origins=ORIGINS, harvested=3)
     assert r.state == "rendered"
 
@@ -1989,6 +2127,20 @@ def test_page_origins_is_seed_origins_so_unseeded_in_scope_failure_reads_dropped
 
 
 def test_a_document_that_never_loaded_is_failed_not_degraded():
+    """The document itself is the request in `dropped_candidates` here (no
+    `responseReceived` for it at all) -- the most basic case `document in
+    dropped_candidates` exists for, distinct from the `degraded` cases below
+    where a THIRD PARTY, not the document, drops.
+
+    MUTATION: drop `or document in dropped_candidates` from the `state =
+    "failed"` guard, leaving only `if document is None:`. This test must go
+    red -- `document` is not `None` here (it is the sent request's id), so
+    the mutated guard does not fire; the loop below then classifies the
+    document's own origin as in-scope (it IS in `page_origins`) and files it
+    under `in_scope_failures` rather than `dropped`, so `dropped` stays
+    empty and `classify` falls all the way to the "no drop" fallback,
+    reporting `rendered` for a page that never loaded.
+    """
     events = [_sent("https://app.test/"), _failed("https://app.test/")]
     r = page.classify(events, page_origins=ORIGINS, harvested=0)
     assert r.state == "failed"
@@ -2019,6 +2171,21 @@ def test_a_page_with_xhr_but_no_links_still_counts_as_rendered():
 
 
 def test_dropped_hosts_are_deduplicated_and_ordered():
+    """Two dropped requests to `cdn.test` (`a.js` and `b.js`) must collapse
+    to one entry, and the two distinct hosts must come back sorted rather
+    than in event-arrival order (`cdn.test` is sent first here, `ads.test`
+    second, and the expected tuple is alphabetical).
+
+    DEDUPLICATION is structural, not something a mutation can meaningfully
+    target: `dropped` is a `set`, and a set cannot hold `"cdn.test"` twice
+    by construction (see DECISIONS.md's "Structure beats behaviour"). The
+    runtime-testable half of this test's name is the ORDERING, which is a
+    behavioural choice (`sorted(...)`) and can regress.
+
+    MUTATION: sort in reverse, `tuple(sorted(dropped, reverse=True))`. This
+    test must go red -- `dropped_hosts` would come back as `("cdn.test",
+    "ads.test")`.
+    """
     events = [_sent("https://app.test/"), _ok("https://app.test/")]
     for u in ("https://cdn.test/a.js", "https://cdn.test/b.js",
               "https://ads.test/t.gif"):

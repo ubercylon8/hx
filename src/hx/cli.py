@@ -881,6 +881,12 @@ def crawl(targets, root, max_pages, max_seconds, max_requests,
                     eng.db, engagement_id=eng.id, kind="crawl",
                     safety_profile=eng.config.safety_profile)
                 died = None
+                # BOUND BEFORE THE `try`, because the `finally` below reads it:
+                # on a crash `summary` would otherwise be unbound and the
+                # cleanup that exists to close the run row would itself raise
+                # NameError, leaving the row open -- the exact failure it is
+                # there to prevent.
+                summary = None
                 try:
                     summary = crawl_run_mod.crawl(
                         seeds=targets,
@@ -904,10 +910,28 @@ def crawl(targets, root, max_pages, max_seconds, max_requests,
                     # open forever either.
                     died = f"{type(exc).__name__}: {exc}"
                 finally:
+                    # A TRUNCATED CRAWL IS A `completed` RUN, and without the
+                    # `truncated_by` half of this line it is indistinguishable
+                    # from an exhaustive one: `stop_reason` was `died`, which
+                    # is None on every success, so a crawl stopped at page 1
+                    # of 500 recorded a clean finish and said nothing. S8
+                    # designates this CLI for LONG crawls -- the ones that
+                    # actually reach a budget -- so the surface most likely to
+                    # truncate was the one least able to say so.
+                    #
+                    # `crawl.run`'s path needs no equivalent: it returns
+                    # `truncated_by` to the agent, which owns its own run
+                    # lifecycle and passes the reason to `run.finish(note=...)`
+                    # -- that lands in this same column. The asymmetry is who
+                    # closes the run, not what gets recorded.
+                    reason = died
+                    if reason is None and summary is not None:
+                        reason = (f"truncated: {summary.truncated_by}"
+                                  if summary.truncated_by else None)
                     run_mod.close_run(
                         eng.db, run_id=run_id,
                         status="error" if died else "completed",
-                        stop_reason=died)
+                        stop_reason=reason)
                 if died:
                     # A CLEAN MESSAGE, NOT A TRACEBACK -- `capture_start`'s
                     # own rule for a died-mid-session Burp, applied here to

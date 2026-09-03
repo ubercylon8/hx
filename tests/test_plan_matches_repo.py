@@ -151,6 +151,27 @@ def _cases():
             for p, path, marker, body, excerpt in seen]
 
 
+#: Phrasings by which a marker's NOTE claims to be the whole file. A note makes
+#: the block an EXCERPT -- compared as a contiguous run, not byte for byte -- so
+#: a note asserting wholeness is a claim the check does not make.
+_CLAIMS_WHOLENESS = ("whole file", "entire file", "complete file", "the file,")
+
+
+def _claims_wholeness(marker: str) -> bool:
+    """Does this marker's note assert it is the whole file?
+
+    `marker.split(" -- ")[0]` decides the comparison: a bare path is checked
+    byte for byte, a path with ANY note is checked as a contiguous substring.
+    A note that says "the whole file" therefore claims a guarantee the check
+    is not making, and the gap is invisible -- a block quoting 31% of its file
+    is still "a contiguous run of the file" and passes.
+    """
+    path, _, note = marker.partition(" -- ")
+    if not note:
+        return False
+    return any(phrase in note.lower() for phrase in _CLAIMS_WHOLENESS)
+
+
 def _contains(haystack: list[str], needle: list[str]) -> bool:
     """Is `needle` a contiguous run of `haystack`, in order, byte for byte?
 
@@ -563,3 +584,41 @@ def test_every_workflow_is_a_workflow():
             f"{stray}. A stray first line -- a shell banner, a fetch artefact "
             f"-- parses as an ordinary key and leaves the file a valid "
             f"mapping, so it reaches GitHub as 'a workflow file issue'")
+
+
+def test_no_marker_claims_to_be_the_whole_file():
+    """A NOTE MAY NOT ASSERT WHOLENESS, because the check cannot deliver it.
+
+    The comparison is chosen by `marker.split(" -- ")[0]`: a bare path is
+    compared byte for byte, a path with any note is compared as a contiguous
+    RUN of the file's lines. So `foo.py -- the whole file` promises the reader
+    a guarantee the gate does not make, and nothing detects the difference: a
+    truncated block is still a contiguous run.
+
+    MEASURED 2026-09-03 before this check existed: 24 markers carried such a
+    note and THREE of them were short -- tests/test_tools_run.py at 31% of its
+    file, tests/test_tools_finding.py at 59%, tests/test_tools_journal.py at
+    62%. One of those truncations was introduced during the crawler branch and
+    caught only by a human reading a diff; two predated it and had never been
+    seen at all.
+
+    The rule makes the ambiguity unrepresentable rather than watched: drop the
+    note and the block becomes a real whole-file marker, byte-equality enforced.
+
+    MUTATION: append ` -- the whole file` to any bare marker in any plan. This
+    test must go red.
+    """
+    offenders = []
+    for plan in PLANS:
+        if _is_pending(plan):
+            continue
+        for lang, prefix, marker, body in BLOCK.findall(plan.read_text()):
+            marker = marker.strip()
+            if _names_a_file(marker.split(" -- ")[0].strip()) and _claims_wholeness(marker):
+                offenders.append(f"{plan.name}::{marker}")
+
+    assert not offenders, (
+        f"{len(offenders)} marker(s) claim to be the whole file while being "
+        f"compared as excerpts: {offenders}. Drop the note -- a bare path is "
+        "compared byte for byte, which is what the note was asking for."
+    )

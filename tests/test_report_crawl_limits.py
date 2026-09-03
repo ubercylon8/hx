@@ -68,3 +68,51 @@ def test_the_degraded_wording_does_not_overstate(engagement_conn):
     out = report_mod.render(engagement_conn, engagement_id="e-1",
                             config=_cfg())
     assert "did not render" not in out.lower()
+
+
+def test_a_truncated_crawl_says_so_and_a_complete_one_does_not(engagement_conn):
+    """THE REFERENT `degraded` AND THE COVERAGE DENOMINATOR BOTH NEEDED.
+
+    A budget-truncated crawl is a `completed` run -- it did what it was asked
+    and ran out of budget -- so `run.status` alone cannot separate "walked the
+    whole application" from "stopped at page 1 of 500". Before this, the two
+    rendered identically and the crawl bullet claimed the second one's
+    coverage for the first.
+
+    Asserted on a phrase unique to this line. Bare words like "truncated" or
+    "budget" appear elsewhere in a rendered report, and two assertions on this
+    branch already passed for exactly that reason -- see docs/DECISIONS.md,
+    "Tests that cannot fail", shape 6.
+
+    MUTATION: drop the `if stops:` block from `report._limits`. Must go red.
+    """
+    engagement_conn.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status, stop_reason) VALUES('r-t','e-1','crawl','staging',1,"
+        "'completed','truncated: max_pages')")
+
+    out = report_mod.render(engagement_conn, engagement_id="e-1",
+                            config=_cfg())
+
+    assert "recorded why it stopped" in out
+    assert "max_pages" in out
+
+
+def test_a_crawl_that_finished_its_frontier_claims_no_truncation(
+        engagement_conn):
+    """THE SEPARATING CASE. A crawl that emptied its frontier has a NULL
+    `stop_reason`, and must not be handed a sentence implying it ran short --
+    that would be the same over-claim pointing the other way.
+
+    MUTATION: render the stop line unconditionally (drop the `if stops:`
+    guard, keeping the append). Must go red.
+    """
+    engagement_conn.execute(
+        "INSERT INTO run(id, engagement_id, kind, safety_profile, started_us,"
+        " status) VALUES('r-c','e-1','crawl','staging',1,'completed')")
+
+    out = report_mod.render(engagement_conn, engagement_id="e-1",
+                            config=_cfg())
+
+    assert "clicks nothing" in out          # the crawl branch DID render
+    assert "recorded why it stopped" not in out

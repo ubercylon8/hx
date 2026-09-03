@@ -1530,9 +1530,20 @@ def _limits(conn, engagement_id) -> list[str]:
     # unchanged sentence is what renders -- with its ground now stated, so a
     # reader can check it -- and the day a crawler lands, an engagement that
     # crawled stops being told no crawl happened.
-    crawls = conn.execute(
-        "SELECT COUNT(*) FROM run WHERE engagement_id=? AND kind='crawl'",
-        (engagement_id,)).fetchone()[0]
+    crawl_rows = conn.execute(
+        "SELECT stop_reason FROM run WHERE engagement_id=? AND kind='crawl'",
+        (engagement_id,)).fetchall()
+    crawls = len(crawl_rows)
+    # WHY A CRAWL STOPPED, when anything recorded one. A budget-truncated crawl
+    # is a `completed` run -- it did what it was asked and ran out of budget --
+    # so status alone cannot separate "walked the whole application" from
+    # "stopped at page 1 of 500". Without this the two render identically and
+    # the bullet above claims the second one's coverage for the first.
+    #
+    # Free text and attacker-influenceable, like every other `stop_reason` this
+    # module renders, so it goes through `_redact` and `_code` exactly as the
+    # unfinished-run reasons a few hundred lines above do.
+    stops = [r[0] for r in crawl_rows if r[0]]
     if crawls:
         out.append(f"- **{crawls} of the run(s) recorded for this engagement "
                    "carry `kind = 'crawl'`.** Attack surface here is "
@@ -1549,6 +1560,13 @@ def _limits(conn, engagement_id) -> list[str]:
                    "was not discovered by it. Pages recorded as `degraded` "
                    "**may not have rendered**: a third-party resource they "
                    "requested was out of scope and was dropped.")
+        if stops:
+            out.append("  A crawl recorded why it stopped: "
+                       + " · ".join(_code(_redact(r) or "") for r in stops)
+                       + ". A crawl that ran out of budget covered less than "
+                         "the application, and the surfaces it never reached "
+                         "were never tested -- read this before reading the "
+                         "coverage denominator as the whole attack surface.")
     else:
         out.append("- **No automated crawl.** No run recorded for this "
                    "engagement has `kind = 'crawl'`: attack surface here is "

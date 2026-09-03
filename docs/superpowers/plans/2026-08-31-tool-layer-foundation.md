@@ -115,7 +115,7 @@ the registry twice would leave Task 2's block stale in this plan.
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_tools_schema.py -- the whole file
+# tests/test_tools_schema.py
 """A validator that ignores a keyword is worse than no validator: the schema
 published to the agent promises a constraint that nothing applies."""
 from __future__ import annotations
@@ -434,7 +434,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'hx.tools'`
 - [ ] **Step 3: Write `src/hx/tools/__init__.py`**
 
 ```python
-# src/hx/tools/__init__.py -- the whole file
+# src/hx/tools/__init__.py
 """The tool layer: one definition, many adapters.
 
 Spec section 8 opens with the architecture -- "One definition; an MCP adapter
@@ -450,7 +450,7 @@ machinery against specs of its own without eleven real tools appearing in it.
 - [ ] **Step 4: Write `src/hx/tools/schema.py`**
 
 ```python
-# src/hx/tools/schema.py -- the whole file
+# src/hx/tools/schema.py
 """A JSON Schema subset that refuses what it cannot enforce.
 
 `ToolSpec.params` is JSON Schema because an MCP adapter publishes it verbatim,
@@ -741,7 +741,7 @@ git commit -m "feat(tools): a schema subset that refuses what it cannot enforce"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_tools_registry.py -- the whole file as of Task 2
+# tests/test_tools_registry.py
 """The registry is the allowlist, so its refusals are the security story."""
 from __future__ import annotations
 
@@ -843,7 +843,7 @@ Expected: FAIL — `ImportError: cannot import name 'registry' from 'hx.tools'`
 - [ ] **Step 3: Write `src/hx/tools/spec.py`**
 
 ```python
-# src/hx/tools/spec.py -- the whole file
+# src/hx/tools/spec.py
 """What a tool IS, before any transport knows about it.
 
 A `ToolSpec` is what the registry holds, what the dispatcher reads and what an
@@ -940,7 +940,7 @@ class ToolSpec:
 - [ ] **Step 4: Write `src/hx/tools/registry.py`**
 
 ```python
-# src/hx/tools/registry.py -- the whole file
+# src/hx/tools/registry.py
 """The allowlist.
 
 WHAT IS NOT HERE HAS NO CODE PATH. Section 8's "not agent-facing" list is
@@ -1040,7 +1040,7 @@ git commit -m "feat(tools): the registry is the allowlist"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_tools_envelope.py -- the whole file
+# tests/test_tools_envelope.py
 """Design section 4: `empty` and `unavailable` are different facts, and the
 tool layer is where an agent first has the chance to confuse them."""
 from __future__ import annotations
@@ -1228,7 +1228,7 @@ Expected: FAIL — `ImportError: cannot import name 'envelope' from 'hx.tools'`
 - [ ] **Step 3: Write `src/hx/tools/envelope.py`**
 
 ```python
-# src/hx/tools/envelope.py -- the whole file
+# src/hx/tools/envelope.py
 """The one shape every tool answers in, and the five things it can say.
 
 PRINCIPLE 4 SAYS THE TRI-STATE HOLDS AT EVERY LAYER, and section 12 says why:
@@ -1475,7 +1475,7 @@ def parse_offset(cursor: str | None) -> int:
 - [ ] **Step 4: Write `src/hx/tools/errors.py`**
 
 ```python
-# src/hx/tools/errors.py -- the whole file
+# src/hx/tools/errors.py
 """The two ways a handler may decline, and the vocabulary it declines in.
 
 A HANDLER RAISES; THE DISPATCHER BUILDS THE ENVELOPE. That split is what makes
@@ -1551,7 +1551,7 @@ Connections from `hx.store.db.connect` are `isolation_level=None`, so every
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_tools_journal.py -- the whole file
+# tests/test_tools_journal.py
 """Principle 5's record. It is also the loop-prevention hole: an agent that
 cannot see what it already tried repeats it."""
 from __future__ import annotations
@@ -1653,6 +1653,67 @@ def test_redaction_leaves_ordinary_strings_alone():
     would corrupt the journal's account of what was tried."""
     for benign in ["needle", "/a?b=c", "GET", "", "not a url, just prose"]:
         assert journal._redacted(benign) == benign
+
+
+@pytest.mark.parametrize("raw,secret", [
+    ("field=1\r\nCookie: session=SEKRIT\r\nother=3", "SEKRIT"),
+    ("a=1\nAuthorization: Bearer SEKRIT", "SEKRIT"),
+    ("x=1\r\nProxy-Authorization: Basic SEKRIT\r\ny=2", "SEKRIT"),
+])
+def test_a_credential_on_a_later_line_is_redacted(raw, secret):
+    """THE ANCHORED VERSION MISSED THE SHAPE `http.send` ALREADY SHIPS.
+    `headers` arrives as separate array items, so line one was always the
+    whole string and `.match` sufficed. A `body` is one free string, and an
+    agent replaying a captured request by hand puts a whole request in it --
+    credential on line two, nothing looking past line one.
+
+    This was recorded in DECISIONS.md as debt against a hypothetical FUTURE
+    tool taking a raw request string. The tool exists; it is `http.send`."""
+    got = journal._redacted(raw)
+    assert secret not in got
+    assert "{{observed:" in got
+
+
+def test_redaction_keeps_the_lines_around_a_credential():
+    """Only the matched LINES go. A journal that dropped the rest of a body
+    would answer "what did I already try" with a request that was never
+    made."""
+    got = journal._redacted("field=1\r\nCookie: session=SEKRIT\r\nother=3")
+    assert "field=1" in got and "other=3" in got
+    # And no stray CR left inside the value that replaced the line: MULTILINE's
+    # `$` matches before the `\n` but not before the `\r`.
+    assert "\r\r" not in got
+    assert got.count("\r\n") == 2
+
+
+@pytest.mark.parametrize("sep,label", [
+    ("\r", "bare CR -- a line terminator RFC 9112 s2.2 requires tolerating"),
+    ("\r\n", "CRLF"),
+    ("\n", "bare LF"),
+])
+def test_a_credential_after_any_line_terminator_is_redacted(sep, label):
+    """MULTILINE's `^` treats only `\\n` as a boundary, and CR ends a line in
+    HTTP. `hx.http_text.split_head_body` tolerates a bare CR for exactly that
+    reason, so a request split on one puts a credential at a real line start
+    that `^` alone does not see. MEASURED before the fix:
+    `"field=1\\rCookie: session=<real>"` reached args_blob intact."""
+    got = journal._redacted(f"field=1{sep}Cookie: session=SEKRIT")
+    assert "SEKRIT" not in got, label
+    assert "{{observed:cookie}}" in got
+
+
+@pytest.mark.parametrize("raw", [
+    "the Cookie: header was odd",
+    "a=1; Cookie: b",
+    "explaining why Authorization: matters",
+])
+def test_a_credential_name_that_does_not_start_a_line_is_left_alone(raw):
+    """NOT THE SAME GAP UNFIXED -- a decision. None of these is a header
+    line: they are prose and a form field. A redactor firing on them would
+    corrupt the journal's account of what was tried, which is the one thing
+    it exists to preserve. What is guarded is a credential at a LINE START,
+    in every spelling a line can start with."""
+    assert journal._redacted(raw) == raw
 ```
 
 `tests/conftest.py` has no `engagement` fixture yet — it has `engagement_conn`
@@ -1693,7 +1754,7 @@ Expected: FAIL — `ImportError: cannot import name 'journal' from 'hx.tools'`
 - [ ] **Step 3: Write `src/hx/tools/journal.py`**
 
 ```python
-# src/hx/tools/journal.py -- the whole file
+# src/hx/tools/journal.py
 """One `agent_action` row per dispatch, refusals included.
 
 WHY REFUSALS TOO. Section 8 asks `run.journal` to answer "what have I already
@@ -1955,7 +2016,7 @@ git commit -m "feat(tools): the journal, refusals included"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_tools_dispatch.py -- the whole file
+# tests/test_tools_dispatch.py
 """One order, published, that every layer and every test agrees on -- the same
 device that made the send path's gate reviewable."""
 from __future__ import annotations
@@ -2275,7 +2336,7 @@ Expected: FAIL — `ImportError: cannot import name 'dispatch' from 'hx.tools'`
 - [ ] **Step 4: Write `src/hx/tools/dispatch.py`**
 
 ```python
-# src/hx/tools/dispatch.py -- the whole file
+# src/hx/tools/dispatch.py
 """The one door every tool call goes through.
 
 THE PUBLISHED DECISION ORDER IS
@@ -2715,7 +2776,7 @@ git commit -m "feat(tools): the dispatcher and its published order"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_tools_run.py -- the whole file as of Task 6
+# tests/test_tools_run.py
 """Section 8's bracket. `run.start` and `run.finish` are what a run IS to the
 tool layer, and in Plan B they are also what a live Burp is bracketed by."""
 from __future__ import annotations
@@ -2833,6 +2894,263 @@ def test_starting_the_same_kind_from_a_new_context_is_refused(tool_ctx, engageme
         halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
     env2 = dispatch.dispatch(new_ctx, "run.start", {"kind": "manual"}, why="second")
     assert (env2.outcome, env2.reason) == ("refused", "run_open")
+
+
+def test_resume_answers_the_four_questions_a_compacted_agent_has(tool_ctx):
+    dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="mapping")
+    env = dispatch.dispatch(tool_ctx, "run.resume", {})
+    brief = env.result
+    assert set(brief) == {"engagement", "halt", "run", "open_runs",
+                          "surfaces", "findings", "recent"}
+    assert brief["run"]["id"] == tool_ctx.run_id
+    assert brief["open_runs"] == [{"id": tool_ctx.run_id, "kind": "manual"}]
+    assert brief["halt"]["armed"] is False
+
+
+def test_resume_reports_a_halt_because_that_is_why_nothing_is_working(tool_ctx):
+    tool_ctx.halt.halt("client asked us to stop")
+    brief = dispatch.dispatch(tool_ctx, "run.resume", {}).result
+    assert brief["halt"] == {"armed": True, "reason": "client asked us to stop"}
+
+
+def test_resume_says_there_is_no_run_rather_than_omitting_the_key(tool_ctx):
+    assert dispatch.dispatch(tool_ctx, "run.resume", {}).result["run"] is None
+
+
+def test_the_brief_is_bounded(tool_ctx):
+    # Make calls distinguishable with different why values
+    for i in range(run_tools.RECENT_LIMIT + 5):
+        dispatch.dispatch(tool_ctx, "run.journal", {}, why=f"call-{i:02d}")
+    brief = dispatch.dispatch(tool_ctx, "run.resume", {}).result
+    assert len(brief["recent"]) == run_tools.RECENT_LIMIT
+    # Verify order: recent[0] should be the LAST call (call-24), and
+    # recent[-1] should be the 20th-from-last (call-05)
+    assert brief["recent"][0]["why"] == "call-24"
+    assert brief["recent"][-1]["why"] == "call-05"
+
+
+def test_the_brief_size_is_bounded_even_with_maximum_length_values(tool_ctx):
+    import json
+    # Create a brief with maximum-length agent-supplied why values
+    max_why = "x" * 500
+    for _ in range(run_tools.RECENT_LIMIT):
+        dispatch.dispatch(tool_ctx, "run.journal", {}, why=max_why)
+    brief = dispatch.dispatch(tool_ctx, "run.resume", {}).result
+    # Serialize the brief and check its size is reasonable
+    serialized = json.dumps(brief)
+    # With RECENT_LIMIT=20, max_why=500, and other fields, the brief should
+    # be much less than 1MB even with maximum values
+    assert len(serialized) < 1_000_000
+
+
+def test_resume_is_a_read_and_survives_a_halt(tool_ctx):
+    tool_ctx.halt.halt("stop")
+    assert dispatch.dispatch(tool_ctx, "run.resume", {}).outcome == "ok"
+
+
+def test_operator_fields_in_the_brief_are_truncated_but_the_stored_values_are_not(
+        tmp_path):
+    """Item 3 of the final whole-branch review.
+
+    `test_the_brief_is_bounded` drives the brief off the `engagement` fixture,
+    whose `config.name == 't'`, `config.client == 'T'` and whose halt reason in
+    that older test was 24 characters -- every one of them already shorter
+    than `OPERATOR_FIELD_LIMIT`, so the truncated and untruncated brief were
+    byte-identical and the assertion (`< 1_000_000`) held at roughly 15 KB
+    either way. Deleting all three `OPERATOR_FIELD_LIMIT` slices in `resume()`
+    left the whole suite green -- they were the only survivors of 49 seeded
+    mutations. This test gives the engagement a name, a client and a halt
+    reason each longer than the limit, so a removed slice changes the
+    assertion instead of leaving it vacuously true.
+    """
+    from hx import config as config_mod
+    from hx import engagement as eng_mod
+    from hx import halt as halt_mod
+    from hx.tools import dispatch as dispatch_mod
+
+    limit = run_tools.OPERATOR_FIELD_LIMIT
+    long_name = "N" * (limit + 50)
+    long_client = "C" * (limit + 50)
+    long_reason = "R" * (limit + 50)
+
+    cfg = config_mod.Config(name=long_name, client=long_client,
+                            safety_profile="staging",
+                            scope_include=["https://app.test/*"])
+    eng = eng_mod.create(tmp_path / "e", cfg, author="test")
+    try:
+        eng.db.row_factory = None
+        ctx = dispatch_mod.ToolContext(
+            engagement=eng, conn=eng.db, blobs=eng.blobs, config=eng.config,
+            halt=halt_mod.OperatorHalt(eng.root, eng.db))
+        ctx.halt.halt(long_reason)
+
+        brief = dispatch.dispatch(ctx, "run.resume", {}).result
+
+        # Each of the three fields comes back at EXACTLY the limit.
+        assert len(brief["engagement"]["name"]) == limit
+        assert len(brief["engagement"]["client"]) == limit
+        assert len(brief["halt"]["reason"]) == limit
+        assert brief["engagement"]["name"] == long_name[:limit]
+        assert brief["engagement"]["client"] == long_client[:limit]
+        assert brief["halt"]["reason"] == long_reason[:limit]
+
+        # The STORED values are untouched -- truncation is a display-boundary
+        # choice the brief makes, not a rewrite of the config or the halt
+        # sentinel underneath it.
+        assert eng.config.name == long_name
+        assert eng.config.client == long_client
+        assert ctx.halt.reason == long_reason
+    finally:
+        eng.db.close()
+
+
+def test_a_halted_engagement_can_still_close_its_run(tool_ctx):
+    # Item 6 of the final whole-branch review: `run.finish` is exempt from
+    # the halt gate. Closing an open run does LESS, not more, and in Plan B
+    # it is what stops the Burp JVM -- a halt refusing it would leave one
+    # running with nothing holding it, exactly what section 8's bracket
+    # exists to prevent.
+    dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="mapping")
+    run_id = tool_ctx.run_id
+    tool_ctx.halt.halt("client asked us to stop")
+
+    env = dispatch.dispatch(tool_ctx, "run.finish",
+                            {"status": "aborted", "note": "halted"}, why="closing up")
+    assert env.outcome == "ok" and env.result["id"] == run_id
+    assert tool_ctx.run_id is None
+    assert tool_ctx.conn.execute("SELECT status FROM run WHERE id=?",
+                            (run_id,)).fetchone() == ("aborted",)
+
+    # Every OTHER mutating tool stays refused while the halt is armed.
+    env = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="again")
+    assert (env.outcome, env.reason) == ("refused", "halted")
+
+
+# ---- Finding 1 of the final whole-branch review: the CLI adapter builds a
+# fresh `ToolContext` per `hx tool` invocation, and before this fix
+# `ctx.run_id` was a plain field that only ever held what THAT process set --
+# so `run.finish` and every run-scoped tool were permanently unreachable
+# through it. The tests below drive the reported sequence exactly: a fresh
+# context per step, never one carried between them, the way separate `hx
+# tool` processes actually are. ---------------------------------------------
+
+
+def _fresh_ctx(engagement):
+    """A brand-new `ToolContext` -- nothing bound -- the way
+    `adapters.cli.build_context` makes one for every `hx tool` invocation."""
+    from hx import halt as halt_mod
+    from hx.tools import dispatch as dispatch_mod
+    return dispatch_mod.ToolContext(
+        engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
+        config=engagement.config,
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+
+
+def test_start_resume_finish_start_round_trips_across_fresh_contexts(engagement):
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                            {"kind": "scan"}, why="mapping")
+    assert env.outcome == "ok"
+    run_id = env.result["id"]
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.resume", {})
+    assert env.outcome == "ok"
+    assert env.result["run"]["id"] == run_id
+    assert env.result["run"]["kind"] == "scan"
+    assert env.result["open_runs"] == [{"id": run_id, "kind": "scan"}]
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.finish",
+                            {"status": "completed"}, why="done")
+    assert env.outcome == "ok"
+    assert env.result["id"] == run_id
+
+    # `no_run` now, not the same run again: a fresh context resolves the
+    # store, and the store says nothing is open.
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.finish",
+                            {"status": "completed"}, why="done again")
+    assert (env.outcome, env.reason) == ("unavailable", "no_run")
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                            {"kind": "scan"}, why="mapping again")
+    assert env.outcome == "ok"
+    assert env.result["id"] != run_id
+
+
+def test_finish_with_two_kinds_open_is_ambiguous_without_kind(engagement):
+    # Two runs of different kinds, opened by two different (fresh) contexts,
+    # exactly as `run.start`'s own docstring says is legitimate: "a crawl
+    # running while you browse is two runs".
+    manual_id = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                                  {"kind": "manual"}, why="w").result["id"]
+    browse_id = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                                  {"kind": "browse"}, why="w").result["id"]
+
+    resumed = dispatch.dispatch(_fresh_ctx(engagement), "run.resume", {}).result
+    assert resumed["run"] is None  # ambiguous -- never guessed
+    assert sorted(resumed["open_runs"], key=lambda r: r["kind"]) == [
+        {"id": browse_id, "kind": "browse"}, {"id": manual_id, "kind": "manual"}]
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.finish",
+                            {"status": "completed"}, why="w")
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert "browse" in env.detail and "manual" in env.detail
+
+    # Both runs are still open -- the refusal above closed neither.
+    still_open = dispatch.dispatch(_fresh_ctx(engagement), "run.resume", {}).result
+    assert len(still_open["open_runs"]) == 2
+
+    # `kind` picks one; the other is untouched.
+    env = dispatch.dispatch(_fresh_ctx(engagement), "run.finish",
+                            {"status": "completed", "kind": "manual"}, why="w")
+    assert env.outcome == "ok" and env.result["id"] == manual_id
+
+    after = dispatch.dispatch(_fresh_ctx(engagement), "run.resume", {}).result
+    assert after["run"] == {"id": browse_id, "kind": "browse",
+                            "status": "running",
+                            "started_us": after["run"]["started_us"],
+                            "requests_issued": 0}
+    assert after["open_runs"] == [{"id": browse_id, "kind": "browse"}]
+
+
+# --- Plan B: the session bracket, as `run.start` and `run.finish` report it.
+# The four `open_for` branches are `tests/test_tools_live.py`'s; what is
+# pinned here is that the pair CARRIES the answer, in the result an agent
+# reads and the journal keeps. ---------------------------------------------
+
+
+def test_start_still_opens_the_run_when_this_adapter_cannot_host_a_session(
+        tool_ctx):
+    """`hx tool` is one process per call, so `tool_ctx.stack` is None. The
+    run must open anyway: a `run.start` that refused would leave no run row
+    and no `agent_action` row -- no trace, on the one call that was trying to
+    set the instrument up, that it could not be."""
+    assert tool_ctx.stack is None
+    env = dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"},
+                            why="mapping")
+    assert env.outcome == "ok"
+    assert env.result["id"].startswith("r-")
+    assert env.result["session"]["live"] is False
+    assert env.result["session"]["reason"] == "no_host"
+
+
+def test_a_browse_run_is_told_it_never_needed_a_session(tool_ctx):
+    """`browse` is the operator's own browser through `hx capture start`,
+    which owns its own Burp. `not_needed` and `no_host` are different next
+    actions, and this pair proves the kind is what chooses between them."""
+    env = dispatch.dispatch(tool_ctx, "run.start", {"kind": "browse"},
+                            why="watching")
+    assert env.result["session"]["reason"] == "not_needed"
+
+
+def test_finish_says_there_was_no_session_to_close_rather_than_omitting_it(
+        tool_ctx):
+    """Section 12's rule, one key down: a `finish` that dropped the field
+    when there was nothing to tear down would make "no JVM was running" and
+    "a JVM was running and nobody stopped it" the same result."""
+    dispatch.dispatch(tool_ctx, "run.start", {"kind": "manual"}, why="mapping")
+    env = dispatch.dispatch(tool_ctx, "run.finish", {"status": "completed"},
+                            why="done")
+    assert env.outcome == "ok"
+    assert env.result["session_closed"] is False
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -3219,7 +3537,7 @@ must be *stated* rather than hidden. Say so in the docstring.
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_tools_surface.py -- the whole file
+# tests/test_tools_surface.py
 """Principle 3: a tool that can return 3,400 rows must never do so by default."""
 from __future__ import annotations
 
@@ -3379,7 +3697,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'hx.tools.impl.surface'
 - [ ] **Step 3: Write `src/hx/tools/impl/surface.py`**
 
 ```python
-# src/hx/tools/impl/surface.py -- the whole file
+# src/hx/tools/impl/surface.py
 """The attack surface, as the agent sees it.
 
 ORDERING IS RISK-FIRST AND STABLE: state-changing surfaces before idempotent
@@ -3607,7 +3925,7 @@ imported at the top of that file — this is the same shape as
 - [ ] **Step 3: Write the failing tool tests**
 
 ```python
-# tests/test_tools_finding.py -- the whole file
+# tests/test_tools_finding.py
 """An agent finding must cite traffic. `Candidate` already required that of
 checks; it is a better rule for an agent."""
 from __future__ import annotations
@@ -3754,12 +4072,113 @@ def test_an_evidence_role_outside_the_set_is_refused(ready):
                             {"finding_id": fid, "exchange_id": "x-1",
                              "role": "smoking-gun"}, why="w")
     assert (env.outcome, env.reason) == ("refused", "bad_args")
+
+
+# ---- The scoped re-review's finding in Finding 1's own fix: `ctx.run_id`
+# used to re-query the store on EVERY read, and `record()` above reads it
+# three times (the guard, and once in each of two writes). `ready` binds its
+# context via `run.start` on the SAME `tool_ctx` it hands back, which makes
+# `ctx.run_id` a fixed, already-bound answer for the rest of that context's
+# life -- exactly the case the memoisation fix does not need to touch. Both
+# tests below build fresh, UNBOUND contexts instead, the shape that actually
+# resolves `run_id` from the store and the only shape the bug could reach. --
+
+
+def _fresh_ctx(engagement):
+    """A brand-new `ToolContext` -- nothing bound -- the way
+    `adapters.cli.build_context` makes one for every `hx tool` invocation."""
+    from hx import halt as halt_mod
+    from hx.tools import dispatch as dispatch_mod
+    return dispatch_mod.ToolContext(
+        engagement=engagement, conn=engagement.db, blobs=engagement.blobs,
+        config=engagement.config,
+        halt=halt_mod.OperatorHalt(engagement.root, engagement.db))
+
+
+def test_a_run_opening_between_the_guard_and_the_writes_cannot_corrupt_the_write(
+        engagement, monkeypatch):
+    """MEASURED, before this fix: one `manual` run open, the guard passes on
+    an unbound context; a `browse` run opens (a different, now-discarded
+    context, the way an operator's `hx scan` or a second agent's `run.start`
+    would) between the guard and the writes; the now-ambiguous `ctx.run_id`
+    turns `None` for the second and third reads, `finding_observation.
+    run_id` (`NOT NULL`) raises `IntegrityError`, and the transaction rolls
+    back -- `error/internal`, the agent's finding and evidence lost, for
+    ordinary concurrent use.
+
+    `ctx.open_runs()` is memoised per `dispatch()` call, so this must now
+    complete exactly as if the concurrent `run.start` never happened: every
+    read inside this one `finding.record` invocation agrees with the guard.
+    """
+    conn = engagement.db
+    started = dispatch.dispatch(_fresh_ctx(engagement), "run.start",
+                                {"kind": "manual"}, why="setup")
+    assert started.outcome == "ok"
+    run_id = started.result["id"]
+    conn.execute(
+        "INSERT INTO surface(id, engagement_id, method, scheme, host, port,"
+        " path_template, query_key_set, kind, discovered_by,"
+        " normaliser_version) VALUES('s-1',?,'GET','https','app.test',443,"
+        "'/login','','idempotent_read','proxy',2)", (engagement.id,))
+    conn.execute(
+        "INSERT INTO exchange(id, run_id, surface_id, via, outcome, sent_us,"
+        " method, url, status) VALUES('x-1',?, 's-1','proxy','ok',1,'GET',"
+        "'https://app.test/login',200)", (run_id,))
+
+    opened = {}
+
+    def hook():
+        # Fires once `record()` has already passed its `ctx.run_id is None`
+        # guard and finished everything but the write -- the exact gap the
+        # review's repro used. Opened via a THIRD, separate context: the
+        # concurrent actor is not this call's own context either.
+        if not opened:
+            opened["id"] = dispatch.dispatch(
+                _fresh_ctx(engagement), "run.start", {"kind": "browse"},
+                why="concurrent").result["id"]
+        return real_now_us()
+
+    real_now_us = finding_tools.now_us
+    monkeypatch.setattr(finding_tools, "now_us", hook)
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "finding.record", BASE,
+                            why="saw it")
+
+    assert opened, "the hook never fired -- this test proves nothing"
+    assert env.outcome != "error", f"a defect leaked to the agent: {env.detail}"
+    assert env.outcome == "ok"
+    fid = env.result["id"]
+    # Attributed to the run the guard actually saw, never the one opened
+    # underneath it, and no partial chain: the finding, its observation and
+    # its evidence all landed together.
+    assert conn.execute("SELECT run_id FROM finding_observation WHERE"
+                        " finding_id=?", (fid,)).fetchone()[0] == run_id
+    assert conn.execute("SELECT COUNT(*) FROM finding WHERE id=?",
+                        (fid,)).fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM evidence WHERE finding_id=?",
+                        (fid,)).fetchone()[0] == 1
+
+
+def test_recording_with_two_kinds_open_names_them_rather_than_saying_no_run(
+        engagement):
+    """§12's distinction, given to `finding.record` the way `run.finish`
+    already has it: "nothing is open" and "I cannot tell which of two" are
+    different facts, and only one of them means `run.start` is the fix."""
+    dispatch.dispatch(_fresh_ctx(engagement), "run.start", {"kind": "manual"},
+                      why="w")
+    dispatch.dispatch(_fresh_ctx(engagement), "run.start", {"kind": "browse"},
+                      why="w")
+
+    env = dispatch.dispatch(_fresh_ctx(engagement), "finding.record", BASE,
+                            why="w")
+    assert (env.outcome, env.reason) == ("refused", "bad_args")
+    assert "browse" in env.detail and "manual" in env.detail
 ```
 
 - [ ] **Step 4: Write `src/hx/tools/impl/finding.py`**
 
 ```python
-# src/hx/tools/impl/finding.py -- the whole file
+# src/hx/tools/impl/finding.py
 """What the agent believes, and what it is showing you.
 
 TWO PROPERTIES THIS MODULE DOES NOT INVENT, because `checks.base.Candidate`
@@ -4063,7 +4482,7 @@ confusion §12 forbids one layer down.
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_tools_checks_report.py -- the whole file
+# tests/test_tools_checks_report.py
 """What can be run, and what the client will read."""
 from __future__ import annotations
 
@@ -4168,7 +4587,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'hx.tools.impl.checks'`
 - [ ] **Step 3: Write `src/hx/tools/impl/checks.py`**
 
 ```python
-# src/hx/tools/impl/checks.py -- the whole file
+# src/hx/tools/impl/checks.py
 """The corpus, including what is switched off.
 
 A LISTING THAT HID DISABLED CHECKS WOULD BE SECTION 12'S FAILURE ONE LAYER UP.
@@ -4217,7 +4636,7 @@ registry.register(spec.ToolSpec(
 - [ ] **Step 4: Write `src/hx/tools/impl/report.py`**
 
 ```python
-# src/hx/tools/impl/report.py -- the whole file
+# src/hx/tools/impl/report.py
 """The client deliverable, rendered.
 
 A READ, NOT A MUTATION, so it works while a halt is armed -- which is exactly
@@ -4286,7 +4705,7 @@ from . import checks, finding, report, run, surface  # noqa: F401
 - [ ] **Step 2: Write the contract tests**
 
 ```python
-# tests/test_tools_contract.py -- the whole file
+# tests/test_tools_contract.py
 """Design section 11: the five properties asserted about the layer itself,
 rather than about any one tool."""
 from __future__ import annotations
@@ -4462,7 +4881,7 @@ it that covers `agent_action` as well.
 - [ ] **Step 4: Write `src/hx/tools/adapters/__init__.py` and `adapters/cli.py`**
 
 ```python
-# src/hx/tools/adapters/__init__.py -- the whole file
+# src/hx/tools/adapters/__init__.py
 """Transports. Each one is a projection of `hx.tools.registry.TOOLS`.
 
 An adapter validates nothing, authorises nothing and journals nothing: it turns
@@ -4473,7 +4892,7 @@ live.
 ```
 
 ```python
-# src/hx/tools/adapters/cli.py -- the whole file
+# src/hx/tools/adapters/cli.py
 """`hx tool` -- the tool layer from a shell.
 
 The adapter the test suite drives, and the one an agent with a shell can use

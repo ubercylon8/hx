@@ -16,6 +16,12 @@ def _b(pages=100, seconds=100.0, requests=10_000):
 
 
 def test_a_fragment_is_not_a_different_page():
+    """`#a` and `#b` are one document and one request -- see the module
+    docstring's "the fragment goes" line.
+
+    MUTATION: pass `parts.fragment` instead of `""` as the fifth element of
+    the `urlunsplit(...)` tuple in `normalise`. This test must go red.
+    """
     assert frontier.normalise("https://a.test/x#frag") == "https://a.test/x"
 
 
@@ -42,6 +48,16 @@ def test_two_ids_on_one_path_are_two_pages():
 
 
 def test_a_url_already_seen_is_not_enqueued_twice():
+    """The `_seen` set, not just the queue: a URL already visited-or-queued
+    must not be offered again, or the same page would be crawled twice for
+    every link back to it. The second offer spells the URL with a different
+    fragment on purpose, so this also depends on `normalise` collapsing it to
+    the same seen-set key as the first.
+
+    MUTATION: delete the `if n in self._seen: return False` guard in
+    `_enqueue` (leave the unconditional `self._seen.add(n)` in place). This
+    test must go red -- the second `offer()` would return 1, not 0.
+    """
     f = frontier.Frontier(["https://a.test/"], _b())
     assert f.offer(["https://a.test/x"]) == 1
     assert f.offer(["https://a.test/x#other"]) == 0
@@ -82,6 +98,15 @@ def test_a_non_http_scheme_is_refused():
 
 
 def test_a_second_seed_origin_is_allowed():
+    """The origin allowlist is built from EVERY seed, not just the first --
+    a two-origin engagement (say `app.test` plus its `api.app.test`) must be
+    able to crawl both.
+
+    MUTATION: build `self._origins` from only the first seed, e.g.
+    `for seed in list(seeds)[:1]:` in `Frontier.__init__`. This test must go
+    red -- `b.test` would never make it into the allowlist and `offer()`
+    would return 0.
+    """
     f = frontier.Frontier(["https://a.test/", "https://b.test/"], _b())
     assert f.offer(["https://b.test/x"]) == 1
 
@@ -101,6 +126,18 @@ def test_the_page_budget_stops_the_crawl_and_names_itself():
 
 
 def test_the_request_budget_stops_the_crawl_and_names_itself():
+    """`next()`'s three budget checks read three DIFFERENT fields off
+    `self._budget`, and it is easy to copy-paste one check into another's
+    shape and read the wrong field -- `_b(requests=10)` leaves `max_pages`
+    and `max_seconds` at their generous defaults, so only the requests check
+    can fire here, and this test isolates it from its two siblings rather
+    than merely happening not to collide with them.
+
+    MUTATION: in the `self._requests >= self._budget.max_requests` check,
+    read `self._budget.max_pages` instead. This test must go red -- with
+    `max_pages` still at its default of 100, `11 >= 100` is false and
+    `next()` returns the queued page instead of `None`.
+    """
     f = frontier.Frontier(["https://a.test/1"], _b(requests=10))
     f.offer(["https://a.test/2"])
     assert f.next() is not None
@@ -110,6 +147,17 @@ def test_the_request_budget_stops_the_crawl_and_names_itself():
 
 
 def test_the_time_budget_stops_the_crawl_and_names_itself():
+    """Same isolation concern as the request-budget test above, for the
+    third of `next()`'s three budget checks: `_b(seconds=5.0)` leaves
+    `max_pages` and `max_requests` at their generous defaults, so only the
+    elapsed-time check can fire.
+
+    MUTATION: in the `self._clock() - self._started >= self._budget.
+    max_seconds` check, read `self._budget.max_requests` instead. This test
+    must go red -- with `max_requests` still at its default of 10_000, the
+    elapsed 99.0 seconds does not clear it and `next()` returns the queued
+    page instead of `None`.
+    """
     ticks = iter([0.0, 0.0, 99.0, 99.0])
     f = frontier.Frontier(["https://a.test/1"], _b(seconds=5.0),
                           clock=lambda: next(ticks))
