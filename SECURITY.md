@@ -2,7 +2,9 @@
 
 ## Reporting a vulnerability in hx
 
-Email **james@fortika.io**. Please do not open a public issue.
+Use [GitHub private vulnerability
+reporting](https://github.com/ubercylon8/hx/security/advisories/new). Please do not open a
+public issue.
 
 Include what you did, what happened, and what you expected. If you have a proof of concept,
 a failing test against a loopback target is the most useful form — every test in this

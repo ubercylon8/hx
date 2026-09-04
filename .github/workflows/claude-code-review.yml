@@ -14,7 +14,13 @@ jobs:
   claude-review:
     # Skip bot-authored PRs (Dependabot bumps): the action rejects non-human
     # actors, and reviewing machine-generated lockfile diffs wastes review quota.
-    if: github.actor != 'dependabot[bot]'
+    #
+    # PUBLIC REPOSITORY. The association gate stops a drive-by fork PR from
+    # spending review quota. A `pull_request` event from a fork carries no
+    # secrets, so this was never a credential exposure -- it is a cost gate.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
 
     runs-on: ubuntu-latest
     permissions:

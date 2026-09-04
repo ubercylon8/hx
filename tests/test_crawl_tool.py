@@ -197,7 +197,7 @@ def test_a_missing_browser_reaches_the_agent_as_unavailable_not_broken(
     """
     def fake_crawl(**kw):
         raise browser_mod.BrowserUnavailable(
-            "no bundled Chromium under /home/x/.BurpSuite/burpbrowser")
+            "no bundled Chromium under /tmp/no-such-home/.BurpSuite/burpbrowser")
 
     monkeypatch.setattr(crawl_run, "crawl", fake_crawl)
     with pytest.raises(errors.ToolUnavailable,

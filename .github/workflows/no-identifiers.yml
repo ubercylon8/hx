@@ -1,0 +1,31 @@
+name: No operational identifiers
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  identifiers:
+    name: Tracked files name no real infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # zizmor[artipacked]: the checkout's credentials are not needed past this step.
+          persist-credentials: false
+
+      - name: Check tracked files
+        # Blocking, like the other gates. A real tailnet address reached 447 of
+        # 609 commits before anyone noticed, and removing it from the working
+        # tree did not remove it from what a clone hands out.
+        env:
+          # Space-separated extended regexes, held as a secret rather than
+          # committed: a denylist naming the real string would publish the exact
+          # thing the gate exists to keep out. Optional -- the built-in rules are
+          # the ones that have caught something.
+          HX_IDENTIFIER_DENYLIST: ${{ secrets.IDENTIFIER_DENYLIST }}
+        run: ./scripts/ci/check-identifiers.sh

@@ -1,0 +1,110 @@
+name: Bug report
+description: Report a problem with hx
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report.
+
+        **Before you paste anything below:** `hx` runs against other people's
+        systems under an engagement. Its logs, config and reports carry client
+        scope — target hostnames, in-scope domains, captured request and
+        response bodies, and anything a redaction rule did not catch. A public
+        issue is exactly where that leaks, and it is not yours to disclose.
+
+        Please scrub first: swap in `app.example.test`, `203.0.113.10`, and cut
+        captured bodies down to the shape that reproduces the bug.
+
+  - type: checkboxes
+    id: scrubbed
+    attributes:
+      label: Scrubbed engagement data
+      description: >-
+        Confirm you have removed client-identifying data from everything you
+        are about to paste. This is a public issue.
+      options:
+        - label: >-
+            I have replaced real target hostnames, domains and IP addresses
+            with fictional ones (e.g. `app.example.test`, `203.0.113.10`), and
+            removed captured traffic that is not needed to reproduce.
+          required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of hx is this about?
+      options:
+        - extension/ (the Java enforcement points)
+        - bridge / session (Python <-> JVM)
+        - crawler (src/hx/crawl)
+        - checks (src/hx/checks)
+        - reporting
+        - engagement store / config
+        - CLI
+        - docs
+        - other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `git rev-parse HEAD`, or the release tag you are running.
+      placeholder: e.g. 1ad6724 or v0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: burp
+    attributes:
+      label: Burp Suite version
+      description: >-
+        Help > About in the GUI, or the jar filename. `hx` supplies no Burp of
+        its own, so the one you point it at matters.
+      placeholder: e.g. Community 2026.7.3
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        Numbered steps, as minimal as you can make them. A failing test against
+        a loopback target is the most useful form there is — the fixture in
+        `tests/integration/target_server.py` refuses anything outside
+        `127.0.0.0/8`.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: >-
+        Session log, `burp.log`, or the tool result. Scrub it first (see the
+        checkbox above).
+      render: shell
+    validations:
+      required: false

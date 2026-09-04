@@ -20,6 +20,7 @@ uv run pytest -m integration   # launches a REAL headless Burp (~5 min)
 ./extension/test.sh            # the Java suite (needs MONTOYA_JAR)
 uv run ruff check .            # lint — blocking in CI
 uv run mypy                    # advisory for now; see pyproject.toml
+./scripts/ci/check-identifiers.sh   # no real infrastructure in tracked files
 ```
 
 CI runs the unit, Java, and lint gates. **It cannot run the integration suite** — that
@@ -28,6 +29,13 @@ integration tests passed. Run them locally before proposing a change that touche
 bridge, the session, or a check.
 
 ## House rules
+
+**No real infrastructure in tracked files.** No target hostnames, client domains, IP
+addresses or absolute home paths — in fixtures, docs, comments or logs. This is a blocking
+gate, not a preference: a CGNAT address of the machine `hx` was written on reached 447 of
+609 commits as an "example of a non-loopback address" before anyone noticed, and publishing
+the repository would have published it. `scripts/ci/check-identifiers.sh` runs on every PR.
+Use `app.example.test`, `203.0.113.10`, `100.64.0.x`, `fd00::/8`.
 
 **Everything is loopback.** No test in this repository has ever sent a request off the
 machine. The target-server fixture refuses any address outside `127.0.0.0/8`, and that
@@ -61,6 +69,10 @@ comes to describe code nobody wrote.
 
 A **merged** plan is history and is not re-synced to match code a later plan rewrote.
 Corrections go to the spec, as dated amendments with the original text left standing.
+
+## Conduct
+
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 See [`docs/DECISIONS.md`](docs/DECISIONS.md) before proposing a change to the safety model
 or the reporting rules — most of it is there because something went wrong first.

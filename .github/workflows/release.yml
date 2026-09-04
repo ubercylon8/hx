@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and publish the tagged release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required to create the release and upload artifacts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # zizmor[artipacked]: the credential is not needed past this step; the
+          # release is created below with GITHUB_TOKEN passed explicitly.
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+
+      - name: Verify the tag matches the packaged version
+        # A tag that disagrees with pyproject.toml produces a release nobody can
+        # reproduce from source. Cheap to check, expensive to discover later.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(uv version --short)
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match pyproject version $pkg" >&2
+            exit 1
+          fi
+          echo "tag and package agree on $pkg"
+
+      - name: Build the distributions
+        run: uv build
+
+      - name: Check the tree names no real infrastructure
+        # The same gate the branches run. A release is the one artifact that
+        # definitely leaves the machine.
+        run: ./scripts/ci/check-identifiers.sh
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md).
+
+          \`hx\` bundles no Burp Suite. You supply your own; see the [install guide](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/INSTALL.md)." \
+            dist/*

@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest a capability for hx
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: the README's "What is not built yet" section names the
+        things that are deliberately absent and why, and `docs/DECISIONS.md`
+        records the ones that were considered and rejected. If your idea is
+        there, saying why the reasoning is wrong is more useful than a new
+        request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What can't you do today
+      description: >-
+        The engagement situation, not the feature. What did you need hx to do,
+        and what did you do instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+    validations:
+      required: false
+
+  - type: dropdown
+    id: safety
+    attributes:
+      label: Does this widen what hx can send?
+      description: >-
+        Anything that originates new traffic, relaxes a gate, submits a form,
+        or authenticates has to answer to the safety model first. Saying so up
+        front is not a strike against the idea.
+      options:
+        - "No — it changes analysis, reporting, or ergonomics only"
+        - "Yes — it sends something hx does not send today"
+        - "Not sure"
+    validations:
+      required: true

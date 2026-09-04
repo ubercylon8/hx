@@ -1,5 +1,9 @@
 # hx
 
+[![CI](https://github.com/ubercylon8/hx/actions/workflows/ci.yml/badge.svg)](https://github.com/ubercylon8/hx/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
+
 An agent-driven web application security assessment harness that uses **Burp Suite
 Community as an engine, not a frontend**.
 
@@ -45,6 +49,7 @@ it — it can only ask.
 | **[Decisions](docs/DECISIONS.md)** | What was measured, what was only argued, and the debt |
 | **[Contributing](CONTRIBUTING.md)** | The three suites and the house rules |
 | **[Security](SECURITY.md)** | Reporting a vulnerability in `hx` itself |
+| **[Changelog](CHANGELOG.md)** | What shipped, and the limitations shipped with it |
 
 ---
 
@@ -77,6 +82,29 @@ Coverage is part of the deliverable. A check that could not run says so, by name
 reason.
 
 ---
+
+## Where this fits
+
+`hx` is not a scanner competing with the scanners. It is the layer that makes an
+*untrusted driver* — an agent, or a script, or a tired person at 2am — safe to point at a
+client's production system, and it uses Burp Community underneath because that is the
+engine most testers already have.
+
+| | hx | Burp Suite Pro | OWASP ZAP | Nuclei |
+|---|---|---|---|---|
+| Cost | free (you supply Burp Community) | licensed per user | free | free |
+| Vulnerability classes | **10 checks, 6 active** | very broad | broad | very broad (templates) |
+| Scope/rate/budget the driver **cannot** bypass | **yes, enforced in the JVM** | operator-configured | operator-configured | flags |
+| Every request attributable, every denial recorded | **yes** | partial (logger) | partial | no |
+| Report distinguishes "tested, clean" from "never reached" | **yes, by design** | no | no | no |
+| Agent-drivable with typed tools and an audit trail | **yes** | via extensions | via API | via CLI |
+| Findings a human must confirm before they can be reported | **enforced by the database** | no | no | no |
+
+Read the middle rows as the point and the second row as the honest cost: if you want
+breadth of detection, Burp Pro and ZAP have years on this. If you want a machine driving a
+test against a real client without the ability to exceed what was authorised — and a report
+that says what it did *not* reach — that is what `hx` is for. The two compose: `hx` runs
+against the same Burp you already use.
 
 ## Requirements
 
