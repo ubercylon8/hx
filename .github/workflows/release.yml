@@ -21,6 +21,12 @@ jobs:
           persist-credentials: false
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+        with:
+          # A release is the one artifact that leaves the machine, so it is built
+          # from the lockfile and nothing else. setup-uv caches by default, and a
+          # cache is writable by any workflow on the repository -- fine for a test
+          # run, not for the bytes someone installs.
+          enable-cache: false
 
       - name: Verify the tag matches the packaged version
         # A tag that disagrees with pyproject.toml produces a release nobody can
