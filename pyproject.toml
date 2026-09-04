@@ -2,7 +2,20 @@
 name = "hx"
 version = "0.1.0"
 description = "Agent-driven web application security assessment harness"
+readme = "README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "James Pichardo" }]
+keywords = ["security", "burp", "pentest", "appsec", "dast"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
 dependencies = [
     "PyYAML>=6.0",
     "click>=8.1",
@@ -18,6 +31,12 @@ dependencies = [
     "jinja2>=3.1",
     "uvicorn>=0.52",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ubercylon8/hx"
+Documentation = "https://github.com/ubercylon8/hx/blob/master/docs/USER-GUIDE.md"
+Source = "https://github.com/ubercylon8/hx"
+Issues = "https://github.com/ubercylon8/hx/issues"
 
 [project.scripts]
 hx = "hx.cli:main"

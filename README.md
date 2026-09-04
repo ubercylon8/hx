@@ -285,3 +285,40 @@ file it names — so a plan cannot silently come to describe code that no longer
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the pieces fit, and
 [`docs/DECISIONS.md`](docs/DECISIONS.md) for the decisions behind them.
+
+---
+
+## Licence
+
+`hx` is licensed under the **[Apache License 2.0](LICENSE)**.
+
+**Burp Suite is not.** `hx` drives Burp; it does not bundle, redistribute, or
+modify it, and no part of Burp Suite is in this repository. You supply your own
+copy under your own licence from PortSwigger, and **your use of Burp is
+governed by that agreement, not by this one** — read it at
+[portswigger.net/burp/eula/community](https://portswigger.net/burp/eula/community).
+
+Two things in that agreement are worth knowing before you build on this:
+
+- Community Edition's grant covers *"internal business purposes (which may
+  include the provision of a bespoke consultancy service to clients where You
+  are acting in a business advisory capacity)"* — an allowance the Professional
+  and DAST terms do not spell out.
+- It restricts **automated service offerings**, and `hx` automates Burp. Running
+  it as part of your own testing is one thing; wrapping it in a service you sell
+  is another, and is a question for your lawyer rather than for this file.
+
+Burp Suite and Burp are trademarks of PortSwigger Ltd. This project is not
+affiliated with, endorsed by, or sponsored by PortSwigger.
+
+## Use it lawfully
+
+`hx` sends crafted requests at systems that belong to somebody else. Point it
+only at systems you own or have **written authorisation** to test. `hx` records
+scope, keeps an audit trail, and refuses to widen either at runtime — but none
+of that is permission, and the report it renders says so on every engagement:
+
+> **No authorization record is on file for this engagement.** … Read nothing
+> above as evidence that testing was authorised.
+
+Getting and keeping that authorisation is yours.
