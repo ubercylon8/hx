@@ -16,7 +16,7 @@ and the DENY-ALL default, §5 tables, §6 bridge with correlation ids and `confi
   `scripts/demo_capture.py:226`, `scripts/demo_gate.py:159` and the integration tests —
   **three, not two**; an earlier correction here enumerated only the first and the tests,
   and left `demo_gate` out of a sentence whose whole purpose was to enumerate. **As of
-  `1f23336` `demo_capture` calls `configure` through `hx.session.session()` and not
+  `e361fee` `demo_capture` calls `configure` through `hx.session.session()` and not
   directly.** `demo_gate` still calls it: it narrates the gate one refusal at a time with a
   hand-typed body (`limit.max_requests: 10`, a two-entry `dangerous.path`) that is the
   point of the script rather than a second spelling of the product's — but its scope hash

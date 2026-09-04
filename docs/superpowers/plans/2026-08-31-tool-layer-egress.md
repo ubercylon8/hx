@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-31-tool-layer-design.md` (§7 the tool catalogue, §8 session lifecycle, §9 adapters, §10 the two-plan split). Master spec: `docs/superpowers/specs/2026-08-21-hx-design.md` (§4 the enforcement invariant, §5 the data model, §8 the tool layer's six principles and the digest, §12 reporting).
 
-**Base:** master at `1f59054` (PR #12 merged). Baseline: 1830 passed / 1 skipped / 44 deselected; 44 integration passed; Java 13 suites ALL PASS.
+**Base:** master at `1c7947a` (PR #12 merged). Baseline: 1830 passed / 1 skipped / 44 deselected; 44 integration passed; Java 13 suites ALL PASS.
 
 ---
 

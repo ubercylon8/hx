@@ -937,7 +937,7 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
 def test_early_hints_do_not_hide_a_failing_origin_from_the_auto_halt(rig):
     """The two spec amendments, against a real Burp rather than a fake.
 
-    `dfc2080` (finalStatus) and `a188d0d` (the `status_unreadable`
+    `909239d` (finalStatus) and `40fb13c` (the `status_unreadable`
     discriminator) were both written from a MEASUREMENT of Montoya's
     behaviour: on a 103-then-200 exchange `response().statusCode()` answers
     103 while `toByteArray()` carries BOTH heads. Everything downstream of

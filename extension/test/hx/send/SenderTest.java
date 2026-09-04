@@ -1403,7 +1403,7 @@ public class SenderTest {
      * coherent -- but halted() and reason() are two calls, and its own javadoc
      * names the one gap left: "halted()==true followed by reason()==null".
      * Sender answers it with an explicit fallback rather than believing it was
-     * never halted, and 07340ab fixed the same shape one layer up a week ago,
+     * never halted, and cb759a5 fixed the same shape one layer up a week ago,
      * on the same operator-facing surface: a halt frame with no reason
      * delivered the four-character word "null".
      *

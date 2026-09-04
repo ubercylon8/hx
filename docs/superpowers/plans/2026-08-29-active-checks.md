@@ -11,7 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-08-28-active-checks-design.md` (approved 2026-08-28)
 
 **What changed under this plan while it waited.** This plan was drafted before the bridge
-session existed and was blocked on it. That plan has since merged (`537bc5a`), so
+session existed and was blocked on it. That plan has since merged (`fd7c086`), so
 `src/hx/session.py` now provides `session(eng, *, instance, jar=None, workdir=None)`, a
 context manager yielding `LiveSession(operator_port, crawler_port, epoch, bridge, workdir)`
 with a live, loopback-verified, **authorised** Burp. That answers this plan's hardest open
@@ -32,7 +32,7 @@ not pay Burp's startup.
 - Engagement directories `0o700`; blob and DB files `0o600`. Never looser, never widened.
 - **Baselines at the time of writing:** `.venv/bin/pytest` → `1006 passed, 1 skipped, 32 deselected`; `.venv/bin/pytest -m integration` → `32 passed` (~210s, real headless Burp); `./extension/test.sh` → `13 ALL PASS`, 2330 `ok`, 2352 output lines, rc 0.
 - **Never trust a cumulative total written in this plan.** The previous plan's arithmetic was wrong four times, and an implementer who trusts a stale total either "fixes" a passing suite to match it or reports a false regression. **Measure the suite before you start, add your task's tests, and report the delta you actually observed.** The numbers above are the state when this plan was written and nothing more.
-- Some functions are guarded by plan byte-compare tests. If one breaks, sync it with a trailing `chore(plans):` commit — see `13a029e` and `3fc0a41` for the established pattern.
+- Some functions are guarded by plan byte-compare tests. If one breaks, sync it with a trailing `chore(plans):` commit — see `8fc93a9` and `301c63f` for the established pattern.
 - **Markers go on at the END, not during execution.** `tests/test_plan_matches_repo.py` compares a marked block against the file it names, so a marker added before the code exists fails on every run — which is what happened when this plan was first committed. During execution the blocks stay unmarked. **The last task adds `# path` markers to every block meant to be transcribed verbatim and syncs them with `scripts/sync_plan_block.py`**, once the code they describe exists.
 - When you do mark them: **code blocks meant to be transcribed verbatim carry a `# path` marker on their first line** — `path` for a whole file, `path -- note` for an excerpt — so `tests/test_plan_matches_repo.py` holds them against the repo. The previous plan shipped with **zero** compared blocks, because one block was restructured mid-flight to dodge a marker error and nobody noticed until the whole-branch review counted them. **An unmarked block is silently never compared.** Blocks that are deliberately sketches (test shapes an implementer will adapt to existing fixtures) are left unmarked AND say so in their surrounding prose, so the distinction is stated rather than inferred from an absent comment.
 - **`tests/test_plan_matches_repo.py` reddens on ANY edit to a file it covers**, correct or not. It is never evidence that a behaviour is pinned. When you mutate something to check a test bites, look at WHICH test failed and disregard that one.

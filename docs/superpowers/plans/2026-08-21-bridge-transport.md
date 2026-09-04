@@ -662,7 +662,7 @@ def test_vectors_match_their_recorded_hex():
 #
 # The golden vectors above are all well-formed, which is exactly why probing
 # found the Java and Python codecs disagreeing on five of six hostile inputs
-# (plan fix f8d8229) with none of these tests noticing. Well-formed vectors
+# (plan fix b81e6bc) with none of these tests noticing. Well-formed vectors
 # pin agreement on what is valid; they say nothing about whether both sides
 # reject the same invalid input the same way. This suite pins rejection too,
 # against the SAME cases the Java CodecTest runs.
@@ -692,7 +692,7 @@ def test_every_malformed_case_is_rejected_by_decode():
 
 
 def test_encode_refuses_an_integer_outside_signed_64_bit_range():
-    """This diverges the other way from most findings in f8d8229: Python's
+    """This diverges the other way from most findings in b81e6bc: Python's
     ints are unbounded, so nothing stopped it from emitting a header the Java
     side cannot represent -- a frame valid here and a hard error there."""
     too_big = 2 ** 63

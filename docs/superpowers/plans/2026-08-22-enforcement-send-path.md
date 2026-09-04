@@ -8,7 +8,7 @@
 
 **Tech Stack:** Java 21 (`javac --release 21`, zero third-party dependencies, hand-rolled test runner), Python 3.12, the Plan 2 bridge (`src/hx/bridge/`, `extension/src/hx/bridge/`), the Plan 1 store (`src/hx/store/`).
 
-**Spec:** `docs/superpowers/specs/2026-08-21-hx-design.md` — §4 (the enforcement invariant), §6 (bridge protocol), §7 (redaction). All three were amended in `f957960` specifically for this plan; read the amended text, not your memory of the original.
+**Spec:** `docs/superpowers/specs/2026-08-21-hx-design.md` — §4 (the enforcement invariant), §6 (bridge protocol), §7 (redaction). All three were amended in `53315ed` specifically for this plan; read the amended text, not your memory of the original.
 
 ## Global Constraints
 
@@ -9222,7 +9222,7 @@ public class DistressTest {
         // -- silently skipping every check after this one, including both
         // remaining original cases and every fix-round test appended below.
         // Fix-round-1 verification is what caught it: the crash reproduces
-        // identically against commit 9a59b1a's own DistressTest.java, so the
+        // identically against commit 4ab73d5's own DistressTest.java, so the
         // original sabotage table's "11/11, matches exactly" for row 1 was
         // true by accident -- the run never got far enough to check the rest.
         //
@@ -16577,7 +16577,7 @@ public class SenderTest {
      * coherent -- but halted() and reason() are two calls, and its own javadoc
      * names the one gap left: "halted()==true followed by reason()==null".
      * Sender answers it with an explicit fallback rather than believing it was
-     * never halted, and 07340ab fixed the same shape one layer up a week ago,
+     * never halted, and cb759a5 fixed the same shape one layer up a week ago,
      * on the same operator-facing surface: a halt frame with no reason
      * delivered the four-character word "null".
      *
@@ -18059,7 +18059,7 @@ public final class Sender {
         // (Redactor.RangeError -> `bad_frame`, as issue()'s own javadoc says),
         // http.send failing is `transport_error`, and an overshot deadline is
         // `timeout` -- all three before anything is framed as a result. That is
-        // the same defect cc886ac fixed one step higher -- a banner placed
+        // the same defect e697b83 fixed one step higher -- a banner placed
         // above the lines that contradict it -- reintroduced at the line the
         // fix moved it to.
         //
@@ -23180,7 +23180,7 @@ from hx.store import records
 # `server.send`'s local refusals; it was two in Sender until the halt checks
 # were factored into `issuanceHeldReason` -- and it was named in no list at
 # all. It was pinned here with a comment saying so, which is a spec fix
-# recorded as a test comment: the thing dfc2080 was written to stop. `unknown_frame` was worse: emitted by
+# recorded as a test comment: the thing 909239d was written to stop. `unknown_frame` was worse: emitted by
 # BridgeClient's `default ->` arm, in neither S6 nor
 # docs/bridge-protocol.md, and in NONE of DENIAL_KIND, EXCHANGE_OUTCOME or
 # UNRECORDABLE -- so test_every_error_class_has_somewhere_to_go passed while an
@@ -30991,7 +30991,7 @@ def test_five_hundreds_from_the_slow_route_abort_the_whole_run(rig):
 def test_early_hints_do_not_hide_a_failing_origin_from_the_auto_halt(rig):
     """The two spec amendments, against a real Burp rather than a fake.
 
-    `dfc2080` (finalStatus) and `a188d0d` (the `status_unreadable`
+    `909239d` (finalStatus) and `40fb13c` (the `status_unreadable`
     discriminator) were both written from a MEASUREMENT of Montoya's
     behaviour: on a 103-then-200 exchange `response().statusCode()` answers
     103 while `toByteArray()` carries BOTH heads. Everything downstream of

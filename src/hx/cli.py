@@ -798,7 +798,7 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # terminal an operator just opened is ordinary; nothing here
             # caught it, so it reached them as a traceback with the message
             # `identity.resolve` already wrote for them at the bottom of it
-            # -- the same defect commit a88388d fixed for the rarer case,
+            # -- the same defect commit a1c0242 fixed for the rarer case,
             # one exception class over.
             #
             # THE MESSAGE INTACT, for the same reason as above: `resolve`
@@ -824,8 +824,8 @@ def scan(root, max_seconds, max_requests, burp_jar) -> None:
             # with an internal newline or a smart quote pasted out of a file
             # reached the operator as a traceback, with the sentence
             # `codec._refuse_unwritable` had already written for them at the
-            # bottom of it. The same defect commit a88388d fixed for
-            # `IdentityDead` and 20b0a64 for `IdentityError`, two doors over.
+            # bottom of it. The same defect commit a1c0242 fixed for
+            # `IdentityDead` and f7fda45 for `IdentityError`, two doors over.
             #
             # BOTH ARMS, ONE HANDLER, because from the operator's side they
             # are one outcome: the identity could not be registered, so no

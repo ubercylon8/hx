@@ -42,7 +42,7 @@ that threat model.
 
 ## 2. What already exists
 
-Verified in the tree on 2026-09-01 at master `caf6933`, not recalled:
+Verified in the tree on 2026-09-01 at master `ca2c462`, not recalled:
 
 | Fact | Where |
 |---|---|
@@ -493,7 +493,7 @@ Landing with this design, in the same commit:
 
 ## 12. Provenance
 
-Brainstormed 2026-09-01 against master `caf6933`, immediately after the
+Brainstormed 2026-09-01 against master `ca2c462`, immediately after the
 tool layer landed (PRs #12 and #13; 2033 unit tests, 46 integration, all
 17 v1 tools registered).
 

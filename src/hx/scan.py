@@ -1390,7 +1390,7 @@ class _IdentityBracket:
         whole of what an operator sees -- which raises rather than lowers
         what it has to be right about.
 
-        THE SCENARIO OUTLIVED ITS ORIGINAL CAUSE. `ba56ba6` (2026-08-30)
+        THE SCENARIO OUTLIVED ITS ORIGINAL CAUSE. `3f2f47f` (2026-08-30)
         stopped registering `origins` as `scope_include` and rewrote
         `_identity_bracket`'s own comment, so neither half of the paragraph
         above is true of the tree today. A canary can still be refused

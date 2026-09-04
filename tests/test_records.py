@@ -18,7 +18,7 @@ from hx.store import records
 # `server.send`'s local refusals; it was two in Sender until the halt checks
 # were factored into `issuanceHeldReason` -- and it was named in no list at
 # all. It was pinned here with a comment saying so, which is a spec fix
-# recorded as a test comment: the thing dfc2080 was written to stop. `unknown_frame` was worse: emitted by
+# recorded as a test comment: the thing 909239d was written to stop. `unknown_frame` was worse: emitted by
 # BridgeClient's `default ->` arm, in neither S6 nor
 # docs/bridge-protocol.md, and in NONE of DENIAL_KIND, EXCHANGE_OUTCOME or
 # UNRECORDABLE -- so test_every_error_class_has_somewhere_to_go passed while an

@@ -1434,7 +1434,7 @@ def test_an_unexported_identity_variable_is_reported_as_a_result_and_not_a_trace
     raises when a declared identity's variable was simply never exported --
     no session is ever opened for this case, so `IdentityDead` was never
     going to catch it. Forgetting an `export` is the ordinary mistake, one
-    exception class over from the rarer one commit a88388d fixed, and until
+    exception class over from the rarer one commit a1c0242 fixed, and until
     now it still reached the operator as a traceback.
     """
     from tests.test_scan_probes import USER, _SessionBridge

@@ -2421,7 +2421,7 @@ def test_every_other_exception_still_reaches_the_run_row_intact(tmp_path):
 # IdentityDead` yet either, so an operator whose scope was a glob
 # re-authenticated for ever against a message blaming their credentials.
 #
-# BOTH CAUSES ARE HISTORICAL. `ba56ba6` (2026-08-30) stopped registering
+# BOTH CAUSES ARE HISTORICAL. `3f2f47f` (2026-08-30) stopped registering
 # `origins` as `scope_include`, and Task 8 gave `hx scan` its `except
 # IdentityDead`. A canary can still be refused `identity_origin` today, by an
 # operator who declares `identities.<id>.origins` omitting the run's first

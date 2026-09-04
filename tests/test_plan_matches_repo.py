@@ -22,7 +22,7 @@ or `.py`, and `# src/hx/bridge/server.py -- send(), new, above halt()` does not.
 Twenty went unchecked; eight were stale. Six of the eight taught a halt that is
 optional -- five spelling `operator_halt=None` or `if self.operator_halt is not
 None`, one giving `launch_burp` a `sentinel: Path | None = None` -- after commit
-2b753de had made both required, on the grounds that a durable halt nobody has to
+1455f81 had made both required, on the grounds that a durable halt nobody has to
 supply is two of spec S4's three paths and a silence where the third was. An
 excerpt is compared as a CONTIGUOUS run of the file's lines, byte for byte, in
 order: no normalisation, so a block is what the file says or it is stale.

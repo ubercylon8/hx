@@ -361,7 +361,7 @@ public class DistressTest {
         // -- silently skipping every check after this one, including both
         // remaining original cases and every fix-round test appended below.
         // Fix-round-1 verification is what caught it: the crash reproduces
-        // identically against commit 9a59b1a's own DistressTest.java, so the
+        // identically against commit 4ab73d5's own DistressTest.java, so the
         // original sabotage table's "11/11, matches exactly" for row 1 was
         // true by accident -- the run never got far enough to check the rest.
         //

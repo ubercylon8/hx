@@ -84,7 +84,7 @@ no `hx.capture`-shaped sink wired to it -- so `surface[6]`
 exists) is the only exchange row this check can truthfully cite: a captured
 request TO the affected surface, not the probe that demonstrated the flaw.
 That gap is disclosed to the client -- `report._limits` says so (added in
-commit 7aa7f63). Closing it for real needs a new bridge frame type and a
+commit 643255b). Closing it for real needs a new bridge frame type and a
 new writer, which is Java work outside this plan; it is open debt owned by
 no current task.
 """

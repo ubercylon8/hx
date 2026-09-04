@@ -4,7 +4,7 @@
 **Master spec:** `docs/superpowers/specs/2026-08-21-hx-design.md` (§4 enforcement invariant,
 §5 tables, §10 check classes, §12 reporting, §13 v1 scope)
 **Builds on:** Plan 3 (enforcement and the send path), Plan 4 (traffic capture),
-Plan 5 (passive corpus and Markdown reporting), merged at `a28649d`.
+Plan 5 (passive corpus and Markdown reporting), merged at `4bf3feb`.
 
 **Blocked on the bridge session, discovered 2026-08-28 while planning.** Nothing in
 `src/hx/` calls `bridge.configure()`. `hx capture start` writes a `run` row and nothing
@@ -38,7 +38,7 @@ identity plan. `active_mutate` and `active_dos` remain off and unimplemented.
 ## 2. What already exists and is idle
 
 This plan is mostly *wiring what previous plans built*, and the design should be read that
-way. Verified against the tree at `a28649d`:
+way. Verified against the tree at `4bf3feb`:
 
 - **`bridge.server.send(req, body, timeout, *, enforce_locally)` has zero callers in
   `src/hx/`.** The whole Java send path — `Sender`, `Limits`, `Redactor`, `HaltSwitch`,

@@ -92,7 +92,7 @@ extend-exclude = ["extension/build"]
 # The gate earned its place before it was configured: on its first run it found
 # an F811 in tests/test_checks_cors.py -- one test shadowing another of the
 # same name, so the shadowed one had not run since the commit that added the
-# second. See 54a181a.
+# second. See 8f7b57a.
 #
 # MEASURED before choosing: widening to `["E", "F", "W"]` adds exactly 110
 # findings and every one of them is E501 line-too-long. Not one is a bug. This

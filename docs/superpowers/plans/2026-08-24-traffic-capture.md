@@ -13,7 +13,7 @@
 
 **Tech Stack:** Java 21 (`javac --release 21`, zero third-party dependencies, hand-rolled test runner), Python 3.12, SQLite, the Plan 2 bridge (`src/hx/bridge/`, `extension/src/hx/bridge/`), the Plan 1 store (`src/hx/store/`), Burp Suite Community 2026.7.3 via the Montoya API.
 
-**Spec:** `docs/superpowers/specs/2026-08-21-hx-design.md` — §4 (enforcement invariant, amended `b05a94a`), §5 (data model), §6 (bridge protocol), §7 (redaction), §9 (discovery).
+**Spec:** `docs/superpowers/specs/2026-08-21-hx-design.md` — §4 (enforcement invariant, amended `766d11d`), §5 (data model), §6 (bridge protocol), §7 (redaction), §9 (discovery).
 
 ## Global Constraints
 

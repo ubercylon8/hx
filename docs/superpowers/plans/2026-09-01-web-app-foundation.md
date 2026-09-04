@@ -16,7 +16,7 @@ sends a byte to a target. Writes are two POST routes over `src/hx/triage.py`
 SQLite. No build step, no SPA, no `node_modules`.
 
 **Spec:** `docs/superpowers/specs/2026-09-01-web-app-design.md`
-(approved 2026-09-01, commit `6d26738`).
+(approved 2026-09-01, commit `7cb0d77`).
 **Master spec:** `docs/superpowers/specs/2026-08-21-hx-design.md`
 (§4 enforcement invariant, §5 data model, §7 redaction, §8 human acts,
 §11 web app as amended to Starlette, §12 reporting, §13 v1 scope).
@@ -4883,7 +4883,7 @@ task:
 | §7.2 `triage.py`, all six decisions | 2 |
 | §7.3 the note reaches the report | 2 (steps 10–12) |
 | §9 testing, all four families | 1–6, and the mutation pass in 6 step 8 |
-| §11 master spec amendment | landed with the spec, commit `6d26738` |
+| §11 master spec amendment | landed with the spec, commit `7cb0d77` |
 
 **Known deviations, both deliberate and both stated at the task that makes
 them:**

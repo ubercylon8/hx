@@ -342,7 +342,7 @@ public final class Sender {
         // (Redactor.RangeError -> `bad_frame`, as issue()'s own javadoc says),
         // http.send failing is `transport_error`, and an overshot deadline is
         // `timeout` -- all three before anything is framed as a result. That is
-        // the same defect cc886ac fixed one step higher -- a banner placed
+        // the same defect e697b83 fixed one step higher -- a banner placed
         // above the lines that contradict it -- reintroduced at the line the
         // fix moved it to.
         //

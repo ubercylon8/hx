@@ -34,7 +34,7 @@ in it has no code path.
 
 ## 2. What already exists
 
-Verified in the tree on 2026-08-31 at master `fe3f2db`, not recalled:
+Verified in the tree on 2026-08-31 at master `537d5fd`, not recalled:
 
 | Fact | Where |
 |---|---|
@@ -414,7 +414,7 @@ web app, per §8.
 
 ## 14. Provenance
 
-Brainstormed 2026-08-31 against master `fe3f2db`. Four decisions taken by
+Brainstormed 2026-08-31 against master `537d5fd`. Four decisions taken by
 the operator: definition plus two thin adapters; `crawl.run` registered
 and `unavailable`; the session bracketed by `run.start`/`run.finish`; and
 the split into two plans, no-egress first.
