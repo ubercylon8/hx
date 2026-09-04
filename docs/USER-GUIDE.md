@@ -124,6 +124,51 @@ one truncates the crawl, and the printed summary **names which budget stopped
 it** — a truncated crawl that presented as an exhaustive one would misstate
 coverage.
 
+### When a page could not load itself
+
+```
+degraded  1
+load-fail 1 page(s) reported they could not load a script or stylesheet they
+          asked for -- the app may not have started, so treat the counts
+          above as a floor
+```
+
+That line means the **browser** told us it refused something the page asked
+for — most often a script blocked on its MIME type. The page is recorded
+`degraded`, not `rendered`, and the request counts are a floor rather than a
+measurement: a single-page application whose main module was refused never
+started, so almost nothing it would have fetched was seen.
+
+**The most common cause is not a bug in the target, and not one in `hx`.**
+A browser talking to a proxy sends its request line in **absolute form** —
+`GET http://host/app.js HTTP/1.1` — rather than the origin form
+`GET /app.js HTTP/1.1` a server sees when spoken to directly. That is
+[RFC 9112 §3.2.2](https://www.rfc-editor.org/rfc/rfc9112#section-3.2.2) and
+every proxy-aware client does it. Some application servers do not strip the
+absolute URI before routing, fail to match their own static-asset routes, and
+fall through to the catch-all that serves `index.html` — with
+`Content-Type: text/html`. Browsers enforce strict MIME checking on **module
+scripts** and refuse them, so a modern SPA never boots.
+
+Measured against OWASP Juice Shop, 2026-09-03: the same asset returned
+`application/javascript` in origin form and `text/html` in absolute form.
+Classic `<script>` tags still loaded — Chrome does not strict-check those —
+so only the ES modules were fatal, and the failure looked like a quiet app
+rather than a broken one.
+
+**How to tell them apart.** Request one of the failing assets by hand, both
+ways:
+
+```bash
+curl -sI http://TARGET/app.js | grep -i content-type
+printf 'GET http://TARGET/app.js HTTP/1.1\r\nHost: TARGET\r\nConnection: close\r\n\r\n' \
+  | nc TARGET 80 | grep -i content-type
+```
+
+Two different content types means the server mishandles absolute form. Nothing
+in `hx` can fix that — it is between the proxy and the application — but the
+crawl now says the coverage is a floor instead of reporting a clean page.
+
 ---
 
 ## 4. Scan

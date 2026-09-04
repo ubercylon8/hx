@@ -152,6 +152,13 @@ yesterday's jar produces green results that mean nothing.
 
 **Import errors on Python 3.11 or earlier** — `hx` requires 3.12.
 
+**A crawl of a modern web app finds almost nothing, and reports `degraded`
+with a `load-fail` line** — the browser refused a script the page asked for.
+Usually the target mishandles the absolute-form request line every client
+sends to a proxy, so its assets come back as `text/html`. See
+[the user guide](USER-GUIDE.md#when-a-page-could-not-load-itself) for how to
+confirm it in one command.
+
 ---
 
 ## Where things live

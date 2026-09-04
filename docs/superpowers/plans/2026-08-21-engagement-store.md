@@ -6270,6 +6270,15 @@ def crawl(targets, root, max_pages, max_seconds, max_requests,
         click.echo(f"failed    {summary.failed}")
         click.echo(f"capped    {summary.capped}")
         click.echo(f"requests  {summary.requests}")
+        if summary.load_failed:
+            # LOUDER THAN A COUNT, because it changes what the numbers above
+            # mean. A page that could not load its own code did not show the
+            # crawler the application; the surfaces it did not reach are not
+            # surfaces this crawl can be read as having covered.
+            click.echo(
+                f"load-fail {summary.load_failed} page(s) reported they could "
+                "not load a script or stylesheet they asked for -- the app "
+                "may not have started, so treat the counts above as a floor")
         if summary.dropped_hosts:
             click.echo(f"dropped   {', '.join(summary.dropped_hosts)}")
             # F2: `dropped_hosts` is built from SEED origins, not scope

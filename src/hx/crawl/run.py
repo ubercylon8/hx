@@ -54,6 +54,11 @@ class CrawlSummary(NamedTuple):
     requests: int
     dropped_hosts: tuple[str, ...]
     truncated_by: str | None
+    #: Pages that reported they could not load a script or stylesheet they
+    #: asked for. LAST, WITH A DEFAULT, so every existing positional
+    #: construction stays valid -- a field added mid-tuple silently changes
+    #: what `CrawlSummary(a, b, c, ...)` means at every call site.
+    load_failed: int = 0
 
 
 def crawl(*, seeds: Iterable[str], proxy_port: int,
@@ -73,6 +78,7 @@ def crawl(*, seeds: Iterable[str], proxy_port: int,
 
     counts = {"rendered": 0, "degraded": 0, "failed": 0}
     capped = 0
+    load_failed = 0
     requests = 0
     dropped: set[str] = set()
 
@@ -85,6 +91,11 @@ def crawl(*, seeds: Iterable[str], proxy_port: int,
                                   session_id=br.session_id)
             counts[result.state] = counts.get(result.state, 0) + 1
             capped += 1 if result.capped else 0
+            # A PAGE THAT COULD NOT LOAD ITS OWN CODE, counted separately
+            # from the drop-driven `degraded`. The two mean different things
+            # to an operator: one is our scope refusing a third party, the
+            # other is the application failing to come up.
+            load_failed += 1 if result.load_errors else 0
             requests += result.requests
             # UNIONED across pages (not just the last one), because this
             # list is what an operator pastes into `render_allow` -- a
@@ -101,6 +112,7 @@ def crawl(*, seeds: Iterable[str], proxy_port: int,
         pages=frontier.visited,
         rendered=counts["rendered"], degraded=counts["degraded"],
         failed=counts["failed"], capped=capped, requests=requests,
+        load_failed=load_failed,
         dropped_hosts=tuple(sorted(dropped)),
         # NAMED, or None. A truncated crawl that presented as complete is
         # S12's failure one level up; a complete crawl that claimed
@@ -121,6 +133,7 @@ def as_tool_result(summary: CrawlSummary) -> dict:
         "degraded": summary.degraded,
         "failed": summary.failed,
         "capped": summary.capped,
+        "load_failed": summary.load_failed,
         "requests": summary.requests,
         "dropped_hosts": list(summary.dropped_hosts),
         "truncated_by": summary.truncated_by,

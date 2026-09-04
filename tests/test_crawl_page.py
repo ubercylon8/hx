@@ -478,4 +478,127 @@ def test_a_page_whose_dom_read_raises_cdp_closed_also_propagates():
         pass
     else:
         raise AssertionError("expected cdp.CdpClosed to propagate")
-    assert conn.calls[:3] == ["Network.enable", "Page.enable", "Page.navigate"]
+    assert conn.calls[:4] == ["Network.enable", "Page.enable",
+                              "Log.enable", "Page.navigate"]
+
+
+# --- the page's own account of what it could not load ----------------------
+
+def _console_error(text: str, url: str = "") -> dict:
+    """A `Log.entryAdded` in the shape measured off real Chromium 150."""
+    return {"method": "Log.entryAdded",
+            "params": {"entry": {"source": "javascript", "level": "error",
+                                 "text": text, "url": url}}}
+
+
+_MODULE_FAIL = ("Failed to load module script: Expected a JavaScript-or-Wasm "
+                'module script but the server responded with a MIME type of '
+                '"text/html". Strict MIME type checking is enforced for module '
+                "scripts per HTML spec.")
+
+
+def test_a_page_that_could_not_load_its_own_module_is_degraded():
+    """THE JUICE SHOP CASE, and the reason this signal exists.
+
+    MEASURED 2026-09-03 against OWASP Juice Shop through this crawler's own
+    Burp: its Express server mishandles the absolute-form request line every
+    client sends to a proxy, so four module scripts came back as `text/html`,
+    Chrome refused all four, and Angular never bootstrapped. The crawl saw 5
+    requests instead of 41 and reported the page `rendered` with no
+    truncation -- nothing was dropped and no budget was hit, so every other
+    S12 mechanism in this file stayed silent.
+
+    MUTATION: delete the `elif failures:` branch from `classify`. This test
+    must go red -- the page would be `rendered`, exactly as it wrongly was.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _console_error(_MODULE_FAIL, "https://app.test/chunk-a.js")]
+    r = page.classify(events, page_origins=ORIGINS, harvested=0)
+
+    assert r.state == "degraded"
+    assert r.load_errors == ("https://app.test/chunk-a.js",)
+
+
+def test_a_load_failure_outranks_a_page_that_yielded_something():
+    """THE SEPARATING CASE, and the one that makes the branch worth having
+    where it sits. A document that fetched links and THEN could not execute
+    its main module has not rendered the application; counting those links as
+    yield reports it `rendered`.
+
+    MUTATION: move the `elif failures:` branch below the `if yielded:` one.
+    Must go red -- and the Juice Shop page would be reported `rendered` again
+    the moment it harvested a single link.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _sent("https://app.test/api/x"), _ok("https://app.test/api/x"),
+              _console_error(_MODULE_FAIL, "https://app.test/main.js")]
+    r = page.classify(events, page_origins=ORIGINS, harvested=7)
+
+    assert r.state == "degraded"
+
+
+def test_an_ordinary_console_error_is_not_a_load_failure():
+    """NARROW ON PURPOSE. A page under test logs errors all day -- a caught
+    exception, a deprecation, a failed analytics beacon -- and none of them
+    mean the application did not come up. Marking every one `degraded` would
+    make the verdict noise.
+
+    MUTATION: treat any `level == "error"` entry as a load failure, dropping
+    the `_LOAD_FAILURE_MARKERS` test. Must go red.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _console_error("Uncaught TypeError: x is not a function"),
+              _console_error("[Deprecation] SomeAPI is deprecated")]
+    r = page.classify(events, page_origins=ORIGINS, harvested=4)
+
+    assert r.state == "rendered"
+    assert r.load_errors == ()
+
+
+def test_a_warning_is_not_an_error():
+    """MUTATION: drop the `level != "error"` guard. Must go red -- a warning
+    is the browser telling you about something it went ahead and did.
+    """
+    warn = {"method": "Log.entryAdded",
+            "params": {"entry": {"source": "network", "level": "warning",
+                                 "text": "Failed to load resource: slow",
+                                 "url": "https://app.test/z.js"}}}
+    events = [_sent("https://app.test/"), _ok("https://app.test/"), warn]
+    r = page.classify(events, page_origins=ORIGINS, harvested=3)
+
+    assert r.state == "rendered"
+
+
+def test_load_failures_are_deduplicated():
+    """Four chunks failing the same way is four entries; the same chunk
+    logged twice is one."""
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _console_error(_MODULE_FAIL, "https://app.test/a.js"),
+              _console_error(_MODULE_FAIL, "https://app.test/a.js"),
+              _console_error(_MODULE_FAIL, "https://app.test/b.js")]
+    r = page.classify(events, page_origins=ORIGINS, harvested=0)
+
+    assert r.load_errors == ("https://app.test/a.js", "https://app.test/b.js")
+
+
+def test_a_dead_favicon_is_not_a_load_failure():
+    """THE MARKER THAT WAS TOO BROAD. `"failed to load resource"` is Chrome's
+    generic console message for ANY failed subresource -- a 404 favicon, a
+    blocked analytics beacon, a missing font. It was in
+    `_LOAD_FAILURE_MARKERS` for one review round, which made the exact
+    example the module's own comment gives as NOT a load failure into one.
+
+    Every surviving marker is the browser refusing to EXECUTE or APPLY
+    something. A dead image is not refused; it is simply absent.
+
+    MUTATION: re-add `"failed to load resource"` to `_LOAD_FAILURE_MARKERS`.
+    This test must go red.
+    """
+    events = [_sent("https://app.test/"), _ok("https://app.test/"),
+              _console_error(
+                  "Failed to load resource: the server responded with a "
+                  "status of 404 (Not Found)", "https://app.test/favicon.ico")]
+    r = page.classify(events, page_origins=ORIGINS, harvested=5)
+
+    assert r.state == "rendered"
+    assert r.load_errors == ()

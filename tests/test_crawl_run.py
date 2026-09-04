@@ -156,3 +156,57 @@ def test_the_browser_is_closed_even_when_a_page_raises():
     except RuntimeError:
         pass
     assert made and made[0].closed
+
+
+def test_load_failed_counts_pages_not_errors():
+    """THE WIRING TEST THAT WAS MISSING. Every other test in this file leaves
+    `load_errors` at its default, so `crawl`'s counting line was never
+    exercised with a non-empty value -- the shape this repo calls a wiring
+    test blind to the argument it exists to check. A bug counting ERRORS
+    rather than PAGES would have shipped with a fully green suite.
+
+    Two pages, one with three load errors and one with one: that is TWO
+    pages, not four errors.
+
+    MUTATION: `load_failed += len(result.load_errors)`. Must go red -- it
+    would report 4.
+    """
+    visit = _visitor({
+        "https://a.test/": (page.PageResult(
+            "degraded", 1, (), (), False,
+            ("https://a.test/x.js", "https://a.test/y.js",
+             "https://a.test/z.js")), ["https://a.test/b"]),
+        "https://a.test/b": (page.PageResult(
+            "degraded", 1, (), (), False, ("https://a.test/q.js",)), []),
+    })
+    s = crawl_run.crawl(seeds=["https://a.test/"], proxy_port=1, budget=_b(),
+                        visit=visit, browser_factory=_FakeBrowser)
+
+    assert s.load_failed == 2
+    assert s.degraded == 2
+
+
+def test_a_crawl_with_no_load_errors_reports_zero():
+    """THE SEPARATING CASE. Without it, a mutation hardcoding `load_failed`
+    to a positive number passes the test above.
+
+    MUTATION: `load_failed = 1` unconditionally. Must go red.
+    """
+    s = crawl_run.crawl(seeds=["https://a.test/"], proxy_port=1, budget=_b(),
+                        visit=_visitor({}), browser_factory=_FakeBrowser)
+
+    assert s.load_failed == 0
+
+
+def test_the_tool_result_carries_the_load_failure_count():
+    """The agent reads `as_tool_result`, not the CLI. A count that reaches
+    the terminal and not the tool leaves an agent believing a crawl it drove
+    was clean.
+
+    MUTATION: drop the `"load_failed"` key from `as_tool_result`. Must go red.
+    """
+    summary = crawl_run.CrawlSummary(
+        pages=2, rendered=0, degraded=2, failed=0, capped=0, requests=9,
+        dropped_hosts=(), truncated_by=None, load_failed=2)
+
+    assert crawl_run.as_tool_result(summary)["load_failed"] == 2

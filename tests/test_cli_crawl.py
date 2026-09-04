@@ -266,3 +266,62 @@ def test_crawl_max_requests_authorises_the_session_and_bounds_the_budget(
     assert result.exit_code == 0, result.output
     assert seen_config["max_requests"] == 42
     assert seen_config["budget_max_requests"] == 42
+
+
+def test_crawl_says_when_a_page_could_not_load_itself(
+        engagement, monkeypatch):
+    """THE CLI BRANCH THAT WAS UNTESTED. Every other summary in this file
+    leaves `load_failed` at its default, so the `if summary.load_failed:`
+    line and its message had no coverage -- a typo feeding the wrong field
+    would have shipped green.
+
+    The message matters more than the count: it tells an operator the
+    numbers above it are a FLOOR, which is the difference between reading a
+    quiet crawl as a small app and reading it as a failed one.
+
+    MUTATION: delete the `if summary.load_failed:` block from `cli.crawl`.
+    Must go red.
+    """
+    monkeypatch.setattr(cli.session_mod, "session", _fake_session())
+
+    def fake_crawl(*, seeds, proxy_port, budget):
+        return crawl_run_mod.CrawlSummary(
+            pages=1, rendered=0, degraded=1, failed=0, capped=0, requests=9,
+            dropped_hosts=(), truncated_by=None, load_failed=1)
+
+    monkeypatch.setattr(cli.crawl_run_mod, "crawl", fake_crawl)
+
+    result = CliRunner().invoke(
+        cli.main, ["crawl", "--target", "https://app.test/",
+                  "--root", str(engagement.root)])
+
+    assert result.exit_code == 0, result.output
+    # Asserted on a phrase unique to this line: bare words like "load" and
+    # "page" occur throughout the summary above it.
+    assert "could not load a script or stylesheet" in result.output
+    assert "floor" in result.output
+
+
+def test_a_crawl_with_no_load_failures_stays_quiet(
+        engagement, monkeypatch):
+    """THE SEPARATING CASE. Rendering the warning unconditionally would tell
+    every clean crawl its counts were a floor.
+
+    MUTATION: drop the `if summary.load_failed:` guard, keeping the echo.
+    Must go red.
+    """
+    monkeypatch.setattr(cli.session_mod, "session", _fake_session())
+
+    def fake_crawl(*, seeds, proxy_port, budget):
+        return crawl_run_mod.CrawlSummary(
+            pages=2, rendered=2, degraded=0, failed=0, capped=0, requests=6,
+            dropped_hosts=(), truncated_by=None)
+
+    monkeypatch.setattr(cli.crawl_run_mod, "crawl", fake_crawl)
+
+    result = CliRunner().invoke(
+        cli.main, ["crawl", "--target", "https://app.test/",
+                  "--root", str(engagement.root)])
+
+    assert result.exit_code == 0, result.output
+    assert "could not load a script or stylesheet" not in result.output

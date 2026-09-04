@@ -40,6 +40,68 @@ class PageResult(NamedTuple):
     dropped_hosts: tuple[str, ...]
     in_scope_failures: tuple[str, ...]
     capped: bool
+    load_errors: tuple[str, ...] = ()
+
+
+#: Console text meaning A RESOURCE THIS PAGE NEEDED DID NOT LOAD.
+#:
+#: NARROW ON PURPOSE. A page under test logs errors all day -- a failed
+#: analytics beacon, a caught exception, a deprecation warning -- and none of
+#: those mean the application did not come up. These do: each is the browser
+#: refusing to EXECUTE something the document asked for.
+#:
+#: MEASURED 2026-09-03 against OWASP Juice Shop through this crawler's own
+#: Burp. Its Express server mishandles the absolute-form request line every
+#: client sends to a proxy (RFC 9112 s3.2.2), so `GET http://host/chunk.js`
+#: fell through to the SPA catch-all and returned `index.html` with
+#: `Content-Type: text/html`. Chrome enforces strict MIME checking on module
+#: scripts, refused all four, and Angular never bootstrapped -- 5 requests
+#: instead of 41, and NOT ONE of the parameterised API endpoints a scan
+#: exists to probe.
+#:
+#: The crawl reported that page `rendered`, with no truncation, because
+#: nothing was dropped and no budget was hit. Every S12 mechanism in this
+#: file stayed silent while the page loaded 0.4% of its application. The
+#: browser had said so in plain English the whole time, on a domain nobody
+#: had enabled.
+#: EVERY ONE IS THE BROWSER REFUSING TO EXECUTE OR APPLY SOMETHING, which is
+#: the semantic that separates "the app did not come up" from "a fetch
+#: failed". `"failed to load resource"` was in this tuple for one review
+#: round and is deliberately NOT: it is Chrome's generic message for ANY
+#: failed subresource -- a 404 favicon, a blocked beacon, a missing font --
+#: so it made the very example this file's own comment gives as NOT a load
+#: failure into one. A marker list that contradicts the paragraph above it is
+#: worse than a short list.
+_LOAD_FAILURE_MARKERS = (
+    "failed to load module script",
+    "refused to execute script",
+    "refused to apply style",
+    "was blocked due to mime type",
+)
+
+
+def load_failures(events: list[dict]) -> tuple[str, ...]:
+    """What the PAGE ITSELF reported it could not load, deduplicated.
+
+    Reads `Log.entryAdded` -- the shape measured above is
+    `{"entry": {"source", "level", "text", "url"}}`. Only `level == "error"`
+    counts: a warning is the browser telling you about something it went
+    ahead and did.
+    """
+    out: list[str] = []
+    for e in events:
+        if e.get("method") != "Log.entryAdded":
+            continue
+        entry = e.get("params", {}).get("entry", {})
+        if entry.get("level") != "error":
+            continue
+        text = (entry.get("text") or "").lower()
+        if not any(m in text for m in _LOAD_FAILURE_MARKERS):
+            continue
+        what = entry.get("url") or entry.get("text") or ""
+        if what and what not in out:
+            out.append(what)
+    return tuple(out)
 
 
 class _Links(HTMLParser):
@@ -185,8 +247,25 @@ def classify(events: list[dict], *, page_origins: set[str],
             if host:
                 dropped.add(host)
 
+    failures = load_failures(events)
+
     if document is None or document in dropped_candidates:
         state = "failed"
+    elif failures:
+        # THE PAGE SAID SO ITSELF, and it outranks `yielded` deliberately.
+        # A document that fetched three links and then could not execute its
+        # own main module has not rendered the application, and counting the
+        # three as yield would report it `rendered`. Measured against Juice
+        # Shop: 5 requests, no drops, no budget hit, four refused module
+        # scripts -- and a confident `rendered` for a page that loaded 0.4%
+        # of its app.
+        #
+        # This can over-fire: a broken analytics script on an otherwise
+        # healthy page lands here. That is a FALSE DEGRADATION and it is the
+        # direction this file already errs in on purpose -- S12's asymmetry
+        # is that under-claiming coverage is survivable and over-claiming is
+        # not. `_LOAD_FAILURE_MARKERS` is kept narrow so it stays rare.
+        state = "degraded"
     else:
         # YIELD is links OR in-scope requests beyond the document itself.
         # The second half is not decoration: S9's measured 65-requests result
@@ -210,7 +289,7 @@ def classify(events: list[dict], *, page_origins: set[str],
     return PageResult(state=state, requests=len(urls),
                       dropped_hosts=tuple(sorted(dropped)),
                       in_scope_failures=tuple(sorted(in_scope_failures)),
-                      capped=capped)
+                      capped=capped, load_errors=failures)
 
 
 def _failed() -> tuple[PageResult, list[str]]:
@@ -252,6 +331,10 @@ def visit(conn: cdp.Connection, url: str, *, page_origins: set[str],
     try:
         conn.call("Network.enable", session_id=session_id)
         conn.call("Page.enable", session_id=session_id)
+        # THE DOMAIN THAT WAS MISSING. `Log` costs nothing and carries the
+        # one signal that separates "this page had little to offer" from
+        # "this page could not load itself" -- see `_LOAD_FAILURE_MARKERS`.
+        conn.call("Log.enable", session_id=session_id)
     except cdp.CdpClosed:
         raise
     except cdp.CdpError:
