@@ -45,4 +45,4 @@ jobs:
           curl -sSfL -o /tmp/montoya-api.jar \
             "https://repo1.maven.org/maven2/net/portswigger/burp/extensions/montoya-api/2025.5/montoya-api-2025.5.jar"
           MONTOYA_JAR=/tmp/montoya-api.jar ./extension/build.sh
-      - uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3  # v4
+      - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4
