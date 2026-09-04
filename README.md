@@ -172,9 +172,9 @@ work from any adapter: `run.start`, `run.finish`, `run.journal`, `run.resume`,
 `checks.list`, `report.render`. Six touch the wire — `http.send`, `http.grep`,
 `http.body`, `http.replay_as`, `scan.run`, `crawl.run` — and of those, four need a live
 session (`needs_egress`); `http.grep` and `http.body` read the stored blobs, so an agent
-that has finished its run can still read what it captured. `crawl.run` is registered and
-always answers `unavailable / not_implemented`: an agent with no crawl tool has no reason
-to say discovery was proxy-only, and one that asks and is told does.
+that has finished its run can still read what it captured. `crawl.run` drives the same crawler as
+`hx crawl`, bounded and synchronous, so an agent can sweep a newly-found area without
+leaving its session.
 
 **The four egress tools work under `hx mcp`, not under `hx tool`.** `hx.session.session()`
 tears Burp down on every exit and each `hx tool` call is its own process, so there is
@@ -221,16 +221,19 @@ it reaches the client deliverable — and optional for `confirmed`.
 
 ## What it does today
 
-**Discovery is proxy-only.** `hx` sees the application as you browse it through Burp. It
-records requests, responses and the surfaces they imply. There is no crawler yet (see
-below), so anything you do not visit is not tested.
+**Discovery has two sources.** `hx` sees the application as you browse it through Burp,
+and `hx crawl` drives Burp's own bundled Chromium over in-scope pages. Both land in the
+same store; a surface records which one found it, so a report can tell what a human
+explored from what a machine walked. The crawler follows links and renders JavaScript —
+it submits no forms, clicks nothing, and runs unauthenticated, so your own browsing is
+still how anything behind a login gets covered.
 
-**Nine checks**, in two classes:
+**Ten checks**, in two classes:
 
 | Class | Checks |
 |---|---|
 | `passive` — reads captured traffic, sends nothing | `cookie-flags` · `security-headers` · `secret-in-response` · `stack-trace` |
-| `active_safe` — idempotent GET probes | `cors` · `open-redirect` · `reflected-input` · `sql-error` · `path-traversal` |
+| `active_safe` — idempotent GET probes | `cors` · `open-redirect` · `reflected-input` · `sql-error` · `sql-behaviour` · `path-traversal` |
 
 `active_timing`, `active_mutate` and `active_dos` are check *classes* the config and the
 extension already understand; no checks of those classes ship yet.
@@ -240,9 +243,12 @@ engagement updates findings rather than duplicating them.
 
 ### Known limitations, stated because the report states them
 
-- **Probes are unauthenticated.** They carry no cookie, no `Authorization`, and none of the
-  endpoint's other parameters, so against an application that requires a session they test
-  the logged-out view. A login redirect or an authorisation refusal is recorded as
+- **Probes are unauthenticated unless you declare an identity.** `config.yaml` takes an
+  `identities` block, and the send path injects it; without one, probes carry no cookie, no
+  `Authorization`, and none of the endpoint's other parameters, so against an application
+  that requires a session they test the logged-out view. The report says which applied: an
+  engagement that declared an identity gets a table of what it issued under, and one that
+  declared none gets this limitation in Limits. A login redirect or an authorisation refusal is recorded as
   `inconclusive`, never as clean — but an application that answers a logged-out request
   with a **200 login page** cannot be told apart from one that answered.
 - **Active findings are never automatically marked as fixed.** Because of the above, a
@@ -255,14 +261,26 @@ engagement updates findings rather than duplicating them.
 
 ## What is not built yet
 
-Against the v1 scope in the design spec, six of nine items are done. Outstanding:
+**Every item in the design spec's v1 scope is built.** What follows is deferred by
+decision, not left undone — each entry names why it was safe to defer, and the report
+discloses the gap rather than leaving it silent.
 
-- **The crawler** — the schema and the extension's crawler listener exist; nothing drives a
-  crawl. `crawl.run` is registered and permanently answers `unavailable /
-  not_implemented`: discovery is the operator's browser through the proxy, and a report
-  should say so.
-- **Identities** — `config.yaml` accepts an `identities` block and nothing applies it. This
-  is the root of the unauthenticated-probe limitation above.
+- **Form submission, clicking, and interaction-gated routes.** The crawler follows links
+  and renders JavaScript; it does not submit forms or click things. That is the most
+  safety-critical paragraph in the design spec — *a crawler that finds "Delete account"
+  and dutifully clicks it is the worst possible failure of this system* — so it gets its
+  own spec rather than riding along with the navigation backbone.
+- **Authenticated crawling.** The crawler runs logged out. Browse the application yourself
+  through the proxy; that is how applications behind SSO or MFA get covered.
+- **Out-of-band (OAST) capability.** No blind-only checks ship, and the report says so.
+- **An async job runner.** `scan.run` and `crawl.run` are synchronous over bounded budgets,
+  and a run that exhausts one returns what it found and names the budget that stopped it.
+- **`run.diff` and scheduled monitoring.** The schema carries `run.kind = scheduled` and
+  `surface.first_seen_run` from day one, so this is a wrapper rather than a rewrite.
+
+The design spec's §13 is the authority on both: what v1 covered, and the "out of v1, with
+reasons" table these entries come from. `docs/DECISIONS.md` records the decisions taken
+along the way and the outstanding debt.
 
 ---
 
