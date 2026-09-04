@@ -263,6 +263,74 @@ def open_(root: Path) -> Engagement:
     return Engagement(id=row["id"], root=root, config=config, db=conn, blobs=blobs)
 
 
+def open_diverged(root: Path) -> tuple[Engagement, str]:
+    """Open an engagement whose `config.yaml` no longer matches the record.
+
+    THE ONE DOOR PAST `open_`'s DIVERGENCE GUARD, and it is narrow on purpose.
+
+    That guard refuses an engagement whose config has been hand-edited, and it
+    is right to: a limit somebody quietly widened between two runs, with the
+    store still stamping the OLD `scope_version_id` on every request, is a
+    deliberate act wearing an accident's clothes. Its message tells the reader
+    to "re-record the change through record_scope_version()".
+
+    Nothing could. `record_scope_version` takes an `Engagement`, and `open_`
+    was the only way to get one -- so the documented recovery path could not
+    be walked, and every caller was told to do something impossible. Found
+    2026-09-04 while trying to declare a `rate_burst` on an existing
+    engagement, which is exactly the legitimate case: an operator who learns
+    mid-engagement that a limit is wrong.
+
+    Returns the engagement AND the yaml currently of record, so a caller can
+    show what it is about to change. It does NOT record anything -- amending
+    is `record_scope_version`, and keeping the two apart is what lets the CLI
+    put a diff and a `--reason` between them.
+    """
+    root = Path(root)
+    if not (root / "hx.db").exists():
+        raise EngagementError(f"no engagement at {root}")
+    conn = db_mod.connect(root / "hx.db")
+    try:
+        # I6 AND I5, RE-DERIVED RATHER THAN INHERITED, and their absence here
+        # was a real defect for one review round. This function exists to skip
+        # ONE of `open_`'s guards -- the divergence check -- and skipping the
+        # others came free with copying less code. It should not have: a store
+        # written by an incompatible schema, or one holding two engagement
+        # rows, is exactly as unfit to be AMENDED as it is to be opened, and
+        # `record_scope_version` would have gone on to INSERT against a schema
+        # nobody validated or stamped a version against an arbitrarily chosen
+        # id.
+        #
+        # A door that bypasses one check must re-derive every other one, and
+        # testing the new feature does not test that -- the mutations for this
+        # command all asked whether `amend` behaves, never whether this
+        # function still refuses what `open_` refuses.
+        found_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if found_version != db_mod.SCHEMA_VERSION:
+            raise EngagementError(
+                f"engagement at {root} was created by a different version of "
+                f"hx: on-disk schema version {found_version}, this hx expects "
+                f"{db_mod.SCHEMA_VERSION}"
+            )
+        rows = conn.execute("SELECT id FROM engagement").fetchall()
+        if len(rows) != 1:
+            raise EngagementError(
+                f"expected exactly one engagement row in {root}, found {len(rows)}"
+            )
+        row = rows[0]
+        recorded = conn.execute(
+            "SELECT yaml FROM scope_version"
+            " ORDER BY effective_from_us DESC, rowid DESC LIMIT 1").fetchone()
+        config = config_mod.load(root / "config.yaml")
+        blobs = blobs_mod.BlobStore(root / "blobs")
+    except Exception:
+        conn.close()
+        raise
+    return (Engagement(id=row["id"], root=root, config=config, db=conn,
+                       blobs=blobs),
+            "" if recorded is None else recorded["yaml"])
+
+
 def record_scope_version(eng: Engagement, *, author: str, reason: str) -> str:
     """Append a new scope version. Never updates an existing row."""
     sv_id = _record_scope(eng.db, eng.id, eng.config, author=author, reason=reason)

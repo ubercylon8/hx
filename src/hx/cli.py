@@ -44,6 +44,34 @@ def default_root() -> Path:
     return Path.home() / "hx" / "engagements"
 
 
+def _diverged_engagement(path: Path) -> tuple[eng_mod.Engagement, str]:
+    """`eng_mod.open_diverged`, with the same failures turned into
+    `ClickException`s that `_open_engagement` turns them into.
+
+    A SEPARATE HELPER because `open_diverged` returns a pair and
+    `_open_engagement` returns one value -- but the except clauses must not
+    drift apart, so they are written identically and this docstring says why
+    two of them exist.
+
+    THE TRIGGER IS THE WORKFLOW ITSELF. `hx amend` is the sanctioned path for
+    a hand-edited config, so a YAML syntax error in that edit is not an exotic
+    failure -- it is the second most likely thing to happen after the edit
+    succeeding. Without this it reached the operator as a raw traceback out of
+    `config_mod.load`, on the one command they run when something is already
+    wrong.
+    """
+    try:
+        return eng_mod.open_diverged(path)
+    except eng_mod.EngagementError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except config_mod.ConfigError as exc:
+        raise click.ClickException(f"invalid config at {path}: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise click.ClickException(f"cannot read the database at {path}: {exc}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"cannot access the engagement at {path}: {exc}") from exc
+
+
 def _open_engagement(path: Path) -> eng_mod.Engagement:
     """`eng_mod.open_`, with every failure turned into a `ClickException`
     instead of a traceback. Shared by `info` and both `capture` subcommands,
@@ -459,6 +487,53 @@ def _operator_halt(eng: eng_mod.Engagement) -> halt_mod.OperatorHalt:
     except sqlite3.Error as exc:
         raise click.ClickException(
             f"cannot read the halt state at {eng.root}: {exc}") from exc
+
+
+@main.command()
+@click.option("--reason", required=True,
+              help="Why the config changed. REQUIRED, and recorded in the "
+                   "scope_version row -- a limit that moved without a stated "
+                   "reason is the thing this command exists to prevent.")
+@click.option("--author", default=None,
+              help="Who is recording it. Defaults to $USER.")
+@click.option("--root", type=click.Path(path_type=Path), default=None)
+def amend(reason, author, root) -> None:
+    """Record an edited config.yaml as a new scope version.
+
+    `hx` refuses to open an engagement whose `config.yaml` no longer matches
+    the row it recorded, because a limit somebody quietly widened between two
+    runs -- with every request still stamped with the OLD scope_version_id --
+    is a deliberate act wearing an accident's clothes.
+
+    This is how a change is made deliberately instead: it shows what moved,
+    takes a reason, and appends a new version. It never updates a row; the
+    old one stays, and the runs stamped with it keep meaning what they meant.
+    """
+    path = root or default_root()
+    eng, recorded = _diverged_engagement(path)
+    try:
+        on_disk = config_mod.dumps(eng.config)
+        if on_disk == recorded:
+            raise click.ClickException(
+                f"{path / 'config.yaml'} already matches the recorded scope "
+                "version; there is nothing to amend.")
+
+        # SHOWN BEFORE IT IS RECORDED. An operator who mistyped a limit finds
+        # out here, not from a report three days later.
+        import difflib
+        diff = list(difflib.unified_diff(
+            recorded.splitlines(), on_disk.splitlines(),
+            fromfile="recorded", tofile="config.yaml", lineterm=""))
+        click.echo("\n".join(diff))
+        click.echo("")
+
+        sv = eng_mod.record_scope_version(
+            eng, author=author or os.environ.get("USER", "unknown"),
+            reason=reason)
+        click.echo(f"recorded scope version {sv}")
+        click.echo(f"  reason  {reason}")
+    finally:
+        eng.db.close()
 
 
 @main.command()

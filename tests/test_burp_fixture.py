@@ -344,6 +344,15 @@ def test_a_present_probe_source_adds_no_environment_row(lab):
 # `*:34777` and `*:38399`. Reproduced on this machine before the fix.
 
 # Every local-address form measured on this machine's `ss -ltnpH` output.
+#
+# THE FORM IS WHAT IS UNDER TEST, never the host. The two non-loopback
+# entries below were real addresses of the machine this was written on --
+# a tailnet host and its IPv6 counterpart -- which is a detail of somebody's
+# private network sitting in a repository, and it buys the test nothing:
+# `ss` formats a CGNAT address and a ULA exactly the same way whatever the
+# digits are. They are now RFC-reserved stand-ins of the same shape
+# (RFC 6598 100.64.0.0/10 and RFC 4193 fd00::/8), so the parser still meets
+# both forms and no real host is named.
 LOOPBACK_FORMS = ["127.0.0.1:8080", "[::1]:631", "[::ffff:127.0.0.1]:40421",
                   "127.0.0.53%lo:53"]
 EXPOSED_FORMS = ["0.0.0.0:8443", "*:8444", "[::]:3389", "100.64.0.1:22",

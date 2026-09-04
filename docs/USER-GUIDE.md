@@ -193,13 +193,19 @@ rate_limit_rps: 5      # sustained, unchanged
 rate_burst: 20         # what may go out back to back after an idle moment
 ```
 
-**On an engagement that already exists this is not a file you may edit.**
+**On an engagement that already exists, editing the file is not enough.**
 `hx` records the config in `scope_version` and refuses to open an engagement
-whose `config.yaml` has drifted from that row — the same guard that stops
-anyone quietly widening a safety limit mid-engagement. There is currently **no
-CLI command** that re-records a changed config, so in practice: decide the
-burst when you create the engagement, or create a new one. (The gap is known;
-`record_scope_version()` exists in the code and nothing reaches it.)
+whose `config.yaml` has drifted from that row — the guard that stops anyone
+quietly widening a safety limit mid-engagement, with every request still
+stamped with the old version. Edit the file, then record the change:
+
+```bash
+hx amend --root <engagement> --reason "target is fragile; slowing to 3/s"
+```
+
+It prints a diff of what moved before recording it, requires a reason, and
+**appends** a version rather than updating one — so runs stamped with the old
+version keep meaning what they meant.
 
 A browser's page-load fan-out is a burst that any ordinary visitor also
 generates; it is not the sustained pressure the limit exists to prevent. The
@@ -373,6 +379,7 @@ require a `why`, which is recorded.
 | `hx triage` | Record a human decision on a finding |
 | `hx report` | Render the Markdown deliverable |
 | `hx web` | Read-only UI on loopback |
+| `hx amend` | Record an edited `config.yaml` as a new scope version |
 | `hx halt` / `hx resume` | Stop issuance durably / re-arm |
 | `hx mcp` / `hx tool` | Agent-facing tool layer |
 
