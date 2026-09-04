@@ -153,11 +153,12 @@ yesterday's jar produces green results that mean nothing.
 **Import errors on Python 3.11 or earlier** — `hx` requires 3.12.
 
 **A crawl of a modern web app finds almost nothing, and reports `degraded`
-with a `load-fail` line** — the browser refused a script the page asked for.
-Usually the target mishandles the absolute-form request line every client
-sends to a proxy, so its assets come back as `text/html`. See
-[the user guide](USER-GUIDE.md#when-a-page-could-not-load-itself) for how to
-confirm it in one command.
+with a `load-fail` line** — most often `hx`'s own rate limit. A single-page
+application can request a dozen files in a tenth of a second; the ones over
+budget are denied, Burp answers a denial with `200 text/html`, and a browser
+refuses that as a module script. The application never starts. Check the
+`denial` table first — see
+[the user guide](USER-GUIDE.md#when-a-page-could-not-load-itself).
 
 ---
 

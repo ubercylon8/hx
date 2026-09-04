@@ -139,25 +139,72 @@ for — most often a script blocked on its MIME type. The page is recorded
 measurement: a single-page application whose main module was refused never
 started, so almost nothing it would have fetched was seen.
 
-**The most common cause is not a bug in the target, and not one in `hx`.**
-A browser talking to a proxy sends its request line in **absolute form** —
+**Read it as a signal to investigate, not as a diagnosis.** `hx` reports that
+the page told it something failed. It does not know why, and the causes are
+not all alike:
+
+- the target genuinely does not serve that asset;
+- the target serves it with a content type the browser will not execute;
+- something between the browser and the target altered or withheld the
+  response.
+
+### Confirming what happened
+
+The crawl's own store answers most of this without re-running anything. For an
+engagement at `ENGAGEMENT`:
+
+```bash
+# What hx actually issued and what came back
+sqlite3 ENGAGEMENT/hx.db \
+  "SELECT s.path_template, e.status, e.resp_len
+     FROM exchange e JOIN surface s ON s.id = e.surface_id
+    ORDER BY e.sent_us;"
+
+# Anything the policy refused, and why
+sqlite3 ENGAGEMENT/hx.db \
+  "SELECT error_class, COUNT(*) FROM denial GROUP BY error_class;"
+
+# What the run itself recorded as issued and dropped
+sqlite3 ENGAGEMENT/hx.db "SELECT requests_issued, dropped_total FROM run;"
+```
+
+**Check `denial` first — the most likely answer is that `hx` refused the
+request itself.** Measured against OWASP Juice Shop, 2026-09-03: its Angular
+bundle fired 9 requests in about 130 ms, the staging profile allows 5 per
+second, and the four over budget were denied with
+`rate limit 5/s: 5 requests issued in the last second`. Burp's `drop()`
+answers a denial with **HTTP 200 and an HTML body**, so the browser saw
+`200 text/html` where it expected an ES module, refused it under strict MIME
+checking, and Angular never started. The crawl saw 5 requests instead of 41.
+
+The safety control did exactly what it should. The problem is what a denial
+*looks like*: a rate-limited image is merely missing, but a rate-limited
+**module script** stops the whole application, and a `200 text/html` is
+indistinguishable from the server legitimately serving a page.
+
+**So a `load-fail` line on a modern single-page application usually means the
+rate limit stopped the app from starting, not that the target is broken.**
+Raising the limit is not the fix — it is a safety control, and `hx` refuses
+edits to a recorded engagement config for good reason. Read the crawl as
+covering what it says it covered, and use your own browsing through the proxy
+for anything the crawler could not reach.
+
+A request with **no `exchange` row and no `denial` row** did not reach the
+proxy at all, which is a different problem and worth knowing before blaming
+the target.
+
+Compare against what the application does with no proxy at all — load it in
+an ordinary browser and read the console. If the same errors appear there, the
+target is broken for everyone and the crawl is reporting a real property of
+the application.
+
+**A known target-side cause, worth checking on an unfamiliar server.** A
+client speaking to a proxy sends its request line in **absolute form** —
 `GET http://host/app.js HTTP/1.1` — rather than the origin form
-`GET /app.js HTTP/1.1` a server sees when spoken to directly. That is
-[RFC 9112 §3.2.2](https://www.rfc-editor.org/rfc/rfc9112#section-3.2.2) and
-every proxy-aware client does it. Some application servers do not strip the
-absolute URI before routing, fail to match their own static-asset routes, and
-fall through to the catch-all that serves `index.html` — with
-`Content-Type: text/html`. Browsers enforce strict MIME checking on **module
-scripts** and refuse them, so a modern SPA never boots.
-
-Measured against OWASP Juice Shop, 2026-09-03: the same asset returned
-`application/javascript` in origin form and `text/html` in absolute form.
-Classic `<script>` tags still loaded — Chrome does not strict-check those —
-so only the ES modules were fatal, and the failure looked like a quiet app
-rather than a broken one.
-
-**How to tell them apart.** Request one of the failing assets by hand, both
-ways:
+`GET /app.js HTTP/1.1` ([RFC 9112 §3.2.2](https://www.rfc-editor.org/rfc/rfc9112#section-3.2.2)).
+A proxy is expected to convert back to origin form before forwarding, and Burp
+does. But some servers mishandle absolute form if they ever see it, and it
+costs one command to rule out:
 
 ```bash
 curl -sI http://TARGET/app.js | grep -i content-type
@@ -165,9 +212,15 @@ printf 'GET http://TARGET/app.js HTTP/1.1\r\nHost: TARGET\r\nConnection: close\r
   | nc TARGET 80 | grep -i content-type
 ```
 
-Two different content types means the server mishandles absolute form. Nothing
-in `hx` can fix that — it is between the proxy and the application — but the
-crawl now says the coverage is a floor instead of reporting a clean page.
+Two different content types means that server mishandles absolute form.
+Measured against OWASP Juice Shop, 2026-09-03: `application/javascript` in
+origin form, `text/html` in absolute form. **That is a property of that
+server, and not established as the cause of any particular `load-fail` line** —
+`hx`'s own store showed Burp forwarding origin-form correctly in the run where
+this was first seen.
+
+Whatever the cause, the crawl now says its coverage is a floor instead of
+reporting a clean page.
 
 ---
 
