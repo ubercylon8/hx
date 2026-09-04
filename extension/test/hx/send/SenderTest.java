@@ -2126,6 +2126,25 @@ public class SenderTest {
         check("and so is one asking for a different budget (" + bigger + ")",
               bigger != null && bigger.contains("limit.max_requests cannot change"));
 
+        // THE BURST IS PART OF THE RATE and is refused for the same reason.
+        // Added 2026-09-04 with the burst itself: `arm` runs once per run, so
+        // a later configure naming a different burst could never take effect,
+        // and an operator NARROWING it because the target turned out fragile
+        // would have been ACKed, told nothing, and left with the wider peak.
+        // Found in review of the PR that introduced the burst -- the key was
+        // added to the wire vocabulary and to `arm`, and to neither guard.
+        //
+        // MUTATION: drop the `limit.rate_burst` branch from
+        // `Limits.refuseIfLimitsMoved`. This must go red.
+        String narrower = limits.refuseIfLimitsMoved(Map.of(
+                "limit.rate_burst", List.of("1")));
+        check("a configure asking for a DIFFERENT burst is refused (" + narrower + ")",
+              narrower != null && narrower.contains("limit.rate_burst cannot change mid-run")
+              && narrower.contains("armed at 5") && narrower.contains("asks for 1"));
+        check("and one repeating the SAME burst is not a change",
+              limits.refuseIfLimitsMoved(Map.of(
+                      "limit.rate_burst", List.of("5"))) == null);
+
         // The two configures that MUST still go through, or this refusal
         // breaks the commonest thing an operator does.
         check("a configure repeating the SAME rate is not a change",

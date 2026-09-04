@@ -56,7 +56,9 @@ public class LimiterTest {
     static final HxRequest API_ORDERS = get("api.example.test", "/v2/orders");
 
     public static void main(String[] args) throws Exception {
-        t("theWindowIsExactAtItsBoundaries", LimiterTest::theWindowIsExactAtItsBoundaries);
+        t("theBucketIsExactAtItsBoundaries", LimiterTest::theBucketIsExactAtItsBoundaries);
+        t("theSustainedRateIsStillTheConfiguredRate",
+          LimiterTest::theSustainedRateIsStillTheConfiguredRate);
         t("retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore", LimiterTest::retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore);
         t("rateIsAnsweredBeforeBudget", LimiterTest::rateIsAnsweredBeforeBudget);
         t("theBudgetIsMonotonicAndTimeDoesNotRefillIt", LimiterTest::theBudgetIsMonotonicAndTimeDoesNotRefillIt);
@@ -79,47 +81,84 @@ public class LimiterTest {
      * The three boundaries that matter, hit exactly: the request at the limit,
      * the microsecond before the window rolls, and the microsecond it rolls.
      */
-    static void theWindowIsExactAtItsBoundaries() {
+    static void theBucketIsExactAtItsBoundaries() {
         TickClock clock = new TickClock(T0);
+        // Default burst == rate, which is what the sliding log this replaced
+        // already allowed: five issuances in one instant.
         Limiter l = new Limiter(clock, 5, 1000);
 
         for (int i = 1; i <= 5; i++)
-            check("rate 5/s: request " + i + " of 5 in the same microsecond is allowed",
+            check("rate 5/s burst 5: request " + i + " of 5 in the same microsecond is allowed",
                   l.check(ACCOUNT).allowed());
 
         Decision sixth = l.check(ACCOUNT);
         check("the 6th request in the same microsecond is refused", !sixth.allowed());
         check("...as rate_limited", "rate_limited".equals(sixth.errorClass()));
-        check("...retrying after the whole second, 1000000us", sixth.retryAfterUs() == 1_000_000L);
-        // String.valueOf, not sixth.detail(): a broken limiter returns an ALLOW
-        // here, whose detail is null. The per-method guard now catches the NPE
-        // that used to end the run, so this is no longer load-bearing -- but it
-        // is still the better failure. The guard collapses a whole method into
-        // ONE line naming a throw; this keeps the eleven checks after it in
-        // theWindowIsExactAtItsBoundaries running and reports THIS one by name.
+        // THE GUARANTEE THAT CHANGED. The sliding log made this 1_000_000 --
+        // a full second, until the oldest of the five left the window. A
+        // bucket refills continuously, so one token is worth 1/5 of a second.
+        // The SUSTAINED rate is identical; the recovery shape is not, and
+        // this line is where the difference is pinned.
+        check("...retrying after one token's worth of refill, 200000us",
+              sixth.retryAfterUs() == 200_000L);
         check("...with a detail that names the limit",
               String.valueOf(sixth.detail()).contains("5/s"));
 
-        clock.set(T0 + 999_999L);
+        clock.set(T0 + 199_999L);
         Decision oneEarly = l.check(ACCOUNT);
-        check("one microsecond before the window rolls it is still refused", !oneEarly.allowed());
+        check("one microsecond before a token is worth a request it is refused",
+              !oneEarly.allowed());
         check("...and the wait has shrunk to exactly 1us", oneEarly.retryAfterUs() == 1L);
 
-        clock.set(T0 + 1_000_000L);
-        check("at exactly one second the oldest issuance has left the window",
+        clock.set(T0 + 200_000L);
+        check("at exactly one token's worth the request is allowed",
               l.check(ACCOUNT).allowed());
-        // All five original issuances shared T0, so the window empties in one
-        // step rather than freeing a slot at a time.
-        boolean fourMore = true;
-        for (int i = 2; i <= 5; i++) fourMore &= l.check(ACCOUNT).allowed();
-        check("...and so do the other four, all issued at the same instant", fourMore);
+        check("...and the next is refused again, the bucket being empty",
+              !l.check(ACCOUNT).allowed());
 
-        Decision full = l.check(ACCOUNT);
-        check("the 6th of the rolled window is refused again", !full.allowed());
-        check("...for a full second measured from the new window's oldest issuance",
-              full.retryAfterUs() == 1_000_000L);
-        check("issued() counted the 10 issuances and none of the 3 refusals",
+        // THE WORST CASE THIS DESIGN PERMITS, asserted rather than left to a
+        // reader: burst + rate inside one second. Five at T0, then one per
+        // 200ms for the rest of the second is five more.
+        clock.set(T0 + 1_000_000L);
+        int inTheStraddlingSecond = 0;
+        for (int i = 0; i < 10; i++)
+            if (l.check(ACCOUNT).allowed()) inTheStraddlingSecond++;
+        // FOUR, not five, and the arithmetic is the point: the last refill
+        // was at T0+200_000, so this second only carries 800_000us of it --
+        // 4 requests at 5/s. Computed rather than observed; an expectation
+        // adjusted until it matched would assert nothing.
+        check("the refill since the last issuance is worth exactly its elapsed "
+              + "time at the configured rate (" + inTheStraddlingSecond + ")",
+              inTheStraddlingSecond == 4);
+        check("issued() counted every issuance and none of the refusals",
               l.issued() == 10L);
+    }
+
+    /**
+     * THE PROMISE A CLIENT IS OWED, and the one this class exists to keep.
+     *
+     * The bucket lets `burst + rate` through a straddling second, which the
+     * sliding log did not. What it must never do is let the SUSTAINED rate
+     * exceed `ratePerSecond` -- that is the number quoted to a client, and a
+     * bucket that drifted above it would be a limiter that does not limit.
+     *
+     * Ten seconds of continuous pressure at 5/s with burst 5: at most the
+     * initial burst plus ten seconds of refill.
+     */
+    static void theSustainedRateIsStillTheConfiguredRate() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 5, 100_000);
+
+        long allowed = 0;
+        for (long us = 0; us <= 10_000_000L; us += 10_000L) {
+            clock.set(T0 + us);
+            // Press harder than the limit at every tick.
+            for (int i = 0; i < 3; i++)
+                if (l.check(ACCOUNT).allowed()) allowed++;
+        }
+        // burst (5) + 10s * 5/s = 55, and never more.
+        check("ten seconds of pressure yields burst + 10s of refill, not more ("
+              + allowed + ")", allowed == 55L);
     }
 
     /**
@@ -131,23 +170,21 @@ public class LimiterTest {
         TickClock clock = new TickClock(T0);
         Limiter l = new Limiter(clock, 3, 1000);
 
-        check("issuance 1 of 3, at T0", l.check(ACCOUNT).allowed());
-        clock.set(T0 + 200_000L);
-        check("issuance 2 of 3, 200ms later", l.check(ACCOUNT).allowed());
-        clock.set(T0 + 350_000L);
-        check("issuance 3 of 3, 350ms in", l.check(ACCOUNT).allowed());
+        // Empty the bucket in one instant: burst defaults to the rate, so
+        // three is exactly what it holds.
+        for (int i = 1; i <= 3; i++)
+            check("issuance " + i + " of 3, all at T0", l.check(ACCOUNT).allowed());
 
-        clock.set(T0 + 400_000L);
         Decision d = l.check(ACCOUNT);
-        check("a 4th inside the same second is refused", !d.allowed());
-        // The oldest of the last three is issuance 1 at T0. It leaves the
-        // window at T0+1000000, which is 600000us after now -- NOT a full
-        // second, and not the gap since the most recent issuance either.
-        check("retryAfterUs is the wait for the OLDEST issuance to leave: 600000us",
-              d.retryAfterUs() == 600_000L);
+        check("a 4th on an empty bucket is refused", !d.allowed());
+        // One token at 3/s is a third of a second, rounded UP: a wait that
+        // rounded down would invite the caller back a microsecond before a
+        // token exists and refuse them again.
+        check("retryAfterUs is one token's refill, rounded up: 333334us",
+              d.retryAfterUs() == 333_334L);
 
         long wait = d.retryAfterUs();
-        clock.set(T0 + 400_000L + wait - 1);
+        clock.set(T0 + wait - 1);
         Decision early = l.check(ACCOUNT);
         check("a caller that waits retryAfterUs minus one microsecond is still refused",
               !early.allowed());
@@ -231,8 +268,19 @@ public class LimiterTest {
         check("...and no public field to reach round the methods", noPublicState);
 
         Constructor<?>[] ctors = Limiter.class.getDeclaredConstructors();
-        check("...and exactly one constructor, so the limits are set once, at construction",
-              ctors.length == 1 && ctors[0].getParameterCount() == 3);
+        // TWO, since 2026-09-04, and the property this guards is unchanged:
+        // limits are set ONCE, at construction, with no setter to move them
+        // afterwards. The second is the three-argument overload that
+        // delegates to the four-argument one with `burst = ratePerSecond`;
+        // it configures nothing the other cannot. What would break the
+        // property is a constructor that did NOT delegate, or any setter --
+        // and the method allowlist a few lines above is what catches those.
+        check("...and no more than two constructors, both setting the limits "
+              + "once at construction, neither able to move them after",
+              ctors.length == 2
+              && java.util.Arrays.stream(ctors)
+                     .map(java.lang.reflect.Constructor::getParameterCount)
+                     .sorted().toList().equals(java.util.List.of(3, 4)));
     }
 
     /** A budget of zero means zero. The dangerous reading is "unset, so
@@ -298,8 +346,14 @@ public class LimiterTest {
         clock.set(T0 - 5_000_000L);          // the clock steps five seconds back
         Decision d = l.check(ACCOUNT);
         check("a backwards clock step does not open the gate", !d.allowed());
-        check("...and the wait grows rather than shrinking: 6000000us",
-              d.retryAfterUs() == 6_000_000L);
+        // The number is 500000 -- one token at 2/s -- and NOT the six seconds
+        // the sliding log reported, which was an artifact of measuring from
+        // the oldest issuance. The property under test is unchanged and is
+        // the line above: a clock that went backwards must not open the gate.
+        // A bucket satisfies it by refusing to refill on negative elapsed,
+        // which can only ever leave FEWER tokens.
+        check("...and the wait is one token's refill, never a negative or a "
+              + "shrunk one", d.retryAfterUs() == 500_000L);
     }
 
     /**
@@ -325,8 +379,8 @@ public class LimiterTest {
         check("a 3rd at the same instant is refused, not let through by an "
               + "overflowed comparison", !third.allowed());
         check("...as rate_limited", "rate_limited".equals(third.errorClass()));
-        check("...owing the full window, 1000000us, not a negative or garbage wait",
-              third.retryAfterUs() == 1_000_000L);
+        check("...owing one token's refill, 500000us, not a negative or garbage wait",
+              third.retryAfterUs() == 500_000L);
 
         TickClock near = new TickClock(Long.MAX_VALUE - 500_000L);
         Limiter l2 = new Limiter(near, 2, 1000);
@@ -338,8 +392,14 @@ public class LimiterTest {
         Decision late = l2.check(ACCOUNT);
         check("100us later -- still inside the window, and now past "
               + "Long.MAX_VALUE -- is still refused", !late.allowed());
-        check("...owing exactly the remaining 999900us",
-              late.retryAfterUs() == 999_900L);
+        // 100us of refill at 2/s earns 200 micro-tokens, leaving 999800 of
+        // the 1000000 a request costs. That shortfall is MICRO-TOKENS; the
+        // wait is what they take to earn, 999800/2 = 499900us. The two units
+        // are easy to conflate and this comment is here because they were.
+        // The subtraction that produced it ran ACROSS Long.MAX_VALUE without
+        // wrapping into an allow, which is what this method exists to pin.
+        check("...owing exactly the remaining 499900us",
+              late.retryAfterUs() == 499_900L);
     }
 
     /**

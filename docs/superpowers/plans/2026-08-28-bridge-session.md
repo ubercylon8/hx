@@ -1251,6 +1251,10 @@ def config_body(cfg) -> dict[str, list[str]]:
         "render.allow": list(cfg.render_allow),
         "method.allow": list(METHOD_ALLOW),
         "limit.rate_rps": [str(cfg.rate_limit_rps)],
+        # Omitted when unset so the extension applies its own default
+        # (burst == rate) rather than being handed a literal "None".
+        **({"limit.rate_burst": [str(cfg.rate_burst)]}
+           if cfg.rate_burst is not None else {}),
         "limit.concurrency": [str(cfg.max_concurrency)],
         "limit.max_requests": [str(cfg.max_requests)],
     }
@@ -1285,8 +1289,6 @@ def stored_scope_sha256(conn, engagement_id: str) -> str:
     if row is None:
         raise SessionError(
             f"engagement {engagement_id} has no scope_version row, so there is "
-            "no recorded boundary to authorise the extension against")
-    return row[0]
 ```
 
 - [ ] **Step 4: Run to verify they pass**

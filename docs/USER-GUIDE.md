@@ -184,10 +184,41 @@ indistinguishable from the server legitimately serving a page.
 
 **So a `load-fail` line on a modern single-page application usually means the
 rate limit stopped the app from starting, not that the target is broken.**
-Raising the limit is not the fix — it is a safety control, and `hx` refuses
-edits to a recorded engagement config for good reason. Read the crawl as
-covering what it says it covered, and use your own browsing through the proxy
-for anything the crawler could not reach.
+
+The fix is `rate_burst`, not a higher rate — **set at creation**, in the
+`config.yaml` of a new engagement:
+
+```yaml
+rate_limit_rps: 5      # sustained, unchanged
+rate_burst: 20         # what may go out back to back after an idle moment
+```
+
+**On an engagement that already exists this is not a file you may edit.**
+`hx` records the config in `scope_version` and refuses to open an engagement
+whose `config.yaml` has drifted from that row — the same guard that stops
+anyone quietly widening a safety limit mid-engagement. There is currently **no
+CLI command** that re-records a changed config, so in practice: decide the
+burst when you create the engagement, or create a new one. (The gap is known;
+`record_scope_version()` exists in the code and nothing reaches it.)
+
+A browser's page-load fan-out is a burst that any ordinary visitor also
+generates; it is not the sustained pressure the limit exists to prevent. The
+burst changes the shape and not the average — but it is not free, and the
+number you quote a client changes with it:
+
+| | with `rate_burst` unset | with `rate_burst: 20` |
+|---|---|---|
+| sustained | 5/s | 5/s |
+| worst case in any one second | 10 | 25 |
+
+Set it as low as the application will tolerate. Measured against OWASP Juice
+Shop, whose Angular bundle asks for nine files at once: `rate_burst: 20` took
+that crawl from 9 requests and 5 static assets to 44 requests and 22 surfaces,
+including every parameterised API endpoint — and 38 requests were still
+rate-refused, because the sustained limit never moved.
+
+Anything the crawler still cannot reach is what your own browsing through the
+proxy is for.
 
 A request with **no `exchange` row and no `denial` row** did not reach the
 proxy at all, which is a different problem and worth knowing before blaming

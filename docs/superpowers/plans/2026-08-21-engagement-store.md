@@ -2682,6 +2682,12 @@ class Config:
     dangerous_paths: list[str] = field(default_factory=lambda: list(DEFAULT_DANGEROUS_PATHS))
     checks: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_CHECKS))
     rate_limit_rps: int = 5
+    #: Burst capacity in requests. The SUSTAINED rate stays
+    #: `rate_limit_rps`; this is what may go out back to back after
+    #: an idle moment, so the worst case in any one second is
+    #: `rate_limit_rps + rate_burst`. Defaults to the rate, which is
+    #: what the limiter allowed before bursts were configurable.
+    rate_burst: int | None = None
     # `Limits.arm()` (extension/src/hx/send/Limits.java) falls back to this
     # same number -- documented in HxExtension.DEFAULT_MAX_REQUESTS -- when a
     # configure body omits `limit.max_requests`. Matching it means adding the
@@ -2876,6 +2882,8 @@ def load_text(text: str) -> Config:
         dangerous_paths=_string_list(raw, "dangerous_paths", DEFAULT_DANGEROUS_PATHS),
         checks=checks,
         rate_limit_rps=_positive_int(raw, "rate_limit_rps", 5),
+        rate_burst=(None if raw.get("rate_burst") is None
+                    else _positive_int(raw, "rate_burst", 5)),
         max_requests=_positive_int(raw, "max_requests", 2000),
         max_concurrency=_positive_int(raw, "max_concurrency", 2),
         identities=identities,
@@ -2935,6 +2943,7 @@ def dumps(cfg: Config) -> str:
             "dangerous_paths": cfg.dangerous_paths,
             "checks": cfg.checks,
             "rate_limit_rps": cfg.rate_limit_rps,
+            "rate_burst": cfg.rate_burst,
             "max_requests": cfg.max_requests,
             "max_concurrency": cfg.max_concurrency,
             "identities": {n: _identity_yaml(i) for n, i in cfg.identities.items()},

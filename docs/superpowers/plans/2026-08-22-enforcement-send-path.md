@@ -7752,7 +7752,9 @@ public class LimiterTest {
     static final HxRequest API_ORDERS = get("api.example.test", "/v2/orders");
 
     public static void main(String[] args) throws Exception {
-        t("theWindowIsExactAtItsBoundaries", LimiterTest::theWindowIsExactAtItsBoundaries);
+        t("theBucketIsExactAtItsBoundaries", LimiterTest::theBucketIsExactAtItsBoundaries);
+        t("theSustainedRateIsStillTheConfiguredRate",
+          LimiterTest::theSustainedRateIsStillTheConfiguredRate);
         t("retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore", LimiterTest::retryAfterUsIsExactlyLongEnoughAndNotAMicrosecondMore);
         t("rateIsAnsweredBeforeBudget", LimiterTest::rateIsAnsweredBeforeBudget);
         t("theBudgetIsMonotonicAndTimeDoesNotRefillIt", LimiterTest::theBudgetIsMonotonicAndTimeDoesNotRefillIt);
@@ -7775,47 +7777,84 @@ public class LimiterTest {
      * The three boundaries that matter, hit exactly: the request at the limit,
      * the microsecond before the window rolls, and the microsecond it rolls.
      */
-    static void theWindowIsExactAtItsBoundaries() {
+    static void theBucketIsExactAtItsBoundaries() {
         TickClock clock = new TickClock(T0);
+        // Default burst == rate, which is what the sliding log this replaced
+        // already allowed: five issuances in one instant.
         Limiter l = new Limiter(clock, 5, 1000);
 
         for (int i = 1; i <= 5; i++)
-            check("rate 5/s: request " + i + " of 5 in the same microsecond is allowed",
+            check("rate 5/s burst 5: request " + i + " of 5 in the same microsecond is allowed",
                   l.check(ACCOUNT).allowed());
 
         Decision sixth = l.check(ACCOUNT);
         check("the 6th request in the same microsecond is refused", !sixth.allowed());
         check("...as rate_limited", "rate_limited".equals(sixth.errorClass()));
-        check("...retrying after the whole second, 1000000us", sixth.retryAfterUs() == 1_000_000L);
-        // String.valueOf, not sixth.detail(): a broken limiter returns an ALLOW
-        // here, whose detail is null. The per-method guard now catches the NPE
-        // that used to end the run, so this is no longer load-bearing -- but it
-        // is still the better failure. The guard collapses a whole method into
-        // ONE line naming a throw; this keeps the eleven checks after it in
-        // theWindowIsExactAtItsBoundaries running and reports THIS one by name.
+        // THE GUARANTEE THAT CHANGED. The sliding log made this 1_000_000 --
+        // a full second, until the oldest of the five left the window. A
+        // bucket refills continuously, so one token is worth 1/5 of a second.
+        // The SUSTAINED rate is identical; the recovery shape is not, and
+        // this line is where the difference is pinned.
+        check("...retrying after one token's worth of refill, 200000us",
+              sixth.retryAfterUs() == 200_000L);
         check("...with a detail that names the limit",
               String.valueOf(sixth.detail()).contains("5/s"));
 
-        clock.set(T0 + 999_999L);
+        clock.set(T0 + 199_999L);
         Decision oneEarly = l.check(ACCOUNT);
-        check("one microsecond before the window rolls it is still refused", !oneEarly.allowed());
+        check("one microsecond before a token is worth a request it is refused",
+              !oneEarly.allowed());
         check("...and the wait has shrunk to exactly 1us", oneEarly.retryAfterUs() == 1L);
 
-        clock.set(T0 + 1_000_000L);
-        check("at exactly one second the oldest issuance has left the window",
+        clock.set(T0 + 200_000L);
+        check("at exactly one token's worth the request is allowed",
               l.check(ACCOUNT).allowed());
-        // All five original issuances shared T0, so the window empties in one
-        // step rather than freeing a slot at a time.
-        boolean fourMore = true;
-        for (int i = 2; i <= 5; i++) fourMore &= l.check(ACCOUNT).allowed();
-        check("...and so do the other four, all issued at the same instant", fourMore);
+        check("...and the next is refused again, the bucket being empty",
+              !l.check(ACCOUNT).allowed());
 
-        Decision full = l.check(ACCOUNT);
-        check("the 6th of the rolled window is refused again", !full.allowed());
-        check("...for a full second measured from the new window's oldest issuance",
-              full.retryAfterUs() == 1_000_000L);
-        check("issued() counted the 10 issuances and none of the 3 refusals",
+        // THE WORST CASE THIS DESIGN PERMITS, asserted rather than left to a
+        // reader: burst + rate inside one second. Five at T0, then one per
+        // 200ms for the rest of the second is five more.
+        clock.set(T0 + 1_000_000L);
+        int inTheStraddlingSecond = 0;
+        for (int i = 0; i < 10; i++)
+            if (l.check(ACCOUNT).allowed()) inTheStraddlingSecond++;
+        // FOUR, not five, and the arithmetic is the point: the last refill
+        // was at T0+200_000, so this second only carries 800_000us of it --
+        // 4 requests at 5/s. Computed rather than observed; an expectation
+        // adjusted until it matched would assert nothing.
+        check("the refill since the last issuance is worth exactly its elapsed "
+              + "time at the configured rate (" + inTheStraddlingSecond + ")",
+              inTheStraddlingSecond == 4);
+        check("issued() counted every issuance and none of the refusals",
               l.issued() == 10L);
+    }
+
+    /**
+     * THE PROMISE A CLIENT IS OWED, and the one this class exists to keep.
+     *
+     * The bucket lets `burst + rate` through a straddling second, which the
+     * sliding log did not. What it must never do is let the SUSTAINED rate
+     * exceed `ratePerSecond` -- that is the number quoted to a client, and a
+     * bucket that drifted above it would be a limiter that does not limit.
+     *
+     * Ten seconds of continuous pressure at 5/s with burst 5: at most the
+     * initial burst plus ten seconds of refill.
+     */
+    static void theSustainedRateIsStillTheConfiguredRate() {
+        TickClock clock = new TickClock(T0);
+        Limiter l = new Limiter(clock, 5, 100_000);
+
+        long allowed = 0;
+        for (long us = 0; us <= 10_000_000L; us += 10_000L) {
+            clock.set(T0 + us);
+            // Press harder than the limit at every tick.
+            for (int i = 0; i < 3; i++)
+                if (l.check(ACCOUNT).allowed()) allowed++;
+        }
+        // burst (5) + 10s * 5/s = 55, and never more.
+        check("ten seconds of pressure yields burst + 10s of refill, not more ("
+              + allowed + ")", allowed == 55L);
     }
 
     /**
@@ -7827,23 +7866,21 @@ public class LimiterTest {
         TickClock clock = new TickClock(T0);
         Limiter l = new Limiter(clock, 3, 1000);
 
-        check("issuance 1 of 3, at T0", l.check(ACCOUNT).allowed());
-        clock.set(T0 + 200_000L);
-        check("issuance 2 of 3, 200ms later", l.check(ACCOUNT).allowed());
-        clock.set(T0 + 350_000L);
-        check("issuance 3 of 3, 350ms in", l.check(ACCOUNT).allowed());
+        // Empty the bucket in one instant: burst defaults to the rate, so
+        // three is exactly what it holds.
+        for (int i = 1; i <= 3; i++)
+            check("issuance " + i + " of 3, all at T0", l.check(ACCOUNT).allowed());
 
-        clock.set(T0 + 400_000L);
         Decision d = l.check(ACCOUNT);
-        check("a 4th inside the same second is refused", !d.allowed());
-        // The oldest of the last three is issuance 1 at T0. It leaves the
-        // window at T0+1000000, which is 600000us after now -- NOT a full
-        // second, and not the gap since the most recent issuance either.
-        check("retryAfterUs is the wait for the OLDEST issuance to leave: 600000us",
-              d.retryAfterUs() == 600_000L);
+        check("a 4th on an empty bucket is refused", !d.allowed());
+        // One token at 3/s is a third of a second, rounded UP: a wait that
+        // rounded down would invite the caller back a microsecond before a
+        // token exists and refuse them again.
+        check("retryAfterUs is one token's refill, rounded up: 333334us",
+              d.retryAfterUs() == 333_334L);
 
         long wait = d.retryAfterUs();
-        clock.set(T0 + 400_000L + wait - 1);
+        clock.set(T0 + wait - 1);
         Decision early = l.check(ACCOUNT);
         check("a caller that waits retryAfterUs minus one microsecond is still refused",
               !early.allowed());
@@ -7927,8 +7964,19 @@ public class LimiterTest {
         check("...and no public field to reach round the methods", noPublicState);
 
         Constructor<?>[] ctors = Limiter.class.getDeclaredConstructors();
-        check("...and exactly one constructor, so the limits are set once, at construction",
-              ctors.length == 1 && ctors[0].getParameterCount() == 3);
+        // TWO, since 2026-09-04, and the property this guards is unchanged:
+        // limits are set ONCE, at construction, with no setter to move them
+        // afterwards. The second is the three-argument overload that
+        // delegates to the four-argument one with `burst = ratePerSecond`;
+        // it configures nothing the other cannot. What would break the
+        // property is a constructor that did NOT delegate, or any setter --
+        // and the method allowlist a few lines above is what catches those.
+        check("...and no more than two constructors, both setting the limits "
+              + "once at construction, neither able to move them after",
+              ctors.length == 2
+              && java.util.Arrays.stream(ctors)
+                     .map(java.lang.reflect.Constructor::getParameterCount)
+                     .sorted().toList().equals(java.util.List.of(3, 4)));
     }
 
     /** A budget of zero means zero. The dangerous reading is "unset, so
@@ -7994,8 +8042,14 @@ public class LimiterTest {
         clock.set(T0 - 5_000_000L);          // the clock steps five seconds back
         Decision d = l.check(ACCOUNT);
         check("a backwards clock step does not open the gate", !d.allowed());
-        check("...and the wait grows rather than shrinking: 6000000us",
-              d.retryAfterUs() == 6_000_000L);
+        // The number is 500000 -- one token at 2/s -- and NOT the six seconds
+        // the sliding log reported, which was an artifact of measuring from
+        // the oldest issuance. The property under test is unchanged and is
+        // the line above: a clock that went backwards must not open the gate.
+        // A bucket satisfies it by refusing to refill on negative elapsed,
+        // which can only ever leave FEWER tokens.
+        check("...and the wait is one token's refill, never a negative or a "
+              + "shrunk one", d.retryAfterUs() == 500_000L);
     }
 
     /**
@@ -8021,8 +8075,8 @@ public class LimiterTest {
         check("a 3rd at the same instant is refused, not let through by an "
               + "overflowed comparison", !third.allowed());
         check("...as rate_limited", "rate_limited".equals(third.errorClass()));
-        check("...owing the full window, 1000000us, not a negative or garbage wait",
-              third.retryAfterUs() == 1_000_000L);
+        check("...owing one token's refill, 500000us, not a negative or garbage wait",
+              third.retryAfterUs() == 500_000L);
 
         TickClock near = new TickClock(Long.MAX_VALUE - 500_000L);
         Limiter l2 = new Limiter(near, 2, 1000);
@@ -8034,8 +8088,14 @@ public class LimiterTest {
         Decision late = l2.check(ACCOUNT);
         check("100us later -- still inside the window, and now past "
               + "Long.MAX_VALUE -- is still refused", !late.allowed());
-        check("...owing exactly the remaining 999900us",
-              late.retryAfterUs() == 999_900L);
+        // 100us of refill at 2/s earns 200 micro-tokens, leaving 999800 of
+        // the 1000000 a request costs. That shortfall is MICRO-TOKENS; the
+        // wait is what they take to earn, 999800/2 = 499900us. The two units
+        // are easy to conflate and this comment is here because they were.
+        // The subtraction that produced it ran ACROSS Long.MAX_VALUE without
+        // wrapping into an allow, which is what this method exists to pin.
+        check("...owing exactly the remaining 499900us",
+              late.retryAfterUs() == 499_900L);
     }
 
     /**
@@ -8360,13 +8420,42 @@ package hx.policy;
  * is what the limit exists to protect. `check` therefore ignores everything
  * about the request it is handed.
  *
- * Time comes from an injected {@link Clock} so the window can be tested at its
- * exact boundaries instead of approached with sleeps. The rate window is a
- * sliding log of the last `ratePerSecond` issue times, which is exact: at no
- * instant can more than `ratePerSecond` issuances lie within any one-second
- * window. A token bucket would be cheaper and would let 2*rate through a window
- * that straddles a refill, and this limit is the one a client's operations team
- * would be reading off a graph.
+ * Time comes from an injected {@link Clock} so the bucket can be tested at its
+ * exact boundaries instead of approached with sleeps.
+ *
+ * THE GUARANTEE, AND IT CHANGED ON 2026-09-04. This was a sliding log of the
+ * last `ratePerSecond` issue times, which was exact: at no instant could more
+ * than `ratePerSecond` issuances lie within any one-second window. Its own
+ * docstring rejected a token bucket in those words, because a bucket "would
+ * let 2*rate through a window that straddles a refill, and this limit is the
+ * one a client's operations team would be reading off a graph".
+ *
+ * That argument was right and is not withdrawn. It was overruled, knowingly,
+ * for a measured reason: under a sliding log the crawler CANNOT LOAD A MODERN
+ * SINGLE-PAGE APPLICATION AT ALL. Measured against OWASP Juice Shop, its
+ * Angular bundle fires nine requests in about 130 milliseconds; at 5/s the
+ * four over the limit were refused, Burp answers a refusal with 200 and an
+ * HTML body, the browser refused those as module scripts under strict MIME
+ * checking, and the application never started. Not "covered less" -- did not
+ * run. The crawl saw 5 requests where a direct browser makes 41.
+ *
+ * So the guarantee is now WEAKER AND MUST BE STATED AS SUCH:
+ *
+ *   - the SUSTAINED rate is still exactly `ratePerSecond`, over any window
+ *     long enough for the bucket to empty;
+ *   - the worst case within any ONE second is `burst + ratePerSecond`, which
+ *     is what a straddling window can carry.
+ *
+ * At the default `burst = ratePerSecond` that is 2*rate for one second, which
+ * is precisely the spike the old comment warned about. It is the shape of one
+ * page load -- the same fan-out an ordinary visitor's browser produces -- and
+ * it cannot be sustained. An operator who needs the old promise sets
+ * `limit.rate_burst` to 1 and gets a bucket that never holds a second token.
+ *
+ * WHAT AN OPERATIONS TEAM SEES has therefore changed, and a report that said
+ * "5 requests per second" while a graph showed ten in one second would be the
+ * kind of quiet inaccuracy this project refuses elsewhere. The number to quote
+ * a client is `rate_limit_rps` sustained, `rate_limit_rps + rate_burst` peak.
  */
 public final class Limiter implements Gate {
 
@@ -8382,22 +8471,65 @@ public final class Limiter implements Gate {
      */
     private static final long MAX_RATE = 10_000L;
 
+    /** Micro-tokens in one request. Tokens are scaled so refill stays in
+     *  integer arithmetic: `elapsedUs * ratePerSecond` IS micro-tokens,
+     *  because 1_000_000 us of elapsed time at R/s earns R requests. */
+    private static final long ONE_REQUEST = 1_000_000L;
+
     private final Clock clock;
     private final long ratePerSecond;
     private final long maxRequests;
+    /** Burst capacity in REQUESTS. The sustained rate is still
+     *  `ratePerSecond`; this only changes the shape over sub-second windows. */
+    private final long burst;
+    private final long capacityMicro;
+    /** The longest elapsed time worth counting: past this the bucket is full,
+     *  and the cap is what keeps `elapsed * ratePerSecond` from overflowing. */
+    private final long fullRefillUs;
 
-    /**
-     * Issue times of the last `ratePerSecond` issuances. The slot at
-     * `issued % ratePerSecond` holds the OLDEST of them, because it is the one
-     * the next issuance overwrites. Never read before `issued` reaches
-     * `ratePerSecond`, so the zeroes it starts life with are never mistaken for
-     * issue times.
-     */
-    private final long[] recent;
+    private long tokensMicro;
+    private long lastRefillUs;
+
 
     private long issued = 0;
 
+    /** The old sliding log's allowance, expressed as a bucket: it permitted
+     *  `ratePerSecond` issuances back to back, so that is the burst every
+     *  caller gets unless one is configured. Not zero -- a zero burst holds a
+     *  single token and would REFUSE the second of five simultaneous
+     *  requests the sliding log allowed, which is a tightening no operator
+     *  asked for. */
     public Limiter(Clock clock, long ratePerSecond, long maxRequests) {
+        this(clock, ratePerSecond, maxRequests, ratePerSecond);
+    }
+
+    /**
+     * WHY A BURST EXISTS, measured 2026-09-03 against OWASP Juice Shop.
+     *
+     * Its Angular bundle fires nine requests in about 130 milliseconds. Under
+     * the staging profile's 5/s the four over the limit were denied --
+     * correctly, and recorded in `denial`. But Burp answers a denial with
+     * HTTP 200 and an HTML body, so the browser saw `200 text/html` where it
+     * expected an ES module, refused it under strict MIME checking, and the
+     * application never started. The crawl saw 5 requests instead of 41 and
+     * reached none of the parameterised API endpoints a scan exists to probe.
+     *
+     * A rate-limited image is merely missing. A rate-limited MODULE SCRIPT
+     * stops the whole application. The limit was enforcing the right TOTAL
+     * against the wrong SHAPE: a browser's page-load fan-out is a burst that
+     * any ordinary visitor also generates, not the sustained hammering this
+     * class exists to prevent.
+     *
+     * A token bucket fixes the shape and not the total. With burst B and rate
+     * R, at most B requests may go out back-to-back after an idle period, and
+     * the SUSTAINED rate is still exactly R -- which is the property a client
+     * is owed. The three-argument constructor passes
+     * `burst = ratePerSecond`, which is what the sliding log this replaced
+     * already allowed -- it permitted R issuances in the same instant. A
+     * `burst` of 0 would hold a single token and REFUSE the second of those,
+     * a tightening no operator asked for, so it is not the default.
+     */
+    public Limiter(Clock clock, long ratePerSecond, long maxRequests, long burst) {
         if (clock == null)
             throw new IllegalArgumentException("a limiter without a clock cannot limit anything");
         // A rate of zero is refused rather than clamped to one. Clamping widens
@@ -8411,10 +8543,27 @@ public final class Limiter implements Gate {
                 "limit.rate_rps above the " + MAX_RATE + " ceiling: " + ratePerSecond);
         if (maxRequests < 0)
             throw new IllegalArgumentException("limit.max_requests must not be negative, got " + maxRequests);
+        // Refused rather than clamped, for the reason the rate check above
+        // gives: a limit may not widen itself. A negative burst is a config
+        // error, not a request to disable bursting -- that is `burst = 0`.
+        if (burst < 0)
+            throw new IllegalArgumentException("limit.rate_burst must not be negative, got " + burst);
+        if (burst > MAX_RATE)
+            throw new IllegalArgumentException(
+                "limit.rate_burst above the " + MAX_RATE + " ceiling: " + burst);
         this.clock = clock;
         this.ratePerSecond = ratePerSecond;
         this.maxRequests = maxRequests;
-        this.recent = new long[(int) ratePerSecond];
+        this.burst = burst;
+        // At least one request's worth, or nothing could ever be issued.
+        this.capacityMicro = Math.max(ONE_REQUEST, burst * ONE_REQUEST);
+        this.fullRefillUs = capacityMicro / ratePerSecond + 1;
+        // STARTS FULL. An engagement's first request should not wait for a
+        // bucket to fill, and starting empty would make the first page load
+        // the one most likely to be throttled -- exactly the case this
+        // constructor exists for.
+        this.tokensMicro = capacityMicro;
+        this.lastRefillUs = clock.nowUs();
     }
 
     /**
@@ -8465,47 +8614,40 @@ public final class Limiter implements Gate {
         // therefore answers "retry in N" once before answering "this run is
         // over" -- one wasted wait, in exchange for one order that every layer
         // and every test agrees on.
-        if (issued >= ratePerSecond) {
-            long oldest = recent[(int) (issued % ratePerSecond)];
-            // An issuance is inside the window while now - oldest < WINDOW_US,
-            // so it leaves in exactly WINDOW_US - (now - oldest). That is
-            // computed as two subtractions rather than as
-            // `oldest + WINDOW_US` compared against `now`: adding a constant
-            // to a clock reading near Long.MAX_VALUE overflows and wraps
-            // negative, which would make an issuance that is still inside the
-            // window look like it left long ago -- and ALLOW a request that
-            // should be refused. Subtracting two nearby clock readings CAN
-            // still overflow -- oldest = Long.MIN_VALUE, now = Long.MAX_VALUE
-            // wraps to -1 -- but only in the FAIL-CLOSED direction: a wrapped
-            // `elapsed` is always deeply negative, so it always reads as
-            // still inside the window and DENIES. It can never produce a
-            // false ALLOW, because any pair whose true difference is under
-            // WINDOW_US must already be within that same 1,000,000 of each
-            // other, nowhere near the ~9.22e18 magnitude a wrap requires.
-            // Strictly less-than is what makes retryAfterUs positive whenever
-            // this branch is taken: if the elapsed time equalled WINDOW_US
-            // exactly, the issuance would already be outside the window and
-            // we would not be here.
-            long elapsed = now - oldest;
-            if (elapsed < WINDOW_US) {
-                return Decision.rateLimited(WINDOW_US - elapsed,
-                    "rate limit " + ratePerSecond + "/s: " + ratePerSecond
-                    + " requests issued in the last second");
-            }
+        // REFILL FIRST, then spend. `elapsed` is bounded before the multiply
+        // so `elapsed * ratePerSecond` cannot overflow: past `fullRefillUs`
+        // the bucket is full anyway, so counting further time buys nothing.
+        //
+        // A clock that went backwards -- or a subtraction that wrapped --
+        // gives a negative `elapsed` and is skipped, which FAILS CLOSED: no
+        // refill means fewer tokens, never more. That is the same direction
+        // the sliding log this replaced was careful about, for the same
+        // reason: a limit may drift toward refusing, never toward allowing.
+        long elapsed = now - lastRefillUs;
+        if (elapsed > 0) {
+            if (elapsed > fullRefillUs) elapsed = fullRefillUs;
+            long refilled = tokensMicro + elapsed * ratePerSecond;
+            tokensMicro = refilled > capacityMicro ? capacityMicro : refilled;
+            lastRefillUs = now;
         }
 
-        // Monotonic by construction: `issued` only ever increases and
-        // `maxRequests` is final, so a budget that is spent stays spent. There
-        // is deliberately no way to refill it -- see LimiterTest's reflection
-        // check. A `configure` frame re-authorises SCOPE, not ISSUANCE, and a
-        // scope push that silently handed the run another thousand requests
-        // would be a budget reset with no operator behind it.
+        if (tokensMicro < ONE_REQUEST) {
+            // Ceiling division: a retry-after that rounded DOWN would invite
+            // the caller back a tick before a token exists, and be told no
+            // again.
+            long shortfall = ONE_REQUEST - tokensMicro;
+            long retryUs = (shortfall + ratePerSecond - 1) / ratePerSecond;
+            return Decision.rateLimited(retryUs,
+                "rate limit " + ratePerSecond + "/s (burst " + burst
+                + "): no token available");
+        }
+
         if (issued >= maxRequests) {
             return Decision.deny("budget_exhausted",
                 "run budget spent: " + issued + " of " + maxRequests + " requests issued");
         }
 
-        recent[(int) (issued % ratePerSecond)] = now;
+        tokensMicro -= ONE_REQUEST;
         issued++;
         return Decision.allow();
     }
@@ -17158,6 +17300,25 @@ public class SenderTest {
         check("and so is one asking for a different budget (" + bigger + ")",
               bigger != null && bigger.contains("limit.max_requests cannot change"));
 
+        // THE BURST IS PART OF THE RATE and is refused for the same reason.
+        // Added 2026-09-04 with the burst itself: `arm` runs once per run, so
+        // a later configure naming a different burst could never take effect,
+        // and an operator NARROWING it because the target turned out fragile
+        // would have been ACKed, told nothing, and left with the wider peak.
+        // Found in review of the PR that introduced the burst -- the key was
+        // added to the wire vocabulary and to `arm`, and to neither guard.
+        //
+        // MUTATION: drop the `limit.rate_burst` branch from
+        // `Limits.refuseIfLimitsMoved`. This must go red.
+        String narrower = limits.refuseIfLimitsMoved(Map.of(
+                "limit.rate_burst", List.of("1")));
+        check("a configure asking for a DIFFERENT burst is refused (" + narrower + ")",
+              narrower != null && narrower.contains("limit.rate_burst cannot change mid-run")
+              && narrower.contains("armed at 5") && narrower.contains("asks for 1"));
+        check("and one repeating the SAME burst is not a change",
+              limits.refuseIfLimitsMoved(Map.of(
+                      "limit.rate_burst", List.of("5"))) == null);
+
         // The two configures that MUST still go through, or this refusal
         // breaks the commonest thing an operator does.
         check("a configure repeating the SAME rate is not a change",
@@ -17340,6 +17501,9 @@ public final class Limits implements Gate {
     private volatile Limiter limiter;
     private volatile long ratePerSecond;
     private volatile long maxRequests;
+    /** The armed burst, kept for the same reason as the two above: so a later
+     *  configure naming a different one can be REFUSED rather than ignored. */
+    private volatile long rateBurst;
 
     public Limits(Clock clock, long defaultRatePerSecond, long defaultMaxRequests) {
         this.clock = clock;
@@ -17366,9 +17530,14 @@ public final class Limits implements Gate {
         if (limiter != null || auth.epoch() == 0) return;
         long rps = positive(auth.scope(), "limit.rate_rps", defaultRatePerSecond);
         long max = positive(auth.scope(), "limit.max_requests", defaultMaxRequests);
+        // ABSENT MEANS `burst == rate`, which is what the limiter allowed
+        // before bursts were configurable. An engagement that says nothing
+        // about bursting therefore behaves exactly as it did.
+        long burst = positive(auth.scope(), "limit.rate_burst", rps);
         ratePerSecond = rps;
         maxRequests = max;
-        limiter = new Limiter(clock, rps, max);
+        rateBurst = burst;
+        limiter = new Limiter(clock, rps, max, burst);
     }
 
     @Override
@@ -17461,6 +17630,15 @@ public final class Limits implements Gate {
         if (limiter == null || scope == null) return null;
         String rate = movedFrom(scope, "limit.rate_rps", ratePerSecond);
         if (rate != null) return rate;
+        // THE BURST IS PART OF THE RATE, and is checked for the same reason.
+        // `arm` runs once per run, so a later configure naming a different
+        // burst could never take effect -- and an operator NARROWING it
+        // because the target turned out fragile would be ACKed, told nothing,
+        // and left with the wider peak still enforced. That is precisely the
+        // failure this method exists to prevent: someone who believes they
+        // slowed the run down and did not.
+        String burst = movedFrom(scope, "limit.rate_burst", rateBurst);
+        if (burst != null) return burst;
         return movedFrom(scope, "limit.max_requests", maxRequests);
     }
 
@@ -17491,6 +17669,8 @@ public final class Limits implements Gate {
     long ratePerSecond() { return limiter == null ? 0L : ratePerSecond; }
 
     long maxRequests() { return limiter == null ? 0L : maxRequests; }
+
+    long rateBurst() { return limiter == null ? 0L : rateBurst; }
 
     long issued() {
         Limiter l = limiter;

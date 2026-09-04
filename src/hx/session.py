@@ -657,6 +657,10 @@ def config_body(cfg) -> dict[str, list[str]]:
         "render.allow": list(cfg.render_allow),
         "method.allow": list(METHOD_ALLOW),
         "limit.rate_rps": [str(cfg.rate_limit_rps)],
+        # Omitted when unset so the extension applies its own default
+        # (burst == rate) rather than being handed a literal "None".
+        **({"limit.rate_burst": [str(cfg.rate_burst)]}
+           if cfg.rate_burst is not None else {}),
         "limit.concurrency": [str(cfg.max_concurrency)],
         "limit.max_requests": [str(cfg.max_requests)],
     }

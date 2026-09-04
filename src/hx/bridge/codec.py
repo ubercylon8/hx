@@ -41,6 +41,7 @@ CONFIG_KEYS = frozenset(
         "dangerous.path",
         "method.allow",
         "limit.rate_rps",
+        "limit.rate_burst",
         "limit.concurrency",
         "limit.max_requests",
         "render.allow",

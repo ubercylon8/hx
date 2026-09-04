@@ -12,7 +12,8 @@ public final class ConfigBody {
 
     public static final Set<String> KEYS = Set.of(
         "scope.include", "scope.exclude", "dangerous.path", "method.allow",
-        "limit.rate_rps", "limit.concurrency", "limit.max_requests", "render.allow"
+        "limit.rate_rps", "limit.rate_burst", "limit.concurrency",
+        "limit.max_requests", "render.allow"
     );
 
     /**
@@ -40,7 +41,7 @@ public final class ConfigBody {
      * the change that honours it.
      */
     private static final Set<String> POSITIVE_INTEGER_KEYS =
-        Set.of("limit.rate_rps", "limit.max_requests");
+        Set.of("limit.rate_rps", "limit.rate_burst", "limit.max_requests");
 
     private ConfigBody() { }
 

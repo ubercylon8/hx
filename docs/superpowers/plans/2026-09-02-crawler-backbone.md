@@ -1267,7 +1267,19 @@ class Browser:
                  stderr_timeout: float = 10.0) -> None:
         self._chrome = Path(chrome) if chrome else find_chromium(burp_home)
         self._proxy_port = proxy_port
-        self._tmp = tempfile.TemporaryDirectory(prefix="hx-crawl-profile-")
+        # `ignore_cleanup_errors` because Chromium outlives its own main
+        # process: zygote and renderer children can still be flushing the
+        # profile when `close()` removes it, and the removal then raises
+        # `OSError: [Errno 39] Directory not empty`. MEASURED 2026-09-04 --
+        # it appeared only once a crawl got far enough to write a real
+        # profile, so the shorter crawls before it never hit it.
+        #
+        # A scratch directory that will not delete is a few hundred kilobytes
+        # in /tmp. Failing the whole crawl over it would discard everything
+        # the run captured, which is the worse of the two outcomes by a wide
+        # margin.
+        self._tmp = tempfile.TemporaryDirectory(
+            prefix="hx-crawl-profile-", ignore_cleanup_errors=True)
         self.proc: subprocess.Popen | None = None
         self.conn: cdp.Connection | None = None
         self.session_id: str | None = None

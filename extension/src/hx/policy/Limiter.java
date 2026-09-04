@@ -12,13 +12,42 @@ package hx.policy;
  * is what the limit exists to protect. `check` therefore ignores everything
  * about the request it is handed.
  *
- * Time comes from an injected {@link Clock} so the window can be tested at its
- * exact boundaries instead of approached with sleeps. The rate window is a
- * sliding log of the last `ratePerSecond` issue times, which is exact: at no
- * instant can more than `ratePerSecond` issuances lie within any one-second
- * window. A token bucket would be cheaper and would let 2*rate through a window
- * that straddles a refill, and this limit is the one a client's operations team
- * would be reading off a graph.
+ * Time comes from an injected {@link Clock} so the bucket can be tested at its
+ * exact boundaries instead of approached with sleeps.
+ *
+ * THE GUARANTEE, AND IT CHANGED ON 2026-09-04. This was a sliding log of the
+ * last `ratePerSecond` issue times, which was exact: at no instant could more
+ * than `ratePerSecond` issuances lie within any one-second window. Its own
+ * docstring rejected a token bucket in those words, because a bucket "would
+ * let 2*rate through a window that straddles a refill, and this limit is the
+ * one a client's operations team would be reading off a graph".
+ *
+ * That argument was right and is not withdrawn. It was overruled, knowingly,
+ * for a measured reason: under a sliding log the crawler CANNOT LOAD A MODERN
+ * SINGLE-PAGE APPLICATION AT ALL. Measured against OWASP Juice Shop, its
+ * Angular bundle fires nine requests in about 130 milliseconds; at 5/s the
+ * four over the limit were refused, Burp answers a refusal with 200 and an
+ * HTML body, the browser refused those as module scripts under strict MIME
+ * checking, and the application never started. Not "covered less" -- did not
+ * run. The crawl saw 5 requests where a direct browser makes 41.
+ *
+ * So the guarantee is now WEAKER AND MUST BE STATED AS SUCH:
+ *
+ *   - the SUSTAINED rate is still exactly `ratePerSecond`, over any window
+ *     long enough for the bucket to empty;
+ *   - the worst case within any ONE second is `burst + ratePerSecond`, which
+ *     is what a straddling window can carry.
+ *
+ * At the default `burst = ratePerSecond` that is 2*rate for one second, which
+ * is precisely the spike the old comment warned about. It is the shape of one
+ * page load -- the same fan-out an ordinary visitor's browser produces -- and
+ * it cannot be sustained. An operator who needs the old promise sets
+ * `limit.rate_burst` to 1 and gets a bucket that never holds a second token.
+ *
+ * WHAT AN OPERATIONS TEAM SEES has therefore changed, and a report that said
+ * "5 requests per second" while a graph showed ten in one second would be the
+ * kind of quiet inaccuracy this project refuses elsewhere. The number to quote
+ * a client is `rate_limit_rps` sustained, `rate_limit_rps + rate_burst` peak.
  */
 public final class Limiter implements Gate {
 
@@ -34,22 +63,65 @@ public final class Limiter implements Gate {
      */
     private static final long MAX_RATE = 10_000L;
 
+    /** Micro-tokens in one request. Tokens are scaled so refill stays in
+     *  integer arithmetic: `elapsedUs * ratePerSecond` IS micro-tokens,
+     *  because 1_000_000 us of elapsed time at R/s earns R requests. */
+    private static final long ONE_REQUEST = 1_000_000L;
+
     private final Clock clock;
     private final long ratePerSecond;
     private final long maxRequests;
+    /** Burst capacity in REQUESTS. The sustained rate is still
+     *  `ratePerSecond`; this only changes the shape over sub-second windows. */
+    private final long burst;
+    private final long capacityMicro;
+    /** The longest elapsed time worth counting: past this the bucket is full,
+     *  and the cap is what keeps `elapsed * ratePerSecond` from overflowing. */
+    private final long fullRefillUs;
 
-    /**
-     * Issue times of the last `ratePerSecond` issuances. The slot at
-     * `issued % ratePerSecond` holds the OLDEST of them, because it is the one
-     * the next issuance overwrites. Never read before `issued` reaches
-     * `ratePerSecond`, so the zeroes it starts life with are never mistaken for
-     * issue times.
-     */
-    private final long[] recent;
+    private long tokensMicro;
+    private long lastRefillUs;
+
 
     private long issued = 0;
 
+    /** The old sliding log's allowance, expressed as a bucket: it permitted
+     *  `ratePerSecond` issuances back to back, so that is the burst every
+     *  caller gets unless one is configured. Not zero -- a zero burst holds a
+     *  single token and would REFUSE the second of five simultaneous
+     *  requests the sliding log allowed, which is a tightening no operator
+     *  asked for. */
     public Limiter(Clock clock, long ratePerSecond, long maxRequests) {
+        this(clock, ratePerSecond, maxRequests, ratePerSecond);
+    }
+
+    /**
+     * WHY A BURST EXISTS, measured 2026-09-03 against OWASP Juice Shop.
+     *
+     * Its Angular bundle fires nine requests in about 130 milliseconds. Under
+     * the staging profile's 5/s the four over the limit were denied --
+     * correctly, and recorded in `denial`. But Burp answers a denial with
+     * HTTP 200 and an HTML body, so the browser saw `200 text/html` where it
+     * expected an ES module, refused it under strict MIME checking, and the
+     * application never started. The crawl saw 5 requests instead of 41 and
+     * reached none of the parameterised API endpoints a scan exists to probe.
+     *
+     * A rate-limited image is merely missing. A rate-limited MODULE SCRIPT
+     * stops the whole application. The limit was enforcing the right TOTAL
+     * against the wrong SHAPE: a browser's page-load fan-out is a burst that
+     * any ordinary visitor also generates, not the sustained hammering this
+     * class exists to prevent.
+     *
+     * A token bucket fixes the shape and not the total. With burst B and rate
+     * R, at most B requests may go out back-to-back after an idle period, and
+     * the SUSTAINED rate is still exactly R -- which is the property a client
+     * is owed. The three-argument constructor passes
+     * `burst = ratePerSecond`, which is what the sliding log this replaced
+     * already allowed -- it permitted R issuances in the same instant. A
+     * `burst` of 0 would hold a single token and REFUSE the second of those,
+     * a tightening no operator asked for, so it is not the default.
+     */
+    public Limiter(Clock clock, long ratePerSecond, long maxRequests, long burst) {
         if (clock == null)
             throw new IllegalArgumentException("a limiter without a clock cannot limit anything");
         // A rate of zero is refused rather than clamped to one. Clamping widens
@@ -63,10 +135,27 @@ public final class Limiter implements Gate {
                 "limit.rate_rps above the " + MAX_RATE + " ceiling: " + ratePerSecond);
         if (maxRequests < 0)
             throw new IllegalArgumentException("limit.max_requests must not be negative, got " + maxRequests);
+        // Refused rather than clamped, for the reason the rate check above
+        // gives: a limit may not widen itself. A negative burst is a config
+        // error, not a request to disable bursting -- that is `burst = 0`.
+        if (burst < 0)
+            throw new IllegalArgumentException("limit.rate_burst must not be negative, got " + burst);
+        if (burst > MAX_RATE)
+            throw new IllegalArgumentException(
+                "limit.rate_burst above the " + MAX_RATE + " ceiling: " + burst);
         this.clock = clock;
         this.ratePerSecond = ratePerSecond;
         this.maxRequests = maxRequests;
-        this.recent = new long[(int) ratePerSecond];
+        this.burst = burst;
+        // At least one request's worth, or nothing could ever be issued.
+        this.capacityMicro = Math.max(ONE_REQUEST, burst * ONE_REQUEST);
+        this.fullRefillUs = capacityMicro / ratePerSecond + 1;
+        // STARTS FULL. An engagement's first request should not wait for a
+        // bucket to fill, and starting empty would make the first page load
+        // the one most likely to be throttled -- exactly the case this
+        // constructor exists for.
+        this.tokensMicro = capacityMicro;
+        this.lastRefillUs = clock.nowUs();
     }
 
     /**
@@ -117,47 +206,40 @@ public final class Limiter implements Gate {
         // therefore answers "retry in N" once before answering "this run is
         // over" -- one wasted wait, in exchange for one order that every layer
         // and every test agrees on.
-        if (issued >= ratePerSecond) {
-            long oldest = recent[(int) (issued % ratePerSecond)];
-            // An issuance is inside the window while now - oldest < WINDOW_US,
-            // so it leaves in exactly WINDOW_US - (now - oldest). That is
-            // computed as two subtractions rather than as
-            // `oldest + WINDOW_US` compared against `now`: adding a constant
-            // to a clock reading near Long.MAX_VALUE overflows and wraps
-            // negative, which would make an issuance that is still inside the
-            // window look like it left long ago -- and ALLOW a request that
-            // should be refused. Subtracting two nearby clock readings CAN
-            // still overflow -- oldest = Long.MIN_VALUE, now = Long.MAX_VALUE
-            // wraps to -1 -- but only in the FAIL-CLOSED direction: a wrapped
-            // `elapsed` is always deeply negative, so it always reads as
-            // still inside the window and DENIES. It can never produce a
-            // false ALLOW, because any pair whose true difference is under
-            // WINDOW_US must already be within that same 1,000,000 of each
-            // other, nowhere near the ~9.22e18 magnitude a wrap requires.
-            // Strictly less-than is what makes retryAfterUs positive whenever
-            // this branch is taken: if the elapsed time equalled WINDOW_US
-            // exactly, the issuance would already be outside the window and
-            // we would not be here.
-            long elapsed = now - oldest;
-            if (elapsed < WINDOW_US) {
-                return Decision.rateLimited(WINDOW_US - elapsed,
-                    "rate limit " + ratePerSecond + "/s: " + ratePerSecond
-                    + " requests issued in the last second");
-            }
+        // REFILL FIRST, then spend. `elapsed` is bounded before the multiply
+        // so `elapsed * ratePerSecond` cannot overflow: past `fullRefillUs`
+        // the bucket is full anyway, so counting further time buys nothing.
+        //
+        // A clock that went backwards -- or a subtraction that wrapped --
+        // gives a negative `elapsed` and is skipped, which FAILS CLOSED: no
+        // refill means fewer tokens, never more. That is the same direction
+        // the sliding log this replaced was careful about, for the same
+        // reason: a limit may drift toward refusing, never toward allowing.
+        long elapsed = now - lastRefillUs;
+        if (elapsed > 0) {
+            if (elapsed > fullRefillUs) elapsed = fullRefillUs;
+            long refilled = tokensMicro + elapsed * ratePerSecond;
+            tokensMicro = refilled > capacityMicro ? capacityMicro : refilled;
+            lastRefillUs = now;
         }
 
-        // Monotonic by construction: `issued` only ever increases and
-        // `maxRequests` is final, so a budget that is spent stays spent. There
-        // is deliberately no way to refill it -- see LimiterTest's reflection
-        // check. A `configure` frame re-authorises SCOPE, not ISSUANCE, and a
-        // scope push that silently handed the run another thousand requests
-        // would be a budget reset with no operator behind it.
+        if (tokensMicro < ONE_REQUEST) {
+            // Ceiling division: a retry-after that rounded DOWN would invite
+            // the caller back a tick before a token exists, and be told no
+            // again.
+            long shortfall = ONE_REQUEST - tokensMicro;
+            long retryUs = (shortfall + ratePerSecond - 1) / ratePerSecond;
+            return Decision.rateLimited(retryUs,
+                "rate limit " + ratePerSecond + "/s (burst " + burst
+                + "): no token available");
+        }
+
         if (issued >= maxRequests) {
             return Decision.deny("budget_exhausted",
                 "run budget spent: " + issued + " of " + maxRequests + " requests issued");
         }
 
-        recent[(int) (issued % ratePerSecond)] = now;
+        tokensMicro -= ONE_REQUEST;
         issued++;
         return Decision.allow();
     }

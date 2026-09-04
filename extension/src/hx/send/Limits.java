@@ -44,6 +44,9 @@ public final class Limits implements Gate {
     private volatile Limiter limiter;
     private volatile long ratePerSecond;
     private volatile long maxRequests;
+    /** The armed burst, kept for the same reason as the two above: so a later
+     *  configure naming a different one can be REFUSED rather than ignored. */
+    private volatile long rateBurst;
 
     public Limits(Clock clock, long defaultRatePerSecond, long defaultMaxRequests) {
         this.clock = clock;
@@ -70,9 +73,14 @@ public final class Limits implements Gate {
         if (limiter != null || auth.epoch() == 0) return;
         long rps = positive(auth.scope(), "limit.rate_rps", defaultRatePerSecond);
         long max = positive(auth.scope(), "limit.max_requests", defaultMaxRequests);
+        // ABSENT MEANS `burst == rate`, which is what the limiter allowed
+        // before bursts were configurable. An engagement that says nothing
+        // about bursting therefore behaves exactly as it did.
+        long burst = positive(auth.scope(), "limit.rate_burst", rps);
         ratePerSecond = rps;
         maxRequests = max;
-        limiter = new Limiter(clock, rps, max);
+        rateBurst = burst;
+        limiter = new Limiter(clock, rps, max, burst);
     }
 
     @Override
@@ -165,6 +173,15 @@ public final class Limits implements Gate {
         if (limiter == null || scope == null) return null;
         String rate = movedFrom(scope, "limit.rate_rps", ratePerSecond);
         if (rate != null) return rate;
+        // THE BURST IS PART OF THE RATE, and is checked for the same reason.
+        // `arm` runs once per run, so a later configure naming a different
+        // burst could never take effect -- and an operator NARROWING it
+        // because the target turned out fragile would be ACKed, told nothing,
+        // and left with the wider peak still enforced. That is precisely the
+        // failure this method exists to prevent: someone who believes they
+        // slowed the run down and did not.
+        String burst = movedFrom(scope, "limit.rate_burst", rateBurst);
+        if (burst != null) return burst;
         return movedFrom(scope, "limit.max_requests", maxRequests);
     }
 
@@ -195,6 +212,8 @@ public final class Limits implements Gate {
     long ratePerSecond() { return limiter == null ? 0L : ratePerSecond; }
 
     long maxRequests() { return limiter == null ? 0L : maxRequests; }
+
+    long rateBurst() { return limiter == null ? 0L : rateBurst; }
 
     long issued() {
         Limiter l = limiter;
